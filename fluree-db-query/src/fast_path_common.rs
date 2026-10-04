@@ -2479,13 +2479,15 @@ pub struct ObjectProbeOps {
 
 impl ObjectProbeOps {
     /// Filter `ops` (one predicate's resolved ops, any sort order) to the
-    /// `IRI_REF` subset and index it object-major. Returns `None` when no op
+    /// `o_type` subset and index it object-major. Returns `None` when no op
     /// can affect the lane — callers then run their unmodified scan.
-    pub fn new(ops: &[fluree_db_binary_index::read::types::OverlayOp]) -> Option<Self> {
-        let iri_ref = OType::IRI_REF.as_u16();
+    pub fn new(
+        ops: &[fluree_db_binary_index::read::types::OverlayOp],
+        o_type: u16,
+    ) -> Option<Self> {
         let mut subset: Vec<ObjectProbeOp> = ops
             .iter()
-            .filter(|o| o.o_type == iri_ref)
+            .filter(|o| o.o_type == o_type)
             .map(|o| ObjectProbeOp {
                 o_key: o.o_key,
                 s_id: o.s_id,

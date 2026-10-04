@@ -3262,3 +3262,140 @@ async fn every_write_path_takes_nested_triple_terms() {
         assert_eq!(named, strings(&[&["ex:o"]]), "[{label}] in the named graph");
     }
 }
+
+/// A link probe bound by a term handle — from a reified pattern's term
+/// lookup, or from a term-valued edge — runs as one bulk object probe per
+/// batch, and merges novelty links: a new link on an indexed term, a term
+/// only novelty holds, and a retracted link. A batch mixing ref and term
+/// keys probes each under its own type, under a predicate that holds both.
+#[tokio::test(flavor = "current_thread")]
+async fn term_bound_links_probe_in_bulk() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/triple-term-links:bulk-probe";
+    let turtle =
+        |body: &str| format!("VERSION \"1.2\"\n@prefix ex: <http://example.org/> .\n{body}\n");
+    // Enough other links that the anchored term, not the link scan, leads.
+    let padding: String = (0..50)
+        .map(|i| format!("ex:p{i} ex:partOf ex:q{i} {{| ex:source ex:pad |}} .\n"))
+        .collect();
+    fluree
+        .insert_turtle(
+            support::genesis_ledger(&fluree, ledger_id),
+            &turtle(&format!(
+                "<< ex:s1 ex:partOf ex:anchor ~ ex:r1 >> ex:source ex:d1 .\n\
+                 << ex:s2 ex:partOf ex:anchor ~ ex:r2 >> ex:source ex:d2 .\n\
+                 << ex:s3 ex:partOf ex:anchor ~ ex:r3 >> ex:source ex:d3 .\n\
+                 << ex:s3 ex:partOf ex:other ~ ex:r4 >> ex:source ex:d4 .\n\
+                 ex:doc1 ex:mentions <<( ex:s1 ex:partOf ex:anchor )>> .\n\
+                 ex:doc2 ex:mentions ex:r1 .\n\
+                 ex:doc3 ex:mentions <<( ex:s3 ex:partOf ex:anchor )>> .\n\
+                 ex:a1 ex:cites ex:r1 .\n\
+                 ex:a2 ex:cites <<( ex:s1 ex:partOf ex:anchor )>> .\n\
+                 ex:a3 ex:cites <<( ex:s3 ex:partOf ex:anchor )>> .\n{padding}",
+            )),
+        )
+        .await
+        .expect("base");
+    fluree
+        .reindex(ledger_id, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("reindex base");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+
+    let queries = [
+        "SELECT ?s ?src WHERE { << ?s ex:partOf ex:anchor >> ex:source ?src } ORDER BY ?s ?src",
+        "SELECT ?doc ?r WHERE { ?doc ex:mentions ?t . ?r rdf:reifies ?t } ORDER BY ?doc ?r",
+        "SELECT ?doc ?a WHERE { ?doc ex:mentions ?t . ?a ex:cites ?t } ORDER BY ?doc ?a",
+    ];
+    // Register the span callsites before this thread's subscriber reads them.
+    run_link_query(&fluree, &ledger, queries[0].to_string()).await;
+    let (store, _guard) = support::span_capture::init_test_tracing();
+    tracing::callsite::rebuild_interest_cache();
+    let answers = |ledger: LedgerState, novelty: bool| {
+        let (fluree, store) = (&fluree, &store);
+        async move {
+            let mut answers = Vec::new();
+            for q in queries {
+                let before = store.find_spans("join_flush_batched_object_binary").len();
+                answers.push(run_link_query(fluree, &ledger, q.to_string()).await);
+                assert!(
+                    store.find_spans("join_flush_batched_object_binary").len() > before,
+                    "{q}: the link probe should run in bulk"
+                );
+            }
+            if novelty {
+                assert!(
+                    store.has_event("join batched object flush merged novelty overlay"),
+                    "the bulk probe should merge novelty links"
+                );
+            }
+            answers
+        }
+    };
+
+    assert_eq!(
+        answers(ledger, false).await,
+        vec![
+            strings(&[
+                &["ex:s1", "ex:d1"],
+                &["ex:s2", "ex:d2"],
+                &["ex:s3", "ex:d3"]
+            ]),
+            strings(&[&["ex:doc1", "ex:r1"], &["ex:doc3", "ex:r3"]]),
+            strings(&[
+                &["ex:doc1", "ex:a2"],
+                &["ex:doc2", "ex:a1"],
+                &["ex:doc3", "ex:a3"]
+            ]),
+        ]
+    );
+
+    fluree
+        .insert_turtle(
+            fluree.ledger(ledger_id).await.expect("reload"),
+            &turtle(
+                "<< ex:s1 ex:partOf ex:anchor ~ ex:r1b >> ex:source ex:d1b .\n\
+                 << ex:s9 ex:partOf ex:anchor ~ ex:r9 >> ex:source ex:d9 .",
+            ),
+        )
+        .await
+        .expect("novelty links");
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(
+            "PREFIX ex: <http://example.org/>\n\
+             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+             DELETE DATA { ex:r2 rdf:reifies <<( ex:s2 ex:partOf ex:anchor )>> }",
+        )
+        .commit()
+        .await
+        .expect("retract a link");
+    let expected = vec![
+        strings(&[
+            &["ex:s1", "ex:d1"],
+            &["ex:s1", "ex:d1b"],
+            &["ex:s3", "ex:d3"],
+            &["ex:s9", "ex:d9"],
+        ]),
+        strings(&[
+            &["ex:doc1", "ex:r1"],
+            &["ex:doc1", "ex:r1b"],
+            &["ex:doc3", "ex:r3"],
+        ]),
+        strings(&[
+            &["ex:doc1", "ex:a2"],
+            &["ex:doc2", "ex:a1"],
+            &["ex:doc3", "ex:a3"],
+        ]),
+    ];
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    assert_eq!(answers(ledger, true).await, expected, "under novelty");
+
+    fluree
+        .reindex(ledger_id, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    assert_eq!(answers(ledger, false).await, expected, "after reindex");
+}

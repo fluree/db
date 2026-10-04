@@ -26,7 +26,9 @@ use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
 use fluree_db_core::clock::Instant;
+use fluree_db_core::o_type::OType;
 use fluree_db_core::subject_id::SubjectId;
+use fluree_db_core::value_id::ObjKind;
 use fluree_db_core::{DatatypeDictId, GraphId, IndexType, ObjectBounds, Sid, BATCHED_JOIN_SIZE};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::{HashSet, VecDeque};
@@ -454,8 +456,8 @@ fn is_batched_eligible(
 /// - subject is a new unbound variable (no BindInstruction for Subject)
 /// - no object bounds or datatype/language constraints
 ///
-/// This enables scanning OPST in bulk for a set of bound ref objects rather than
-/// opening one scan per left row.
+/// This enables scanning OPST in bulk for a set of bound ref (or triple-term)
+/// objects rather than opening one scan per left row.
 fn is_batched_object_eligible(
     bind_instructions: &[BindInstruction],
     right_pattern: &TriplePattern,
@@ -602,6 +604,9 @@ pub struct NestedLoopJoinOperator {
     /// Accumulated entries for batched processing: (stored_batch_idx, row_idx, subject_s_id)
     /// Stores the raw s_id directly to avoid dictionary round-trips with EncodedSid.
     batched_accumulator: Vec<(usize, usize, u64)>,
+    /// Object lane: the `OType` every accumulated key carries. Refs and
+    /// triple-term handles never share a flush.
+    batched_object_o_type: u16,
     /// Accumulator size that triggers a flush. `BATCHED_JOIN_SIZE` throughout
     /// unless `set_row_budget` starts it near the budget, so a small `LIMIT`
     /// doesn't buffer ~100k left rows before producing anything. Each flush
@@ -901,6 +906,7 @@ impl NestedLoopJoinOperator {
             batched_predicate,
             batched_overlay_mode: ProbeLanePlan::Clean,
             batched_accumulator: Vec::new(),
+            batched_object_o_type: OType::IRI_REF.as_u16(),
             flush_schedule: FlushSchedule::fixed(BATCHED_JOIN_SIZE),
             stored_left_batches: Vec::new(),
             batched_output: VecDeque::new(),
@@ -1552,7 +1558,7 @@ impl Operator for NestedLoopJoinOperator {
                     self.subject_left_col.unwrap()
                 };
 
-                let resolved: Option<u64> = {
+                let resolved: Option<(u16, u64)> = {
                     let left_batch = self.current_left_batch.as_ref().unwrap();
                     let store = ctx.binary_store.as_deref();
                     // Persisted reverse dict first, then DictNovelty: a subject
@@ -1577,10 +1583,21 @@ impl Operator for NestedLoopJoinOperator {
                                     })
                             })
                     };
+                    let iri_ref = OType::IRI_REF.as_u16();
                     match left_batch.get_by_col(left_row, left_col) {
-                        Binding::EncodedSid { s_id, .. } => Some(*s_id),
-                        Binding::Sid { sid, .. } => resolve_subject(sid),
-                        Binding::IriMatch { primary_sid, .. } => resolve_subject(primary_sid),
+                        Binding::EncodedSid { s_id, .. } => Some((iri_ref, *s_id)),
+                        Binding::Sid { sid, .. } => resolve_subject(sid).map(|k| (iri_ref, k)),
+                        Binding::IriMatch { primary_sid, .. } => {
+                            resolve_subject(primary_sid).map(|k| (iri_ref, k))
+                        }
+                        // A term handle keys OPST like a ref; per row it would
+                        // decode the term only for the scan to re-derive it.
+                        Binding::EncodedLit { o_kind, o_key, .. }
+                            if self.batched_object_eligible
+                                && *o_kind == ObjKind::TRIPLE_TERM.as_u8() =>
+                        {
+                            Some((OType::TRIPLE_TERM.as_u16(), *o_key))
+                        }
                         Binding::Unbound => None,
                         _ => {
                             // For subject/predicate bindings we already screened invalid types.
@@ -1590,7 +1607,15 @@ impl Operator for NestedLoopJoinOperator {
                     }
                 };
 
-                if let Some(key) = resolved {
+                if let Some((o_type, key)) = resolved {
+                    if o_type != self.batched_object_o_type {
+                        if !self.batched_accumulator.is_empty() {
+                            ctx.check_cancelled()?;
+                            self.flush_batched_accumulator_for_ctx(ctx).await?;
+                            ctx.check_cancelled()?;
+                        }
+                        self.batched_object_o_type = o_type;
+                    }
                     let batch_idx = self.ensure_current_batch_stored();
                     self.batched_accumulator.push((batch_idx, left_row, key));
                     if self.batched_accumulator.len() >= self.flush_schedule.size() {
@@ -1954,7 +1979,7 @@ impl NestedLoopJoinOperator {
     /// Decide how the batched lanes handle the active overlay this call.
     ///
     /// The subject-probe and exists lanes merge overlay ops per probed
-    /// subject; the object (OPST) lane merges its `IRI_REF` subset per probed
+    /// subject; the object (OPST) lane merges its key type's subset per probed
     /// object. Decline cases route to the overlay-correct per-row fallback
     /// BEFORE any accumulation, so a flush never reroutes mid-stream.
     fn compute_batched_overlay_mode(&self, ctx: &ExecutionContext<'_>) -> Result<ProbeLanePlan> {
@@ -2094,8 +2119,6 @@ impl NestedLoopJoinOperator {
         mut probe_ops: Option<&mut ProbeOps>,
         on_match: &mut dyn FnMut(&[usize], &Binding) -> Result<()>,
     ) -> Result<()> {
-        use fluree_db_core::o_type::OType;
-
         let scan_start = Instant::now();
 
         let mut leaflets_scanned: u64 = 0;
@@ -2694,7 +2717,6 @@ impl NestedLoopJoinOperator {
             cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
         };
         use fluree_db_binary_index::RunSortOrder;
-        use fluree_db_core::o_type::OType;
 
         if self.batched_accumulator.is_empty() {
             return Ok(());
@@ -2731,7 +2753,7 @@ impl NestedLoopJoinOperator {
 
         // One reconciler per flush (see `flush_batched_accumulator_binary`).
         let mut probe_ops = match &self.batched_overlay_mode {
-            ProbeLanePlan::Merge(ops) => ObjectProbeOps::new(ops),
+            ProbeLanePlan::Merge(ops) => ObjectProbeOps::new(ops, self.batched_object_o_type),
             _ => None,
         };
 
@@ -2743,7 +2765,7 @@ impl NestedLoopJoinOperator {
         // We build a set of leaf indices that contain any of our object IDs, then scan
         // those leaves. This avoids re-opening and re-decoding leaflets once per object
         // (which is the dominant cost in `BinaryCursor`-per-object approaches).
-        let iri_ref = OType::IRI_REF.as_u16();
+        let o_type = self.batched_object_o_type;
         let cmp = cmp_v2_for_order(RunSortOrder::Opst);
 
         let mut objs: Vec<u64> = o_to_accum.keys().copied().collect();
@@ -2763,7 +2785,7 @@ impl NestedLoopJoinOperator {
                 p_id,
                 t: 0,
                 o_i: 0,
-                o_type: iri_ref,
+                o_type,
                 g_id: ctx.binary_g_id,
             };
             let max_key = RunRecordV2 {
@@ -2772,7 +2794,7 @@ impl NestedLoopJoinOperator {
                 p_id,
                 t: u32::MAX,
                 o_i: u32::MAX,
-                o_type: iri_ref,
+                o_type,
                 g_id: ctx.binary_g_id,
             };
             let r = branch.find_leaves_in_range(&min_key, &max_key, cmp);
@@ -2799,7 +2821,7 @@ impl NestedLoopJoinOperator {
                 if entry.p_const.is_some() && entry.p_const != Some(p_id) {
                     continue;
                 }
-                if entry.o_type_const.is_some() && entry.o_type_const != Some(iri_ref) {
+                if entry.o_type_const.is_some() && entry.o_type_const != Some(o_type) {
                     continue;
                 }
 
@@ -2858,7 +2880,7 @@ impl NestedLoopJoinOperator {
                     // which is extremely rare for OPST; fall back to row-scan in that case.
                     for row in 0..batch.row_count {
                         let ot = batch.o_type.get_or(row, 0);
-                        if ot != iri_ref {
+                        if ot != o_type {
                             continue;
                         }
                         let pid = batch.p_id.get_or(row, 0);
@@ -2895,7 +2917,7 @@ impl NestedLoopJoinOperator {
 
                 // Fast path: if o_type/p_id are const and already filtered by leaflet
                 // metadata, we can skip per-row checks.
-                let ot_const_ok = batch.o_type.is_const() && batch.o_type.get_or(0, 0) == iri_ref;
+                let ot_const_ok = batch.o_type.is_const() && batch.o_type.get_or(0, 0) == o_type;
                 let pid_const_ok = batch.p_id.is_const() && batch.p_id.get_or(0, 0) == p_id;
 
                 // Start scanning at the first possible match within this leaflet.
@@ -2934,7 +2956,7 @@ impl NestedLoopJoinOperator {
                     for r in row..run_end {
                         if !ot_const_ok {
                             let ot = batch.o_type.get_or(r, 0);
-                            if ot != iri_ref {
+                            if ot != o_type {
                                 continue;
                             }
                         }
