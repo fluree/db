@@ -1,0 +1,150 @@
+//! The native transaction behind `fluree.Transaction`: writes staged one at a
+//! time, readable before they commit, committed as one commit.
+
+use crate::connection::{commit_opts, operation, receipt_to_py, write_policy, Snapshot};
+use crate::error::{api_error, invalid_request};
+use crate::runtime::{block_on, InRuntime};
+use fluree_db_api::{Fluree, GovernanceOptions, GraphDb};
+use pyo3::prelude::*;
+use pyo3::types::PyDict;
+use std::sync::Mutex;
+
+#[pyclass(frozen, module = "fluree._fluree")]
+pub(crate) struct Transaction {
+    fluree: InRuntime<Fluree>,
+    ledger: String,
+    policy: Option<GovernanceOptions>,
+    state: Mutex<State>,
+}
+
+/// The engine transaction is checked out for each engine call, so the lock
+/// is never held while the GIL is released.
+enum State {
+    Open(Box<EngineTxn>),
+    /// Checked out by a call in progress on another thread.
+    Busy,
+    Closed,
+}
+
+type EngineTxn = InRuntime<fluree_db_api::Transaction>;
+
+impl Transaction {
+    pub(crate) fn begin(
+        py: Python<'_>,
+        fluree: &Fluree,
+        ledger: &str,
+        policy: Option<GovernanceOptions>,
+    ) -> PyResult<Self> {
+        let txn = block_on(py, async {
+            let context = write_policy(fluree, ledger, policy.as_ref()).await?;
+            fluree.begin_transaction(ledger, context).await
+        })?
+        .map_err(api_error)?;
+        Ok(Self {
+            fluree: InRuntime::new(fluree.clone()),
+            ledger: ledger.to_string(),
+            policy,
+            state: Mutex::new(State::Open(Box::new(InRuntime::new(txn)))),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn check_out(&self) -> PyResult<Box<EngineTxn>> {
+        let mut state = self.lock();
+        match std::mem::replace(&mut *state, State::Busy) {
+            State::Open(txn) => Ok(txn),
+            State::Busy => Err(invalid_request(
+                "the transaction is in use by another thread",
+            )),
+            State::Closed => {
+                *state = State::Closed;
+                Err(invalid_request(
+                    "the transaction has already been committed or rolled back",
+                ))
+            }
+        }
+    }
+
+    /// Run `f` on the checked-out transaction and check it back in.
+    fn with_txn<T>(&self, f: impl FnOnce(&mut EngineTxn) -> PyResult<T>) -> PyResult<T> {
+        let mut txn = self.check_out()?;
+        let result = f(&mut txn);
+        *self.lock() = State::Open(txn);
+        result
+    }
+}
+
+#[pymethods]
+impl Transaction {
+    #[getter]
+    fn ledger(&self) -> &str {
+        &self.ledger
+    }
+
+    #[getter]
+    fn is_open(&self) -> bool {
+        !matches!(*self.lock(), State::Closed)
+    }
+
+    /// Stage one write over those before it; see `Connection.transact`.
+    fn stage(
+        &self,
+        py: Python<'_>,
+        op: &str,
+        kind: &str,
+        payload: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let operation = operation(op, kind, payload)?;
+        self.with_txn(|txn| block_on(py, txn.get_mut().stage(operation))?.map_err(api_error))
+    }
+
+    /// The ledger as the staged writes leave it, governed and carrying the
+    /// default context as `Connection.snapshot` views are.
+    fn snapshot(&self, py: Python<'_>) -> PyResult<Snapshot> {
+        let fluree = &*self.fluree;
+        let db = self.with_txn(|txn| {
+            block_on(py, async {
+                let view = txn.db().await?;
+                let view: GraphDb = match &self.policy {
+                    Some(policy) => fluree.wrap_policy(view, policy).await?,
+                    None => fluree.wrap_policy_defaults(view).await?,
+                };
+                let context = fluree.get_default_context(&self.ledger).await?;
+                Ok::<_, fluree_db_api::ApiError>(view.with_default_context(context))
+            })?
+            .map_err(api_error)
+        })?;
+        Ok(Snapshot::new(fluree, db))
+    }
+
+    /// Commit the staged writes as one commit; returns the `Commit` dict.
+    /// The transaction is closed afterwards, whether or not it committed.
+    #[pyo3(signature = (message = None))]
+    fn commit<'py>(
+        &self,
+        py: Python<'py>,
+        message: Option<String>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let txn = self.check_out()?;
+        let committed = block_on(py, async move {
+            InRuntime::into_inner(*txn)
+                .commit(commit_opts(message))
+                .await
+        });
+        *self.lock() = State::Closed;
+        let receipt = committed?.map_err(api_error)?.receipt;
+        receipt_to_py(py, &receipt)
+    }
+
+    /// Discard the staged writes.
+    fn rollback(&self) -> PyResult<()> {
+        drop(self.check_out()?);
+        *self.lock() = State::Closed;
+        Ok(())
+    }
+}

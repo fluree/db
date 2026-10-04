@@ -18,7 +18,7 @@ JSON-LD or Turtle and query it with SPARQL or JSON-LD::
             print(name, age)
 """
 
-from fluree._connection import Connection, Ledger, QueryProfile, Snapshot, connect
+from fluree._connection import Connection, Ledger, QueryProfile, Snapshot, Transaction, connect
 from fluree._records import (
     Branch,
     Change,
@@ -70,6 +70,7 @@ __all__ = [
     "RowStream",
     "Rows",
     "Snapshot",
+    "Transaction",
     "__version__",
     "connect",
 ]

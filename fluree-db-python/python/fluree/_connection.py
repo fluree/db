@@ -220,21 +220,39 @@ class Ledger:
             raise InvalidRequestError("with_policy needs at least one policy option")
         return Ledger(self._connection, self._id, {**(self._policy or {}), **opts})
 
-    def insert(self, data: Data, *, format: Format | None = None) -> Commit:
+    def insert(self, data: Data, *, format: Format | None = None, message: str | None = None) -> Commit:
         """Add data: JSON-LD (a dict, list, or JSON text), Turtle, or TriG.
 
         A path is read as a file, its format taken from the extension unless
-        ``format`` is given.
+        ``format`` is given. ``message`` is recorded with the commit, and
+        :meth:`log` shows it.
         """
-        return self._transact("insert", *_rdf_payload(data, format))
+        return self._transact("insert", *_rdf_payload(data, format), message)
 
-    def upsert(self, data: Data, *, format: Format | None = None) -> Commit:
+    def upsert(self, data: Data, *, format: Format | None = None, message: str | None = None) -> Commit:
         """Add data, replacing existing values of the properties it sets."""
-        return self._transact("upsert", *_rdf_payload(data, format))
+        return self._transact("upsert", *_rdf_payload(data, format), message)
 
-    def update(self, transaction: str | dict[str, Any] | os.PathLike[str]) -> Commit:
+    def update(
+        self, transaction: str | dict[str, Any] | os.PathLike[str], *, message: str | None = None
+    ) -> Commit:
         """Apply a SPARQL UPDATE, or a JSON-LD ``where``/``delete``/``insert``."""
-        return self._transact("update", *_update_payload(transaction))
+        return self._transact("update", *_update_payload(transaction), message)
+
+    def transaction(self, *, message: str | None = None) -> Transaction:
+        """Open a :class:`Transaction`: several writes, each seeing the ones
+        before it, committed together as one commit, with ``message``.
+
+        Use it as a context manager to commit on a clean exit and roll back
+        on an exception::
+
+            with ledger.transaction(message="onboard bob") as txn:
+                txn.insert(...)
+                txn.update(...)
+            txn.committed  # the Commit
+        """
+        native = self._connection._native.begin(self._id, self._policy)
+        return Transaction(self, native, message)
 
     def query(self, query: Query, *, max_fuel: float | None = None, timeout: float | None = None) -> Any:
         """Query the latest state. See :meth:`Snapshot.query` for results,
@@ -573,9 +591,9 @@ class Ledger:
         """Ledger metadata and statistics."""
         return self._connection._native.info(self._id)
 
-    def _transact(self, op: str, kind: str, payload: Any) -> Commit:
-        commit = self._connection._native.transact(self._id, op, kind, payload, self._policy)
-        return Commit(**commit)
+    def _transact(self, op: str, kind: str, payload: Any, message: str | None) -> Commit:
+        native = self._connection._native
+        return Commit(**native.transact(self._id, op, kind, payload, self._policy, message))
 
     def _govern(self, query: Any) -> Any:
         """Fold this handle's policy into a JSON-LD query's ``opts``. Options the
@@ -668,6 +686,83 @@ class Snapshot:
         if sparql:
             return self._native.query_sparql(query, controls)
         return self._native.query_jsonld(query, controls)
+
+
+class Transaction:
+    """Writes staged one at a time and committed together as one commit.
+
+    Get one from :meth:`Ledger.transaction`. Each write applies over the ones
+    before it — an ``update``'s ``WHERE`` sees an earlier ``insert`` — and is
+    checked as it is staged, so a write that is invalid or that policy does
+    not allow raises at once and is left out; the transaction carries on
+    without it. Queries on the transaction read the staged state; nothing is
+    visible on the ledger until :meth:`commit`.
+
+    A fact that one write adds and a later one removes (or the reverse) is
+    left out of the commit, so the commit holds only the net change. The
+    writes stage against the ledger as it was when the transaction began; if
+    another commit lands first, they are staged again on top of it.
+
+    As a context manager it commits on a clean exit and rolls back on an
+    exception; :attr:`committed` holds the resulting :class:`Commit`.
+    """
+
+    __slots__ = ("_ledger", "_message", "_native", "committed")
+
+    def __init__(self, ledger: Ledger, native: _fluree.Transaction, message: str | None) -> None:
+        self._ledger = ledger
+        self._native = native
+        self._message = message
+        self.committed: Commit | None = None
+
+    def __repr__(self) -> str:
+        state = "open" if self._native.is_open else "closed"
+        return f"<Transaction {self._native.ledger!r} {state}>"
+
+    def __enter__(self) -> Transaction:
+        return self
+
+    def __exit__(self, exc_type: object, *exc: object) -> None:
+        if not self._native.is_open:
+            return
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+
+    def insert(self, data: Data, *, format: Format | None = None) -> None:
+        """Stage an insert; see :meth:`Ledger.insert`."""
+        self._native.stage("insert", *_rdf_payload(data, format))
+
+    def upsert(self, data: Data, *, format: Format | None = None) -> None:
+        """Stage an upsert; see :meth:`Ledger.upsert`."""
+        self._native.stage("upsert", *_rdf_payload(data, format))
+
+    def update(self, transaction: str | dict[str, Any] | os.PathLike[str]) -> None:
+        """Stage an update; see :meth:`Ledger.update`."""
+        self._native.stage("update", *_update_payload(transaction))
+
+    def query(self, query: Query, *, max_fuel: float | None = None, timeout: float | None = None) -> Any:
+        """Query the staged state; see :meth:`Snapshot.query`."""
+        return self._view().query(query, max_fuel=max_fuel, timeout=timeout)
+
+    def explain(self, query: Query) -> dict[str, Any]:
+        """The plan ``query`` would run with over the staged state."""
+        return self._view().explain(query)
+
+    def commit(self, *, message: str | None = None) -> Commit:
+        """Commit the staged writes as one commit, recording ``message`` (by
+        default the one the transaction was opened with). The transaction is
+        closed afterwards, even if the commit fails."""
+        self.committed = Commit(**self._native.commit(message or self._message))
+        return self.committed
+
+    def rollback(self) -> None:
+        """Discard the staged writes and close the transaction."""
+        self._native.rollback()
+
+    def _view(self) -> Snapshot:
+        return Snapshot(self._native.snapshot(), self._ledger)
 
 
 @dataclass(frozen=True, slots=True)

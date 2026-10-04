@@ -139,7 +139,12 @@ impl<T> InRuntime<T> {
     }
 
     pub(crate) fn get_mut(&mut self) -> &mut T {
-        self.0.as_mut().expect("taken only by drop")
+        self.0.as_mut().expect("taken only by into_inner or drop")
+    }
+
+    /// The value, for a caller that will drop it inside the runtime itself.
+    pub(crate) fn into_inner(mut self) -> T {
+        self.0.take().expect("taken only by into_inner or drop")
     }
 }
 
@@ -147,7 +152,7 @@ impl<T> Deref for InRuntime<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        self.0.as_ref().expect("taken only by drop")
+        self.0.as_ref().expect("taken only by into_inner or drop")
     }
 }
 

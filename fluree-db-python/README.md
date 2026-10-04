@@ -40,6 +40,24 @@ with fluree.connect("./data") as conn:          # or fluree.connect(":memory:")
 - `insert(data)` and `upsert(data)` take JSON-LD (a dict, list, or JSON text),
   Turtle or TriG text, or a path to a file.
 - `update(txn)` takes SPARQL UPDATE, or JSON-LD `where`/`delete`/`insert`.
+- `message=` on any of them is recorded with the commit; `ledger.log()` shows
+  it.
+
+To make several writes one commit, use a transaction. Each write applies over
+the ones before it and is checked as it is staged; queries on the transaction
+read the staged state, which no one else sees until it commits:
+
+```python
+with people.transaction(message="onboard bob") as txn:
+    txn.insert({...})
+    txn.update("DELETE { ... } INSERT { ... } WHERE { ... }")   # sees the insert
+    txn.query("SELECT ...")
+print(txn.committed)     # the Commit; an exception in the block rolls back
+```
+
+A write that fails (bad syntax, denied by policy, a SHACL violation) raises at
+once and is left out. The commit holds only the net change, and if another
+commit lands first, the writes are staged again on top of it.
 
 ## Querying
 

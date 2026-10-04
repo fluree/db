@@ -12,14 +12,19 @@ use crate::error::{api_error, fluree_error, invalid_request, not_found};
 use crate::query::{execute, Controls};
 use crate::runtime::{block_on, enter, runtime, InRuntime};
 use crate::stream::{RowStream, CHANNEL_DEPTH};
+use crate::transaction::Transaction;
+use fluree_db_api::CommitOpts;
 use fluree_db_api::{
-    build_transact_policy_context, export::ExportFormat, ApiError, CommitDetail, CommitRef,
-    DataSetDb, DropMode, Fluree, FlureeBuilder, FormatterConfig, GovernanceOptions, GraphDb,
-    GraphSnapshotQueryBuilder, OwnedStreamQuery, ParsedContext, QueryCancellation,
-    QueryExecutionOptions, TimeSpec, Tracker,
+    build_transact_policy_context, export::ExportFormat, ApiError, CommitDetail, CommitReceipt,
+    CommitRef, DataSetDb, DropMode, Fluree, FlureeBuilder, FormatterConfig, GovernanceOptions,
+    GraphDb, GraphSnapshotQueryBuilder, OwnedStreamQuery, ParsedContext, PolicyContext,
+    QueryCancellation, QueryExecutionOptions, TimeSpec, Tracker, TxnOperation,
 };
+use fluree_db_core::commit::{TxnMetaEntry, TxnMetaValue};
 use fluree_db_core::ledger_id::normalize_ledger_id;
 use fluree_db_core::ContentId;
+
+use fluree_vocab::namespaces::FLUREE_DB;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use serde_json::Value as JsonValue;
@@ -30,18 +35,78 @@ pub(crate) struct Connection {
     fluree: InRuntime<Fluree>,
 }
 
-/// A transaction body: JSON-LD, or text (Turtle/TriG for insert and upsert,
-/// SPARQL UPDATE for update).
-enum Payload {
-    Json(JsonValue),
-    Text(String),
+/// A write from its operation (`insert`, `upsert`, `update`) and payload
+/// format: `"jsonld"` (a JSON-able object), `"turtle"` (insert and upsert),
+/// or `"sparql"` (update).
+pub(crate) fn operation(
+    op: &str,
+    kind: &str,
+    payload: &Bound<'_, PyAny>,
+) -> PyResult<TxnOperation> {
+    Ok(match (op, kind) {
+        ("insert", "jsonld") => TxnOperation::Insert(to_json(payload)?),
+        ("upsert", "jsonld") => TxnOperation::Upsert(to_json(payload)?),
+        ("update", "jsonld") => TxnOperation::Update(to_json(payload)?),
+        ("insert", "turtle") => TxnOperation::InsertTurtle(payload.extract()?),
+        ("upsert", "turtle") => TxnOperation::UpsertTurtle(payload.extract()?),
+        ("update", "sparql") => TxnOperation::SparqlUpdate(payload.extract()?),
+        ("insert" | "upsert" | "update", other) => {
+            return Err(invalid_request(format!(
+                "{other:?} is not a valid format for this operation"
+            )))
+        }
+        (other, _) => return Err(invalid_request(format!("unknown operation {other:?}"))),
+    })
 }
 
-#[derive(Clone, Copy)]
-enum Op {
-    Insert,
-    Upsert,
-    Update,
+/// Commit options carrying `message` as the commit's `f:message`.
+pub(crate) fn commit_opts(message: Option<String>) -> CommitOpts {
+    let opts = CommitOpts::default();
+    match message {
+        Some(message) => opts.with_txn_meta(vec![TxnMetaEntry::new(
+            FLUREE_DB,
+            "message",
+            TxnMetaValue::string(message),
+        )]),
+        None => opts,
+    }
+}
+
+/// The policy context a governed write is checked against.
+pub(crate) async fn write_policy(
+    fluree: &Fluree,
+    ledger: &str,
+    policy: Option<&GovernanceOptions>,
+) -> fluree_db_api::Result<Option<PolicyContext>> {
+    let Some(opts) = policy else {
+        return Ok(None);
+    };
+    let state = fluree.ledger(ledger).await?;
+    build_transact_policy_context(
+        fluree,
+        &state.snapshot,
+        state.novelty.as_ref(),
+        Some(state.novelty.as_ref()),
+        state.t(),
+        opts,
+    )
+    .await
+}
+
+/// The receipt of a write, as the dict `fluree.Commit` is built from.
+pub(crate) fn receipt_to_py<'py>(
+    py: Python<'py>,
+    receipt: &CommitReceipt,
+) -> PyResult<Bound<'py, PyDict>> {
+    let commit = PyDict::new(py);
+    commit.set_item("t", receipt.t)?;
+    // A transaction that changes nothing writes no commit.
+    let written = receipt.flake_count > 0;
+    commit.set_item("id", written.then(|| receipt.commit_id.to_string()))?;
+    commit.set_item("digest", written.then(|| receipt.commit_id.digest_hex()))?;
+    commit.set_item("asserts", receipt.assert_count)?;
+    commit.set_item("retracts", receipt.retract_count)?;
+    Ok(commit)
 }
 
 fn canonical(ledger: &str) -> PyResult<String> {
@@ -252,9 +317,9 @@ impl Connection {
         branch::revert_preview(py, &self.fluree, &canonical(ledger)?, commits, options)
     }
 
-    /// Commit a transaction. `kind` is `"jsonld"` (payload: a JSON-able
-    /// object), `"turtle"` (insert/upsert), or `"sparql"` (update).
-    #[pyo3(signature = (ledger, op, kind, payload, policy = None))]
+    /// Commit one write; see [`operation`] for `op`, `kind` and `payload`.
+    #[pyo3(signature = (ledger, op, kind, payload, policy = None, message = None))]
+    #[allow(clippy::too_many_arguments)]
     fn transact<'py>(
         &self,
         py: Python<'py>,
@@ -263,54 +328,25 @@ impl Connection {
         kind: &str,
         payload: &Bound<'py, PyAny>,
         policy: Option<&Bound<'py, PyAny>>,
+        message: Option<String>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let id = canonical(ledger)?;
         let policy = governance(policy)?;
-        let op = match op {
-            "insert" => Op::Insert,
-            "upsert" => Op::Upsert,
-            "update" => Op::Update,
-            other => return Err(invalid_request(format!("unknown operation {other:?}"))),
-        };
-        let payload = match (op, kind) {
-            (_, "jsonld") => Payload::Json(to_json(payload)?),
-            (Op::Insert | Op::Upsert, "turtle") | (Op::Update, "sparql") => {
-                Payload::Text(payload.extract()?)
-            }
-            (_, other) => {
-                return Err(invalid_request(format!(
-                    "{other:?} is not a valid format for this operation"
-                )))
-            }
-        };
-
+        let operation = operation(op, kind, payload)?;
         let fluree = &*self.fluree;
         let receipt = block_on(py, async {
-            let policy = match &policy {
-                Some(opts) => {
-                    let state = fluree.ledger(&id).await?;
-                    build_transact_policy_context(
-                        fluree,
-                        &state.snapshot,
-                        state.novelty.as_ref(),
-                        Some(state.novelty.as_ref()),
-                        state.t(),
-                        opts,
-                    )
-                    .await?
-                }
-                None => None,
-            };
+            let policy = write_policy(fluree, &id, policy.as_ref()).await?;
             let graph = fluree.graph(&id);
             let tx = graph.transact();
-            let tx = match (op, &payload) {
-                (Op::Insert, Payload::Json(v)) => tx.insert(v),
-                (Op::Insert, Payload::Text(s)) => tx.insert_turtle(s),
-                (Op::Upsert, Payload::Json(v)) => tx.upsert(v),
-                (Op::Upsert, Payload::Text(s)) => tx.upsert_turtle(s),
-                (Op::Update, Payload::Json(v)) => tx.update(v),
-                (Op::Update, Payload::Text(s)) => tx.sparql_update(s),
+            let tx = match &operation {
+                TxnOperation::Insert(v) => tx.insert(v),
+                TxnOperation::InsertTurtle(s) => tx.insert_turtle(s),
+                TxnOperation::Upsert(v) => tx.upsert(v),
+                TxnOperation::UpsertTurtle(s) => tx.upsert_turtle(s),
+                TxnOperation::Update(v) => tx.update(v),
+                TxnOperation::SparqlUpdate(s) => tx.sparql_update(s),
             };
+            let tx = tx.commit_opts(commit_opts(message));
             let tx = match policy {
                 Some(ctx) => tx.policy(ctx),
                 None => tx,
@@ -318,16 +354,19 @@ impl Connection {
             tx.commit().await.map(|out| out.receipt)
         })?
         .map_err(api_error)?;
+        receipt_to_py(py, &receipt)
+    }
 
-        let commit = PyDict::new(py);
-        commit.set_item("t", receipt.t)?;
-        // A transaction that changes nothing writes no commit.
-        let written = receipt.flake_count > 0;
-        commit.set_item("id", written.then(|| receipt.commit_id.to_string()))?;
-        commit.set_item("digest", written.then(|| receipt.commit_id.digest_hex()))?;
-        commit.set_item("asserts", receipt.assert_count)?;
-        commit.set_item("retracts", receipt.retract_count)?;
-        Ok(commit)
+    /// Open a transaction on `ledger`; its writes are checked against
+    /// `policy` and its reads filtered by it.
+    #[pyo3(signature = (ledger, policy = None))]
+    fn begin(
+        &self,
+        py: Python<'_>,
+        ledger: &str,
+        policy: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Transaction> {
+        Transaction::begin(py, &self.fluree, &canonical(ledger)?, governance(policy)?)
     }
 
     #[pyo3(signature = (ledger, sparql, at = None, policy = None, controls = None))]
@@ -712,6 +751,15 @@ fn commit_detail_to_py<'py>(
 pub(crate) struct Snapshot {
     fluree: InRuntime<Fluree>,
     db: InRuntime<GraphDb>,
+}
+
+impl Snapshot {
+    pub(crate) fn new(fluree: &Fluree, db: GraphDb) -> Self {
+        Self {
+            fluree: InRuntime::new(fluree.clone()),
+            db: InRuntime::new(db),
+        }
+    }
 }
 
 #[pymethods]

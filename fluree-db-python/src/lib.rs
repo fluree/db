@@ -22,6 +22,7 @@ mod error;
 mod query;
 mod runtime;
 mod stream;
+mod transaction;
 
 use pyo3::prelude::*;
 
@@ -31,5 +32,6 @@ fn _fluree(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<connection::Connection>()?;
     m.add_class::<connection::Snapshot>()?;
     m.add_class::<stream::RowStream>()?;
+    m.add_class::<transaction::Transaction>()?;
     Ok(())
 }
