@@ -1539,6 +1539,7 @@ async fn dry_run_sync(
     let opts = fluree_db_api::SyncGraphOpts {
         dry_run: true,
         allow_empty,
+        ..Default::default()
     };
     let report = state
         .fluree
