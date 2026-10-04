@@ -9,6 +9,9 @@ use serde_json::{json, Value};
 const PREFIX: &str = "PREFIX ex: <http://example.org/> ";
 const EVENT: &str = "batched wildcard join engaged";
 
+/// The fast-path switch is process-global: tests that flip it run one at a time.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Clone, Copy, Debug)]
 enum Routing {
     MustFire,
@@ -79,6 +82,7 @@ fn normalized(result: &Value) -> Vec<String> {
 #[tokio::test(flavor = "current_thread")]
 async fn wildcard_joins_preserve_facts_multiplicity_and_fallbacks() {
     assert!(std::env::var_os("FLUREE_DISABLE_QUERY_FAST_PATHS").is_none());
+    let _serial = SERIAL.lock().await;
     let _reset = Reset;
     let dir = tempfile::tempdir().unwrap();
     let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
@@ -449,6 +453,7 @@ async fn wildcard_joins_preserve_facts_multiplicity_and_fallbacks() {
 async fn wildcard_join_benchmark() {
     use std::fmt::Write;
     use std::time::Instant;
+    let _serial = SERIAL.lock().await;
     let _reset = Reset;
     let dir = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
@@ -524,6 +529,7 @@ async fn wildcard_join_benchmark() {
 /// scan; the ref keys beside them still batch.
 #[tokio::test(flavor = "current_thread")]
 async fn wildcard_incoming_probe_leaves_term_keys_to_the_scan() {
+    let _serial = SERIAL.lock().await;
     let _reset = Reset;
     let dir = tempfile::tempdir().unwrap();
     let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
