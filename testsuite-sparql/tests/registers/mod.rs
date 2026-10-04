@@ -557,3 +557,123 @@ pub const RDF12_TURTLE_EVAL: &[&str] = &[
     "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-annotation-04",
     "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-reified-triples-annotation-01",
 ];
+
+pub const RDF12_NTRIPLES: &[&str] = &[
+    // N-Triples is read by the Turtle parser (the `.nt` ingest path), which
+    // accepts these as Turtle: relative IRIs, directives, `,` object lists,
+    // numeric and long-string shorthands, `<< >>` reified triples and
+    // annotations (21)
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-uri-06",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-uri-07",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-uri-08",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-uri-09",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-prefix-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-base-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-struct-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-string-02",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-string-03",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-string-04",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-string-05",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-num-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-num-02",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-num-03",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-triples/syntax#ntriples12-bad-09",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-triples/syntax#ntriples12-bad-iri-1",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-triples/syntax#ntriples12-bad-reified-1",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-triples/syntax#ntriples12-bad-reified-2",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-triples/syntax#ntriples12-bad-reified-3",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-triples/syntax#ntriples12-bnode-bad-annotated-syntax-1",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-triples/syntax#ntriples12-bnode-bad-annotated-syntax-2",
+    // ill-formed literals the Turtle grammar admits: an explicit
+    // `^^rdf:langString` / `^^rdf:dirLangString`, and an over-long BCP 47
+    // primary subtag (3)
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-triples/syntax#ntriples-langdir-bad-3",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-triples/syntax#ntriples-langdir-bad-4",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-triples/syntax#ntriples-langdir-bad-5",
+];
+
+pub const RDF12_NQUADS: &[&str] = &[
+    // blank-node graph labels are refused on import (6)
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nq-syntax-bnode-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nq-syntax-bnode-02",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nq-syntax-bnode-03",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nq-syntax-bnode-04",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nq-syntax-bnode-05",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nq-syntax-bnode-06",
+    // `nquads_to_trig` hands each line to the Turtle parser, which accepts
+    // these as Turtle: a relative graph IRI, a directive, numeric and
+    // long-string shorthands (9)
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nq-syntax-bad-uri-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nt-syntax-bad-prefix-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nt-syntax-bad-string-02",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nt-syntax-bad-string-03",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nt-syntax-bad-string-04",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nt-syntax-bad-string-05",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nt-syntax-bad-num-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nt-syntax-bad-num-02",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nt-syntax-bad-num-03",
+];
+
+pub const RDF12_TRIG: &[&str] = &[
+    // the named-graph block parser (`parse_trig_phase1`, behind TriG insert
+    // and import) has no `[ … ]` property lists, `[]`, collections, repeated
+    // `;` or bare `<< … >> .` statements; default-graph content goes through
+    // the full Turtle parser and has all of them (32)
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#sole_blankNodePropertyList",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#blankNodePropertyList_as_subject",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#blankNodePropertyList_with_multiple_triples",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#nested_blankNodePropertyLists",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#blankNodePropertyList_containing_collection",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#blankNodePropertyList_as_object",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#blankNodePropertyList_as_object_containing_objectList",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#blankNodePropertyList_as_object_containing_objectList_of_two_objects",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#predicateObjectList_with_blankNodePropertyList_as_object",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#anonymous_blank_node_subject",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#anonymous_blank_node_object",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#collection_subject",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#collection_object",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#nested_collection",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#empty_collection",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#first",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#last",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#repeated_semis_at_end",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#repeated_semis_not_at_end",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-subm-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-subm-05",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-subm-06",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-subm-08",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-subm-09",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-subm-10",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-subm-14",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-trig/eval#trig12-annotation-02",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-trig/syntax#trig12-4",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-trig/syntax#trig12-ann-2",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-trig/syntax#trig12-bnode-3",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-trig/syntax#trig12-inside-1",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-trig/syntax#trig12-inside-2",
+    // blank-node graph labels (`_:g { }`, `[] { }`) are refused (6)
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#labeled_blank_node_graph",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#alternating_bnode_graphs",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#anonymous_blank_node_graph",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-syntax-minimal-whitespace-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-kw-graph-06",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-kw-graph-07",
+    // numeric literals are canonicalized on ingest; the expected graphs keep
+    // the source lexical form (as in RDF11_TURTLE) (7)
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#bareword_double",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#double_lower_case_e",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#positive_numeric",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#numeric_with_leading_0",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-subm-11",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-subm-19",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-subm-20",
+    // lexer, as in RDF11_TURTLE: `\u` escapes in IRIREF that decode to
+    // forbidden characters are accepted (3); PN_LOCAL with interior dots (1)
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-eval-bad-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-eval-bad-02",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-eval-bad-03",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-syntax-ln-dots",
+    // annotation-of-annotation, deferred as in RDF12_TURTLE_EVAL (2)
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-trig/eval#trig12-annotation-04",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-trig/eval#trig12-reified-triples-annotation-01",
+];

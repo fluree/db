@@ -1,9 +1,11 @@
-//! W3C RDF (Turtle) test suite registration.
+//! W3C RDF test suite registration.
 //!
 //! Runs the vendored `rdf-tests` RDF 1.1 and RDF 1.2 Turtle manifests
 //! through the Turtle parser on the `GraphCollectorSink` path — the parser
 //! behind `parse_to_json`, i.e. the conversion every JSON-LD write path
-//! (upsert, graph sync, memory import) uses for Turtle input. Same contract
+//! (upsert, graph sync, memory import) uses for Turtle input — and the RDF
+//! 1.2 N-Triples, N-Quads and TriG manifests (each including its RDF 1.1
+//! suite) through the parsers their ingest paths use. Same contract
 //! as `w3c_sparql.rs`: a suite is green when every test passes or appears in
 //! its register, and `check_testsuite` polices the register both ways.
 
@@ -38,5 +40,32 @@ fn rdf12_turtle_eval() -> Result<()> {
     check_testsuite(
         "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval/manifest.ttl",
         reg::RDF12_TURTLE_EVAL,
+    )
+}
+
+/// RDF 1.2 N-Triples (with RDF 1.1): syntax and canonical form.
+#[test]
+fn rdf12_ntriples() -> Result<()> {
+    check_testsuite(
+        "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-triples/manifest.ttl",
+        reg::RDF12_NTRIPLES,
+    )
+}
+
+/// RDF 1.2 N-Quads (with RDF 1.1): syntax and canonical form.
+#[test]
+fn rdf12_nquads() -> Result<()> {
+    check_testsuite(
+        "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-quads/manifest.ttl",
+        reg::RDF12_NQUADS,
+    )
+}
+
+/// RDF 1.2 TriG (with RDF 1.1): syntax and evaluation.
+#[test]
+fn rdf12_trig() -> Result<()> {
+    check_testsuite(
+        "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-trig/manifest.ttl",
+        reg::RDF12_TRIG,
     )
 }

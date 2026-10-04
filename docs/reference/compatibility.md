@@ -39,8 +39,9 @@ N-Quads files. As in RDF 1.2, only the annotation syntax asserts the triple;
 `<< s p o >>` and `rdf:reifies <<( s p o )>>` reify it without asserting it.
 The `VERSION "1.2"` / `@version`
 directive and `--ltr` / `--rtl` base-direction language tags are accepted.
-The vendored W3C RDF 1.1 and RDF 1.2 Turtle suites run in CI
-(`testsuite-sparql/tests/w3c_rdf.rs`), with known gaps in the skip register.
+The vendored W3C RDF 1.1 and RDF 1.2 Turtle, N-Triples, N-Quads and TriG
+suites run in CI (`testsuite-sparql/tests/w3c_rdf.rs`), with known gaps in the
+skip register.
 
 Not yet supported:
 - Annotation-of-annotation (a `{| ... |}` or `<< ... >>` inside an annotation body)
@@ -485,7 +486,7 @@ Export Fluree data to:
 - SPARQL 1.1 Federation: remote `SERVICE` endpoints (local-ledger `SERVICE` is supported)
 - Remote `LOAD` in SPARQL UPDATE
 - GeoSPARQL: remaining OGC functions (only `geof:distance` is implemented today)
-- RDF 1.2 / SPARQL 1.2: annotation-of-annotation; a `GRAPH ?g` name written as an INSERT template object
+- RDF 1.2 / SPARQL 1.2: annotation-of-annotation
 
 **Storage:**
 - Additional cloud providers (GCP, Azure)

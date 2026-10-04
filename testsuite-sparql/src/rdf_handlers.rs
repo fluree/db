@@ -15,6 +15,12 @@
 //! valid Turtle document. Negative N-Triples tests can legitimately be valid
 //! Turtle (prefixed names, `a`, numeric shorthands); such entries belong in
 //! the suite's skip register with that reason.
+//!
+//! TriG documents parse the way TriG ingest parses them ([`trig_dataset`]),
+//! and N-Quads documents are first regrouped into TriG by
+//! `nquads_to_trig`, as bulk import does. Canonicalization (C14N) tests
+//! write the parsed document back with the N-Triples / N-Quads writer that
+//! serves CONSTRUCT results and compare it with the canonical form.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -27,9 +33,10 @@ use crate::files::read_file_to_string;
 use crate::manifest::Test;
 use crate::result_comparison::{are_results_isomorphic, format_results_diff};
 use crate::result_format::{
-    ir_term_to_rdf_term, reification_triples, RdfTerm, SparqlResults, Triple,
+    ir_term_to_rdf_term, reification_triples, trig_dataset, RdfTerm, SparqlResults, Triple,
 };
 use crate::vocab::rdft;
+use fluree_graph_ir::Dataset;
 
 const RDF_FIRST: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#first";
 const RDF_REST: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest";
@@ -49,6 +56,152 @@ pub fn register_rdf_tests(evaluator: &mut TestEvaluator) {
         rdft::TEST_NTRIPLES_NEGATIVE_SYNTAX,
         evaluate_negative_syntax,
     );
+    evaluator.register(rdft::TEST_NTRIPLES_POSITIVE_C14N, evaluate_ntriples_c14n);
+    evaluator.register(rdft::TEST_NQUADS_POSITIVE_SYNTAX, |t| {
+        positive_dataset_syntax(t, nquads_dataset)
+    });
+    evaluator.register(rdft::TEST_NQUADS_NEGATIVE_SYNTAX, |t| {
+        negative_dataset_syntax(t, nquads_dataset)
+    });
+    evaluator.register(rdft::TEST_NQUADS_POSITIVE_C14N, evaluate_nquads_c14n);
+    evaluator.register(rdft::TEST_TRIG_POSITIVE_SYNTAX, |t| {
+        positive_dataset_syntax(t, trig_action)
+    });
+    evaluator.register(rdft::TEST_TRIG_NEGATIVE_SYNTAX, |t| {
+        negative_dataset_syntax(t, trig_action)
+    });
+    evaluator.register(rdft::TEST_TRIG_NEGATIVE_EVAL, |t| {
+        negative_dataset_syntax(t, trig_action)
+    });
+    evaluator.register(rdft::TEST_TRIG_EVAL, evaluate_trig_eval);
+}
+
+/// A TriG action, relative IRIs resolved against its manifest URL.
+fn trig_action(url: &str) -> Result<Dataset> {
+    let content = read_file_to_string(url).with_context(|| format!("Reading {url}"))?;
+    trig_dataset(&format!("@base <{url}> .\n{content}"))
+}
+
+/// An N-Quads document, regrouped into TriG as bulk import does.
+fn nquads_dataset(url: &str) -> Result<Dataset> {
+    let content = read_file_to_string(url).with_context(|| format!("Reading {url}"))?;
+    let trig =
+        fluree_db_transact::parse::nquads_to_trig(&content).map_err(|e| anyhow::anyhow!("{e}"))?;
+    trig_dataset(&trig)
+}
+
+fn positive_dataset_syntax(test: &Test, parse: fn(&str) -> Result<Dataset>) -> Result<()> {
+    let url = action_url(test)?;
+    parse(url).map(|_| ()).with_context(|| {
+        format!(
+            "Positive syntax test failed — parser rejected a valid document.\n\
+             Test: {}\nFile: {url}",
+            test.id
+        )
+    })
+}
+
+fn negative_dataset_syntax(test: &Test, parse: fn(&str) -> Result<Dataset>) -> Result<()> {
+    let url = action_url(test)?;
+    ensure!(
+        parse(url).is_err(),
+        "Negative syntax test failed — parser accepted an invalid document.\n\
+         Test: {}\nFile: {url}",
+        test.id
+    );
+    Ok(())
+}
+
+/// `rdft:TestTrigEval`: the action's dataset against the expected N-Quads,
+/// graph by graph up to blank-node isomorphism.
+fn evaluate_trig_eval(test: &Test) -> Result<()> {
+    let url = action_url(test)?;
+    let result_url = test
+        .result
+        .as_deref()
+        .with_context(|| format!("{}: evaluation test has no mf:result", test.id))?;
+    let actual = trig_action(url).with_context(|| {
+        format!(
+            "Evaluation test failed — parser rejected the action document.\n\
+             Test: {}\nFile: {url}",
+            test.id
+        )
+    })?;
+    let expected = nquads_dataset(result_url).with_context(|| {
+        format!(
+            "Evaluation test failed — could not parse the expected dataset.\n\
+             Test: {}\nFile: {result_url}",
+            test.id
+        )
+    })?;
+    let names = |d: &Dataset| d.named.keys().map(ir_term_to_rdf_term).collect::<Vec<_>>();
+    let as_graphs = |d: &Dataset| {
+        std::iter::once(graph_to_rdf_triples(&d.default))
+            .chain(d.named.values().map(graph_to_rdf_triples))
+            .collect::<Vec<_>>()
+    };
+    let (expected_names, actual_names) = (names(&expected), names(&actual));
+    ensure!(
+        expected_names.len() == actual_names.len()
+            && expected_names
+                .iter()
+                .zip(&actual_names)
+                .all(|(e, a)| e == a
+                    || matches!((e, a), (RdfTerm::BlankNode(_), RdfTerm::BlankNode(_)))),
+        "Evaluation test failed — graph names differ.\nTest: {}\nFile: {url}\n\
+         expected {expected_names:?}\nactual {actual_names:?}",
+        test.id
+    );
+    for (expected, actual) in as_graphs(&expected).into_iter().zip(as_graphs(&actual)) {
+        let expected = SparqlResults::Graph(expected);
+        let actual = SparqlResults::Graph(actual);
+        if !are_results_isomorphic(&expected, &actual) {
+            bail!(
+                "Evaluation test failed — graphs differ.\nTest: {}\nFile: {url}\n{}",
+                test.id,
+                format_results_diff(&expected, &actual)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `rdft:TestNTriplesPositiveC14N`: the parsed document, written by the
+/// N-Triples writer, is the expected canonical form.
+fn evaluate_ntriples_c14n(test: &Test) -> Result<()> {
+    let url = action_url(test)?;
+    let graph = parse_action(url)?.into_graph();
+    let written =
+        fluree_graph_format::format_ntriples(&graph).map_err(|e| anyhow::anyhow!("{e}"))?;
+    compare_c14n(test, &written)
+}
+
+/// `rdft:TestNQuadsPositiveC14N`: as for N-Triples, with the N-Quads writer.
+fn evaluate_nquads_c14n(test: &Test) -> Result<()> {
+    let dataset = nquads_dataset(action_url(test)?)?;
+    let written =
+        fluree_graph_format::format_nquads(&dataset).map_err(|e| anyhow::anyhow!("{e}"))?;
+    compare_c14n(test, &written)
+}
+
+/// Canonical documents are sets of lines; their order is unspecified.
+fn compare_c14n(test: &Test, written: &str) -> Result<()> {
+    let result_url = test
+        .result
+        .as_deref()
+        .with_context(|| format!("{}: C14N test has no mf:result", test.id))?;
+    let expected = read_file_to_string(result_url)?;
+    let lines = |s: &str| {
+        let mut v: Vec<String> = s.lines().map(str::to_string).collect();
+        v.sort();
+        v
+    };
+    ensure!(
+        lines(&expected) == lines(written),
+        "C14N test failed — written form differs.\nTest: {}\nexpected:\n{expected}\nwritten:\n{written}",
+        test.id
+    );
+    Ok(())
 }
 
 /// Parse an action document from its manifest URL, resolving relative IRIs

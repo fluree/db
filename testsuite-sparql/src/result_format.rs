@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use anyhow::{bail, Context, Result};
-use fluree_graph_ir::{Graph as IrGraph, GraphCollectorSink, Term as IrTerm};
+use fluree_graph_ir::{Dataset as IrDataset, Graph as IrGraph, GraphCollectorSink, Term as IrTerm};
 use fluree_graph_turtle::parse as parse_turtle;
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -766,79 +766,81 @@ pub type ExpectedDataset = (Vec<Triple>, Vec<(String, Vec<Triple>)>);
 /// An expected-state file's default graph and named graphs. A `.trig` file
 /// names its graphs in `GRAPH` blocks; any other file is one default graph.
 pub fn parse_expected_dataset(url: &str) -> Result<ExpectedDataset> {
-    use fluree_db_transact::{RawObject, RawTerm};
     if !url.ends_with(".trig") {
         return Ok((parse_expected_graph(url)?, Vec::new()));
     }
     let content =
         read_file_to_string(url).with_context(|| format!("Reading expected graph file: {url}"))?;
-    let with_base = format!("@base <{url}> .\n{content}");
-    let phase1 = fluree_db_transact::parse_trig_phase1(&with_base)
-        .map_err(|e| anyhow::anyhow!("Parsing expected TriG {url}: {e}"))?;
-    let mut sink = GraphCollectorSink::new();
-    parse_turtle(&phase1.turtle, &mut sink)
-        .with_context(|| format!("Parsing expected graph: {url}"))?;
-    let default = graph_triples(&sink.into_graph());
+    let dataset = trig_dataset(&format!("@base <{url}> .\n{content}"))
+        .with_context(|| format!("Parsing expected TriG {url}"))?;
+    let named = dataset
+        .named
+        .iter()
+        .map(|(name, graph)| (term_label(name), graph_triples(graph)))
+        .collect();
+    Ok((graph_triples(&dataset.default), named))
+}
 
-    let mut named = Vec::new();
+fn term_label(term: &IrTerm) -> String {
+    match term {
+        IrTerm::Iri(iri) => iri.to_string(),
+        IrTerm::BlankNode(id) => format!("_:{}", id.as_str()),
+        other => format!("{other:?}"),
+    }
+}
+
+/// A TriG document as a dataset, parsed the way TriG ingest parses it: the
+/// default graph through the Turtle parser, `GRAPH` blocks through
+/// [`fluree_db_transact::parse_trig_phase1`].
+pub fn trig_dataset(input: &str) -> Result<IrDataset> {
+    use fluree_db_transact::{RawObject, RawTerm};
+    use fluree_graph_ir::Datatype;
+    let phase1 =
+        fluree_db_transact::parse_trig_phase1(input).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut sink = GraphCollectorSink::new();
+    parse_turtle(&phase1.turtle, &mut sink)?;
+    let mut dataset = IrDataset::new();
+    dataset.default = sink.into_graph();
+
     for block in &phase1.named_graphs {
-        let node = |term: &RawTerm| -> Result<RdfTerm> {
+        let node = |term: &RawTerm| -> Result<IrTerm> {
             Ok(match term {
                 RawTerm::Iri(iri) => match iri.strip_prefix("_:") {
-                    Some(label) => RdfTerm::BlankNode(label.to_string()),
-                    None => RdfTerm::Iri(iri.clone()),
+                    Some(label) => IrTerm::blank(label),
+                    None => IrTerm::iri(iri),
                 },
                 RawTerm::PrefixedName { prefix, local } => {
                     let ns = block
                         .prefixes
                         .get(prefix.as_str())
-                        .with_context(|| format!("undefined prefix {prefix}: in {url}"))?;
-                    RdfTerm::Iri(format!("{ns}{local}"))
+                        .with_context(|| format!("undefined prefix {prefix}:"))?;
+                    IrTerm::iri(format!("{ns}{local}"))
                 }
             })
         };
-        fn object(o: &RawObject, node: &dyn Fn(&RawTerm) -> Result<RdfTerm>) -> Result<RdfTerm> {
-            let typed = |value: String, dt: &str| RdfTerm::Literal {
-                value,
-                datatype: Some(format!("http://www.w3.org/2001/XMLSchema#{dt}")),
-                language: None,
-            };
+        fn object(o: &RawObject, node: &dyn Fn(&RawTerm) -> Result<IrTerm>) -> Result<IrTerm> {
             Ok(match o {
                 RawObject::Iri(iri) => node(&RawTerm::Iri(iri.clone()))?,
                 RawObject::PrefixedName { prefix, local } => node(&RawTerm::PrefixedName {
                     prefix: prefix.clone(),
                     local: local.clone(),
                 })?,
-                RawObject::String(s) => RdfTerm::Literal {
-                    value: s.clone(),
-                    datatype: None,
-                    language: None,
-                },
-                RawObject::Integer(n) => typed(n.to_string(), "integer"),
-                RawObject::Double(d) => typed(d.to_string(), "double"),
-                RawObject::Boolean(b) => typed(b.to_string(), "boolean"),
-                RawObject::TypedLiteral { value, datatype } => RdfTerm::Literal {
-                    value: value.clone(),
-                    datatype: Some(datatype.clone()),
-                    language: None,
-                },
-                RawObject::LangString { value, lang } => RdfTerm::Literal {
-                    value: value.clone(),
-                    datatype: None,
-                    language: Some(lang.clone()),
-                },
+                RawObject::String(s) => IrTerm::string(s),
+                RawObject::Integer(n) => IrTerm::integer(*n),
+                RawObject::Double(d) => IrTerm::double(*d),
+                RawObject::Boolean(b) => IrTerm::boolean(*b),
+                RawObject::TypedLiteral { value, datatype } => {
+                    IrTerm::typed(value, Datatype::from_iri(datatype))
+                }
+                RawObject::LangString { value, lang } => IrTerm::lang_string(value, lang),
                 RawObject::TripleTerm {
                     subject,
                     predicate,
                     object: o,
-                } => RdfTerm::Triple(Box::new(Triple {
-                    subject: node(subject)?,
-                    predicate: node(predicate)?,
-                    object: object(o, node)?,
-                })),
+                } => IrTerm::triple(node(subject)?, node(predicate)?, object(o, node)?),
             })
         }
-        let mut triples = Vec::new();
+        let graph = dataset.graph_mut(Some(&node(&RawTerm::Iri(block.iri.clone()))?));
         for t in &block.triples {
             let subject = node(
                 t.subject
@@ -847,24 +849,19 @@ pub fn parse_expected_dataset(url: &str) -> Result<ExpectedDataset> {
             )?;
             let predicate = node(&t.predicate)?;
             for o in &t.objects {
-                triples.push(Triple {
-                    subject: subject.clone(),
-                    predicate: predicate.clone(),
-                    object: object(o, &node)?,
-                });
+                graph.add_triple(subject.clone(), predicate.clone(), object(o, &node)?);
             }
         }
         for r in &block.reified {
-            triples.extend(reification_triples(
-                node(&r.reifier)?,
+            graph.add_reification(
                 node(&r.subject)?,
                 node(&r.predicate)?,
                 object(&r.object, &node)?,
-            ));
+                node(&r.reifier)?,
+            );
         }
-        named.push((block.iri.clone(), triples));
     }
-    Ok((default, named))
+    Ok(dataset)
 }
 
 /// `reifier`'s attachment to `(s, p, o)`: `reifier rdf:reifies <<( s p o )>>`.
