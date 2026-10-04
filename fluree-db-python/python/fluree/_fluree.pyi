@@ -23,6 +23,17 @@ class Connection:
     def ledgers(self) -> list[str]: ...
     def drop(self, ledger: str) -> None: ...
     def close(self) -> None: ...
+    def sync(
+        self,
+        ledger: str,
+        kind: str,
+        payload: Any,
+        graph: str | None = None,
+        allow_empty: bool = False,
+        dry_run: bool = False,
+        policy: dict[str, Any] | None = None,
+        message: str | None = None,
+    ) -> dict[str, Any]: ...
     def begin(self, ledger: str, policy: dict[str, Any] | None = None) -> Transaction: ...
     def transact(
         self,

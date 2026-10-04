@@ -13,13 +13,13 @@ use crate::query::{execute, Controls};
 use crate::runtime::{block_on, enter, runtime, InRuntime};
 use crate::stream::{RowStream, CHANNEL_DEPTH};
 use crate::transaction::Transaction;
-use fluree_db_api::CommitOpts;
 use fluree_db_api::{
     build_transact_policy_context, export::ExportFormat, ApiError, CommitDetail, CommitReceipt,
     CommitRef, DataSetDb, DropMode, Fluree, FlureeBuilder, FormatterConfig, GovernanceOptions,
     GraphDb, GraphSnapshotQueryBuilder, OwnedStreamQuery, ParsedContext, PolicyContext,
     QueryCancellation, QueryExecutionOptions, TimeSpec, Tracker, TxnOperation,
 };
+use fluree_db_api::{CommitOpts, GraphPayload, GraphSel, SyncGraphOpts, TxnOpts};
 use fluree_db_core::commit::{TxnMetaEntry, TxnMetaValue};
 use fluree_db_core::ledger_id::normalize_ledger_id;
 use fluree_db_core::ContentId;
@@ -38,6 +38,12 @@ pub(crate) struct Connection {
 /// A write from its operation (`insert`, `upsert`, `update`) and payload
 /// format: `"jsonld"` (a JSON-able object), `"turtle"` (insert and upsert),
 /// or `"sparql"` (update).
+/// A sync payload: JSON-LD, or Turtle / N-Triples / TriG text.
+enum Payload {
+    Json(JsonValue),
+    Text(String),
+}
+
 pub(crate) fn operation(
     op: &str,
     kind: &str,
@@ -355,6 +361,64 @@ impl Connection {
         })?
         .map_err(api_error)?;
         receipt_to_py(py, &receipt)
+    }
+
+    /// Make `graph` (the default graph when `None`) hold exactly `payload`,
+    /// committing only the difference. `kind` is `"jsonld"` or `"turtle"`
+    /// (Turtle, N-Triples or TriG text). A dry run commits nothing and
+    /// reports what the commit would hold.
+    #[pyo3(signature = (ledger, kind, payload, graph = None, allow_empty = false, dry_run = false, policy = None, message = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn sync<'py>(
+        &self,
+        py: Python<'py>,
+        ledger: &str,
+        kind: &str,
+        payload: &Bound<'py, PyAny>,
+        graph: Option<String>,
+        allow_empty: bool,
+        dry_run: bool,
+        policy: Option<&Bound<'py, PyAny>>,
+        message: Option<String>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let id = canonical(ledger)?;
+        let policy = governance(policy)?;
+        let payload = match kind {
+            "jsonld" => Payload::Json(to_json(payload)?),
+            "turtle" => Payload::Text(payload.extract()?),
+            other => return Err(invalid_request(format!("cannot sync {other:?} data"))),
+        };
+        let graph = match graph {
+            Some(iri) => GraphSel::Graph(iri),
+            None => GraphSel::Default,
+        };
+        let opts = SyncGraphOpts {
+            dry_run,
+            allow_empty,
+            message,
+        };
+        let fluree = &*self.fluree;
+        let report = block_on(py, async {
+            let policy = write_policy(fluree, &id, policy.as_ref()).await?;
+            let payload = match &payload {
+                Payload::Json(json) => GraphPayload::JsonLd(json),
+                Payload::Text(text) => GraphPayload::Rdf(text),
+            };
+            fluree
+                .sync_graph_with(&id, &graph, payload, opts, TxnOpts::default(), policy)
+                .await
+        })?
+        .map_err(api_error)?;
+        let commit = PyDict::new(py);
+        commit.set_item("t", report.t)?;
+        commit.set_item("id", report.commit_id.as_ref().map(ToString::to_string))?;
+        commit.set_item(
+            "digest",
+            report.commit_id.as_ref().map(ContentId::digest_hex),
+        )?;
+        commit.set_item("asserts", report.asserted)?;
+        commit.set_item("retracts", report.retracted)?;
+        Ok(commit)
     }
 
     /// Open a transaction on `ledger`; its writes are checked against

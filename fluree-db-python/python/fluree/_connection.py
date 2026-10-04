@@ -239,6 +239,36 @@ class Ledger:
         """Apply a SPARQL UPDATE, or a JSON-LD ``where``/``delete``/``insert``."""
         return self._transact("update", *_update_payload(transaction), message)
 
+    def sync(
+        self,
+        data: Data,
+        *,
+        graph: str | None = None,
+        format: Format | None = None,
+        allow_empty: bool = False,
+        dry_run: bool = False,
+        message: str | None = None,
+    ) -> Commit:
+        """Make a graph hold exactly ``data``, committing only the difference:
+        facts missing from ``data`` are retracted, new ones asserted, and
+        unchanged ones left alone. History keeps every earlier state.
+
+        ``graph`` is a named graph's IRI; by default the default graph is
+        synced. ``data`` is as for :meth:`insert`, and Turtle, N-Triples or
+        TriG text.
+
+        Empty ``data`` would clear the graph, so it is refused unless
+        ``allow_empty`` is set. With ``dry_run`` nothing is committed and the
+        returned :class:`Commit` (``id`` ``None``) counts what would change.
+        When ``data`` already matches, no commit is written either.
+        """
+        kind, payload = _rdf_payload(data, format)
+        native = self._connection._native
+        commit = native.sync(
+            self._id, kind, payload, graph, allow_empty, dry_run, self._policy, message
+        )
+        return Commit(**commit)
+
     def transaction(self, *, message: str | None = None) -> Transaction:
         """Open a :class:`Transaction`: several writes, each seeing the ones
         before it, committed together as one commit, with ``message``.

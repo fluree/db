@@ -42,6 +42,9 @@ with fluree.connect("./data") as conn:          # or fluree.connect(":memory:")
 - `update(txn)` takes SPARQL UPDATE, or JSON-LD `where`/`delete`/`insert`.
 - `message=` on any of them is recorded with the commit; `ledger.log()` shows
   it.
+- `sync(data, graph=None)` makes the default graph, or a named graph, hold
+  exactly `data`, committing only the difference; `dry_run=True` counts what
+  would change. Handy for mirroring an export from another system.
 
 To make several writes one commit, use a transaction. Each write applies over
 the ones before it and is checked as it is staged; queries on the transaction
