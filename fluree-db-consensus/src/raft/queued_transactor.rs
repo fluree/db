@@ -21,8 +21,8 @@
 
 use crate::raft::staged_receipt::AppliedReceipt;
 use crate::raft::state_machine::{
-    ApplyOutcome, ApplyRecord, BodyKind, Command as SmCommand, NameServiceState, PoisonRecord,
-    QueueSubmission, RefKey, Response as SmResponse,
+    ApplyOutcome, ApplyRecord, BodyKind, Command as SmCommand, NameServiceState, PoisonReason,
+    PoisonRecord, QueueSubmission, RefKey, Response as SmResponse,
 };
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::waiter::{AbortReason, WaitError, WaiterMap, WaiterOutcome};
@@ -911,8 +911,15 @@ fn failure_from_poison(record: &PoisonRecord) -> SubmissionError {
     // that need richer typing can use the body via the commit log;
     // the status route only promises pass/fail + identity.
     SubmissionError::Execution {
-        status: 422,
+        status: poison_status(&record.reason),
         message: format!("submission poisoned: {:?}", record.reason),
+    }
+}
+
+fn poison_status(reason: &PoisonReason) -> u16 {
+    match reason {
+        PoisonReason::PolicyViolation { .. } => 403,
+        _ => 422,
     }
 }
 
@@ -1205,7 +1212,7 @@ fn submission_error_from_abort(reason: AbortReason) -> SubmissionError {
                 .into(),
         },
         AbortReason::Poisoned(reason) => SubmissionError::Execution {
-            status: 422,
+            status: poison_status(&reason),
             message: format!("submission poisoned: {reason:?}"),
         },
     }
@@ -1360,6 +1367,27 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn policy_poison_maps_to_403_for_fresh_and_replayed_submissions() {
+        use crate::raft::state_machine::PoisonRecord;
+        use fluree_db_core::ContentKind;
+
+        let reason = PoisonReason::PolicyViolation {
+            error: "write refused".into(),
+        };
+        let fresh = submission_error_from_abort(AbortReason::Poisoned(reason.clone()));
+        let replayed = failure_from_poison(&PoisonRecord {
+            request_cid: ContentId::new(ContentKind::Commit, &[1]),
+            body_cid: ContentId::new(ContentKind::Commit, &[2]),
+            reason,
+            recorded_index: 1,
+            recorded_at_millis: 0,
+        });
+        assert_eq!(status(&fresh), 403);
+        assert_eq!(status(&replayed), 403);
+        assert_eq!(fresh.to_string(), replayed.to_string());
     }
 
     /// A poison replayed from the replicated idempotency map must

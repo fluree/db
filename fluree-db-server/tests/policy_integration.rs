@@ -1273,7 +1273,7 @@ fn modify_public_doc_content_body() -> JsonValue {
 }
 
 /// An employee bearer attempting to rewrite a public document's `ex:content`
-/// is denied by the required modify gate. The response is HTTP 400 and the
+/// is denied by the required modify gate. The response is HTTP 403 and the
 /// `error` field carries the custom `f:exMessage` verbatim.
 #[tokio::test]
 async fn employee_bearer_update_denied_with_ex_message() {
@@ -1305,9 +1305,11 @@ async fn employee_bearer_update_denied_with_ex_message() {
     let (status, json) = json_body(resp).await;
     assert_eq!(
         status,
-        StatusCode::BAD_REQUEST,
+        StatusCode::FORBIDDEN,
         "employee write must be rejected; got body: {json}"
     );
+    assert_eq!(json["status"], 403, "{json}");
+    assert_eq!(json["@type"], "err:policy/AccessDenied", "{json}");
     let err_msg = json
         .get("error")
         .and_then(|v| v.as_str())
@@ -1391,7 +1393,7 @@ async fn delegated_employee_write_enforces_modify_policy() {
     let (status, json) = json_body(resp).await;
     assert_eq!(
         status,
-        StatusCode::BAD_REQUEST,
+        StatusCode::FORBIDDEN,
         "delegated employee write must be rejected; got body: {json}"
     );
     let err_msg = json
@@ -1441,7 +1443,7 @@ async fn sparql_update_under_employee_bearer_denied() {
     let (status, json) = json_body(resp).await;
     assert_eq!(
         status,
-        StatusCode::BAD_REQUEST,
+        StatusCode::FORBIDDEN,
         "employee SPARQL UPDATE must be rejected; got body: {json}"
     );
     let err_msg = json
@@ -1676,7 +1678,7 @@ async fn cypher_write_under_employee_bearer_denied() {
     let (status, json) = json_body(resp).await;
     assert_eq!(
         status,
-        StatusCode::BAD_REQUEST,
+        StatusCode::FORBIDDEN,
         "employee Cypher SET must be rejected; got body: {json}"
     );
     let err_msg = json
@@ -2400,7 +2402,7 @@ async fn sparql_update_pragma_identity_enforces_modify_policy() {
 
     let employee = rewrite_doc1_content_sparql("http://example.org/employee-user");
     let (status, json) = sparql_update(app.clone(), "prag6:main", &employee, None).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
     assert!(
         json.to_string()
             .contains("Employees may not modify document content."),
@@ -2457,7 +2459,7 @@ async fn request_credential_sparql_update_pragma_cannot_replace_header_identity(
         "http://example.org/employee-user",
     ))
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "control: {json}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "control: {json}");
     assert!(
         json.to_string()
             .contains("Employees may not modify document content."),
