@@ -185,13 +185,26 @@ impl SequentialStager {
         tracker: Option<&Tracker>,
         advance: bool,
     ) -> Result<usize> {
+        self.stage_with(advance, |state| {
+            fluree.stage_transaction_from_txn(state, txn, index_config, policy, tracker)
+        })
+        .await
+    }
+
+    /// [`Self::stage`] for an operation staged by any staging entry point:
+    /// `stage` receives the virtual state and returns its [`StageResult`].
+    /// On an error the virtual state is gone; the stager must not be used
+    /// again.
+    pub(crate) async fn stage_with<F, Fut>(&mut self, advance: bool, stage: F) -> Result<usize>
+    where
+        F: FnOnce(LedgerState) -> Fut,
+        Fut: std::future::Future<Output = Result<StageResult>>,
+    {
         let state = self
             .current
             .take()
             .expect("virtual state consumed by a final non-advancing stage");
-        let result = fluree
-            .stage_transaction_from_txn(state, txn, index_config, policy, tracker)
-            .await?;
+        let result = stage(state).await?;
         // The staged delta, which includes graphs `GRAPH ?g` templates resolved
         // to; needed to advance the virtual state between operations.
         let graph_iris: Vec<String> = result.graph_delta.values().cloned().collect();

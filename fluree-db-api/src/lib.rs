@@ -104,6 +104,7 @@ pub(crate) mod runtime_dicts;
 pub mod server_defaults;
 pub(crate) mod sparql_lang;
 mod time_resolve;
+mod transaction;
 pub mod tx;
 pub mod tx_builder;
 #[cfg(feature = "shacl")]
@@ -219,6 +220,7 @@ pub use rebase::{
 };
 pub use revert::{RevertReport, RevertSelection, StagedRevert};
 pub use revert_preview::{RevertConflictSummary, RevertPreview, RevertPreviewOpts};
+pub use transaction::{Transaction, TxnOperation};
 pub use tx::{
     IndexingMode, IndexingStatus, StageResult, TrackedTransactionInput, TransactResult,
     TransactResultRef,

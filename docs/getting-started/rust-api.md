@@ -652,7 +652,54 @@ async fn main() -> Result<()> {
 }
 ```
 
-**Note:** `StagedGraph` currently supports querying only. Staging on top of a staged transaction and committing from a `StagedGraph` are not yet supported.
+`StagedGraph` is a read-only preview of one transaction. To stage several
+writes, read between them, and commit them as one commit, use a
+`Transaction`.
+
+### Multi-Write Transactions
+
+`Fluree::begin_transaction` opens a transaction at the ledger's current head.
+Each `stage` applies its write over the ones before it (an update's `WHERE`
+sees an earlier insert), and is validated as it is staged: a write that fails
+to parse, is denied by policy, or violates SHACL returns an error and is left
+out, and the transaction carries on without it. `db()` reads the staged state.
+`commit` writes everything as one commit, keeping only the net change: a fact
+one write adds and a later one removes is not committed. If another commit
+lands first, the staged result is re-based over it when they touched
+different subjects, and otherwise staged again on the new head.
+
+```rust
+use fluree_db_api::{CommitOpts, FlureeBuilder, Result, TxnOperation};
+use serde_json::json;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await?;
+
+    let mut txn = fluree.begin_transaction("mydb:main", None).await?;
+    txn.stage(TxnOperation::Insert(json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:alice", "ex:age": 30
+    })))
+    .await?;
+    txn.stage(TxnOperation::SparqlUpdate(
+        "PREFIX ex: <http://example.org/ns/> \
+         DELETE { ex:alice ex:age ?a } INSERT { ex:alice ex:age ?b } \
+         WHERE { ex:alice ex:age ?a BIND(?a + 1 AS ?b) }"
+            .into(),
+    ))
+    .await?;
+
+    let staged = txn.db().await?; // alice is 31 here; the ledger is unchanged
+    let result = txn.commit(CommitOpts::default()).await?;
+    println!("committed t={}", result.receipt.t);
+    Ok(())
+}
+```
+
+Pass a `PolicyContext` to `begin_transaction` to check every write against
+policy. Dropping a `Transaction` discards it.
 
 ### Export Data
 

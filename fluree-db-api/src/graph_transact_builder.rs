@@ -302,8 +302,8 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
 
 /// A staged (uncommitted) transaction bound to an executor.
 ///
-/// Queries against this type see the staged changes.
-/// Stage-on-stage and commit-from-staged are TBD.
+/// Queries against this type see the staged changes. To stage several
+/// writes and commit them as one, use [`crate::Transaction`].
 ///
 /// # Example
 ///
