@@ -8,6 +8,7 @@ use crate::convert::{
     commit_ref, commit_summary, flake, from_json, jsonld_columns, sparql_columns, time_spec,
     to_json,
 };
+use crate::cypher;
 use crate::error::{api_error, fluree_error, invalid_request, not_found};
 use crate::ops;
 use crate::query::{execute, Controls};
@@ -463,6 +464,52 @@ impl Connection {
         Ok(commit)
     }
 
+    /// Run Cypher: a read against `ledger` (at `at`), or a write — one
+    /// statement or a `;` script — committed all or nothing. Returns
+    /// `(commit, (columns, rows))`, `commit` being `None` for a read.
+    #[pyo3(signature = (ledger, cypher, params = None, at = None, policy = None, timeout = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn cypher<'py>(
+        &self,
+        py: Python<'py>,
+        ledger: &str,
+        cypher: &str,
+        params: Option<&Bound<'py, PyAny>>,
+        at: Option<&Bound<'py, PyTuple>>,
+        policy: Option<&Bound<'py, PyAny>>,
+        timeout: Option<f64>,
+    ) -> PyResult<(Option<Bound<'py, PyDict>>, Bound<'py, PyTuple>)> {
+        let id = canonical(ledger)?;
+        let params = cypher::params(params)?;
+        let policy = governance(policy)?;
+        let fluree = &*self.fluree;
+        if cypher::is_write(cypher)? {
+            if at.is_some() {
+                return Err(invalid_request("a past state cannot be written to"));
+            }
+            let governance = policy.unwrap_or_default();
+            let (commit, table) =
+                cypher::write(py, fluree, &id, cypher, params.as_ref(), governance)?;
+            return Ok((Some(commit), table));
+        }
+        let spec = time_spec(at)?;
+        let db = block_on(py, load(fluree, &id, spec, policy.as_ref()))?.map_err(api_error)?;
+        let table = cypher::read(py, fluree, &db, cypher, params.as_ref(), timeout)?;
+        Ok((None, table))
+    }
+
+    /// Open an explicit Cypher transaction on `ledger`.
+    #[pyo3(signature = (ledger, policy = None))]
+    fn begin_cypher(
+        &self,
+        py: Python<'_>,
+        ledger: &str,
+        policy: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<cypher::CypherTransaction> {
+        let governance = governance(policy)?.unwrap_or_default();
+        cypher::CypherTransaction::begin(py, &self.fluree, &canonical(ledger)?, governance)
+    }
+
     /// Open a transaction on `ledger`; its writes are checked against
     /// `policy` and its reads filtered by it.
     #[pyo3(signature = (ledger, policy = None))]
@@ -878,6 +925,24 @@ impl Snapshot {
     #[getter]
     fn t(&self) -> i64 {
         self.db.t
+    }
+
+    /// A Cypher read of this snapshot.
+    #[pyo3(signature = (cypher, params = None, timeout = None))]
+    fn cypher<'py>(
+        &self,
+        py: Python<'py>,
+        cypher: &str,
+        params: Option<&Bound<'py, PyAny>>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        if cypher::is_write(cypher)? {
+            return Err(invalid_request(
+                "a snapshot is read-only; write through the ledger",
+            ));
+        }
+        let params = cypher::params(params)?;
+        cypher::read(py, &self.fluree, &self.db, cypher, params.as_ref(), timeout)
     }
 
     #[pyo3(signature = (sparql, controls = None))]

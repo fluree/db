@@ -85,6 +85,32 @@ commit lands first, the writes are staged again on top of it.
 `ledger.at(t=..., time=..., commit=...)` return a frozen view that every query
 sees identically.
 
+## Cypher
+
+`ledger.cypher(...)` runs openCypher, with results shaped like the Neo4j
+Python driver's:
+
+```python
+result = people.cypher(
+    "MATCH (p:Person {name: $name})-[r:KNOWS]->(friend) RETURN p, r, friend.name AS friend",
+    name="Alice",
+)
+for record in result:
+    record["friend"], record[0]["age"], record["r"].type    # by key or position
+result.single(), result.data(), result.value("friend"), result.to_df()
+```
+
+- Nodes, relationships and paths come back as `fluree.Node` (properties read
+  like a dict, plus `labels` and `element_id`), `fluree.Relationship` (`type`,
+  `start_node`, `end_node`) and `fluree.Path`; dates, decimals and the like as
+  Python values.
+- A write — `CREATE`, `MERGE`, `SET`, `DELETE`, or a `;` script of them —
+  commits, all or nothing; `result.commit` is the `Commit`.
+- `with people.cypher_transaction() as tx: tx.run(...)` groups statements into
+  one atomic commit; reads inside it see its own writes.
+- `ledger.at(...).cypher(...)` reads the past. Cypher and SPARQL see the same
+  data: Cypher's names are bare IRIs (`Person` is `<Person>`).
+
 ## History
 
 - `ledger.history(subject, predicate=None, from_t=1)` lists every assertion and

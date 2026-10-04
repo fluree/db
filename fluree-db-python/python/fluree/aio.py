@@ -29,7 +29,7 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import os
-from collections.abc import AsyncIterator, Awaitable, Callable, Generator
+from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Mapping
 from typing import Any, Generic, TypeVar
 
 import fluree
@@ -46,6 +46,7 @@ from fluree._connection import (
     RebaseStrategy,
     RevertStrategy,
 )
+from fluree._cypher import CypherResult
 from fluree._records import (
     Branch,
     Change,
@@ -61,7 +62,7 @@ from fluree._records import (
     VerifyReport,
 )
 
-__all__ = ["Connection", "Ledger", "RowStream", "Snapshot", "Transaction", "connect"]
+__all__ = ["Connection", "CypherTransaction", "Ledger", "RowStream", "Snapshot", "Transaction", "connect"]
 
 T = TypeVar("T")
 
@@ -246,6 +247,27 @@ class Ledger:
     ) -> QueryProfile:
         return await _query(lambda c: _sync._profile(self._sync._run, query, max_fuel, timeout, c))
 
+    async def cypher(
+        self,
+        query: str,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+        **kwparameters: Any,
+    ) -> CypherResult:
+        """See :meth:`fluree.Ledger.cypher`."""
+        return await _call(self._sync.cypher, query, parameters, timeout=timeout, **kwparameters)
+
+    def cypher_transaction(self) -> _Opening[CypherTransaction]:
+        """Open a :class:`CypherTransaction`. Await it, or use it with
+        ``async with`` to commit on a clean exit and roll back on an
+        exception."""
+
+        async def open() -> CypherTransaction:
+            return CypherTransaction(await _call(self._sync.cypher_transaction))
+
+        return _Opening(open)
+
     def stream(
         self,
         query: Query,
@@ -422,6 +444,16 @@ class Snapshot:
             self._sync.export, path, format=format, graph=graph, all_graphs=all_graphs, context=context
         )
 
+    async def cypher(
+        self,
+        query: str,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+        **kwparameters: Any,
+    ) -> CypherResult:
+        return await _call(self._sync.cypher, query, parameters, timeout=timeout, **kwparameters)
+
     async def branch(self, name: str) -> Ledger:
         return self._ledger._wrap(await _call(self._sync.branch, name))
 
@@ -466,6 +498,37 @@ class Transaction:
 
     async def commit(self, *, message: str | None = None) -> Commit:
         return await _call(self._sync.commit, message=message)
+
+    async def rollback(self) -> None:
+        await _call(self._sync.rollback)
+
+
+class CypherTransaction:
+    """Cypher statements committed together; see
+    :class:`fluree.CypherTransaction`."""
+
+    __slots__ = ("_sync",)
+
+    def __init__(self, sync: fluree.CypherTransaction) -> None:
+        self._sync = sync
+
+    @property
+    def committed(self) -> Commit | None:
+        return self._sync.committed
+
+    async def __aenter__(self) -> CypherTransaction:
+        return self
+
+    async def __aexit__(self, exc_type: object, *exc: object) -> None:
+        await _call(self._sync.__exit__, exc_type, *exc)
+
+    async def run(
+        self, query: str, parameters: Mapping[str, Any] | None = None, **kwparameters: Any
+    ) -> CypherResult:
+        return await _call(self._sync.run, query, parameters, **kwparameters)
+
+    async def commit(self) -> Commit:
+        return await _call(self._sync.commit)
 
     async def rollback(self) -> None:
         await _call(self._sync.rollback)

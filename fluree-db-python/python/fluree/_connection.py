@@ -7,9 +7,11 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any, Literal as _Literal, Union
 
 from fluree import _fluree
+from fluree._cypher import CypherResult, CypherTransaction, _params, _result
 from fluree._records import (
     Branch,
     Change,
@@ -297,6 +299,37 @@ class Ledger:
     def profile(self, query: Query, *, max_fuel: float | None = None, timeout: float | None = None) -> QueryProfile:
         """Run :meth:`query` and report the fuel and time it took."""
         return _profile(self._run, query, max_fuel, timeout)
+
+    def cypher(
+        self,
+        query: str,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+        **kwparameters: Any,
+    ) -> CypherResult:
+        """Run a Cypher statement, as ``session.run`` does in the Neo4j driver.
+
+        A read returns its records; a write — or a ``;``-separated script of
+        them — commits, all or nothing, and the result's ``commit`` says
+        what it wrote. Parameters (``$name``) come from ``parameters`` and
+        keyword arguments. ``timeout`` (seconds) bounds a read.
+
+        Records are :class:`Record` tuples, also indexable by column name;
+        nodes, relationships and paths come back as :class:`Node`,
+        :class:`Relationship` and :class:`Path`. Group several statements
+        into one transaction with :meth:`cypher_transaction`.
+        """
+        native = self._connection._native
+        commit, table = native.cypher(
+            self._id, query, _params(parameters, kwparameters), None, self._policy, timeout
+        )
+        return _result(commit, table)
+
+    def cypher_transaction(self) -> CypherTransaction:
+        """Open a :class:`CypherTransaction` for several Cypher statements
+        committed together."""
+        return CypherTransaction(self._connection._native.begin_cypher(self._id, self._policy))
 
     def stream(
         self,
@@ -738,6 +771,18 @@ class Snapshot:
         """Export the data as of this snapshot; see :meth:`Ledger.export`."""
         return self._ledger._export(path, format, graph, all_graphs, context, ("t", self.t))
 
+    def cypher(
+        self,
+        query: str,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+        **kwparameters: Any,
+    ) -> CypherResult:
+        """Run a Cypher read against this snapshot; see :meth:`Ledger.cypher`."""
+        table = self._native.cypher(query, _params(parameters, kwparameters), timeout)
+        return _result(None, table)
+
     def branch(self, name: str) -> Ledger:
         """Create branch ``name`` from this past state; see :meth:`Ledger.branch`."""
         return self._ledger._create_branch(name, ("t", self.t))
@@ -857,6 +902,18 @@ class Transaction:
     def explain(self, query: Query) -> dict[str, Any]:
         """The plan ``query`` would run with over the staged state."""
         return self._view().explain(query)
+
+    def cypher(
+        self,
+        query: str,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+        **kwparameters: Any,
+    ) -> CypherResult:
+        """Run a Cypher read over the staged state. Cypher writes go through
+        :meth:`Ledger.cypher_transaction`."""
+        return self._view().cypher(query, parameters, timeout=timeout, **kwparameters)
 
     def commit(self, *, message: str | None = None) -> Commit:
         """Commit the staged writes as one commit, recording ``message`` (by
