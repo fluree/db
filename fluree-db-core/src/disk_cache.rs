@@ -102,7 +102,8 @@ impl Drop for FlightGuard {
 pub struct DiskArtifactCache {
     root: PathBuf,
     budget_bytes: u64,
-    state: Mutex<DiskArtifactCacheState>,
+    /// Shared with the background scan that sizes the directory.
+    state: Arc<Mutex<DiskArtifactCacheState>>,
     /// Per-target single-flight coordination: coalesces concurrent remote
     /// fetches for the same cache target into one `cs.get` + one tmp-file write.
     /// Keyed by the resolved cache-target path (narrow: same content + same
@@ -114,6 +115,15 @@ pub struct DiskArtifactCache {
 #[derive(Debug, Default)]
 struct DiskArtifactCacheState {
     tracked_bytes: Option<u64>,
+    /// A background scan is sizing the directory; see
+    /// [`DiskArtifactCache::known_bytes`].
+    scanning: bool,
+    /// Entries written (positive) and evicted (negative) while that scan
+    /// runs, reconciled with what it saw.
+    pending: Vec<(PathBuf, i64)>,
+    /// Test hook: the background scan waits for this before walking.
+    #[cfg(test)]
+    scan_hold: Option<std::sync::mpsc::Receiver<()>>,
 }
 
 #[derive(Debug)]
@@ -186,6 +196,13 @@ fn create_dir_result_as_cache_outcome(res: io::Result<()>) -> io::Result<()> {
     }
 }
 
+#[cfg(test)]
+fn directory_bytes(root: &Path) -> io::Result<u64> {
+    Ok(scan_cache_entries(root)?
+        .into_iter()
+        .fold(0u64, |acc, entry| acc.saturating_add(entry.bytes)))
+}
+
 fn scan_cache_entries(root: &Path) -> io::Result<Vec<CacheEntry>> {
     let mut stack = vec![root.to_path_buf()];
     let mut entries = Vec::new();
@@ -239,7 +256,7 @@ impl DiskArtifactCache {
         Self {
             root: PathBuf::new(),
             budget_bytes: 0,
-            state: Mutex::new(DiskArtifactCacheState::default()),
+            state: Arc::new(Mutex::new(DiskArtifactCacheState::default())),
             inflight: Mutex::new(HashMap::new()),
             next_flight_generation: AtomicU64::new(0),
         }
@@ -255,7 +272,7 @@ impl DiskArtifactCache {
             return Self {
                 root,
                 budget_bytes: 0,
-                state: Mutex::new(DiskArtifactCacheState::default()),
+                state: Arc::new(Mutex::new(DiskArtifactCacheState::default())),
                 inflight: Mutex::new(HashMap::new()),
                 next_flight_generation: AtomicU64::new(0),
             };
@@ -318,7 +335,7 @@ impl DiskArtifactCache {
         Self {
             root,
             budget_bytes,
-            state: Mutex::new(DiskArtifactCacheState::default()),
+            state: Arc::new(Mutex::new(DiskArtifactCacheState::default())),
             inflight: Mutex::new(HashMap::new()),
             next_flight_generation: AtomicU64::new(0),
         }
@@ -330,7 +347,7 @@ impl DiskArtifactCache {
         Self {
             root,
             budget_bytes,
-            state: Mutex::new(DiskArtifactCacheState::default()),
+            state: Arc::new(Mutex::new(DiskArtifactCacheState::default())),
             inflight: Mutex::new(HashMap::new()),
             next_flight_generation: AtomicU64::new(0),
         }
@@ -348,26 +365,99 @@ impl DiskArtifactCache {
             .saturating_div(CACHE_EVICT_DENOMINATOR)
     }
 
+    /// The directory's size, scanning it now if it is not yet known.
+    #[cfg(test)]
     fn current_bytes(&self) -> io::Result<u64> {
-        let mut state = self.state.lock();
-        if let Some(bytes) = state.tracked_bytes {
+        if let Some(bytes) = self.state.lock().tracked_bytes {
             return Ok(bytes);
         }
-        let bytes = scan_cache_entries(&self.root)?
-            .into_iter()
-            .fold(0u64, |acc, entry| acc.saturating_add(entry.bytes));
-        state.tracked_bytes = Some(bytes);
+        let bytes = directory_bytes(&self.root)?;
+        self.set_current_bytes(bytes);
         Ok(bytes)
     }
 
-    fn set_current_bytes(&self, bytes: u64) {
-        self.state.lock().tracked_bytes = Some(bytes);
+    /// The directory's size if it is known. If not, starts sizing it on a
+    /// background thread and returns `None`.
+    ///
+    /// Walking a large shared cache takes seconds; done inline, under the
+    /// state lock, it stalls the async worker that writes first and every
+    /// writer queued on the lock. Writes made meanwhile skip the budget check
+    /// and are counted into the scan's total when it lands.
+    fn known_bytes(&self) -> Option<u64> {
+        let mut state = self.state.lock();
+        if state.tracked_bytes.is_some() || state.scanning {
+            return state.tracked_bytes;
+        }
+        state.scanning = true;
+        state.pending.clear();
+        #[cfg(test)]
+        let hold = state.scan_hold.take();
+        drop(state);
+
+        let root = self.root.clone();
+        let shared = Arc::clone(&self.state);
+        let scan = move || {
+            #[cfg(test)]
+            if let Some(hold) = hold {
+                let _ = hold.recv();
+            }
+            let scanned = scan_cache_entries(&root);
+            let mut state = shared.lock();
+            match scanned {
+                // A synchronous scan or eviction that set the size meanwhile
+                // is more recent than this one.
+                Ok(entries) if state.tracked_bytes.is_none() => {
+                    let seen: std::collections::HashSet<&Path> =
+                        entries.iter().map(|e| e.path.as_path()).collect();
+                    let mut total: i64 = entries.iter().map(|e| e.bytes as i64).sum();
+                    // A write the walk already saw is in `total`; an eviction
+                    // counts only against an entry it saw.
+                    for (path, delta) in &state.pending {
+                        if (*delta > 0) != seen.contains(path.as_path()) {
+                            total = total.saturating_add(*delta);
+                        }
+                    }
+                    state.tracked_bytes = Some(total.max(0) as u64);
+                }
+                Ok(_) => {}
+                Err(err) => tracing::debug!(
+                    cache_dir = %root.display(),
+                    error = %err,
+                    "failed to size the disk cache; the next write retries"
+                ),
+            }
+            state.scanning = false;
+            state.pending.clear();
+        };
+        // No threads on wasm32, where the cache never writes (budget 0).
+        #[cfg(target_arch = "wasm32")]
+        scan();
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Err(err) = std::thread::Builder::new()
+            .name("fluree-cache-size".into())
+            .spawn(scan)
+        {
+            tracing::debug!(error = %err, "failed to start the disk cache size scan");
+            self.state.lock().scanning = false;
+        }
+        None
     }
 
-    fn note_write(&self, bytes: u64) {
+    fn set_current_bytes(&self, bytes: u64) {
         let mut state = self.state.lock();
-        let current = state.tracked_bytes.unwrap_or(0);
-        state.tracked_bytes = Some(current.saturating_add(bytes));
+        state.tracked_bytes = Some(bytes);
+        state.pending.clear();
+    }
+
+    fn note_write(&self, path: &Path, bytes: u64) {
+        let mut state = self.state.lock();
+        match state.tracked_bytes {
+            Some(current) => state.tracked_bytes = Some(current.saturating_add(bytes)),
+            None if state.scanning => state.pending.push((path.to_path_buf(), bytes as i64)),
+            // Untracked: the next capacity check sizes the directory, this
+            // write included.
+            None => {}
+        }
     }
 
     /// Drop one entry, keeping the byte accounting in step.
@@ -386,6 +476,8 @@ impl DiskArtifactCache {
                 let mut state = self.state.lock();
                 if let Some(tracked) = state.tracked_bytes {
                     state.tracked_bytes = Some(tracked.saturating_sub(bytes));
+                } else if state.scanning {
+                    state.pending.push((path.to_path_buf(), -(bytes as i64)));
                 }
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -449,7 +541,9 @@ impl DiskArtifactCache {
             return Ok(());
         }
 
-        let current = self.current_bytes()?;
+        let Some(current) = self.known_bytes() else {
+            return Ok(());
+        };
         if current.saturating_add(incoming_bytes) <= self.budget_bytes {
             return Ok(());
         }
@@ -501,7 +595,7 @@ impl DiskArtifactCache {
         }
 
         match Self::write_atomic(target, bytes) {
-            Ok(true) => self.note_write(bytes.len() as u64),
+            Ok(true) => self.note_write(target, bytes.len() as u64),
             Ok(false) => {}
             Err(err) if is_disk_full(&err) => {
                 if let Err(evict_err) = self.evict_until(self.low_water_mark()) {
@@ -513,7 +607,7 @@ impl DiskArtifactCache {
                     return;
                 }
                 match Self::write_atomic(target, bytes) {
-                    Ok(true) => self.note_write(bytes.len() as u64),
+                    Ok(true) => self.note_write(target, bytes.len() as u64),
                     Ok(false) => {}
                     Err(retry_err) => tracing::warn!(
                         cache_dir = %self.root.display(),
@@ -945,6 +1039,35 @@ mod tests {
         cache.best_effort_write(&dir.join("b.leaf"), &[0u8; 200]);
 
         assert_eq!(cache.current_bytes().unwrap(), 300);
+    }
+
+    /// The first write sizes the directory off the writer's thread: a large
+    /// shared cache took seconds to walk inline, under the state lock, which
+    /// stalled the async worker writing first and every writer behind it.
+    #[test]
+    fn first_write_does_not_wait_for_the_size_scan() {
+        let dir = temp_cache_dir("background-scan");
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
+        fs::write(dir.join("existing.leaf"), [0u8; 300]).unwrap();
+        let (release, hold) = std::sync::mpsc::channel();
+        cache.state.lock().scan_hold = Some(hold);
+
+        // Returns with the scan still held: the size is not known yet.
+        cache.best_effort_write(&dir.join("new.leaf"), &[0u8; 100]);
+        assert!(dir.join("new.leaf").exists());
+        assert_eq!(cache.state.lock().tracked_bytes, None);
+
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while cache.state.lock().scanning {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "size scan never landed"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The walk saw the new entry too; it is counted once.
+        assert_eq!(cache.state.lock().tracked_bytes, Some(400));
     }
 
     /// A released object's entry must go, or a later read sees a blob storage
