@@ -19,6 +19,7 @@ mod branch;
 mod connection;
 mod convert;
 mod error;
+mod ops;
 mod query;
 mod runtime;
 mod stream;

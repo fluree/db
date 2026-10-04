@@ -59,6 +59,10 @@ def test_the_api_end_to_end():
             await people.sync({"@context": CONTEXT, "@graph": [{"@id": "ex:dave", "ex:name": "Dave"}]})
             assert [n for (n,) in await people.query(NAMES)] == ["Dave"]
 
+            assert (await people.verify()).healthy
+            assert (await people.validate()).conforms
+            assert (await people.index_status()).commit_t == (await people.log())[0].t
+
             other = await conn.ledger("people:dev")
             assert other.id == "people:dev"
             assert await conn.ledgers() == ["people:dev", "people:main"]

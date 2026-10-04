@@ -127,6 +127,16 @@ policy, and a write the policy does not allow raises
 `fluree.PermissionDeniedError`. History and commit contents are filtered the
 same way.
 
+## Maintenance
+
+- `ledger.validate()` checks the data against the ledger's SHACL shapes — or
+  other shapes passed in — and returns a report, changing nothing.
+- `ledger.index_status()`, `ledger.index()` (index now and wait) and
+  `ledger.reindex()` manage indexing; queries never need it, but indexed data
+  reads faster.
+- `ledger.verify()` checks that the commit chain and index are intact, and
+  `ledger.sweep()` deletes index files no index references any more.
+
 ## Backup and export
 
 - `ledger.export(path, format=...)` writes Turtle, TriG, N-Triples, N-Quads or

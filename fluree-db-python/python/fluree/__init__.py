@@ -24,11 +24,16 @@ from fluree._records import (
     Change,
     Commit,
     Conflict,
+    IndexStatus,
     MergePreview,
     MergeResult,
     RebaseResult,
     RevertPreview,
     RevertResult,
+    SweepResult,
+    ValidationReport,
+    ValidationResult,
+    VerifyReport,
 )
 from fluree._fluree import __version__
 from fluree._results import Rows, RowStream
@@ -53,6 +58,7 @@ __all__ = [
     "ConflictError",
     "Connection",
     "FlureeError",
+    "IndexStatus",
     "InvalidRequestError",
     "LangString",
     "Ledger",
@@ -70,7 +76,11 @@ __all__ = [
     "RowStream",
     "Rows",
     "Snapshot",
+    "SweepResult",
     "Transaction",
+    "ValidationReport",
+    "ValidationResult",
+    "VerifyReport",
     "__version__",
     "connect",
 ]

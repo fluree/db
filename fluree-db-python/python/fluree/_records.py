@@ -258,3 +258,117 @@ def _revert_preview(raw: dict[str, Any]) -> RevertPreview:
             "conflicts": [_conflict(c) for c in raw["conflicts"]],
         }
     )
+
+
+_SHACL = "http://www.w3.org/ns/shacl#"
+_RDF_LANG_STRING = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationResult:
+    """One way the data fails a SHACL shape.
+
+    ``focus`` is the node that failed and ``path`` the property, when the
+    constraint is on one; ``value`` is the offending value, when there is
+    one. ``severity`` is ``"violation"``, ``"warning"`` or ``"info"``.
+    ``shape`` is the node shape and ``component`` the SHACL constraint
+    component (``sh:MinCountConstraintComponent``, ...) that produced it.
+    """
+
+    focus: Any
+    path: IRI | None
+    message: str
+    severity: str
+    value: Any
+    shape: IRI | BlankNode
+    component: IRI
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationReport:
+    """The outcome of :meth:`Ledger.validate`. ``conforms`` is false when any
+    result is a violation. ``shape_count`` is how many shapes were checked —
+    ``0`` means no shapes were found, so the data trivially conforms. ``t`` is
+    the state that was validated."""
+
+    conforms: bool
+    results: list[ValidationResult]
+    shape_count: int
+    t: int
+
+
+@dataclass(frozen=True, slots=True)
+class IndexStatus:
+    """Where indexing of a ledger stands. Commits after ``index_t`` (up to
+    ``commit_t``) are queryable but not yet indexed. ``phase`` is ``"idle"``,
+    ``"pending"`` or ``"in_progress"``; ``enabled`` is false on a connection
+    without background indexing (``":memory:"``, or ``indexing=False``)."""
+
+    index_t: int
+    commit_t: int
+    enabled: bool
+    phase: str
+    error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class VerifyReport:
+    """The outcome of :meth:`Ledger.verify`.
+
+    ``severity`` is ``"healthy"``, ``"provenance"`` (a raw transaction is
+    missing: the data is intact) or ``"chain"`` (a commit or the index root is
+    missing or unreadable). ``problems`` describes each one, as a dict with a
+    ``kind``. ``truncated`` means ``max_commits`` stopped the check early.
+    """
+
+    severity: str
+    head_t: int
+    index_t: int
+    commits_checked: int
+    truncated: bool
+    problems: list[dict[str, Any]]
+
+    @property
+    def healthy(self) -> bool:
+        return self.severity == "healthy"
+
+
+@dataclass(frozen=True, slots=True)
+class SweepResult:
+    """The outcome of :meth:`Ledger.sweep`: ``orphans`` index files no longer
+    referenced, of which ``reclaimed`` were deleted (none on a dry run);
+    ``failures`` lists ``(file, error)`` for those that could not be."""
+
+    dry_run: bool
+    orphans: int
+    reclaimed: int
+    failures: list[tuple[str, str]]
+
+
+def _jsonld_term(value: Any) -> Any:
+    """A Python value for a JSON-LD node reference, value object, or scalar."""
+    if isinstance(value, dict):
+        if "@id" in value:
+            return _node(value["@id"])
+        if "@language" in value:
+            return to_python(("literal", str(value["@value"]), _RDF_LANG_STRING, value["@language"]))
+        if "@type" in value:
+            return to_python(("literal", str(value["@value"]), value["@type"], None))
+        return value.get("@value")
+    return value
+
+
+def _validation_report(raw: dict[str, Any]) -> ValidationReport:
+    results = [
+        ValidationResult(
+            focus=_node(r["focus_node"]) if isinstance(r["focus_node"], str) else _jsonld_term(r["focus_node"]),
+            path=None if r.get("result_path") is None else IRI(r["result_path"]),
+            message=r["message"],
+            severity=r["severity"].removeprefix(_SHACL).lower(),
+            value=_jsonld_term(r.get("value")),
+            shape=_node(r["source_shape"]),
+            component=IRI(r["constraint_component"]),
+        )
+        for r in raw["results"]
+    ]
+    return ValidationReport(raw["conforms"], results, raw["shape_count"], raw["t"])

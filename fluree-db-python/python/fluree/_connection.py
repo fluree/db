@@ -14,15 +14,20 @@ from fluree._records import (
     Branch,
     Change,
     Commit,
+    IndexStatus,
     MergePreview,
     MergeResult,
     RebaseResult,
     RevertPreview,
     RevertResult,
+    SweepResult,
+    ValidationReport,
+    VerifyReport,
     _change,
     _commit,
     _merge_preview,
     _revert_preview,
+    _validation_report,
 )
 from fluree._results import Rows, RowStream
 from fluree._terms import IRI
@@ -533,6 +538,79 @@ class Ledger:
         }
         native = self._connection._native
         return _revert_preview(native.revert_preview(self._id, _commit_refs(commits), options))
+
+    def validate(
+        self,
+        shapes: Data | None = None,
+        *,
+        shapes_graph: str | None = None,
+        graph: str | None = None,
+        include_attached: bool = False,
+        format: Format | None = None,
+        max_fuel: float | None = None,
+        timeout: float | None = None,
+    ) -> ValidationReport:
+        """Check the data against SHACL shapes, without changing anything.
+
+        By default the shapes are the ledger's own — the ones its writes are
+        checked against. Give ``shapes`` (JSON-LD, Turtle, or a path, as for
+        :meth:`insert`) to check against other shapes, or ``shapes_graph``,
+        the IRI of a named graph that holds them; ``include_attached`` adds
+        the ledger's own shapes to either. ``graph`` validates a named graph
+        rather than the default graph. ``max_fuel`` and ``timeout`` bound the
+        work, as for :meth:`query`.
+        """
+        self._require_unrestricted("validate")
+        if shapes is not None and shapes_graph is not None:
+            raise InvalidRequestError("give shapes or shapes_graph, not both")
+        if shapes is not None:
+            kind, payload = _rdf_payload(shapes, format)
+        elif shapes_graph is not None:
+            kind, payload = "graph", shapes_graph
+        else:
+            kind, payload = "attached", None
+        if timeout is not None and timeout <= 0:
+            raise InvalidRequestError("timeout must be positive")
+        options = {
+            "shapes_kind": kind,
+            "shapes": payload,
+            "graph": graph,
+            "include_attached": include_attached,
+            "max_fuel": None if max_fuel is None else float(max_fuel),
+            "timeout": None if timeout is None else float(timeout),
+        }
+        return _validation_report(self._connection._native.validate(self._id, options))
+
+    def index_status(self) -> IndexStatus:
+        """How far indexing has caught up with the ledger's commits."""
+        return IndexStatus(**self._connection._native.index_status(self._id))
+
+    def index(self, *, timeout: float | None = None) -> int:
+        """Index everything committed so far, waiting up to ``timeout``
+        seconds; returns the indexed ``t``. Queries do not need this — they
+        read unindexed commits too — but it makes them faster sooner.
+        Needs a connection with background indexing."""
+        self._require_unrestricted("index")
+        return self._connection._native.index(self._id, timeout)
+
+    def reindex(self) -> int:
+        """Rebuild the index from scratch from the commit history; returns the
+        indexed ``t``."""
+        self._require_unrestricted("reindex")
+        return self._connection._native.reindex(self._id)
+
+    def verify(self, *, max_commits: int | None = None) -> VerifyReport:
+        """Check that every commit, back to the first (or the last
+        ``max_commits``), and the index root are present and readable."""
+        self._require_unrestricted("verify")
+        return VerifyReport(**self._connection._native.verify(self._id, max_commits))
+
+    def sweep(self, *, dry_run: bool = False) -> SweepResult:
+        """Delete index files that no index of any branch of this ledger
+        references any more — left behind as indexing replaces old index
+        files. ``dry_run`` counts them without deleting."""
+        self._require_unrestricted("sweep")
+        return SweepResult(**self._connection._native.sweep(self._id, dry_run))
 
     def _create_branch(self, name: str, at: tuple[str, Any] | None) -> Ledger:
         self._require_unrestricted("branch")

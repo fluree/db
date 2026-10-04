@@ -50,11 +50,15 @@ from fluree._records import (
     Branch,
     Change,
     Commit,
+    IndexStatus,
     MergePreview,
     MergeResult,
     RebaseResult,
     RevertPreview,
     RevertResult,
+    SweepResult,
+    ValidationReport,
+    VerifyReport,
 )
 
 __all__ = ["Connection", "Ledger", "RowStream", "Snapshot", "Transaction", "connect"]
@@ -311,6 +315,25 @@ class Ledger:
     async def revert_preview(self, commits: CommitRef | list[CommitRef], **options: Any) -> RevertPreview:
         """See :meth:`fluree.Ledger.revert_preview` for ``options``."""
         return await _call(self._sync.revert_preview, commits, **options)
+
+    async def validate(self, shapes: Data | None = None, **options: Any) -> ValidationReport:
+        """See :meth:`fluree.Ledger.validate` for ``options``."""
+        return await _call(self._sync.validate, shapes, **options)
+
+    async def index_status(self) -> IndexStatus:
+        return await _call(self._sync.index_status)
+
+    async def index(self, *, timeout: float | None = None) -> int:
+        return await _call(self._sync.index, timeout=timeout)
+
+    async def reindex(self) -> int:
+        return await _call(self._sync.reindex)
+
+    async def verify(self, *, max_commits: int | None = None) -> VerifyReport:
+        return await _call(self._sync.verify, max_commits=max_commits)
+
+    async def sweep(self, *, dry_run: bool = False) -> SweepResult:
+        return await _call(self._sync.sweep, dry_run=dry_run)
 
     async def export(
         self,

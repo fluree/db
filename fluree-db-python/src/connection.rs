@@ -9,6 +9,7 @@ use crate::convert::{
     to_json,
 };
 use crate::error::{api_error, fluree_error, invalid_request, not_found};
+use crate::ops;
 use crate::query::{execute, Controls};
 use crate::runtime::{block_on, enter, runtime, InRuntime};
 use crate::stream::{RowStream, CHANNEL_DEPTH};
@@ -361,6 +362,47 @@ impl Connection {
         })?
         .map_err(api_error)?;
         receipt_to_py(py, &receipt)
+    }
+
+    fn validate<'py>(
+        &self,
+        py: Python<'py>,
+        ledger: &str,
+        options: ops::ValidateArgs,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        ops::validate(py, &self.fluree, &canonical(ledger)?, options)
+    }
+
+    fn index_status<'py>(&self, py: Python<'py>, ledger: &str) -> PyResult<Bound<'py, PyDict>> {
+        ops::index_status(py, &self.fluree, &canonical(ledger)?)
+    }
+
+    #[pyo3(signature = (ledger, timeout = None))]
+    fn index(&self, py: Python<'_>, ledger: &str, timeout: Option<f64>) -> PyResult<i64> {
+        ops::index(py, &self.fluree, &canonical(ledger)?, timeout)
+    }
+
+    fn reindex(&self, py: Python<'_>, ledger: &str) -> PyResult<i64> {
+        ops::reindex(py, &self.fluree, &canonical(ledger)?)
+    }
+
+    #[pyo3(signature = (ledger, max_commits = None))]
+    fn verify<'py>(
+        &self,
+        py: Python<'py>,
+        ledger: &str,
+        max_commits: Option<usize>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        ops::verify(py, &self.fluree, &canonical(ledger)?, max_commits)
+    }
+
+    fn sweep<'py>(
+        &self,
+        py: Python<'py>,
+        ledger: &str,
+        dry_run: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        ops::sweep(py, &self.fluree, &canonical(ledger)?, dry_run)
     }
 
     /// Make `graph` (the default graph when `None`) hold exactly `payload`,
