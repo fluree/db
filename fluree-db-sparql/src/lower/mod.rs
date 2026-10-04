@@ -111,7 +111,11 @@ pub fn lower_sparql_with_source<E: IriEncoder>(
     tracing::debug!("lowering SPARQL AST to query algebra");
 
     let mut ctx = LoweringContext::new(ast, encoder, vars, source_text);
-    let result = ctx.lower();
+    let mut result = ctx.lower();
+    if let Ok(query) = &mut result {
+        query.include_system_facts = ast.pragmas.include_system_facts.unwrap_or(false);
+        query.union_default_graph = ast.pragmas.union_default_graph;
+    }
 
     match &result {
         Ok(query) => {
@@ -130,8 +134,8 @@ pub fn lower_sparql_with_source<E: IriEncoder>(
     // (`fluree_db_query::parse::reject_user_authored_reifies_in_query`):
     // user queries naming `f:reifies*` IRIs directly are rejected
     // so system facts can't be enumerated through the user surface.
-    // The opt-in `opts.includeSystemFacts: true` only relaxes the
-    // variable-predicate scan filter — direct mention is the
+    // The opt-in `opts.includeSystemFacts: true` (`# PRAGMA
+    // include-system-facts: true`) only relaxes the variable-predicate scan filter — direct mention is the
     // contract-level boundary, identical for SPARQL and JSON-LD.
     if let Ok(query) = &result {
         reject_direct_reifies_in_patterns(&query.patterns)?;
@@ -606,6 +610,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     reasoning: self.reasoning_config()?,
                     post_values,
                     include_system_facts: false,
+                    union_default_graph: None,
                     cypher_vocab: None,
                     unmatched_optional: Default::default(),
                 })
@@ -4740,6 +4745,45 @@ mod pragma_tests {
         .unwrap();
         assert!(query.reasoning.modes.owl2rl);
         assert!(query.reasoning.has_reasoning());
+    }
+
+    /// Every query form carries the pragma into the IR the executor reads.
+    #[test]
+    fn pragma_include_system_facts_reaches_every_query_form() {
+        for form in [
+            "SELECT * WHERE { ?s ?p ?o }",
+            "ASK { ?s ?p ?o }",
+            "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }",
+            "DESCRIBE ?s WHERE { ?s ?p ?o }",
+        ] {
+            let on = lower_query(&format!("# PRAGMA include-system-facts: true\n{form}")).unwrap();
+            assert!(on.include_system_facts, "{form}");
+            let off = lower_query(form).unwrap();
+            assert!(!off.include_system_facts, "{form}");
+        }
+    }
+
+    /// Every query form carries the request's union switch into the IR, and
+    /// a query without the pragma leaves it to the ledger.
+    #[test]
+    fn pragma_union_default_graph_reaches_every_query_form() {
+        for form in [
+            "SELECT * WHERE { ?s ?p ?o }",
+            "ASK { ?s ?p ?o }",
+            "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }",
+            "DESCRIBE ?s WHERE { ?s ?p ?o }",
+        ] {
+            for on in [true, false] {
+                let query =
+                    lower_query(&format!("# PRAGMA union-default-graph: {on}\n{form}")).unwrap();
+                assert_eq!(query.union_default_graph, Some(on), "{form}");
+            }
+            assert_eq!(
+                lower_query(form).unwrap().union_default_graph,
+                None,
+                "{form}"
+            );
+        }
     }
 
     #[test]

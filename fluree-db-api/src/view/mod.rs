@@ -150,8 +150,10 @@ mod query_builder;
 mod query_input;
 mod stream_query;
 mod types;
+mod union_graph;
 
 pub use dataset::DataSetDb;
 pub use query_input::QueryInput;
 pub use stream_query::{OwnedStreamQuery, StreamDatasetPlan, StreamQueryPlan};
 pub use types::{ConfigReasoningBudget, DerivedFactsHandle, GraphDb, ReasoningModePrecedence};
+pub(crate) use union_graph::union_default_dataset;

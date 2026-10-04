@@ -40,6 +40,9 @@ pub struct LedgerConfig {
     /// Serving-posture defaults (`f:servingDefaults`). Ledger-scoped:
     /// never merged per-graph and not subject to override control.
     pub serving: Option<ServingDefaults>,
+    /// Query defaults (`f:queryDefaults`). Ledger-scoped: never merged
+    /// per-graph and not subject to override control.
+    pub query: Option<QueryDefaults>,
     /// Per-graph config overrides (`f:graphOverrides`).
     pub graph_overrides: Vec<GraphConfig>,
 }
@@ -183,6 +186,21 @@ pub struct ServingDefaults {
     pub serve_blocks: Option<bool>,
     /// `f:publicVisibility` — ledger is discoverable/readable without a token.
     pub public_visibility: Option<bool>,
+}
+
+/// Query defaults from the config graph (`f:queryDefaults`).
+///
+/// Ledger-scoped: lives only on `f:LedgerConfig`, ignored on `f:GraphConfig`,
+/// and not subject to override control. A request may still choose for
+/// itself, since these shape what a query reads rather than what it may
+/// read.
+#[derive(Debug, Clone, Default)]
+pub struct QueryDefaults {
+    /// `f:unionDefaultGraph` — a query that does not choose its own default
+    /// graph reads the union of the ledger's default graph and its named
+    /// graphs (never the reserved `#txn-meta` / `#config` graphs). `None`
+    /// means off.
+    pub union_default_graph: Option<bool>,
 }
 
 /// Full-text indexing defaults from the config graph (`f:fullTextDefaults`).

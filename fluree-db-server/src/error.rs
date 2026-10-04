@@ -109,6 +109,8 @@ impl ServerError {
             },
 
             // Not Found
+            ServerError::Api(ApiError::GraphNotFound(_)) => errors::GRAPH_NOT_FOUND,
+            ServerError::Api(ApiError::CommitNotFound(_)) => errors::COMMIT_NOT_FOUND,
             ServerError::Api(ApiError::NotFound(msg)) => {
                 // Distinguish graph source not found from ledger not found
                 if msg.contains("Graph source") || msg.contains("graph source") {
@@ -295,6 +297,8 @@ impl ServerError {
             // Every form `ApiError` gives a missing ledger, not only `NotFound`:
             // the ledger loader's own error is one, and read as a 500 here.
             ServerError::Api(e) if e.is_not_found() => StatusCode::NOT_FOUND,
+            ServerError::Api(ApiError::GraphNotFound(_)) => StatusCode::NOT_FOUND,
+            ServerError::Api(ApiError::CommitNotFound(_)) => StatusCode::NOT_FOUND,
 
             // 409 - Conflict
             ServerError::Api(ApiError::LedgerExists(_)) => StatusCode::CONFLICT,

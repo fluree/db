@@ -10,7 +10,8 @@ use crate::{config_resolver, time_resolve, ApiError, Fluree, GovernanceOptions, 
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::ids::GraphId;
 use fluree_db_core::{
-    ContentStore, DictNovelty, IndexType, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID, TXN_META_GRAPH_ID,
+    ContentStore, DictNovelty, IndexType, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID, DEFAULT_GRAPH_IRI,
+    TXN_META_GRAPH_ID,
 };
 use fluree_db_query::ir::ReasoningModes;
 use fluree_db_query::BinaryRangeProvider;
@@ -41,7 +42,7 @@ impl Fluree {
     /// so the ledger_id always matches the nameservice alias.
     ///
     /// Supported fragments:
-    /// - *(none)* → default graph (g_id = 0)
+    /// - *(none)* or `#urn:default` → default graph (g_id = 0)
     /// - `#txn-meta` → txn metadata graph (g_id = 1)
     /// - `#config` → ledger config graph (g_id = 2)
     /// - `#<iri>` → user-defined named graph by exact IRI
@@ -53,12 +54,13 @@ impl Fluree {
             None => Ok((ledger_id, GraphRef::Default)),
             Some((ledger_id, frag)) => {
                 if ledger_id.is_empty() {
-                    return Err(ApiError::query("Missing ledger before '#'"));
+                    return Err(ApiError::invalid_query("Missing ledger before '#'"));
                 }
                 if frag.is_empty() {
-                    return Err(ApiError::query("Missing named graph after '#'"));
+                    return Err(ApiError::invalid_query("Missing named graph after '#'"));
                 }
                 match frag {
+                    DEFAULT_GRAPH_IRI => Ok((ledger_id, GraphRef::Default)),
                     "txn-meta" => Ok((ledger_id, GraphRef::TxnMeta)),
                     // The config graph is reserved and slot-addressed exactly
                     // like `txn-meta`; the baseline gave `txn-meta` a fragment
@@ -103,7 +105,7 @@ impl Fluree {
                         .as_ref()
                         .and_then(|s| s.graph_id_for_iri(&iri))
                 })
-                .ok_or_else(|| ApiError::query(format!("Unknown named graph '#{iri}'")))?,
+                .ok_or_else(|| ApiError::GraphNotFound(format!("<{iri}>")))?,
         };
 
         if g_id != DEFAULT_GRAPH_ID && view.binary_store.is_some() && view.dict_novelty.is_some() {

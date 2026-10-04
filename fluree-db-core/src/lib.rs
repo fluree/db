@@ -128,7 +128,7 @@ pub use flake::{normalize_lang_tag, Flake, FlakeMeta};
 pub use graph_db_ref::GraphDbRef;
 pub use graph_registry::{
     config_graph_iri, txn_meta_graph_iri, GraphRegistry, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID,
-    FIRST_USER_GRAPH_ID, TXN_META_GRAPH_ID,
+    DEFAULT_GRAPH_IRI, FIRST_USER_GRAPH_ID, TXN_META_GRAPH_ID,
 };
 pub use ids::{
     DatatypeDictId, GraphId, LangId, ListIndex, PredicateId, RuntimeDatatypeId, RuntimePredicateId,

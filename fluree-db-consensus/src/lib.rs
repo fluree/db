@@ -922,6 +922,13 @@ pub enum SubmissionError {
     #[error("{message}")]
     DatatypeLimitExceeded { message: String },
 
+    /// A commit reference in the submission (a revert's commits) names no
+    /// commit of the ledger (HTTP 404, `err:db/CommitNotFound`). Typed so the
+    /// HTTP layer can tell it from a missing ledger; an `Execution` status
+    /// alone cannot.
+    #[error("{message}")]
+    CommitNotFound { message: String },
+
     /// The consensus implementation has reached its in-flight operation
     /// cap and refused the submission without executing it. Callers
     /// should retry with backoff.
@@ -961,7 +968,7 @@ impl SubmissionError {
             // `AlreadyInFlight` (409) for the full cache TTL.
             Self::NoveltyBackpressure { .. } | Self::NoveltyDeltaTooLarge { .. } => true,
             // Decided before commit construction, like the novelty refusals.
-            Self::DatatypeLimitExceeded { .. } => true,
+            Self::DatatypeLimitExceeded { .. } | Self::CommitNotFound { .. } => true,
             Self::Execution { status, .. } => !(502..=504).contains(status),
         }
     }

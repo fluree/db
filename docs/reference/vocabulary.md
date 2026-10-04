@@ -352,6 +352,7 @@ These predicates define ledger-level configuration stored in the config graph. S
 | `f:reasoningDefaults` | `https://ns.flur.ee/db#reasoningDefaults` | OWL/RDFS reasoning defaults |
 | `f:datalogDefaults` | `https://ns.flur.ee/db#datalogDefaults` | Datalog rule defaults |
 | `f:transactDefaults` | `https://ns.flur.ee/db#transactDefaults` | Transaction constraint defaults |
+| `f:queryDefaults` | `https://ns.flur.ee/db#queryDefaults` | Query defaults (ledger-scoped: `f:LedgerConfig` only) |
 
 ### Policy fields
 
@@ -393,6 +394,12 @@ These predicates define ledger-level configuration stored in the config graph. S
 | `f:uniqueEnabled` | `https://ns.flur.ee/db#uniqueEnabled` | Enable unique constraint enforcement (boolean) |
 | `f:constraintsSource` | `https://ns.flur.ee/db#constraintsSource` | Graph(s) containing constraint annotations (GraphRef) |
 | `f:enforceUnique` | `https://ns.flur.ee/db#enforceUnique` | Annotation on property IRIs: enforce value uniqueness (boolean) |
+
+### Query fields
+
+| Predicate | Full IRI | Description |
+|-----------|----------|-------------|
+| `f:unionDefaultGraph` | `https://ns.flur.ee/db#unionDefaultGraph` | A query that does not choose its own default graph reads the union of the default graph and all named graphs (boolean). See [Union default graph](../concepts/datasets-and-named-graphs.md#union-default-graph) |
 
 ### Override control
 

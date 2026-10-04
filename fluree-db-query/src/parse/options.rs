@@ -567,6 +567,7 @@ pub fn parse_options(
         reasoning: parse_reasoning(obj)?,
         object_var_parsing: parse_object_var_parsing(obj),
         include_system_facts: parse_include_system_facts(obj),
+        union_default_graph: parse_union_default_graph(obj)?,
     })
 }
 
@@ -611,10 +612,44 @@ pub fn parse_include_system_facts(obj: &serde_json::Map<String, JsonValue>) -> b
         .unwrap_or(false)
 }
 
+/// Parse `opts.unionDefaultGraph` from the top-level query object: the
+/// request's own union default graph switch, `None` when absent. A value that
+/// is not a boolean is an error, never a silently ignored option.
+pub fn parse_union_default_graph(obj: &serde_json::Map<String, JsonValue>) -> Result<Option<bool>> {
+    let Some(opts) = obj.get("opts").and_then(|v| v.as_object()) else {
+        return Ok(None);
+    };
+    let Some(value) = opts.get("unionDefaultGraph") else {
+        return Ok(None);
+    };
+    value.as_bool().map(Some).ok_or_else(|| {
+        ParseError::InvalidOption(format!(
+            "opts.unionDefaultGraph must be true or false, got {value}"
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn union_default_graph_opt() {
+        let parse = |v: JsonValue| parse_union_default_graph(v.as_object().unwrap());
+        assert_eq!(parse(json!({})).unwrap(), None);
+        assert_eq!(parse(json!({"opts": {}})).unwrap(), None);
+        assert_eq!(
+            parse(json!({"opts": {"unionDefaultGraph": true}})).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            parse(json!({"opts": {"unionDefaultGraph": false}})).unwrap(),
+            Some(false)
+        );
+        let err = parse(json!({"opts": {"unionDefaultGraph": "yes"}})).unwrap_err();
+        assert!(err.to_string().contains("unionDefaultGraph"), "{err}");
+    }
 
     fn reasoning_of(v: &JsonValue) -> Option<crate::ir::ReasoningModes> {
         parse_reasoning(v.as_object().unwrap()).unwrap()

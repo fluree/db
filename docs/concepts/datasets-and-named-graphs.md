@@ -38,6 +38,7 @@ Fluree exposes two query styles over HTTP:
 - **Ledger-scoped** (`POST /query/{ledger}`): the ledger is fixed by the URL. The request may still select a **named graph inside that ledger**:
   - JSON-LD: `"from": "default"`, `"from": "txn-meta"`, or `"from": "<graph IRI>"`
   - SPARQL: `FROM <default>`, `FROM <txn-meta>`, `FROM <graph IRI>`, and `FROM NAMED <graph IRI>`
+  - `urn:default`, the name [`/info`](../api/endpoints.md#get-infoledger-id) lists the default graph under, is accepted wherever `default` is, and `GRAPH <urn:default> { ... }` reads the default graph as `GRAPH <ledger:main>` does. A write cannot name a graph `urn:default` (see [SPARQL UPDATE](../query/sparql.md))
   - `GRAPH <iri> { ... }` and `GRAPH ?g { ... }` resolve the ledger's registered user named graphs **without** an explicit `FROM NAMED` (the reserved `#txn-meta` / `#config` graphs stay private). Supplying `FROM NAMED` still narrows resolution to exactly the graphs listed.
 
 If the request body tries to target a different ledger than the one in the URL, the server rejects it with a "Ledger mismatch" error.
@@ -203,24 +204,52 @@ FROM <ledger:main>
 WHERE {
   ?person ex:name ?name
   # This matches triples in the default graph only
+  # (unless the ledger reads a union default graph, below)
 }
 ```
 
 ### Union Default Graph
 
-Some SPARQL implementations create a "union default graph" containing triples from all graphs. Fluree keeps them separate by default, but you can achieve union semantics:
+A ledger can instead read its default graph as the **union** of the default graph and all of its named graphs, the SPARQL service feature `sd:UnionDefaultGraph`. Switch it on for the ledger in its config graph:
 
-```sparql
-# Manual union across graphs
-SELECT ?name
-FROM NAMED <ledger:main>
-FROM NAMED <ledger:archive>
-WHERE {
-  { GRAPH <ledger:main> { ?person ex:name ?name } }
-  UNION
-  { GRAPH <ledger:archive> { ?person ex:name ?name } }
+```trig
+@prefix f: <https://ns.flur.ee/db#> .
+
+GRAPH <urn:fluree:ledger:main#config> {
+    <urn:cfg:main>  a f:LedgerConfig ;
+                    f:queryDefaults <urn:cfg:query> .
+    <urn:cfg:query> f:unionDefaultGraph true .
 }
 ```
+
+or for one query, whatever the ledger says:
+
+```sparql
+# PRAGMA union-default-graph: true
+SELECT ?name WHERE { ?person ex:name ?name }
+```
+
+```json
+{
+  "select": ["?name"],
+  "where": { "@id": "?person", "ex:name": "?name" },
+  "opts": { "unionDefaultGraph": true }
+}
+```
+
+`# PRAGMA union-default-graph: false` (or `"unionDefaultGraph": false`) reads the default graph alone on a ledger that unions.
+
+The union is a set: a triple stored in several graphs matches once, and a property path follows edges across graphs, so `ex:alice ex:knows+ ?x` reaches a node through an edge in the default graph and the next edge in a named graph. It applies whenever the query does not choose a default graph of its own, which includes naming just the ledger itself in `FROM`. Everything else stays as it was:
+
+- `GRAPH <iri>` and `GRAPH ?g` address the named graphs exactly as without the union, and `GRAPH <ledger:main>` still names the default graph alone.
+- `FROM <graph>` reads just that graph; `FROM NAMED` names exactly the graphs it lists. A `FROM` list that names the ledger and any of its graphs reads just the graphs it names, not the union.
+- The reserved `#txn-meta` and `#config` graphs are never part of the union.
+- Policy applies to each graph as it would to a `GRAPH` pattern reading it.
+- Transactions are unaffected: they write to the graphs they name, and an update's `WHERE` matches the default graph alone. History queries (`FROM … TO …`) read the default graph alone too.
+
+The ledger's SPARQL endpoint advertises `sd:feature sd:UnionDefaultGraph` in its [service description](../api/endpoints.md#service-description) while the setting is on.
+
+A union reads every graph for every default-graph pattern, so a query costs more than the same query over the default graph alone, and the single-graph shortcuts for counts and aggregates do not apply. On a ledger without named graphs the setting changes nothing.
 
 ## Multi-Ledger Datasets
 

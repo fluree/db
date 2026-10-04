@@ -259,6 +259,7 @@ fn parse_query_ast_internal(
         // executor cares about have to be parsed inline. Currently
         // just `includeSystemFacts`; extend here as more land.
         query.options.include_system_facts = options::parse_include_system_facts(obj);
+        query.options.union_default_graph = options::parse_union_default_graph(obj)?;
         return Ok((query, SelectMode::Ask));
     }
 

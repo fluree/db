@@ -2411,6 +2411,17 @@ pub mod config_iris {
     /// `f:publicVisibility` — boolean, ledger may be discovered and read
     /// without authentication. Absent means false (token required).
     pub const PUBLIC_VISIBILITY: &str = "https://ns.flur.ee/db#publicVisibility";
+
+    // ---- Query defaults fields (ledger-scoped) ----
+
+    /// `f:queryDefaults` — query-time defaults on LedgerConfig.
+    /// Ledger-scoped: ignored on GraphConfig, not subject to override control.
+    pub const QUERY_DEFAULTS: &str = "https://ns.flur.ee/db#queryDefaults";
+
+    /// `f:unionDefaultGraph` — boolean, a query that does not choose its own
+    /// default graph reads the union of the ledger's default graph and its
+    /// named graphs. Absent means false.
+    pub const UNION_DEFAULT_GRAPH: &str = "https://ns.flur.ee/db#unionDefaultGraph";
 }
 
 // ============================================================================

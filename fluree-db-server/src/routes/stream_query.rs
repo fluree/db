@@ -125,6 +125,8 @@ async fn stream_query_connection_inner(
     params.reject_dataset_outside_sparql(is_sparql_request(&headers, &credential, &params))?;
     let (stream_plan, tracker) = if is_sparql_request(&headers, &credential, &params) {
         let sparql = resolve_sparql_text(&params, &credential)?;
+        // Merge the `# PRAGMA` options into the headers (see `with_sparql_pragmas`).
+        let headers = headers.clone().with_sparql_request_pragmas(&sparql)?;
 
         // Bearer scope over every FROM/FROM NAMED ledger.
         if let Some(p) = bearer.0.as_ref() {
@@ -285,6 +287,8 @@ async fn stream_query_inner(
     params.reject_dataset_outside_sparql(is_sparql_request(&headers, &credential, &params))?;
     let (stream_plan, tracker) = if is_sparql_request(&headers, &credential, &params) {
         let sparql = resolve_sparql_text(&params, &credential)?;
+        // Merge the `# PRAGMA` options into the headers (see `with_sparql_pragmas`).
+        let headers = headers.clone().with_sparql_request_pragmas(&sparql)?;
         if let Some(p) = bearer.0.as_ref() {
             if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger)?) {
                 return Err(ServerError::not_found("Ledger not found"));

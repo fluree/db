@@ -306,7 +306,7 @@ impl Operator for VectorSearchOperator {
 
             // Execute vector search
             let params = VectorSearchParams::new(&query_vector, self.pattern.metric, limit)
-                .with_as_of_t(if ctx.dataset.is_some() {
+                .with_as_of_t(if ctx.explicit_dataset().is_some() {
                     None
                 } else {
                     Some(ctx.to_t)
