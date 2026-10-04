@@ -198,7 +198,6 @@ triple terms; and the triple-term functions `TRIPLE()`, `SUBJECT()`, `PREDICATE(
 `OBJECT()` and `isTRIPLE()`.
 
 Not yet supported:
-- Triple-term constants in a `CONSTRUCT` template other than as the object of `rdf:reifies`
 - Nested annotations (annotation-of-annotation)
 
 **Specification:** https://www.w3.org/TR/sparql12-query/

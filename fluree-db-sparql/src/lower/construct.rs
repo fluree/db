@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::ast::annotation::{AnnotationVerb, ReifierId};
 use crate::ast::query::{ConstructQuery, ConstructTemplate};
 use crate::ast::term::QuotedTriple;
-use crate::ast::{GraphName, SubjectTerm, Term};
+use crate::ast::{GraphName, SubjectTerm, Term, TripleTerm};
 
 use fluree_db_query::ir::triple::{Ref, Term as IrTerm, TriplePattern};
 use fluree_db_query::ir::{
@@ -116,24 +116,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             // `?r rdf:reifies <<( s p o )>>`: the triple term is the reified
             // triple, not asserted, and `?r` its reifier.
             if let Term::TripleTerm(term) = &tp.object {
-                if p != reifies || tp.annotation.is_some() {
-                    return Err(LowerError::not_implemented(
-                        "a triple term in a CONSTRUCT template is only supported as the \
-                         object of rdf:reifies",
-                        tp.span,
-                    ));
+                if p == reifies && tp.annotation.is_none() {
+                    let reified = self.construct_term_pattern(term, &mut out)?;
+                    let triple = out.push_reified_pattern(reified, graph.clone());
+                    out.push_reification(triple, s);
+                    continue;
                 }
-                let mut siblings = Vec::new();
-                let reified = self.lower_triple_term(term, &mut siblings)?;
-                if !siblings.is_empty() {
-                    return Err(LowerError::not_implemented(
-                        "nested triple terms in a CONSTRUCT template",
-                        tp.span,
-                    ));
-                }
-                let triple = out.push_reified_pattern(reified, graph.clone());
-                out.push_reification(triple, s);
-                continue;
             }
 
             // Carry the declared datatype into the template.
@@ -224,13 +212,29 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 IrTerm::from(self.construct_reified_triple(qt, graph, out)?),
                 None,
             )),
-            Term::TripleTerm(tt) => Err(LowerError::not_implemented(
-                "a triple term in a CONSTRUCT template is only supported as the object of \
-                 rdf:reifies",
-                tt.span,
-            )),
+            Term::TripleTerm(tt) => {
+                let pattern = self.construct_term_pattern(tt, out)?;
+                let var = self
+                    .vars
+                    .get_or_insert(&format!("?#__tt_{}", self.vars.len()));
+                out.push_term_template(var, pattern);
+                Ok((IrTerm::Var(var), None))
+            }
             other => self.lower_object_with_constraint(other),
         }
+    }
+
+    /// A template triple term's triple; a nested term becomes a term
+    /// template first.
+    fn construct_term_pattern(
+        &mut self,
+        term: &TripleTerm,
+        out: &mut QueryConstructTemplate,
+    ) -> Result<TriplePattern> {
+        let s = self.lower_subject(&term.subject)?;
+        let p = self.lower_predicate(&term.predicate)?;
+        let (o, dtc) = self.construct_object(&term.object, &None, out)?;
+        Ok(TriplePattern { s, p, o, dtc })
     }
 
     /// Extract the CONSTRUCT WHERE shorthand's template from the lowered WHERE

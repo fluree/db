@@ -100,16 +100,27 @@ pub(super) fn instantiate_construct_graph(
         Ref::Var(v) => Ok(terms_slot(template, *v)),
         constant => terms.constant_ref(constant, position).map(Slot::Const),
     };
+    let object_slot = |terms: &mut TermResolver<'_>, pattern: &fluree_db_query::TriplePattern| {
+        Ok::<_, FormatError>(match &pattern.o {
+            Term::Var(v) => terms_slot(template, *v),
+            constant => Slot::Const(terms.constant_object(constant, pattern.dtc.as_ref())?),
+        })
+    };
+    let mut term_slots = Vec::with_capacity(template.term_templates().len());
+    for pattern in template.term_templates() {
+        term_slots.push([
+            slot_of(&mut terms, &pattern.s, Position::Subject)?,
+            slot_of(&mut terms, &pattern.p, Position::Predicate)?,
+            object_slot(&mut terms, pattern)?,
+        ]);
+    }
     // Each pattern's slots, graph, the reifiers attached to it, and the
     // components of a constant triple-term object.
     let mut patterns = Vec::with_capacity(template.patterns().len());
     for (i, pattern) in template.patterns().iter().enumerate() {
         let s = slot_of(&mut terms, &pattern.s, Position::Subject)?;
         let p = slot_of(&mut terms, &pattern.p, Position::Predicate)?;
-        let o = match &pattern.o {
-            Term::Var(v) => terms_slot(template, *v),
-            constant => Slot::Const(terms.constant_object(constant, pattern.dtc.as_ref())?),
-        };
+        let o = object_slot(&mut terms, pattern)?;
         let const_term = match &pattern.o {
             Term::Value(FlakeValue::TripleTerm(term)) => terms.term_components(term)?,
             _ => None,
@@ -145,25 +156,46 @@ pub(super) fn instantiate_construct_graph(
     // row's blanks.
     let mut row_bnodes: HashMap<VarId, BlankId> = HashMap::new();
     let mut reifiers: Vec<IrTerm> = Vec::new();
+    // This row's triple terms, by term template; `None` where a component
+    // is unbound.
+    let mut row_terms: Vec<Option<IrTerm>> = Vec::with_capacity(term_slots.len());
 
     for batch in &result.batches {
         for row in 0..batch.len() {
             row_bnodes.clear();
-            let mut resolve =
-                |terms: &mut TermResolver<'_>, slot: &Slot, position| -> Result<Option<IrTerm>> {
-                    Ok(match slot {
-                        Slot::Const(term) => term.clone(),
-                        Slot::Blank(v) => Some(IrTerm::BlankNode(row_blank(
-                            *v,
-                            &mut row_bnodes,
-                            &mut bnode_counter,
-                        ))),
-                        Slot::Var(v) => match batch.get(row, *v) {
-                            Some(binding) => terms.binding(binding, position)?,
-                            None => None,
-                        },
-                    })
-                };
+            let mut resolve_in = |terms: &mut TermResolver<'_>,
+                                  row_terms: &[Option<IrTerm>],
+                                  slot: &Slot,
+                                  position|
+             -> Result<Option<IrTerm>> {
+                Ok(match slot {
+                    Slot::Const(term) => term.clone(),
+                    Slot::Blank(v) => Some(IrTerm::BlankNode(row_blank(
+                        *v,
+                        &mut row_bnodes,
+                        &mut bnode_counter,
+                    ))),
+                    Slot::Var(v) => match batch.get(row, *v) {
+                        Some(binding) => terms.binding(binding, position)?,
+                        None => None,
+                    },
+                    Slot::Term(i) => row_terms[*i].clone(),
+                })
+            };
+            row_terms.clear();
+            for slots in &term_slots {
+                let mut parts: [Option<IrTerm>; 3] = [None, None, None];
+                for (part, (slot, position)) in parts.iter_mut().zip(slots.iter().zip(POSITIONS)) {
+                    *part = resolve_in(&mut terms, &row_terms, slot, position)?;
+                }
+                row_terms.push(match parts {
+                    [Some(s), Some(p), Some(o)] => Some(IrTerm::triple(s, p, o)),
+                    _ => None,
+                });
+            }
+            let mut resolve = |terms: &mut TermResolver<'_>, slot: &Slot, position| {
+                resolve_in(terms, &row_terms, slot, position)
+            };
             'pattern: for (slots, graph_slot, reifier_slots, const_term, asserted) in &patterns {
                 // `?r rdf:reifies ?t` with a triple term bound to ?t (or a
                 // constant one) writes what `?r rdf:reifies <<( s p o )>>`
@@ -246,16 +278,20 @@ pub(super) fn instantiate_construct_graph(
 }
 
 /// A template position: a constant resolved up front, a variable bound per
-/// row, or a template blank node minted per row.
+/// row, a template blank node minted per row, or a triple term built per row
+/// from a term template (an index into `term_templates`).
 enum Slot {
     Const(Option<IrTerm>),
     Var(VarId),
     Blank(VarId),
+    Term(usize),
 }
 
 fn terms_slot(template: &ConstructTemplate, v: VarId) -> Slot {
     if template.bnode_vars.contains(&v) {
         Slot::Blank(v)
+    } else if let Some(i) = template.term_template_of(v) {
+        Slot::Term(i)
     } else {
         Slot::Var(v)
     }

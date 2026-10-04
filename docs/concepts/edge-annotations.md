@@ -537,7 +537,7 @@ A triple term's object may itself be a triple term — `<<( ex:alice ex:says <<(
 These produce a clear error with a span pointing at the offending construct:
 
 - **Annotation on a property-path triple.** `?s ex:p1/ex:p2 ?o {| ... |}` is rejected — the grammar only attaches annotations to simple-predicate triples.
-- **Property paths and nested triple terms in a `CONSTRUCT` template's annotation.** A template annotation block (`{| ... |}`) takes simple predicates only, and a template triple term (`?r rdf:reifies <<( ... )>>`) cannot nest.
+- **Property paths in a `CONSTRUCT` template's annotation.** A template annotation block (`{| ... |}`) takes simple predicates only.
 
 Annotations on literal-valued objects (plain, typed, and language-tagged) are supported on **both** the JSON-LD and SPARQL UPDATE write surfaces — the SPARQL path records the language tag for language-tagged objects so the stored annotation matches the base edge.
 
@@ -564,7 +564,6 @@ The bare-quoted-triple form combined with an annotation tail (`<< :s :p :o >> :p
 Today's surface covers the common LPG / RDF-star use cases. The following are not yet supported and produce a clear validation error rather than silent partial behavior:
 
 - **Annotations on list-occurrence triples.** `@list` membership is in scope as a future extension; the on-disk format already reserves space for it. Today, annotating a list element is rejected at parse time.
-- **Triple-term constants in a `CONSTRUCT` template** other than the object of `rdf:reifies`. A template variable bound to a term (`CONSTRUCT { ?d :mentions ?t }`) writes it.
 
 The mandated SPARQL 1.2 `VERSION "1.2"` prologue declaration is **accepted** (lex-and-skipped): the RDF 1.2 surface runs ungated, so a conformant 1.2 client that emits the declaration parses normally.
 

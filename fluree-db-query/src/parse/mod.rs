@@ -551,7 +551,9 @@ fn parse_construct_query(
                 .filter(|p| {
                     matches!(
                         p,
-                        UnresolvedPattern::Triple(_) | UnresolvedPattern::EdgeAnnotation { .. }
+                        UnresolvedPattern::Triple(_)
+                            | UnresolvedPattern::EdgeAnnotation { .. }
+                            | UnresolvedPattern::TripleTermValue { .. }
                     )
                 })
                 .cloned()
@@ -632,7 +634,9 @@ fn parse_construct_items(
                 patterns.extend(temp_query.patterns.into_iter().filter(|p| {
                     matches!(
                         p,
-                        UnresolvedPattern::Triple(_) | UnresolvedPattern::EdgeAnnotation { .. }
+                        UnresolvedPattern::Triple(_)
+                            | UnresolvedPattern::EdgeAnnotation { .. }
+                            | UnresolvedPattern::TripleTermValue { .. }
                     )
                 }));
             }

@@ -10,7 +10,7 @@
 //! an optional pre-resolved schema bundle). Hydration formatting lives
 //! inside the `Column::Hydration` variant on the SELECT projection.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use fluree_graph_json_ld::ParsedContext;
 
@@ -56,6 +56,11 @@ pub struct ConstructTemplate {
     /// Patterns that are only reified (`r rdf:reifies <<( s p o )>>`), so
     /// their triple is not written. Empty when every pattern is asserted.
     reified_only: HashSet<usize>,
+    /// Triple terms the template writes as values: variable `v` stands for
+    /// the term `term_templates[term_vars[v]]` instantiates to on each row.
+    /// A term template's object may be another term variable, pushed first.
+    term_templates: Vec<TriplePattern>,
+    term_vars: HashMap<VarId, usize>,
 }
 
 /// A reifier attachment in a CONSTRUCT template (see
@@ -84,7 +89,26 @@ impl ConstructTemplate {
             graphs: Vec::new(),
             reifications: Vec::new(),
             reified_only: HashSet::new(),
+            term_templates: Vec::new(),
+            term_vars: HashMap::new(),
         }
+    }
+
+    /// Make `var` stand for the triple term `pattern` instantiates to.
+    pub fn push_term_template(&mut self, var: VarId, pattern: TriplePattern) {
+        self.term_vars.insert(var, self.term_templates.len());
+        self.term_templates.push(pattern);
+    }
+
+    /// The term templates, each after any it nests.
+    pub fn term_templates(&self) -> &[TriplePattern] {
+        &self.term_templates
+    }
+
+    /// The index into [`term_templates`](Self::term_templates) of the term
+    /// `var` stands for.
+    pub fn term_template_of(&self, var: VarId) -> Option<usize> {
+        self.term_vars.get(&var).copied()
     }
 
     /// Append a pattern that writes into `graph` (`None`: the default graph)
@@ -155,6 +179,7 @@ impl ConstructTemplate {
             .chain(self.reifications.iter().map(|r| &r.reifier));
         self.patterns
             .iter()
+            .chain(&self.term_templates)
             .flat_map(TriplePattern::referenced_vars)
             .chain(refs.filter_map(Ref::as_var))
     }

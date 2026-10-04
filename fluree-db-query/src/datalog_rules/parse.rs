@@ -209,6 +209,12 @@ pub(super) fn parse_sparql_rule(
              nodes (every round would mint new ones and the fixpoint would never end)",
         ));
     }
+    if !template.term_templates().is_empty() {
+        return Err(invalid(
+            &label,
+            "the CONSTRUCT template writes a triple term; a rule head cannot",
+        ));
+    }
     if template.patterns().is_empty() {
         return Err(invalid(
             &label,

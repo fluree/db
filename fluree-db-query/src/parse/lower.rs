@@ -1520,16 +1520,59 @@ fn lower_construct_patterns<E: IriEncoder>(
                 };
                 lower_construct_patterns(patterns, Some(&name), encoder, vars, out)?;
             }
-            UnresolvedPattern::TripleTermValue { .. } => {
-                return Err(ParseError::InvalidConstruct(
-                    "a triple-term value in a CONSTRUCT template is not supported".to_string(),
-                ))
+            UnresolvedPattern::TripleTermValue {
+                subject,
+                predicate,
+                term,
+            } => {
+                let o = construct_term_var(term, encoder, vars, out)?;
+                out.push_pattern(
+                    TriplePattern::new(
+                        lower_ref_term(subject, encoder, vars)?,
+                        lower_ref_term(predicate, encoder, vars)?,
+                        Term::Var(o),
+                    ),
+                    graph.cloned(),
+                );
             }
             // Filters, optionals and binds have no meaning in a template.
             _ => {}
         }
     }
     Ok(())
+}
+
+/// A template variable standing for the triple term `term` instantiates to,
+/// its nested term registered first.
+fn construct_term_var<E: IriEncoder>(
+    term: &UnresolvedTermPattern,
+    encoder: &E,
+    vars: &mut VarRegistry,
+    out: &mut ConstructTemplate,
+) -> Result<VarId> {
+    let pattern = match &term.o {
+        UnresolvedTermObject::Value { o, dtc } => lower_triple_pattern(
+            &UnresolvedTriplePattern {
+                s: term.s.clone(),
+                p: term.p.clone(),
+                o: o.clone(),
+                dtc: dtc.clone(),
+            },
+            encoder,
+            vars,
+        )?,
+        UnresolvedTermObject::Term(inner) => {
+            let o = construct_term_var(inner, encoder, vars, out)?;
+            TriplePattern::new(
+                lower_ref_term(&term.s, encoder, vars)?,
+                lower_ref_term(&term.p, encoder, vars)?,
+                Term::Var(o),
+            )
+        }
+    };
+    let var = vars.get_or_insert(&format!("?__tt{}", vars.len()));
+    out.push_term_template(var, pattern);
+    Ok(var)
 }
 
 // ============================================================================

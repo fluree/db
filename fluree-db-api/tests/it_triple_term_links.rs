@@ -3399,3 +3399,121 @@ async fn term_bound_links_probe_in_bulk() {
     let ledger = fluree.ledger(ledger_id).await.expect("reload");
     assert_eq!(answers(ledger, false).await, expected, "after reindex");
 }
+
+/// A CONSTRUCT template writes a triple term under any predicate: constant,
+/// built from each solution, nested, and as `rdf:reifies`' nested object.
+/// A term with an unbound component writes nothing; a blank node inside
+/// one is fresh per solution. JSON-LD templates build the same terms.
+#[tokio::test]
+async fn construct_templates_write_triple_terms_as_values() {
+    use fluree_db_api::format::{format_results_string, FormatterConfig};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree
+        .insert_turtle(
+            support::genesis_ledger(&fluree, "it/triple-term-links:construct-values"),
+            CLAIMS,
+        )
+        .await
+        .expect("insert")
+        .ledger;
+    let lines = |result: &fluree_db_api::QueryResult| {
+        let text = format_results_string(
+            result,
+            &result.context,
+            &ledger.snapshot,
+            &FormatterConfig::ntriples(),
+        )
+        .expect("N-Triples");
+        let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+        lines.sort();
+        lines
+    };
+    let construct = |body: &'static str| {
+        let fluree = &fluree;
+        let ledger = &ledger;
+        async move {
+            let sparql = format!(
+                "PREFIX ex: <http://example.org/>\n\
+                 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n{body}"
+            );
+            support::query_sparql(fluree, ledger, &sparql)
+                .await
+                .unwrap_or_else(|e| panic!("{sparql}: {e}"))
+        }
+    };
+    let ex = |l: &str| format!("<http://example.org/{l}>");
+    let term = |s: &str, p: &str, o: &str| format!("<<( {s} {p} {o} )>>");
+    let says = |o: &str| format!("{} {} {o} .", ex("doc"), ex("says"));
+
+    let result = construct("CONSTRUCT { ex:doc ex:says <<( ex:a ex:b ex:c )>> } WHERE {}").await;
+    assert_eq!(lines(&result), [says(&term(&ex("a"), &ex("b"), &ex("c")))]);
+
+    let knows = |o: &str| term(&ex("alice"), &ex("knows"), &ex(o));
+    let result = construct(
+        "CONSTRUCT { ex:doc ex:says <<( ex:alice ex:knows ?o )>> } \
+         WHERE { ex:alice ex:knows ?o }",
+    )
+    .await;
+    assert_eq!(lines(&result), [says(&knows("bob")), says(&knows("carol"))]);
+
+    let heard = |o: &str| term(&ex("me"), &ex("heard"), &knows(o));
+    let nested = [says(&heard("bob")), says(&heard("carol"))];
+    let result = construct(
+        "CONSTRUCT { ex:doc ex:says <<( ex:me ex:heard <<( ex:alice ex:knows ?o )>> )>> } \
+         WHERE { ex:alice ex:knows ?o }",
+    )
+    .await;
+    assert_eq!(lines(&result), nested);
+
+    let result = construct(
+        "CONSTRUCT { ex:r rdf:reifies <<( ex:me ex:heard <<( ex:alice ex:knows ?o )>> )>> } \
+         WHERE { ex:alice ex:knows ?o }",
+    )
+    .await;
+    let reifies = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
+    assert_eq!(
+        lines(&result),
+        [
+            format!("{} {reifies} {} .", ex("r"), heard("bob")),
+            format!("{} {reifies} {} .", ex("r"), heard("carol")),
+        ]
+    );
+
+    let result =
+        construct("CONSTRUCT { ex:doc ex:says <<( ex:alice ex:knows ?nope )>> } WHERE {}").await;
+    assert!(lines(&result).is_empty(), "{:?}", lines(&result));
+
+    let result = construct(
+        "CONSTRUCT { ex:doc ex:says <<( _:b ex:knows ?o )>> } WHERE { ex:alice ex:knows ?o }",
+    )
+    .await;
+    let blanks: std::collections::HashSet<String> = lines(&result)
+        .iter()
+        .map(|l| {
+            let start = l.find("<<( ").expect("a term") + 4;
+            l[start..].split(' ').next().unwrap().to_string()
+        })
+        .collect();
+    assert_eq!(
+        blanks.len(),
+        2,
+        "a fresh blank node per solution: {blanks:?}"
+    );
+    assert!(blanks.iter().all(|b| b.starts_with("_:")), "{blanks:?}");
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "where": {"@id": "ex:alice", "ex:knows": "?o"},
+        "construct": [{
+            "@id": "ex:doc",
+            "ex:says": {"@id": {
+                "@id": "ex:me",
+                "ex:heard": {"@id": {"@id": "ex:alice", "ex:knows": "?o"}}
+            }}
+        }]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("JSON-LD construct");
+    assert_eq!(lines(&result), nested);
+}

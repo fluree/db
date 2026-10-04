@@ -1097,7 +1097,7 @@ Annotation tails are supported in `INSERT DATA`, `DELETE DATA`, and `INSERT { } 
 - **Simple-predicate triples only.** `?s ex:p1/ex:p2 ?o {| ... |}` (property-path) is rejected.
 - **Triple terms in object position only** (a triple term's object may be another one).
 - **No reserved predicates by hand.** The [system predicates](../reference/vocabulary.md#edge-annotation-predicates-reserved) that back annotations are rejected on every UPDATE clause; mint annotations only through the `~` / `{| |}` surface.
-- **`CONSTRUCT` template annotation blocks take simple predicates only**, and a template triple term cannot nest.
+- **`CONSTRUCT` template annotation blocks take simple predicates only.**
 
 ## SPARQL UPDATE
 
