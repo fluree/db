@@ -192,6 +192,45 @@ async fn dataset_select_streams_via_from() {
     assert_eq!(records.iter().filter(|r| r["type"] == "row").count(), 3);
 }
 
+/// Streamed rows are the `bindings` entries `/query` returns — the documented
+/// contract — so their IRIs are absolute even when the query declares a prefix
+/// for them: a row carries no prefix map to expand a compact IRI against.
+#[tokio::test]
+async fn streamed_rows_match_buffered_sparql_json_iris() {
+    let (fluree, ledger) = seed_three().await;
+    let sparql = "PREFIX a: <http://a.co/> SELECT ?s WHERE { ?s a:name \"Xavier\" }";
+
+    let buffered = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("buffered query")
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let expected = &buffered["results"]["bindings"][0];
+    assert_eq!(
+        expected["s"],
+        json!({"type": "uri", "value": "http://a.co/x"})
+    );
+
+    let records = collect_records(
+        &fluree,
+        ledger,
+        OwnedStreamQuery::Sparql(sparql.to_string()),
+    )
+    .await;
+    let row = records.iter().find(|r| r["type"] == "row").expect("a row");
+    assert_eq!(&row["row"], expected, "single-ledger stream row");
+
+    let from_query = json!({
+        "@context": { "a": "http://a.co/" },
+        "from": "stream/sel:main",
+        "select": ["?s"],
+        "where": { "@id": "?s", "a:name": "Xavier" }
+    });
+    let records = collect_dataset_records(&fluree, from_query).await;
+    let row = records.iter().find(|r| r["type"] == "row").expect("a row");
+    assert_eq!(&row["row"], expected, "dataset stream row");
+}
+
 #[tokio::test]
 async fn multi_ledger_dataset_streams_union() {
     let fluree = FlureeBuilder::memory().build_memory();

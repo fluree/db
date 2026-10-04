@@ -186,7 +186,7 @@ impl Fluree {
         );
 
         let (var_names, head_vars) = sparql::compute_head(&meta);
-        let compactor = IriCompactor::new(graph.snapshot.shared_namespaces(), &meta.context);
+        let compactor = row_compactor(graph.snapshot.shared_namespaces(), &meta.context);
 
         // Head first: flushes an immediate first byte and starts the idle clock
         // fresh before any (potentially slow) batch pull.
@@ -458,7 +458,7 @@ impl Fluree {
             primary.binary_graph(),
         );
         let (var_names, head_vars) = sparql::compute_head(&meta);
-        let compactor = IriCompactor::new(primary.snapshot.shared_namespaces(), &meta.context);
+        let compactor = row_compactor(primary.snapshot.shared_namespaces(), &meta.context);
 
         if tx
             .send(Bytes::from(ndjson_stream::head_record(&var_names)))
@@ -568,6 +568,17 @@ impl BatchSink for CollectSink {
 ///
 /// Uses `QueryError::InvalidQuery` (not `ApiError::query`, which maps to a 500)
 /// so these client mistakes surface as a `4xx`.
+/// The compactor for streamed rows. Rows are the `bindings` entries `/query`
+/// returns, so they take its SPARQL-results profile: absolute IRIs, since a
+/// row carries no prefix map to expand a compact one against.
+fn row_compactor(
+    namespaces: std::sync::Arc<std::collections::HashMap<u16, String>>,
+    context: &crate::ParsedContext,
+) -> IriCompactor {
+    IriCompactor::new(namespaces, context)
+        .with_absolute_iris(crate::format::FormatterConfig::sparql_json().absolute_iris)
+}
+
 fn ensure_streamable(output: &fluree_db_query::ir::QueryOutput) -> Result<()> {
     let reject = |what: &str| {
         Err(ApiError::Query(fluree_db_query::QueryError::InvalidQuery(
