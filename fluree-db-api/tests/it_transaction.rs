@@ -159,45 +159,94 @@ async fn commits_over_a_concurrent_write_to_other_subjects() {
     );
 }
 
-/// A commit that changes what an operation read: the operations stage again
-/// over it, as a single write does when it loses a race.
+/// A commit that changes what an operation's `WHERE` matches: the operations
+/// stage again over it, as a single write does when it loses a race.
 #[tokio::test]
-async fn restages_over_a_concurrent_write_it_read() {
+async fn restages_over_a_concurrent_write_its_update_matches() {
     let fluree = fluree().await;
-    fluree
-        .graph(LEDGER)
-        .transact()
-        .insert(&json!({
-            "@context": { "ex": "http://example.org/" },
-            "@id": "ex:alice", "ex:name": "Alice", "ex:age": 30,
-        }))
-        .commit()
-        .await
-        .unwrap();
+    insert_alice(&fluree, 30).await;
 
     let mut txn = fluree.begin_transaction(LEDGER, None).await.unwrap();
     txn.stage(TxnOperation::SparqlUpdate(BIRTHDAY.into()))
         .await
         .unwrap();
-    assert_eq!(
-        people(&fluree, &txn.db().await.unwrap()).await,
-        vec![json!(["Alice", 31])]
-    );
-
-    fluree
-        .graph(LEDGER)
-        .transact()
-        .upsert(&json!({
-            "@context": { "ex": "http://example.org/" },
-            "@id": "ex:alice", "ex:age": 50,
-        }))
-        .commit()
-        .await
-        .unwrap();
+    set_alice_age(&fluree, 50).await;
 
     txn.commit(CommitOpts::default()).await.unwrap();
     assert_eq!(
         people(&fluree, &head(&fluree).await).await,
         vec![json!(["Alice", 51])]
     );
+}
+
+/// A transaction that was read may have decided its writes from what it read;
+/// staging them again over a commit it never saw would lose that commit's
+/// update. It refuses instead.
+#[tokio::test]
+async fn a_read_transaction_conflicts_when_the_ledger_moved() {
+    let fluree = fluree().await;
+    insert_alice(&fluree, 30).await;
+
+    let mut txn = fluree.begin_transaction(LEDGER, None).await.unwrap();
+    let ages = people(&fluree, &txn.db().await.unwrap()).await;
+    assert_eq!(ages, vec![json!(["Alice", 30])]);
+    // Decided from the read: 30 + 1.
+    txn.stage(TxnOperation::Upsert(json!({
+        "@context": { "ex": "http://example.org/" },
+        "@id": "ex:alice", "ex:age": 31,
+    })))
+    .await
+    .unwrap();
+    set_alice_age(&fluree, 50).await;
+
+    let err = txn.commit(CommitOpts::default()).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_api::TransactError::CommitConflict { .. })
+        ),
+        "{err}"
+    );
+    assert_eq!(
+        people(&fluree, &head(&fluree).await).await,
+        vec![json!(["Alice", 50])]
+    );
+
+    // Unmoved, a read transaction commits as usual.
+    let mut txn = fluree.begin_transaction(LEDGER, None).await.unwrap();
+    txn.db().await.unwrap();
+    txn.stage(TxnOperation::SparqlUpdate(BIRTHDAY.into()))
+        .await
+        .unwrap();
+    txn.commit(CommitOpts::default()).await.unwrap();
+    assert_eq!(
+        people(&fluree, &head(&fluree).await).await,
+        vec![json!(["Alice", 51])]
+    );
+}
+
+async fn insert_alice(fluree: &Fluree, age: i64) {
+    fluree
+        .graph(LEDGER)
+        .transact()
+        .insert(&json!({
+            "@context": { "ex": "http://example.org/" },
+            "@id": "ex:alice", "ex:name": "Alice", "ex:age": age,
+        }))
+        .commit()
+        .await
+        .unwrap();
+}
+
+async fn set_alice_age(fluree: &Fluree, age: i64) {
+    fluree
+        .graph(LEDGER)
+        .transact()
+        .upsert(&json!({
+            "@context": { "ex": "http://example.org/" },
+            "@id": "ex:alice", "ex:age": age,
+        }))
+        .commit()
+        .await
+        .unwrap();
 }

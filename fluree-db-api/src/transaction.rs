@@ -8,10 +8,18 @@
 //! nets its parts.
 //!
 //! The operations stage against the ledger's state when the transaction
-//! began. If another commit lands before this one, the commit re-bases the
-//! staged result over it when the two touched different subjects, and
-//! otherwise stages every operation again against the new head, as a single
-//! write does when it loses a race.
+//! began. If another commit lands before this one, what happens depends on
+//! whether the transaction was read:
+//!
+//! - **Not read:** each operation decides its own effect (an update's
+//!   `WHERE` is evaluated where it is staged), so the commit re-bases the
+//!   staged result over the other commit when the two touched different
+//!   subjects, and otherwise stages every operation again against the new
+//!   head, as a single write does when it loses a race.
+//! - **Read through [`Transaction::db`]:** the caller may have decided what to
+//!   write from what it read, and staging again would replay those decisions
+//!   against data they never saw — a lost update. The commit fails with
+//!   [`TransactError::CommitConflict`]; run the transaction again.
 
 use crate::ledger_manager::RefreshOpts;
 use crate::tx::{SequentialStager, StageResult, TransactResultRef};
@@ -19,8 +27,9 @@ use crate::tx_builder::{is_retryable_commit_conflict, OpPlan, TransactOperation}
 use crate::{ApiError, Fluree, GraphDb, PolicyContext, Result};
 use fluree_db_core::ContentId;
 use fluree_db_ledger::{IndexConfig, LedgerState};
-use fluree_db_transact::{CommitOpts, TxnOpts, TxnType};
+use fluree_db_transact::{CommitOpts, TransactError, TxnOpts, TxnType};
 use serde_json::Value as JsonValue;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// One write in a [`Transaction`].
 #[derive(Clone, Debug)]
@@ -66,6 +75,9 @@ pub struct Transaction {
     operations: Vec<TxnOperation>,
     policy: Option<PolicyContext>,
     index_config: IndexConfig,
+    /// Whether [`Self::db`] was called: the commit then requires the head it
+    /// began on.
+    read: AtomicBool,
 }
 
 impl Fluree {
@@ -89,6 +101,7 @@ impl Fluree {
             operations: Vec::new(),
             policy,
             index_config: crate::server_defaults::default_index_config(),
+            read: AtomicBool::new(false),
         })
     }
 }
@@ -143,7 +156,11 @@ impl Transaction {
 
     /// The ledger as the staged operations leave it, for queries. Apply
     /// policy to it as to any other view.
+    ///
+    /// Reading makes the commit conditional on the ledger not having moved
+    /// since the transaction began; see the module docs.
     pub async fn db(&self) -> Result<GraphDb> {
+        self.read.store(true, Ordering::Relaxed);
         let view = GraphDb::from_ledger_state(self.stager.state());
         self.fluree.resolve_and_attach_config(view).await
     }
@@ -161,7 +178,9 @@ impl Transaction {
             operations,
             policy,
             index_config,
+            read,
         } = self;
+        let read = read.into_inner();
         let handle = fluree.ledger_cached(&ledger_id).await?;
         let base_t = base.t();
         let mut prestaged = Some(stager.finish().await?);
@@ -171,6 +190,12 @@ impl Transaction {
             let guard = handle.lock_for_write().await;
             let unchanged = guard.state().t() == base_t
                 && guard.state().head_commit_id.as_ref() == base_head.as_ref();
+            if read && !unchanged {
+                return Err(ApiError::Transact(TransactError::CommitConflict {
+                    expected_t: base_t,
+                    head_t: guard.state().t(),
+                }));
+            }
             let stage = match prestaged.take() {
                 Some(stage) if unchanged => stage,
                 Some(stage) => {

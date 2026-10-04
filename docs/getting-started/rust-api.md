@@ -665,8 +665,10 @@ to parse, is denied by policy, or violates SHACL returns an error and is left
 out, and the transaction carries on without it. `db()` reads the staged state.
 `commit` writes everything as one commit, keeping only the net change: a fact
 one write adds and a later one removes is not committed. If another commit
-lands first, the staged result is re-based over it when they touched
-different subjects, and otherwise staged again on the new head.
+lands first, a transaction that was never read is re-based over it when they
+touched different subjects, and otherwise staged again on the new head. One
+that was read through `db()` fails with `TransactError::CommitConflict`
+instead — its writes may rest on what it read — and should be run again.
 
 ```rust
 use fluree_db_api::{CommitOpts, FlureeBuilder, Result, TxnOperation};
