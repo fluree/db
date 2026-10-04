@@ -245,6 +245,8 @@ fn push_nt_term(out: &mut String, term: &Term) {
             language,
         } => {
             push_quoted(out, value);
+            // Tags are case-insensitive; the canonical form is lowercase.
+            let language = language.as_deref().map(str::to_ascii_lowercase);
             push_literal_suffix(out, datatype, language.as_deref(), |out, iri| {
                 syntax::push_iri_ref(out, iri);
             });

@@ -15,32 +15,46 @@ const HEX: &[u8; 16] = b"0123456789ABCDEF";
 /// Escape `s` as the body of a `"…"` string literal, in canonical N-Triples
 /// form (also valid Turtle, N-Quads and TriG): `"` `\` and the control
 /// characters with a short escape use it (`\t \b \n \r \f`), every other C0
-/// control and DEL is `\uXXXX`, and everything else is written as is.
+/// control, DEL and the noncharacters U+FFFE / U+FFFF are `\uXXXX`, and
+/// everything else is written as is.
 pub fn escape_string<E>(s: &str, mut put: impl FnMut(&str) -> Result<(), E>) -> Result<(), E> {
     let bytes = s.as_bytes();
     let mut start = 0;
-    for (i, &b) in bytes.iter().enumerate() {
-        let short: &str = match b {
-            b'"' => "\\\"",
-            b'\\' => "\\\\",
-            b'\t' => "\\t",
-            0x08 => "\\b",
-            b'\n' => "\\n",
-            b'\r' => "\\r",
-            0x0C => "\\f",
-            0x00..=0x1F | 0x7F => "",
-            _ => continue,
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // U+FFFE / U+FFFF are `EF BF BE` / `EF BF BF`.
+        let (escape, len): (&str, usize) = match b {
+            b'"' => ("\\\"", 1),
+            b'\\' => ("\\\\", 1),
+            b'\t' => ("\\t", 1),
+            0x08 => ("\\b", 1),
+            b'\n' => ("\\n", 1),
+            b'\r' => ("\\r", 1),
+            0x0C => ("\\f", 1),
+            0x00..=0x1F | 0x7F => ("", 1),
+            0xEF if bytes.get(i + 1) == Some(&0xBF) && bytes.get(i + 2) == Some(&0xBE) => {
+                ("\\uFFFE", 3)
+            }
+            0xEF if bytes.get(i + 1) == Some(&0xBF) && bytes.get(i + 2) == Some(&0xBF) => {
+                ("\\uFFFF", 3)
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
         };
-        // Every escaped byte is ASCII, so `i` is a char boundary.
+        // Every escaped sequence starts a char, so `i` is a char boundary.
         if start < i {
             put(&s[start..i])?;
         }
-        if short.is_empty() {
+        if escape.is_empty() {
             put(ascii(&uchar(b)))?;
         } else {
-            put(short)?;
+            put(escape)?;
         }
-        start = i + 1;
+        i += len;
+        start = i;
     }
     if start < bytes.len() {
         put(&s[start..])?;
@@ -310,6 +324,11 @@ mod tests {
         assert_eq!(string("\u{0}\u{1f}\u{7f}"), r"\u0000\u001F\u007F");
         // C1 controls and non-ASCII are legal in a string literal.
         assert_eq!(string("\u{85}é😀"), "\u{85}é😀");
+        // The two noncharacters are escaped; their neighbours are not.
+        assert_eq!(
+            string("a\u{FFFE}b\u{FFFF}\u{FFFD}\u{EFBF}"),
+            "a\\uFFFEb\\uFFFF\u{FFFD}\u{EFBF}"
+        );
     }
 
     #[test]

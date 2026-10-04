@@ -602,6 +602,8 @@ GRAPH <http://example.org/graphs/inventory> {
 }
 ```
 
+Default-graph triples can also be wrapped in an unlabeled `{ ... }` block. Graph labels must be IRIs; a blank-node label (`_:g { ... }`, `[] { ... }`) is refused. Inside a labeled block, blank-node property lists (`[ ... ]`, `[]`) and collections (`( ... )`) are not supported yet; use labeled blank nodes (`_:b`) there instead.
+
 ### Submitting TriG Data
 
 TriG is supported on the **insert** and **upsert** endpoints, and on **sync** for replacing one named graph's contents ([Sync](sync.md#payload-formats)). Use the `application/trig` content type:

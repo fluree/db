@@ -1680,7 +1680,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 /// Unescape local name escape sequences (`\x` → `x`).
 ///
 /// Only called when `\` is detected in the local part (extremely rare).
-fn unescape_pn_local(local: &str) -> String {
+pub fn unescape_pn_local(local: &str) -> String {
     let mut result = String::with_capacity(local.len());
     let mut chars = local.chars();
     while let Some(c) = chars.next() {
