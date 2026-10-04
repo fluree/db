@@ -12,13 +12,45 @@ use serde_json::Value as JsonValue;
 use std::future::Future;
 use std::time::Duration;
 
-/// `{"max_fuel": float | None, "timeout": float | None, "stats": bool}`
-#[derive(FromPyObject, Clone, Copy, Default)]
+/// `{"max_fuel": float | None, "timeout": float | None, "stats": bool,
+/// "cancel": Canceller | None}`
+#[derive(FromPyObject, Clone, Default)]
 #[pyo3(from_item_all)]
 pub(crate) struct Controls {
     max_fuel: Option<f64>,
     timeout: Option<f64>,
     stats: bool,
+    #[pyo3(from_py_with = cancellation)]
+    cancel: Option<QueryCancellation>,
+}
+
+fn cancellation(obj: &Bound<'_, PyAny>) -> PyResult<Option<QueryCancellation>> {
+    if obj.is_none() {
+        return Ok(None);
+    }
+    let canceller = obj.cast::<Canceller>()?;
+    Ok(Some(canceller.get().cancellation.clone()))
+}
+
+/// Cancels the queries it is passed to, from any thread: how an asyncio task
+/// that stops waiting stops the query it was waiting on.
+#[pyclass(frozen, module = "fluree._fluree")]
+pub(crate) struct Canceller {
+    cancellation: QueryCancellation,
+}
+
+#[pymethods]
+impl Canceller {
+    #[new]
+    fn new() -> Self {
+        Self {
+            cancellation: QueryCancellation::new(),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancellation.cancel();
+    }
 }
 
 impl Controls {
@@ -36,20 +68,33 @@ impl Controls {
         self.timeout
     }
 
-    /// Run a query future built around a cancellation handle, enforcing the
-    /// timeout and Ctrl-C through it.
+    /// The handle that cancels a query run under these controls.
+    pub(crate) fn cancellation(&self) -> QueryCancellation {
+        // Not `unwrap_or_default`: `QueryCancellation::default()` is the
+        // disabled handle, which nothing can cancel.
+        #[allow(clippy::unwrap_or_default)]
+        self.cancel.clone().unwrap_or_else(QueryCancellation::new)
+    }
+
+    /// Run a query future built around a cancellation handle (and these
+    /// controls), enforcing the timeout and Ctrl-C through it.
     pub(crate) fn run<F>(
         self,
         py: Python<'_>,
-        query: impl FnOnce(QueryCancellation) -> F,
+        query: impl FnOnce(QueryCancellation, Self) -> F,
     ) -> PyResult<Answer>
     where
         F: Future<Output = Result<Answer, Failure>> + Send,
     {
-        let cancellation = QueryCancellation::new();
+        let cancellation = self.cancellation();
         let timeout = self.timeout.map(Duration::from_secs_f64);
-        block_on_cancellable(py, &cancellation, timeout, query(cancellation.clone()))?
-            .map_err(PyErr::from)
+        block_on_cancellable(
+            py,
+            &cancellation,
+            timeout,
+            query(cancellation.clone(), self),
+        )?
+        .map_err(PyErr::from)
     }
 
     pub(crate) fn answer(

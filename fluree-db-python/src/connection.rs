@@ -17,7 +17,7 @@ use fluree_db_api::{
     build_transact_policy_context, export::ExportFormat, ApiError, CommitDetail, CommitReceipt,
     CommitRef, DataSetDb, DropMode, Fluree, FlureeBuilder, FormatterConfig, GovernanceOptions,
     GraphDb, GraphSnapshotQueryBuilder, OwnedStreamQuery, ParsedContext, PolicyContext,
-    QueryCancellation, QueryExecutionOptions, TimeSpec, Tracker, TxnOperation,
+    QueryExecutionOptions, TimeSpec, Tracker, TxnOperation,
 };
 use fluree_db_api::{CommitOpts, GraphPayload, GraphSel, SyncGraphOpts, TxnOpts};
 use fluree_db_core::commit::{TxnMetaEntry, TxnMetaValue};
@@ -449,7 +449,7 @@ impl Connection {
         let fluree = &*self.fluree;
         let controls = controls.unwrap_or_default();
         let (id, policy) = (&id, policy.as_ref());
-        let answer = controls.run(py, |cancel| async move {
+        let answer = controls.run(py, |cancel, controls| async move {
             let db = load(fluree, id, spec, policy).await?;
             execute!(
                 controls,
@@ -480,7 +480,7 @@ impl Connection {
         let fluree = &*self.fluree;
         let controls = controls.unwrap_or_default();
         let id = &id;
-        let answer = controls.run(py, |cancel| async move {
+        let answer = controls.run(py, |cancel, controls| async move {
             // This path takes no view, so the default context goes on the query.
             if let Some(obj) = query
                 .as_object_mut()
@@ -510,7 +510,7 @@ impl Connection {
         let policy = governance(policy)?;
         let fluree = &*self.fluree;
         let controls = controls.unwrap_or_default();
-        let answer = controls.run(py, |cancel| async move {
+        let answer = controls.run(py, |cancel, controls| async move {
             let builder = fluree
                 .query_from()
                 .sparql(sparql)
@@ -537,7 +537,7 @@ impl Connection {
         let fluree = &*self.fluree;
         let controls = controls.unwrap_or_default();
         let query = &query;
-        let answer = controls.run(py, |cancel| async move {
+        let answer = controls.run(py, |cancel, controls| async move {
             execute!(controls, cancel, fluree.query_from().jsonld(query))
         })?;
         answer.into_py(py, None)
@@ -847,7 +847,7 @@ impl Snapshot {
     ) -> PyResult<Bound<'py, PyAny>> {
         let controls = controls.unwrap_or_default();
         let (fluree, db) = (&*self.fluree, &*self.db);
-        let answer = controls.run(py, |cancel| async move {
+        let answer = controls.run(py, |cancel, controls| async move {
             execute!(
                 controls,
                 cancel,
@@ -869,7 +869,7 @@ impl Snapshot {
         let query = to_json(query)?;
         let controls = controls.unwrap_or_default();
         let (fluree, db, query) = (&*self.fluree, &*self.db, &query);
-        let answer = controls.run(py, |cancel| async move {
+        let answer = controls.run(py, |cancel, controls| async move {
             execute!(
                 controls,
                 cancel,
@@ -925,7 +925,7 @@ fn start_stream(
             (OwnedStreamQuery::JsonLd(json), columns)
         }
     };
-    let cancellation = QueryCancellation::new();
+    let cancellation = controls.cancellation();
     let options = QueryExecutionOptions::new().with_cancellation(cancellation.clone());
     // A single-ledger dataset keeps the view's policy with the producer.
     let dataset = DataSetDb::single(db);

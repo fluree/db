@@ -95,15 +95,25 @@ class RowStream(Iterator[tuple[Any, ...]]):
 
     def __next__(self) -> tuple[Any, ...]:
         while not self._buffer:
-            if self._native is None:
+            if not self._fill():
                 raise StopIteration
-            batch = self._native.next_batch(self._batch_size)
-            if self._columns is None:
-                self._columns = self._native.columns
-            if batch is None:
-                self._native = None
-                raise StopIteration
-            self._buffer.extend(batch)
+        return self._take()
+
+    def _fill(self) -> bool:
+        """Read the next batch into the buffer; ``False`` once the stream ends."""
+        native = self._native
+        if native is None:
+            return False
+        batch = native.next_batch(self._batch_size)
+        if self._columns is None:
+            self._columns = native.columns
+        if batch is None:
+            self._native = None
+            return False
+        self._buffer.extend(batch)
+        return True
+
+    def _take(self) -> tuple[Any, ...]:
         if self._row is None:
             self._row = _row_type(self._columns or [])
         return self._row._make(map(to_python, self._buffer.popleft()))

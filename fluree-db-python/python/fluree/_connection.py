@@ -805,20 +805,30 @@ class QueryProfile:
     time: _dt.timedelta | None
 
 
-def _controls(max_fuel: float | None, timeout: float | None, stats: bool) -> dict[str, Any] | None:
+def _controls(
+    max_fuel: float | None, timeout: float | None, stats: bool, cancel: _fluree.Canceller | None = None
+) -> dict[str, Any] | None:
     if timeout is not None and timeout <= 0:
         raise InvalidRequestError("timeout must be positive")
-    if not stats and max_fuel is None and timeout is None:
+    if not stats and max_fuel is None and timeout is None and cancel is None:
         return None
     return {
         "max_fuel": None if max_fuel is None else float(max_fuel),
         "timeout": None if timeout is None else float(timeout),
         "stats": stats,
+        "cancel": cancel,
     }
 
 
-def _execute(run: Any, query: Query, max_fuel: float | None, timeout: float | None, stats: bool) -> Any:
-    controls = _controls(max_fuel, timeout, stats)
+def _execute(
+    run: Any,
+    query: Query,
+    max_fuel: float | None,
+    timeout: float | None,
+    stats: bool,
+    cancel: _fluree.Canceller | None = None,
+) -> Any:
+    controls = _controls(max_fuel, timeout, stats, cancel)
     sparql = isinstance(query, str) and not _looks_like_json(query)
     raw = run(query if sparql else _json_query(query), sparql, controls)
     result, measured = raw if stats else (raw, None)
@@ -827,8 +837,14 @@ def _execute(run: Any, query: Query, max_fuel: float | None, timeout: float | No
     return (result, measured) if stats else result
 
 
-def _profile(run: Any, query: Query, max_fuel: float | None, timeout: float | None) -> QueryProfile:
-    result, stats = _execute(run, query, max_fuel, timeout, stats=True)
+def _profile(
+    run: Any,
+    query: Query,
+    max_fuel: float | None,
+    timeout: float | None,
+    cancel: _fluree.Canceller | None = None,
+) -> QueryProfile:
+    result, stats = _execute(run, query, max_fuel, timeout, True, cancel)
     time = stats["time"]
     elapsed = None
     if time is not None and time.endswith("ms"):

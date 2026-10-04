@@ -149,6 +149,28 @@ fits: `NotFoundError` is a `LookupError`, `InvalidRequestError` a `ValueError`,
 `PermissionDeniedError` a `PermissionError`, `QueryTimeoutError` a
 `TimeoutError`.
 
+## asyncio
+
+`fluree.aio` is the same API with coroutines, for FastAPI and other asyncio
+applications:
+
+```python
+import fluree.aio
+
+async with fluree.aio.connect("./data") as conn:
+    people = await conn.ledger("people")
+    rows = await people.query("SELECT ...")
+    async for row in people.stream("SELECT ..."):
+        ...
+    async with people.transaction() as txn:
+        await txn.insert({...})
+```
+
+Each call runs on a worker thread while the event loop carries on.
+Cancelling a task that awaits a query (`asyncio.timeout`, a client that
+disconnects) stops the query in the engine; a write already under way still
+completes.
+
 ## Concurrency
 
 Engine calls release the GIL, so threads can query in parallel. Several

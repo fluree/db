@@ -50,7 +50,12 @@ impl RowStream {
 
     fn finish(&self) {
         self.cancellation.cancel();
-        self.records.lock().expect("stream lock").take();
+        // A read in progress on another thread holds the lock with the GIL
+        // released; waiting for it here, with the GIL held, would deadlock.
+        // It sees the cancelled producer end the stream instead.
+        if let Ok(mut records) = self.records.try_lock() {
+            records.take();
+        }
     }
 }
 
