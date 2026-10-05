@@ -330,7 +330,7 @@ pub(super) fn bare_ledger_id(s: &str) -> String {
 /// downstream parser produces the user-facing parse error rather than this
 /// layer attempting an opaque rewrite.
 pub fn apply_snapshot_to_sparql(sparql: &str, snapshot: &EnvelopeSnapshot) -> String {
-    use fluree_db_sparql::ast::{IriValue, QueryBody};
+    use fluree_db_sparql::ast::QueryBody;
 
     let parsed = fluree_db_sparql::parse_sparql(sparql);
     let Some(ast) = parsed.ast.as_ref() else {
@@ -347,32 +347,32 @@ pub fn apply_snapshot_to_sparql(sparql: &str, snapshot: &EnvelopeSnapshot) -> St
         return sparql.to_string();
     };
 
-    // Collect (span, replacement) pairs. We work with full IRIs only; prefixed
-    // names need context expansion and are skipped (they also can't be ledger
-    // references in current Fluree SPARQL).
+    // Collect (span, replacement) pairs. Each member is read as the engine's
+    // dataset conversion reads it (a full IRI as written, a prefixed name as
+    // `prefix:local`), so a member is pinned exactly when validation counted
+    // its ledger, whichever form names it. The replacement is always a full
+    // IRI naming the same ledger.
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     for iri in ds.default_graphs.iter().chain(ds.named_graphs.iter()) {
-        if let IriValue::Full(value) = &iri.value {
-            let value_str: &str = value.as_ref();
-            let bare = bare_ledger_id(value_str);
-            if let Some(t) = snapshot.ledgers.get(&bare) {
-                // Defensive: skip IRIs that already carry an explicit
-                // temporal pin. Validation rejects collisions when
-                // envelope asOf is set, so this only fires in the
-                // no-asOf path where an inner pin should win.
-                if string_has_explicit_pin(value_str) {
-                    continue;
-                }
-                // Splice `@t:N` BEFORE any `#fragment` so named-graph
-                // selectors (e.g. `<ledger#txn-meta>`) are pinned
-                // correctly: `<ledger@t:42#txn-meta>`. The dataset parser
-                // reattaches the fragment after temporal parsing.
-                let replacement = match value_str.split_once('#') {
-                    Some((base, fragment)) => format!("<{base}@t:{t}#{fragment}>"),
-                    None => format!("<{value_str}@t:{t}>"),
-                };
-                edits.push((iri.span.start, iri.span.end, replacement));
+        let written = crate::dataset::iri_value_to_string(&iri.value);
+        let bare = bare_ledger_id(&written);
+        if let Some(t) = snapshot.ledgers.get(&bare) {
+            // Defensive: skip IRIs that already carry an explicit
+            // temporal pin. Validation rejects collisions when
+            // envelope asOf is set, so this only fires in the
+            // no-asOf path where an inner pin should win.
+            if string_has_explicit_pin(&written) {
+                continue;
             }
+            // Splice `@t:N` BEFORE any `#fragment` so named-graph
+            // selectors (e.g. `<ledger#txn-meta>`) are pinned
+            // correctly: `<ledger@t:42#txn-meta>`. The dataset parser
+            // reattaches the fragment after temporal parsing.
+            let replacement = match written.split_once('#') {
+                Some((base, fragment)) => format!("<{base}@t:{t}#{fragment}>"),
+                None => format!("<{written}@t:{t}>"),
+            };
+            edits.push((iri.span.start, iri.span.end, replacement));
         }
     }
 
@@ -527,6 +527,19 @@ mod tests {
         let out = apply_snapshot_to_sparql(sparql, &snap);
         assert!(out.contains("FROM <ledgerA@t:42>"));
         assert!(out.contains("FROM NAMED <ledgerB@t:99>"));
+    }
+
+    /// A prefixed name in `FROM` names the ledger written there (`mq:p2`), so
+    /// it is pinned like the bracketed IRI of the same ledger.
+    #[test]
+    fn sparql_prefixed_from_is_pinned_as_the_ledger_it_names() {
+        let snap = snapshot(&[("mq:p1", 3), ("mq:p2", 7)]);
+        let sparql = "SELECT ?s FROM <mq:p1> FROM mq:p2 FROM NAMED mq:p2 WHERE { ?s ?p ?o }";
+        let out = apply_snapshot_to_sparql(sparql, &snap);
+        assert_eq!(
+            out,
+            "SELECT ?s FROM <mq:p1@t:3> FROM <mq:p2@t:7> FROM NAMED <mq:p2@t:7> WHERE { ?s ?p ?o }"
+        );
     }
 
     #[test]

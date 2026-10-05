@@ -23,7 +23,9 @@ use std::sync::Arc;
 
 use crate::support::{genesis_ledger, MemoryFluree, MemoryLedger};
 use fluree_db_api::query::multi::MultiQueryError;
-use fluree_db_api::query::multi::{MultiQueryBounds, MultiQueryRequest, MultiQueryStatus};
+use fluree_db_api::query::multi::{
+    MultiQueryBounds, MultiQueryRequest, MultiQueryStatus, MultiQueryValidationError,
+};
 use fluree_db_api::{FlureeBuilder, FormatterConfig};
 use serde_json::json;
 
@@ -300,11 +302,11 @@ async fn multi_query_validation_error_surfaces_as_typed_variant() {
 
 #[tokio::test]
 async fn multi_query_partial_failure_per_alias_via_in_process_api() {
-    // Two aliases — one good JSON-LD, one syntactically-broken SPARQL.
-    // Validation passes (the multi-query validator defers SPARQL
-    // grammar to the downstream parser); the dispatcher's per-alias
-    // error path lands the broken SPARQL in `response.errors` while the
-    // good alias produces results. Status is "partial."
+    // Two aliases — one good JSON-LD, one SPARQL that parses but fails when
+    // it runs (its WHERE uses a prefix it never declares). Validation
+    // passes; the dispatcher's per-alias error path lands the failing
+    // SPARQL in `response.errors` while the good alias produces results.
+    // Status is "partial."
     let fluree = Arc::new(FlureeBuilder::memory().build_memory());
     ignore_ledgers(seed_two_ledgers(&fluree).await);
 
@@ -319,7 +321,7 @@ async fn multi_query_partial_failure_per_alias_via_in_process_api() {
             },
             "bad": {
                 "language": "sparql",
-                "query": "SELECT ?x FROM <mq:users> WHERE { this is not valid SPARQL }"
+                "query": "SELECT ?x FROM <mq:users> WHERE { ?x undeclared:p ?y }"
             }
         }
     }))
@@ -330,11 +332,51 @@ async fn multi_query_partial_failure_per_alias_via_in_process_api() {
         .envelope(envelope)
         .execute()
         .await
-        .expect("envelope executes even with one broken sub-query");
+        .expect("envelope executes even with one failing sub-query");
 
     assert_eq!(response.status, MultiQueryStatus::Partial);
     assert!(response.results.contains_key("good"));
     assert!(response.errors.contains_key("bad"));
+}
+
+#[tokio::test]
+async fn multi_query_sparql_sub_query_that_does_not_parse_is_refused_via_in_process_api() {
+    // A SPARQL sub-query that does not parse names no dataset the envelope
+    // can check or pin, so the envelope is refused with the parser's error.
+    let fluree = Arc::new(FlureeBuilder::memory().build_memory());
+    ignore_ledgers(seed_two_ledgers(&fluree).await);
+
+    let envelope: MultiQueryRequest = serde_json::from_value(json!({
+        "queries": {
+            "good": {
+                "language": "jsonld",
+                "query": { "@context": { "schema": "http://schema.org/" },
+                           "from": "mq:users",
+                           "select": ["?n"],
+                           "where": { "@id": "?u", "schema:name": "?n" } }
+            },
+            "bad": {
+                "language": "sparql",
+                "query": "SELECT ?x FROM <mq:users> WHERE { this is not valid SPARQL }"
+            }
+        }
+    }))
+    .expect("envelope deserialises");
+
+    let err = fluree
+        .multi_query()
+        .envelope(envelope)
+        .execute()
+        .await
+        .expect_err("a sub-query that does not parse refuses the envelope");
+    assert!(
+        matches!(
+            err,
+            MultiQueryError::Validation(MultiQueryValidationError::SparqlUnreadable { ref alias, .. })
+                if alias == "bad"
+        ),
+        "got: {err:?}"
+    );
 }
 
 // =============================================================================

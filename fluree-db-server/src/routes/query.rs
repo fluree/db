@@ -2453,14 +2453,27 @@ pub(crate) fn normalize_ledger_scoped_from(ledger_id: &str, query: &mut JsonValu
                 )));
             }
         }
-        JsonValue::Object(m) => {
-            // Object form must name this ledger in @id (time/graph selectors ok).
-            if let Some(id) = m.get("@id").and_then(|v| v.as_str()) {
-                let base = base_ledger_id(id)?;
-                let base_path = base_ledger_id(ledger_id)?;
-                if base != base_path {
+        JsonValue::Object(ref m) => {
+            // Object form must name this ledger (time/graph selectors ok). Read
+            // it as the dataset parser reads it — one source, named by `@id`
+            // or else `id` — and compare canonical ledger ids, as the read
+            // checks do, so every spelling of this ledger passes and no
+            // spelling of another one does. An object that names no source is
+            // refused here, whichever lane the query would take.
+            let sources = DatasetSpec::default_graph_sources(&from_val)
+                .map_err(|e| ServerError::bad_request(e.to_string()))?;
+            let path_id = crate::error::scope_id(ledger_id)?;
+            let key = if m.contains_key("@id") {
+                "from.@id"
+            } else {
+                "from.id"
+            };
+            for source in &sources {
+                let base = base_ledger_id(&source.identifier)?;
+                if crate::error::scope_id(&base).ok().as_ref() != Some(&path_id) {
                     return Err(ServerError::bad_request(format!(
-                        "Ledger mismatch: endpoint ledger is '{ledger_id}' but query 'from.@id' targets '{id}'"
+                        "Ledger mismatch: endpoint ledger is '{ledger_id}' but query '{key}' targets '{}'",
+                        source.identifier
                     )));
                 }
             }
@@ -4684,15 +4697,16 @@ async fn execute_dataset_query(
 
 use fluree_db_api::query::multi::MultiQueryError;
 use fluree_db_api::query::multi::{
-    AsOf, MultiQueryBounds, MultiQueryRequest, MultiQuerySubquery, MultiQueryValidationError,
-    SubqueryLanguage,
+    AsOf, EnvelopeLedgers, MultiQueryBounds, MultiQueryRequest, MultiQuerySubquery,
+    MultiQueryValidationError, SubqueryLanguage,
 };
 
 fn collect_multi_query_min_t_requirements(
     headers: &FlureeHeaders,
     envelope: &MultiQueryRequest,
-    distinct_ledgers: &BTreeSet<String>,
+    ledgers: &EnvelopeLedgers,
 ) -> Result<BTreeMap<String, i64>> {
+    let distinct_ledgers = &ledgers.distinct;
     let mut requirements = BTreeMap::new();
 
     let envelope_min_t = min_t_from_opts(envelope.opts.as_ref())?.or(headers.min_t);
@@ -4708,7 +4722,7 @@ fn collect_multi_query_min_t_requirements(
         }
     }
 
-    for sub in envelope.queries.values() {
+    for (alias, sub) in &envelope.queries {
         let sub_min_t = min_t_from_opts(sub.opts.as_ref())?;
         match sub.language {
             SubqueryLanguage::JsonLd => {
@@ -4733,19 +4747,16 @@ fn collect_multi_query_min_t_requirements(
                         .min_t
                         .or(sub_min_t);
                     // The envelope already applied any `Fluree-Min-T` header to
-                    // every distinct ledger; the sub-collector only needs to pick
-                    // up per-query `@t:` pins, so pass no header here.
-                    let mut sub_requirements =
-                        collect_sparql_min_t_requirements(None, sparql, None)?;
-                    if let Some(min_t) = sub_min_t {
-                        if let Ok(ledgers) = fluree_db_api::sparql_dataset_ledger_ids(sparql) {
-                            for ledger_id in ledgers {
-                                merge_min_t_requirement(&mut sub_requirements, &ledger_id, min_t);
-                            }
+                    // every distinct ledger. Per alias: each member's own `@t:`
+                    // pin, and the alias's min-t on every member — the members
+                    // validation read, which are the ledgers the envelope pins.
+                    for member in ledgers.sparql.get(alias).into_iter().flatten() {
+                        if let Some(TimeSpec::AtT(t)) = member.at {
+                            merge_min_t_requirement(&mut requirements, &member.ledger, t);
                         }
-                    }
-                    for (ledger_id, min_t) in sub_requirements {
-                        merge_min_t_requirement(&mut requirements, &ledger_id, min_t);
+                        if let Some(min_t) = sub_min_t {
+                            merge_min_t_requirement(&mut requirements, &member.ledger, min_t);
+                        }
                     }
                 }
             }
@@ -4857,16 +4868,18 @@ pub async fn multi_query(
             let bounds = MultiQueryBounds::DEFAULT;
 
             // Validation — we re-run it inside the api crate's dispatcher,
-            // but pre-validating here gives us the distinct-ledger set we
-            // need for the bearer-scope check before any execution starts.
-            let distinct_ledgers =
-                match fluree_db_api::query::multi::validate_envelope(&envelope, &bounds) {
-                    Ok(distinct) => distinct,
+            // but pre-validating here gives us the ledgers the envelope reads
+            // (the set its snapshot pins) for the bearer-scope check and the
+            // freshness wait before any execution starts.
+            let envelope_ledgers =
+                match fluree_db_api::query::multi::validate_envelope_ledgers(&envelope, &bounds) {
+                    Ok(ledgers) => ledgers,
                     Err(err) => {
                         set_span_error_code(&span, "error:BadRequest");
                         return Err(validation_error_to_server(&err));
                     }
                 };
+            let distinct_ledgers = &envelope_ledgers.distinct;
 
             // Bearer ledger-scope enforcement — parity with single-query
             // /query and /query/:ledger. Unsigned bearer tokens may carry a
@@ -4875,7 +4888,7 @@ pub async fn multi_query(
             // (avoiding existence leak), matching the single-query response.
             if let Some(principal) = bearer.0.as_ref() {
                 if !credential.is_signed() {
-                    for ledger_id in &distinct_ledgers {
+                    for ledger_id in distinct_ledgers {
                         if !principal.can_read(&crate::error::scope_id(ledger_id)?) {
                             set_span_error_code(&span, "error:Forbidden");
                             return Err(ServerError::not_found("Ledger not found"));
@@ -4885,7 +4898,7 @@ pub async fn multi_query(
             }
 
             let min_t_requirements =
-                collect_multi_query_min_t_requirements(&headers, &envelope, &distinct_ledgers)?;
+                collect_multi_query_min_t_requirements(&headers, &envelope, &envelope_ledgers)?;
             if min_t_requirements.is_empty() {
                 maybe_refresh_query_ledgers(state.as_ref(), distinct_ledgers.iter().cloned()).await;
             } else {

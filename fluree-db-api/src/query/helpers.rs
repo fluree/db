@@ -508,36 +508,7 @@ pub(crate) fn parse_and_validate_sparql(sparql: &str) -> Result<fluree_db_sparql
     #[cfg(test)]
     SPARQL_PARSE_COUNT.with(|c| c.set(c.get() + 1));
 
-    let parse_output = fluree_db_sparql::parse_sparql(sparql);
-
-    // Parse errors: return ApiError::sparql with structured diagnostics.
-    //
-    // Error-severity diagnostics are authoritative EVEN WHEN the parser's
-    // error recovery produced an AST. A recovered AST silently drops or
-    // rewrites exactly the parts of the query the parser flagged, so
-    // executing it answers a different question than the user asked
-    // (docs/audit/burn-down/ROADMAP.md §1 addendum: the API previously
-    // swallowed these diagnostics whenever an AST survived recovery).
-    // Recovery itself is unchanged — `parse_sparql` still returns the AST
-    // plus diagnostics for tooling — and warning-severity diagnostics never
-    // reject. The SPARQL UPDATE path (tx_builder::parse_and_lower_sparql_update)
-    // already enforces the same rule.
-    let has_parse_errors = parse_output.has_errors();
-    let ast = match parse_output.ast {
-        Some(ast) if !has_parse_errors => ast,
-        _ => {
-            let errors: Vec<_> = parse_output
-                .diagnostics
-                .into_iter()
-                .filter(|d| d.severity == fluree_db_sparql::Severity::Error)
-                .collect();
-            let message = errors
-                .first()
-                .map(|d| d.message.clone())
-                .unwrap_or_else(|| "SPARQL parse error".to_string());
-            return Err(ApiError::sparql(message, errors));
-        }
-    };
+    let ast = parse_sparql_strict(sparql)?;
 
     // Validation errors: validate against Fluree capabilities/restrictions.
     let capabilities = fluree_db_sparql::Capabilities::default();
@@ -555,6 +526,43 @@ pub(crate) fn parse_and_validate_sparql(sparql: &str) -> Result<fluree_db_sparql
     }
 
     Ok(ast)
+}
+
+/// Parse SPARQL text the way every query entry point does: an error-severity
+/// diagnostic refuses the text even when the parser's error recovery produced
+/// an AST. Callers that read a query's dataset before it runs (the multi-query
+/// envelope) parse with this so they read the AST the engine will run.
+pub(crate) fn parse_sparql_strict(sparql: &str) -> Result<fluree_db_sparql::SparqlAst> {
+    let parse_output = fluree_db_sparql::parse_sparql(sparql);
+
+    // Parse errors: return ApiError::sparql with structured diagnostics.
+    //
+    // Error-severity diagnostics are authoritative EVEN WHEN the parser's
+    // error recovery produced an AST. A recovered AST silently drops or
+    // rewrites exactly the parts of the query the parser flagged, so
+    // executing it answers a different question than the user asked
+    // (docs/audit/burn-down/ROADMAP.md §1 addendum: the API previously
+    // swallowed these diagnostics whenever an AST survived recovery).
+    // Recovery itself is unchanged — `parse_sparql` still returns the AST
+    // plus diagnostics for tooling — and warning-severity diagnostics never
+    // reject. The SPARQL UPDATE path (tx_builder::parse_and_lower_sparql_update)
+    // already enforces the same rule.
+    let has_parse_errors = parse_output.has_errors();
+    match parse_output.ast {
+        Some(ast) if !has_parse_errors => Ok(ast),
+        _ => {
+            let errors: Vec<_> = parse_output
+                .diagnostics
+                .into_iter()
+                .filter(|d| d.severity == fluree_db_sparql::Severity::Error)
+                .collect();
+            let message = errors
+                .first()
+                .map(|d| d.message.clone())
+                .unwrap_or_else(|| "SPARQL parse error".to_string());
+            Err(ApiError::sparql(message, errors))
+        }
+    }
 }
 
 /// Creates a tracker for "tracked" query endpoints.
