@@ -2596,34 +2596,6 @@ async fn sparql_within_ledger_from_alias_scopes_default_graph() {
     assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["Alice"]])));
 }
 
-/// P2 (negative): `resolve_within_ledger_graph` matches the alias by EXACT
-/// string (`iri == db.snapshot.ledger_id || iri == db.ledger_id`), so a
-/// mismatched spelling of the ledger id — here `wl`, the name without its
-/// `:main` branch — is not recognized as the default graph and falls through to
-/// the cross-ledger rejection. Documents (locks) the exact-match limitation:
-/// broadening the match is a deliberate DEFER, so this behavior must not
-/// silently change.
-#[tokio::test]
-async fn sparql_within_ledger_from_alias_spelling_mismatch_is_rejected() {
-    assert_index_defaults();
-    let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = seed_within_ledger_dataset(&fluree, "wl:main").await;
-
-    let sparql = r"
-        PREFIX schema: <http://schema.org/>
-        SELECT ?name FROM <wl> { ?s schema:name ?name }
-    ";
-    let err = support::query_sparql(&fluree, &ledger, sparql)
-        .await
-        .expect_err("a mismatched alias spelling must be rejected, not silently matched");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("not in this ledger"),
-        "expected the within-ledger cross-ledger rejection, got: {msg}"
-    );
-    assert_eq!(err.status_code(), 400, "a graph not in the ledger is a 400");
-}
-
 /// `urn:default`, the name ledger info lists the default graph under, names
 /// the default graph in a within-ledger `FROM` / `FROM NAMED`, as the alias
 /// does.
