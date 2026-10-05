@@ -180,7 +180,7 @@ Each row is `[age, expanded_person, expanded_org]`. When every column is an IRI-
 
 In a query that does not group, a scalar select expression desugars to a `bind` in the WHERE pattern list. In a query that groups (a `groupBy`, or an aggregate anywhere in `select`, `having` or `orderBy`), where it runs depends on what it reads — the same rule SPARQL uses:
 
-- An expression over `groupBy` keys, aggregate outputs and earlier such aliases — or a constant — runs **once per group**, after aggregation and `having`: its alias is a single value per group. `(as (+ ?count 1) ?adjusted)` and `(as (strlen ?category) ?len)` under `"groupBy": ["?category"]` both give one value per row.
+- An expression over `groupBy` keys, aggregate outputs and earlier such aliases — or a constant — runs **once per group**, after aggregation (before `having` when `having` reads its alias, after it otherwise): its alias is a single value per group. `(as (+ ?count 1) ?adjusted)` and `(as (strlen ?category) ?len)` under `"groupBy": ["?category"]` both give one value per row.
 - An expression over a variable that is neither a `groupBy` key nor an aggregate runs **before grouping**, once per solution, so its alias is a per-group list like any other ungrouped variable (see [groupBy](#groupby)).
 - An alias that is itself a `groupBy` key, or that an aggregate reads, is computed before grouping — so an alias is a valid `groupBy` key.
 
@@ -1367,7 +1367,7 @@ Filter grouped results:
 }
 ```
 
-`having` and `orderBy` in a grouped query follow SPARQL 1.1: a variable they read that is neither a `groupBy` key nor an aggregate means `(sample ?v)` — an arbitrary value from the group. A select expression's alias is not visible to `having` (it is computed after), unless it is an aggregate's alias. On a query that does not group, `having` filters the solutions, like a `filter`.
+`having` and `orderBy` in a grouped query follow SPARQL 1.1: a variable they read that is neither a `groupBy` key nor an aggregate means `(sample ?v)` — an arbitrary value from the group. `having` can read a select expression's alias as well as an aggregate's: the expression runs once per group, before `having` (the SPARQL rule, a Fluree extension there). On a query that does not group, `having` filters the solutions, like a `filter`.
 
 ## Aggregation Functions
 

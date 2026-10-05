@@ -341,21 +341,94 @@ async fn sub_select_grouped_expression_is_a_scalar_outside() {
     assert_eq!(parts, vec!["network", "other", "other"]);
 }
 
-/// §18.2.4.2: HAVING runs before the SELECT expressions, so it reads a SELECT
-/// alias as unbound — no row qualifies, and nothing panics (a debug-build panic
-/// in `eval` before).
+/// HAVING reads the SELECT clause's aliases: an aggregate's alias, and an
+/// expression's alias, whose expression runs before HAVING, once per group
+/// (`Grouping::binds_before_having`), through a chain of aliases too. SPARQL 1.1
+/// evaluates SELECT expressions after HAVING (§18.2.4), so this is a Fluree
+/// extension; the W3C aggregate tests always repeat the aggregate in HAVING
+/// instead. A variable nothing binds is still unbound: no group qualifies.
 #[tokio::test]
-async fn having_reads_a_select_alias_as_unbound() {
+async fn having_reads_a_select_alias() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_areas(&fluree, "grouped-projection/having-alias:main").await;
-    for having in [r#"(?seg = "network")"#, "(?nosuch = 1)"] {
+    assert_rows(
+        &fluree,
+        &ledger,
+        &format!(r#"SELECT {SEG} (COUNT(?e) AS ?n) {W} GROUP BY ?a HAVING (?seg = "network")"#),
+        json!([{"seg": "network", "n": "3"}]),
+        json!([["network", 3]]),
+    )
+    .await;
+    assert_rows(
+        &fluree,
+        &ledger,
+        &format!("SELECT ?a (COUNT(?e) + 0 AS ?n) {W} GROUP BY ?a HAVING (?n > 1)"),
+        json!([{"a": "Local", "n": "2"}, {"a": "Net", "n": "3"}]),
+        json!([["Local", 2], ["Net", 3]]),
+    )
+    .await;
+    assert_rows(
+        &fluree,
+        &ledger,
+        &format!("SELECT ?a (COUNT(?e) AS ?n) (?n * 10 AS ?t) {W} GROUP BY ?a HAVING (?t > 15)"),
+        json!([{"a": "Local", "n": "2", "t": "20"}, {"a": "Net", "n": "3", "t": "30"}]),
+        json!([["Local", 2, 20], ["Net", 3, 30]]),
+    )
+    .await;
+    let result = run(
+        &fluree,
+        &ledger,
+        &format!("SELECT {SEG} (COUNT(?e) AS ?n) {W} GROUP BY ?a HAVING (?nosuch = 1)"),
+    )
+    .await;
+    assert_eq!(result.row_count(), 0, "HAVING (?nosuch = 1)");
+}
+
+/// The value HAVING tests is the value the alias returns: the expression runs
+/// once per group, before HAVING, never again. Over 40 groups a
+/// non-deterministic alias splits them, and every returned value passes.
+#[tokio::test]
+async fn having_tests_the_value_an_alias_returns() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "grouped-projection/having-alias-once:main");
+    let graph: Vec<JsonValue> = (0..40)
+        .map(|i| json!({"@id": format!("ex:e{i}"), "ex:area": format!("A{i}")}))
+        .collect();
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({"@context": {"ex": "http://example.org/"}, "@graph": graph}),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    for (alias, having, passes) in [
+        (
+            "(RAND() AS ?x)",
+            "(?x < 0.5)",
+            (|x: &str| x.parse::<f64>().expect("double") < 0.5) as fn(&str) -> bool,
+        ),
+        ("(STRUUID() AS ?x)", r#"(?x < "8")"#, |x: &str| x < "8"),
+    ] {
         let result = run(
             &fluree,
             &ledger,
-            &format!("SELECT {SEG} (COUNT(?e) AS ?n) {W} GROUP BY ?a HAVING {having}"),
+            &format!("SELECT ?a {alias} (COUNT(?e) AS ?n) {W} GROUP BY ?a HAVING {having}"),
         )
         .await;
-        assert_eq!(result.row_count(), 0, "HAVING {having}");
+        let found = sparql_rows(&result, &ledger);
+        assert!(
+            !found.is_empty() && found.len() < 40,
+            "{alias}: {} of 40 groups kept",
+            found.len()
+        );
+        for row in &found {
+            assert!(
+                passes(&row["x"]),
+                "{alias}: returned {} fails {having}",
+                row["x"]
+            );
+        }
     }
 }
 

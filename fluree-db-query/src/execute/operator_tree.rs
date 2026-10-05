@@ -3715,20 +3715,17 @@ pub(crate) fn apply_solution_modifiers(
         }
     }
 
-    // HAVING (filter on aggregated results)
-    if let Some(expr) = having_expr {
-        operator = Box::new(
-            HavingOperator::new(operator, expr.clone(), *planning).with_out_schema(
-                variable_deps
-                    .as_ref()
-                    .map(|d| d.required_having_vars.as_slice()),
-            ),
-        );
-    }
-
-    // Post-aggregation BINDs (e.g., SELECT (CEIL(?avg) AS ?ceil))
-    if !post_binds_vec.is_empty() {
+    // Post-aggregation BINDs (e.g., SELECT (CEIL(?avg) AS ?ceil)): the ones
+    // HAVING reads run before it, the rest after it
+    // (`Grouping::binds_before_having`), each once per group.
+    let before_having: Vec<bool> = grouping
+        .map(Grouping::binds_before_having)
+        .unwrap_or_default();
+    let apply_binds = |mut operator: BoxedOperator, before: bool| -> BoxedOperator {
         for (i, (var, expr)) in post_binds_vec.iter().enumerate() {
+            if before_having.get(i).copied().unwrap_or(false) != before {
+                continue;
+            }
             operator = Box::new(
                 crate::bind::BindOperator::new(operator, *var, expr.clone(), vec![])
                     .with_planning(*planning)
@@ -3740,7 +3737,22 @@ pub(crate) fn apply_solution_modifiers(
                     ),
             );
         }
+        operator
+    };
+    operator = apply_binds(operator, true);
+
+    // HAVING (filter on aggregated results)
+    if let Some(expr) = having_expr {
+        operator = Box::new(
+            HavingOperator::new(operator, expr.clone(), *planning).with_out_schema(
+                variable_deps
+                    .as_ref()
+                    .map(|d| d.required_having_vars.as_slice()),
+            ),
+        );
     }
+
+    operator = apply_binds(operator, false);
 
     // Expression-based ORDER BY binds (e.g. `ORDER BY DESC(?a / ?b)`).
     //

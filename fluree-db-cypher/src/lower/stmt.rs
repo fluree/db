@@ -450,8 +450,9 @@ struct ProjectionState {
     /// Post-aggregation binds: `output_var = <expr over aggregate outputs and
     /// literals>`, for aggregates composed into a larger expression
     /// (`count(a) + count(b)`, `count(m) + 1`, `sum(a) / count(b)`). Fire after
-    /// every aggregate is computed and after HAVING (the grouping phase's
-    /// stage order), so a HAVING cannot read them.
+    /// every aggregate is computed, once per group; the ones a `WITH … WHERE`
+    /// (lowered to HAVING) reads fire before it, so `WITH p, count(f) + 0 AS c
+    /// WHERE c > 1` filters on `c` (`Grouping::binds_before_having`).
     post_binds: Vec<(VarId, fluree_db_query::ir::Expression)>,
     /// Counter for synthetic per-aggregate output vars lifted out of composite
     /// expressions (`?#__agg_N`).

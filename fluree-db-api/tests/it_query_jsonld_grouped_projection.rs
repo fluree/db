@@ -65,6 +65,28 @@ async fn jsonld_having_on_a_non_key_variable_samples_it() {
     }
 }
 
+/// `having` reads a select expression's alias: the expression runs once per
+/// group, before `having` (the SPARQL rule, a Fluree extension there).
+#[tokio::test]
+async fn jsonld_having_reads_a_select_expression_alias() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "jsonld-grouped/having-alias:main").await;
+    let found = rows(
+        &fluree,
+        &ledger,
+        json!({
+            "select": ["?a", "(as (count ?e) ?n)", "(as (+ ?n 0) ?m)"],
+            "groupBy": ["?a"],
+            "having": "(> ?m 1)"
+        }),
+    )
+    .await;
+    assert_eq!(
+        normalize_rows(&found),
+        normalize_rows(&json!([["Local", 2, 2], ["Net", 3, 3]]))
+    );
+}
+
 #[tokio::test]
 async fn jsonld_order_by_a_non_key_variable_samples_it() {
     let fluree = FlureeBuilder::memory().build_memory();

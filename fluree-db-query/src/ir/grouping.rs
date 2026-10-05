@@ -360,14 +360,15 @@ impl Grouping {
     /// top-level projection may do (`policy`); everything else must be
     /// rejected before the plan runs.
     ///
-    /// Stage order is the executor's: HAVING, the grouping's binds (each may
+    /// Stage order is the executor's: the binds HAVING reads
+    /// ([`Self::binds_before_having`]), HAVING, the other binds (each bind may
     /// read the ones before it), the ORDER BY binds, ORDER BY, then the
     /// projection (checked only under [`UngroupedProjection::Reject`]). A
     /// variable nothing binds before grouping is not an ungrouped read: it is
-    /// unbound there (a HAVING reading a SELECT alias, §18.2.4.2). Neither is a
-    /// variable that only an `EXISTS` body (or a pattern comprehension) in the
-    /// expression mentions: the group row does not bind it, so it is free in
-    /// the pattern; the reads checked are [`Expression::row_reads`].
+    /// unbound there. Neither is a variable that only an `EXISTS` body (or a
+    /// pattern comprehension) in the expression mentions: the group row does
+    /// not bind it, so it is free in the pattern; the reads checked are
+    /// [`Expression::row_reads`].
     ///
     /// The lowerers never produce such a read (they rewrite non-key HAVING /
     /// ORDER BY reads to `SAMPLE`, [`sample_ungrouped_reads`]); this is the
@@ -388,23 +389,46 @@ impl Grouping {
         ) -> Option<VarId> {
             vars.find(|v| where_vars.contains(v) && !grouped(*v))
         }
-        let binds = self.bind_list();
         // What grouping has produced when a stage runs: the keys, the aggregate
-        // outputs, and the outputs of the grouping's first `binds_done` binds and
-        // the first `order_binds_done` ORDER BY binds. Scanned rather than
-        // collected: every grouped plan runs this check, over a few variables.
-        let grouped = |v: VarId, binds_done: usize, order_binds_done: usize| {
+        // outputs, the binds run so far (`done`) and the first
+        // `order_binds_done` ORDER BY binds. Scanned rather than collected:
+        // every grouped plan runs this check, over a few variables.
+        let produced = |v: VarId, done: &[VarId], order_binds_done: usize| {
             self.group_by_vars().any(|k| k == v)
                 || self.aggregates().any(|spec| spec.output_var == v)
-                || binds[..binds_done].iter().any(|(out, _)| *out == v)
+                || done.contains(&v)
                 || order_binds[..order_binds_done]
                     .iter()
                     .any(|(out, _)| *out == v)
         };
+        let binds = self.bind_list();
+        let before_having = self.binds_before_having();
+        // The grouping's binds that run before HAVING (`true`) or after it.
+        let check_binds = |done: &mut Vec<VarId>, before: bool| -> Option<UngroupedRead> {
+            for (i, (out, expr)) in binds.iter().enumerate() {
+                if before_having[i] != before {
+                    continue;
+                }
+                if let Some(var) = find(expr.row_reads().into_iter(), where_vars, |v| {
+                    produced(v, done, 0)
+                }) {
+                    return Some(UngroupedRead {
+                        var,
+                        stage: ReadStage::Bind(*out),
+                    });
+                }
+                done.push(*out);
+            }
+            None
+        };
 
+        let mut done: Vec<VarId> = Vec::new();
+        if let Some(read) = check_binds(&mut done, true) {
+            return Some(read);
+        }
         if let Some(having) = self.having() {
             if let Some(var) = find(having.row_reads().into_iter(), where_vars, |v| {
-                grouped(v, 0, 0)
+                produced(v, &done, 0)
             }) {
                 return Some(UngroupedRead {
                     var,
@@ -412,19 +436,12 @@ impl Grouping {
                 });
             }
         }
-        for (i, (out, expr)) in binds.iter().enumerate() {
-            if let Some(var) = find(expr.row_reads().into_iter(), where_vars, |v| {
-                grouped(v, i, 0)
-            }) {
-                return Some(UngroupedRead {
-                    var,
-                    stage: ReadStage::Bind(*out),
-                });
-            }
+        if let Some(read) = check_binds(&mut done, false) {
+            return Some(read);
         }
         for (j, (out, expr)) in order_binds.iter().enumerate() {
             if let Some(var) = find(expr.row_reads().into_iter(), where_vars, |v| {
-                grouped(v, binds.len(), j)
+                produced(v, &done, j)
             }) {
                 return Some(UngroupedRead {
                     var,
@@ -432,7 +449,7 @@ impl Grouping {
                 });
             }
         }
-        let after_binds = |v| grouped(v, binds.len(), order_binds.len());
+        let after_binds = |v| produced(v, &done, order_binds.len());
         if let Some(var) = find(ordering.iter().map(|s| s.var), where_vars, after_binds) {
             return Some(UngroupedRead {
                 var,
@@ -511,6 +528,40 @@ impl Grouping {
         match self {
             Self::Implicit { binds, .. } | Self::Explicit { binds, .. } => binds,
         }
+    }
+
+    /// Which of the grouping's binds run before HAVING: the ones HAVING reads,
+    /// directly or through another bind (`true` at a bind's index). The others
+    /// run after HAVING, and each part keeps SELECT order (a bind reads only
+    /// earlier ones).
+    ///
+    /// So HAVING sees a SELECT alias: an aggregate alias is an aggregate output
+    /// and always could, and an expression alias (`(COUNT(?e) + 0 AS ?n)`, or
+    /// one over the keys) now can too. SPARQL 1.1 runs every SELECT expression
+    /// after HAVING (§18.2.4), so this is a Fluree extension, and so is reading
+    /// an aggregate alias; Cypher's `WITH … WHERE` needs it, since its `WHERE`
+    /// sees the whole projection. Each bind still runs once per group, so HAVING
+    /// tests the value the projection shows. An alias HAVING does not read
+    /// keeps the spec's place.
+    pub fn binds_before_having(&self) -> Vec<bool> {
+        let binds = self.bind_list();
+        let mut before = vec![false; binds.len()];
+        let Some(having) = self.having() else {
+            return before;
+        };
+        if binds.is_empty() {
+            return before;
+        }
+        // Every variable HAVING mentions, EXISTS correlations included: an alias
+        // a correlated pattern reads has to be bound in the row it seeds from.
+        let mut read = having.referenced_vars();
+        for (i, (out, expr)) in binds.iter().enumerate().rev() {
+            if read.contains(out) {
+                before[i] = true;
+                read.extend(expr.referenced_vars());
+            }
+        }
+        before
     }
 
     /// Rename every occurrence of variable `old` to `new` across GROUP BY keys,
@@ -1130,6 +1181,78 @@ mod tests {
         assert_eq!(aggregates.len(), 1);
     }
 
+    /// The binds HAVING reads, directly or through another bind, run before it;
+    /// the rest after it, each part in SELECT order.
+    #[test]
+    fn binds_before_having_follow_what_having_reads() {
+        use crate::ir::UngroupedProjection::Reject;
+        let (k, n, s, t, u, w) = (VarId(0), VarId(1), VarId(2), VarId(3), VarId(4), VarId(5));
+        let count = AggregateSpec {
+            function: AggregateFn::CountAll,
+            output_var: n,
+        };
+        // ?s = ?n + 0, ?t = ?s * 10, ?u = ?k; HAVING reads ?t.
+        let binds = vec![
+            (
+                s,
+                Expression::call(
+                    crate::ir::Function::Add,
+                    vec![Expression::Var(n), Expression::Const(FlakeValue::Long(0))],
+                ),
+            ),
+            (
+                t,
+                Expression::call(
+                    crate::ir::Function::Mul,
+                    vec![Expression::Var(s), Expression::Const(FlakeValue::Long(10))],
+                ),
+            ),
+            (u, Expression::Var(k)),
+        ];
+        let g = Grouping::assemble(
+            vec![k],
+            vec![count.clone()],
+            binds.clone(),
+            Some(Expression::Var(t)),
+        )
+        .expect("valid")
+        .expect("grouping");
+        assert_eq!(g.binds_before_having(), vec![true, true, false]);
+
+        // Without HAVING, or when it reads no alias, every bind runs after it.
+        let none = Grouping::assemble(
+            vec![k],
+            vec![count.clone()],
+            binds.clone(),
+            Some(Expression::Var(n)),
+        )
+        .expect("valid")
+        .expect("grouping");
+        assert_eq!(none.binds_before_having(), vec![false, false, false]);
+
+        // The plan check walks the same order: a pre-HAVING bind reading a
+        // non-key WHERE variable is reported before HAVING's own read.
+        let bad = vec![(s, Expression::Var(w)), (t, Expression::Var(k))];
+        let g = Grouping::assemble(
+            vec![k],
+            vec![count],
+            bad,
+            Some(Expression::and(vec![
+                Expression::Var(s),
+                Expression::Var(w),
+            ])),
+        )
+        .expect("valid")
+        .expect("grouping");
+        assert_eq!(
+            g.first_ungrouped_read(&[k, w], &[], &[], None, Reject),
+            Some(UngroupedRead {
+                var: w,
+                stage: ReadStage::Bind(s)
+            })
+        );
+    }
+
     #[test]
     fn having_as_filter_hides_select_aliases() {
         let (a, alias) = (VarId(0), VarId(1));
@@ -1192,8 +1315,8 @@ mod tests {
             let earlier = (b, Expression::Var(k));
 
             let g = grouping(Some(Expression::Var(read)), vec![]);
-            // HAVING runs before the binds, so it reads ?b as unbound: not a
-            // grouped read.
+            // ?b is not bound here (no bind produces it), and it is not a
+            // WHERE variable either: not a grouped read.
             assert_eq!(
                 g.first_ungrouped_read(&where_vars, &[], &[], None, Reject),
                 expect(ReadStage::Having),

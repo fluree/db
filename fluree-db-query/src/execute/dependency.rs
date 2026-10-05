@@ -88,25 +88,34 @@ pub fn compute_variable_deps(query: &Query) -> Option<VariableDeps> {
         }
     }
 
-    // Post-aggregation binds (reverse order): trace expression inputs.
-    // Record deps BEFORE processing each bind backward, since that
-    // represents what the bind's output must contain for downstream.
+    // Post-aggregation binds, traced backward in execution order: the binds
+    // that run after HAVING, HAVING, then the ones HAVING reads, which run
+    // before it (`Grouping::binds_before_having`). Record deps BEFORE tracing
+    // each bind backward: that is what the bind's output must contain for
+    // downstream. Indexed like the binds.
     let binds = query
         .grouping
         .as_ref()
         .map(Grouping::bind_list)
         .unwrap_or(&[]);
-    let mut required_bind_vars: Vec<Vec<VarId>> = Vec::with_capacity(binds.len());
-    for (var, expr) in binds.iter().rev() {
-        // Record what this bind's output must contain.
-        required_bind_vars.push(deps.iter().copied().collect());
-        // Then trace backward through the bind expression.
-        if deps.remove(var) {
-            deps.extend(reads(expr));
+    let before_having: Vec<bool> = query
+        .grouping
+        .as_ref()
+        .map(Grouping::binds_before_having)
+        .unwrap_or_default();
+    let mut required_bind_vars: Vec<Vec<VarId>> = vec![Vec::new(); binds.len()];
+    let mut trace_binds = |deps: &mut HashSet<VarId>, before: bool| {
+        for (i, (var, expr)) in binds.iter().enumerate().rev() {
+            if before_having[i] != before {
+                continue;
+            }
+            required_bind_vars[i] = deps.iter().copied().collect();
+            if deps.remove(var) {
+                deps.extend(reads(expr));
+            }
         }
-    }
-    // Reverse so indices match the forward (execution) order of binds.
-    required_bind_vars.reverse();
+    };
+    trace_binds(&mut deps, false);
 
     // Record what HAVING's output must contain (before tracing HAVING backward).
     let required_having_vars: Vec<VarId> = deps.iter().copied().collect();
@@ -116,6 +125,7 @@ pub fn compute_variable_deps(query: &Query) -> Option<VariableDeps> {
     if let Some(having_expr) = query.grouping.as_ref().and_then(Grouping::having) {
         deps.extend(reads(having_expr));
     }
+    trace_binds(&mut deps, true);
 
     // Record what Aggregate's output must contain (before tracing aggregates backward).
     let required_aggregate_vars: Vec<VarId> = deps.iter().copied().collect();
