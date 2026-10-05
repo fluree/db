@@ -516,9 +516,10 @@ impl Grouping {
         aggregates.peek().is_some() && aggregates.all(|spec| spec.function.is_streamable())
     }
 
-    /// The per-group `Extend`s of this grouping phase, in evaluation order
-    /// (`(VarId, Expression)` pairs). They run after HAVING, with or without
-    /// an aggregation stage.
+    /// The per-group `Extend`s of this grouping phase, in SELECT order
+    /// (`(VarId, Expression)` pairs), with or without an aggregation stage.
+    /// The ones HAVING reads run before it, the rest after it
+    /// ([`Self::binds_before_having`]).
     pub fn binds(&self) -> impl Iterator<Item = &(VarId, Expression)> {
         self.bind_list().iter()
     }

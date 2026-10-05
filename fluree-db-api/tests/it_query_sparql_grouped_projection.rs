@@ -979,8 +979,8 @@ async fn ask_and_construct_group() {
 /// used a separate evaluator that never resolved EXISTS, so `HAVING (EXISTS
 /// …)` kept no group and `HAVING (NOT EXISTS …)` kept every group.
 ///
-/// A non-key variable inside the EXISTS reads a SAMPLE, like any other HAVING
-/// read of it.
+/// A non-key variable inside the EXISTS is free in its body: the group row does
+/// not bind it (`exists_body_variables_are_free_over_the_group_row`).
 #[tokio::test]
 async fn having_exists_is_evaluated_per_group() {
     let fluree = FlureeBuilder::memory().build_memory();
