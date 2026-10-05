@@ -51,6 +51,7 @@ Wherever a query or an update names a graph of the ledger it reads or writes, on
 | The name | reads | writes |
 |---|---|---|
 | the ledger's own address, in any spelling: `mydb`, `mydb:main`, `urn:fluree:mydb:main` | the default graph | the default graph |
+| `urn:default` | the default graph | refused with a `400`, except `WITH <urn:default>` and a top-level `"graph": "urn:default"`, which write the default graph |
 | the address with a reserved keyword: `mydb:main#config`, `mydb#txn-meta` | that reserved graph, as `urn:fluree:mydb:main#config` reads it | the config graph; a `#txn-meta` write is refused |
 | the address with a graph IRI: `mydb:main#http://example.org/g` | the graph `http://example.org/g` | the graph `http://example.org/g` |
 | a registered graph IRI | that graph | that graph |
@@ -269,7 +270,7 @@ The union is a set: a triple stored in several graphs matches once, and a proper
 
 - `GRAPH <iri>` and `GRAPH ?g` address the named graphs exactly as without the union, and `GRAPH <ledger:main>` still names the default graph alone.
 - `FROM <graph>` reads just that graph; `FROM NAMED` names exactly the graphs it lists. A `FROM` list that names the ledger and any of its graphs reads just the graphs it names, not the union.
-- The reserved `#txn-meta` and `#config` graphs are never part of the union.
+- The union's named graphs are the ones `GRAPH ?g` lists, a graph registered under the ledger's address by an earlier version included (see [above](#the-ledgers-own-address-in-a-graph-position)). The reserved `#txn-meta` and `#config` graphs are never part of the union.
 - Policy applies to each graph as it would to a `GRAPH` pattern reading it.
 - Transactions are unaffected: they write to the graphs they name, and an update's `WHERE` matches the default graph alone. History queries (`FROM … TO …`) read the default graph alone too.
 
