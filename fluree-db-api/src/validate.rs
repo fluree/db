@@ -78,32 +78,7 @@ impl Default for ValidateOptions {
     }
 }
 
-/// One validation result with all identifiers resolved to IRIs.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ReportResult {
-    /// The node that failed validation (`sh:focusNode`): a JSON string for
-    /// IRIs / blank-node labels, or a JSON-LD value object (or native
-    /// scalar) for literal `sh:targetNode` targets.
-    pub focus_node: JsonValue,
-    /// The property path, when it is a single predicate (`sh:resultPath`).
-    /// Complex paths are omitted rather than misrepresented.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result_path: Option<String>,
-    /// The node shape that produced this result.
-    pub source_shape: String,
-    /// The property shape that produced this result, when applicable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_constraint: Option<String>,
-    /// The constraint component IRI (`sh:sourceConstraintComponent`).
-    pub constraint_component: String,
-    /// Severity IRI: `sh:Violation`, `sh:Warning`, or `sh:Info`.
-    pub severity: String,
-    /// Human-readable message (`sh:resultMessage`).
-    pub message: String,
-    /// The offending value, when applicable (`sh:value`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<JsonValue>,
-}
+pub use fluree_db_transact::ReportResult;
 
 /// A resolved validation report, ready for serialization.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -630,54 +605,7 @@ async fn validate_view_inner(
         .map_err(TransactError::from)?;
 
     let resolve = |sid: &Sid| resolve_sid(snapshot, inline_registry.as_ref(), sid);
-    let mut results: Vec<ReportResult> = raw
-        .results
-        .iter()
-        .map(|r| ReportResult {
-            focus_node: match &r.focus_node {
-                fluree_db_shacl::FocusNode::Node(sid) => JsonValue::String(resolve(sid)),
-                fluree_db_shacl::FocusNode::Literal(lit) => {
-                    match value_json(
-                        &lit.value,
-                        Some(&lit.datatype),
-                        lit.lang.as_deref(),
-                        &resolve,
-                    ) {
-                        // A bare string would be ambiguous with an IRI focus —
-                        // wrap plain string literals as a value object.
-                        JsonValue::String(s) => json!({"@value": s}),
-                        other => other,
-                    }
-                }
-            },
-            result_path: r.result_path.as_ref().map(&resolve),
-            source_shape: resolve(&r.source_shape),
-            source_constraint: r.source_constraint.as_ref().map(&resolve),
-            constraint_component: r.constraint_component.to_string(),
-            severity: severity_iri(r.severity).to_string(),
-            message: r.message.clone(),
-            value: r.value.as_ref().map(|v| {
-                value_json(
-                    v,
-                    r.value_datatype.as_ref(),
-                    r.value_lang.as_deref(),
-                    &resolve,
-                )
-            }),
-        })
-        .collect();
-    results.sort_by(|a, b| {
-        (
-            a.focus_node.to_string(),
-            &a.constraint_component,
-            &a.message,
-        )
-            .cmp(&(
-                b.focus_node.to_string(),
-                &b.constraint_component,
-                &b.message,
-            ))
-    });
+    let results = report_results(&raw.results, &resolve);
 
     Ok(ValidateReport {
         conforms: raw.conforms,
@@ -725,6 +653,62 @@ fn resolve_sid(
             })
         })
         .unwrap_or_else(|| sid.name.to_string())
+}
+
+/// Validation results with every identifier resolved by `resolve`, sorted by
+/// (focus node, component, message).
+pub(crate) fn report_results<'a>(
+    results: impl IntoIterator<Item = &'a fluree_db_shacl::ValidationResult>,
+    resolve: &impl Fn(&Sid) -> String,
+) -> Vec<ReportResult> {
+    let mut results: Vec<ReportResult> = results
+        .into_iter()
+        .map(|r| ReportResult {
+            focus_node: match &r.focus_node {
+                fluree_db_shacl::FocusNode::Node(sid) => JsonValue::String(resolve(sid)),
+                fluree_db_shacl::FocusNode::Literal(lit) => {
+                    match value_json(
+                        &lit.value,
+                        Some(&lit.datatype),
+                        lit.lang.as_deref(),
+                        resolve,
+                    ) {
+                        // A bare string would be ambiguous with an IRI focus —
+                        // wrap plain string literals as a value object.
+                        JsonValue::String(s) => json!({"@value": s}),
+                        other => other,
+                    }
+                }
+            },
+            result_path: r.result_path.as_ref().map(resolve),
+            source_shape: resolve(&r.source_shape),
+            source_constraint: r.source_constraint.as_ref().map(resolve),
+            constraint_component: r.constraint_component.to_string(),
+            severity: severity_iri(r.severity).to_string(),
+            message: r.message.clone(),
+            value: r.value.as_ref().map(|v| {
+                value_json(
+                    v,
+                    r.value_datatype.as_ref(),
+                    r.value_lang.as_deref(),
+                    resolve,
+                )
+            }),
+        })
+        .collect();
+    results.sort_by(|a, b| {
+        (
+            a.focus_node.to_string(),
+            &a.constraint_component,
+            &a.message,
+        )
+            .cmp(&(
+                b.focus_node.to_string(),
+                &b.constraint_component,
+                &b.message,
+            ))
+    });
+    results
 }
 
 fn severity_iri(severity: Severity) -> &'static str {

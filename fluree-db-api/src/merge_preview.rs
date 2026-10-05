@@ -717,7 +717,7 @@ impl crate::Fluree {
                     .await?;
                 Some(ValidationSummary {
                     conforms: outcome.conforms(),
-                    report: outcome.report,
+                    report: outcome.report.map(|report| report.to_string()),
                 })
             } else {
                 None

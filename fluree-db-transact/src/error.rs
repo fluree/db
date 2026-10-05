@@ -1,5 +1,6 @@
 //! Transaction error types
 
+use serde_json::Value as JsonValue;
 use thiserror::Error;
 
 /// Transaction errors
@@ -156,7 +157,7 @@ pub enum TransactError {
     /// SHACL validation violation (only available with `shacl` feature)
     #[cfg(feature = "shacl")]
     #[error("{0}")]
-    ShaclViolation(String),
+    ShaclViolation(ShaclViolations),
 
     /// Transaction exceeded the configured max-fuel limit
     #[error("{0}")]
@@ -267,6 +268,79 @@ pub enum TransactError {
         /// The new subject trying to assert this value.
         new_subject: String,
     },
+}
+
+/// One validation result with all identifiers resolved to IRIs.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReportResult {
+    /// The node that failed validation (`sh:focusNode`): a JSON string for
+    /// IRIs / blank-node labels, or a JSON-LD value object (or native
+    /// scalar) for literal `sh:targetNode` targets.
+    pub focus_node: JsonValue,
+    /// The property path, when it is a single predicate (`sh:resultPath`).
+    /// Complex paths are omitted rather than misrepresented.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_path: Option<String>,
+    /// The node shape that produced this result.
+    pub source_shape: String,
+    /// The property shape that produced this result, when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_constraint: Option<String>,
+    /// The constraint component IRI (`sh:sourceConstraintComponent`).
+    pub constraint_component: String,
+    /// Severity IRI: `sh:Violation`, `sh:Warning`, or `sh:Info`.
+    pub severity: String,
+    /// Human-readable message (`sh:resultMessage`).
+    pub message: String,
+    /// The offending value, when applicable (`sh:value`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<JsonValue>,
+}
+
+/// The violations that rejected a write: the readable report the error
+/// displays, and each violation resolved to IRIs, as
+/// `fluree_db_api::validate` reports them. Reads as the report text, so it
+/// can be matched and searched as a string.
+#[derive(Debug, Clone)]
+pub struct ShaclViolations {
+    message: String,
+    results: Vec<ReportResult>,
+}
+
+impl ShaclViolations {
+    pub fn new(message: String, results: Vec<ReportResult>) -> Self {
+        Self { message, results }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// The violations, resolved; empty where only the text was kept.
+    pub fn results(&self) -> &[ReportResult] {
+        &self.results
+    }
+}
+
+/// Violations known only by their text.
+impl From<String> for ShaclViolations {
+    fn from(message: String) -> Self {
+        Self::new(message, Vec::new())
+    }
+}
+
+impl std::fmt::Display for ShaclViolations {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::ops::Deref for ShaclViolations {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.message
+    }
 }
 
 /// Result type for transaction operations
