@@ -277,6 +277,27 @@ fits: `NotFoundError` is a `LookupError`, `InvalidRequestError` a `ValueError`,
 `PermissionDeniedError` a `PermissionError`, `QueryTimeoutError` a
 `TimeoutError`.
 
+Some errors carry what the engine knows, so an application can act on them
+without reading the message:
+
+- `ShaclViolationError` (an `InvalidRequestError`): a write the ledger's SHACL
+  shapes reject. `violations` lists each failure as the same
+  `ValidationResult` that `ledger.validate()` reports — focus node, path,
+  value, constraint component and message.
+- `UniqueConstraintError` (an `InvalidRequestError`): a value of an
+  `f:enforceUnique` property that another subject already holds; `property`,
+  `value`, `graph`, `existing_subject` and `new_subject`.
+- `ConflictError`: when a commit lost a race, `expected_t` and `head_t` say
+  where the ledger was and where it moved to.
+
+```python
+try:
+    people.insert(person)
+except fluree.ShaclViolationError as e:
+    for v in e.violations:
+        print(v.focus, v.path, v.message)
+```
+
 ## asyncio
 
 `fluree.aio` is the same API with coroutines, for FastAPI and other asyncio

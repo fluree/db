@@ -48,6 +48,8 @@ from fluree.errors import (
     PermissionDeniedError,
     QueryTimeoutError,
     ResourceLimitError,
+    ShaclViolationError,
+    UniqueConstraintError,
 )
 
 __all__ = [
@@ -82,9 +84,11 @@ __all__ = [
     "RevertPreview",
     "RevertResult",
     "RowStream",
+    "ShaclViolationError",
     "Snapshot",
     "SweepResult",
     "Transaction",
+    "UniqueConstraintError",
     "ValidationReport",
     "ValidationResult",
     "Vector",

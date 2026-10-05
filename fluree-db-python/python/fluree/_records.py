@@ -375,7 +375,11 @@ def _jsonld_term(value: Any) -> Any:
 
 
 def _validation_report(raw: dict[str, Any]) -> ValidationReport:
-    results = [
+    return ValidationReport(raw["conforms"], _validation_results(raw["results"]), raw["shape_count"], raw["t"])
+
+
+def _validation_results(raw: list[dict[str, Any]]) -> list[ValidationResult]:
+    return [
         ValidationResult(
             focus=_node(r["focus_node"]) if isinstance(r["focus_node"], str) else _jsonld_term(r["focus_node"]),
             path=None if r.get("result_path") is None else IRI(r["result_path"]),
@@ -385,6 +389,5 @@ def _validation_report(raw: dict[str, Any]) -> ValidationReport:
             shape=_node(r["source_shape"]),
             component=IRI(r["constraint_component"]),
         )
-        for r in raw["results"]
+        for r in raw
     ]
-    return ValidationReport(raw["conforms"], results, raw["shape_count"], raw["t"])

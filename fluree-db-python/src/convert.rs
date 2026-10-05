@@ -203,6 +203,11 @@ static DATE_CLASS: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static TIME_CLASS: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static DECIMAL_CLASS: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 
+/// `iri` as a `fluree.IRI`.
+pub(crate) fn iri<'py>(py: Python<'py>, iri: &str) -> PyResult<Bound<'py, PyAny>> {
+    term_class(py, &IRI_CLASS, "IRI")?.call1((iri,))
+}
+
 fn term_class<'py>(
     py: Python<'py>,
     cell: &'static PyOnceLock<Py<PyType>>,
