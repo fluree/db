@@ -1654,7 +1654,7 @@ Note: `f:*` keys used for graph source queries should be defined in your `@conte
     "(as (avg ?price) ?avgPrice)"
   ],
   "groupBy": ["?category"],
-  "having": [["filter", "(> (count ?product) 5)"]],
+  "having": "(> (count ?product) 5)",
   "where": [
     { "@id": "?product", "ex:category": "?category", "ex:price": "?price" }
   ],
