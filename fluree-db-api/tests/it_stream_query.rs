@@ -554,8 +554,8 @@ async fn jsonld_grouped_read_is_the_same_4xx_on_query_and_stream() {
 #[tokio::test]
 async fn order_by_a_variable_nothing_binds_streams_every_row() {
     let (fluree, ledger) = seed_areas().await;
-    let sparql = r#"PREFIX ex: <http://example.org/>
-        SELECT ?e WHERE { ?e ex:area ?a } ORDER BY ?nosuch"#
+    let sparql = r"PREFIX ex: <http://example.org/>
+        SELECT ?e WHERE { ?e ex:area ?a } ORDER BY ?nosuch"
         .to_string();
     let records = collect_records(&fluree, ledger, OwnedStreamQuery::Sparql(sparql)).await;
     let last = records.last().expect("terminal record");

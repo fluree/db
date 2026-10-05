@@ -15,6 +15,11 @@ use std::collections::HashMap;
 
 use super::{LowerError, LoweringContext, Result};
 
+/// Binds a level generates before grouping, as `(variable, expression)` pairs
+/// in evaluation order: aggregate inputs here, and in the SELECT lowering also
+/// GROUP BY expressions and SELECT expressions placed before grouping.
+pub(super) type GeneratedBinds = Vec<(VarId, fluree_db_query::ir::Expression)>;
+
 impl<E: IriEncoder> LoweringContext<'_, E> {
     fn iri_key(iri: &crate::ast::term::Iri) -> String {
         use crate::ast::term::IriValue;
@@ -118,7 +123,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     fn lower_aggregate_input_var(
         &mut self,
         expr: &Option<Box<Expression>>,
-        pre_binds: &mut Vec<(VarId, fluree_db_query::ir::Expression)>,
+        pre_binds: &mut GeneratedBinds,
     ) -> Result<Option<VarId>> {
         match expr {
             None => Ok(None),
@@ -198,7 +203,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         &mut self,
         agg: &Expression,
         output_var: VarId,
-        pre_binds: &mut Vec<(VarId, fluree_db_query::ir::Expression)>,
+        pre_binds: &mut GeneratedBinds,
     ) -> Result<AggregateSpec> {
         let Expression::Aggregate {
             function,
@@ -317,7 +322,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         expr: &Expression,
         aliases: &mut HashMap<String, VarId>,
         aggregates: &mut Vec<AggregateSpec>,
-        pre_binds: &mut Vec<(VarId, fluree_db_query::ir::Expression)>,
+        pre_binds: &mut GeneratedBinds,
     ) -> Result<()> {
         match expr.unwrap_bracketed() {
             agg @ Expression::Aggregate { .. } => {
@@ -382,10 +387,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     pub(super) fn extract_aggregates(
         &mut self,
         select: &SelectClause,
-    ) -> Result<(
-        Vec<AggregateSpec>,
-        Vec<(VarId, fluree_db_query::ir::Expression)>,
-    )> {
+    ) -> Result<(Vec<AggregateSpec>, GeneratedBinds)> {
         let mut aggregates = Vec::new();
         let mut pre_binds = Vec::new();
 
