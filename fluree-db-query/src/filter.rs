@@ -264,6 +264,27 @@ fn is_uncorrelated_exists(patterns: &[Pattern], batch_schema: &[VarId]) -> bool 
     pattern_vars.is_disjoint(&schema_vars)
 }
 
+/// The seed an `EXISTS` body or a pattern comprehension correlates with: the
+/// row's bindings, except that a per-group list (`Binding::Grouped`, which a
+/// JSON-LD group row can carry for a projected non-key variable) seeds as
+/// unbound. A list is not a term the pattern can match, and the group row does
+/// not bind that variable to one value, so it is free in the pattern, as any
+/// variable the grouping does not produce is ([`Expression::row_reads`]).
+fn correlation_seed(batch: &Batch, row_idx: usize) -> SeedOperator {
+    let width = batch.schema().len();
+    if !(0..width).any(|col| matches!(batch.get_by_col(row_idx, col), Binding::Grouped(_))) {
+        return SeedOperator::from_batch_row(batch, row_idx);
+    }
+    let schema: Arc<[VarId]> = Arc::from(batch.schema().to_vec().into_boxed_slice());
+    let row = (0..width)
+        .map(|col| match batch.get_by_col(row_idx, col) {
+            Binding::Grouped(_) => Binding::Unbound,
+            other => other.clone(),
+        })
+        .collect();
+    SeedOperator::from_row(schema, row)
+}
+
 /// Evaluate a pattern comprehension for a given row (always correlated): run the
 /// subquery seeded with the row's bindings, evaluate `projection` per match, and
 /// collect the non-null results into a `Binding::List`.
@@ -275,7 +296,7 @@ async fn eval_pattern_comprehension_for_row(
     ctx: &ExecutionContext<'_>,
     planning: &crate::temporal_mode::PlanningContext,
 ) -> Result<Binding> {
-    let seed = SeedOperator::from_batch_row(batch, row_idx);
+    let seed = correlation_seed(batch, row_idx);
     let mut op =
         build_where_operators_seeded(Some(Box::new(seed)), patterns, None, None, planning)?;
     op.open(ctx).await?;
@@ -455,7 +476,7 @@ fn resolve_exists_for_row<'a>(
                     }
                 }
 
-                let seed = SeedOperator::from_batch_row(batch, row_idx);
+                let seed = correlation_seed(batch, row_idx);
                 let found = any_solution(Box::new(seed), patterns, None, planning, ctx).await?;
                 Ok(Expression::Const(FlakeValue::Boolean(found != *negated)))
             }

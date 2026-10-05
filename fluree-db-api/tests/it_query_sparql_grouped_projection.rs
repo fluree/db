@@ -787,16 +787,97 @@ async fn having_exists_is_evaluated_per_group() {
         json!([["Net", 3], ["Remote", 1]]),
     )
     .await;
+    // ?e is not a key, so the group row does not bind it: it is free in the
+    // body, and some entity is in Net, so every group is kept (§18.2.4.1
+    // samples the expression's variables, not a pattern's).
     assert_rows(
         &fluree,
         &ledger,
         &format!(
             r#"SELECT ?a (COUNT(?e) AS ?n) {W} GROUP BY ?a HAVING (EXISTS {{ ?e ex:area "Net" }})"#
         ),
-        json!([{"a": "Net", "n": "3"}]),
-        json!([["Net", 3]]),
+        json!([
+            {"a": "Local", "n": "2"},
+            {"a": "Net", "n": "3"},
+            {"a": "Remote", "n": "1"}
+        ]),
+        json!([["Local", 2], ["Net", 3], ["Remote", 1]]),
     )
     .await;
+}
+
+/// A variable only an EXISTS body mentions is free over the group row, so the
+/// answer does not depend on which solution SAMPLE would pick: with one Net
+/// entity flagged, `EXISTS { ?e ex:flag true }` holds for every group, whichever
+/// entity carries the flag, and `NOT EXISTS` for none. The same holds on the
+/// `GroupByOperator` lane (a dedup-only GROUP BY, and GROUP_CONCAT) and for an
+/// EXISTS SELECT expression, which runs once per group.
+#[tokio::test]
+async fn exists_body_variables_are_free_over_the_group_row() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for flagged in ["ex:e1", "ex:e2"] {
+        let ledger_id = format!("grouped-projection/exists-free-{}:main", &flagged[3..]);
+        let ledger = seed_areas(&fluree, &ledger_id).await;
+        let ledger = fluree
+            .insert(
+                ledger,
+                &json!({
+                    "@context": {"ex": "http://example.org/"},
+                    "@id": flagged,
+                    "ex:flag": true
+                }),
+            )
+            .await
+            .expect("flag")
+            .ledger;
+        let all = json!([
+            {"a": "Local", "n": "2"},
+            {"a": "Net", "n": "3"},
+            {"a": "Remote", "n": "1"}
+        ]);
+        let exists = "EXISTS { ?e ex:flag true }";
+        let found = |result: &QueryResult| sorted(sparql_rows(result, &ledger));
+        let result = run(
+            &fluree,
+            &ledger,
+            &format!("SELECT ?a (COUNT(?e) AS ?n) {W} GROUP BY ?a HAVING ({exists})"),
+        )
+        .await;
+        assert_eq!(
+            found(&result),
+            sorted(rows(&all)),
+            "{flagged}: HAVING EXISTS"
+        );
+        let result = run(
+            &fluree,
+            &ledger,
+            &format!("SELECT ?a (COUNT(?e) AS ?n) {W} GROUP BY ?a HAVING (NOT {exists})"),
+        )
+        .await;
+        assert_eq!(result.row_count(), 0, "{flagged}: HAVING NOT EXISTS");
+        for body in [
+            format!("SELECT ?a {W} GROUP BY ?a HAVING ({exists})"),
+            format!("SELECT ?a (GROUP_CONCAT(STR(?e)) AS ?g) {W} GROUP BY ?a HAVING ({exists})"),
+        ] {
+            let result = run(&fluree, &ledger, &body).await;
+            assert_eq!(result.row_count(), 3, "{flagged}: {body}");
+        }
+        let result = run(
+            &fluree,
+            &ledger,
+            &format!("SELECT ?a ({exists} AS ?f) (COUNT(?e) AS ?n) {W} GROUP BY ?a"),
+        )
+        .await;
+        assert_eq!(
+            found(&result),
+            sorted(rows(&json!([
+                {"a": "Local", "f": "true", "n": "2"},
+                {"a": "Net", "f": "true", "n": "3"},
+                {"a": "Remote", "f": "true", "n": "1"}
+            ]))),
+            "{flagged}: EXISTS SELECT expression"
+        );
+    }
 }
 
 /// The area fixture with `ex:E` types, for Cypher's label match.

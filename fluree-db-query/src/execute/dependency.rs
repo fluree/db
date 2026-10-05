@@ -5,7 +5,7 @@
 //! and GROUP BY. Variables without downstream dependencies are dead and can
 //! be projected away early.
 
-use crate::ir::{AggregateFn, Grouping, Pattern, Query};
+use crate::ir::{AggregateFn, Expression, Grouping, Pattern, Query};
 use crate::var_registry::VarId;
 use std::collections::HashSet;
 
@@ -49,13 +49,42 @@ pub fn compute_variable_deps(query: &Query) -> Option<VariableDeps> {
     }
     let required_sort_vars: Vec<VarId> = deps.iter().copied().collect();
 
+    // What a post-grouping stage (ORDER BY bind, grouping bind, HAVING) reads.
+    // Over a group row that is the expression's row reads plus the variables
+    // its EXISTS / pattern-comprehension bodies correlate on that grouping
+    // produces: any other body variable is free in the body, and tracing it
+    // would carry it through grouping as a per-group list. Without grouping
+    // the row is a WHERE solution, and every variable the expression mentions
+    // correlates with it.
+    let grouping_outputs: Option<HashSet<VarId>> = query.grouping.as_ref().map(|g| {
+        g.group_by_vars()
+            .chain(g.aggregates().map(|spec| spec.output_var))
+            .chain(g.binds().map(|(var, _)| *var))
+            .chain(query.order_binds.iter().map(|(var, _)| *var))
+            .collect()
+    });
+    let reads = |expr: &Expression| -> Vec<VarId> {
+        match &grouping_outputs {
+            None => expr.referenced_vars(),
+            Some(produced) => {
+                let mut vars = expr.row_reads();
+                vars.extend(
+                    expr.referenced_vars()
+                        .into_iter()
+                        .filter(|v| produced.contains(v)),
+                );
+                vars
+            }
+        }
+    };
+
     // Expression-based ORDER BY binds run as a dedicated stage AFTER the
     // post-aggregation binds, so they are traced FIRST in this backward walk:
     // tracing their expression inputs keeps the referenced GROUP BY keys,
     // aggregate outputs, and post-binds alive through grouping/trimming.
     for (var, expr) in query.order_binds.iter().rev() {
         if deps.remove(var) {
-            deps.extend(expr.referenced_vars());
+            deps.extend(reads(expr));
         }
     }
 
@@ -73,7 +102,7 @@ pub fn compute_variable_deps(query: &Query) -> Option<VariableDeps> {
         required_bind_vars.push(deps.iter().copied().collect());
         // Then trace backward through the bind expression.
         if deps.remove(var) {
-            deps.extend(expr.referenced_vars());
+            deps.extend(reads(expr));
         }
     }
     // Reverse so indices match the forward (execution) order of binds.
@@ -85,7 +114,7 @@ pub fn compute_variable_deps(query: &Query) -> Option<VariableDeps> {
     // HAVING expression variables: needed in HAVING's input but not
     // necessarily in its output (HAVING evaluates before trimming).
     if let Some(having_expr) = query.grouping.as_ref().and_then(Grouping::having) {
-        deps.extend(having_expr.referenced_vars());
+        deps.extend(reads(having_expr));
     }
 
     // Record what Aggregate's output must contain (before tracing aggregates backward).

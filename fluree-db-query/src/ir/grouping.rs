@@ -364,9 +364,10 @@ impl Grouping {
     /// read the ones before it), the ORDER BY binds, ORDER BY, then the
     /// projection (checked only under [`UngroupedProjection::Reject`]). A
     /// variable nothing binds before grouping is not an ungrouped read: it is
-    /// unbound there (a HAVING reading a SELECT alias, §18.2.4.2).
-    /// [`Expression::referenced_vars`] includes `EXISTS` correlation variables,
-    /// so an `EXISTS` inside a grouped expression is covered too.
+    /// unbound there (a HAVING reading a SELECT alias, §18.2.4.2). Neither is a
+    /// variable that only an `EXISTS` body (or a pattern comprehension) in the
+    /// expression mentions: the group row does not bind it, so it is free in
+    /// the pattern; the reads checked are [`Expression::row_reads`].
     ///
     /// The lowerers never produce such a read (they rewrite non-key HAVING /
     /// ORDER BY reads to `SAMPLE`, [`sample_ungrouped_reads`]); this is the
@@ -402,7 +403,7 @@ impl Grouping {
         };
 
         if let Some(having) = self.having() {
-            if let Some(var) = find(having.referenced_vars().into_iter(), where_vars, |v| {
+            if let Some(var) = find(having.row_reads().into_iter(), where_vars, |v| {
                 grouped(v, 0, 0)
             }) {
                 return Some(UngroupedRead {
@@ -412,7 +413,7 @@ impl Grouping {
             }
         }
         for (i, (out, expr)) in binds.iter().enumerate() {
-            if let Some(var) = find(expr.referenced_vars().into_iter(), where_vars, |v| {
+            if let Some(var) = find(expr.row_reads().into_iter(), where_vars, |v| {
                 grouped(v, i, 0)
             }) {
                 return Some(UngroupedRead {
@@ -422,7 +423,7 @@ impl Grouping {
             }
         }
         for (j, (out, expr)) in order_binds.iter().enumerate() {
-            if let Some(var) = find(expr.referenced_vars().into_iter(), where_vars, |v| {
+            if let Some(var) = find(expr.row_reads().into_iter(), where_vars, |v| {
                 grouped(v, binds.len(), j)
             }) {
                 return Some(UngroupedRead {
@@ -664,9 +665,13 @@ impl UngroupedRead {
 /// output (HAVING reads it unbound, §18.2.4.2; ORDER BY reads the Extend), and a
 /// variable nothing binds (unbound either way). The rewrite reuses a `SAMPLE(?v)`
 /// the level already computes, and otherwise adds one whose output `mint`
-/// names. It renames with [`Expression::substitute_var`], which also reaches
-/// `EXISTS` patterns. After it, every such read is a read of an aggregate
-/// output, so running it again changes nothing.
+/// names. It reads and renames only what the expressions read from the group
+/// row ([`Expression::row_reads`], [`Expression::substitute_row_read`]): a
+/// variable inside an `EXISTS` body is a pattern variable, not a variable of
+/// the expression (`Sample(?v)` cannot stand in a triple pattern), and the
+/// group row does not bind it, so the pattern sees it free. After the rewrite,
+/// every such read is a read of an aggregate output, so running it again
+/// changes nothing.
 ///
 /// Which value SAMPLE picks is implementation-defined.
 pub fn sample_ungrouped_reads(
@@ -687,10 +692,10 @@ pub fn sample_ungrouped_reads(
         }
     };
     if let Some(having) = having.as_deref() {
-        having.referenced_vars().into_iter().for_each(&mut note);
+        having.row_reads().into_iter().for_each(&mut note);
     }
     for (_, expr) in order_binds.iter() {
-        expr.referenced_vars().into_iter().for_each(&mut note);
+        expr.row_reads().into_iter().for_each(&mut note);
     }
     for spec in ordering.iter() {
         note(spec.var);
@@ -716,10 +721,10 @@ pub fn sample_ungrouped_reads(
                 output_var
             });
         if let Some(having) = having.as_deref_mut() {
-            having.substitute_var(v, sampled);
+            having.substitute_row_read(v, sampled);
         }
         for (_, expr) in order_binds.iter_mut() {
-            expr.substitute_var(v, sampled);
+            expr.substitute_row_read(v, sampled);
         }
         for spec in ordering.iter_mut() {
             if spec.var == v {
@@ -805,8 +810,9 @@ pub enum SelectExprPlacement {
 ///
 /// An expression that reads an aggregate output and a non-key variable runs
 /// per group, where the plan-time check rejects the non-key read. A variable
-/// nothing binds before grouping (a typo, or a variable internal to an
-/// `EXISTS`) is unbound either way, so it does not hold an expression back.
+/// nothing binds before grouping (a typo) is unbound either way, and one that
+/// only an `EXISTS` body mentions is free in the pattern over a group row
+/// ([`Expression::row_reads`]), so neither holds an expression back.
 #[derive(Debug)]
 pub struct SelectExprPlacer {
     grouped: bool,
@@ -860,10 +866,7 @@ impl SelectExprPlacer {
         if !self.grouped {
             return vec![SelectExprPlacement::PreGroup; items.len()];
         }
-        let refs: Vec<Vec<VarId>> = items
-            .iter()
-            .map(|(_, expr, _)| expr.referenced_vars())
-            .collect();
+        let refs: Vec<Vec<VarId>> = items.iter().map(|(_, expr, _)| expr.row_reads()).collect();
         // Key-only aliases that a before-grouping expression reads, found by
         // walking back from each such reader until nothing more moves.
         let mut moved: HashSet<VarId> = HashSet::new();
@@ -991,12 +994,15 @@ mod tests {
             })
             .collect();
         assert_eq!(samples, vec![(e, VarId(101)), (es, VarId(102))]);
-        let refs = having.referenced_vars();
-        assert!(!refs.contains(&e), "?e renamed, EXISTS body included");
-        assert!(refs.contains(&VarId(101)));
+        let reads = having.row_reads();
+        assert!(!reads.contains(&e), "?e renamed where the HAVING reads it");
+        assert!(reads.contains(&VarId(101)));
         for kept in [a, n, x, nosuch] {
-            assert!(refs.contains(&kept), "{kept:?} left alone");
+            assert!(reads.contains(&kept), "{kept:?} left alone");
         }
+        // The EXISTS body keeps ?e: the group row does not bind it, so it is
+        // free in the pattern, not the sampled value.
+        assert!(having.referenced_vars().contains(&e), "EXISTS body renamed");
         assert_eq!(order_binds[0].1.referenced_vars(), vec![VarId(102)]);
         assert_eq!(
             ordering.iter().map(|s| s.var).collect::<Vec<_>>(),
@@ -1038,6 +1044,65 @@ mod tests {
         );
         assert_eq!(aggregates.len(), 1);
         assert_eq!(ordering[0].var, s);
+    }
+
+    /// A variable only an EXISTS body mentions is free over the group row:
+    /// the SAMPLE rewrite, the plan-time check and the placer all leave it
+    /// alone, while an EXISTS correlated on a key keeps its key.
+    #[test]
+    fn exists_body_variables_are_not_group_row_reads() {
+        use crate::ir::UngroupedProjection::Reject;
+        let (k, e, n, f) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let exists = |v: VarId| Expression::Exists {
+            patterns: vec![filter_on(v)],
+            negated: false,
+        };
+        let count = AggregateSpec {
+            function: AggregateFn::Count(e),
+            output_var: n,
+        };
+
+        // No SAMPLE for ?e: the body is not rewritten, and nothing is collected.
+        let mut aggregates = vec![count.clone()];
+        let mut having = exists(e);
+        sample_ungrouped_reads(
+            &[k],
+            &mut aggregates,
+            Some(&mut having),
+            &mut [],
+            &mut [],
+            || panic!("where_vars collected for an EXISTS-only variable"),
+            &mut |_| panic!("an EXISTS-only variable sampled"),
+        );
+        assert_eq!(aggregates.len(), 1);
+        assert_eq!(having.referenced_vars(), vec![e]);
+
+        // Not an ungrouped read, in HAVING or in a bind.
+        let where_vars = [k, e];
+        let g = Grouping::assemble(
+            vec![k],
+            vec![count.clone()],
+            vec![(f, exists(e))],
+            Some(exists(e)),
+        )
+        .expect("valid")
+        .expect("grouping");
+        assert_eq!(
+            g.first_ungrouped_read(&where_vars, &[], &[], Some(&[k, f, n]), Reject),
+            None
+        );
+
+        // An EXISTS-only expression is evaluated per group; one that also
+        // reads ?e outside the body still runs per solution.
+        let placer = SelectExprPlacer::grouped([k], [&count], [k, e].into_iter().collect());
+        let both = Expression::and(vec![Expression::Var(e), exists(e)]);
+        assert_eq!(
+            placer.place_all(&[(f, &exists(e), false), (VarId(4), &both, false)]),
+            vec![
+                SelectExprPlacement::PostGroup,
+                SelectExprPlacement::PreGroup
+            ]
+        );
     }
 
     #[test]
