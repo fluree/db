@@ -4,45 +4,61 @@ use crate::error::{fluree_error, raise_status};
 use fluree_db_api::{QueryCancellation, QueryCancellationReason};
 use pyo3::prelude::*;
 use std::future::Future;
-use std::ops::Deref;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::OnceLock;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::runtime::{EnterGuard, Runtime};
 
 /// How often a waiting query checks its deadline and Python's signals.
 const POLL: Duration = Duration::from_millis(50);
 
+/// The engine runtime of one process. A forked child inherits its parent's
+/// runtime without the threads that drive it, so a child that uses the engine
+/// starts a runtime of its own (except on macOS; see [`engine`]); the
+/// inherited one is leaked, never dropped, since dropping it would wait on
+/// threads that do not exist.
 struct Engine {
     runtime: Runtime,
     pid: u32,
 }
 
-static ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
+static ENGINE: AtomicPtr<Engine> = AtomicPtr::new(std::ptr::null_mut());
+static STARTING: Mutex<()> = Mutex::new(());
 
 fn engine() -> PyResult<&'static Engine> {
-    let engine = ENGINE
-        .get_or_init(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .thread_name("fluree-engine")
-                .build()
-                .map(|runtime| Engine {
-                    runtime,
-                    pid: std::process::id(),
-                })
-                .map_err(|e| format!("failed to start the Fluree engine runtime: {e}"))
-        })
-        .as_ref()
-        .map_err(|e| fluree_error(e.clone()))?;
-    // A forked child inherits the runtime's state but none of its threads.
-    if engine.pid != std::process::id() {
+    let pid = std::process::id();
+    if let Some(engine) = current(pid) {
+        return Ok(engine);
+    }
+    // On macOS the system dispatch library, which Rust's timed waits use,
+    // aborts in a child forked from a process that used it, so a forked child
+    // cannot run an engine of its own.
+    if cfg!(target_os = "macos") && !ENGINE.load(Ordering::Acquire).is_null() {
         return Err(fluree_error(
-            "Fluree cannot be used in a process forked after the engine started; \
-             use the multiprocessing 'spawn' or 'forkserver' start method",
+            "on macOS, a process forked after Fluree started cannot use it; use the \
+             multiprocessing 'spawn' start method (the macOS default) or 'forkserver'",
         ));
     }
+    let _starting = STARTING.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(engine) = current(pid) {
+        return Ok(engine);
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("fluree-engine")
+        .build()
+        .map_err(|e| fluree_error(format!("failed to start the Fluree engine runtime: {e}")))?;
+    let engine: &'static Engine = Box::leak(Box::new(Engine { runtime, pid }));
+    ENGINE.store(std::ptr::from_ref(engine).cast_mut(), Ordering::Release);
     Ok(engine)
+}
+
+/// This process's engine, if it has started one.
+fn current(pid: u32) -> Option<&'static Engine> {
+    // SAFETY: the pointer is null or a leaked `Engine`, never freed.
+    let engine = unsafe { ENGINE.load(Ordering::Acquire).as_ref() }?;
+    (engine.pid == pid).then_some(engine)
 }
 
 /// Run an engine future to completion with the GIL released.
@@ -129,39 +145,71 @@ pub(crate) fn enter() -> PyResult<EnterGuard<'static>> {
     Ok(engine()?.runtime.enter())
 }
 
-/// An engine value dropped inside the runtime: engine `Drop` impls hand their
-/// cleanup to `Handle::try_current()` and skip it outside one.
-pub(crate) struct InRuntime<T>(Option<T>);
+/// An engine value, usable only in the process that created it, and dropped
+/// inside the runtime: engine `Drop` impls hand their cleanup to
+/// `Handle::try_current()` and skip it outside one.
+///
+/// A forked child inherits the value but not the threads and locks its
+/// state relies on, so there [`get`](Self::get) refuses it and dropping
+/// leaks it.
+pub(crate) struct InRuntime<T> {
+    value: Option<T>,
+    pid: u32,
+}
 
 impl<T> InRuntime<T> {
     pub(crate) fn new(value: T) -> Self {
-        Self(Some(value))
+        Self {
+            value: Some(value),
+            pid: std::process::id(),
+        }
     }
 
-    pub(crate) fn get_mut(&mut self) -> &mut T {
-        self.0.as_mut().expect("taken only by into_inner or drop")
+    pub(crate) fn get(&self) -> PyResult<&T> {
+        self.check()?;
+        Ok(self
+            .value
+            .as_ref()
+            .expect("taken only by into_inner or drop"))
+    }
+
+    pub(crate) fn get_mut(&mut self) -> PyResult<&mut T> {
+        self.check()?;
+        Ok(self
+            .value
+            .as_mut()
+            .expect("taken only by into_inner or drop"))
     }
 
     /// The value, for a caller that will drop it inside the runtime itself.
-    pub(crate) fn into_inner(mut self) -> T {
-        self.0.take().expect("taken only by into_inner or drop")
+    pub(crate) fn into_inner(mut self) -> PyResult<T> {
+        self.check()?;
+        Ok(self.value.take().expect("taken only by into_inner or drop"))
     }
-}
 
-impl<T> Deref for InRuntime<T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        self.0.as_ref().expect("taken only by into_inner or drop")
+    fn check(&self) -> PyResult<()> {
+        if self.pid == std::process::id() {
+            return Ok(());
+        }
+        Err(fluree_error(
+            "this was opened in the parent of a forked process; open a new connection \
+             in this process",
+        ))
     }
 }
 
 impl<T> Drop for InRuntime<T> {
     fn drop(&mut self) {
-        let _guard = ENGINE
-            .get()
-            .and_then(|engine| engine.as_ref().ok())
-            .map(|engine| engine.runtime.enter());
-        drop(self.0.take());
+        let Some(value) = self.value.take() else {
+            return;
+        };
+        match current(self.pid) {
+            Some(engine) if self.pid == std::process::id() => {
+                let _guard = engine.runtime.enter();
+                drop(value);
+            }
+            Some(_) => std::mem::forget(value),
+            None => drop(value),
+        }
     }
 }

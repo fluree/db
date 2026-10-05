@@ -91,7 +91,7 @@ impl RowStream {
             self.finish();
             return Err(timeout_error(self.timeout));
         }
-        let records = records.get_mut();
+        let records = records.get_mut()?;
 
         let mut lines: Vec<Bytes> = Vec::new();
         let mut closed = false;

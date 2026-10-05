@@ -83,8 +83,11 @@ impl Transaction {
 impl Transaction {
     /// The staged state, governed and carrying the default context as
     /// `Connection.snapshot` views are. Reading it marks the transaction read.
-    async fn view(&self, txn: &EngineTxn) -> fluree_db_api::Result<GraphDb> {
-        let fluree = &*self.fluree;
+    async fn view(
+        &self,
+        fluree: &Fluree,
+        txn: &fluree_db_api::Transaction,
+    ) -> fluree_db_api::Result<GraphDb> {
         let view = txn.db().await?;
         let view = match &self.policy {
             Some(policy) => fluree.wrap_policy(view, policy).await?,
@@ -118,7 +121,7 @@ impl Transaction {
         params: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let operation = operation(op, kind, payload, params)?;
-        self.with_txn(|txn| block_on(py, txn.get_mut().stage(operation))?.map_err(api_error))
+        self.with_txn(|txn| block_on(py, txn.get_mut()?.stage(operation))?.map_err(api_error))
     }
 
     /// Stage a Cypher write — one statement or a `;` script, whose
@@ -137,19 +140,19 @@ impl Transaction {
             ));
         }
         let params = cypher::params(params)?;
+        let fluree = self.fluree.get()?;
         let rows = self.with_txn(|txn| {
+            let txn = txn.get_mut()?;
             block_on(py, async {
                 let mut last = None;
                 for statement in split_statements(query) {
                     last = if cypher_statement_is_write(&statement)? {
-                        txn.get_mut()
-                            .stage_cypher(&statement, params.clone())
-                            .await?
+                        txn.stage_cypher(&statement, params.clone()).await?
                     } else {
-                        let view = self.view(txn).await?;
+                        let view = self.view(fluree, txn).await?;
                         Some(
                             cypher::read_table(
-                                &self.fluree,
+                                fluree,
                                 &view,
                                 &statement,
                                 params.as_ref(),
@@ -170,8 +173,9 @@ impl Transaction {
     /// The ledger as the staged writes leave it, governed and carrying the
     /// default context as `Connection.snapshot` views are.
     fn snapshot(&self, py: Python<'_>) -> PyResult<Snapshot> {
-        let fluree = &*self.fluree;
-        let db = self.with_txn(|txn| block_on(py, self.view(txn))?.map_err(api_error))?;
+        let fluree = self.fluree.get()?;
+        let db =
+            self.with_txn(|txn| block_on(py, self.view(fluree, txn.get()?))?.map_err(api_error))?;
         Ok(Snapshot::new(fluree, db))
     }
 
@@ -184,11 +188,8 @@ impl Transaction {
         message: Option<String>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let txn = self.check_out()?;
-        let committed = block_on(py, async move {
-            InRuntime::into_inner(*txn)
-                .commit(commit_opts(message))
-                .await
-        });
+        let committed = InRuntime::into_inner(*txn)
+            .and_then(|txn| block_on(py, async move { txn.commit(commit_opts(message)).await }));
         *self.lock() = State::Closed;
         let receipt = committed?.map_err(api_error)?.receipt;
         receipt_to_py(py, &receipt)

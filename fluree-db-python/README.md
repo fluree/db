@@ -282,9 +282,16 @@ completes.
 
 Engine calls release the GIL, so threads can query in parallel. Several
 processes may share one database directory; a commit that loses a race to
-another process is retried against the new state. Do not fork a process after
-it has used Fluree — use the `spawn` or `forkserver` multiprocessing start
-method.
+another process is retried against the new state.
+
+Forked processes (a `multiprocessing` pool with the `fork` start method,
+gunicorn workers) open their own connection: one opened before the fork
+raises `FlureeError` in the child rather than half-working, and is left
+alone when the child exits. On Linux a child connects as usual, ideally
+forked while the parent is not mid-query. On macOS the system refuses
+threaded work in a child forked after Fluree started, so use the `spawn`
+start method there (the macOS default) or `forkserver`; a child forked
+before Fluree was first used is fine on either.
 
 ## Development
 

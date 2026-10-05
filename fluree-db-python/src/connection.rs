@@ -204,7 +204,7 @@ impl Connection {
     #[pyo3(signature = (ledger, source = None))]
     fn create(&self, py: Python<'_>, ledger: &str, source: Option<PathBuf>) -> PyResult<String> {
         let id = canonical(ledger)?;
-        let fluree = &*self.fluree;
+        let fluree = self.fluree.get()?;
         match source {
             None => block_on(py, fluree.create_ledger(&id))?
                 .map(drop)
@@ -225,13 +225,13 @@ impl Connection {
 
     fn exists(&self, py: Python<'_>, ledger: &str) -> PyResult<bool> {
         let id = canonical(ledger)?;
-        block_on(py, self.fluree.ledger_exists(&id))?.map_err(api_error)
+        block_on(py, self.fluree.get()?.ledger_exists(&id))?.map_err(api_error)
     }
 
     /// The canonical id of an existing ledger.
     fn ledger(&self, py: Python<'_>, ledger: &str) -> PyResult<String> {
         let id = canonical(ledger)?;
-        if block_on(py, self.fluree.ledger_exists(&id))?.map_err(api_error)? {
+        if block_on(py, self.fluree.get()?.ledger_exists(&id))?.map_err(api_error)? {
             Ok(id)
         } else {
             Err(not_found(format!("ledger {ledger:?} does not exist")))
@@ -239,7 +239,7 @@ impl Connection {
     }
 
     fn ledgers(&self, py: Python<'_>) -> PyResult<Vec<String>> {
-        let records = block_on(py, self.fluree.nameservice().all_records())?
+        let records = block_on(py, self.fluree.get()?.nameservice().all_records())?
             .map_err(|e| api_error(e.into()))?;
         let mut ids: Vec<String> = records
             .into_iter()
@@ -253,18 +253,18 @@ impl Connection {
     /// Drop a whole ledger, every branch. Takes the bare name: the engine
     /// rejects a `name:branch` id here rather than guess at the intent.
     fn drop(&self, py: Python<'_>, ledger: &str) -> PyResult<()> {
-        block_on(py, self.fluree.drop_ledger(ledger, DropMode::Hard))?
+        block_on(py, self.fluree.get()?.drop_ledger(ledger, DropMode::Hard))?
             .map(drop)
             .map_err(api_error)
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
-        block_on(py, self.fluree.disconnect())
+        block_on(py, self.fluree.get()?.disconnect())
     }
 
     /// Every branch of `ledger`'s ledger, by name.
     fn branches<'py>(&self, py: Python<'py>, ledger: &str) -> PyResult<Vec<Bound<'py, PyDict>>> {
-        branch::list(py, &self.fluree, &canonical(ledger)?)
+        branch::list(py, self.fluree.get()?, &canonical(ledger)?)
     }
 
     /// Branch `name` off `ledger` at its head or at `at`; returns its id.
@@ -276,11 +276,17 @@ impl Connection {
         name: &str,
         at: Option<&Bound<'_, PyTuple>>,
     ) -> PyResult<String> {
-        branch::create(py, &self.fluree, &canonical(ledger)?, name, time_spec(at)?)
+        branch::create(
+            py,
+            self.fluree.get()?,
+            &canonical(ledger)?,
+            name,
+            time_spec(at)?,
+        )
     }
 
     fn drop_branch(&self, py: Python<'_>, ledger: &str) -> PyResult<()> {
-        branch::drop(py, &self.fluree, &canonical(ledger)?)
+        branch::drop(py, self.fluree.get()?, &canonical(ledger)?)
     }
 
     fn merge<'py>(
@@ -290,7 +296,13 @@ impl Connection {
         source: &str,
         strategy: &str,
     ) -> PyResult<Bound<'py, PyDict>> {
-        branch::merge(py, &self.fluree, &canonical(target)?, source, strategy)
+        branch::merge(
+            py,
+            self.fluree.get()?,
+            &canonical(target)?,
+            source,
+            strategy,
+        )
     }
 
     fn rebase<'py>(
@@ -299,7 +311,7 @@ impl Connection {
         ledger: &str,
         strategy: &str,
     ) -> PyResult<Bound<'py, PyDict>> {
-        branch::rebase(py, &self.fluree, &canonical(ledger)?, strategy)
+        branch::rebase(py, self.fluree.get()?, &canonical(ledger)?, strategy)
     }
 
     fn revert<'py>(
@@ -309,7 +321,13 @@ impl Connection {
         commits: &Bound<'py, PyList>,
         strategy: &str,
     ) -> PyResult<Bound<'py, PyDict>> {
-        branch::revert(py, &self.fluree, &canonical(ledger)?, commits, strategy)
+        branch::revert(
+            py,
+            self.fluree.get()?,
+            &canonical(ledger)?,
+            commits,
+            strategy,
+        )
     }
 
     fn merge_preview<'py>(
@@ -319,7 +337,7 @@ impl Connection {
         source: &str,
         options: branch::MergePreviewArgs,
     ) -> PyResult<Bound<'py, PyDict>> {
-        branch::merge_preview(py, &self.fluree, &canonical(target)?, source, options)
+        branch::merge_preview(py, self.fluree.get()?, &canonical(target)?, source, options)
     }
 
     fn revert_preview<'py>(
@@ -329,7 +347,13 @@ impl Connection {
         commits: &Bound<'py, PyList>,
         options: branch::RevertPreviewArgs,
     ) -> PyResult<Bound<'py, PyDict>> {
-        branch::revert_preview(py, &self.fluree, &canonical(ledger)?, commits, options)
+        branch::revert_preview(
+            py,
+            self.fluree.get()?,
+            &canonical(ledger)?,
+            commits,
+            options,
+        )
     }
 
     /// Commit one write; see [`operation`] for `op`, `kind` and `payload`.
@@ -349,7 +373,7 @@ impl Connection {
         let id = canonical(ledger)?;
         let policy = governance(policy)?;
         let operation = operation(op, kind, payload, params)?;
-        let fluree = &*self.fluree;
+        let fluree = self.fluree.get()?;
         let receipt = block_on(py, async {
             let policy = write_policy(fluree, &id, policy.as_ref()).await?;
             let graph = fluree.graph(&id);
@@ -382,20 +406,20 @@ impl Connection {
         ledger: &str,
         options: ops::ValidateArgs,
     ) -> PyResult<Bound<'py, PyAny>> {
-        ops::validate(py, &self.fluree, &canonical(ledger)?, options)
+        ops::validate(py, self.fluree.get()?, &canonical(ledger)?, options)
     }
 
     fn index_status<'py>(&self, py: Python<'py>, ledger: &str) -> PyResult<Bound<'py, PyDict>> {
-        ops::index_status(py, &self.fluree, &canonical(ledger)?)
+        ops::index_status(py, self.fluree.get()?, &canonical(ledger)?)
     }
 
     #[pyo3(signature = (ledger, timeout = None))]
     fn index(&self, py: Python<'_>, ledger: &str, timeout: Option<f64>) -> PyResult<i64> {
-        ops::index(py, &self.fluree, &canonical(ledger)?, timeout)
+        ops::index(py, self.fluree.get()?, &canonical(ledger)?, timeout)
     }
 
     fn reindex(&self, py: Python<'_>, ledger: &str) -> PyResult<i64> {
-        ops::reindex(py, &self.fluree, &canonical(ledger)?)
+        ops::reindex(py, self.fluree.get()?, &canonical(ledger)?)
     }
 
     #[pyo3(signature = (ledger, max_commits = None))]
@@ -405,7 +429,7 @@ impl Connection {
         ledger: &str,
         max_commits: Option<usize>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        ops::verify(py, &self.fluree, &canonical(ledger)?, max_commits)
+        ops::verify(py, self.fluree.get()?, &canonical(ledger)?, max_commits)
     }
 
     fn sweep<'py>(
@@ -414,7 +438,7 @@ impl Connection {
         ledger: &str,
         dry_run: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
-        ops::sweep(py, &self.fluree, &canonical(ledger)?, dry_run)
+        ops::sweep(py, self.fluree.get()?, &canonical(ledger)?, dry_run)
     }
 
     /// Make `graph` (the default graph when `None`) hold exactly `payload`,
@@ -451,7 +475,7 @@ impl Connection {
             allow_empty,
             message,
         };
-        let fluree = &*self.fluree;
+        let fluree = self.fluree.get()?;
         let report = block_on(py, async {
             let policy = write_policy(fluree, &id, policy.as_ref()).await?;
             let payload = match &payload {
@@ -493,7 +517,7 @@ impl Connection {
         let params = cypher::params(params)?;
         let spec = time_spec(at)?;
         let policy = governance(policy)?;
-        let fluree = &*self.fluree;
+        let fluree = self.fluree.get()?;
         let db = block_on(py, load(fluree, &id, spec, policy.as_ref()))?.map_err(api_error)?;
         let controls = controls.unwrap_or_default();
         cypher::read(py, fluree, &db, cypher, params.as_ref(), controls)
@@ -514,7 +538,7 @@ impl Connection {
         let params = cypher::params(params)?;
         let spec = time_spec(at)?;
         let policy = governance(policy)?;
-        let fluree = &*self.fluree;
+        let fluree = self.fluree.get()?;
         let plan = block_on(py, async {
             let db = load(fluree, &id, spec, policy.as_ref()).await?;
             fluree.explain_cypher(&db, cypher, params.as_ref()).await
@@ -532,7 +556,12 @@ impl Connection {
         ledger: &str,
         policy: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Transaction> {
-        Transaction::begin(py, &self.fluree, &canonical(ledger)?, governance(policy)?)
+        Transaction::begin(
+            py,
+            self.fluree.get()?,
+            &canonical(ledger)?,
+            governance(policy)?,
+        )
     }
 
     #[pyo3(signature = (ledger, sparql, at = None, policy = None, controls = None, params = None))]
@@ -551,7 +580,7 @@ impl Connection {
         let spec = time_spec(at)?;
         let policy = governance(policy)?;
         let params = sparql_params(params)?;
-        let fluree = &*self.fluree;
+        let fluree = self.fluree.get()?;
         let controls = controls.unwrap_or_default();
         let (id, policy) = (&id, policy.as_ref());
         let answer = controls.run(py, |cancel, controls| async move {
@@ -583,7 +612,7 @@ impl Connection {
         let id = canonical(ledger)?;
         let spec = time_spec(at)?;
         let mut query = to_json(query)?;
-        let fluree = &*self.fluree;
+        let fluree = self.fluree.get()?;
         let controls = controls.unwrap_or_default();
         let id = &id;
         let answer = controls.run(py, |cancel, controls| async move {
@@ -616,7 +645,7 @@ impl Connection {
     ) -> PyResult<Bound<'py, PyAny>> {
         let policy = governance(policy)?;
         let params = sparql_params(params)?;
-        let fluree = &*self.fluree;
+        let fluree = self.fluree.get()?;
         let controls = controls.unwrap_or_default();
         let answer = controls.run(py, |cancel, controls| async move {
             let builder = fluree
@@ -646,7 +675,7 @@ impl Connection {
         controls: Option<Controls>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let query = to_json(query)?;
-        let fluree = &*self.fluree;
+        let fluree = self.fluree.get()?;
         let controls = controls.unwrap_or_default();
         let query = &query;
         let answer = controls.run(py, |cancel, controls| async move {
@@ -672,7 +701,7 @@ impl Connection {
         let spec = time_spec(at)?;
         let policy = governance(policy)?;
         let query = QueryText::from_py(query, params)?;
-        let fluree = &*self.fluree;
+        let fluree = self.fluree.get()?;
         let db = block_on(py, load(fluree, &id, spec, policy.as_ref()))?.map_err(api_error)?;
         start_stream(py, fluree, db, query, controls.unwrap_or_default())
     }
@@ -692,7 +721,7 @@ impl Connection {
         let spec = time_spec(at)?;
         let policy = governance(policy)?;
         let query = QueryText::from_py(query, params)?;
-        let fluree = &*self.fluree;
+        let fluree = self.fluree.get()?;
         let plan = block_on(py, async {
             let db = load(fluree, &id, spec, policy.as_ref()).await?;
             query.explain(fluree, &db).await
@@ -712,7 +741,7 @@ impl Connection {
         let id = canonical(ledger)?;
         let spec = time_spec(at)?;
         let policy = governance(policy)?;
-        let fluree = &*self.fluree;
+        let fluree = self.fluree.get()?;
         let db = block_on(py, load(fluree, &id, spec, policy.as_ref()))?.map_err(api_error)?;
         Ok(Snapshot {
             fluree: InRuntime::new(fluree.clone()),
@@ -730,7 +759,7 @@ impl Connection {
     ) -> PyResult<(Vec<Bound<'py, PyDict>>, usize)> {
         let id = canonical(ledger)?;
         let (summaries, total) =
-            block_on(py, self.fluree.commit_log(&id, limit))?.map_err(api_error)?;
+            block_on(py, self.fluree.get()?.commit_log(&id, limit))?.map_err(api_error)?;
         let commits = summaries
             .iter()
             .map(|s| commit_summary(py, s))
@@ -751,7 +780,7 @@ impl Connection {
         let id = canonical(ledger)?;
         let policy = governance(policy)?;
         let reference = commit_ref(commit)?;
-        let fluree = &*self.fluree;
+        let fluree = self.fluree.get()?;
         let detail = block_on(py, async {
             let graph = fluree.graph(&id);
             let builder = match &reference {
@@ -798,7 +827,7 @@ impl Connection {
         };
         let context = context.map(to_json).transpose()?;
         let spec = time_spec(at)?;
-        let fluree = &*self.fluree;
+        let fluree = self.fluree.get()?;
         block_on(py, async {
             let mut builder = fluree.export(&id).format(format).as_of(spec);
             if all_graphs {
@@ -844,7 +873,7 @@ impl Connection {
         include_indexes: bool,
     ) -> PyResult<()> {
         let id = canonical(ledger)?;
-        let fluree = &*self.fluree;
+        let fluree = self.fluree.get()?;
         block_on(py, async {
             let io = |e: std::io::Error| ApiError::internal(format!("{}: {e}", path.display()));
             let mut file = tokio::fs::File::create(&path).await.map_err(io)?;
@@ -859,7 +888,7 @@ impl Connection {
     /// Create `ledger` from a `.flpack` archive. Returns its canonical id.
     fn restore(&self, py: Python<'_>, path: PathBuf, ledger: &str) -> PyResult<String> {
         let id = canonical(ledger)?;
-        let fluree = &*self.fluree;
+        let fluree = self.fluree.get()?;
         block_on(py, async {
             let mut file = tokio::fs::File::open(&path)
                 .await
@@ -873,7 +902,7 @@ impl Connection {
     /// The ledger's default JSON-LD context, or `None` if it has none.
     fn context<'py>(&self, py: Python<'py>, ledger: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
         let id = canonical(ledger)?;
-        block_on(py, self.fluree.get_default_context(&id))?
+        block_on(py, self.fluree.get()?.get_default_context(&id))?
             .map_err(api_error)?
             .map(|context| from_json(py, &context))
             .transpose()
@@ -887,14 +916,15 @@ impl Connection {
     ) -> PyResult<()> {
         let id = canonical(ledger)?;
         let context = to_json(context)?;
-        block_on(py, self.fluree.set_default_context(&id, &context))?
+        block_on(py, self.fluree.get()?.set_default_context(&id, &context))?
             .map(drop)
             .map_err(api_error)
     }
 
     fn info<'py>(&self, py: Python<'py>, ledger: &str) -> PyResult<Bound<'py, PyAny>> {
         let id = canonical(ledger)?;
-        let info = block_on(py, self.fluree.ledger_info(&id).execute())?.map_err(api_error)?;
+        let info =
+            block_on(py, self.fluree.get()?.ledger_info(&id).execute())?.map_err(api_error)?;
         from_json(py, &info)
     }
 }
@@ -944,13 +974,13 @@ impl Snapshot {
 #[pymethods]
 impl Snapshot {
     #[getter]
-    fn ledger(&self) -> &str {
-        &self.db.ledger_id
+    fn ledger(&self) -> PyResult<&str> {
+        Ok(&self.db.get()?.ledger_id)
     }
 
     #[getter]
-    fn t(&self) -> i64 {
-        self.db.t
+    fn t(&self) -> PyResult<i64> {
+        Ok(self.db.get()?.t)
     }
 
     /// A Cypher read of this snapshot.
@@ -967,8 +997,8 @@ impl Snapshot {
         let controls = controls.unwrap_or_default();
         cypher::read(
             py,
-            &self.fluree,
-            &self.db,
+            self.fluree.get()?,
+            self.db.get()?,
             cypher,
             params.as_ref(),
             controls,
@@ -986,7 +1016,8 @@ impl Snapshot {
         let plan = block_on(
             py,
             self.fluree
-                .explain_cypher(&self.db, cypher, params.as_ref()),
+                .get()?
+                .explain_cypher(self.db.get()?, cypher, params.as_ref()),
         )?
         .map_err(api_error)?;
         from_json(py, &plan)
@@ -1002,7 +1033,7 @@ impl Snapshot {
     ) -> PyResult<Bound<'py, PyAny>> {
         let params = sparql_params(params)?;
         let controls = controls.unwrap_or_default();
-        let (fluree, db) = (&*self.fluree, &*self.db);
+        let (fluree, db) = (self.fluree.get()?, self.db.get()?);
         let answer = controls.run(py, |cancel, controls| async move {
             let builder = GraphSnapshotQueryBuilder::new_from_parts(fluree, db)
                 .sparql(sparql)
@@ -1025,7 +1056,7 @@ impl Snapshot {
     ) -> PyResult<Bound<'py, PyAny>> {
         let query = to_json(query)?;
         let controls = controls.unwrap_or_default();
-        let (fluree, db, query) = (&*self.fluree, &*self.db, &query);
+        let (fluree, db, query) = (self.fluree.get()?, self.db.get()?, &query);
         let answer = controls.run(py, |cancel, controls| async move {
             execute!(
                 controls,
@@ -1047,8 +1078,8 @@ impl Snapshot {
         let query = QueryText::from_py(query, params)?;
         start_stream(
             py,
-            &self.fluree,
-            (*self.db).clone(),
+            self.fluree.get()?,
+            self.db.get()?.clone(),
             query,
             controls.unwrap_or_default(),
         )
@@ -1062,7 +1093,8 @@ impl Snapshot {
         params: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let query = QueryText::from_py(query, params)?;
-        let plan = block_on(py, query.explain(&self.fluree, &self.db))?.map_err(api_error)?;
+        let plan =
+            block_on(py, query.explain(self.fluree.get()?, self.db.get()?))?.map_err(api_error)?;
         from_json(py, &plan)
     }
 }
