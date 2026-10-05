@@ -66,6 +66,11 @@ impl TxnOperation {
     }
 }
 
+/// A point in a [`Transaction`]'s staged operations; see
+/// [`Transaction::savepoint`].
+#[derive(Clone, Copy, Debug)]
+pub struct Savepoint(usize);
+
 /// The rows a Cypher write's `RETURN` produced: column names and typed cells.
 pub type CypherReturn = (Vec<String>, Vec<Vec<CypherCell>>);
 
@@ -195,6 +200,29 @@ impl Transaction {
             self.read.store(true, Ordering::Relaxed);
         }
         Ok(rows)
+    }
+
+    /// The operations staged so far, to return to with [`Self::rollback_to`].
+    pub fn savepoint(&self) -> Savepoint {
+        Savepoint(self.operations.len())
+    }
+
+    /// Discard every operation staged since `savepoint` — for a group of
+    /// operations, such as a `;` Cypher script, that must stage all or
+    /// nothing. A read in the discarded group still counts as a read.
+    pub async fn rollback_to(&mut self, savepoint: Savepoint) -> Result<()> {
+        if savepoint.0 >= self.operations.len() {
+            return Ok(());
+        }
+        self.operations.truncate(savepoint.0);
+        self.stager = stage_all(
+            &self.fluree,
+            self.base.clone(),
+            &self.operations,
+            &self.context,
+        )
+        .await?;
+        Ok(())
     }
 
     async fn push(&mut self, staged: Staged) -> Result<Option<CypherReturn>> {

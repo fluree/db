@@ -114,6 +114,31 @@ async fn a_failed_operation_leaves_the_transaction_as_it_was() {
 }
 
 #[tokio::test]
+async fn rollback_to_a_savepoint_discards_the_operations_after_it() {
+    let fluree = fluree().await;
+    let mut txn = fluree.begin_transaction(LEDGER, None).await.unwrap();
+    txn.stage(insert("alice", "Alice", 30)).await.unwrap();
+    let savepoint = txn.savepoint();
+    txn.stage(insert("bob", "Bob", 40)).await.unwrap();
+    txn.stage(insert("cy", "Cy", 50)).await.unwrap();
+    txn.rollback_to(savepoint).await.unwrap();
+    assert_eq!(txn.len(), 1);
+    // The staged state is rebuilt too, so later operations see only alice.
+    txn.stage(TxnOperation::SparqlUpdate(BIRTHDAY.into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        people(&fluree, &txn.db().await.unwrap()).await,
+        vec![json!(["Alice", 31])]
+    );
+    txn.commit(CommitOpts::default()).await.unwrap();
+    assert_eq!(
+        people(&fluree, &head(&fluree).await).await,
+        vec![json!(["Alice", 31])]
+    );
+}
+
+#[tokio::test]
 async fn net_zero_and_empty_transactions_commit_nothing() {
     let fluree = fluree().await;
     let mut txn = fluree.begin_transaction(LEDGER, None).await.unwrap();
