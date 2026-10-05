@@ -3,7 +3,7 @@
 //! incremental build. When that read fails the build reseeds from the base
 //! root, which keeps counts exact but holds NDV at a floor, so most stats
 //! tests cannot tell a working read site from a broken one. These tests
-//! compare NDV, not counts, on workloads where the floor and the true
+//! compare NDV, not just counts, on workloads where the floor and the true
 //! estimate diverge.
 
 use crate::support;
@@ -13,11 +13,13 @@ use fluree_db_api::tx::IndexingMode;
 use fluree_db_api::{Fluree, IndexerConfig, LedgerState, NameServiceMode, TriggerIndexOptions};
 use fluree_db_binary_index::format::index_root::IndexRoot;
 use fluree_db_connection::config::ConnectionConfig;
+use fluree_db_core::graph_registry::{DEFAULT_GRAPH_ID, FIRST_USER_GRAPH_ID};
 use fluree_db_core::index_stats::GraphPropertyStatEntry;
 use fluree_db_core::{ContentId, ContentStore, StorageRead, StorageWrite};
 use fluree_db_indexer::stats::HllSketchBlob;
 use fluree_db_nameservice::memory::MemoryNameService;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::task::LocalSet;
 
@@ -168,13 +170,41 @@ fn encode_v1(blob: &HllSketchBlob) -> Vec<u8> {
     .unwrap()
 }
 
+type UserStats = BTreeMap<(u16, u32), (u64, u64, u64, i64, Vec<(u8, u64)>)>;
+
+/// Per-(graph, property) stats for the default graph and every user named
+/// graph: count, ndv values, ndv subjects, last modified t, datatypes.
+fn user_stats(root: &IndexRoot) -> UserStats {
+    root.stats
+        .as_ref()
+        .and_then(|s| s.graphs.as_ref())
+        .expect("per-graph stats")
+        .iter()
+        .filter(|g| g.g_id == DEFAULT_GRAPH_ID || g.g_id >= FIRST_USER_GRAPH_ID)
+        .flat_map(|g| {
+            g.properties.iter().map(move |p| {
+                (
+                    (g.g_id, p.p_id),
+                    (
+                        p.count,
+                        p.ndv_values,
+                        p.ndv_subjects,
+                        p.last_modified_t,
+                        p.datatypes.clone(),
+                    ),
+                )
+            })
+        })
+        .collect()
+}
+
 /// Asserts the build that produced `incremental` was incremental, and that
-/// it carried the prior sketch's registers: its NDV must equal a full
-/// rebuild's, not the base-root floor.
+/// it carried the prior sketch's registers: every user-graph stat, NDV
+/// included, must equal a full rebuild's rather than the base-root floor.
 fn assert_matches_full_rebuild(
     incremental: (&IndexRoot, u64),
     full: (&IndexRoot, u64),
-    floor: &GraphPropertyStatEntry,
+    base: &IndexRoot,
 ) {
     let (incremental, incremental_leaves) = incremental;
     let (full, full_leaves) = full;
@@ -183,18 +213,21 @@ fn assert_matches_full_rebuild(
         "the build under test must be incremental: it wrote {incremental_leaves} leaves, \
          a full rebuild wrote {full_leaves}"
     );
-    let got = val_stat(incremental);
-    let want = val_stat(full);
-    assert_eq!(got.count, want.count);
+    let floor = user_stats(base);
+    let want = user_stats(full);
     assert!(
-        want.ndv_values > floor.ndv_values && want.ndv_subjects > floor.ndv_subjects,
-        "workload must move NDV past the base floor, or a fallback would pass: \
+        want.iter().any(|(key, (_, ndv_v, ndv_s, _, _))| {
+            floor
+                .get(key)
+                .is_some_and(|(_, base_v, base_s, _, _)| ndv_v > base_v && ndv_s > base_s)
+        }),
+        "workload must move some NDV past the base floor, or a fallback would pass: \
          floor {floor:?}, full {want:?}"
     );
     assert_eq!(
-        (got.ndv_values, got.ndv_subjects),
-        (want.ndv_values, want.ndv_subjects),
-        "incremental NDV must equal a full rebuild's"
+        user_stats(incremental),
+        want,
+        "incremental stats must equal a full rebuild's"
     );
 }
 
@@ -220,11 +253,7 @@ async fn incremental_build_carries_ndv_from_a_v2_sketch() {
             let full = reindex(&fluree, &storage, ledger_id).await;
 
             assert_eq!(val_stat(&incremental.0).count, 360);
-            assert_matches_full_rebuild(
-                (&incremental.0, incremental.1),
-                (&full.0, full.1),
-                &val_stat(&base),
-            );
+            assert_matches_full_rebuild((&incremental.0, incremental.1), (&full.0, full.1), &base);
         })
         .await;
 }
@@ -254,11 +283,7 @@ async fn incremental_build_upgrades_a_v1_sketch() {
                 "a build seeded from v1 writes v2"
             );
             let full = reindex(&fluree, &storage, ledger_id).await;
-            assert_matches_full_rebuild(
-                (&incremental.0, incremental.1),
-                (&full.0, full.1),
-                &val_stat(&base),
-            );
+            assert_matches_full_rebuild((&incremental.0, incremental.1), (&full.0, full.1), &base);
         })
         .await;
 }
@@ -300,6 +325,100 @@ async fn unreadable_sketch_keeps_counts_exact_and_thins_ndv_until_rebuild() {
                  thinned {} vs rebuilt {}",
                 thinned.ndv_values,
                 truth.ndv_values
+            );
+        })
+        .await;
+}
+
+async fn sparql_update(fluree: &Fluree, ledger_id: &str, update: String) {
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(&update)
+        .commit()
+        .await
+        .expect("sparql update");
+}
+
+fn triples(range: std::ops::Range<u32>, triple: impl Fn(u32) -> String) -> String {
+    range.map(triple).collect::<Vec<_>>().join("\n")
+}
+
+/// Retractions and named graphs through SPARQL UPDATE (the other tests use
+/// JSON-LD inserts into the default graph). The novelty retracts part of one
+/// property, every string of a mixed-datatype property, and all of another
+/// property, so counts clamp to zero and datatype entries drop out while
+/// registers, which never shrink, carry forward.
+#[tokio::test(flavor = "current_thread")]
+async fn incremental_build_with_retractions_in_named_graphs_matches_full_rebuild() {
+    let (fluree, storage, local) = setup();
+    local
+        .run_until(async move {
+            let ledger_id = "it/sketch-retract:main";
+            fluree.create_ledger(ledger_id).await.expect("create");
+            sparql_update(
+                &fluree,
+                ledger_id,
+                format!(
+                    "PREFIX ex: <http://example.org/>\nINSERT DATA {{\n{}\n\
+                     GRAPH ex:g1 {{\n{}\n{}\n}}\n\
+                     GRAPH ex:g2 {{\n{}\n{}\n}}\n}}",
+                    triples(0..300, |i| format!("ex:s{i} ex:val {i} .")),
+                    triples(0..200, |i| format!("ex:a{i} ex:val {i} .")),
+                    triples(0..200, |i| format!("ex:a{i} ex:label \"a{i}\" .")),
+                    triples(0..20, |i| format!("ex:b{i} ex:mixed {i} .")),
+                    triples(20..40, |i| format!("ex:b{i} ex:mixed \"m{i}\" .")),
+                ),
+            )
+            .await;
+            let (base, _) = index(&fluree, &storage, ledger_id).await;
+            assert!(
+                user_stats(&base)
+                    .keys()
+                    .any(|&(g_id, _)| g_id >= FIRST_USER_GRAPH_ID),
+                "named graphs must be in the base stats"
+            );
+
+            sparql_update(
+                &fluree,
+                ledger_id,
+                format!(
+                    "PREFIX ex: <http://example.org/>\nDELETE DATA {{\n{}\n\
+                     GRAPH ex:g1 {{\n{}\n}}\n\
+                     GRAPH ex:g2 {{\n{}\n}}\n}}",
+                    triples(0..50, |i| format!("ex:s{i} ex:val {i} .")),
+                    triples(0..200, |i| format!("ex:a{i} ex:label \"a{i}\" .")),
+                    triples(20..40, |i| format!("ex:b{i} ex:mixed \"m{i}\" .")),
+                ),
+            )
+            .await;
+            sparql_update(
+                &fluree,
+                ledger_id,
+                format!(
+                    "PREFIX ex: <http://example.org/>\nINSERT DATA {{\n{}\n\
+                     GRAPH ex:g1 {{\n{}\n}}\n}}",
+                    triples(300..360, |i| format!("ex:s{i} ex:val {i} .")),
+                    triples(200..260, |i| format!("ex:a{i} ex:val {i} .")),
+                ),
+            )
+            .await;
+
+            let incremental = index(&fluree, &storage, ledger_id).await;
+            let full = reindex(&fluree, &storage, ledger_id).await;
+            assert_matches_full_rebuild((&incremental.0, incremental.1), (&full.0, full.1), &base);
+
+            // The retractions must have reached the compared stats.
+            let stats = user_stats(&incremental.0);
+            assert!(
+                stats.values().any(|(count, ..)| *count == 310),
+                "default-graph ex:val: 300 - 50 + 60 = 310 facts; {stats:?}"
+            );
+            assert!(
+                stats
+                    .values()
+                    .any(|(count, .., datatypes)| *count == 20 && datatypes.len() == 1),
+                "g2 ex:mixed keeps only its integer datatype; {stats:?}"
             );
         })
         .await;
