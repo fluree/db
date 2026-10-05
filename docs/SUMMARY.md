@@ -282,6 +282,7 @@
   - [Graph identities and naming](reference/graph-identities.md)
   - [OWL & RDFS support](reference/owl-rdfs-support.md)
   - [Crate map](reference/crate-map.md)
+  - [License FAQ](reference/license-faq.md)
 
 - [Contributing](contributing/README.md)
   - [Linking issues from PRs](contributing/issue-linking.md)

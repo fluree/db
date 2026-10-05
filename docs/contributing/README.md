@@ -348,9 +348,13 @@ None
 
 ## License
 
-Contributions licensed under Apache 2.0.
+Fluree DB is distributed under the [Business Source License 1.1](https://github.com/fluree/db/blob/main/LICENSE),
+which converts to Apache License 2.0 on each version's Change Date.
 
-By contributing, you agree to license your contributions under the same license.
+By contributing, you license your contributions to Fluree, PBC under the
+[Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0), and agree that
+Fluree may distribute them as part of Fluree DB under the Business Source
+License, the Apache License 2.0, and Fluree's commercial licenses.
 
 ## Recognition
 
