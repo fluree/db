@@ -82,7 +82,7 @@ def test_parameters(ledger):
     assert ledger.query(query, {"name": "Bob"}).single()["age"] == 40
     assert ledger.query(query, name="Bob").single()["age"] == 40
     assert ledger.query(query, {"name": "Alice"}, name="Bob").single()["age"] == 40
-    assert ledger.query(query, name="Nobody").single() is None
+    assert ledger.query(query, name="Nobody").first() is None
 
 
 def test_nodes_relationships_and_paths(ledger):
@@ -121,12 +121,15 @@ def test_nodes_relationships_and_paths(ledger):
     assert path.start_node["name"] == "Alice" and path.end_node["name"] == "Carol"
 
 
-def test_single(ledger):
+def test_single_and_first(ledger):
     assert ledger.query('MATCH (p {name: "Bob"}) RETURN p.name').single()[0] == "Bob"
-    with pytest.warns(UserWarning):
-        ledger.query("MATCH (p:Person) RETURN p.name").single()
-    with pytest.raises(InvalidRequestError):
-        ledger.query("MATCH (p:Person) RETURN p.name").single(strict=True)
+    several = ledger.query("MATCH (p:Person) RETURN p.name ORDER BY p.name")
+    none = ledger.query('MATCH (p {name: "Nobody"}) RETURN p.name')
+    for result in (several, none):
+        with pytest.raises(InvalidRequestError, match="first()"):
+            result.single()
+    assert several.first()[0] == "Alice"
+    assert none.first() is None
 
 
 def test_writes_commit(ledger):
@@ -152,7 +155,7 @@ def test_a_script_commits_all_or_nothing(ledger):
 
     with pytest.raises(fluree.FlureeError):
         ledger.update('CREATE (:Person {name: "Frank"}); THIS IS NOT CYPHER')
-    assert ledger.query('MATCH (p {name: "Frank"}) RETURN p').single() is None
+    assert ledger.query('MATCH (p {name: "Frank"}) RETURN p').first() is None
 
 
 def test_a_failed_script_in_a_transaction_stages_nothing(ledger):
@@ -165,7 +168,7 @@ def test_a_failed_script_in_a_transaction_stages_nothing(ledger):
         ):
             with pytest.raises(fluree.FlureeError):
                 txn.update(script)
-            assert txn.query('MATCH (p {name: "Frank"}) RETURN p').single() is None
+            assert txn.query('MATCH (p {name: "Frank"}) RETURN p').first() is None
     names = ledger.query('MATCH (p:Person) WHERE p.name IN ["Frank", "Gail"] RETURN p.name')
     assert names.value(0) == ["Gail"]
 
@@ -184,7 +187,7 @@ def test_cypher_in_a_transaction(ledger):
         txn.update("MATCH (p {name: $n}) SET p.age = $age", n="Gus", age=50)
         # Cypher and SPARQL see each other's staged writes.
         txn.update('INSERT { ?p <nick> "G" } WHERE { ?p <name> "Gus" ; <age> 50 }')
-        assert ledger.query('MATCH (p {name: "Gus"}) RETURN p').single() is None
+        assert ledger.query('MATCH (p {name: "Gus"}) RETURN p').first() is None
     assert txn.committed.t == ledger.log()[0].t and ledger.log()[0].message == "gus"
     record = ledger.query('MATCH (p {name: "Gus"}) RETURN p.age AS age, p.nick AS nick').single()
     assert (record.age, record.nick) == (50, "G")
@@ -193,7 +196,7 @@ def test_cypher_in_a_transaction(ledger):
         with ledger.transaction() as txn:
             txn.update('CREATE (:Person {name: "Hal"})')
             raise RuntimeError
-    assert ledger.query('MATCH (p {name: "Hal"}) RETURN p').single() is None
+    assert ledger.query('MATCH (p {name: "Hal"}) RETURN p').first() is None
 
 
 def test_cypher_return_in_a_transaction_is_a_read(ledger):
@@ -203,7 +206,7 @@ def test_cypher_return_in_a_transaction_is_a_read(ledger):
     ledger.update('CREATE (:Person {name: "Jo"})')
     with pytest.raises(ConflictError):
         txn.commit()
-    assert ledger.query('MATCH (p {name: "Ida"}) RETURN p').single() is None
+    assert ledger.query('MATCH (p {name: "Ida"}) RETURN p').first() is None
 
 
 def test_cypher_without_return_is_staged_again(ledger):
@@ -212,7 +215,7 @@ def test_cypher_without_return_is_staged_again(ledger):
     ledger.update('CREATE (:Person {name: "Jo"})')
     txn.commit()
     assert ledger.query('MATCH (p {name: "Bob"}) RETURN p.age').single()[0] == 41
-    assert ledger.query('MATCH (p {name: "Jo"}) RETURN p').single() is not None
+    assert ledger.query('MATCH (p {name: "Jo"}) RETURN p').first() is not None
 
 
 def test_cypher_update_message(ledger):

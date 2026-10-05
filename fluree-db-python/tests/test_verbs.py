@@ -49,7 +49,7 @@ def test_methods_win_over_attribute_access(ledger):
 
 def test_single_and_frames(ledger):
     assert ledger.query(SPARQL_NAMES + " LIMIT 1").single().name == "Alice"
-    assert ledger.query(f"PREFIX ex: <{EX}> SELECT ?n WHERE {{ ex:nobody ex:name ?n }}").single() is None
+    assert ledger.query(f"PREFIX ex: <{EX}> SELECT ?n WHERE {{ ex:nobody ex:name ?n }}").first() is None
     pandas = pytest.importorskip("pandas")
     for query in (SPARQL_NAMES, CYPHER_NAMES):
         result = ledger.query(query)

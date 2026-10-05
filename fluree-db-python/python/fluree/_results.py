@@ -4,7 +4,6 @@ eagerly as a :class:`Result` or streamed as a :class:`RowStream`."""
 from __future__ import annotations
 
 import functools
-import warnings
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any, SupportsIndex, overload
@@ -102,7 +101,7 @@ def _record(keys: tuple[str, ...], values: tuple[Any, ...]) -> Record:
 class Result(Sequence[Record]):
     """The records a SPARQL ``SELECT`` or a Cypher statement returned, in
     order. Iterate it, index it, or read it as a whole: ``single()`` for
-    one record, ``value()`` for one column, ``data()`` for dicts,
+    the one record, ``first()`` for the first, ``value()`` for one column, ``data()`` for dicts,
     ``to_pandas()`` for a DataFrame."""
 
     __slots__ = ("_keys", "_records")
@@ -143,18 +142,19 @@ class Result(Sequence[Record]):
     def __repr__(self) -> str:
         return f"<Result keys={self._keys!r} len={len(self)}>"
 
-    def single(self, strict: bool = False) -> Record | None:
-        """The one record. With none, ``None``; with more than one, the
-        first, with a warning. ``strict`` raises
-        :class:`InvalidRequestError` instead of either."""
-        if len(self._records) == 1:
-            return self._records[0]
-        if strict:
-            raise InvalidRequestError(f"expected exactly one record, got {len(self._records)}")
-        if not self._records:
-            return None
-        warnings.warn("expected a result with a single record, but it contains more", stacklevel=2)
+    def single(self) -> Record:
+        """The one record; :class:`InvalidRequestError` unless there is
+        exactly one. For "the first record, if any", use :meth:`first`."""
+        if len(self._records) != 1:
+            raise InvalidRequestError(
+                f"expected exactly one record, got {len(self._records)}; "
+                "use first() for the first record, if any"
+            )
         return self._records[0]
+
+    def first(self) -> Record | None:
+        """The first record, or ``None`` when there are none."""
+        return self._records[0] if self._records else None
 
     def value(self, key: str | int = 0, default: Any = None) -> list[Any]:
         """One column's values, ``default`` where a record lacks it."""

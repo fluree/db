@@ -97,8 +97,10 @@ frozen view that every query sees identically.
 - SPARQL `SELECT` and every Cypher query return a `Result` of `Record`s in
   the query's column order. A record unpacks like a tuple and reads by
   position, key, or attribute (`r[0]`, `r["name"]`, `r.name`); the result has
-  `keys()`, `single()`, `value(key)`, `values()`, `data()` and
-  `to_pandas()` (alias `to_df()`) — the Neo4j driver's vocabulary.
+  `keys()`, `value(key)`, `values()`, `data()` and `to_pandas()` (alias
+  `to_df()`), the Neo4j driver's vocabulary. `single()` returns the one
+  record and raises unless there is exactly one; `first()` returns the first
+  record, or `None`.
 - Literals are Python values (`int`, `float`, `Decimal`, `datetime`, `str`,
   ...); IRIs are `fluree.IRI` and language-tagged strings
   `fluree.LangString`, both `str` subclasses. A literal with no lossless
