@@ -909,12 +909,13 @@ impl<'a> FromQueryBuilder<'a> {
     /// / inline policy) that should be resolved into a `PolicyContext`
     /// *internally*, against the query's own resolved dataset.
     ///
-    /// This is the policy channel for **SPARQL** sub-queries, which have no
-    /// body `opts` block to carry identity/policy the way JSON-LD does. When
-    /// set and the input is SPARQL, execution routes through
+    /// This is the programmatic policy channel for **SPARQL**, which carries
+    /// only the pragma subset of JSON-LD's body `opts` (no inline `policy`
+    /// document). When set and the input is SPARQL, execution routes through
     /// `query_connection_sparql_with_opts` (mirroring JSON-LD's
-    /// `query_connection` opts→policy path). For JSON-LD input it is a no-op
-    /// — JSON-LD carries its opts in the body. Takes precedence over
+    /// `query_connection` opts→policy path), and the request's own
+    /// `# PRAGMA` policy selection is not consulted. For JSON-LD input it is a
+    /// no-op — JSON-LD carries its opts in the body. Takes precedence over
     /// [`Self::policy`] when both are set.
     pub fn connection_opts(mut self, opts: GovernanceOptions) -> Self {
         self.connection_opts = Some(opts);
@@ -936,6 +937,7 @@ impl<'a> FromQueryBuilder<'a> {
     }
 
     fn prepare_authorization(&mut self) -> Result<Option<JsonValue>> {
+        self.adopt_sparql_pragma_policy();
         let Some(authorization) = self.authorization else {
             return Ok(None);
         };
@@ -952,6 +954,22 @@ impl<'a> FromQueryBuilder<'a> {
             Ok(Some(json))
         } else {
             Ok(None)
+        }
+    }
+
+    /// A SPARQL request's policy pragmas stand in for the body `opts` it has
+    /// no room for, unless the caller chose policy programmatically. Under
+    /// [`Self::authorization`] they are constrained like any request selection.
+    fn adopt_sparql_pragma_policy(&mut self) {
+        if self.connection_opts.is_some() || self.policy.is_some() {
+            return;
+        }
+        if let Some(QueryInput::Sparql(sparql)) = self.core.input {
+            let mut opts = GovernanceOptions::from_sparql(sparql);
+            if opts.has_any_policy_inputs() {
+                opts.server_identity = self.core.execution.server_identity.clone();
+                self.connection_opts = Some(opts);
+            }
         }
     }
 

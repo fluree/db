@@ -19,9 +19,13 @@ mod query_path_time_pin;
 mod sparql_construct_jsonld_accept;
 #[path = "sparql_dataset_semantics.rs"]
 mod sparql_dataset_semantics;
+#[path = "sparql_pragmas.rs"]
+mod sparql_pragmas;
 #[path = "sparql_protocol_dataset_params.rs"]
 mod sparql_protocol_dataset_params;
 #[path = "sparql_service_description.rs"]
 mod sparql_service_description;
 #[path = "stream_query_integration.rs"]
 mod stream_query_integration;
+#[path = "union_default_graph.rs"]
+mod union_default_graph;

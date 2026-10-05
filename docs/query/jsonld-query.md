@@ -246,6 +246,17 @@ Specifies which ledger(s) to query:
 }
 ```
 
+**Union default graph:** a ledger's default graph holds only the triples written outside any named graph, unless the ledger reads a [union default graph](../concepts/datasets-and-named-graphs.md#union-default-graph). `opts.unionDefaultGraph` decides for one query, whatever the ledger's setting (the SPARQL counterpart is `# PRAGMA union-default-graph`):
+
+```json
+{
+  "from": "mydb:main",
+  "opts": { "unionDefaultGraph": true },
+  "select": ["?name"],
+  "where": { "@id": "?person", "ex:name": "?name" }
+}
+```
+
 ### where
 
 The `where` clause contains query patterns:
@@ -321,8 +332,9 @@ with the Fluree vocabulary (`https://ns.flur.ee/db#`, e.g. stored
 predicates — the internal storage encoding of edge annotations. They are
 system-written (user transactions cannot assert them), redundant with the
 edge and annotation content already in the results, and therefore hidden from
-variable-predicate scans. Pass `"opts": {"includeSystemFacts": true}` to
-surface them for debugging or inspection. Commit metadata (`f:t`, `f:address`,
+variable-predicate scans. Pass `"opts": {"includeSystemFacts": true}` (in
+SPARQL, `# PRAGMA include-system-facts: true`) to surface them for debugging or
+inspection. Commit metadata (`f:t`, `f:address`,
 …) lives in the ledger's txn-meta graph, not the default graph, so it never
 appears in default-graph scans either way.
 

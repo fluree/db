@@ -2231,6 +2231,38 @@ mod tests {
         );
     }
 
+    /// A panic in the closure reaches the caller as a panic, not as a storage error.
+    /// The key lock is released, so the next compare-and-swap on the key writes.
+    #[tokio::test]
+    async fn compare_and_swap_resumes_a_panic_in_the_closure_on_the_caller() {
+        let (_dir, storage) = storage();
+        let panicked = tokio::spawn({
+            let storage = storage.clone();
+            async move {
+                storage
+                    .compare_and_swap("h.json", |_| -> StorageExtResult<CasAction<()>> {
+                        panic!("closure panicked")
+                    })
+                    .await
+            }
+        })
+        .await
+        .expect_err("the closure's panic came back as a value");
+        assert_eq!(
+            crate::task::panic_message(panicked.into_panic()),
+            "closure panicked"
+        );
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            storage.compare_and_swap("h.json", |_| Ok(CasAction::<()>::Write(b"v1".to_vec()))),
+        )
+        .await
+        .expect("the panicked compare-and-swap kept the key lock")
+        .unwrap();
+        assert!(matches!(outcome, CasOutcome::Written));
+    }
+
     /// A dropped ledger removes a directory this storage has cached.
     /// Inserting and swapping under it again must recreate the directory.
     #[tokio::test]
@@ -3771,6 +3803,9 @@ mod wal_tests {
     /// `recover_wal` blocks that thread until it can take the root gate.
     /// The compare-and-swap holds the root gate from its read to its write.
     /// It must be able to release the root gate without the blocked runtime thread.
+    ///
+    /// The runtime thread blocks until the closure runs, so the root gate is held when
+    /// `recover_wal` starts waiting. A closure that needs the runtime thread never runs.
     #[test]
     fn recover_wal_on_a_runtime_thread_does_not_deadlock_an_in_flight_cas() {
         use std::time::Duration;
@@ -3784,15 +3819,23 @@ mod wal_tests {
             rt.block_on(async {
                 let dir = tempfile::tempdir().unwrap();
                 let storage = FileStorage::new(dir.path());
+                let (in_f_tx, in_f_rx) = std::sync::mpsc::channel();
                 let cas = tokio::spawn(async move {
                     storage
-                        .compare_and_swap(HEAD, |_| Ok(CasAction::<()>::Write(b"x".to_vec())))
+                        .compare_and_swap(HEAD, move |_| {
+                            // The root gate is held here.
+                            let _ = in_f_tx.send(());
+                            // Stay in flight while `recover_wal` starts waiting.
+                            std::thread::sleep(Duration::from_millis(100));
+                            Ok(CasAction::<()>::Write(b"x".to_vec()))
+                        })
                         .await
                 });
                 // Yield so the compare-and-swap task starts its blocking task.
-                // Then block the runtime thread until the read has finished.
                 tokio::task::yield_now().await;
-                std::thread::sleep(Duration::from_millis(200));
+                in_f_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("the compare-and-swap closure needed the blocked runtime thread");
                 FileStorage::new(dir.path()).recover_wal().unwrap();
                 cas.await.unwrap().unwrap();
             });

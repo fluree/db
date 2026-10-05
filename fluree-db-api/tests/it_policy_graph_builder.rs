@@ -282,6 +282,122 @@ async fn identity_selects_its_stored_policy_class() {
 }
 
 // =========================================================================
+// SPARQL: `# PRAGMA` policy selection, the counterpart of `opts`
+// =========================================================================
+
+fn sparql_rows(v: &Value) -> usize {
+    v.pointer("/results/bindings")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len)
+}
+
+/// Runs `pragmas` + a query over `property` through both builders, after an
+/// unrestricted control, and returns the two row counts.
+async fn sparql_through_both_builders(
+    fluree: &Fluree,
+    ledger_id: &str,
+    property: &str,
+    pragmas: &str,
+) -> (usize, usize) {
+    let body = format!("SELECT ?s WHERE {{ ?s <{property}> ?v }}");
+    let control = fluree
+        .graph(ledger_id)
+        .query()
+        .sparql(&body)
+        .execute_formatted()
+        .await
+        .expect("control");
+    assert_eq!(sparql_rows(&control), 5, "control: {control}");
+
+    let graph = fluree
+        .graph(ledger_id)
+        .query()
+        .sparql(&format!("{pragmas}\n{body}"))
+        .execute_formatted()
+        .await
+        .expect("graph-scoped sparql");
+    let from = fluree
+        .query_from()
+        .sparql(&format!(
+            "{pragmas}\nSELECT ?s FROM <{ledger_id}> WHERE {{ ?s <{property}> ?v }}"
+        ))
+        .execute_formatted()
+        .await
+        .expect("from-driven sparql");
+    (sparql_rows(&graph), sparql_rows(&from))
+}
+
+/// Twin of `policy_class_selects_stored_rules`.
+#[tokio::test]
+async fn sparql_pragma_policy_class_selects_stored_rules() {
+    const LEDGER: &str = "repro/gqb-sparql-pragma-class:main";
+    let fluree = setup(LEDGER).await;
+    let pragmas = format!(
+        "# PRAGMA policy-class: <{READER}>\n\
+         # PRAGMA policy-values: {{\"?$identity\": {{\"@id\": \"{ALICE_ID}\"}}}}\n\
+         # PRAGMA default-allow: false"
+    );
+    assert_eq!(
+        sparql_through_both_builders(&fluree, LEDGER, SSN, &pragmas).await,
+        (1, 1)
+    );
+}
+
+/// Twin of `identity_selects_its_stored_policy_class`.
+#[tokio::test]
+async fn sparql_pragma_identity_selects_its_stored_policy_class() {
+    const LEDGER: &str = "repro/gqb-sparql-pragma-identity:main";
+    let fluree = setup(LEDGER).await;
+    let pragmas = format!("# PRAGMA identity: <{ALICE_ID}>");
+    assert_eq!(
+        sparql_through_both_builders(&fluree, LEDGER, SSN, &pragmas).await,
+        (1, 1)
+    );
+}
+
+/// A host that selects policy programmatically keeps it: the request text's
+/// pragmas cannot replace `connection_opts` or a prebuilt `policy`. Each
+/// pragma would change the row count if it were adopted.
+#[tokio::test]
+async fn sparql_pragma_policy_yields_to_caller_selection() {
+    const LEDGER: &str = "repro/gqb-sparql-pragma-caller-wins:main";
+    let fluree = setup(LEDGER).await;
+    let sparql =
+        |pragma: &str| format!("{pragma}\nSELECT ?s FROM <{LEDGER}> WHERE {{ ?s <{SSN}> ?v }}");
+
+    let alice = fluree_db_api::GovernanceOptions {
+        identity: Some(ALICE_ID.to_string()),
+        ..Default::default()
+    };
+    let widen = fluree
+        .query_from()
+        .sparql(&sparql("# PRAGMA default-allow: true"))
+        .connection_opts(alice)
+        .execute_formatted()
+        .await
+        .expect("connection_opts query");
+    assert_eq!(
+        sparql_rows(&widen),
+        1,
+        "connection_opts' identity must govern, not the pragma: {widen}"
+    );
+
+    let root = fluree_db_api::PolicyContext::new(fluree_db_api::PolicyWrapper::root(), None);
+    let narrow = fluree
+        .query_from()
+        .sparql(&sparql("# PRAGMA default-allow: false"))
+        .policy(root)
+        .execute_formatted()
+        .await
+        .expect("prebuilt policy query");
+    assert_eq!(
+        sparql_rows(&narrow),
+        5,
+        "the prebuilt policy must govern, not the pragma: {narrow}"
+    );
+}
+
+// =========================================================================
 // Every terminal, not just `execute_formatted`
 // =========================================================================
 

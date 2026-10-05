@@ -174,8 +174,10 @@ A `GET` on `/v1/fluree/query` or `/v1/fluree/query/{ledger}` with no `query`
 parameter returns a description of the endpoint in JSON-LD, Turtle, N-Triples
 or RDF/XML, chosen by `Accept`. It names the endpoint, the SPARQL query
 language (`sd:SPARQLQuery` at versions 1.0 through 1.2, and `sd:SPARQL11Query`
-for older clients), the result formats, and simple entailment. See
-[Service description](../api/endpoints.md#service-description).
+for older clients), the result formats, and simple entailment, plus
+`sd:UnionDefaultGraph` on a ledger whose
+[union default graph](../concepts/datasets-and-named-graphs.md#union-default-graph)
+is on. See [Service description](../api/endpoints.md#service-description).
 
 **Specification:** https://www.w3.org/TR/sparql11-service-description/ and the
 SPARQL 1.2 Service Description draft

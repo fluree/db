@@ -11,6 +11,7 @@ mod tracking;
 pub(crate) use bearer::extract_bearer_token;
 pub use bearer::{EventsPrincipal, MaybeBearer};
 pub use credential::{CredentialPayload, ExtractedCredential, MaybeCredential};
+pub(crate) use credential_policy::validate_pragma_selection;
 pub use credential_policy::CredentialPolicy;
 pub(crate) use data_bearer::{parse_scopes, read_scopes, verify_data_principal};
 pub use data_bearer::{DataPrincipal, MaybeDataBearer};

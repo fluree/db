@@ -180,6 +180,23 @@ The requested resource doesn't exist.
 - Check if ledger was created
 - Verify entity IRI
 
+A dataset member (`FROM` / `FROM NAMED`, JSON-LD `from` / `fromNamed`, or a
+`graph()` / `db()` address) that names a graph its ledger does not have is a
+404 with `@type` `err:db/GraphNotFound`:
+
+```json
+{
+  "error": "Graph not found: ...",
+  "status": 404,
+  "@type": "err:db/GraphNotFound"
+}
+```
+
+A commit reference that names no commit of the ledger (an `@commit:` pin,
+`at`, commit show's `commit`, or a revert's commits) is a 404 with `@type`
+`err:db/CommitNotFound`. A malformed one (too short, an abbreviated CID, or a
+prefix that matches several commits) is a 400.
+
 #### 408 Request Timeout
 
 The request took too long to process.

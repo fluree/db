@@ -1783,7 +1783,7 @@ impl Operator for FusedR2rmlAggregateOperator {
         let table_provider = ctx.r2rml_table_provider.ok_or_else(|| {
             QueryError::InvalidQuery("R2RML table provider not configured".to_string())
         })?;
-        let as_of_t = if ctx.dataset.is_some() {
+        let as_of_t = if ctx.explicit_dataset().is_some() {
             None
         } else {
             Some(ctx.to_t)
@@ -2312,7 +2312,7 @@ impl FusedR2rmlAggregateOperator {
         // mapping below. A missing provider / load failure leaves `mapping` as
         // `None`, which disables fusion and, for a genuine R2RML scan, falls
         // back to the normal path.
-        let as_of_t = if ctx.dataset.is_some() {
+        let as_of_t = if ctx.explicit_dataset().is_some() {
             None
         } else {
             Some(ctx.to_t)
@@ -3750,7 +3750,7 @@ impl FusedR2rmlAggregateOperator {
         let table_provider = ctx.r2rml_table_provider.ok_or_else(|| {
             QueryError::InvalidQuery("R2RML table provider not configured".to_string())
         })?;
-        let as_of_t = if ctx.dataset.is_some() {
+        let as_of_t = if ctx.explicit_dataset().is_some() {
             None
         } else {
             Some(ctx.to_t)
@@ -4078,7 +4078,7 @@ impl FusedR2rmlAggregateOperator {
         let table_provider = ctx.r2rml_table_provider.ok_or_else(|| {
             QueryError::InvalidQuery("R2RML table provider not configured".to_string())
         })?;
-        let as_of_t = if ctx.dataset.is_some() {
+        let as_of_t = if ctx.explicit_dataset().is_some() {
             None
         } else {
             Some(ctx.to_t)
@@ -5648,6 +5648,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
         }
@@ -6843,6 +6844,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
         };
@@ -6873,6 +6875,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
         };
@@ -6911,6 +6914,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
         };
@@ -7308,6 +7312,7 @@ mod tests {
                 offset: None,
                 post_values: None,
                 include_system_facts: false,
+                union_default_graph: None,
                 cypher_vocab: None,
                 unmatched_optional: Default::default(),
             };

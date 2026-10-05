@@ -2541,6 +2541,34 @@ async fn sparql_within_ledger_from_alias_spelling_mismatch_is_rejected() {
         msg.contains("not in this ledger"),
         "expected the within-ledger cross-ledger rejection, got: {msg}"
     );
+    assert_eq!(err.status_code(), 400, "a graph not in the ledger is a 400");
+}
+
+/// `urn:default`, the name ledger info lists the default graph under, names
+/// the default graph in a within-ledger `FROM` / `FROM NAMED`, as the alias
+/// does.
+#[tokio::test]
+async fn sparql_within_ledger_from_urn_default_scopes_default_graph() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_within_ledger_dataset(&fluree, "wl:main").await;
+
+    for sparql in [
+        "PREFIX schema: <http://schema.org/>
+         SELECT ?name FROM <urn:default> { ?s schema:name ?name }",
+        "PREFIX schema: <http://schema.org/>
+         SELECT ?name FROM NAMED <urn:default> { GRAPH <urn:default> { ?s schema:name ?name } }",
+    ] {
+        let result = support::query_sparql(&fluree, &ledger, sparql)
+            .await
+            .expect("urn:default must resolve to the ledger's default graph");
+        let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+        assert_eq!(
+            normalize_rows(&jsonld),
+            normalize_rows(&json!([["Alice"]])),
+            "{sparql}"
+        );
+    }
 }
 
 /// Query-surface parity (D-3, Option A): the within-ledger SPARQL `FROM` /
