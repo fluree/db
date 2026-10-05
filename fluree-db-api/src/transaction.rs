@@ -1,37 +1,42 @@
 //! Transactions built one operation at a time and committed as one commit.
 //!
-//! Each [`Transaction::stage`] applies its operation over the ones before it
-//! — validated by the full staging pipeline (policy, SHACL, uniqueness) as it
-//! is added — and [`Transaction::db`] reads the result without committing.
-//! [`Transaction::commit`] writes every staged operation as a single commit,
-//! the operations netted in order exactly as a `;`-separated SPARQL UPDATE
-//! nets its parts.
+//! Each [`Transaction::stage`] (or [`Transaction::stage_cypher`]) applies its
+//! operation over the ones before it — validated by the full staging pipeline
+//! (policy, SHACL, uniqueness) as it is added — and [`Transaction::db`] reads
+//! the result without committing. [`Transaction::commit`] writes every staged
+//! operation as a single commit, the operations netted in order exactly as a
+//! `;`-separated SPARQL UPDATE nets its parts. Operations in different
+//! languages — JSON-LD, Turtle, SPARQL UPDATE, Cypher — mix freely.
 //!
 //! The operations stage against the ledger's state when the transaction
 //! began. If another commit lands before this one, what happens depends on
 //! whether the transaction was read:
 //!
 //! - **Not read:** each operation decides its own effect (an update's
-//!   `WHERE` is evaluated where it is staged), so the commit re-bases the
-//!   staged result over the other commit when the two touched different
-//!   subjects, and otherwise stages every operation again against the new
-//!   head, as a single write does when it loses a race.
-//! - **Read through [`Transaction::db`]:** the caller may have decided what to
-//!   write from what it read, and staging again would replay those decisions
-//!   against data they never saw — a lost update. The commit fails with
+//!   `WHERE`, a Cypher `MATCH` or `MERGE`, is evaluated where it is staged),
+//!   so the commit re-bases the staged result over the other commit when the
+//!   two touched different subjects, and otherwise stages every operation
+//!   again against the new head, as a single write does when it loses a race.
+//! - **Read through [`Transaction::db`], or through the `RETURN` rows of a
+//!   Cypher write:** the caller may have decided what to write from what it
+//!   read, and staging again would replay those decisions against data they
+//!   never saw — a lost update. The commit fails with
 //!   [`TransactError::CommitConflict`]; run the transaction again.
 
+use crate::cypher_write::{self, ResolvedConditional, WritePlan};
+use crate::format::cypher_typed::CypherCell;
 use crate::ledger_manager::RefreshOpts;
-use crate::tx::{SequentialStager, StageResult, TransactResultRef};
+use crate::tx::{SequentialStager, TransactResultRef};
 use crate::tx_builder::{is_retryable_commit_conflict, OpPlan, TransactOperation};
-use crate::{ApiError, Fluree, GraphDb, PolicyContext, Result};
+use crate::{ApiError, CypherParamMap, Fluree, GovernanceOptions, GraphDb, PolicyContext, Result};
 use fluree_db_core::ContentId;
 use fluree_db_ledger::{IndexConfig, LedgerState};
 use fluree_db_transact::{CommitOpts, TransactError, TxnOpts, TxnType};
 use serde_json::Value as JsonValue;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// One write in a [`Transaction`].
+/// One write in a [`Transaction`]. Cypher writes are staged with
+/// [`Transaction::stage_cypher`].
 #[derive(Clone, Debug)]
 pub enum TxnOperation {
     /// JSON-LD insert.
@@ -61,6 +66,21 @@ impl TxnOperation {
     }
 }
 
+/// The rows a Cypher write's `RETURN` produced: column names and typed cells.
+pub type CypherReturn = (Vec<String>, Vec<Vec<CypherCell>>);
+
+/// A staged operation, as replayed when the transaction stages again.
+enum Staged {
+    Operation(TxnOperation),
+    /// A Cypher write statement. The skolem id names the nodes and edges it
+    /// creates, so staging it again creates the same identities.
+    Cypher {
+        query: String,
+        params: Option<CypherParamMap>,
+        skolem_txn_id: String,
+    },
+}
+
 /// A transaction open on one ledger: staged operations, readable through
 /// [`Self::db`], committed together by [`Self::commit`].
 ///
@@ -72,35 +92,58 @@ pub struct Transaction {
     base: LedgerState,
     base_head: Option<ContentId>,
     stager: SequentialStager,
-    operations: Vec<TxnOperation>,
+    operations: Vec<Staged>,
+    context: StageContext,
+    /// Whether the caller read the staged state: the commit then requires the
+    /// head it began on.
+    read: AtomicBool,
+}
+
+/// What every operation stages under.
+struct StageContext {
+    ledger_id: String,
+    governance: GovernanceOptions,
     policy: Option<PolicyContext>,
     index_config: IndexConfig,
-    /// Whether [`Self::db`] was called: the commit then requires the head it
-    /// began on.
-    read: AtomicBool,
 }
 
 impl Fluree {
     /// Open a transaction on `ledger_id` at its current head. Operations
-    /// staged on it are checked against `policy` when one is given.
+    /// staged on it are checked against the policy `governance` describes
+    /// (`None`: the ledger's configured defaults only).
     pub async fn begin_transaction(
         &self,
         ledger_id: &str,
-        policy: Option<PolicyContext>,
+        governance: Option<GovernanceOptions>,
     ) -> Result<Transaction> {
         let handle = self.ledger_cached(ledger_id).await?;
         let snapshot = handle.snapshot().await;
         let base_head = snapshot.head_commit_id.clone();
         let base = snapshot.to_ledger_state();
+        let governance = governance.unwrap_or_default();
+        let policy = crate::build_transact_policy_context(
+            self,
+            &base.snapshot,
+            base.novelty.as_ref(),
+            Some(base.novelty.as_ref()),
+            base.t(),
+            &governance,
+        )
+        .await?;
+        let ledger_id = handle.id().to_string();
         Ok(Transaction {
             fluree: self.clone(),
-            ledger_id: handle.id().to_string(),
             stager: SequentialStager::new(base.clone()),
             base,
             base_head,
             operations: Vec::new(),
-            policy,
-            index_config: crate::server_defaults::default_index_config(),
+            context: StageContext {
+                ledger_id: ledger_id.clone(),
+                governance,
+                policy,
+                index_config: crate::server_defaults::default_index_config(),
+            },
+            ledger_id,
             read: AtomicBool::new(false),
         })
     }
@@ -116,27 +159,49 @@ impl Transaction {
         self.base.t()
     }
 
-    /// The operations staged so far.
-    pub fn operations(&self) -> &[TxnOperation] {
-        &self.operations
+    /// How many operations are staged.
+    pub fn len(&self) -> usize {
+        self.operations.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.operations.is_empty()
     }
 
     /// Apply `operation` over those already staged. An operation that fails
     /// to stage — a parse error, a policy denial, a SHACL violation — is
     /// not added, and the transaction stays as it was.
     pub async fn stage(&mut self, operation: TxnOperation) -> Result<()> {
-        let staged = stage_operation(
-            &self.fluree,
-            &mut self.stager,
-            &operation,
-            self.policy.as_ref(),
-            &self.index_config,
-        )
-        .await;
-        match staged {
-            Ok(()) => {
-                self.operations.push(operation);
-                Ok(())
+        self.push(Staged::Operation(operation)).await.map(drop)
+    }
+
+    /// Apply a Cypher write statement (`CREATE`, `MERGE`, `SET`, `DELETE`,
+    /// multi-clause writes) over the operations already staged: its `MATCH`
+    /// and `MERGE` see them. Returns the rows of its `RETURN`, if it has one;
+    /// receiving them counts as reading the transaction (see the module
+    /// docs). A statement that fails to stage is not added.
+    pub async fn stage_cypher(
+        &mut self,
+        query: &str,
+        params: Option<CypherParamMap>,
+    ) -> Result<Option<CypherReturn>> {
+        let staged = Staged::Cypher {
+            query: query.to_string(),
+            params,
+            skolem_txn_id: cypher_write::fresh_skolem_txn_id(),
+        };
+        let rows = self.push(staged).await?;
+        if rows.is_some() {
+            self.read.store(true, Ordering::Relaxed);
+        }
+        Ok(rows)
+    }
+
+    async fn push(&mut self, staged: Staged) -> Result<Option<CypherReturn>> {
+        match stage_one(&self.fluree, &mut self.stager, &staged, &self.context).await {
+            Ok(rows) => {
+                self.operations.push(staged);
+                Ok(rows)
             }
             Err(e) => {
                 // A failed stage consumes the stager's state; rebuild it from
@@ -145,8 +210,7 @@ impl Transaction {
                     &self.fluree,
                     self.base.clone(),
                     &self.operations,
-                    self.policy.as_ref(),
-                    &self.index_config,
+                    &self.context,
                 )
                 .await?;
                 Err(e)
@@ -176,8 +240,7 @@ impl Transaction {
             base_head,
             stager,
             operations,
-            policy,
-            index_config,
+            context,
             read,
         } = self;
         let read = read.into_inner();
@@ -196,32 +259,18 @@ impl Transaction {
                     head_t: guard.state().t(),
                 }));
             }
-            let stage = match prestaged.take() {
-                Some(stage) if unchanged => stage,
-                Some(stage) => {
-                    match Fluree::rebase_stage(&guard, stage, base_t, base_head.as_ref()) {
-                        Some(rebased) => rebased,
-                        None => {
-                            restage(
-                                &fluree,
-                                guard.clone_state(),
-                                &operations,
-                                &policy,
-                                &index_config,
-                            )
-                            .await?
-                        }
-                    }
-                }
+            let rebased = match prestaged.take() {
+                Some(stage) if unchanged => Some(stage),
+                Some(stage) => Fluree::rebase_stage(&guard, stage, base_t, base_head.as_ref()),
+                None => None,
+            };
+            let stage = match rebased {
+                Some(stage) => stage,
                 None => {
-                    restage(
-                        &fluree,
-                        guard.clone_state(),
-                        &operations,
-                        &policy,
-                        &index_config,
-                    )
-                    .await?
+                    stage_all(&fluree, guard.clone_state(), &operations, &context)
+                        .await?
+                        .finish()
+                        .await?
                 }
             };
             match fluree
@@ -230,7 +279,7 @@ impl Transaction {
                     stage,
                     TxnType::Update,
                     commit_opts.clone(),
-                    &index_config,
+                    &context.index_config,
                     None,
                     None,
                 )
@@ -255,56 +304,183 @@ impl Transaction {
     }
 }
 
-async fn stage_operation(
+/// Stage one operation over the stager's state; for a Cypher write, also
+/// answer its `RETURN`.
+async fn stage_one(
     fluree: &Fluree,
     stager: &mut SequentialStager,
-    operation: &TxnOperation,
-    policy: Option<&PolicyContext>,
-    index_config: &IndexConfig,
-) -> Result<()> {
-    let plan = operation.plan()?;
+    staged: &Staged,
+    context: &StageContext,
+) -> Result<Option<CypherReturn>> {
+    match staged {
+        Staged::Operation(operation) => {
+            let plan = operation.plan()?;
+            stager
+                .stage_with(true, |state| async move {
+                    let (stage, _, _) = fluree
+                        .stage_plan(
+                            &plan,
+                            state,
+                            TxnOpts::default(),
+                            &CommitOpts::default(),
+                            None,
+                            &context.index_config,
+                            context.policy.as_ref(),
+                        )
+                        .await?;
+                    Ok(stage)
+                })
+                .await?;
+            Ok(None)
+        }
+        Staged::Cypher {
+            query,
+            params,
+            skolem_txn_id,
+        } => {
+            stage_cypher(
+                fluree,
+                stager,
+                query,
+                params.as_ref(),
+                skolem_txn_id,
+                context,
+            )
+            .await
+        }
+    }
+}
+
+/// What a staged Cypher statement's `RETURN` needs once its flakes are part
+/// of the stager's state.
+enum PendingReturn {
+    /// Created entities, read back by their skolemized identities.
+    Created(cypher_write::CypherWriteReturnPlan),
+    /// A multi-clause statement's rows, already formatted.
+    Rows(CypherReturn),
+}
+
+async fn stage_cypher(
+    fluree: &Fluree,
+    stager: &mut SequentialStager,
+    query: &str,
+    params: Option<&CypherParamMap>,
+    skolem_txn_id: &str,
+    context: &StageContext,
+) -> Result<Option<CypherReturn>> {
+    let mut pending = None;
+    let pending_ref = &mut pending;
     stager
         .stage_with(true, |state| async move {
-            let (stage, _, _) = fluree
-                .stage_plan(
-                    &plan,
-                    state,
-                    TxnOpts::default(),
-                    &CommitOpts::default(),
-                    None,
-                    index_config,
-                    policy,
+            // Multi-clause statements run through the sequential driver, which
+            // answers a trailing RETURN from its final row table.
+            if let Ok(ast) = crate::query::helpers::substituted_cypher_ast(query, params) {
+                if let Some(sq) = crate::cypher_seq::detect_sequential(&ast) {
+                    let outcome = fluree
+                        .stage_cypher_sequential(
+                            state,
+                            &sq,
+                            &context.ledger_id,
+                            Some(&context.governance),
+                            Some(&context.index_config),
+                            context.policy.as_ref(),
+                            None,
+                            Some(skolem_txn_id.to_string()),
+                        )
+                        .await?;
+                    if let Some(result) = outcome.return_result {
+                        let view = fluree
+                            .resolve_and_attach_config(GraphDb::from_ledger_state(
+                                &outcome.final_state,
+                            ))
+                            .await?;
+                        let table = result.to_cypher_typed_table(&view).await.map_err(|e| {
+                            ApiError::internal(format!("Cypher RETURN formatting: {e}"))
+                        })?;
+                        *pending_ref = Some(PendingReturn::Rows(table));
+                    }
+                    return Ok(outcome.stage_result);
+                }
+            }
+
+            if let Some(plan) = cypher_write::plan_write_return_source(query, params)? {
+                *pending_ref = Some(PendingReturn::Created(plan));
+            }
+            let plan = fluree
+                .cypher_write_plan_with_skolem(
+                    query,
+                    params,
+                    &context.ledger_id,
+                    &state.snapshot,
+                    Some(skolem_txn_id.to_string()),
                 )
                 .await?;
-            Ok(stage)
+            let resolved = match plan {
+                WritePlan::Single(txn) => ResolvedConditional::single(*txn),
+                WritePlan::Conditional(cw) => {
+                    // The branch-choosing probe sees what the caller's policy
+                    // lets it see, as the autocommit path's does.
+                    let probe = GraphDb::from_ledger_state(&state);
+                    let probe = if context.governance.has_any_policy_inputs() {
+                        fluree.wrap_policy(probe, &context.governance).await?
+                    } else {
+                        probe
+                    };
+                    fluree
+                        .resolve_conditional_cypher(&cw, probe, &context.ledger_id, &state.snapshot)
+                        .await?
+                }
+                WritePlan::Sequential(_) => {
+                    return Err(ApiError::internal(
+                        "sequential Cypher write reached the single-statement path",
+                    ))
+                }
+            };
+            match resolved.followup {
+                Some(followup) => {
+                    fluree
+                        .stage_pair_from_txns(
+                            state,
+                            resolved.primary,
+                            followup,
+                            Some(&context.index_config),
+                            context.policy.as_ref(),
+                            None,
+                        )
+                        .await
+                }
+                None => {
+                    fluree
+                        .stage_transaction_from_txn(
+                            state,
+                            resolved.primary,
+                            Some(&context.index_config),
+                            context.policy.as_ref(),
+                            None,
+                        )
+                        .await
+                }
+            }
         })
-        .await
-        .map(drop)
+        .await?;
+    Ok(match pending {
+        None => None,
+        Some(PendingReturn::Rows(table)) => Some(table),
+        Some(PendingReturn::Created(plan)) => {
+            Some(cypher_write::write_return_typed_rows(&plan, skolem_txn_id, stager.state()).await?)
+        }
+    })
 }
 
 async fn stage_all(
     fluree: &Fluree,
     base: LedgerState,
-    operations: &[TxnOperation],
-    policy: Option<&PolicyContext>,
-    index_config: &IndexConfig,
+    operations: &[Staged],
+    context: &StageContext,
 ) -> Result<SequentialStager> {
     let mut stager = SequentialStager::new(base);
-    for operation in operations {
-        stage_operation(fluree, &mut stager, operation, policy, index_config).await?;
+    for staged in operations {
+        stage_one(fluree, &mut stager, staged, context).await?;
     }
     Ok(stager)
-}
-
-async fn restage(
-    fluree: &Fluree,
-    state: LedgerState,
-    operations: &[TxnOperation],
-    policy: &Option<PolicyContext>,
-    index_config: &IndexConfig,
-) -> Result<StageResult> {
-    stage_all(fluree, state, operations, policy.as_ref(), index_config)
-        .await?
-        .finish()
-        .await
 }

@@ -700,8 +700,11 @@ async fn main() -> Result<()> {
 }
 ```
 
-Pass a `PolicyContext` to `begin_transaction` to check every write against
-policy. Dropping a `Transaction` discards it.
+Pass `GovernanceOptions` to `begin_transaction` to check every write against
+that policy. `stage_cypher(query, params)` stages a Cypher write alongside the
+other operations — its `MATCH` and `MERGE` see them — and returns the rows of
+its `RETURN`, if any. Receiving those rows counts as reading the transaction,
+as `db()` does. Dropping a `Transaction` discards it.
 
 ### Export Data
 

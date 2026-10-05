@@ -100,7 +100,7 @@ async fn a_failed_operation_leaves_the_transaction_as_it_was() {
     ))
     .await
     .expect_err("parse error");
-    assert_eq!(txn.operations().len(), 1);
+    assert_eq!(txn.len(), 1);
     txn.stage(insert("bob", "Bob", 40)).await.unwrap();
     assert_eq!(
         people(&fluree, &txn.db().await.unwrap()).await,
@@ -249,4 +249,100 @@ async fn set_alice_age(fluree: &Fluree, age: i64) {
         .commit()
         .await
         .unwrap();
+}
+
+async fn count(fluree: &Fluree, sparql: &str) -> usize {
+    select(fluree, &head(fluree).await, sparql).await.len()
+}
+
+/// Cypher and SPARQL writes in one transaction see one another and land in
+/// one commit.
+#[tokio::test]
+async fn cypher_and_sparql_mix_in_one_commit() {
+    let fluree = fluree().await;
+    let mut txn = fluree.begin_transaction(LEDGER, None).await.unwrap();
+    let returned = txn
+        .stage_cypher(r#"CREATE (:Person {name: "Ann"})"#, None)
+        .await
+        .unwrap();
+    assert!(returned.is_none());
+    txn.stage(TxnOperation::SparqlUpdate(
+        r#"INSERT { ?p <age> 30 } WHERE { ?p <name> "Ann" }"#.into(),
+    ))
+    .await
+    .unwrap();
+    // Matches only if it sees the SPARQL update's age.
+    txn.stage_cypher(
+        "MATCH (p:Person {name: $name}) WHERE p.age = 30 SET p.checked = true",
+        Some(serde_json::from_value(json!({"name": "Ann"})).unwrap()),
+    )
+    .await
+    .unwrap();
+
+    let result = txn.commit(CommitOpts::default()).await.unwrap();
+    assert_eq!(result.receipt.t, 1);
+    assert_eq!(
+        select(
+            &fluree,
+            &head(&fluree).await,
+            r#"SELECT ?age WHERE { ?p <name> "Ann" ; <age> ?age ; <checked> true }"#
+        )
+        .await,
+        vec![json!([30])]
+    );
+}
+
+/// A Cypher write's RETURN rows are a read: the transaction then refuses a
+/// ledger that moved.
+#[tokio::test]
+async fn cypher_return_rows_count_as_a_read() {
+    let fluree = fluree().await;
+    let mut txn = fluree.begin_transaction(LEDGER, None).await.unwrap();
+    let (columns, rows) = txn
+        .stage_cypher(r#"CREATE (p:Person {name: "Bo"}) RETURN p"#, None)
+        .await
+        .unwrap()
+        .expect("RETURN rows");
+    assert_eq!((columns, rows.len()), (vec!["p".to_string()], 1));
+    insert_alice(&fluree, 30).await;
+    let err = txn.commit(CommitOpts::default()).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_api::TransactError::CommitConflict { .. })
+        ),
+        "{err}"
+    );
+}
+
+/// A MERGE staged before another commit created its node is staged again
+/// over that commit, so it matches instead of creating a duplicate.
+#[tokio::test]
+async fn a_merge_restages_over_a_concurrent_create() {
+    let fluree = fluree().await;
+    let mut txn = fluree.begin_transaction(LEDGER, None).await.unwrap();
+    txn.stage_cypher(r#"MERGE (p:Person {name: "Cy"}) SET p.seen = true"#, None)
+        .await
+        .unwrap();
+    fluree
+        .graph(LEDGER)
+        .transact()
+        .sparql_update(r#"INSERT DATA { <cy> a <Person> ; <name> "Cy" }"#)
+        .commit()
+        .await
+        .unwrap();
+
+    txn.commit(CommitOpts::default()).await.unwrap();
+    assert_eq!(
+        count(
+            &fluree,
+            r#"SELECT ?p WHERE { ?p a <Person> ; <name> "Cy" }"#
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(&fluree, "SELECT ?p WHERE { <cy> <seen> true }").await,
+        1
+    );
 }
