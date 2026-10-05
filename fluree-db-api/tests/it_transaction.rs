@@ -80,7 +80,7 @@ async fn operations_see_earlier_ones_and_commit_once() {
     let mut txn = begin(&fluree).await;
     txn.stage(insert("alice", "Alice", 30)).await.unwrap();
     // Reads alice's age from the insert above.
-    txn.stage(TxnOperation::SparqlUpdate(BIRTHDAY.into()))
+    txn.stage(TxnOperation::SparqlUpdate(BIRTHDAY.into(), None))
         .await
         .unwrap();
     txn.stage(TxnOperation::InsertTurtle(
@@ -117,6 +117,7 @@ async fn a_failed_operation_leaves_the_transaction_as_it_was() {
     txn.stage(insert("alice", "Alice", 30)).await.unwrap();
     txn.stage(TxnOperation::SparqlUpdate(
         "INSERT DATA { not sparql".into(),
+        None,
     ))
     .await
     .expect_err("parse error");
@@ -144,7 +145,7 @@ async fn rollback_to_a_savepoint_discards_the_operations_after_it() {
     txn.rollback_to(savepoint).await.unwrap();
     assert_eq!(txn.len(), 1);
     // The staged state is rebuilt too, so later operations see only alice.
-    txn.stage(TxnOperation::SparqlUpdate(BIRTHDAY.into()))
+    txn.stage(TxnOperation::SparqlUpdate(BIRTHDAY.into(), None))
         .await
         .unwrap();
     assert_eq!(
@@ -163,9 +164,10 @@ async fn net_zero_and_empty_transactions_commit_nothing() {
     let fluree = fluree().await;
     let mut txn = begin(&fluree).await;
     txn.stage(insert("alice", "Alice", 30)).await.unwrap();
-    txn.stage(TxnOperation::SparqlUpdate(format!(
-        "{PREFIX}DELETE DATA {{ ex:alice ex:name \"Alice\" ; ex:age 30 }}"
-    )))
+    txn.stage(TxnOperation::SparqlUpdate(
+        format!("{PREFIX}DELETE DATA {{ ex:alice ex:name \"Alice\" ; ex:age 30 }}"),
+        None,
+    ))
     .await
     .unwrap();
     let result = txn.commit(CommitOpts::default()).await.unwrap();
@@ -213,7 +215,7 @@ async fn restages_over_a_concurrent_write_its_update_matches() {
     insert_alice(&fluree, 30).await;
 
     let mut txn = begin(&fluree).await;
-    txn.stage(TxnOperation::SparqlUpdate(BIRTHDAY.into()))
+    txn.stage(TxnOperation::SparqlUpdate(BIRTHDAY.into(), None))
         .await
         .unwrap();
     set_alice_age(&fluree, 50).await;
@@ -262,7 +264,7 @@ async fn a_read_transaction_conflicts_when_the_ledger_moved() {
     // Unmoved, a read transaction commits as usual.
     let mut txn = begin(&fluree).await;
     txn.db().await.unwrap();
-    txn.stage(TxnOperation::SparqlUpdate(BIRTHDAY.into()))
+    txn.stage(TxnOperation::SparqlUpdate(BIRTHDAY.into(), None))
         .await
         .unwrap();
     txn.commit(CommitOpts::default()).await.unwrap();
@@ -315,6 +317,7 @@ async fn cypher_and_sparql_mix_in_one_commit() {
     assert!(returned.is_none());
     txn.stage(TxnOperation::SparqlUpdate(
         r#"INSERT { ?p <age> 30 } WHERE { ?p <name> "Ann" }"#.into(),
+        None,
     ))
     .await
     .unwrap();
@@ -407,9 +410,10 @@ async fn a_failed_operation_keeps_the_values_already_staged() {
     })))
     .await
     .unwrap();
-    txn.stage(TxnOperation::SparqlUpdate(format!(
-        "{PREFIX}INSERT {{ ex:order ex:token ?t }} WHERE {{ BIND(STRUUID() AS ?t) }}"
-    )))
+    txn.stage(TxnOperation::SparqlUpdate(
+        format!("{PREFIX}INSERT {{ ex:order ex:token ?t }} WHERE {{ BIND(STRUUID() AS ?t) }}"),
+        None,
+    ))
     .await
     .unwrap();
     let staged = select(&fluree, &txn.db().await.unwrap(), ORDER).await;
@@ -417,6 +421,7 @@ async fn a_failed_operation_keeps_the_values_already_staged() {
 
     txn.stage(TxnOperation::SparqlUpdate(
         "INSERT DATA { not sparql".into(),
+        None,
     ))
     .await
     .expect_err("parse error");
@@ -676,9 +681,10 @@ async fn netting_sees_a_named_graph_value_held_only_in_the_index() {
     let fluree = FlureeBuilder::file(path).build().expect("cold reload");
     let mut txn = begin(&fluree).await;
     for op in ["INSERT", "DELETE"] {
-        txn.stage(TxnOperation::SparqlUpdate(format!(
-            "{PREFIX}{op} DATA {{ {VALUE} }}"
-        )))
+        txn.stage(TxnOperation::SparqlUpdate(
+            format!("{PREFIX}{op} DATA {{ {VALUE} }}"),
+            None,
+        ))
         .await
         .unwrap();
     }

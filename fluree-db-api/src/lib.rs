@@ -365,7 +365,7 @@ pub use fluree_db_transact::{
 // Re-export SPARQL types (product feature; always enabled)
 pub use fluree_db_sparql::{
     lower_sparql, parse_sparql, validate as validate_sparql, Capabilities as SparqlCapabilities,
-    Diagnostic as SparqlDiagnostic, LowerError as SparqlLowerError,
+    Diagnostic as SparqlDiagnostic, LowerError as SparqlLowerError, ParamMap as SparqlParamMap,
     ParseOutput as SparqlParseOutput, Prologue as SparqlPrologue, QueryBody as SparqlQueryBody,
     Severity as SparqlSeverity, SourceSpan as SparqlSourceSpan, SparqlAst,
     UpdateOperation as SparqlUpdateOperation,

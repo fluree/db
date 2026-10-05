@@ -376,6 +376,26 @@ WHERE {
 }
 ```
 
+### Parameters
+
+When Fluree is embedded (the Rust API and the Python package), a query or
+update can take parameters: values bound to variables by name. A parameter
+replaces its variable — written `?name` or `$name`, which SPARQL treats as the
+same variable — everywhere in the request before it is planned, so
+`SELECT ?person WHERE { ?person ex:name $name }` with `name = "Alice"` runs
+exactly as `SELECT ?person WHERE { ?person ex:name "Alice" }`. Unlike a
+`VALUES` block, the value is visible inside every `FILTER`, `OPTIONAL` and
+subquery.
+
+- A projected parameter (`SELECT $name ?age`) is still a column, holding the
+  value; `SELECT *` does not list it.
+- A parameter that the request never mentions is an error, since a misspelt
+  variable would otherwise be unbound and match everything. So is a parameter
+  the request assigns itself (`BIND`, `VALUES`, `AS`), and one used inside a
+  remote `SERVICE`, whose body is sent to the endpoint as written.
+- `INSERT DATA` and `DELETE DATA` take no variables, so no parameters; use
+  `INSERT { ... } WHERE { ... }`.
+
 ## Aggregation
 
 ### GROUP BY

@@ -96,6 +96,12 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
         self
     }
 
+    /// Bind SPARQL variables to values; see [`QueryExecutionOptions::with_params`].
+    pub fn params(mut self, params: fluree_db_sparql::ParamMap) -> Self {
+        self.core.set_params(params);
+        self
+    }
+
     /// Set query execution controls.
     pub fn execution_options(mut self, options: QueryExecutionOptions) -> Self {
         self.core.set_execution_options(options);
@@ -461,6 +467,12 @@ impl<'a: 'v, 'v> GraphSnapshotQueryBuilder<'a, 'v> {
     /// Attach a cooperative cancellation handle.
     pub fn cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
         self.core.set_cancellation(cancellation);
+        self
+    }
+
+    /// Bind SPARQL variables to values; see [`QueryExecutionOptions::with_params`].
+    pub fn params(mut self, params: fluree_db_sparql::ParamMap) -> Self {
+        self.core.set_params(params);
         self
     }
 

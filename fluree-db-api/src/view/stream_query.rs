@@ -98,6 +98,7 @@ impl Fluree {
         options: &QueryExecutionOptions,
     ) -> Result<StreamQueryPlan> {
         let input = input.as_input();
+        let params = options.sparql_params(&input)?;
 
         let (vars, mut parsed) = match &input {
             QueryInput::JsonLd(json) => crate::query::helpers::parse_jsonld_query(
@@ -112,6 +113,7 @@ impl Fluree {
                     sparql,
                     &db.snapshot,
                     db.default_context.as_ref(),
+                    params,
                 )?
             }
         };
@@ -339,7 +341,7 @@ impl Fluree {
         sparql: &str,
         qc_opts: &crate::GovernanceOptions,
     ) -> Result<DataSetDb> {
-        let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
+        let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
         let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
         if spec.is_empty() {
             return Err(ApiError::query(
@@ -378,6 +380,7 @@ impl Fluree {
             .primary()
             .ok_or_else(|| ApiError::query("Dataset has no graphs for query execution"))?;
         let input = input.as_input();
+        let params = options.sparql_params(&input)?;
 
         let (vars, mut parsed) = match &input {
             QueryInput::JsonLd(json) => crate::query::helpers::parse_jsonld_query(
@@ -390,6 +393,7 @@ impl Fluree {
                 sparql,
                 &primary.snapshot,
                 primary.default_context.as_ref(),
+                params,
             )?,
         };
 

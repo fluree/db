@@ -97,7 +97,18 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
     /// registry. This avoids the namespace-conflict retry that pre-lowering
     /// against an unlocked snapshot would require.
     pub fn sparql_update(mut self, sparql: &'g str) -> Self {
-        self.core.set_sparql_update(sparql);
+        self.core.set_sparql_update(sparql, None);
+        self
+    }
+
+    /// [`Self::sparql_update`] with variables bound to values; see
+    /// [`fluree_db_sparql::substitute_params`].
+    pub fn sparql_update_with_params(
+        mut self,
+        sparql: &'g str,
+        params: &'g fluree_db_sparql::ParamMap,
+    ) -> Self {
+        self.core.set_sparql_update(sparql, Some(params));
         self
     }
 

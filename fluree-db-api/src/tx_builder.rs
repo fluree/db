@@ -94,6 +94,7 @@ impl GraphPayload<'_> {
 /// last operation's delta carries the whole request's allocations.
 pub(crate) fn parse_and_lower_sparql_update(
     sparql: &str,
+    params: Option<&fluree_db_sparql::ParamMap>,
     snapshot: &LedgerSnapshot,
     txn_opts: TxnOpts,
 ) -> Result<Vec<Txn>> {
@@ -105,7 +106,7 @@ pub(crate) fn parse_and_lower_sparql_update(
             format!("SPARQL UPDATE parse error: {}", messages.join("; ")),
         ));
     }
-    let ast = parsed
+    let mut ast = parsed
         .ast
         .ok_or_else(|| ApiError::http(400, "Failed to parse SPARQL UPDATE".to_string()))?;
 
@@ -130,6 +131,10 @@ pub(crate) fn parse_and_lower_sparql_update(
             .map(|d| d.message.clone())
             .unwrap_or_else(|| "SPARQL UPDATE validation error".to_string());
         return Err(ApiError::sparql(message, errors));
+    }
+    if let Some(params) = params {
+        fluree_db_sparql::substitute_params(&mut ast, params)
+            .map_err(|e| ApiError::http(400, e.to_string()))?;
     }
 
     let mut ns = NamespaceRegistry::from_db(snapshot);
@@ -493,6 +498,8 @@ pub(crate) struct TransactCore<'a> {
     /// Raw SPARQL UPDATE text, lowered to a `Txn` under the write lock during
     /// `execute()` so its namespace allocation shares the staging registry.
     pub(crate) pending_sparql: Option<&'a str>,
+    /// Parameters substituted into `pending_sparql`.
+    pub(crate) sparql_params: Option<&'a fluree_db_sparql::ParamMap>,
     /// A multi-clause Cypher write staged clause-by-clause under the write
     /// lock by the sequential driver (see [`crate::cypher_seq`]).
     pub(crate) pre_built_cypher_seq: Option<crate::cypher_seq::CypherSeqInput>,
@@ -525,6 +532,7 @@ impl<'a> TransactCore<'a> {
             pre_built_txn: None,
             pre_built_txn_followup: None,
             pending_sparql: None,
+            sparql_params: None,
             pre_built_cypher_seq: None,
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
@@ -605,7 +613,11 @@ impl<'a> TransactCore<'a> {
         self.txn_opts = opts;
     }
 
-    pub(crate) fn set_sparql_update(&mut self, sparql: &'a str) {
+    pub(crate) fn set_sparql_update(
+        &mut self,
+        sparql: &'a str,
+        params: Option<&'a fluree_db_sparql::ParamMap>,
+    ) {
         if self.operation.is_some() || self.pre_built_txn.is_some() || self.pending_sparql.is_some()
         {
             self.errors.push(BuilderError::Conflict {
@@ -614,6 +626,7 @@ impl<'a> TransactCore<'a> {
             });
         } else {
             self.pending_sparql = Some(sparql);
+            self.sparql_params = params;
         }
     }
 
@@ -1062,7 +1075,18 @@ impl<'a> RefTransactBuilder<'a> {
     /// namespace-conflict retry that pre-lowering against an unlocked
     /// snapshot would require.
     pub fn sparql_update(mut self, sparql: &'a str) -> Self {
-        self.core.set_sparql_update(sparql);
+        self.core.set_sparql_update(sparql, None);
+        self
+    }
+
+    /// [`Self::sparql_update`] with variables bound to values; see
+    /// [`fluree_db_sparql::substitute_params`].
+    pub fn sparql_update_with_params(
+        mut self,
+        sparql: &'a str,
+        params: &'a fluree_db_sparql::ParamMap,
+    ) -> Self {
+        self.core.set_sparql_update(sparql, Some(params));
         self
     }
 
@@ -1182,7 +1206,7 @@ pub(crate) enum OpPlan<'a> {
     /// A SPARQL UPDATE request, parsed and lowered against whichever state
     /// it is staged on — lowering allocates namespace codes relative to
     /// that state's table.
-    Sparql(&'a str),
+    Sparql(&'a str, Option<&'a fluree_db_sparql::ParamMap>),
     JsonLike {
         txn_type: TxnType,
         txn_json: JsonValue,
@@ -1431,8 +1455,12 @@ impl Fluree {
         }
 
         if let Some(sparql) = core.pending_sparql {
-            let txns =
-                parse_and_lower_sparql_update(sparql, &ledger_state.snapshot, core.txn_opts)?;
+            let txns = parse_and_lower_sparql_update(
+                sparql,
+                core.sparql_params,
+                &ledger_state.snapshot,
+                core.txn_opts,
+            )?;
             // A single-op request reports its own type; a multi-op (or
             // empty no-op) request is reported as a generic update.
             let txn_type = match txns.as_slice() {
@@ -1545,8 +1573,13 @@ impl Fluree {
         let ledger_id = ledger_state.ledger_id().to_string();
         let store_raw_txn = txn_opts.store_raw_txn.unwrap_or(false);
         match op_plan {
-            OpPlan::Sparql(sparql) => {
-                let txns = parse_and_lower_sparql_update(sparql, &ledger_state.snapshot, txn_opts)?;
+            OpPlan::Sparql(sparql, params) => {
+                let txns = parse_and_lower_sparql_update(
+                    sparql,
+                    *params,
+                    &ledger_state.snapshot,
+                    txn_opts,
+                )?;
                 // A single-op request reports its own type; a multi-op (or
                 // empty no-op) request is reported as a generic update.
                 let txn_type = match txns.as_slice() {
@@ -2334,7 +2367,7 @@ impl Fluree {
         // commit itself. Later attempts take the lock first and stage under
         // it; they are for commit conflicts that `refresh` heals.
         let op_plan = match core.pending_sparql.take() {
-            Some(sparql) => OpPlan::Sparql(sparql),
+            Some(sparql) => OpPlan::Sparql(sparql, core.sparql_params),
             None => OpPlan::from_op(core.operation.take().unwrap())?, // safe: validate checks
         };
         let txn_opts = core.txn_opts;
