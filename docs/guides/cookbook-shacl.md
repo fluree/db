@@ -428,11 +428,15 @@ entries (followed through `owl:imports`) — or simply write full IRIs.
 The spec's **pre-binding restrictions** are enforced: the query must be a
 SELECT and must not use `MINUS`, `SERVICE`, `VALUES`, reassign `$this`
 (`BIND (… AS $this)`), or use a sub-`SELECT` that fails to project `$this`
-(including `SELECT *`). A query that breaks these — or does not parse — is a
-validation *failure*: transactions on focus nodes the shape targets are
-rejected with the reason, scoped to that shape rather than wedging the
-ledger. `$shapesGraph` / `$currentShape` (optional per spec) are not
-supported.
+(including `SELECT *`). A query that breaks these, does not parse, or
+cannot be planned (for example, it projects a variable that is neither a
+`GROUP BY` key nor an aggregate) is a validation *failure*, reported with
+the reason and scoped to that shape rather than wedging the ledger. It
+follows the shape's `sh:severity` and the graph's validation mode, as a
+result does: on a Violation shape in a reject-mode graph, transactions on
+focus nodes the shape targets are rejected; on a Warning or Info shape, or
+in a warn-mode graph, the failure is logged and the transaction commits.
+`$shapesGraph` / `$currentShape` (optional per spec) are not supported.
 
 Like every other constraint, `sh:sparql` runs at transaction staging time
 against the staged view — the query sees the transaction's writes exactly as

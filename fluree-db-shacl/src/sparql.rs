@@ -53,6 +53,54 @@ use fluree_db_sparql::{parse_sparql, QueryBody, SparqlAst};
 use fluree_vocab::shacl as sh_vocab;
 use std::sync::Arc;
 
+/// A `sh:sparql` constraint that could not run: its query does not parse,
+/// lower or plan, or it uses `$PATH` where nothing can bind it.
+///
+/// Raised as [`ShaclError::SparqlConstraint`] unless the validation pass
+/// collects failures ([`ConstraintFailures`]), in which case it is recorded
+/// with the severity of the shape that owns the constraint and the graph
+/// being validated, and the pass goes on to the shape's other constraints.
+/// The transaction path then decides by severity and the graph's validation
+/// mode: a Violation in a reject-mode graph fails the transaction with the
+/// same error; anything else is logged.
+#[derive(Debug, Clone)]
+pub struct ConstraintFailure {
+    /// The constraint's IRI.
+    pub constraint: String,
+    /// Why it could not run.
+    pub message: String,
+    /// The severity of the shape that owns the constraint.
+    pub severity: Severity,
+    /// The graph being validated.
+    pub graph_id: fluree_db_core::GraphId,
+}
+
+impl ConstraintFailure {
+    /// The error the failure raises when nothing collects it.
+    pub fn into_error(self) -> ShaclError {
+        ShaclError::SparqlConstraint {
+            constraint: self.constraint,
+            message: self.message,
+        }
+    }
+}
+
+/// Collects the [`ConstraintFailure`]s of one validation pass (see
+/// `ShaclEngine::with_constraint_failures`).
+#[derive(Debug, Default)]
+pub struct ConstraintFailures(parking_lot::Mutex<Vec<ConstraintFailure>>);
+
+impl ConstraintFailures {
+    fn record(&self, failure: ConstraintFailure) {
+        self.0.lock().push(failure);
+    }
+
+    /// The failures recorded so far, in the order they occurred.
+    pub fn take(&self) -> Vec<ConstraintFailure> {
+        std::mem::take(&mut *self.0.lock())
+    }
+}
+
 /// A compiled `sh:sparql` constraint, attached to a node or property shape.
 #[derive(Debug, Clone)]
 pub struct SparqlConstraint {
@@ -482,9 +530,57 @@ pub(crate) struct SparqlConstraintCtx<'a> {
     /// Request deadline and per-query memory ceiling. `None` leaves the
     /// constraint body unbounded — see [`crate::ShaclEngine::with_cancellation`].
     pub cancellation: Option<&'a fluree_db_core::QueryCancellation>,
+    /// Where a constraint that cannot run is recorded instead of raised
+    /// ([`ConstraintFailure`]). `None` raises it.
+    pub failures: Option<&'a ConstraintFailures>,
 }
 
+/// Run one `sh:sparql` constraint for `focus`: each solution is a result.
+///
+/// A constraint that cannot run is raised as [`ShaclError::SparqlConstraint`],
+/// or recorded in `exec.failures` with the shape's `severity` when the pass
+/// collects failures (no results, and the pass continues). Any other error
+/// (a runtime query error such as an exhausted budget) is always raised.
 pub(crate) async fn validate_sparql_constraint(
+    db: GraphDbRef<'_>,
+    focus: &Sid,
+    constraint: &SparqlConstraint,
+    fallback_path: Option<&Sid>,
+    severity: Severity,
+    source_shape: &Sid,
+    exec: SparqlConstraintCtx<'_>,
+) -> Result<Vec<ValidationResult>> {
+    let outcome = run_sparql_constraint(
+        db,
+        focus,
+        constraint,
+        fallback_path,
+        severity,
+        source_shape,
+        exec,
+    )
+    .await;
+    match (outcome, exec.failures) {
+        (
+            Err(ShaclError::SparqlConstraint {
+                constraint,
+                message,
+            }),
+            Some(failures),
+        ) => {
+            failures.record(ConstraintFailure {
+                constraint,
+                message,
+                severity,
+                graph_id: db.g_id,
+            });
+            Ok(Vec::new())
+        }
+        (outcome, _) => outcome,
+    }
+}
+
+async fn run_sparql_constraint(
     db: GraphDbRef<'_>,
     focus: &Sid,
     constraint: &SparqlConstraint,

@@ -99,6 +99,9 @@ struct ClassMembershipCtx<'a> {
     /// only installed when a cancellation is present, so without one a
     /// constraint body runs unbounded. `None` outside a request scope.
     cancellation: Option<&'a fluree_db_core::QueryCancellation>,
+    /// Where an `sh:sparql` constraint that cannot run is recorded instead
+    /// of raised. See [`ShaclEngine::with_constraint_failures`].
+    failures: Option<&'a crate::sparql::ConstraintFailures>,
 }
 
 /// SHACL validation engine
@@ -124,6 +127,8 @@ pub struct ShaclEngine {
     /// Cooperative cancellation handed to `sh:sparql` constraint queries.
     /// See [`ShaclEngine::with_cancellation`].
     cancellation: Option<fluree_db_core::QueryCancellation>,
+    /// See [`ShaclEngine::with_constraint_failures`].
+    constraint_failures: Option<Arc<crate::sparql::ConstraintFailures>>,
 }
 
 impl ShaclEngine {
@@ -137,6 +142,7 @@ impl ShaclEngine {
             membership_g_ids: Vec::new(),
             class_cache: Mutex::new(HashMap::new()),
             cancellation: None,
+            constraint_failures: None,
         }
     }
 
@@ -151,6 +157,7 @@ impl ShaclEngine {
             membership_g_ids: Vec::new(),
             class_cache: Mutex::new(HashMap::new()),
             cancellation: None,
+            constraint_failures: None,
         }
     }
 
@@ -165,6 +172,7 @@ impl ShaclEngine {
             membership_g_ids: Vec::new(),
             class_cache: Mutex::new(HashMap::new()),
             cancellation: None,
+            constraint_failures: None,
         }
     }
 
@@ -235,6 +243,7 @@ impl ShaclEngine {
             membership_g_ids: Vec::new(),
             class_cache: Mutex::new(HashMap::new()),
             cancellation: None,
+            constraint_failures: None,
         })
     }
 
@@ -264,6 +273,20 @@ impl ShaclEngine {
     #[must_use]
     pub fn with_cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
         self.cancellation = Some(cancellation);
+        self
+    }
+
+    /// Record an `sh:sparql` constraint that cannot run (its query does not
+    /// parse, lower or plan) in `failures`, with its shape's severity, instead
+    /// of raising it; validation continues with the shape's other
+    /// constraints. For a caller that applies severity and validation mode to
+    /// such a failure (the transaction path). Without it the failure is
+    /// raised as `ShaclError::SparqlConstraint`.
+    pub fn with_constraint_failures(
+        mut self,
+        failures: Arc<crate::sparql::ConstraintFailures>,
+    ) -> Self {
+        self.constraint_failures = Some(failures);
         self
     }
 
@@ -378,6 +401,7 @@ impl ShaclEngine {
             hierarchy: self.hierarchy.as_ref(),
             iri_encoder,
             cancellation: self.cancellation.as_ref(),
+            failures: self.constraint_failures.as_deref(),
         };
         let active = ActiveShapeChecks::default();
         for shape in applicable_shapes {
@@ -449,6 +473,7 @@ impl ShaclEngine {
             hierarchy: self.hierarchy.as_ref(),
             iri_encoder,
             cancellation: self.cancellation.as_ref(),
+            failures: self.constraint_failures.as_deref(),
         };
         // Class-target focus nodes are constant across the shape loop (same
         // `db`, same hierarchy), so memoize them per class: several shapes
@@ -826,6 +851,7 @@ fn validate_shape<'a>(
                 crate::sparql::SparqlConstraintCtx {
                     iri_encoder: class_ctx.and_then(|c| c.iri_encoder),
                     cancellation: class_ctx.and_then(|c| c.cancellation),
+                    failures: class_ctx.and_then(|c| c.failures),
                 },
             )
             .await?;
@@ -1828,6 +1854,7 @@ async fn validate_property_shape<'a>(
                 crate::sparql::SparqlConstraintCtx {
                     iri_encoder: class_ctx.and_then(|c| c.iri_encoder),
                     cancellation: class_ctx.and_then(|c| c.cancellation),
+                    failures: class_ctx.and_then(|c| c.failures),
                 },
             )
             .await?,

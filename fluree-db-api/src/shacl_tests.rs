@@ -5449,6 +5449,171 @@ async fn shacl_sparql_grouped_projection_of_a_non_key_fails_closed() {
     assert!(!message.contains("VarId("), "{message}");
 }
 
+/// A player shape whose `sh:sparql` constraint cannot run (`select` does not
+/// parse, lower or plan), at `severity` (the default, Violation, when `None`),
+/// on a ledger whose config puts SHACL in Warn mode when `warn_mode`.
+async fn ledger_with_failing_player_constraint(
+    fluree: &crate::Fluree,
+    ledger_id: &str,
+    select: &str,
+    severity: Option<&str>,
+    warn_mode: bool,
+) -> crate::LedgerState {
+    let mut shape = json!({
+        "@context": shacl_context(),
+        "@id": "ex:PlayerShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Player"},
+        "sh:sparql": {
+            "@id": "ex:PlayerShape-sparql",
+            "sh:message": "player constraint",
+            "sh:select": select
+        }
+    });
+    if let Some(severity) = severity {
+        shape["sh:severity"] = json!({"@id": severity});
+    }
+    let ledger = fluree.create_ledger(ledger_id).await.unwrap();
+    let ledger = fluree.upsert(ledger, &shape).await.unwrap().ledger;
+    if !warn_mode {
+        return ledger;
+    }
+    let config = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        GRAPH <urn:fluree:{ledger_id}#config> {{
+            <urn:config:main> rdf:type f:LedgerConfig ;
+                              f:shaclDefaults <urn:config:shacl> .
+            <urn:config:shacl> f:shaclEnabled true ;
+                               f:validationMode f:ValidationWarn .
+        }}
+        "
+    );
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&config)
+        .execute()
+        .await
+        .expect("warn-mode config")
+        .ledger
+}
+
+/// An `sh:sparql` constraint that cannot run (its query does not parse, lower
+/// or plan) follows the shape's severity and the graph's validation mode, as a
+/// result would: on a Violation shape in a reject-mode graph it fails the
+/// transaction with the constraint's error (fail closed); on a Warning or Info
+/// shape, or in a warn-mode graph, it is logged and the write commits. Every
+/// such failure used to fail the transaction, whatever the severity or mode.
+#[tokio::test]
+async fn shacl_sparql_constraint_failure_follows_severity_and_mode() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    // (failure, constraint query, what the error says)
+    let failing = [
+        (
+            "plan",
+            "SELECT $this ?value WHERE { $this <http://example.org/ns/score> ?value } \
+             GROUP BY $this",
+            "projected variable ?value is neither a GROUP BY key",
+        ),
+        (
+            "parse",
+            "SELECT $this WHERE { $this <http://example.org/ns/score> ",
+            "invalid sh:select query",
+        ),
+        (
+            "lower",
+            "SELECT $this WHERE { $this nope:score ?value }",
+            "failed to lower sh:select query",
+        ),
+    ];
+    // (severity, warn-mode graph, the write commits)
+    let cells = [
+        (None, false, false),
+        (Some("sh:Violation"), true, true),
+        (Some("sh:Warning"), false, true),
+        (Some("sh:Warning"), true, true),
+        (Some("sh:Info"), false, true),
+        (Some("sh:Info"), true, true),
+    ];
+    for (kind, select, says) in failing {
+        for (i, (severity, warn_mode, commits)) in cells.into_iter().enumerate() {
+            let ledger_id = format!("shacl/sparql-failure-{kind}-{i}:main");
+            let cell = format!("{kind} failure, severity {severity:?}, warn mode {warn_mode}");
+            let ledger = ledger_with_failing_player_constraint(
+                &fluree, &ledger_id, select, severity, warn_mode,
+            )
+            .await;
+            let outcome = insert_player(&fluree, ledger, "ex:p1", 5).await;
+            match (outcome, commits) {
+                (Ok(_), true) => {}
+                (
+                    Err(ApiError::Transact(TransactError::Shacl(
+                        fluree_db_shacl::ShaclError::SparqlConstraint {
+                            constraint,
+                            message,
+                        },
+                    ))),
+                    false,
+                ) => {
+                    assert_eq!(
+                        constraint, "http://example.org/ns/PlayerShape-sparql",
+                        "{cell}"
+                    );
+                    assert!(message.contains(says), "{cell}: {message}");
+                }
+                (outcome, _) => panic!(
+                    "{cell}: expected {}, got {outcome:?}",
+                    if commits {
+                        "a commit"
+                    } else {
+                        "the constraint's error"
+                    }
+                ),
+            }
+        }
+    }
+}
+
+/// A constraint that cannot run on a Warning shape is logged, not fatal, and
+/// the node's other shapes are still enforced: a Violation shape on the same
+/// target class rejects the write.
+#[tokio::test]
+async fn shacl_sparql_constraint_failure_keeps_other_shapes_enforced() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with_failing_player_constraint(
+        &fluree,
+        "shacl/sparql-failure-others:main",
+        "SELECT $this WHERE { $this <http://example.org/ns/score> ",
+        Some("sh:Warning"),
+        false,
+    )
+    .await;
+    let name_shape = json!({
+        "@context": shacl_context(),
+        "@id": "ex:PlayerNameShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Player"},
+        "sh:property": [{"sh:path": {"@id": "ex:name"}, "sh:minCount": 1}]
+    });
+    let ledger = fluree.upsert(ledger, &name_shape).await.unwrap().ledger;
+    let err = insert_player(&fluree, ledger.clone(), "ex:p1", 5)
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "ex:p1");
+    let named = json!({
+        "@context": shacl_context(),
+        "@id": "ex:p2",
+        "@type": "ex:Player",
+        "ex:name": "Pat",
+        "ex:score": 5
+    });
+    fluree
+        .upsert(ledger, &named)
+        .await
+        .expect("a named player commits; the failing Warning constraint is logged");
+}
+
 /// Insert an `ex:Player` with the given friends, each scoring 1.
 async fn insert_friends(
     fluree: &crate::Fluree,
