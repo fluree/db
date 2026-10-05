@@ -1467,10 +1467,17 @@ fn lower_modify(
         Vec::new()
     };
 
-    let default_template_graph: Option<Arc<str>> = with_graph_iri.as_deref().map(|iri| {
-        write_graphs.insert(iri.to_string());
-        Arc::from(iri)
-    });
+    // `WITH <urn:default>` names the default graph, which templates write
+    // without naming a graph; any other `WITH` IRI is their graph.
+    let default_template_graph: Option<Arc<str>> = with_graph_iri
+        .as_deref()
+        .filter(|iri| {
+            fluree_db_core::GraphSel::keyword(iri) != Some(fluree_db_core::GraphSel::Default)
+        })
+        .map(|iri| {
+            write_graphs.insert(iri.to_string());
+            Arc::from(iri)
+        });
 
     let sparql_where = SparqlWhereClause {
         prologue: prologue.clone(),

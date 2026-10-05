@@ -1479,8 +1479,8 @@ impl<'a> ExecutionContext<'a> {
     /// discovery, each under the name that reads it back
     /// ([`TargetLedger::enumeration_name`](fluree_db_core::TargetLedger::enumeration_name)):
     /// its IRI, or `L#<iri>` for a graph registered under the ledger's own
-    /// address. Excludes the default and reserved system graphs; empty when
-    /// the query names a dataset.
+    /// address. Excludes the default and reserved system graphs, and a graph
+    /// no name reads back; empty when the query names a dataset.
     pub fn single_db_user_graph_iris(&self) -> Vec<Arc<str>> {
         if self.explicit_dataset().is_some() {
             return Vec::new();
@@ -1491,7 +1491,11 @@ impl<'a> ExecutionContext<'a> {
         registry
             .iter_entries()
             .filter(|(g, _)| *g >= FIRST_USER_GRAPH_ID)
-            .map(|(g, iri)| Arc::from(target.enumeration_name(iri, g).as_ref()))
+            .filter_map(|(g, iri)| {
+                target
+                    .enumeration_name(iri, g)
+                    .map(|name| Arc::from(name.as_ref()))
+            })
             .collect()
     }
 

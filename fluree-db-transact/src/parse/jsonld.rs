@@ -598,8 +598,9 @@ fn parse_update_template_default_graph(
         return Ok(None);
     };
 
-    // Allow `"graph": "default"` as a no-op.
-    if matches!(v, Value::String(s) if s == "default") {
+    // Allow `"graph": "default"` (or `urn:default`) as a no-op.
+    if matches!(v, Value::String(s) if fluree_db_core::GraphSel::keyword(s) == Some(fluree_db_core::GraphSel::Default))
+    {
         return Ok(None);
     }
 

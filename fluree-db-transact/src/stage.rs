@@ -1230,7 +1230,11 @@ fn ledger_graph_lookup(ledger: &LedgerState) -> impl Fn(&str) -> Option<GraphId>
 /// `CREATE GRAPH`, a sync target, and each `GRAPH ?g` binding. The ledger's
 /// own address writes its default graph, `L#<g>` the graph `<g>`, and any other
 /// IRI the graph of that IRI, which the commit registers when it is new.
+/// `urn:default` names no graph a write can name ([`refuse_default_graph_name`]);
+/// `WITH <urn:default>` and a JSON-LD top-level `"graph": "urn:default"` write
+/// the default graph, since lowering never makes them a template's graph.
 fn write_graph(target: &TargetLedger<'_>, iri: &str) -> Result<WriteGraph> {
+    refuse_default_graph_name(iri)?;
     match target.graph_position(iri) {
         GraphPosition::Default => Ok(WriteGraph::Default),
         GraphPosition::Registered { iri, .. } | GraphPosition::New(iri) => {
@@ -3105,7 +3109,11 @@ async fn stream_where_into_accumulator(
             .iter_entries()
             .chain(binary_entries)
         {
-            let name: Arc<str> = target.enumeration_name(iri, g_id).as_ref().into();
+            // A graph no name reads back is not listed.
+            let Some(name) = target.enumeration_name(iri, g_id) else {
+                continue;
+            };
+            let name: Arc<str> = name.as_ref().into();
             named.push((name.clone(), g_id, g_id >= FIRST_USER_GRAPH_ID, name));
         }
         // The default graph, under the ledger's own id.

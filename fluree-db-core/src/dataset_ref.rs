@@ -34,7 +34,8 @@
 //! readings of a string that is lexically both, for the resolver to choose.
 
 use crate::graph_registry::{
-    validate_absolute_graph_iri, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID, TXN_META_GRAPH_ID,
+    validate_absolute_graph_iri, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID, DEFAULT_GRAPH_IRI,
+    TXN_META_GRAPH_ID,
 };
 use crate::ids::GraphId;
 use crate::ledger_id::{
@@ -136,10 +137,12 @@ impl GraphSel {
     /// The keyword spellings, in the order [`GraphSel::keyword`] matches them.
     pub const KEYWORDS: [&'static str; 3] = ["default", "txn-meta", "config"];
 
-    /// The keyword `s` spells, if it is one.
+    /// The keyword `s` spells, if it is one. `urn:default`
+    /// ([`DEFAULT_GRAPH_IRI`], the name `/info` lists the default graph under)
+    /// is a second spelling of `default`.
     pub fn keyword(s: &str) -> Option<Self> {
         match s {
-            "default" => Some(Self::Default),
+            "default" | DEFAULT_GRAPH_IRI => Some(Self::Default),
             "txn-meta" => Some(Self::TxnMeta),
             "config" => Some(Self::Config),
             _ => None,
@@ -848,6 +851,9 @@ impl<'a> TargetLedger<'a> {
     ///
     /// - this ledger's own address in any spelling
     ///   ([`LedgerRef::is_own_address`]): its default graph;
+    /// - `urn:default` ([`DEFAULT_GRAPH_IRI`]): the default graph. A write
+    ///   refuses the name as a graph before it asks this table: the default
+    ///   graph is written without naming a graph;
     /// - its address with a reserved keyword (`L#config`, `L#txn-meta`): that
     ///   reserved graph, as its `urn:fluree:` form names it
     ///   ([`Self::reserved_graph_iri`]);
@@ -864,6 +870,9 @@ impl<'a> TargetLedger<'a> {
     /// Only an IRI that starts with the ledger's name can be its address, so
     /// the common case is one registry lookup with nothing parsed.
     pub fn graph_position<'i>(&self, iri: &'i str) -> GraphPosition<'i> {
+        if iri == DEFAULT_GRAPH_IRI {
+            return GraphPosition::Default;
+        }
         if let Some(address) = self.own_address_reading(iri) {
             if address.at().is_some() {
                 return GraphPosition::NotAGraph;
@@ -949,14 +958,23 @@ impl<'a> TargetLedger<'a> {
     /// under, so a `?g` binding names that graph again in any graph position:
     /// `iri` itself, or `<ledger>#<iri>` when [`graph_position`] reads `iri`
     /// as another graph (a graph registered under this ledger's own address,
-    /// which a graph position reads as the ledger's default graph).
+    /// which a graph position reads as the ledger's default graph). `None`
+    /// when neither reads the graph back: a graph no name reaches is not
+    /// listed.
     ///
     /// [`graph_position`]: TargetLedger::graph_position
-    pub fn enumeration_name<'i>(&self, iri: &'i str, g_id: GraphId) -> Cow<'i, str> {
-        match self.graph_position(iri) {
-            GraphPosition::Registered { g_id: found, .. } if found == g_id => Cow::Borrowed(iri),
-            _ => Cow::Owned(format!("{}#{iri}", self.id)),
+    pub fn enumeration_name<'i>(&self, iri: &'i str, g_id: GraphId) -> Option<Cow<'i, str>> {
+        let reads_back = |name: &str| {
+            matches!(
+                self.graph_position(name),
+                GraphPosition::Registered { g_id: found, .. } if found == g_id
+            )
+        };
+        if reads_back(iri) {
+            return Some(Cow::Borrowed(iri));
         }
+        let through = format!("{}#{iri}", self.id);
+        reads_back(&through).then_some(Cow::Owned(through))
     }
 
     /// Whether `iri` is an address of this ledger, in any spelling, with or
@@ -1521,8 +1539,8 @@ mod tests {
             }
         );
         assert_eq!(
-            target.enumeration_name("L:main#config", 6),
-            "L:main#L:main#config"
+            target.enumeration_name("L:main#config", 6).as_deref(),
+            Some("L:main#L:main#config")
         );
         // A time, another ledger, the address alone and other IRIs are not.
         for other in [
@@ -1575,14 +1593,36 @@ mod tests {
             ("http://ex.org/g", 3),
             ("urn:fluree:L:main#resolution-config", 4),
         ] {
-            assert_eq!(target.enumeration_name(iri, g_id), iri);
+            assert_eq!(target.enumeration_name(iri, g_id).as_deref(), Some(iri));
         }
-        let legacy = target.enumeration_name("L:feature", 5);
+        let legacy = target.enumeration_name("L:feature", 5).unwrap();
         assert_eq!(legacy, "L:feature#L:feature");
         assert!(matches!(
             target.graph_position(&legacy),
             GraphPosition::Registered { g_id: 5, .. }
         ));
+    }
+
+    /// `urn:default` names the default graph in every graph position: the
+    /// keyword table reads it as `default`, in a dataset position and after
+    /// an address's `#`.
+    #[test]
+    fn urn_default_names_the_default_graph() {
+        let id = LedgerId::parse("L:feature").unwrap();
+        let target = TargetLedger::new(&id, &feature_registry);
+        assert_eq!(GraphSel::keyword("urn:default"), Some(GraphSel::Default));
+        for written in ["urn:default", "L:feature#urn:default"] {
+            assert_eq!(
+                target.graph_position(written),
+                GraphPosition::Default,
+                "{written}"
+            );
+        }
+        let resolved = resolve("urn:default").unwrap();
+        assert_eq!(
+            (resolved.g_id, resolved.graph),
+            (DEFAULT_GRAPH_ID, GraphSel::Default)
+        );
     }
 
     #[test]
