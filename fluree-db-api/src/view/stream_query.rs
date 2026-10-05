@@ -257,7 +257,11 @@ impl Fluree {
         tracker.record_policy_enforcement(db.policy_enforcement());
 
         let db_ref = db.as_graph_db_ref();
-        let prepare_config = PrepareConfig::current(db.binary_store.as_ref());
+        let union = super::union_default_dataset(db, executable);
+        let mut prepare_config = PrepareConfig::current(db.binary_store.as_ref());
+        prepare_config.planning = prepare_config
+            .planning
+            .with_multi_default_graph(union.is_some());
         let prepared = fluree_db_query::execute::prepare_execution_with_config(
             db_ref,
             executable,
@@ -280,6 +284,7 @@ impl Fluree {
             options,
             Some((&r2rml, &r2rml)),
         );
+        config.dataset = union.as_ref();
 
         execute_prepared_streaming(db_ref, vars, prepared, config, sink).await
     }

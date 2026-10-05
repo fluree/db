@@ -29,7 +29,7 @@ use fluree_db_core::value_id::ValueTypeTag;
 use fluree_db_core::{
     ClassStatEntry, GraphPropertyStatEntry, GraphStatsEntry, IndexSchema, IndexStats,
     LedgerSnapshot, OverlayProvider, RuntimePredicateId, RuntimeSmallDicts, SchemaPredicateInfo,
-    Sid, Storage,
+    Sid, Storage, DEFAULT_GRAPH_IRI,
 };
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{GraphSourceRecord, GraphSourceType, NsRecord};
@@ -705,7 +705,7 @@ pub(crate) fn resolve_graph_selector(
         GraphSelector::Default => Ok(0),
         GraphSelector::ById(g_id) => Ok(*g_id),
         GraphSelector::ByName(name) => match name.as_str() {
-            "default" | "urn:default" => Ok(0),
+            "default" | DEFAULT_GRAPH_IRI => Ok(0),
             "txn-meta" => Ok(1),
             "config" => Ok(2),
             other => {
@@ -722,7 +722,7 @@ pub(crate) fn resolve_graph_selector(
             }
         },
         GraphSelector::ByIri(iri) => {
-            if iri == "urn:default" {
+            if iri == DEFAULT_GRAPH_IRI {
                 return Ok(0);
             }
             // Recognize this ledger's reserved system graph IRIs so resolution
@@ -751,7 +751,7 @@ pub(crate) fn resolve_graph_selector(
 /// Determine the display name for a graph ID.
 fn graph_display_name(g_id: GraphId, store: Option<&BinaryIndexStore>) -> String {
     if g_id == 0 {
-        return "urn:default".to_string();
+        return DEFAULT_GRAPH_IRI.to_string();
     }
     if let Some(store) = store {
         if let Some(iri) = store.graph_iri_for_id(g_id) {
@@ -790,7 +790,7 @@ fn build_ledger_block(ledger: &LedgerState, stats: &IndexStats) -> Ledger {
     // store an IRI for it, so we synthesize `urn:default` here.
     let (default_flakes, default_size) = graph_totals(0);
     named_graphs.push(NamedGraph {
-        iri: "urn:default".to_string(),
+        iri: DEFAULT_GRAPH_IRI.to_string(),
         g_id: 0,
         flakes: Some(default_flakes as i64),
         size: default_size,
@@ -1528,13 +1528,13 @@ pub fn build_virtual_ledger_info(
             flakes: total_rows,
             size: 0,
             named_graphs: vec![NamedGraph {
-                iri: "urn:default".to_string(),
+                iri: DEFAULT_GRAPH_IRI.to_string(),
                 g_id: 0,
                 flakes: total_rows,
                 size: 0,
             }],
         },
-        graph: "urn:default".to_string(),
+        graph: DEFAULT_GRAPH_IRI.to_string(),
         stats: Stats {
             flakes: total_rows,
             size: 0,

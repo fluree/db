@@ -211,6 +211,7 @@ pub use policy_view::{
 pub use query::builder::{
     DatasetQueryBuilder, FromQueryBuilder, GraphSourceMode, ViewQueryBuilder,
 };
+pub use query::helpers::sparql_pragma_tracking;
 pub use query::nameservice_builder::NameserviceQueryBuilder;
 pub use query::{QueryExecutionOptions, QueryResult, TrackedErrorResponse, TrackedQueryResponse};
 pub use rebase::{
@@ -4315,9 +4316,14 @@ impl Fluree {
         // all. Explicit here rather than implicit in the view's origin,
         // because config-graph defaults are completed at query preparation
         // (`complete_config_defaults`) for every view that reaches it.
+        //
+        // For the same reason the probe reads the default graph alone, as
+        // every read of a write statement does: the write stages against it,
+        // whatever the ledger's union default graph.
         let probe_view = probe_view
             .with_default_context(default_context)
-            .with_reasoning(fluree_db_query::ir::reasoning::ReasoningModes::none());
+            .with_reasoning(fluree_db_query::ir::reasoning::ReasoningModes::none())
+            .with_union_default_graph(false);
 
         match cw {
             ConditionalCypherWrite::MergeSet { merge, trailing } => {

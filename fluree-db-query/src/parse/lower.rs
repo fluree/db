@@ -183,6 +183,7 @@ pub(crate) fn lower_query<E: IriEncoder>(
         reasoning,
         post_values: None,
         include_system_facts: ast.options.include_system_facts,
+        union_default_graph: ast.options.union_default_graph,
         cypher_vocab: None,
         unmatched_optional: Default::default(),
     })

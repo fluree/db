@@ -138,12 +138,9 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
     /// leaves the ledger's or source's configured defaults in force, and those
     /// leave an unconfigured ledger untouched.
     ///
-    /// SPARQL has nowhere to carry an `opts` block, so only configured defaults
-    /// can govern a SPARQL request through this builder. That is a limit of the
-    /// builder, not of the product: over HTTP a SPARQL request selects policy
-    /// with the `fluree-identity`, `fluree-policy`, `fluree-policy-class`,
-    /// `fluree-policy-values` and `fluree-default-allow` headers, but those
-    /// resolve into a view through `db_with_policy` and never reach this builder.
+    /// A SPARQL request selects policy with its `# PRAGMA identity` /
+    /// `policy-class` / `policy-values` / `default-allow` directives, the
+    /// counterpart of JSON-LD's body `opts`.
     ///
     /// The verified identity does not arrive in the body either: it rides the
     /// builder's execution options from the auth layer, and without it an
@@ -157,7 +154,10 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
                 crate::GovernanceOptions::from_json(json)
                     .map_err(|e| ApiError::invalid_query(e.to_string()))?
             }
-            _ => crate::GovernanceOptions::default(),
+            Some(crate::view::QueryInput::Sparql(sparql)) => {
+                crate::GovernanceOptions::from_sparql(sparql)
+            }
+            None => crate::GovernanceOptions::default(),
         };
         opts.server_identity = self.core.execution.server_identity.clone();
         // `has_any_policy_inputs`, not the narrower `selects_policy_set`: the

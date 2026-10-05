@@ -175,7 +175,7 @@ WHERE {
 Fluree supports user-defined named graphs ingested via TriG format. These graphs are queryable using the structured `from` object syntax with a `graph` field.
 
 For the ledger-scoped HTTP endpoint (`POST /query/{ledger}`), the server also accepts a convenient shorthand:
-- `"from": "txn-meta"` / `"from": "default"` / `"from": "<graph IRI>"`
+- `"from": "txn-meta"` / `"from": "default"` (or `"urn:default"`) / `"from": "<graph IRI>"`
 to select a graph **within** the ledger in the URL.
 
 **Ingesting data with named graphs (TriG):**
@@ -261,7 +261,7 @@ Query across the default graph and user-defined named graphs:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `@id` | string | Yes | Ledger reference (e.g., `mydb:main`, `mydb:main@t:100`) |
-| `@graph` | string | No | Graph selector: `"default"`, `"txn-meta"`, or full IRI |
+| `@graph` | string | No | Graph selector: `"default"` (or `"urn:default"`), `"txn-meta"`, or full IRI |
 | `t` | integer | No | Time-travel: specific transaction number |
 | `at` | string | No | Time-travel: ISO-8601 timestamp or `commit:<hash>` |
 | `policy` | object | No | Per-source policy override (see below) |
@@ -274,7 +274,7 @@ When using object syntax for `from`, the following fields are available:
 |-------|------|----------|-------------|
 | `@id` | string | Yes | Ledger reference (e.g., `mydb:main`, `mydb:main@t:100`) |
 | `alias` | string | No | Dataset-local alias for GRAPH pattern reference |
-| `graph` | string | No | Graph selector: `"default"`, `"txn-meta"`, or full IRI |
+| `graph` | string | No | Graph selector: `"default"` (or `"urn:default"`), `"txn-meta"`, or full IRI |
 | `t` | integer | No | Time-travel: specific transaction number |
 | `iso` | string | No | Time-travel: ISO-8601 timestamp |
 | `commit_id` | string | No | Time-travel: commit ContentId |
@@ -324,7 +324,7 @@ The `graph` field accepts three types of values:
 
 | Value | Meaning |
 |-------|---------|
-| `"default"` | Explicitly select the ledger's default graph |
+| `"default"` or `"urn:default"` | Explicitly select the ledger's default graph. `urn:default` is the name ledger info lists it under. |
 | `"txn-meta"` | Select the built-in transaction metadata graph (`urn:fluree:{ledger_id}#txn-meta`) |
 | `"<full-iri>"` | Select a user-defined named graph by its full IRI |
 

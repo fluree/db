@@ -275,6 +275,7 @@ mod tests {
             patterns,
             reasoning: crate::ir::ReasoningConfig::default(),
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
             grouping: None,

@@ -236,6 +236,15 @@ impl FlureeToolService {
                      UPDATE are not supported by this tool",
                 ));
             }
+            // Refused rather than ignored: either would change which data the
+            // query sees.
+            if ast.pragmas.has_policy_selection() || ast.pragmas.min_t.is_some() {
+                return Err(fluree_db_api::ApiError::http(
+                    400,
+                    "sparql_query does not take policy or min-t pragmas: the connection's \
+                     identity selects policy, and the `t` argument pins the snapshot",
+                ));
+            }
         }
 
         // No AgentJsonContext: the ledger (and optional `t`) fully scope a single-ledger query,
