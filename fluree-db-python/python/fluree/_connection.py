@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import os
+import re
 import random as _random
 import time as _time
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ from collections.abc import Callable, Mapping
 from typing import Any, Literal as _Literal, TypeVar, Union
 
 from fluree import _fluree
-from fluree._cypher import CypherResult, CypherTransaction, _params, _result
+from fluree._cypher import CypherTransaction, _params, _table
 from fluree._records import (
     Branch,
     Change,
@@ -33,8 +34,8 @@ from fluree._records import (
     _revert_preview,
     _validation_report,
 )
-from fluree._results import Rows, RowStream
-from fluree._terms import IRI
+from fluree._results import Result, RowStream
+from fluree._terms import IRI, to_python
 from fluree.errors import ConflictError, InvalidRequestError, PermissionDeniedError
 
 MEMORY = ":memory:"
@@ -57,6 +58,7 @@ Query = Union[str, dict[str, Any]]
 Data = Union[str, dict[str, Any], list[Any], "os.PathLike[str]"]
 Format = _Literal["jsonld", "turtle", "trig"]
 ExportFormat = _Literal["turtle", "trig", "ntriples", "nquads", "jsonld"]
+Language = _Literal["sparql", "cypher", "jsonld"]
 MergeStrategy = _Literal["take-both", "abort", "take-source", "take-branch"]
 RebaseStrategy = _Literal["take-both", "abort", "take-source", "take-branch", "skip"]
 RevertStrategy = _Literal["abort", "take-source", "take-branch"]
@@ -74,6 +76,7 @@ _EXPORT_SUFFIXES: dict[str, ExportFormat] = {
 _TURTLE_SUFFIXES = {".ttl", ".nt", ".trig"}
 _JSON_SUFFIXES = {".jsonld", ".json"}
 _SPARQL_SUFFIXES = {".rq", ".ru", ".sparql"}
+_CYPHER_SUFFIXES = {".cypher", ".cyp", ".cql"}
 
 
 def connect(
@@ -145,23 +148,39 @@ class Connection:
         """The ids of every ledger, as ``name:branch``."""
         return self._native.ledgers()
 
-    def query(self, query: Query, *, max_fuel: float | None = None, timeout: float | None = None) -> Any:
+    def query(
+        self,
+        query: Query,
+        *,
+        language: Language | None = None,
+        max_fuel: float | None = None,
+        timeout: float | None = None,
+    ) -> Any:
         """Run a query whose ``FROM`` names the ledgers to read.
 
         SPARQL ``FROM <ledger>`` (and ``FROM NAMED``) or a JSON-LD ``"from"``
         picks the ledgers, so one query can span several; a ledger address can
         carry a time (``<people@t:5>``), and SPARQL ``FROM ... TO ...`` reads a
         range of history. Results, ``max_fuel`` and ``timeout`` are as for
-        :meth:`Snapshot.query`.
+        :meth:`Snapshot.query`. Cypher has no ``FROM``; run it on a ledger.
         """
-        return _execute(self._run, query, max_fuel, timeout, stats=False)
+        return _execute(self._run, query, max_fuel, timeout, False, language=language)
 
-    def profile(self, query: Query, *, max_fuel: float | None = None, timeout: float | None = None) -> QueryProfile:
+    def profile(
+        self,
+        query: Query,
+        *,
+        language: Language | None = None,
+        max_fuel: float | None = None,
+        timeout: float | None = None,
+    ) -> QueryProfile:
         """Run :meth:`query` and report the fuel and time it took."""
-        return _profile(self._run, query, max_fuel, timeout)
+        return _profile(self._run, query, max_fuel, timeout, language=language)
 
-    def _run(self, query: Any, sparql: bool, controls: dict[str, Any] | None) -> Any:
-        if sparql:
+    def _run(self, query: Any, language: str, controls: dict[str, Any] | None, params: Any) -> Any:
+        if language == "cypher":
+            raise InvalidRequestError("a Cypher query names no ledgers; run it with ledger.query()")
+        if language == "sparql":
             return self._native.query_sparql_from(query, None, controls)
         return self._native.query_jsonld_from(query, controls)
 
@@ -257,10 +276,33 @@ class Ledger:
         return self._transact("upsert", *_rdf_payload(data, format), message)
 
     def update(
-        self, transaction: str | dict[str, Any] | os.PathLike[str], *, message: str | None = None
+        self,
+        transaction: str | dict[str, Any] | os.PathLike[str],
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: Language | None = None,
+        message: str | None = None,
+        **kwparameters: Any,
     ) -> Commit:
-        """Apply a SPARQL UPDATE, or a JSON-LD ``where``/``delete``/``insert``."""
-        return self._transact("update", *_update_payload(transaction), message)
+        """Apply a SPARQL UPDATE, a Cypher write, or a JSON-LD
+        ``where``/``delete``/``insert``.
+
+        The language is told from the text (``language`` overrides it); a
+        path is read as a file, ``.rq``/``.ru`` as SPARQL and
+        ``.cypher``/``.cyp``/``.cql`` as Cypher. A Cypher write may be a ``;``
+        script, committed all or nothing; its ``$name`` parameters come from
+        ``parameters`` and keyword arguments, and the records a ``RETURN``
+        produces are the commit's ``result``.
+        """
+        kind, payload = _update_payload(transaction, language)
+        params = _params(parameters, kwparameters)
+        if kind == "cypher":
+            if message is not None:
+                raise InvalidRequestError("message= is not yet supported for Cypher writes")
+            commit, table = self._connection._native.cypher_update(self._id, payload, params, self._policy)
+            return Commit(**commit, result=_table(table) if table[0] else None)
+        _no_parameters(params)
+        return self._transact("update", kind, payload, message)
 
     def sync(
         self,
@@ -337,40 +379,37 @@ class Ledger:
         native = self._connection._native.begin(self._id, self._policy)
         return Transaction(self, native, message)
 
-    def query(self, query: Query, *, max_fuel: float | None = None, timeout: float | None = None) -> Any:
-        """Query the latest state. See :meth:`Snapshot.query` for results,
-        ``max_fuel`` and ``timeout``."""
-        return _execute(self._run, query, max_fuel, timeout, stats=False)
-
-    def profile(self, query: Query, *, max_fuel: float | None = None, timeout: float | None = None) -> QueryProfile:
-        """Run :meth:`query` and report the fuel and time it took."""
-        return _profile(self._run, query, max_fuel, timeout)
-
-    def cypher(
+    def query(
         self,
-        query: str,
+        query: Query,
         parameters: Mapping[str, Any] | None = None,
         *,
+        language: Language | None = None,
+        max_fuel: float | None = None,
         timeout: float | None = None,
         **kwparameters: Any,
-    ) -> CypherResult:
-        """Run a Cypher statement, as ``session.run`` does in the Neo4j driver.
-
-        A read returns its records; a write — or a ``;``-separated script of
-        them — commits, all or nothing, and the result's ``commit`` says
-        what it wrote. Parameters (``$name``) come from ``parameters`` and
-        keyword arguments. ``timeout`` (seconds) bounds a read.
-
-        Records are :class:`Record` tuples, also indexable by column name;
-        nodes, relationships and paths come back as :class:`Node`,
-        :class:`Relationship` and :class:`Path`. Group several statements
-        into one transaction with :meth:`cypher_transaction`.
-        """
-        native = self._connection._native
-        commit, table = native.cypher(
-            self._id, query, _params(parameters, kwparameters), None, self._policy, timeout
+    ) -> Any:
+        """Query the latest state. See :meth:`Snapshot.query`."""
+        return _execute(
+            self._run, query, max_fuel, timeout, False,
+            language=language, params=_params(parameters, kwparameters),
         )
-        return _result(commit, table)
+
+    def profile(
+        self,
+        query: Query,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: Language | None = None,
+        max_fuel: float | None = None,
+        timeout: float | None = None,
+        **kwparameters: Any,
+    ) -> QueryProfile:
+        """Run :meth:`query` and report the fuel and time it took."""
+        return _profile(
+            self._run, query, max_fuel, timeout,
+            language=language, params=_params(parameters, kwparameters),
+        )
 
     def cypher_transaction(self) -> CypherTransaction:
         """Open a :class:`CypherTransaction` for several Cypher statements
@@ -388,16 +427,30 @@ class Ledger:
         """Run a SELECT and read its rows as they are produced; see
         :class:`RowStream`. ``max_fuel`` and ``timeout`` cover the whole stream."""
         controls = _controls(max_fuel, timeout, stats=False)
-        native = self._connection._native.stream(self._id, _explainable(query), None, self._policy, controls)
+        native = self._connection._native.stream(self._id, _streamable(query), None, self._policy, controls)
         return RowStream(native, batch_size)
 
-    def explain(self, query: Query) -> dict[str, Any]:
+    def explain(
+        self,
+        query: Query,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: Language | None = None,
+        **kwparameters: Any,
+    ) -> dict[str, Any]:
         """The plan the engine would run ``query`` with, without running it."""
-        return self._connection._native.explain(self._id, _explainable(query), None, self._policy)
-
-    def _run(self, query: Any, sparql: bool, controls: dict[str, Any] | None) -> Any:
         native = self._connection._native
-        if sparql:
+        if _query_language(query, language) == "cypher":
+            params = _params(parameters, kwparameters)
+            return native.explain_cypher(self._id, query, params, None, self._policy)
+        _no_parameters(_params(parameters, kwparameters))
+        return native.explain(self._id, _explainable(query, language), None, self._policy)
+
+    def _run(self, query: Any, language: str, controls: dict[str, Any] | None, params: Any) -> Any:
+        native = self._connection._native
+        if language == "cypher":
+            return _table(native.cypher_query(self._id, query, params, None, self._policy, controls))
+        if language == "sparql":
             return native.query_sparql(self._id, query, None, self._policy, controls)
         return native.query_jsonld(self._id, self._govern(query), None, controls)
 
@@ -817,18 +870,6 @@ class Snapshot:
         """Export the data as of this snapshot; see :meth:`Ledger.export`."""
         return self._ledger._export(path, format, graph, all_graphs, context, ("t", self.t))
 
-    def cypher(
-        self,
-        query: str,
-        parameters: Mapping[str, Any] | None = None,
-        *,
-        timeout: float | None = None,
-        **kwparameters: Any,
-    ) -> CypherResult:
-        """Run a Cypher read against this snapshot; see :meth:`Ledger.cypher`."""
-        table = self._native.cypher(query, _params(parameters, kwparameters), timeout)
-        return _result(None, table)
-
     def branch(self, name: str) -> Ledger:
         """Create branch ``name`` from this past state; see :meth:`Ledger.branch`."""
         return self._ledger._create_branch(name, ("t", self.t))
@@ -845,24 +886,60 @@ class Snapshot:
     def __repr__(self) -> str:
         return f"<Snapshot {self.ledger!r} t={self.t}>"
 
-    def query(self, query: Query, *, max_fuel: float | None = None, timeout: float | None = None) -> Any:
-        """Run a SPARQL or JSON-LD query.
+    def query(
+        self,
+        query: Query,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: Language | None = None,
+        max_fuel: float | None = None,
+        timeout: float | None = None,
+        **kwparameters: Any,
+    ) -> Any:
+        """Run a SPARQL, Cypher, or JSON-LD query.
 
-        SPARQL ``SELECT`` returns :class:`Rows`, ``ASK`` a ``bool``, and
-        ``CONSTRUCT``/``DESCRIBE`` the constructed graph as a JSON-LD document.
-        A JSON-LD query (a dict, or JSON text) returns its JSON result as
-        Python objects.
+        The language is told from the query — a dict or JSON text is
+        JSON-LD, text that opens like SPARQL (``PREFIX``, ``SELECT``, ...) is
+        SPARQL, and text that opens like Cypher (``MATCH``, ``UNWIND``, ...)
+        is Cypher — or set with ``language``.
+
+        - SPARQL ``SELECT`` and every Cypher query return a :class:`Result`;
+          Cypher nodes, relationships and paths come back as :class:`Node`,
+          :class:`Relationship` and :class:`Path`.
+        - SPARQL ``ASK`` returns a ``bool``; ``CONSTRUCT``/``DESCRIBE`` the
+          constructed graph as a JSON-LD document.
+        - A JSON-LD query returns its JSON result as Python objects.
+
+        Cypher ``$name`` parameters come from ``parameters`` and keyword
+        arguments. A Cypher write is refused here; run it with
+        :meth:`Ledger.update`.
 
         ``max_fuel`` caps the work the query may do (see :meth:`profile` for
         what a query costs); past it the query stops with
         :class:`ResourceLimitError`. ``timeout`` is in seconds; past it the
-        query is cancelled with :class:`QueryTimeoutError`.
+        query is cancelled with :class:`QueryTimeoutError`. Cypher takes
+        ``timeout`` but not yet ``max_fuel``.
         """
-        return _execute(self._run, query, max_fuel, timeout, stats=False)
+        return _execute(
+            self._run, query, max_fuel, timeout, False,
+            language=language, params=_params(parameters, kwparameters),
+        )
 
-    def profile(self, query: Query, *, max_fuel: float | None = None, timeout: float | None = None) -> QueryProfile:
+    def profile(
+        self,
+        query: Query,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: Language | None = None,
+        max_fuel: float | None = None,
+        timeout: float | None = None,
+        **kwparameters: Any,
+    ) -> QueryProfile:
         """Run :meth:`query` and report the fuel and time it took."""
-        return _profile(self._run, query, max_fuel, timeout)
+        return _profile(
+            self._run, query, max_fuel, timeout,
+            language=language, params=_params(parameters, kwparameters),
+        )
 
     def stream(
         self,
@@ -875,14 +952,27 @@ class Snapshot:
         """Run a SELECT and read its rows as they are produced; see
         :class:`RowStream`."""
         controls = _controls(max_fuel, timeout, stats=False)
-        return RowStream(self._native.stream(_explainable(query), controls), batch_size)
+        return RowStream(self._native.stream(_streamable(query), controls), batch_size)
 
-    def explain(self, query: Query) -> dict[str, Any]:
+    def explain(
+        self,
+        query: Query,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: Language | None = None,
+        **kwparameters: Any,
+    ) -> dict[str, Any]:
         """The plan the engine would run ``query`` with, without running it."""
-        return self._native.explain(_explainable(query))
+        params = _params(parameters, kwparameters)
+        if _query_language(query, language) == "cypher":
+            return self._native.explain_cypher(query, params)
+        _no_parameters(params)
+        return self._native.explain(_explainable(query, language))
 
-    def _run(self, query: Any, sparql: bool, controls: dict[str, Any] | None) -> Any:
-        if sparql:
+    def _run(self, query: Any, language: str, controls: dict[str, Any] | None, params: Any) -> Any:
+        if language == "cypher":
+            return _table(self._native.cypher_query(query, params, controls))
+        if language == "sparql":
             return self._native.query_sparql(query, controls)
         return self._native.query_jsonld(query, controls)
 
@@ -905,7 +995,7 @@ class Transaction:
 
     - a transaction that was only written to is staged again on top of it —
       each update's ``WHERE`` matches the new data;
-    - a transaction that was also *read* (``query``, ``cypher``, ``explain``)
+    - a transaction that was also *read* (``query`` or ``explain``)
       raises :class:`ConflictError` on :meth:`commit`, since what was read may
       have decided what was written. Run it again, or use
       :meth:`Ledger.transact`, which does.
@@ -945,29 +1035,46 @@ class Transaction:
         """Stage an upsert; see :meth:`Ledger.upsert`."""
         self._native.stage("upsert", *_rdf_payload(data, format))
 
-    def update(self, transaction: str | dict[str, Any] | os.PathLike[str]) -> None:
-        """Stage an update; see :meth:`Ledger.update`."""
-        self._native.stage("update", *_update_payload(transaction))
-
-    def query(self, query: Query, *, max_fuel: float | None = None, timeout: float | None = None) -> Any:
-        """Query the staged state; see :meth:`Snapshot.query`."""
-        return self._view().query(query, max_fuel=max_fuel, timeout=timeout)
-
-    def explain(self, query: Query) -> dict[str, Any]:
-        """The plan ``query`` would run with over the staged state."""
-        return self._view().explain(query)
-
-    def cypher(
+    def update(
         self,
-        query: str,
+        transaction: str | dict[str, Any] | os.PathLike[str],
+        *,
+        language: Language | None = None,
+    ) -> None:
+        """Stage an update; see :meth:`Ledger.update`."""
+        kind, payload = _update_payload(transaction, language)
+        if kind == "cypher":
+            raise InvalidRequestError(
+                "Cypher writes inside transaction() are not supported yet; "
+                "use ledger.cypher_transaction()"
+            )
+        self._native.stage("update", kind, payload)
+
+    def query(
+        self,
+        query: Query,
         parameters: Mapping[str, Any] | None = None,
         *,
+        language: Language | None = None,
+        max_fuel: float | None = None,
         timeout: float | None = None,
         **kwparameters: Any,
-    ) -> CypherResult:
-        """Run a Cypher read over the staged state. Cypher writes go through
-        :meth:`Ledger.cypher_transaction`."""
-        return self._view().cypher(query, parameters, timeout=timeout, **kwparameters)
+    ) -> Any:
+        """Query the staged state; see :meth:`Snapshot.query`."""
+        return self._view().query(
+            query, parameters, language=language, max_fuel=max_fuel, timeout=timeout, **kwparameters
+        )
+
+    def explain(
+        self,
+        query: Query,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: Language | None = None,
+        **kwparameters: Any,
+    ) -> dict[str, Any]:
+        """The plan ``query`` would run with over the staged state."""
+        return self._view().explain(query, parameters, language=language, **kwparameters)
 
     def commit(self, *, message: str | None = None) -> Commit:
         """Commit the staged writes as one commit, recording ``message`` (by
@@ -1016,10 +1123,19 @@ def _execute(
     timeout: float | None,
     stats: bool,
     cancel: _fluree.Canceller | None = None,
+    *,
+    language: Language | None = None,
+    params: dict[str, Any] | None = None,
 ) -> Any:
+    language = _query_language(query, language)
+    if language == "cypher":
+        if stats or max_fuel is not None:
+            raise InvalidRequestError("max_fuel and profile() are not yet supported for Cypher")
+        return run(query, "cypher", _controls(None, timeout, False, cancel), params)
+    _no_parameters(params)
     controls = _controls(max_fuel, timeout, stats, cancel)
-    sparql = isinstance(query, str) and not _looks_like_json(query)
-    raw = run(query if sparql else _json_query(query), sparql, controls)
+    sparql = language == "sparql"
+    raw = run(query if sparql else _json_query(query), language, controls, None)
     result, measured = raw if stats else (raw, None)
     if sparql:
         result = _sparql_result(result)
@@ -1032,8 +1148,11 @@ def _profile(
     max_fuel: float | None,
     timeout: float | None,
     cancel: _fluree.Canceller | None = None,
+    *,
+    language: Language | None = None,
+    params: dict[str, Any] | None = None,
 ) -> QueryProfile:
-    result, stats = _execute(run, query, max_fuel, timeout, True, cancel)
+    result, stats = _execute(run, query, max_fuel, timeout, True, cancel, language=language, params=params)
     time = stats["time"]
     elapsed = None
     if time is not None and time.endswith("ms"):
@@ -1041,17 +1160,74 @@ def _profile(
     return QueryProfile(result, stats["fuel"], elapsed)
 
 
-def _explainable(query: Query) -> Any:
-    if isinstance(query, str) and not _looks_like_json(query):
+def _explainable(query: Query, language: Language | None = None) -> Any:
+    if _query_language(query, language) == "sparql":
         return query
     return _json_query(query)
+
+
+def _streamable(query: Query) -> Any:
+    if _query_language(query, None) == "cypher":
+        raise InvalidRequestError("streaming is not yet supported for Cypher; use query()")
+    return _explainable(query)
 
 
 def _sparql_result(result: tuple[Any, ...]) -> Any:
     kind = result[0]
     if kind == "select":
-        return Rows(result[1], result[2])
+        return Result._from_cells(result[1], result[2], to_python)
     return result[1]
+
+
+def _no_parameters(params: dict[str, Any] | None) -> None:
+    if params:
+        raise InvalidRequestError("query parameters ($name) are supported for Cypher only, so far")
+
+
+_LANGUAGES = ("sparql", "cypher", "jsonld")
+_LEADING_NOISE = re.compile(r"(?:\s+|#[^\n]*|//[^\n]*|/\*.*?\*/)*", re.S)
+_SPARQL_READ = {"PREFIX", "BASE", "SELECT", "ASK", "CONSTRUCT", "DESCRIBE"}
+_SPARQL_WRITE = _SPARQL_READ | {"INSERT", "LOAD", "CLEAR", "DROP", "COPY", "MOVE", "ADD"}
+_CYPHER_LEAD = {
+    "MATCH", "OPTIONAL", "MERGE", "UNWIND", "CREATE", "DETACH", "DELETE", "SET", "REMOVE",
+    "WITH", "RETURN", "CALL", "FOREACH", "USE", "EXPLAIN", "PROFILE",
+}
+
+
+def _query_language(query: Any, language: Language | None) -> str:
+    if language is not None:
+        if language not in _LANGUAGES:
+            raise InvalidRequestError(f"language is one of {', '.join(_LANGUAGES)}, not {language!r}")
+        return language
+    if not isinstance(query, str) or _looks_like_json(query):
+        return "jsonld"
+    return _text_language(query, write=False)
+
+
+def _text_language(text: str, *, write: bool) -> str:
+    """``"sparql"`` or ``"cypher"``, from the statement's opening keyword.
+
+    The keywords both languages open with are told apart by what follows:
+    SPARQL ``CREATE GRAPH``, ``DELETE DATA``/``WHERE``/``{`` and
+    ``WITH <iri>`` are updates; Cypher's ``CREATE (``, ``DELETE n`` and
+    ``WITH n`` are not.
+    """
+    rest = text[_LEADING_NOISE.match(text).end() :]  # type: ignore[union-attr]
+    match = re.match(r"[A-Za-z]+", rest)
+    if match is None:
+        return "sparql"
+    word = match.group(0).upper()
+    following = rest[match.end() :].lstrip()
+    next_word = re.match(r"[A-Za-z]*", following).group(0).upper()  # type: ignore[union-attr]
+    if word in (_SPARQL_WRITE if write else _SPARQL_READ):
+        return "sparql"
+    if write and (
+        (word == "CREATE" and next_word in ("GRAPH", "SILENT"))
+        or (word == "DELETE" and (next_word in ("DATA", "WHERE") or following.startswith("{")))
+        or (word == "WITH" and following.startswith("<"))
+    ):
+        return "sparql"
+    return "cypher" if word in _CYPHER_LEAD else "sparql"
 
 
 def _commit_ref(commit: CommitRef) -> int | str:
@@ -1119,17 +1295,27 @@ def _rdf_payload(data: Data, format: Format | None) -> tuple[str, Any]:
     raise TypeError(f"cannot insert {type(data).__name__}; pass JSON-LD, Turtle, or a path")
 
 
-def _update_payload(txn: str | dict[str, Any] | os.PathLike[str]) -> tuple[str, Any]:
+def _update_payload(
+    txn: str | dict[str, Any] | os.PathLike[str], language: Language | None = None
+) -> tuple[str, Any]:
+    """``(kind, payload)``: kind ``"sparql"``, ``"cypher"``, or ``"jsonld"``."""
+    if language is not None and language not in _LANGUAGES:
+        raise InvalidRequestError(f"language is one of {', '.join(_LANGUAGES)}, not {language!r}")
     if isinstance(txn, os.PathLike):
         path = Path(txn)
         text = path.read_text(encoding="utf-8")
-        if path.suffix.lower() in _SPARQL_SUFFIXES:
-            return "sparql", text
+        suffix = path.suffix.lower()
+        if language is None and suffix in _SPARQL_SUFFIXES:
+            language = "sparql"
+        elif language is None and suffix in _CYPHER_SUFFIXES:
+            language = "cypher"
         txn = text
     if isinstance(txn, dict):
+        if language not in (None, "jsonld"):
+            raise InvalidRequestError(f"a dict is a JSON-LD update, not {language}")
         return "jsonld", txn
     if isinstance(txn, str):
-        if _looks_like_json(txn):
+        if language == "jsonld" or (language is None and _looks_like_json(txn)):
             return "jsonld", json.loads(txn)
-        return "sparql", txn
-    raise TypeError(f"an update is SPARQL text or a JSON-LD dict, not {type(txn).__name__}")
+        return language or _text_language(txn, write=True), txn
+    raise TypeError(f"an update is SPARQL or Cypher text or a JSON-LD dict, not {type(txn).__name__}")

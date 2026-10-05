@@ -35,15 +35,30 @@ class Connection:
         message: str | None = None,
     ) -> dict[str, Any]: ...
     def begin(self, ledger: str, policy: dict[str, Any] | None = None) -> Transaction: ...
-    def cypher(
+    def cypher_query(
         self,
         ledger: str,
         cypher: str,
         params: dict[str, Any] | None = None,
         at: tuple[str, Any] | None = None,
         policy: dict[str, Any] | None = None,
-        timeout: float | None = None,
-    ) -> tuple[dict[str, Any] | None, tuple[list[str], list[tuple[Any, ...]]]]: ...
+        controls: Controls | None = None,
+    ) -> tuple[list[str], list[tuple[Any, ...]]]: ...
+    def cypher_update(
+        self,
+        ledger: str,
+        cypher: str,
+        params: dict[str, Any] | None = None,
+        policy: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], tuple[list[str], list[tuple[Any, ...]]]]: ...
+    def explain_cypher(
+        self,
+        ledger: str,
+        cypher: str,
+        params: dict[str, Any] | None = None,
+        at: tuple[str, Any] | None = None,
+        policy: dict[str, Any] | None = None,
+    ) -> dict[str, Any]: ...
     def begin_cypher(self, ledger: str, policy: dict[str, Any] | None = None) -> CypherTransaction: ...
     def validate(self, ledger: str, options: dict[str, Any]) -> dict[str, Any]: ...
     def index_status(self, ledger: str) -> dict[str, Any]: ...
@@ -126,9 +141,10 @@ class Snapshot:
     def query_jsonld(self, query: Any, controls: Controls | None = None) -> Any: ...
     def stream(self, query: Any, controls: Controls | None = None) -> RowStream: ...
     def explain(self, query: Any) -> dict[str, Any]: ...
-    def cypher(
-        self, cypher: str, params: dict[str, Any] | None = None, timeout: float | None = None
+    def cypher_query(
+        self, cypher: str, params: dict[str, Any] | None = None, controls: Controls | None = None
     ) -> tuple[list[str], list[tuple[Any, ...]]]: ...
+    def explain_cypher(self, cypher: str, params: dict[str, Any] | None = None) -> dict[str, Any]: ...
 
 class RowStream:
     @property

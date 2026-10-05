@@ -39,7 +39,10 @@ with fluree.connect("./data") as conn:          # or fluree.connect(":memory:")
 
 - `insert(data)` and `upsert(data)` take JSON-LD (a dict, list, or JSON text),
   Turtle or TriG text, or a path to a file.
-- `update(txn)` takes SPARQL UPDATE, or JSON-LD `where`/`delete`/`insert`.
+- `update(txn)` takes SPARQL UPDATE, a Cypher write (`CREATE`, `MERGE`,
+  `SET`, `DELETE`, or a `;` script of them, committed all or nothing), or
+  JSON-LD `where`/`delete`/`insert`. The language is told from the text;
+  `language=` overrides it.
 - `message=` on any of them is recorded with the commit; `ledger.log()` shows
   it.
 - `sync(data, graph=None)` makes the default graph, or a named graph, hold
@@ -77,13 +80,22 @@ people.transact(birthday)
 
 ## Querying
 
-- **SPARQL** `SELECT` returns `Rows`: named tuples in the query's column order,
-  with `to_dicts()` and `to_pandas()`. Literals are Python values (`int`,
-  `float`, `Decimal`, `datetime`, `str`, ...); IRIs are `fluree.IRI` and
-  language-tagged strings `fluree.LangString`, both `str` subclasses. A literal
-  with no lossless Python type stays a `fluree.Literal`. `ASK` returns a `bool`;
-  `CONSTRUCT` returns a JSON-LD document.
-- **JSON-LD** queries (a `dict`) return their JSON result as Python objects.
+`query()` takes SPARQL, Cypher, or JSON-LD — told apart by how the query
+opens, or set with `language=` — and reads the latest state.
+`ledger.snapshot()` and `ledger.at(t=..., time=..., commit=...)` return a
+frozen view that every query sees identically.
+
+- SPARQL `SELECT` and every Cypher query return a `Result` of `Record`s in
+  the query's column order. A record unpacks like a tuple and reads by
+  position, key, or attribute (`r[0]`, `r["name"]`, `r.name`); the result has
+  `keys()`, `single()`, `value(key)`, `values()`, `data()` and
+  `to_pandas()` (alias `to_df()`) — the Neo4j driver's vocabulary.
+- Literals are Python values (`int`, `float`, `Decimal`, `datetime`, `str`,
+  ...); IRIs are `fluree.IRI` and language-tagged strings
+  `fluree.LangString`, both `str` subclasses. A literal with no lossless
+  Python type stays a `fluree.Literal`.
+- SPARQL `ASK` returns a `bool`, `CONSTRUCT` a JSON-LD document; JSON-LD
+  queries (a `dict`) return their JSON result as Python objects.
 - `ledger.stream(query)` reads a large `SELECT` row by row in flat memory;
   leaving the loop early stops the query.
 - `query(..., max_fuel=..., timeout=...)` bounds a query's work and time;
@@ -94,35 +106,32 @@ people.transact(birthday)
 - `ledger.set_context({...})` sets the default JSON-LD context: queries that
   omit `PREFIX` or `@context` resolve prefixes against it.
 
-`ledger.query(...)` reads the latest state. `ledger.snapshot()` and
-`ledger.at(t=..., time=..., commit=...)` return a frozen view that every query
-sees identically.
-
-## Cypher
-
-`ledger.cypher(...)` runs openCypher, with results shaped like the Neo4j
-Python driver's:
+### Cypher
 
 ```python
-result = people.cypher(
+result = people.query(
     "MATCH (p:Person {name: $name})-[r:KNOWS]->(friend) RETURN p, r, friend.name AS friend",
     name="Alice",
 )
 for record in result:
-    record["friend"], record[0]["age"], record["r"].type    # by key or position
-result.single(), result.data(), result.value("friend"), result.to_df()
+    record.friend, record["p"]["age"], record["r"].type
+
+commit = people.update("CREATE (p:Person {name: $name}) RETURN p", name="Eve")
+commit.result.single()["p"]
 ```
 
+- `$name` parameters come from a dict or keyword arguments.
 - Nodes, relationships and paths come back as `fluree.Node` (properties read
-  like a dict, plus `labels` and `element_id`), `fluree.Relationship` (`type`,
-  `start_node`, `end_node`) and `fluree.Path`; dates, decimals and the like as
-  Python values.
-- A write — `CREATE`, `MERGE`, `SET`, `DELETE`, or a `;` script of them —
-  commits, all or nothing; `result.commit` is the `Commit`.
-- `with people.cypher_transaction() as tx: tx.run(...)` groups statements into
-  one atomic commit; reads inside it see its own writes.
-- `ledger.at(...).cypher(...)` reads the past. Cypher and SPARQL see the same
-  data: Cypher's names are bare IRIs (`Person` is `<Person>`).
+  like a dict, plus `labels` and `element_id` — the same `IRI` SPARQL returns
+  for it), `fluree.Relationship` (`type`, `start_node`, `end_node`) and
+  `fluree.Path`.
+- A Cypher write runs through `update()`; the records its `RETURN` produces
+  are the commit's `result`. `with people.cypher_transaction() as tx:
+  tx.run(...)` groups statements into one atomic commit.
+- Cypher and SPARQL see the same data: Cypher's names are bare IRIs (`Person`
+  is `<Person>`).
+- Not yet for Cypher: `max_fuel`, `profile()`, `stream()`, and `message=` on
+  writes.
 
 ## History
 

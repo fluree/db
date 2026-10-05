@@ -35,12 +35,12 @@ def test_stream_jsonld(ledger):
     query = {"@context": {"ex": EX}, "select": ["?s", "?n"], "where": {"@id": "?s", "ex:n": "?n"}}
     rows = list(ledger.stream(query))
     assert len(rows) == 2500
-    assert rows[0]._fields == ("s", "n")
+    assert rows[0].keys() == ["s", "n"]
 
 
 def test_stream_select_star(ledger):
     rows = list(ledger.snapshot().stream(f"PREFIX ex: <{EX}> SELECT * WHERE {{ ?s ex:n ?n }}"))
-    assert len(rows) == 2500 and set(rows[0]._fields) == {"s", "n"}
+    assert len(rows) == 2500 and set(rows[0].keys()) == {"s", "n"}
 
 
 def test_breaking_early_stops_a_huge_query(ledger):

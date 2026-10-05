@@ -76,7 +76,7 @@ def test_select_rows_follow_projection_order(people):
     assert rows[0].name == "Alice"
     assert rows[1].age is None
     assert isinstance(rows[1].s, BlankNode)
-    assert rows.to_dicts()[2] == {"name": "Bob", "s": EX + "bob", "age": None}
+    assert rows.data()[2] == {"name": "Bob", "s": EX + "bob", "age": None}
 
 
 def test_literals_become_python_values(people):

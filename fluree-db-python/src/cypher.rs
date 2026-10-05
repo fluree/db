@@ -12,6 +12,7 @@
 use crate::connection::receipt_to_py;
 use crate::convert::from_json;
 use crate::error::{api_error, invalid_request};
+use crate::query::Controls;
 use crate::runtime::{block_on, block_on_cancellable, InRuntime};
 use fluree_db_api::cypher_import::split_statements;
 use fluree_db_api::cypher_txn::CypherTransaction as EngineTxn;
@@ -20,8 +21,8 @@ use fluree_db_api::format::cypher_typed::{
     CypherCell, CypherNode, CypherRelationship, CypherTemporal,
 };
 use fluree_db_api::{
-    ApiError, CypherParamMap, Fluree, GovernanceOptions, GraphDb, QueryCancellation,
-    QueryExecutionOptions, TrackingOptions, TransactError,
+    ApiError, CypherParamMap, Fluree, GovernanceOptions, GraphDb, QueryExecutionOptions,
+    TrackingOptions, TransactError,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
@@ -56,21 +57,32 @@ pub(crate) fn is_write(cypher: &str) -> PyResult<bool> {
     Ok(false)
 }
 
-/// Run a read against `db`, cancelled at `timeout` or on Ctrl-C.
+/// Refuse a write where only reads run.
+pub(crate) fn require_read(cypher: &str) -> PyResult<()> {
+    if is_write(cypher)? {
+        return Err(invalid_request(
+            "this Cypher statement writes; run it with update()",
+        ));
+    }
+    Ok(())
+}
+
+/// Run a read against `db`, cancelled at the controls' timeout, through
+/// their canceller, or on Ctrl-C.
 pub(crate) fn read<'py>(
     py: Python<'py>,
     fluree: &Fluree,
     db: &GraphDb,
     cypher: &str,
     params: Option<&CypherParamMap>,
-    timeout: Option<f64>,
+    controls: Controls,
 ) -> PyResult<Bound<'py, PyTuple>> {
-    let cancellation = QueryCancellation::new();
+    let cancellation = controls.cancellation();
     let options = QueryExecutionOptions::new().with_cancellation(cancellation.clone());
     let table = block_on_cancellable(
         py,
         &cancellation,
-        timeout.map(Duration::from_secs_f64),
+        controls.timeout().map(Duration::from_secs_f64),
         read_table(fluree, db, cypher, params, &options),
     )?
     .map_err(api_error)?;

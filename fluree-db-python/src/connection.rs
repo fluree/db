@@ -464,12 +464,10 @@ impl Connection {
         Ok(commit)
     }
 
-    /// Run Cypher: a read against `ledger` (at `at`), or a write — one
-    /// statement or a `;` script — committed all or nothing. Returns
-    /// `(commit, (columns, rows))`, `commit` being `None` for a read.
-    #[pyo3(signature = (ledger, cypher, params = None, at = None, policy = None, timeout = None))]
+    /// A Cypher read of `ledger` at `at`; returns `(columns, rows)`.
+    #[pyo3(signature = (ledger, cypher, params = None, at = None, policy = None, controls = None))]
     #[allow(clippy::too_many_arguments)]
-    fn cypher<'py>(
+    fn cypher_query<'py>(
         &self,
         py: Python<'py>,
         ledger: &str,
@@ -477,25 +475,64 @@ impl Connection {
         params: Option<&Bound<'py, PyAny>>,
         at: Option<&Bound<'py, PyTuple>>,
         policy: Option<&Bound<'py, PyAny>>,
-        timeout: Option<f64>,
-    ) -> PyResult<(Option<Bound<'py, PyDict>>, Bound<'py, PyTuple>)> {
+        controls: Option<Controls>,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        cypher::require_read(cypher)?;
         let id = canonical(ledger)?;
         let params = cypher::params(params)?;
+        let spec = time_spec(at)?;
         let policy = governance(policy)?;
         let fluree = &*self.fluree;
-        if cypher::is_write(cypher)? {
-            if at.is_some() {
-                return Err(invalid_request("a past state cannot be written to"));
-            }
-            let governance = policy.unwrap_or_default();
-            let (commit, table) =
-                cypher::write(py, fluree, &id, cypher, params.as_ref(), governance)?;
-            return Ok((Some(commit), table));
-        }
-        let spec = time_spec(at)?;
         let db = block_on(py, load(fluree, &id, spec, policy.as_ref()))?.map_err(api_error)?;
-        let table = cypher::read(py, fluree, &db, cypher, params.as_ref(), timeout)?;
-        Ok((None, table))
+        let controls = controls.unwrap_or_default();
+        cypher::read(py, fluree, &db, cypher, params.as_ref(), controls)
+    }
+
+    /// A Cypher write — one statement or a `;` script — committed all or
+    /// nothing. Returns `(commit, (columns, rows))`, the rows a `RETURN`
+    /// produced.
+    #[pyo3(signature = (ledger, cypher, params = None, policy = None))]
+    fn cypher_update<'py>(
+        &self,
+        py: Python<'py>,
+        ledger: &str,
+        cypher: &str,
+        params: Option<&Bound<'py, PyAny>>,
+        policy: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<(Bound<'py, PyDict>, Bound<'py, PyTuple>)> {
+        if !cypher::is_write(cypher)? {
+            return Err(invalid_request(
+                "this Cypher statement only reads; run it with query()",
+            ));
+        }
+        let id = canonical(ledger)?;
+        let params = cypher::params(params)?;
+        let governance = governance(policy)?.unwrap_or_default();
+        cypher::write(py, &self.fluree, &id, cypher, params.as_ref(), governance)
+    }
+
+    /// The plan a Cypher read would run with.
+    #[pyo3(signature = (ledger, cypher, params = None, at = None, policy = None))]
+    fn explain_cypher<'py>(
+        &self,
+        py: Python<'py>,
+        ledger: &str,
+        cypher: &str,
+        params: Option<&Bound<'py, PyAny>>,
+        at: Option<&Bound<'py, PyTuple>>,
+        policy: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let id = canonical(ledger)?;
+        let params = cypher::params(params)?;
+        let spec = time_spec(at)?;
+        let policy = governance(policy)?;
+        let fluree = &*self.fluree;
+        let plan = block_on(py, async {
+            let db = load(fluree, &id, spec, policy.as_ref()).await?;
+            fluree.explain_cypher(&db, cypher, params.as_ref()).await
+        })?
+        .map_err(api_error)?;
+        from_json(py, &plan)
     }
 
     /// Open an explicit Cypher transaction on `ledger`.
@@ -928,21 +965,42 @@ impl Snapshot {
     }
 
     /// A Cypher read of this snapshot.
-    #[pyo3(signature = (cypher, params = None, timeout = None))]
-    fn cypher<'py>(
+    #[pyo3(signature = (cypher, params = None, controls = None))]
+    fn cypher_query<'py>(
         &self,
         py: Python<'py>,
         cypher: &str,
         params: Option<&Bound<'py, PyAny>>,
-        timeout: Option<f64>,
+        controls: Option<Controls>,
     ) -> PyResult<Bound<'py, PyTuple>> {
-        if cypher::is_write(cypher)? {
-            return Err(invalid_request(
-                "a snapshot is read-only; write through the ledger",
-            ));
-        }
+        cypher::require_read(cypher)?;
         let params = cypher::params(params)?;
-        cypher::read(py, &self.fluree, &self.db, cypher, params.as_ref(), timeout)
+        let controls = controls.unwrap_or_default();
+        cypher::read(
+            py,
+            &self.fluree,
+            &self.db,
+            cypher,
+            params.as_ref(),
+            controls,
+        )
+    }
+
+    #[pyo3(signature = (cypher, params = None))]
+    fn explain_cypher<'py>(
+        &self,
+        py: Python<'py>,
+        cypher: &str,
+        params: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let params = cypher::params(params)?;
+        let plan = block_on(
+            py,
+            self.fluree
+                .explain_cypher(&self.db, cypher, params.as_ref()),
+        )?
+        .map_err(api_error)?;
+        from_json(py, &plan)
     }
 
     #[pyo3(signature = (sparql, controls = None))]

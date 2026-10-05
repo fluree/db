@@ -40,13 +40,15 @@ from fluree._connection import (
     Data,
     ExportFormat,
     Format,
+    Language,
     MergeStrategy,
     Query,
     QueryProfile,
     RebaseStrategy,
     RevertStrategy,
 )
-from fluree._cypher import CypherResult
+from fluree._cypher import _params
+from fluree._results import Result
 from fluree._records import (
     Branch,
     Change,
@@ -146,13 +148,29 @@ class Connection:
     async def ledgers(self) -> list[str]:
         return await _call(self._sync.ledgers)
 
-    async def query(self, query: Query, *, max_fuel: float | None = None, timeout: float | None = None) -> Any:
-        return await _query(lambda c: _sync._execute(self._sync._run, query, max_fuel, timeout, False, c))
+    async def query(
+        self,
+        query: Query,
+        *,
+        language: Language | None = None,
+        max_fuel: float | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        return await _query(
+            lambda c: _sync._execute(self._sync._run, query, max_fuel, timeout, False, c, language=language)
+        )
 
     async def profile(
-        self, query: Query, *, max_fuel: float | None = None, timeout: float | None = None
+        self,
+        query: Query,
+        *,
+        language: Language | None = None,
+        max_fuel: float | None = None,
+        timeout: float | None = None,
     ) -> QueryProfile:
-        return await _query(lambda c: _sync._profile(self._sync._run, query, max_fuel, timeout, c))
+        return await _query(
+            lambda c: _sync._profile(self._sync._run, query, max_fuel, timeout, c, language=language)
+        )
 
     async def restore(self, path: str | os.PathLike[str], ledger: str) -> Ledger:
         return Ledger(self, await _call(self._sync.restore, path, ledger))
@@ -206,9 +224,17 @@ class Ledger:
         return await _call(self._sync.upsert, data, format=format, message=message)
 
     async def update(
-        self, transaction: str | dict[str, Any] | os.PathLike[str], *, message: str | None = None
+        self,
+        transaction: str | dict[str, Any] | os.PathLike[str],
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: Language | None = None,
+        message: str | None = None,
+        **kwparameters: Any,
     ) -> Commit:
-        return await _call(self._sync.update, transaction, message=message)
+        return await _call(
+            self._sync.update, transaction, parameters, language=language, message=message, **kwparameters
+        )
 
     async def sync(
         self,
@@ -260,24 +286,39 @@ class Ledger:
 
         return _Opening(open)
 
-    async def query(self, query: Query, *, max_fuel: float | None = None, timeout: float | None = None) -> Any:
-        return await _query(lambda c: _sync._execute(self._sync._run, query, max_fuel, timeout, False, c))
-
-    async def profile(
-        self, query: Query, *, max_fuel: float | None = None, timeout: float | None = None
-    ) -> QueryProfile:
-        return await _query(lambda c: _sync._profile(self._sync._run, query, max_fuel, timeout, c))
-
-    async def cypher(
+    async def query(
         self,
-        query: str,
+        query: Query,
         parameters: Mapping[str, Any] | None = None,
         *,
+        language: Language | None = None,
+        max_fuel: float | None = None,
         timeout: float | None = None,
         **kwparameters: Any,
-    ) -> CypherResult:
-        """See :meth:`fluree.Ledger.cypher`."""
-        return await _call(self._sync.cypher, query, parameters, timeout=timeout, **kwparameters)
+    ) -> Any:
+        params = _params(parameters, kwparameters)
+        return await _query(
+            lambda c: _sync._execute(
+                self._sync._run, query, max_fuel, timeout, False, c, language=language, params=params
+            )
+        )
+
+    async def profile(
+        self,
+        query: Query,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: Language | None = None,
+        max_fuel: float | None = None,
+        timeout: float | None = None,
+        **kwparameters: Any,
+    ) -> QueryProfile:
+        params = _params(parameters, kwparameters)
+        return await _query(
+            lambda c: _sync._profile(
+                self._sync._run, query, max_fuel, timeout, c, language=language, params=params
+            )
+        )
 
     def cypher_transaction(self) -> _Opening[CypherTransaction]:
         """Open a :class:`CypherTransaction`. Await it, or use it with
@@ -303,8 +344,15 @@ class Ledger:
             lambda: self._sync.stream(query, max_fuel=max_fuel, timeout=timeout, batch_size=batch_size)
         )
 
-    async def explain(self, query: Query) -> dict[str, Any]:
-        return await _call(self._sync.explain, query)
+    async def explain(
+        self,
+        query: Query,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: Language | None = None,
+        **kwparameters: Any,
+    ) -> dict[str, Any]:
+        return await _call(self._sync.explain, query, parameters, language=language, **kwparameters)
 
     async def snapshot(self) -> Snapshot:
         return Snapshot(self, await _call(self._sync.snapshot))
@@ -429,13 +477,39 @@ class Snapshot:
     def __repr__(self) -> str:
         return repr(self._sync).replace("<Snapshot", "<aio.Snapshot", 1)
 
-    async def query(self, query: Query, *, max_fuel: float | None = None, timeout: float | None = None) -> Any:
-        return await _query(lambda c: _sync._execute(self._sync._run, query, max_fuel, timeout, False, c))
+    async def query(
+        self,
+        query: Query,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: Language | None = None,
+        max_fuel: float | None = None,
+        timeout: float | None = None,
+        **kwparameters: Any,
+    ) -> Any:
+        params = _params(parameters, kwparameters)
+        return await _query(
+            lambda c: _sync._execute(
+                self._sync._run, query, max_fuel, timeout, False, c, language=language, params=params
+            )
+        )
 
     async def profile(
-        self, query: Query, *, max_fuel: float | None = None, timeout: float | None = None
+        self,
+        query: Query,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: Language | None = None,
+        max_fuel: float | None = None,
+        timeout: float | None = None,
+        **kwparameters: Any,
     ) -> QueryProfile:
-        return await _query(lambda c: _sync._profile(self._sync._run, query, max_fuel, timeout, c))
+        params = _params(parameters, kwparameters)
+        return await _query(
+            lambda c: _sync._profile(
+                self._sync._run, query, max_fuel, timeout, c, language=language, params=params
+            )
+        )
 
     def stream(
         self,
@@ -449,8 +523,15 @@ class Snapshot:
             lambda: self._sync.stream(query, max_fuel=max_fuel, timeout=timeout, batch_size=batch_size)
         )
 
-    async def explain(self, query: Query) -> dict[str, Any]:
-        return await _call(self._sync.explain, query)
+    async def explain(
+        self,
+        query: Query,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: Language | None = None,
+        **kwparameters: Any,
+    ) -> dict[str, Any]:
+        return await _call(self._sync.explain, query, parameters, language=language, **kwparameters)
 
     async def export(
         self,
@@ -464,16 +545,6 @@ class Snapshot:
         return await _call(
             self._sync.export, path, format=format, graph=graph, all_graphs=all_graphs, context=context
         )
-
-    async def cypher(
-        self,
-        query: str,
-        parameters: Mapping[str, Any] | None = None,
-        *,
-        timeout: float | None = None,
-        **kwparameters: Any,
-    ) -> CypherResult:
-        return await _call(self._sync.cypher, query, parameters, timeout=timeout, **kwparameters)
 
     async def branch(self, name: str) -> Ledger:
         return self._ledger._wrap(await _call(self._sync.branch, name))
@@ -506,16 +577,38 @@ class Transaction:
     async def upsert(self, data: Data, *, format: Format | None = None) -> None:
         await _call(self._sync.upsert, data, format=format)
 
-    async def update(self, transaction: str | dict[str, Any] | os.PathLike[str]) -> None:
-        await _call(self._sync.update, transaction)
+    async def update(
+        self, transaction: str | dict[str, Any] | os.PathLike[str], *, language: Language | None = None
+    ) -> None:
+        await _call(self._sync.update, transaction, language=language)
 
-    async def query(self, query: Query, *, max_fuel: float | None = None, timeout: float | None = None) -> Any:
+    async def query(
+        self,
+        query: Query,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: Language | None = None,
+        max_fuel: float | None = None,
+        timeout: float | None = None,
+        **kwparameters: Any,
+    ) -> Any:
+        params = _params(parameters, kwparameters)
         return await _query(
-            lambda c: _sync._execute(self._sync._view()._run, query, max_fuel, timeout, False, c)
+            lambda c: _sync._execute(
+                self._sync._view()._run, query, max_fuel, timeout, False, c,
+                language=language, params=params,
+            )
         )
 
-    async def explain(self, query: Query) -> dict[str, Any]:
-        return await _call(self._sync.explain, query)
+    async def explain(
+        self,
+        query: Query,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: Language | None = None,
+        **kwparameters: Any,
+    ) -> dict[str, Any]:
+        return await _call(self._sync.explain, query, parameters, language=language, **kwparameters)
 
     async def commit(self, *, message: str | None = None) -> Commit:
         return await _call(self._sync.commit, message=message)
@@ -549,7 +642,7 @@ class CypherTransaction:
 
     async def run(
         self, query: str, parameters: Mapping[str, Any] | None = None, **kwparameters: Any
-    ) -> CypherResult:
+    ) -> Result:
         return await _call(self._sync.run, query, parameters, **kwparameters)
 
     async def commit(self) -> Commit:

@@ -4,10 +4,13 @@ previews of merging, rebasing and reverting."""
 from __future__ import annotations
 
 import datetime as _dt
-from dataclasses import dataclass
-from typing import Any, Literal as _Literal
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Literal as _Literal
 
 from fluree._terms import IRI, BlankNode, _datetime, to_python
+
+if TYPE_CHECKING:
+    from fluree._results import Result
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,7 +26,8 @@ class Commit:
     which case no commit was written and ``t`` is the ledger's unchanged ``t``.
 
     ``time`` and ``message`` are filled in for commits read from
-    :meth:`Ledger.log` and the previews.
+    :meth:`Ledger.log` and the previews. ``result`` holds the records a
+    Cypher write's ``RETURN`` produced.
     """
 
     t: int
@@ -33,6 +37,8 @@ class Commit:
     retracts: int
     time: _dt.datetime | None = None
     message: str | None = None
+    #: The records a Cypher write's ``RETURN`` produced, else ``None``.
+    result: Result | None = field(default=None, compare=False, repr=False)
 
     @property
     def short_id(self) -> str | None:
