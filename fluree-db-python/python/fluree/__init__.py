@@ -25,6 +25,7 @@ from fluree._records import (
     Change,
     Commit,
     Conflict,
+    FullText,
     IndexStatus,
     MergePreview,
     MergeResult,
@@ -38,7 +39,7 @@ from fluree._records import (
 )
 from fluree._fluree import __version__
 from fluree._results import Record, Result, RowStream
-from fluree._terms import IRI, BlankNode, LangString, Literal
+from fluree._terms import IRI, BlankNode, LangString, Literal, Vector
 from fluree.errors import (
     ConflictError,
     FlureeError,
@@ -59,6 +60,7 @@ __all__ = [
     "ConflictError",
     "Connection",
     "FlureeError",
+    "FullText",
     "IndexStatus",
     "InvalidRequestError",
     "LangString",
@@ -85,6 +87,7 @@ __all__ = [
     "Transaction",
     "ValidationReport",
     "ValidationResult",
+    "Vector",
     "VerifyReport",
     "__version__",
     "connect",

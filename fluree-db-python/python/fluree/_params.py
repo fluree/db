@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import datetime as _dt
+import json
 import math
 from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any
 
 from fluree._graph import Node
-from fluree._terms import XSD, IRI, BlankNode, LangString, Literal
+from fluree._terms import EMBEDDING_VECTOR, XSD, IRI, BlankNode, LangString, Literal, Vector
 from fluree.errors import InvalidRequestError
 
 
@@ -26,6 +27,8 @@ def _cypher_params(params: Mapping[str, Any] | None) -> dict[str, Any] | None:
 def _cypher(value: Any) -> Any:
     if isinstance(value, Node):
         return value.element_id
+    if _is_ndarray(value):
+        return value.tolist()
     if isinstance(value, (_dt.datetime, _dt.date, _dt.time)):
         return value.isoformat()
     if isinstance(value, Decimal):
@@ -46,6 +49,10 @@ def _sparql_params(params: Mapping[str, Any] | None) -> dict[str, Any] | None:
 def _sparql(name: str, value: Any) -> Any:
     if isinstance(value, Node):
         value = value.element_id
+    if _is_ndarray(value) and value.ndim != 1:
+        raise InvalidRequestError(f"parameter {name!r}: a vector is a one-dimensional array")
+    if isinstance(value, Vector) or _is_ndarray(value):
+        return {"@value": json.dumps(list(Vector(value))), "@type": EMBEDDING_VECTOR}
     if isinstance(value, BlankNode):
         return {"@id": f"_:{value}"}
     if isinstance(value, IRI):
@@ -82,3 +89,8 @@ def _sparql(name: str, value: Any) -> Any:
         # A JSON-LD term, as {"@id": ...} or {"@value": ..., "@type": ...}.
         return dict(value)
     raise InvalidRequestError(f"parameter {name!r}: a {type(value).__name__} is not an RDF term")
+
+
+def _is_ndarray(value: Any) -> bool:
+    kind = type(value)
+    return kind.__name__ == "ndarray" and kind.__module__ == "numpy"

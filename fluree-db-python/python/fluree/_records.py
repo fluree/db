@@ -304,6 +304,16 @@ class ValidationReport:
 
 
 @dataclass(frozen=True, slots=True)
+class FullText:
+    """A ledger's full-text configuration (see :meth:`Ledger.set_full_text`):
+    the properties whose plain-string values ``fulltext()`` scores, and the
+    language untagged values are analyzed in."""
+
+    properties: tuple[IRI, ...]
+    language: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class IndexStatus:
     """Where indexing of a ledger stands. Commits after ``index_t`` (up to
     ``commit_t``) are queryable but not yet indexed. ``phase`` is ``"idle"``,

@@ -9,14 +9,83 @@ use fluree_db_api::{CommitRef, ResolvedFlake, ResolvedValue, TimeSpec};
 use fluree_db_core::{CommitSummary, ContentId};
 use fluree_db_sparql::ast::{QueryBody, SelectVariables};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3::sync::PyOnceLock;
+use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple, PyType};
 use serde_json::Value as JsonValue;
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 const RDF_LANG_STRING: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
 
+/// A Python value as JSON. A `fluree.Vector`, or a one-dimensional numpy
+/// array, becomes an `f:embeddingVector` value object; everything else
+/// converts as plain data.
 pub(crate) fn to_json(obj: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
+    let py = obj.py();
+    if obj.is_none() {
+        return Ok(JsonValue::Null);
+    }
+    if obj.is_instance_of::<PyBool>()
+        || obj.is_instance_of::<PyInt>()
+        || obj.is_instance_of::<PyFloat>()
+    {
+        return Ok(pythonize::depythonize(obj)?);
+    }
+    if let Ok(s) = obj.cast::<PyString>() {
+        return Ok(JsonValue::String(s.to_str()?.to_owned()));
+    }
+    if let Ok(dict) = obj.cast::<PyDict>() {
+        let mut map = serde_json::Map::with_capacity(dict.len());
+        for (key, value) in dict.iter() {
+            let key = key
+                .cast::<PyString>()
+                .map_err(|_| invalid_request(format!("dict keys must be strings, not {key}")))?;
+            map.insert(key.to_str()?.to_owned(), to_json(&value)?);
+        }
+        return Ok(JsonValue::Object(map));
+    }
+    if let Ok(list) = obj.cast::<PyList>() {
+        return list.iter().map(|item| to_json(&item)).collect();
+    }
+    if obj.is_instance(VECTOR.import(py, "fluree._terms", "Vector")?)? || is_ndarray(obj)? {
+        return vector_json(obj);
+    }
+    if let Ok(tuple) = obj.cast::<PyTuple>() {
+        return tuple.iter().map(|item| to_json(&item)).collect();
+    }
     Ok(pythonize::depythonize(obj)?)
+}
+
+static VECTOR: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+
+fn is_ndarray(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let class = obj.get_type();
+    Ok(class.name()? == "ndarray" && class.module()?.to_str()? == "numpy")
+}
+
+fn vector_json(obj: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
+    if is_ndarray(obj)? {
+        let ndim: usize = obj.getattr("ndim")?.extract()?;
+        if ndim != 1 {
+            return Err(invalid_request(format!(
+                "a vector is one-dimensional; this numpy array has {ndim} dimensions"
+            )));
+        }
+    }
+    let values = obj
+        .try_iter()?
+        .map(|item| {
+            let value: f64 = item?.extract()?;
+            serde_json::Number::from_f64(value)
+                .map(JsonValue::Number)
+                .ok_or_else(|| {
+                    invalid_request(format!("a vector holds finite numbers, not {value}"))
+                })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok(serde_json::json!({
+        "@value": values,
+        "@type": fluree_vocab::fluree::EMBEDDING_VECTOR,
+    }))
 }
 
 /// SPARQL parameters: a dict of variable name to JSON-LD value, `None` when empty.

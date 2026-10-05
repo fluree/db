@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
 RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+EMBEDDING_VECTOR = "https://ns.flur.ee/db#embeddingVector"
 
 
 class IRI(str):
@@ -61,6 +62,40 @@ class LangString(str):
 
     def __reduce__(self) -> tuple[Any, ...]:
         return (LangString, (str(self), self.language))
+
+
+class Vector(tuple):  # type: ignore[type-arg]
+    """An embedding vector: a tuple of floats, stored as ``f:embeddingVector``.
+
+    Build one from any sequence of numbers or a numpy array. Insert it as a
+    property value, pass it as a query parameter, and read it back from
+    queries; ``numpy.asarray(vector)`` gives a ``float32`` array. Values are
+    stored at ``float32`` precision. A one-dimensional numpy array is taken as
+    a vector wherever a ``Vector`` is.
+    """
+
+    __slots__ = ()
+
+    def __new__(cls, values: Any = ()) -> Vector:
+        return super().__new__(cls, (float(v) for v in values))
+
+    def __repr__(self) -> str:
+        if len(self) <= 8:
+            return f"Vector({list(self)!r})"
+        head = ", ".join(repr(v) for v in self[:4])
+        return f"Vector([{head}, ...], dims={len(self)})"
+
+    def __array__(self, dtype: Any = None, copy: Any = None) -> Any:
+        import numpy
+
+        return numpy.array(tuple(self), dtype=dtype or numpy.float32)
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (Vector, (tuple(self),))
+
+
+def _vector(lexical: str) -> Vector:
+    return Vector(json.loads(lexical))
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +165,7 @@ _CONVERTERS: dict[str, Callable[[str], Any]] = {
     XSD + "date": _dt.date.fromisoformat,
     XSD + "time": _time,
     RDF + "JSON": json.loads,
+    EMBEDDING_VECTOR: _vector,
     **{XSD + name: int for name in _INTEGER_TYPES},
 }
 

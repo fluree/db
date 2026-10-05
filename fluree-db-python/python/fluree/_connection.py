@@ -11,7 +11,7 @@ import random as _random
 import time as _time
 from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any, Literal as _Literal, TypeVar, Union
 
 from fluree import _fluree
@@ -21,6 +21,7 @@ from fluree._records import (
     Branch,
     Change,
     Commit,
+    FullText,
     IndexStatus,
     MergePreview,
     MergeResult,
@@ -853,6 +854,89 @@ class Ledger:
     def info(self) -> dict[str, Any]:
         """Ledger metadata and statistics."""
         return self._connection._native.info(self._id)
+
+    def set_full_text(
+        self, properties: Iterable[str], *, language: str = "en", reindex: bool = True
+    ) -> None:
+        """Make the plain-string values of ``properties`` searchable with
+        ``fulltext()``, analyzed in ``language`` (a BCP-47 tag; values tagged
+        with their own language use it instead).
+
+        ``properties`` are IRIs, full or compact against the ledger's default
+        context; they replace the ones configured before, and an empty list
+        turns the configuration off. The data itself is not changed.
+
+        ``reindex`` rebuilds the index so values already in the ledger are
+        searchable. From then on, a property is searchable as values commit
+        once an index build has seen values of it: a property configured
+        before the ledger holds any of its values is searchable after the
+        next index build (background indexing, or :meth:`reindex`). Pass
+        ``reindex=False`` to defer the rebuild, for instance before a bulk
+        load, and call :meth:`reindex` when ready.
+        """
+        self._require_unrestricted("set_full_text")
+        targets = list(properties)
+        config_iri = self._config_subject() or f"urn:fluree:{self._id}:config:ledger"
+        if targets:
+            group = f"urn:fluree:{self._id}:config:fullText"
+            doc: dict[str, Any] = {
+                "@id": config_iri,
+                "@type": _F + "LedgerConfig",
+                "@graph": self._config_graph,
+                _F + "fullTextDefaults": {
+                    "@id": group,
+                    "@type": _F + "FullTextDefaults",
+                    _F + "defaultLanguage": language,
+                    _F + "property": [
+                        {
+                            "@id": f"{group}:{i}",
+                            "@type": _F + "FullTextProperty",
+                            _F + "target": {"@id": str(target)},
+                        }
+                        for i, target in enumerate(targets)
+                    ],
+                },
+            }
+            # The node names its graph, so it goes in an envelope: a top-level
+            # "@graph" would be the envelope's own.
+            self.upsert({"@context": self.context or {}, "@graph": [doc]})
+        else:
+            self.update(
+                f"PREFIX f: <{_F}> WITH <{self._config_graph}> "
+                f"DELETE {{ <{config_iri}> f:fullTextDefaults ?g }} "
+                f"WHERE {{ <{config_iri}> f:fullTextDefaults ?g }}"
+            )
+        if reindex:
+            self.reindex()
+
+    def full_text(self) -> FullText | None:
+        """The ledger's full-text configuration, or ``None`` without one."""
+        self._require_unrestricted("full_text")
+        config_iri = self._config_subject()
+        if config_iri is None:
+            return None
+        rows = self._config_query(
+            f"SELECT ?target ?language WHERE {{ <{config_iri}> f:fullTextDefaults ?g . "
+            "OPTIONAL { ?g f:property ?p . ?p f:target ?target } "
+            "OPTIONAL { ?g f:defaultLanguage ?language } } ORDER BY ?target"
+        )
+        if not rows:
+            return None
+        targets = tuple(dict.fromkeys(r.target for r in rows if r.target is not None))
+        return FullText(targets, rows[0].language)
+
+    @property
+    def _config_graph(self) -> str:
+        return f"urn:fluree:{self._id}#config"
+
+    def _config_subject(self) -> str | None:
+        """The ledger's ``f:LedgerConfig``, the first by IRI as the engine reads it."""
+        rows = self._config_query("SELECT ?c WHERE { ?c a f:LedgerConfig } ORDER BY ?c LIMIT 1")
+        return str(rows[0].c) if rows else None
+
+    def _config_query(self, select: str) -> Result:
+        sparql = f"PREFIX f: <{_F}> " + select.replace(" WHERE ", f" FROM <{self._config_graph}> WHERE ", 1)
+        return _sparql_result(self._connection._native.query_sparql_from(sparql))
 
     def _transact(
         self, op: str, kind: str, payload: Any, message: str | None, params: Any = None

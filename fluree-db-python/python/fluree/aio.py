@@ -29,7 +29,7 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import os
-from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Iterable, Mapping
 from typing import Any, Generic, TypeVar
 
 import fluree
@@ -53,6 +53,7 @@ from fluree._records import (
     Branch,
     Change,
     Commit,
+    FullText,
     IndexStatus,
     MergePreview,
     MergeResult,
@@ -452,6 +453,14 @@ class Ledger:
 
     async def set_context(self, context: dict[str, Any]) -> None:
         await _call(self._sync.set_context, context)
+
+    async def set_full_text(
+        self, properties: Iterable[str], *, language: str = "en", reindex: bool = True
+    ) -> None:
+        await _call(self._sync.set_full_text, list(properties), language=language, reindex=reindex)
+
+    async def full_text(self) -> FullText | None:
+        return await _call(self._sync.full_text)
 
     async def info(self) -> dict[str, Any]:
         return await _call(self._sync.info)

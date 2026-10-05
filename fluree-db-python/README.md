@@ -148,6 +148,40 @@ commit.result.single()["p"]
   is `<Person>`).
 - Not yet for Cypher: `max_fuel`, `profile()` and `stream()`.
 
+## Search
+
+Full-text and vector search run inside queries, so a search joins with any
+other pattern and sees the same data: staged writes in a transaction, a past
+`t`, a branch.
+
+```python
+people.set_full_text(["ex:title", "ex:body"], language="en")  # reindexes by default
+people.query("""
+    SELECT ?doc ?score WHERE {
+      ?doc ex:body ?body .
+      BIND(fulltext(?body, $q) AS ?score) FILTER(?score > 0)
+    } ORDER BY DESC(?score) LIMIT 10""", q="graph databases")
+
+people.insert({"@context": ctx, "@id": "ex:doc1", "ex:embedding": fluree.Vector(model.encode(text))})
+people.query("""
+    SELECT ?doc ?score WHERE {
+      ?doc ex:embedding ?v .
+      BIND(dotProduct(?v, $q) AS ?score)
+    } ORDER BY DESC(?score) LIMIT 5""", q=query_embedding)
+```
+
+- `set_full_text(properties)` makes the plain-string values of those
+  properties searchable with `fulltext()`, analyzed in `language`;
+  language-tagged values use their own. `full_text()` reads the setting back.
+  A property becomes searchable once an index build has seen values of it, so
+  configure after loading data, or call `reindex()` after the first load.
+- `fluree.Vector` holds an embedding (stored as float32); a one-dimensional
+  numpy array works anywhere a `Vector` does, as a value or a parameter.
+  Vectors come back from queries as `Vector`, and `numpy.asarray(v)` gives
+  a float32 array.
+- `cosineSimilarity`, `dotProduct` and `euclideanDistance` score vectors;
+  `dotProduct` over normalized embeddings is the fastest.
+
 ## History
 
 - `ledger.history(subject, predicate=None, from_t=1)` lists every assertion and
