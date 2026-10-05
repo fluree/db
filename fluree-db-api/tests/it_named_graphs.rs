@@ -3990,6 +3990,41 @@ async fn test_a_graph_registered_under_the_address_migrates_to_the_default_graph
     }
 }
 
+/// The union default graph reads the graphs `GRAPH ?g` lists, so it reads a
+/// graph registered under the ledger's address (listed as `L#<address>`), in
+/// either spelling of the address; a triple both graphs hold reads once.
+#[tokio::test]
+async fn test_the_union_default_graph_reads_the_address_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (i, spelling) in ["", "urn:fluree:"].into_iter().enumerate() {
+        let (branch, address) =
+            legacy_address_branch(&fluree, &format!("legacy-union-{i}"), spelling).await;
+        let ledger = fluree.ledger(&branch).await.expect("load the branch");
+        let sparql = "# PRAGMA union-default-graph: true\n\
+                      PREFIX ex: <http://example.org/>\n\
+                      SELECT ?o WHERE { ?s ex:v ?o }";
+        let result = crate::support::query_sparql(&fluree, &ledger, sparql)
+            .await
+            .unwrap_or_else(|e| panic!("[{address}] union query: {e}"));
+        let json = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+        let mut values: Vec<String> = json
+            .as_array()
+            .expect("rows")
+            .iter()
+            .filter_map(|row| {
+                let cell = row.as_array().and_then(|r| r.first()).unwrap_or(row);
+                cell.as_str().map(str::to_string)
+            })
+            .collect();
+        values.sort();
+        assert_eq!(
+            values,
+            ["default only", "legacy only", "same"],
+            "[{address}] the union reads the default graph and the address graph"
+        );
+    }
+}
+
 /// A query and an update read a graph position the same way: `GRAPH ?g`
 /// lists a graph registered under the ledger's address as `L#<address>` on
 /// both, that name reads it back on both, and the address itself reads the

@@ -4325,6 +4325,63 @@ async fn graph_source_probes_fail_closed_and_skip_ledger_graphs() {
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
+/// A union default graph reads the ledger's own graphs, loaded as ledger
+/// graphs, so it answers while every graph-source lookup fails: none of its
+/// members is asked about as a source, including under the names a `GRAPH`
+/// pattern reaches the default graph by (the ledger's address,
+/// `urn:default`), which no registry entry vouches for.
+#[tokio::test]
+async fn a_union_default_graph_never_probes_its_members() {
+    let _lock = KILL_SWITCH.lock().await;
+    set_fast_paths_disabled(false);
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree
+        .create_ledger("union-native:main")
+        .await
+        .expect("create");
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(
+            "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:v \"default\" .\n\
+             GRAPH <http://example.org/g> { ex:b ex:v \"named\" . }\n",
+        )
+        .execute()
+        .await
+        .expect("seed");
+    let down = with_source_lookups_failing(&fluree);
+    let mut failures = Vec::new();
+    for (pattern, expected) in [
+        ("?s ex:v ?v", &["v=default", "v=named"][..]),
+        (
+            "GRAPH <union-native:main> { ?s ex:v ?v }",
+            &["v=default"][..],
+        ),
+        ("GRAPH <urn:default> { ?s ex:v ?v }", &["v=default"][..]),
+        (
+            "GRAPH <http://example.org/g> { ?s ex:v ?v }",
+            &["v=named"][..],
+        ),
+    ] {
+        let sparql = format!(
+            "# PRAGMA union-default-graph: true\n\
+             PREFIX ex: <http://example.org/>\n\
+             SELECT ?v WHERE {{ {pattern} }}"
+        );
+        match down
+            .graph("union-native:main")
+            .query()
+            .sparql(&sparql)
+            .execute_formatted()
+            .await
+        {
+            Ok(v) if rows_of(&v) == expected => {}
+            other => failures.push(format!("{pattern}: {other:?}")),
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
 /// Declining an IRI that names no source is not swallowing a failure: when
 /// the nameservice cannot answer for a well-formed id, the probe fails the
 /// query rather than quietly plan a possible SQL source as a native graph.
