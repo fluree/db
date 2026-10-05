@@ -2429,6 +2429,12 @@ fn build_operator_tree_inner(
     // below alike.
     let fast_paths_globally_disabled = fast_paths_disabled();
     let enable_fused_fast_paths = enable_fused_fast_paths && !fast_paths_globally_disabled;
+    // A trailing VALUES clause (`query.post_values`) joins after the WHERE
+    // tree, below grouping. Every fast path reads `query.patterns` alone, so
+    // one would answer as if the VALUES were absent (`COUNT(*) … VALUES ?a
+    // { "Net" }` counted every row). None of them applies.
+    let trailing_values = query.post_values.is_some();
+    let enable_fused_fast_paths = enable_fused_fast_paths && !trailing_values;
     // EXPLAIN seed (PR-1): record whether the kill switch suppressed the fused
     // fast-path chain at this gate. TODO(PR-3): per-detector verdicts, not one
     // aggregate chain stamp.
@@ -3054,7 +3060,7 @@ fn build_operator_tree_inner(
     // This avoids decoding leaflets for long (p,o) runs that span leaflet boundaries.
     // Skipped in `History` mode for the same reason as the fused fast paths above:
     // the path emits current-state counts and ignores retracts.
-    if !planning.is_history() && !fast_paths_globally_disabled {
+    if !planning.is_history() && !fast_paths_globally_disabled && !trailing_values {
         if let Some((pred, s_var, o_var, count_var, limit)) =
             detect_predicate_group_by_object_count_topk(query)
         {
@@ -3085,7 +3091,7 @@ fn build_operator_tree_inner(
 
     // Fast-path: `SELECT (COUNT(?s) AS ?c) WHERE { ?s <p> <o> }` using leaflet FIRST headers.
     // Skipped in `History` mode (current-state count semantics).
-    if !planning.is_history() && !fast_paths_globally_disabled {
+    if !planning.is_history() && !fast_paths_globally_disabled && !trailing_values {
         if let Some((pred, s_var, obj, count_var)) = detect_predicate_object_count(query) {
             stamp_fast_path("predicate_object_count", FastPathOutcome::Proceed);
             let mut operator: BoxedOperator = Box::new(PredicateObjectCountFirstsOperator::new(
@@ -3139,7 +3145,11 @@ fn build_operator_tree_inner(
     // open()-time gate (`fast_path_store`) is the real guard, declining to the
     // generic fallback under overlay novelty, time-travel, a non-root policy, or
     // multi-ledger.
-    if !planning.is_history() && !fast_paths_globally_disabled && stats.is_some() {
+    if !planning.is_history()
+        && !fast_paths_globally_disabled
+        && !trailing_values
+        && stats.is_some()
+    {
         if let Some((pred_var, count_var)) = detect_stats_count_by_predicate(query) {
             // EXPLAIN seed (PR-1): planned here; the FastPathOperator below
             // stamps the runtime Proceed/Fallback(GateDeclined) at open().

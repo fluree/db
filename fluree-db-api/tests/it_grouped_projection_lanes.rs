@@ -17,6 +17,10 @@
 //! alone; the others also decline it because their projection check refuses
 //! the expression's column.
 //!
+//! A trailing VALUES clause joins after the WHERE tree, which no fast path
+//! reads: each such query must decline the fast path its WHERE and grouping
+//! would otherwise take, and answer with the VALUES applied.
+//!
 //! Own binary: it toggles the process-global fast-path kill switch.
 
 #![cfg(feature = "native")]
@@ -141,6 +145,17 @@ fn canary_pairs(seg: &str) -> Vec<CanaryPair> {
             ),
         },
         CanaryPair {
+            site: "SUM(?o)",
+            key_only: (
+                "SELECT (SUM(?g) AS ?s) WHERE { ?e ex:age ?g }".to_string(),
+                json!([[145]]),
+            ),
+            with_bind: (
+                "SELECT (SUM(?g) AS ?s) (?s + 1 AS ?t) WHERE { ?e ex:age ?g }".to_string(),
+                json!([[145, 146]]),
+            ),
+        },
+        CanaryPair {
             site: "whole-graph scalar aggregates",
             key_only: (
                 "SELECT (COUNT(?e) AS ?n) (MAX(?age) AS ?m) \
@@ -155,6 +170,41 @@ fn canary_pairs(seg: &str) -> Vec<CanaryPair> {
                 json!([[6, 50, 56]]),
             ),
         },
+    ]
+}
+
+/// Queries with a trailing VALUES clause, each shaped for the fast path
+/// `site`, which must not take it: the fast path would ignore the VALUES (each
+/// answered as if it were absent before the fix).
+fn trailing_values_cases() -> Vec<(&'static str, &'static str, Value)> {
+    vec![
+        (
+            "COUNT rows",
+            r#"SELECT (COUNT(*) AS ?n) WHERE { ?e ex:area ?a } VALUES ?a { "Net" }"#,
+            json!([[3]]),
+        ),
+        (
+            "group_by_object_count_topk",
+            r#"SELECT ?a (COUNT(?e) AS ?n) WHERE { ?e ex:area ?a } GROUP BY ?a
+               ORDER BY DESC(?n) LIMIT 2 VALUES ?a { "Local" }"#,
+            json!([["Local", 2]]),
+        ),
+        (
+            "group_by_object_star_topk",
+            r#"SELECT ?a (COUNT(?e) AS ?n) WHERE { ?e ex:area ?a ; ex:kind ?k } GROUP BY ?a
+               ORDER BY DESC(?n) LIMIT 2 VALUES ?k { "k1" }"#,
+            json!([["Net", 2], ["Local", 1]]),
+        ),
+        (
+            "COUNT by predicate (directory)",
+            "SELECT ?p (COUNT(?o) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p VALUES ?s { ex:e1 }",
+            json!([["ex:age", 1], ["ex:area", 1], ["ex:kind", 1]]),
+        ),
+        (
+            "SUM(?o)",
+            "SELECT (SUM(?g) AS ?s) WHERE { ?e ex:age ?g } VALUES ?e { ex:e1 }",
+            json!([[30]]),
+        ),
     ]
 }
 
@@ -206,6 +256,10 @@ async fn grouped_select_expression_on_an_indexed_ledger_in_both_lanes() {
         cases.push(pair.key_only.clone());
         cases.push(pair.with_bind.clone());
     }
+    let values_cases = trailing_values_cases();
+    for (_, body, expected) in &values_cases {
+        cases.push(((*body).to_string(), expected.clone()));
+    }
 
     let _guard = FastPathsGuard;
     let (store, tracing_guard) = span_capture::init_test_tracing();
@@ -231,6 +285,16 @@ async fn grouped_select_expression_on_an_indexed_ledger_in_both_lanes() {
                     if must_fire { "" } else { "not " }
                 ));
             }
+        }
+    }
+    for (site, body, _) in &values_cases {
+        let before = store.find_events("fast-path outcome").len();
+        run(&fluree, &db, &ledger, body).await;
+        let sites = proceeded(before);
+        if sites.iter().any(|s| s == site) {
+            misrouted.push(format!(
+                "`{site}` must not proceed with a trailing VALUES [proceeded: {sites:?}]\n{body}"
+            ));
         }
     }
     drop(tracing_guard);
