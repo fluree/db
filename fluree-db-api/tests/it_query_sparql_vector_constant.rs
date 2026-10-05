@@ -94,3 +94,55 @@ async fn a_constant_query_vector_scores_as_a_values_binding() {
         bound
     );
 }
+
+#[tokio::test]
+async fn a_constant_vector_matches_in_a_pattern() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, "it/vector-pattern:main");
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@graph": [
+                    {"@id": "ex:a", "ex:embedding": {"@value": [0.5, 0.25, 0.75], "@type": "@vector"}},
+                    {"@id": "ex:b", "ex:embedding": {"@value": [0.25, 0.5, 0.75], "@type": "@vector"}}
+                ]
+            }),
+        )
+        .await
+        .expect("insert")
+        .ledger;
+    let db = graphdb_from_ledger(&ledger);
+
+    let sparql = format!(
+        "{PREFIX}SELECT ?s WHERE {{ ?s ex:embedding \"[0.5, 0.25, 0.75]\"^^f:embeddingVector }}"
+    );
+    let result = fluree.query(&db, sparql.as_str()).await.expect("sparql");
+    assert_eq!(
+        result.to_jsonld(&ledger.snapshot).expect("jsonld"),
+        json!([["ex:a"]])
+    );
+
+    let jsonld = fluree
+        .query(
+            &db,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "select": "?s",
+                "where": {
+                    "@id": "?s",
+                    "ex:embedding": {
+                        "@value": [0.5, 0.25, 0.75],
+                        "@type": "https://ns.flur.ee/db#embeddingVector"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        jsonld.to_jsonld(&ledger.snapshot).expect("jsonld"),
+        json!(["ex:a"])
+    );
+}

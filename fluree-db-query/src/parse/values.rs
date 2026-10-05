@@ -267,7 +267,10 @@ fn parse_literal_value(value_val: &JsonValue, dt_iri: Option<&str>) -> Result<Li
 }
 
 /// Parse vector literal from array @value
-fn parse_vector_literal(arr: &[JsonValue], dt_iri: Option<&str>) -> Result<LiteralValue> {
+pub(super) fn parse_vector_literal(
+    arr: &[JsonValue],
+    dt_iri: Option<&str>,
+) -> Result<LiteralValue> {
     // Allow vector literals only when explicitly typed
     let is_vec = dt_iri.is_some_and(|dt| {
         dt == fluree_vocab::fluree::EMBEDDING_VECTOR
