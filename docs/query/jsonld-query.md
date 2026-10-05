@@ -212,6 +212,17 @@ Single-pattern shorthand (object instead of array):
 
 Returns `true` if at least one solution exists, `false` otherwise. Internally, `LIMIT 1` is applied for efficiency.
 
+`groupBy` and `having` group the solutions first: `ask` is then `true` when at least one group passes `having`:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "ask": { "@id": "?product", "ex:category": "?category" },
+  "groupBy": ["?category"],
+  "having": "(> (count ?product) 10)"
+}
+```
+
 ### from
 
 Specifies which ledger(s) to query:

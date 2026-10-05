@@ -711,22 +711,26 @@ async fn sparql_construct_nested_property_lists_stay_distinct() {
     }
 }
 
-/// P4 negative guardrail (W2BC): CONSTRUCT has no aggregation stage, so an
-/// inline-aggregate ORDER BY (e.g. `ORDER BY COUNT(?h)`) cannot be hoisted and
-/// the query is rejected rather than mis-executed.
+/// An inline-aggregate ORDER BY (`ORDER BY COUNT(?h)`) groups a CONSTRUCT level
+/// (SPARQL 1.1 §18.2.4.1): one implicit group, whose solution binds no template
+/// variable (neither is a GROUP BY key), so every template triple is skipped
+/// and the graph is empty. It used to be refused, when CONSTRUCT had no
+/// grouping stage.
 #[tokio::test]
-async fn sparql_construct_aggregate_order_by_is_rejected() {
+async fn sparql_construct_aggregate_order_by_groups() {
     let (fluree, ledger) = seed_people().await;
     let db = support::graphdb_from_ledger(&ledger);
 
     let sparql = "PREFIX person: <http://example.org/Person#> \
          CONSTRUCT { ?s person:handle ?h } \
          WHERE { ?s person:handle ?h } ORDER BY (COUNT(?h))";
-    let result = db.query(&fluree).sparql(sparql).execute_formatted().await;
-    assert!(
-        result.is_err(),
-        "CONSTRUCT + inline-aggregate ORDER BY must be rejected, got: {result:#?}"
-    );
+    let result = db
+        .query(&fluree)
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .expect("CONSTRUCT with an aggregate ORDER BY");
+    assert_eq!(result["@graph"], serde_json::json!([]), "{result:#}");
 }
 
 /// §16.2: the template is instantiated once per SOLUTION (the sequence, not

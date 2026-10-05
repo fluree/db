@@ -185,10 +185,22 @@ impl<'a> Validator<'a> {
     fn validate_construct(&mut self, query: &ConstructQuery) {
         self.validate_query_where(&query.where_clause.pattern);
         // Template triples don't need ground validation (they use WHERE variables)
+        // A grouping CONSTRUCT's HAVING and ORDER BY get the SELECT checks
+        // that apply without a projection.
+        projection::check_nested_aggregates(
+            &crate::ast::query::SelectVariables::Explicit(Vec::new()),
+            &query.modifiers,
+            &mut self.diagnostics,
+        );
     }
 
     fn validate_ask(&mut self, query: &AskQuery) {
         self.validate_query_where(&query.where_clause.pattern);
+        projection::check_nested_aggregates(
+            &crate::ast::query::SelectVariables::Explicit(Vec::new()),
+            &query.modifiers,
+            &mut self.diagnostics,
+        );
     }
 
     fn validate_describe(&mut self, query: &DescribeQuery) {

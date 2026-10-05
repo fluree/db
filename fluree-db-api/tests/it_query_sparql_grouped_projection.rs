@@ -902,44 +902,75 @@ async fn sub_select_having_reads_trailing_values_as_unbound() {
     .await;
 }
 
-/// ASK and CONSTRUCT have no grouping stage in this lowering. GROUP BY, HAVING
-/// and an aggregate ORDER BY used to be dropped, which changed the answer
-/// (`ASK { … } HAVING (?a = "Nope")` was true; the CONSTRUCT below built all
-/// six triples). They are now refused, as they were for DESCRIBE.
+/// GROUP BY, HAVING and an aggregate ORDER BY group an ASK or CONSTRUCT level
+/// too (§18.2.4.1): ASK is true when some group passes HAVING, and CONSTRUCT
+/// instantiates its template once per such group. A template variable that is
+/// not a GROUP BY key is unbound in the group solution, so the triples that
+/// read it are skipped. These used to be refused (and before that, dropped:
+/// `ASK { … } HAVING (?a = "Nope")` was true). DESCRIBE still refuses them.
 #[tokio::test]
-async fn ask_and_construct_refuse_grouping() {
+async fn ask_and_construct_group() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_areas(&fluree, "grouped-projection/ask-construct:main").await;
-    // Every form is checked, and every one not refused is reported.
-    let mut not_refused = Vec::new();
-    for (body, form) in [
+    let ask = |body: String| {
+        let (fluree, ledger) = (&fluree, &ledger);
+        async move {
+            run(fluree, ledger, &body)
+                .await
+                .to_sparql_json(&ledger.snapshot)
+                .expect("json")["boolean"]
+                .clone()
+        }
+    };
+    for (body, expected) in [
+        (format!("ASK {W}"), true),
+        (format!(r#"ASK {W} HAVING (?a = "Nope")"#), false),
+        (format!("ASK {W} GROUP BY ?a HAVING (COUNT(?e) > 2)"), true),
+        (format!("ASK {W} GROUP BY ?a HAVING (COUNT(?e) > 3)"), false),
+        (format!("ASK {W} HAVING (COUNT(?e) > 5)"), true),
+        (format!("ASK {W} HAVING (COUNT(?e) > 6)"), false),
+        // One implicit group, even over no solutions.
+        (format!("ASK {W} ORDER BY COUNT(?e)"), true),
         (
-            format!(r#"ASK {W} HAVING (?a = "Nope")"#),
-            "ASK with GROUP BY/HAVING",
-        ),
-        (format!("ASK {W} GROUP BY ?a"), "ASK with GROUP BY/HAVING"),
-        (
-            format!("ASK {W} ORDER BY COUNT(?e)"),
-            "aggregate ORDER BY in ASK",
-        ),
-        (
-            format!(r#"CONSTRUCT {{ ?e ex:area ?a }} {W} GROUP BY ?a HAVING (?a = "Remote")"#),
-            "CONSTRUCT with GROUP BY/HAVING",
+            "ASK { ?e ex:nosuch ?a } HAVING (COUNT(?e) = 0)".to_string(),
+            true,
         ),
     ] {
-        let query = format!("{PREFIX}{body}");
-        match support::query_sparql(&fluree, &ledger, &query).await {
-            Err(err) if err.to_string().contains(form) => {}
-            Err(err) => not_refused.push(format!("{body}: {err}")),
-            Ok(_) => not_refused.push(format!("{body}: answered")),
-        }
+        assert_eq!(ask(body.clone()).await, json!(expected), "{body}");
     }
-    assert!(not_refused.is_empty(), "{not_refused:#?}");
-    // Without them, both still answer.
-    let result = run(&fluree, &ledger, &format!("ASK {W}")).await;
+
+    let construct = format!(
+        "CONSTRUCT {{ ex:summary ex:bigArea ?a . ?e ex:inBigArea ?a }} {W} \
+         GROUP BY ?a HAVING (COUNT(?e) > 1)"
+    );
+    let graph = run(&fluree, &ledger, &construct)
+        .await
+        .to_construct(&ledger.snapshot)
+        .expect("to_construct")["@graph"]
+        .clone();
+    let nodes = graph.as_array().expect("@graph");
     assert_eq!(
-        result.to_sparql_json(&ledger.snapshot).expect("json")["boolean"],
-        true
+        nodes.len(),
+        1,
+        "only the summary node, no ?e triples: {graph}"
+    );
+    assert_eq!(nodes[0]["@id"], "ex:summary", "{graph}");
+    let mut areas: Vec<String> = nodes[0]["ex:bigArea"]
+        .as_array()
+        .expect("values")
+        .iter()
+        .map(|v| v.as_str().expect("string").to_string())
+        .collect();
+    areas.sort();
+    assert_eq!(areas, ["Local", "Net"], "{graph}");
+
+    let body = format!("DESCRIBE ?a {W} GROUP BY ?a");
+    let err = support::query_sparql(&fluree, &ledger, &format!("{PREFIX}{body}"))
+        .await
+        .expect_err("DESCRIBE with GROUP BY");
+    assert!(
+        err.to_string().contains("DESCRIBE with GROUP BY/HAVING"),
+        "{body}: {err}"
     );
 }
 

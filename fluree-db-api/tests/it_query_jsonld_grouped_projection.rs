@@ -598,29 +598,38 @@ async fn jsonld_values_reach_generated_binds() {
     );
 }
 
-/// `ask` had no grouping stage and dropped `groupBy` / `having`, answering
-/// `true` for a `having` that rejects every group. It now refuses them, like
-/// SPARQL ASK.
+/// `groupBy` / `having` group an `ask`: it is true when some group passes
+/// `having` (the SPARQL ASK twin is `ask_and_construct_group`). They used to be
+/// refused, and before that dropped (`true` for a `having` that rejects every
+/// group).
 #[tokio::test]
-async fn jsonld_ask_refuses_grouping() {
+async fn jsonld_ask_groups() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_areas(&fluree, "jsonld-grouped/ask:main").await;
     let ctx = json!({"ex": "http://example.org/"});
-    let mut not_refused = Vec::new();
-    for (key, value) in [
-        ("having", json!("(= ?a \"Nope\")")),
-        ("groupBy", json!(["?a"])),
+    for (group_by, having, expected) in [
+        (None, "(= ?a \"Nope\")", false),
+        (Some(json!(["?a"])), "(> (count ?e) 2)", true),
+        (Some(json!(["?a"])), "(> (count ?e) 3)", false),
+        (None, "(> (count ?e) 5)", true),
+        (None, "(> (count ?e) 6)", false),
     ] {
-        let mut query = json!({"@context": ctx, "ask": {"@id": "?e", "ex:area": "?a"}});
-        query[key] = value;
-        let expected = format!("\"ask\" does not support \"{key}\"");
-        match support::query_jsonld(&fluree, &ledger, &query).await {
-            Err(err) if err.to_string().contains(&expected) => {}
-            Err(err) => not_refused.push(format!("{key}: {err}")),
-            Ok(_) => not_refused.push(format!("{key}: answered")),
+        let mut query = json!({
+            "@context": ctx,
+            "ask": {"@id": "?e", "ex:area": "?a"},
+            "having": having
+        });
+        if let Some(group_by) = group_by {
+            query["groupBy"] = group_by;
         }
+        let answer = support::query_jsonld(&fluree, &ledger, &query)
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{query}"))
+            .to_jsonld_async(ledger.as_graph_db_ref(0))
+            .await
+            .expect("to_jsonld_async");
+        assert_eq!(answer, JsonValue::Bool(expected), "{query}");
     }
-    assert!(not_refused.is_empty(), "{not_refused:#?}");
 }
 
 /// JSON-LD `having` has no EXISTS form (unlike a `filter`): one is refused at

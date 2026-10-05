@@ -244,17 +244,6 @@ fn parse_query_ast_internal(
                 "\"ask\" must be an array or object of where-clause patterns".to_string(),
             ));
         }
-        // `ask` returns before `parse_options`, so grouping options would be
-        // dropped, and they change the answer (a `having` that rejects every
-        // group is false). Refuse them, as SPARQL ASK does.
-        if let Some(key) = ["groupBy", "group-by", "having"]
-            .into_iter()
-            .find(|key| obj.contains_key(*key))
-        {
-            return Err(ParseError::InvalidOption(format!(
-                "\"ask\" does not support \"{key}\""
-            )));
-        }
         let object_var_parsing = options::parse_object_var_parsing(obj);
         where_clause::parse_where_with_counters(
             ask_val,
@@ -264,6 +253,15 @@ fn parse_query_ast_internal(
             nested_counter,
             object_var_parsing,
         )?;
+        // `groupBy` / `having` group the level, which changes the answer: `ask`
+        // is then true when some group passes `having` (a `having` that rejects
+        // every group is false), as in SPARQL ASK.
+        let (having, having_aggregates) =
+            options::parse_having_with_aggregates(obj, filter_data::parse_filter_expr)?;
+        query.options.group_by = options::parse_group_by(obj)?;
+        query.options.having = having;
+        query.options.aggregates = having_aggregates;
+        where_clause::resolve_atoms_outside_where(&mut query, &ctx);
         // LIMIT 1 for efficiency — only need to know if any solution exists
         query.options.limit = Some(1);
         // ASK returns before `parse_options` runs, so opts that the

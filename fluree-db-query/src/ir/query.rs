@@ -147,6 +147,27 @@ impl ConstructTemplate {
     pub fn referenced_vars(&self) -> HashSet<VarId> {
         self.var_iter().collect()
     }
+
+    /// Rename `old` to `new` in the patterns, graph names and reifiers.
+    pub fn substitute_var(&mut self, old: VarId, new: VarId) {
+        let rename = |r: &mut Ref| {
+            if r.as_var() == Some(old) {
+                *r = Ref::Var(new);
+            }
+        };
+        for pattern in &mut self.patterns {
+            pattern.substitute_var(old, new);
+        }
+        for graph in self.graphs.iter_mut().flatten() {
+            rename(graph);
+        }
+        for reification in &mut self.reifications {
+            rename(&mut reification.reifier);
+        }
+        if self.bnode_vars.remove(&old) {
+            self.bnode_vars.insert(new);
+        }
+    }
 }
 
 /// A restriction applied to a SELECT query's result stream.

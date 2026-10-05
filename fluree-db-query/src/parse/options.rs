@@ -296,7 +296,7 @@ pub fn parse_group_by(obj: &serde_json::Map<String, JsonValue>) -> Result<Vec<Ar
 /// - allow `"having": "(>= (count ?x) 2)"` and `"having": "(>= (avg ?x) 10)"`
 /// - aggregate forms inside HAVING are rewritten into real query aggregates,
 ///   and the HAVING expression is rewritten to reference the aggregate output var.
-fn parse_having_with_aggregates(
+pub(crate) fn parse_having_with_aggregates(
     obj: &serde_json::Map<String, JsonValue>,
     parse_filter_expr: impl Fn(&JsonValue) -> Result<UnresolvedExpression>,
 ) -> Result<(Option<UnresolvedExpression>, Vec<UnresolvedAggregateSpec>)> {
