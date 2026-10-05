@@ -62,6 +62,7 @@ Data = Union[str, dict[str, Any], list[Any], "os.PathLike[str]"]
 Format = _Literal["jsonld", "turtle", "trig"]
 ExportFormat = _Literal["turtle", "trig", "ntriples", "nquads", "jsonld"]
 Language = _Literal["sparql", "cypher", "jsonld"]
+SelectLanguage = _Literal["sparql", "cypher"]
 MergeStrategy = _Literal["take-both", "abort", "take-source", "take-branch"]
 RebaseStrategy = _Literal["take-both", "abort", "take-source", "take-branch", "skip"]
 RevertStrategy = _Literal["abort", "take-source", "take-branch"]
@@ -177,6 +178,24 @@ class Connection:
         return _execute(
             self._run, query, max_fuel, timeout, False,
             language=language, params=_params(parameters, kwparameters),
+        )
+
+    def select(
+        self,
+        query: str,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: SelectLanguage | None = None,
+        max_fuel: float | None = None,
+        timeout: float | None = None,
+        **kwparameters: Any,
+    ) -> Result:
+        """A SPARQL ``SELECT`` whose ``FROM`` names the ledgers, as for
+        :meth:`query`, returning its :class:`Result`; see
+        :meth:`Snapshot.select`."""
+        return _execute(
+            self._run, query, max_fuel, timeout, False,
+            language=language, params=_params(parameters, kwparameters), select=True,
         )
 
     def profile(
@@ -424,6 +443,22 @@ class Ledger:
         return _execute(
             self._run, query, max_fuel, timeout, False,
             language=language, params=_params(parameters, kwparameters),
+        )
+
+    def select(
+        self,
+        query: str,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: SelectLanguage | None = None,
+        max_fuel: float | None = None,
+        timeout: float | None = None,
+        **kwparameters: Any,
+    ) -> Result:
+        """Run a ``SELECT`` on the latest state; see :meth:`Snapshot.select`."""
+        return _execute(
+            self._run, query, max_fuel, timeout, False,
+            language=language, params=_params(parameters, kwparameters), select=True,
         )
 
     def profile(
@@ -1037,6 +1072,26 @@ class Snapshot:
             language=language, params=_params(parameters, kwparameters),
         )
 
+    def select(
+        self,
+        query: str,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: SelectLanguage | None = None,
+        max_fuel: float | None = None,
+        timeout: float | None = None,
+        **kwparameters: Any,
+    ) -> Result:
+        """Run a SPARQL ``SELECT`` or a Cypher query and return its
+        :class:`Result` — :meth:`query` for the queries whose result is a
+        table, typed as one. Anything else (``ASK``, ``CONSTRUCT``, JSON-LD)
+        raises :class:`InvalidRequestError` without running. Parameters,
+        ``max_fuel`` and ``timeout`` are as for :meth:`query`."""
+        return _execute(
+            self._run, query, max_fuel, timeout, False,
+            language=language, params=_params(parameters, kwparameters), select=True,
+        )
+
     def profile(
         self,
         query: Query,
@@ -1185,6 +1240,21 @@ class Transaction:
             query, parameters, language=language, max_fuel=max_fuel, timeout=timeout, **kwparameters
         )
 
+    def select(
+        self,
+        query: str,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: SelectLanguage | None = None,
+        max_fuel: float | None = None,
+        timeout: float | None = None,
+        **kwparameters: Any,
+    ) -> Result:
+        """Run a ``SELECT`` on the staged state; see :meth:`Snapshot.select`."""
+        return self._view().select(
+            query, parameters, language=language, max_fuel=max_fuel, timeout=timeout, **kwparameters
+        )
+
     def explain(
         self,
         query: Query,
@@ -1244,8 +1314,11 @@ def _execute(
     *,
     language: Language | None = None,
     params: dict[str, Any] | None = None,
+    select: bool = False,
 ) -> Any:
     kind = _query_language(query, language)
+    if select:
+        _require_table(query, kind)
     if kind == "cypher":
         if stats or max_fuel is not None:
             raise InvalidRequestError("max_fuel and profile() are not yet supported for Cypher")
@@ -1261,6 +1334,22 @@ def _execute(
     if sparql:
         result = _sparql_result(result)
     return (result, measured) if stats else result
+
+
+def _require_table(query: Any, kind: str) -> None:
+    """Refuse, before running it, a query whose result is not a table."""
+    if kind == "jsonld":
+        raise InvalidRequestError(
+            "select() takes a SPARQL SELECT or a Cypher query; run a JSON-LD query with query()"
+        )
+    if kind == "sparql":
+        form = _fluree.sparql_form(query)
+        if form == "update":
+            raise InvalidRequestError("this is a SPARQL update; run it with update()")
+        if form not in (None, "select"):
+            raise InvalidRequestError(
+                f"select() takes a SPARQL SELECT, not {form.upper()}; run it with query()"
+            )
 
 
 def _profile(

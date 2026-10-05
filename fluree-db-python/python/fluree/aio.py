@@ -46,6 +46,7 @@ from fluree._connection import (
     QueryProfile,
     RebaseStrategy,
     RevertStrategy,
+    SelectLanguage,
 )
 from fluree._params import _params
 from fluree._results import Record, Result
@@ -163,6 +164,24 @@ class Connection:
         return await _query(
             lambda c: _sync._execute(
                 self._sync._run, query, max_fuel, timeout, False, c, language=language, params=params
+            )
+        )
+
+    async def select(
+        self,
+        query: str,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: SelectLanguage | None = None,
+        max_fuel: float | None = None,
+        timeout: float | None = None,
+        **kwparameters: Any,
+    ) -> Result:
+        params = _params(parameters, kwparameters)
+        return await _query(
+            lambda c: _sync._execute(
+                self._sync._run, query, max_fuel, timeout, False, c,
+                language=language, params=params, select=True,
             )
         )
 
@@ -311,6 +330,24 @@ class Ledger:
         return await _query(
             lambda c: _sync._execute(
                 self._sync._run, query, max_fuel, timeout, False, c, language=language, params=params
+            )
+        )
+
+    async def select(
+        self,
+        query: str,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: SelectLanguage | None = None,
+        max_fuel: float | None = None,
+        timeout: float | None = None,
+        **kwparameters: Any,
+    ) -> Result:
+        params = _params(parameters, kwparameters)
+        return await _query(
+            lambda c: _sync._execute(
+                self._sync._run, query, max_fuel, timeout, False, c,
+                language=language, params=params, select=True,
             )
         )
 
@@ -507,6 +544,24 @@ class Snapshot:
             )
         )
 
+    async def select(
+        self,
+        query: str,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: SelectLanguage | None = None,
+        max_fuel: float | None = None,
+        timeout: float | None = None,
+        **kwparameters: Any,
+    ) -> Result:
+        params = _params(parameters, kwparameters)
+        return await _query(
+            lambda c: _sync._execute(
+                self._sync._run, query, max_fuel, timeout, False, c,
+                language=language, params=params, select=True,
+            )
+        )
+
     async def profile(
         self,
         query: Query,
@@ -621,13 +676,37 @@ class Transaction:
         timeout: float | None = None,
         **kwparameters: Any,
     ) -> Any:
+        return await self._query(query, parameters, language, max_fuel, timeout, kwparameters, False)
+
+    async def select(
+        self,
+        query: str,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: SelectLanguage | None = None,
+        max_fuel: float | None = None,
+        timeout: float | None = None,
+        **kwparameters: Any,
+    ) -> Result:
+        return await self._query(query, parameters, language, max_fuel, timeout, kwparameters, True)
+
+    async def _query(
+        self,
+        query: Query,
+        parameters: Mapping[str, Any] | None,
+        language: Language | None,
+        max_fuel: float | None,
+        timeout: float | None,
+        kwparameters: dict[str, Any],
+        select: bool,
+    ) -> Any:
         params = _params(parameters, kwparameters)
         canceller = _fluree.Canceller()
         try:
             return await self._call(
                 lambda: _sync._execute(
                     self._sync._view()._run, query, max_fuel, timeout, False, canceller,
-                    language=language, params=params,
+                    language=language, params=params, select=select,
                 )
             )
         except asyncio.CancelledError:

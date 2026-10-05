@@ -332,6 +332,21 @@ impl SparqlResult {
     }
 }
 
+/// The form of a SPARQL request: `"select"`, `"ask"`, `"construct"`,
+/// `"describe"` or `"update"`; `None` when it does not parse, for running it
+/// to report why.
+#[pyfunction]
+pub(crate) fn sparql_form(sparql: &str) -> Option<&'static str> {
+    let body = fluree_db_sparql::parse_sparql(sparql).ast?.body;
+    Some(match body {
+        QueryBody::Select(_) => "select",
+        QueryBody::Ask(_) => "ask",
+        QueryBody::Construct(_) => "construct",
+        QueryBody::Describe(_) => "describe",
+        QueryBody::Update(_) => "update",
+    })
+}
+
 /// The SELECT columns a SPARQL query projects, in order; `None` for `SELECT *`
 /// and for other query forms.
 pub(crate) fn sparql_columns(sparql: &str) -> Option<Vec<String>> {

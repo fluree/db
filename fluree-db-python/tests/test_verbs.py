@@ -137,3 +137,49 @@ def test_explain_cypher(ledger):
 )
 def test_language_detection(text, write, language):
     assert _text_language(text, write=write) == language
+
+
+@pytest.mark.parametrize("query", [SPARQL_NAMES, CYPHER_NAMES], ids=["sparql", "cypher"])
+def test_select_returns_the_table_query_does(ledger, query):
+    assert ledger.select(query).values() == ledger.query(query).values()
+    assert ledger.snapshot().select(query).keys() == ["name", "age"]
+    with ledger.transaction() as txn:
+        txn.insert({"@context": {"ex": EX}, "@id": "ex:eve", "ex:name": "Eve"})
+        txn.update('CREATE (:Person {name: "Fay"})')
+        assert "Eve" in txn.select(SPARQL_NAMES).value("name")
+        assert "Fay" in txn.select(CYPHER_NAMES).value("name")
+        txn.rollback()
+
+
+def test_select_takes_parameters_and_limits(ledger):
+    by_name = f"PREFIX ex: <{EX}> SELECT ?age WHERE {{ ?s ex:name $name ; ex:age ?age }}"
+    assert ledger.select(by_name, name="Alice").single().age == 30
+    assert ledger.select("MATCH (p:Person {name: $n}) RETURN p.age AS age", n="Carol").value("age") == [40]
+    with pytest.raises(fluree.ResourceLimitError):
+        ledger.select(SPARQL_NAMES, max_fuel=1)
+    from_people = SPARQL_NAMES.replace(" WHERE", " FROM <people> WHERE")
+    assert ledger._connection.select(from_people).value("name") == ["Alice", "Bob"]
+
+
+def test_select_refuses_what_is_not_a_table_without_running_it(ledger):
+    prefix = f"PREFIX ex: <{EX}> "
+    for query, message in (
+        (prefix + "ASK { ?s ex:name ?n }", "not ASK"),
+        (prefix + "CONSTRUCT { ?s ex:name ?n } WHERE { ?s ex:name ?n }", "not CONSTRUCT"),
+        (prefix + "DESCRIBE ex:alice", "not DESCRIBE"),
+        ({"select": ["?n"], "where": {"@id": "?s", EX + "name": "?n"}}, "JSON-LD"),
+        (prefix + 'INSERT DATA { ex:zed ex:name "Zed" }', "update()"),
+    ):
+        with pytest.raises(InvalidRequestError, match=message):
+            ledger.select(query)  # type: ignore[arg-type]
+    assert ledger.query(prefix + "ASK { ex:zed ?p ?o }") is False
+    # A query that does not parse runs, to report why.
+    with pytest.raises(InvalidRequestError, match="SPARQL error"):
+        ledger.select("SELECT ?x WHERE { ?x")
+
+
+def test_select_is_typed_as_a_result():
+    import typing
+
+    for handle in (fluree.Connection, fluree.Ledger, fluree.Snapshot, fluree.Transaction):
+        assert typing.get_type_hints(handle.select)["return"] is Result

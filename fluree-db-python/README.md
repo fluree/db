@@ -19,13 +19,13 @@ with fluree.connect("./data") as conn:          # or fluree.connect(":memory:")
         "@id": "ex:bob", "ex:name": "Bob", "ex:age": 37,
     })
 
-    rows = people.query("""
+    rows = people.select("""
         PREFIX ex: <http://example.org/>
         SELECT ?name ?age WHERE { ?s ex:name ?name ; ex:age ?age } ORDER BY ?name
     """)
     for name, age in rows:
         print(name, age)              # Alice 42, then Bob 37 — native str and int
-    df = rows.to_pandas()
+    df = rows.to_pandas()             # with pandas installed: pip install "fluree[pandas]"
 
     # Every past state stays queryable.
     before_bob = people.at(t=commit.t - 1)
@@ -105,6 +105,9 @@ frozen view that every query sees identically.
   Python type stays a `fluree.Literal`.
 - SPARQL `ASK` returns a `bool`, `CONSTRUCT` a JSON-LD document; JSON-LD
   queries (a `dict`) return their JSON result as Python objects.
+- `select()` is `query()` for tables: it takes a SPARQL `SELECT` or a Cypher
+  query and is typed to return a `Result`, so editors and type checkers know
+  what comes back. Any other query is refused before it runs.
 - `ledger.stream(query)` reads a large `SELECT` row by row in flat memory.
   Open it with `with ledger.stream(query) as rows:` when the loop may stop
   early: leaving the block stops the query.

@@ -210,3 +210,19 @@ def test_cancelling_a_task_mid_write_rolls_its_transaction_back(how):
             assert await ledger.log() == []
 
     run(main())
+
+
+def test_select():
+    async def main():
+        async with fluree.aio.connect(":memory:") as conn:
+            people = await conn.create("people")
+            await people.insert(person("Alice"))
+            assert (await people.select(NAMES)).value("name") == ["Alice"]
+            assert (await (await people.snapshot()).select(NAMES)).single().name == "Alice"
+            async with people.transaction() as txn:
+                await txn.insert(person("Bob"))
+                assert (await txn.select(NAMES)).value("name") == ["Alice", "Bob"]
+            with pytest.raises(fluree.InvalidRequestError, match="not ASK"):
+                await people.select(f"PREFIX ex: <{EX}> ASK {{ ?s ex:name ?n }}")
+
+    run(main())
