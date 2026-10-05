@@ -64,7 +64,8 @@ pub use projection::{
     Projection, Root,
 };
 pub use query::{
-    ConstructTemplate, Query, QueryOutput, Restriction, TemplateReification, UngroupedProjection,
+    ConstructTemplate, PostValues, Query, QueryOutput, Restriction, TemplateReification,
+    UngroupedProjection,
 };
 pub use reasoning::{ReasoningConfig, ReasoningModes};
 pub use triple::{Ref, Term, TriplePattern};

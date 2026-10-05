@@ -5,7 +5,7 @@
 //! and GROUP BY. Variables without downstream dependencies are dead and can
 //! be projected away early.
 
-use crate::ir::{AggregateFn, Expression, Grouping, Pattern, Query};
+use crate::ir::{AggregateFn, Expression, Grouping, Query};
 use crate::var_registry::VarId;
 use std::collections::HashSet;
 
@@ -159,9 +159,16 @@ pub fn compute_variable_deps(query: &Query) -> Option<VariableDeps> {
 
     // Post-query VALUES joins its rows against the WHERE output directly
     // above the WHERE tree, so its vars must survive WHERE-level trimming
-    // (otherwise the join degenerates to a cross product).
-    if let Some(Pattern::Values { vars, .. }) = &query.post_values {
-        deps.extend(vars.iter().copied());
+    // (otherwise the join degenerates to a cross product). The binds after the
+    // join run before grouping: trace them backward first, so the WHERE keeps
+    // their inputs.
+    if let Some(post_values) = &query.post_values {
+        for (var, expr) in post_values.then.iter().rev() {
+            if deps.remove(var) {
+                deps.extend(expr.referenced_vars());
+            }
+        }
+        deps.extend(post_values.vars.iter().copied());
     }
 
     // deps now contains the full set of WHERE-produced variables needed downstream.

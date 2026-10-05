@@ -604,10 +604,7 @@ mod tests {
                 18 => q.patterns.push(q.patterns[0].clone()),
                 19 => q.output = QueryOutput::wildcard(),
                 20 => {
-                    q.post_values = Some(Pattern::Values {
-                        vars: vec![VarId(0)],
-                        rows: vec![],
-                    });
+                    q.post_values = Some(crate::ir::PostValues::new(vec![VarId(0)], vec![]));
                 }
                 21 => q.grouping = sq(&mut q, 0).grouping.clone(),
                 22 => sq(&mut q, 1).substitute_var(VarId(1), VarId(12)),

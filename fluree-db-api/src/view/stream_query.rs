@@ -640,7 +640,7 @@ fn ensure_streamable(query: &mut fluree_db_query::ir::Query, vars: &VarRegistry)
                 query
                     .post_values
                     .iter()
-                    .flat_map(fluree_db_query::ir::Pattern::produced_vars),
+                    .flat_map(fluree_db_query::ir::PostValues::produced_vars),
             )
             .collect();
     let where_list: Vec<fluree_db_query::VarId> = where_vars.iter().copied().collect();

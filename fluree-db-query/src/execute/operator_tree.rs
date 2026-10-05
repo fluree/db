@@ -3317,12 +3317,20 @@ fn build_operator_tree_inner(
     // Apply post-query VALUES clause after the WHERE tree is fully built.
     // This is kept separate from `patterns` so the WHERE-clause planner cannot
     // reorder it relative to OPTIONAL/UNION (which would change semantics).
-    if let Some(Pattern::Values { vars, rows }) = &query.post_values {
+    if let Some(post_values) = &query.post_values {
         operator = Box::new(crate::values::ValuesOperator::new(
             operator,
-            vars.clone(),
-            rows.clone(),
+            post_values.vars.clone(),
+            post_values.rows.clone(),
         ));
+        // The level's generated binds read the VALUES variables: they run
+        // after the join, in order, as trailing WHERE binds would.
+        for (var, expr) in &post_values.then {
+            operator = Box::new(
+                crate::bind::BindOperator::new(operator, *var, expr.clone(), vec![])
+                    .with_planning(*planning),
+            );
+        }
     }
 
     // The solution-modifier tail (grouping → HAVING → post-binds → order-binds
@@ -3373,7 +3381,7 @@ pub(crate) fn bindable_sort_keys<'a>(
     grouping: Option<&Grouping>,
     order_binds: &[(VarId, Expression)],
     patterns: &[Pattern],
-    post_values: Option<&Pattern>,
+    post_values: Option<&crate::ir::PostValues>,
 ) -> std::borrow::Cow<'a, [SortSpec]> {
     use std::borrow::Cow;
     let staged = |v: VarId| {
@@ -3390,7 +3398,11 @@ pub(crate) fn bindable_sort_keys<'a>(
     }
     let produced: HashSet<VarId> = crate::ir::pattern::produced_vars_of(patterns)
         .into_iter()
-        .chain(post_values.into_iter().flat_map(Pattern::produced_vars))
+        .chain(
+            post_values
+                .into_iter()
+                .flat_map(crate::ir::PostValues::produced_vars),
+        )
         .collect();
     let bindable = |v: VarId| staged(v) || produced.contains(&v);
     if ordering.iter().all(|spec| bindable(spec.var)) {

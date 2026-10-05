@@ -779,6 +779,75 @@ async fn trailing_values_join_before_grouping() {
     assert_eq!(run(&fluree, &ledger, &body).await.row_count(), 3, "{body}");
 }
 
+/// e1 and e3 have `ex:n 1`, e2 has `ex:n 20`.
+async fn seed_numbers(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:e1", "ex:n": 1},
+            {"@id": "ex:e2", "ex:n": 20},
+            {"@id": "ex:e3", "ex:n": 1}
+        ]
+    });
+    fluree.insert(ledger0, &insert).await.expect("seed").ledger
+}
+
+/// The binds a level generates before grouping (an aggregate's input
+/// expression, a GROUP BY expression, a SELECT expression of a level that does
+/// not group) run after the trailing VALUES join, so they read its variables,
+/// at the top level as in a sub-SELECT (whose VALUES is spliced right after
+/// its WHERE). At the top level they used to run before the join and read the
+/// VALUES variables as unbound: `SUM(?n * ?v)` was 0, the SELECT expression
+/// unbound, and the GROUP BY expression made one unbound group.
+#[tokio::test]
+async fn generated_binds_read_trailing_values_at_both_levels() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_numbers(&fluree, "grouped-projection/values-binds:main").await;
+    const N: &str = "WHERE { ?e ex:n ?n }";
+    let both_levels = |select: &str, outer: &str, rest: &str| {
+        [
+            format!("SELECT {select} {N} {rest}"),
+            format!("SELECT {outer} WHERE {{ {{ SELECT {select} {N} {rest} }} }}"),
+        ]
+    };
+    for body in both_levels("(SUM(?n * ?v) AS ?s)", "?s", "VALUES ?v { 2 }") {
+        assert_rows(&fluree, &ledger, &body, json!([{"s": "44"}]), json!([[44]])).await;
+    }
+    // Two VALUES rows: each solution pairs with each, before the aggregate.
+    for body in both_levels("(SUM(?n * ?v) AS ?s)", "?s", "VALUES ?v { 1 2 }") {
+        assert_rows(&fluree, &ledger, &body, json!([{"s": "66"}]), json!([[66]])).await;
+    }
+    for body in both_levels("?e (?n * ?v AS ?p)", "?e ?p", "VALUES ?v { 2 }") {
+        assert_rows(
+            &fluree,
+            &ledger,
+            &body,
+            json!([
+                {"e": "http://example.org/e1", "p": "2"},
+                {"e": "http://example.org/e2", "p": "40"},
+                {"e": "http://example.org/e3", "p": "2"}
+            ]),
+            json!([["ex:e1", 2], ["ex:e2", 40], ["ex:e3", 2]]),
+        )
+        .await;
+    }
+    for body in both_levels(
+        "?k (COUNT(?e) AS ?c)",
+        "?k ?c",
+        "GROUP BY (?n * ?v AS ?k) VALUES ?v { 2 }",
+    ) {
+        assert_rows(
+            &fluree,
+            &ledger,
+            &body,
+            json!([{"k": "2", "c": "2"}, {"k": "40", "c": "1"}]),
+            json!([[2, 2], [40, 1]]),
+        )
+        .await;
+    }
+}
+
 /// The sub-SELECT twin: its trailing VALUES also joins before grouping, and its
 /// HAVING also reads the VALUES variables the WHERE does not bind as unbound,
 /// grouped or not. The grouped HAVING used to read them as a SAMPLE of the

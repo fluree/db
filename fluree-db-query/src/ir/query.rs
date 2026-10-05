@@ -367,6 +367,76 @@ impl QueryOutput {
     }
 }
 
+/// A query's trailing `VALUES` clause (SPARQL's `ValuesClause` after the
+/// solution modifiers) and the binds the query level generated, which read it.
+///
+/// The VALUES joins after the WHERE operator tree and before grouping (a
+/// deliberate deviation from SPARQL 1.1 §18.2.4.3, which joins it after HAVING:
+/// here it restricts the aggregates' input). `then` holds the level's generated
+/// binds (GROUP BY expressions, aggregate inputs, and SELECT expressions placed
+/// before grouping), evaluated in order after the join, so they read its
+/// variables, as a sub-SELECT's binds do (its VALUES is spliced right after its
+/// WHERE). Kept out of `patterns` so the WHERE planner cannot reorder the join
+/// relative to OPTIONAL/UNION.
+#[derive(Debug, Clone)]
+pub struct PostValues {
+    /// The VALUES block's variables, in column order.
+    pub vars: Vec<VarId>,
+    /// Its rows, one binding per variable (`Binding::Unbound` for UNDEF).
+    pub rows: Vec<Vec<crate::binding::Binding>>,
+    /// Binds evaluated in order after the join.
+    pub then: Vec<(VarId, super::Expression)>,
+}
+
+impl PostValues {
+    /// A VALUES block with no binds after it.
+    pub fn new(vars: Vec<VarId>, rows: Vec<Vec<crate::binding::Binding>>) -> Self {
+        Self {
+            vars,
+            rows,
+            then: Vec::new(),
+        }
+    }
+
+    /// The variables bound once the join and its binds have run.
+    pub fn produced_vars(&self) -> Vec<VarId> {
+        self.vars
+            .iter()
+            .copied()
+            .chain(self.then.iter().map(|(var, _)| *var))
+            .collect()
+    }
+
+    /// Rename `old` to `new` in the VALUES columns and the binds.
+    pub fn substitute_var(&mut self, old: VarId, new: VarId) {
+        for var in &mut self.vars {
+            if *var == old {
+                *var = new;
+            }
+        }
+        for (var, expr) in &mut self.then {
+            if *var == old {
+                *var = new;
+            }
+            expr.substitute_var(old, new);
+        }
+    }
+
+    /// The clause as WHERE patterns, in evaluation order: the VALUES block,
+    /// then its binds.
+    pub fn to_patterns(&self) -> Vec<Pattern> {
+        std::iter::once(Pattern::Values {
+            vars: self.vars.clone(),
+            rows: self.rows.clone(),
+        })
+        .chain(self.then.iter().map(|(var, expr)| Pattern::Bind {
+            var: *var,
+            expr: expr.clone(),
+        }))
+        .collect()
+    }
+}
+
 /// Resolved query ready for execution.
 ///
 /// This is the canonical query IR — produced by parsing/lowering, consumed
@@ -401,12 +471,9 @@ pub struct Query {
     pub offset: Option<usize>,
     /// Reasoning configuration (RDFS/OWL/datalog modes, schema bundle).
     pub reasoning: ReasoningConfig,
-    /// Post-query VALUES clause (SPARQL `ValuesClause` after `SolutionModifier`).
-    ///
-    /// Stored separately from `patterns` so the WHERE-clause planner does not
-    /// reorder it relative to OPTIONAL/UNION/etc.  Applied as a final inner-join
-    /// constraint after the WHERE operator tree is fully built.
-    pub post_values: Option<Pattern>,
+    /// The trailing VALUES clause and the binds after it ([`PostValues`]),
+    /// applied after the WHERE operator tree is fully built.
+    pub post_values: Option<PostValues>,
     /// When true, scan operators bypass the **variable-predicate**
     /// filter that hides Fluree-system predicates (`f:reifies*` in
     /// every graph; the broader `f:` namespace in the default graph).

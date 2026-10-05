@@ -495,17 +495,14 @@ mod tests {
             order_binds: Vec::new(),
             limit: None,
             offset: None,
-            post_values: Some(Pattern::Values {
-                vars: vec![y],
-                rows: Vec::new(),
-            }),
+            post_values: Some(crate::ir::PostValues::new(vec![y], Vec::new())),
         };
         fold_equijoin_filters(&mut query, Some(&stats_with_feature_ref_only(true)));
 
         assert_eq!(query.patterns.len(), 2);
         match &query.post_values {
-            Some(Pattern::Values { vars, .. }) => assert_eq!(vars, &vec![x]),
-            other => panic!("expected post-query VALUES, got {other:?}"),
+            Some(post_values) => assert_eq!(post_values.vars, vec![x]),
+            None => panic!("expected post-query VALUES"),
         }
     }
 

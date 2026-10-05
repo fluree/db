@@ -35,28 +35,24 @@ use super::{LowerError, LoweringContext, Result};
 fn pre_group_vars(
     where_patterns: &[Pattern],
     trailing_values: Option<&Pattern>,
-    pre_group_binds: &[Pattern],
+    pre_group_binds: &[(VarId, Expression)],
 ) -> HashSet<VarId> {
     let mut vars = produced_vars_of(where_patterns);
-    vars.extend(
-        trailing_values
-            .into_iter()
-            .chain(pre_group_binds)
-            .flat_map(Pattern::produced_vars),
-    );
+    vars.extend(trailing_values.into_iter().flat_map(Pattern::produced_vars));
+    vars.extend(pre_group_binds.iter().map(|(var, _)| *var));
     vars
 }
 
 /// The SELECT expressions of one query level, placed.
 pub(super) struct SelectExtends {
-    /// WHERE `BIND`s, appended to the level's patterns: every SELECT
-    /// expression of a level that does not group, and a grouping level's
-    /// expression whose alias is itself a group key.
-    pub pre: Vec<Pattern>,
+    /// Binds before grouping, after the level's WHERE and trailing VALUES:
+    /// every SELECT expression of a level that does not group, and a grouping
+    /// level's expression whose alias is itself a group key.
+    pub pre: Vec<(VarId, Expression)>,
     /// Per-group `Extend`s (SPARQL 1.1 §18.2.4.4), in SELECT order: every
     /// other SELECT expression of a grouping level, compound aggregate items
-    /// included. They run after HAVING, so HAVING cannot see them
-    /// (§18.2.4.2).
+    /// included. The ones HAVING reads run before it, the rest after it
+    /// (`Grouping::binds_before_having`).
     pub extends: Vec<(VarId, Expression)>,
 }
 
@@ -98,9 +94,10 @@ pub(super) struct LoweredModifiers {
     /// HAVING expression (post-lift — aggregate calls have been hoisted into
     /// `aggregates` with synthetic output variables, and this references them).
     pub having: Option<Expression>,
-    /// Pre-GROUP-BY BIND patterns for expression-based GROUP BY conditions.
-    /// These must be injected into the WHERE pattern list before query building.
-    pub pre_group_binds: Vec<Pattern>,
+    /// Binds before grouping: expression GROUP BY conditions and aggregate
+    /// inputs, including those of aggregates hoisted from SELECT, HAVING and
+    /// ORDER BY expressions.
+    pub pre_group_binds: Vec<(VarId, Expression)>,
     /// Compound-aggregate SELECT items (e.g. `((MAX(?u) - MIN(?u)) AS
     /// ?spread)`), keyed by alias. Each inner aggregate has been hoisted into
     /// `aggregates`, and the expression reads those synthetic output vars.
@@ -118,9 +115,9 @@ impl LoweredModifiers {
 }
 
 /// One SELECT level (top level or sub-SELECT), lowered past its WHERE: its
-/// solution modifiers, grouping phase and SELECT-expression placement. Every
-/// WHERE-side addition (SELECT binds of an ungrouped level, GROUP BY and
-/// aggregate-input binds, a HAVING-as-Filter) is already on its patterns.
+/// solution modifiers, grouping phase and SELECT-expression placement. A
+/// HAVING-as-Filter is already on its patterns; the binds it generated are in
+/// `binds`, for the caller to place after the level's trailing VALUES.
 pub(super) struct LoweredSelectLevel {
     /// LIMIT, OFFSET, ORDER BY — lifted onto the query / sub-query.
     pub base: BaseModifiers,
@@ -132,6 +129,19 @@ pub(super) struct LoweredSelectLevel {
     /// under implicit grouping). `None` when the level has no `*` or does
     /// not group.
     pub star_projection: Option<Vec<VarId>>,
+    /// The binds the level generated, evaluated in order after its WHERE and
+    /// its trailing VALUES, before grouping: SELECT expressions placed before
+    /// grouping, then expression GROUP BY conditions and aggregate inputs.
+    pub binds: Vec<(VarId, Expression)>,
+}
+
+impl LoweredSelectLevel {
+    /// The level's generated binds as WHERE patterns.
+    pub fn bind_patterns(binds: Vec<(VarId, Expression)>) -> impl Iterator<Item = Pattern> {
+        binds
+            .into_iter()
+            .map(|(var, expr)| Pattern::Bind { var, expr })
+    }
 }
 
 impl<E: IriEncoder> LoweringContext<'_, E> {
@@ -186,13 +196,14 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     /// §18.2.4 gives the query level: grouping and aggregates, HAVING, then
     /// the SELECT expressions. Shared by the top level and sub-SELECTs.
     ///
-    /// `patterns` are the level's WHERE patterns; the WHERE-side additions are
+    /// `patterns` are the level's WHERE patterns; a HAVING-as-Filter is
     /// appended to them. `trailing_values` is the level's trailing VALUES
     /// clause, which the caller joins right after the WHERE, before grouping,
     /// where it restricts the aggregates' input (a deliberate deviation from
-    /// §18.2.4.3, which joins it after HAVING). Its variables are therefore
-    /// bound before grouping, except to HAVING: HAVING reads the ones the
-    /// WHERE does not bind as unbound, as it would after HAVING.
+    /// §18.2.4.3, which joins it after HAVING), and then places the returned
+    /// `binds`. Its variables are therefore bound before grouping, except to
+    /// HAVING: HAVING reads the ones the WHERE does not bind as unbound, as it
+    /// would after HAVING.
     pub(super) fn lower_select_level(
         &mut self,
         select: &SelectClause,
@@ -231,8 +242,8 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 }));
             }
         }
-        patterns.extend(extends.pre);
-        patterns.extend(std::mem::take(&mut lowered.pre_group_binds));
+        let mut binds = extends.pre;
+        binds.append(&mut lowered.pre_group_binds);
 
         let star_projection = (matches!(select.variables, SelectVariables::Star)
             && lowered.groups())
@@ -252,6 +263,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             distinct: lowered.distinct,
             grouping,
             star_projection,
+            binds,
         })
     }
 
@@ -332,7 +344,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         for ((var, expr, _), placement) in computed.into_iter().zip(placements) {
             match placement {
                 SelectExprPlacement::PostGroup => extends.push((var, expr)),
-                SelectExprPlacement::PreGroup => pre.push(Pattern::Bind { var, expr }),
+                SelectExprPlacement::PreGroup => pre.push((var, expr)),
             }
         }
         Ok(SelectExtends { pre, extends })
@@ -372,11 +384,10 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             let select_expr_aliases = self.select_expr_alias_map(select);
             let mut group_vars = Vec::with_capacity(group_by_clause.conditions.len());
             for cond in &group_by_clause.conditions {
-                let (var_id, bind_pattern) =
-                    self.lower_group_condition(cond, &select_expr_aliases)?;
+                let (var_id, bind) = self.lower_group_condition(cond, &select_expr_aliases)?;
                 group_vars.push(var_id);
-                if let Some(pattern) = bind_pattern {
-                    pre_group_binds.push(pattern);
+                if let Some(expr) = bind {
+                    pre_group_binds.push((var_id, expr));
                 }
             }
             group_by = group_vars;
@@ -410,7 +421,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         // are placed, in SELECT order, by `lower_select_extends`.
         let mut compound_select_exprs: HashMap<VarId, Expression> = HashMap::new();
         if !compound_aggregate_select_items.is_empty() {
-            let mut select_pre_binds: Vec<Pattern> = Vec::new();
+            let mut select_pre_binds = Vec::new();
             for (_, ast_expr) in &compound_aggregate_select_items {
                 self.collect_inline_aggregates(
                     ast_expr,
@@ -430,7 +441,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
         // HAVING (may reference aggregate expressions)
         if let Some(ref having_clause) = modifiers.having {
-            let mut having_pre_binds: Vec<Pattern> = Vec::new();
+            let mut having_pre_binds = Vec::new();
             for cond in &having_clause.conditions {
                 self.collect_inline_aggregates(
                     cond,
@@ -454,7 +465,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         // order bind is applied by the operator tree's post-grouping stage.
         if !base.deferred_order_exprs.is_empty() {
             let deferred = std::mem::take(&mut base.deferred_order_exprs);
-            let mut order_pre_binds: Vec<Pattern> = Vec::new();
+            let mut order_pre_binds = Vec::new();
             for (_, ast_expr) in &deferred {
                 self.collect_inline_aggregates(
                     ast_expr,
@@ -684,7 +695,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
     /// Lower a GROUP BY condition to a variable ID and optional pre-GROUP-BY BIND.
     ///
-    /// Returns `(var_id, Option<Pattern::Bind>)`:
+    /// Returns `(var_id, Option<expr>)`, where `expr` binds `var_id`:
     /// - `GROUP BY ?x`              → variable reference, no BIND needed
     /// - `GROUP BY (?x)`            → parenthesized variable, unwrapped to plain variable
     /// - `GROUP BY (expr AS ?alias)` → desugared to BIND(expr AS ?alias) + GROUP BY ?alias
@@ -696,7 +707,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         &mut self,
         cond: &GroupCondition,
         select_expr_aliases: &HashMap<String, VarId>,
-    ) -> Result<(VarId, Option<Pattern>)> {
+    ) -> Result<(VarId, Option<Expression>)> {
         match cond {
             GroupCondition::Var(var) => Ok((self.register_var(var), None)),
             GroupCondition::Expr { expr, alias, .. } => {
@@ -709,13 +720,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                         if let Some(alias_var) = alias {
                             let lowered = self.lower_expression(expr)?;
                             let var_id = self.register_var(alias_var);
-                            return Ok((
-                                var_id,
-                                Some(Pattern::Bind {
-                                    var: var_id,
-                                    expr: lowered,
-                                }),
-                            ));
+                            return Ok((var_id, Some(lowered)));
                         }
 
                         // Unaliased `GROUP BY (expr)`: if the SELECT projects the
@@ -733,13 +738,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                         let lowered = self.lower_expression(expr)?;
                         let name = format!("?__group_expr_{}", self.vars.len());
                         let var_id = self.vars.get_or_insert(&name);
-                        Ok((
-                            var_id,
-                            Some(Pattern::Bind {
-                                var: var_id,
-                                expr: lowered,
-                            }),
-                        ))
+                        Ok((var_id, Some(lowered)))
                     }
                 }
             }
@@ -873,6 +872,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             }
         };
         patterns.splice(where_len..where_len, trailing_values);
+        patterns.extend(LoweredSelectLevel::bind_patterns(level.binds));
 
         // `SELECT *` of a grouping level projects its keys; implicit grouping
         // has none, so the sub-SELECT exports nothing and keeps its row count.

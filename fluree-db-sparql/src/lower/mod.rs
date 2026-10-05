@@ -62,7 +62,7 @@ pub use error::{LowerError, Result};
 use crate::ast::query::{QueryBody, SelectVariables, SparqlAst};
 
 use fluree_db_query::ir::Pattern;
-use fluree_db_query::ir::{Query, QueryOutput, ReasoningConfig};
+use fluree_db_query::ir::{PostValues, Query, QueryOutput, ReasoningConfig};
 
 use self::select::BaseModifiers;
 use fluree_db_query::parse::encode::IriEncoder;
@@ -518,8 +518,9 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
 
                 // Lower post-query VALUES clause.  Stored in `post_values` (not
                 // in `patterns`) so the WHERE-clause planner cannot reorder it
-                // relative to OPTIONAL/UNION.  Applied after the WHERE tree.
-                let post_values = if let Some(ref values_pattern) = select_query.values {
+                // relative to OPTIONAL/UNION.  Applied after the WHERE tree,
+                // followed by the binds this level generates.
+                let values = if let Some(ref values_pattern) = select_query.values {
                     let mut values_ir = self.lower_graph_pattern(values_pattern)?;
                     // lower_graph_pattern returns a Vec; post-query VALUES is always exactly one Pattern::Values.
                     if values_ir.len() == 1 && matches!(values_ir[0], Pattern::Values { .. }) {
@@ -546,8 +547,22 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     &select_query.select,
                     &select_query.modifiers,
                     &mut patterns,
-                    post_values.as_ref(),
+                    values.as_ref(),
                 )?;
+                // The generated binds run after the trailing VALUES, so they
+                // read its variables (as in a sub-SELECT); without one, they
+                // end the WHERE.
+                let post_values = match values {
+                    Some(Pattern::Values { vars, rows }) => Some(PostValues {
+                        vars,
+                        rows,
+                        then: level.binds,
+                    }),
+                    _ => {
+                        patterns.extend(select::LoweredSelectLevel::bind_patterns(level.binds));
+                        None
+                    }
+                };
                 let star_projection = level.star_projection;
                 let grouping = level.grouping;
                 let BaseModifiers {

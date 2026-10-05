@@ -7,7 +7,6 @@
 use crate::ast::expr::{AggregateFunction, Expression};
 use crate::ast::query::{SelectClause, SelectVariable, SelectVariables};
 
-use fluree_db_query::ir::Pattern;
 use fluree_db_query::ir::{AggregateFn, AggregateSpec, InputSemantics};
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::VarId;
@@ -119,7 +118,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     fn lower_aggregate_input_var(
         &mut self,
         expr: &Option<Box<Expression>>,
-        pre_binds: &mut Vec<Pattern>,
+        pre_binds: &mut Vec<(VarId, fluree_db_query::ir::Expression)>,
     ) -> Result<Option<VarId>> {
         match expr {
             None => Ok(None),
@@ -135,10 +134,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     let var_name = format!("?__agg_expr_{}", self.agg_counter);
                     self.agg_counter += 1;
                     let var_id = self.vars.get_or_insert(&var_name);
-                    pre_binds.push(Pattern::Bind {
-                        var: var_id,
-                        expr: lowered,
-                    });
+                    pre_binds.push((var_id, lowered));
                     self.agg_expr_binds.insert(key, var_id);
                     Ok(Some(var_id))
                 }
@@ -202,7 +198,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         &mut self,
         agg: &Expression,
         output_var: VarId,
-        pre_binds: &mut Vec<Pattern>,
+        pre_binds: &mut Vec<(VarId, fluree_db_query::ir::Expression)>,
     ) -> Result<AggregateSpec> {
         let Expression::Aggregate {
             function,
@@ -321,7 +317,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         expr: &Expression,
         aliases: &mut HashMap<String, VarId>,
         aggregates: &mut Vec<AggregateSpec>,
-        pre_binds: &mut Vec<Pattern>,
+        pre_binds: &mut Vec<(VarId, fluree_db_query::ir::Expression)>,
     ) -> Result<()> {
         match expr.unwrap_bracketed() {
             agg @ Expression::Aggregate { .. } => {
@@ -386,9 +382,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     pub(super) fn extract_aggregates(
         &mut self,
         select: &SelectClause,
-    ) -> Result<(Vec<AggregateSpec>, Vec<Pattern>)> {
+    ) -> Result<(
+        Vec<AggregateSpec>,
+        Vec<(VarId, fluree_db_query::ir::Expression)>,
+    )> {
         let mut aggregates = Vec::new();
-        let mut pre_binds: Vec<Pattern> = Vec::new();
+        let mut pre_binds = Vec::new();
 
         if let SelectVariables::Explicit(vars) = &select.variables {
             for var in vars {

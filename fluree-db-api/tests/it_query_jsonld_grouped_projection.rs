@@ -548,6 +548,56 @@ async fn jsonld_order_by_a_variable_nothing_binds_orders_nothing() {
     assert_eq!(found, json!([["Net", 3], ["Local", 2], ["Remote", 1]]));
 }
 
+/// The JSON-LD twin of `generated_binds_read_trailing_values_at_both_levels`:
+/// a top-level `values` seeds the WHERE, so a select expression reads its
+/// variables, and so does an aggregate over a `bind` of them (JSON-LD has no
+/// aggregate over an expression, and `groupBy` takes variables only).
+#[tokio::test]
+async fn jsonld_values_reach_generated_binds() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "jsonld-grouped/values-binds:main");
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@graph": [
+                    {"@id": "ex:e1", "ex:n": 1},
+                    {"@id": "ex:e2", "ex:n": 20},
+                    {"@id": "ex:e3", "ex:n": 1}
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let ctx = json!({"ex": "http://example.org/"});
+    let run = |select: JsonValue| {
+        let (fluree, ledger, ctx) = (&fluree, &ledger, &ctx);
+        async move {
+            let query = json!({
+                "@context": ctx,
+                "select": select,
+                "where": [{"@id": "?e", "ex:n": "?n"}, ["bind", "?x", "(* ?n ?v)"]],
+                "values": ["?v", [2]]
+            });
+            support::query_jsonld(fluree, ledger, &query)
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{query}"))
+                .to_jsonld(&ledger.snapshot)
+                .expect("to_jsonld")
+        }
+    };
+    assert_eq!(
+        normalize_rows(&run(json!(["(as (sum ?x) ?s)"])).await),
+        normalize_rows(&json!([[44]]))
+    );
+    assert_eq!(
+        normalize_rows(&run(json!(["?e", "(as (* ?n ?v) ?p)"])).await),
+        normalize_rows(&json!([["ex:e1", 2], ["ex:e2", 40], ["ex:e3", 2]]))
+    );
+}
+
 /// `ask` had no grouping stage and dropped `groupBy` / `having`, answering
 /// `true` for a `having` that rejects every group. It now refuses them, like
 /// SPARQL ASK.
