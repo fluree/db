@@ -68,6 +68,10 @@ impl<H: StorageHooks> StorageRead for HookedStorage<H> {
         self.inner.permits_plaintext_cache()
     }
 
+    fn is_remote(&self) -> bool {
+        self.inner.is_remote()
+    }
+
     fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>> {
         self.inner.encryption_admin()
     }

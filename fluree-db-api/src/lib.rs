@@ -897,6 +897,10 @@ where
         self.commit.permits_plaintext_cache() && self.index.permits_plaintext_cache()
     }
 
+    fn is_remote(&self) -> bool {
+        self.commit.is_remote() || self.index.is_remote()
+    }
+
     /// Both tiers encrypted under the same key set rotate as one store.
     /// Otherwise there is no single key set to rotate to: `None`. In-repo
     /// builds encrypt above the tiers instead, where this is not consulted.
@@ -1143,6 +1147,14 @@ impl StorageRead for AddressIdentifierResolverStorage {
                 .identifier_map
                 .values()
                 .all(fluree_db_core::StorageRead::permits_plaintext_cache)
+    }
+
+    fn is_remote(&self) -> bool {
+        self.default.is_remote()
+            || self
+                .identifier_map
+                .values()
+                .any(fluree_db_core::StorageRead::is_remote)
     }
 
     /// The default storage's admin. Every write and every listing goes to

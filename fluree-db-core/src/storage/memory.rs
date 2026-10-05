@@ -26,6 +26,7 @@ pub const STORAGE_METHOD_MEMORY: &str = "memory";
 #[derive(Debug, Clone)]
 pub struct MemoryStorage {
     data: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    remote: bool,
 }
 
 impl Default for MemoryStorage {
@@ -39,6 +40,17 @@ impl MemoryStorage {
     pub fn new() -> Self {
         Self {
             data: Arc::new(RwLock::new(HashMap::new())),
+            remote: false,
+        }
+    }
+
+    /// A view of the same data that reports its reads as remote, for tests
+    /// and benchmarks of what only remote storage gets — the disk artifact
+    /// cache.
+    pub fn simulating_remote(&self) -> Self {
+        Self {
+            data: Arc::clone(&self.data),
+            remote: true,
         }
     }
 
@@ -73,6 +85,11 @@ impl StorageRead for MemoryStorage {
     /// Reads return exactly the bytes at rest.
     fn permits_plaintext_cache(&self) -> bool {
         true
+    }
+
+    /// Reads are served from memory, unless built by [`Self::simulating_remote`].
+    fn is_remote(&self) -> bool {
+        self.remote
     }
 
     fn encryption_admin(&self) -> Option<std::sync::Arc<dyn crate::EncryptionAdmin>> {
@@ -232,6 +249,11 @@ impl ContentStore for MemoryContentStore {
     /// Reads return exactly the bytes at rest.
     fn permits_plaintext_cache(&self) -> bool {
         true
+    }
+
+    /// Reads are served from memory.
+    fn is_remote(&self) -> bool {
+        false
     }
 
     async fn has(&self, id: &ContentId) -> Result<bool> {

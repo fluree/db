@@ -541,7 +541,7 @@ impl DictTreeReader {
             let Some(cache_dir) = disk_cache_dir else {
                 return Ok(None);
             };
-            if !cs.permits_plaintext_cache() {
+            if !crate::read::artifact_cache::uses_disk_cache(cs) {
                 return Ok(None);
             }
             let cache_path = cache_dir.join(cid.to_string());
@@ -882,6 +882,10 @@ mod tests {
             true
         }
 
+        fn is_remote(&self) -> bool {
+            false
+        }
+
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             Ok(self.paths.lock().contains_key(id))
         }
@@ -1048,6 +1052,10 @@ mod tests {
         }
         fn permits_plaintext_cache(&self) -> bool {
             self.permits_plaintext_cache
+        }
+
+        fn is_remote(&self) -> bool {
+            true
         }
     }
 

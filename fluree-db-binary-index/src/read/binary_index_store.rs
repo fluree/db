@@ -37,7 +37,7 @@ use crate::format::index_root::{IndexRoot, OTypeTableEntry};
 use crate::format::leaf::DecodedLeafDirV3;
 use crate::format::run_record::RunSortOrder;
 
-use super::artifact_cache::{fetch_cached_bytes, fetch_cached_bytes_cid};
+use super::artifact_cache::{fetch_cached_bytes, fetch_cached_bytes_cid, uses_disk_cache};
 use super::leaflet_cache::LeafletCache;
 
 const HOT_REMOTE_LEAF_PROMOTION_TOUCHES: usize = 2;
@@ -655,9 +655,10 @@ impl BinaryIndexStore {
     /// comparator the read path uses, so the warmed leaves are exactly those the
     /// scan reads. Only warms the disk cache — results are byte-identical.
     ///
-    /// Remote-only: no CAS, or leaves that resolve to a local path, are skipped
-    /// (a local read is already cheap). Bounded by the shared `budget`; per-leaf
-    /// failures are logged and ignored — the scan fetches them the old way.
+    /// Only for a store the disk cache serves (see `uses_disk_cache`); leaves
+    /// that resolve to a local path are skipped too (a local read is already
+    /// cheap). Bounded by the shared `budget`; per-leaf failures are logged
+    /// and ignored — the scan fetches them the old way.
     pub async fn prefetch_leaves_for_range(
         &self,
         g_id: GraphId,
@@ -672,6 +673,9 @@ impl BinaryIndexStore {
         let Some(cs) = self.cas.as_ref() else {
             return;
         };
+        if !uses_disk_cache(cs.as_ref()) {
+            return;
+        }
         let Some(branch) = self.branch_for_order(g_id, order) else {
             return;
         };
@@ -938,7 +942,7 @@ impl BinaryIndexStore {
         if let Some(cs) = self.cas.as_ref() {
             let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
             let mut local = cs.resolve_local_path(leaf_cid);
-            if local.is_none() && cs.permits_plaintext_cache() {
+            if local.is_none() && uses_disk_cache(cs.as_ref()) {
                 let promoted = self.cache_dir.join(leaf_cid.to_string());
                 if promoted.exists() {
                     local = Some(promoted);
@@ -1000,10 +1004,10 @@ impl BinaryIndexStore {
             }
         }
 
-        // Check cache. A store that decrypts on read gets no disk cache:
-        // nothing is written there, and nothing left there by an earlier run
-        // is consulted.
-        let persist = cs.permits_plaintext_cache();
+        // Check cache, for a store the cache serves at all. Any other store
+        // gets nothing written there, and nothing left there by an earlier
+        // run is consulted.
+        let persist = uses_disk_cache(cs.as_ref());
         let cache_path = self.cache_dir.join(leaf_cid.to_string());
         if persist {
             match std::fs::read(&cache_path) {
@@ -1130,8 +1134,8 @@ impl BinaryIndexStore {
 
         // Fast path 2: locally cached (remote-promoted) — same mmap path; a
         // missing cache file falls through to the range-read paths below.
-        // Skipped for a store that forbids a plaintext copy outside it.
-        if cs.permits_plaintext_cache() {
+        // Skipped for a store the cache does not serve.
+        if uses_disk_cache(cs.as_ref()) {
             let cache_path = self.cache_dir.join(leaf_cid.to_string());
             match self.open_mmapped_leaf(&cache_path, leaf_id, sidecar_cid, need_replay) {
                 Ok(handle) => return Ok(handle),
@@ -3336,9 +3340,9 @@ async fn build_dictionary_set(
 // ============================================================================
 
 /// Where a vector shard's bytes come from: its local CAS file when one
-/// exists, else the disk cache — which counts as present only when the store
-/// permits a plaintext copy outside it, so a stale shard left there by an
-/// earlier unencrypted run is fetched afresh rather than served.
+/// exists, else the disk cache — which counts as present only for a store the
+/// cache serves, so a stale shard left there by an earlier run is fetched
+/// afresh rather than served.
 fn vector_shard_source(
     cs: &dyn ContentStore,
     shard_cid: &ContentId,
@@ -3354,7 +3358,7 @@ fn vector_shard_source(
         };
     }
     let cache_path = cache_dir.join(format!("{shard_cid}.vas"));
-    let on_disk = cs.permits_plaintext_cache() && cache_path.exists();
+    let on_disk = uses_disk_cache(cs) && cache_path.exists();
     crate::arena::vector::ShardSource {
         cid_hash,
         cid: Some(shard_cid.clone()),
@@ -3590,8 +3594,8 @@ impl ContentStoreRangeFetcher {
             }
         }
 
-        // Check cache, unless the store forbids a plaintext copy outside it.
-        if self.cs.permits_plaintext_cache() {
+        // Check cache, for a store the cache serves.
+        if uses_disk_cache(self.cs.as_ref()) {
             let cache_path = self.cache_dir.join(id.to_string());
             if let Some(buf) = read_range_from_file(&cache_path, range.clone())? {
                 return Ok(buf);
@@ -3712,6 +3716,10 @@ pub(crate) mod tests {
 
         fn permits_plaintext_cache(&self) -> bool {
             self.permits_plaintext_cache
+        }
+
+        fn is_remote(&self) -> bool {
+            true
         }
     }
 
@@ -3858,6 +3866,10 @@ pub(crate) mod tests {
     impl ContentStore for FailNthContentStore {
         fn permits_plaintext_cache(&self) -> bool {
             self.inner.permits_plaintext_cache()
+        }
+
+        fn is_remote(&self) -> bool {
+            self.inner.is_remote()
         }
 
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
@@ -4578,6 +4590,10 @@ pub(crate) mod tests {
     impl ContentStore for LocalFileContentStore {
         fn permits_plaintext_cache(&self) -> bool {
             self.inner.permits_plaintext_cache()
+        }
+
+        fn is_remote(&self) -> bool {
+            false
         }
 
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {

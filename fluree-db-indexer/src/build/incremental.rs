@@ -90,8 +90,8 @@ impl Phase2FetchStats {
 }
 
 /// Seed the read-through artifact cache with bytes this build just uploaded,
-/// so the first reader does not re-fetch them. Skipped when the store does
-/// not permit a plaintext copy outside it (encrypted storage).
+/// so the first reader does not re-fetch them — when the store is one the
+/// cache serves at all (see `uses_disk_cache`).
 fn cache_artifact_bytes(
     content_store: &dyn ContentStore,
     cache_dir: &std::path::Path,
@@ -99,21 +99,20 @@ fn cache_artifact_bytes(
     bytes: &[u8],
     artifact_kind: &'static str,
 ) {
-    if !content_store.permits_plaintext_cache() {
-        return;
-    }
-    fluree_db_binary_index::read::artifact_cache::best_effort_cache_bytes_to_path(
+    if fluree_db_binary_index::read::artifact_cache::seed_disk_cache(
+        content_store,
+        cid,
         cache_dir,
-        &cache_dir.join(cid.to_string()),
         bytes,
-    );
-    tracing::trace!(
-        %cid,
-        artifact_kind,
-        bytes = bytes.len(),
-        cache_dir = %cache_dir.display(),
-        "V6 incremental: seeded artifact cache"
-    );
+    ) {
+        tracing::trace!(
+            %cid,
+            artifact_kind,
+            bytes = bytes.len(),
+            cache_dir = %cache_dir.display(),
+            "V6 incremental: seeded artifact cache"
+        );
+    }
 }
 
 async fn fetch_cached_index_bytes(

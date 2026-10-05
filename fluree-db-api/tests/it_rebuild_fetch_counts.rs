@@ -77,6 +77,10 @@ impl<C: ContentStore + Send + Sync> ContentStore for CountingContentStore<C> {
         self.inner.permits_plaintext_cache()
     }
 
+    fn is_remote(&self) -> bool {
+        self.inner.is_remote()
+    }
+
     async fn has(&self, id: &ContentId) -> StorageResult<bool> {
         self.inner.has(id).await
     }

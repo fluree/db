@@ -293,6 +293,10 @@ impl StorageRead for S3Storage {
         true
     }
 
+    fn is_remote(&self) -> bool {
+        true
+    }
+
     fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
         None
     }

@@ -226,8 +226,9 @@ pub trait StorageRead: Debug + Send + Sync {
     /// the local filesystem (e.g., `FileStorage`). Returns `None` for
     /// remote or in-memory backends.
     ///
-    /// Callers use this to avoid redundant copy-to-cache when the data
-    /// is already locally accessible.
+    /// Callers read or map the path in place, and never copy it into the
+    /// disk cache. A storage whose reads transform the bytes at rest
+    /// (decryption) must return `None`.
     fn resolve_local_path(&self, address: &str) -> Option<PathBuf> {
         let _ = address;
         None
@@ -245,6 +246,16 @@ pub trait StorageRead: Debug + Send + Sync {
     /// would silently re-open the plaintext leak, so every implementation
     /// has to answer.
     fn permits_plaintext_cache(&self) -> bool;
+
+    /// Whether reads from this storage leave the machine.
+    ///
+    /// `false` when bytes come from local disk or memory: a copy in the disk
+    /// artifact cache can never be cheaper than the read it would replace.
+    /// A storage that routes addresses across several backends answers
+    /// `true` when any of them is remote. Required for the same reason as
+    /// [`Self::permits_plaintext_cache`]: a wrapper that forgot to delegate
+    /// would quietly cache local reads, or stop caching remote ones.
+    fn is_remote(&self) -> bool;
 
     /// The encryption administration surface, when this storage encrypts
     /// at rest. `None` for plaintext storages; wrappers delegate to what
@@ -550,6 +561,10 @@ impl StorageRead for Arc<dyn Storage> {
         self.as_ref().permits_plaintext_cache()
     }
 
+    fn is_remote(&self) -> bool {
+        self.as_ref().is_remote()
+    }
+
     fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>> {
         self.as_ref().encryption_admin()
     }
@@ -654,8 +669,15 @@ pub trait ContentStore: Debug + Send + Sync {
     /// Whether bytes returned by [`Self::get`] may be persisted unencrypted
     /// outside this store — see [`StorageRead::permits_plaintext_cache`],
     /// including why there is no default. The disk artifact cache consults
-    /// this before reading or writing an artifact in its directory.
+    /// this, through [`crate::disk_cache::uses_disk_cache`], before reading or
+    /// writing an artifact in its directory.
     fn permits_plaintext_cache(&self) -> bool;
+
+    /// Whether [`Self::get`] leaves the machine — see
+    /// [`StorageRead::is_remote`], including why there is no default.
+    /// Callers deciding whether to use the disk artifact cache go through
+    /// [`crate::disk_cache::uses_disk_cache`] rather than reading this.
+    fn is_remote(&self) -> bool;
 
     /// Synchronous, non-blocking lookup of already-resident bytes for a CID.
     ///
@@ -783,6 +805,10 @@ impl ContentStore for Arc<dyn ContentStore> {
 
     fn permits_plaintext_cache(&self) -> bool {
         self.as_ref().permits_plaintext_cache()
+    }
+
+    fn is_remote(&self) -> bool {
+        self.as_ref().is_remote()
     }
 
     fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
@@ -1070,6 +1096,10 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
 
     fn permits_plaintext_cache(&self) -> bool {
         self.storage.permits_plaintext_cache()
+    }
+
+    fn is_remote(&self) -> bool {
+        self.storage.is_remote()
     }
 
     fn miss_register(&self) -> Option<&residency::MissRegister> {
@@ -1421,6 +1451,12 @@ impl ContentStore for BranchedContentStore {
                 .parents
                 .iter()
                 .all(ContentStore::permits_plaintext_cache)
+    }
+
+    /// A read may be served by any ancestor, so one remote store in the
+    /// ancestry makes the whole chain remote.
+    fn is_remote(&self) -> bool {
+        self.branch_store.is_remote() || self.parents.iter().any(ContentStore::is_remote)
     }
 
     fn miss_register(&self) -> Option<&residency::MissRegister> {
@@ -1828,7 +1864,7 @@ mod tests {
     #[cfg(feature = "native")]
     #[tokio::test]
     async fn releasing_a_blob_evicts_its_cached_copy() {
-        let storage = MemoryStorage::new();
+        let storage = MemoryStorage::new().simulating_remote();
         let store = content_store_for(storage.clone(), LEDGER);
         let bytes = b"root bytes";
         let id = store.put(ContentKind::IndexRoot, bytes).await.unwrap();

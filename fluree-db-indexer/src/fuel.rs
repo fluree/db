@@ -153,6 +153,10 @@ impl ContentStore for MeteredContentStore {
         self.inner.permits_plaintext_cache()
     }
 
+    fn is_remote(&self) -> bool {
+        self.inner.is_remote()
+    }
+
     async fn release(&self, id: &ContentId) -> StorageResult<()> {
         self.inner.release(id).await
     }

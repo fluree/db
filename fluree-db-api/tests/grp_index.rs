@@ -3,6 +3,8 @@ mod support;
 
 #[path = "it_custom_datatype_limit.rs"]
 mod it_custom_datatype_limit;
+#[path = "it_disk_cache_locality.rs"]
+mod it_disk_cache_locality;
 #[path = "it_duration_index_roundtrip.rs"]
 mod it_duration_index_roundtrip;
 #[path = "it_fwd_pack_compaction.rs"]
