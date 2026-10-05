@@ -18,7 +18,18 @@ doctest = false
 
 [dependencies]
 bytes = "1"
-fluree-db-api = { path = "../fluree-db-api", features = ["native", "shacl", "aws"] }
+# The engine features the CLI ships with (fluree-db-cli's default set, less
+# its server): S3/DynamoDB storage, SHACL, Iceberg / SQL / Delta graph
+# sources, and GraphQL.
+fluree-db-api = { path = "../fluree-db-api", features = [
+    "native",
+    "shacl",
+    "aws",
+    "iceberg",
+    "sql",
+    "delta",
+    "graphql",
+] }
 fluree-db-core = { path = "../fluree-db-core" }
 fluree-db-sparql = { path = "../fluree-db-sparql" }
 fluree-vocab = { path = "../fluree-vocab" }
