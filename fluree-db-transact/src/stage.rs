@@ -2700,9 +2700,29 @@ async fn stream_where_into_accumulator(
         lower_where_patterns(&txn.where_patterns, &ledger.snapshot, &mut txn.vars)?
     };
 
-    // If VALUES clause present, prepend it as first pattern (seeds the join)
+    // If VALUES clause present, prepend it as first pattern (seeds the join).
+    //
+    // The where reads every IRI in the ledger's encoding, the one a where
+    // VALUES lowers to. The update encoded its top-level `values` as it
+    // encodes its templates, with the transaction's registry, which gives a
+    // namespace the ledger has not registered a new code the where cannot
+    // decode; such an IRI enters the where in the ledger encoder's fallback
+    // form, `Sid(EMPTY, iri)`, and a write stores it under its canonical
+    // code (`FlakeGenerator`).
     if let Some(inline_values) = &txn.values {
-        let values_pattern = inline_values_to_pattern(inline_values)?;
+        let in_ledger_encoding = |sid: &Sid| -> Sid {
+            let code = sid.namespace_code;
+            if fluree_vocab::namespaces::is_full_iri(code)
+                || ledger.snapshot.namespaces().contains_key(&code)
+            {
+                return sid.clone();
+            }
+            match generator.decode_sid(sid) {
+                Some(iri) => Sid::new(fluree_vocab::namespaces::EMPTY, iri),
+                None => sid.clone(),
+            }
+        };
+        let values_pattern = inline_values_to_pattern(inline_values, in_ledger_encoding)?;
         query_patterns.insert(0, values_pattern);
     }
 
@@ -3359,12 +3379,22 @@ fn template_term_to_binding(term: &TemplateTerm) -> Result<Binding> {
 }
 
 /// Convert InlineValues to Pattern::Values
-fn inline_values_to_pattern(values: &InlineValues) -> Result<Pattern> {
+fn inline_values_to_pattern(
+    values: &InlineValues,
+    in_ledger_encoding: impl Fn(&Sid) -> Sid,
+) -> Result<Pattern> {
     let vars = values.vars.clone();
     let rows: Result<Vec<Vec<Binding>>> = values
         .rows
         .iter()
-        .map(|row| row.iter().map(template_term_to_binding).collect())
+        .map(|row| {
+            row.iter()
+                .map(|term| match term {
+                    TemplateTerm::Sid(sid) => Ok(Binding::sid(in_ledger_encoding(sid))),
+                    other => template_term_to_binding(other),
+                })
+                .collect()
+        })
         .collect();
     Ok(Pattern::Values { vars, rows: rows? })
 }

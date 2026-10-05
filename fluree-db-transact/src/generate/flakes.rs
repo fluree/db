@@ -108,6 +108,13 @@ impl<'a> FlakeGenerator<'a> {
         }
     }
 
+    /// `sid`'s IRI, decoded with the transaction's namespace codes: the
+    /// ledger's and the ones the transaction has allocated.
+    pub fn decode_sid(&self, sid: &Sid) -> Option<String> {
+        let prefix = self.ns_registry.get_prefix(sid.namespace_code)?;
+        Some(format!("{prefix}{}", sid.name))
+    }
+
     /// Set the WHERE dataset's alias names and the canonical IRI each resolves
     /// to (see [`DataSet::with_named_graph_alias`](fluree_db_query::DataSet)).
     pub fn set_graph_aliases(&mut self, aliases: HashMap<Arc<str>, Arc<str>>) {

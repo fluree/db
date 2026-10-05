@@ -891,7 +891,8 @@ async fn where_default_leaves_a_graph_named_at_default_alone() {
 /// `urn:default`, written in the `where` of an update with a graph key, reads
 /// the default graph as `"default"` does: as a node's `@graph`, in a
 /// `["graph", …]` pattern (also when `fromNamed` lists `urn:default`), and as
-/// the value a VALUES row binds a graph variable to. A `fromNamed` alias
+/// the value a VALUES row binds a graph variable to, in the `where` or the
+/// update's top-level `values`. A `fromNamed` alias
 /// spelled `urn:default` that names another graph could never be read (the
 /// name means the default graph), so it is refused, wherever it is listed.
 #[tokio::test]
@@ -921,6 +922,13 @@ async fn where_reads_urn_default_as_the_default_graph() {
                     ["values", ["?g", [{"@id": "urn:default"}]]],
                     ["graph", "?g", {"@id": "?s", "ex:p": "?o"}]
                 ]
+            }),
+        ),
+        (
+            "top-level VALUES-bound graph",
+            json!({
+                "values": ["?g", [{"@id": "urn:default"}]],
+                "where": [["graph", "?g", {"@id": "?s", "ex:p": "?o"}]]
             }),
         ),
     ] {
