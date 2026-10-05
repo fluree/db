@@ -521,6 +521,33 @@ async fn update_grouped_read_error_names_the_variable() {
     assert!(!msg.contains("VarId("), "{msg}");
 }
 
+/// An `orderBy` key nothing binds orders nothing: the solutions come back,
+/// ordered by the bound keys, grouped or not (the SPARQL twin is
+/// `order_by_a_variable_nothing_binds_orders_nothing`). It was a 500.
+#[tokio::test]
+async fn jsonld_order_by_a_variable_nothing_binds_orders_nothing() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "jsonld-grouped/order-nosuch:main").await;
+    let found = rows(
+        &fluree,
+        &ledger,
+        json!({"select": ["?e"], "orderBy": ["?nosuch"]}),
+    )
+    .await;
+    assert_eq!(found.as_array().map(Vec::len), Some(6), "{found}");
+    let found = rows(
+        &fluree,
+        &ledger,
+        json!({
+            "select": ["?a", "(as (count ?e) ?n)"],
+            "groupBy": ["?a"],
+            "orderBy": ["?nosuch", ["desc", "?n"]]
+        }),
+    )
+    .await;
+    assert_eq!(found, json!([["Net", 3], ["Local", 2], ["Remote", 1]]));
+}
+
 /// `ask` had no grouping stage and dropped `groupBy` / `having`, answering
 /// `true` for a `having` that rejects every group. It now refuses them, like
 /// SPARQL ASK.

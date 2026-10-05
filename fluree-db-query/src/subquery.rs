@@ -265,6 +265,23 @@ impl SubqueryOperator {
         stats: Option<Arc<StatsView>>,
         planning: PlanningContext,
     ) -> Self {
+        // A sort key nothing in the sub-query binds orders nothing: drop it
+        // once here, not per parent row in `build_inner_plan`.
+        let mut subquery = subquery;
+        let kept = match crate::execute::operator_tree::bindable_sort_keys(
+            &subquery.ordering,
+            Some(&subquery.select),
+            subquery.grouping.as_ref(),
+            &subquery.order_binds,
+            &subquery.patterns,
+            None,
+        ) {
+            std::borrow::Cow::Owned(kept) => Some(kept),
+            std::borrow::Cow::Borrowed(_) => None,
+        };
+        if let Some(kept) = kept {
+            subquery.ordering = kept;
+        }
         let parent_schema: HashSet<VarId> = child.schema().iter().copied().collect();
         let subquery_select_vars: HashSet<VarId> = subquery.select.iter().copied().collect();
 

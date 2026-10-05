@@ -583,6 +583,48 @@ async fn order_by_a_non_key_variable_reads_a_sample() {
     }
 }
 
+/// A sort key nothing binds is unbound in every solution, so it orders nothing
+/// (an unbound key sorts the same in every row): the solutions come back,
+/// ordered by the keys that are bound, at the top level, under grouping and in
+/// a sub-SELECT. It was a 500 naming an internal id ("Sort variable VarId(n)
+/// not found in query schema").
+#[tokio::test]
+async fn order_by_a_variable_nothing_binds_orders_nothing() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "grouped-projection/order-nosuch:main").await;
+    let result = run(&fluree, &ledger, &format!("SELECT ?e {W} ORDER BY ?nosuch")).await;
+    assert_eq!(result.row_count(), 6, "ungrouped ORDER BY ?nosuch");
+
+    let order = |body: String| {
+        let (fluree, ledger) = (&fluree, &ledger);
+        async move {
+            let result = run(fluree, ledger, &body).await;
+            sparql_rows(&result, ledger)
+                .into_iter()
+                .map(|r| r["a"].clone())
+                .collect::<Vec<String>>()
+        }
+    };
+    assert_eq!(
+        order(format!(
+            "SELECT ?a (COUNT(?e) AS ?n) {W} GROUP BY ?a ORDER BY ?nosuch DESC(?n)"
+        ))
+        .await,
+        ["Net", "Local", "Remote"],
+        "grouped ORDER BY ?nosuch DESC(?n)"
+    );
+    assert_eq!(
+        order(format!(
+            "SELECT ?a WHERE {{ {{ SELECT DISTINCT ?a {W} ORDER BY ?nosuch DESC(?a) LIMIT 2 }} }}"
+        ))
+        .await
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>(),
+        ["Net".to_string(), "Remote".to_string()].into(),
+        "sub-SELECT ORDER BY ?nosuch DESC(?a) LIMIT 2"
+    );
+}
+
 /// An aggregate in HAVING or ORDER BY groups the level (§18.2.4.1), so a
 /// projected non-key variable is the same V4 error as under an explicit GROUP
 /// BY. The projected expression used to expand into one row per solution, and

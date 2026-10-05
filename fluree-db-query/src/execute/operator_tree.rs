@@ -3321,11 +3321,19 @@ fn build_operator_tree_inner(
     // `apply_solution_modifiers`, so both inherit identical modifier semantics.
     // Only the WHERE build and outermost-only concerns (post-VALUES) stay here.
     let projected = query.output.projected_vars();
+    let ordering = bindable_sort_keys(
+        &query.ordering,
+        projected.as_deref(),
+        query.grouping.as_ref(),
+        &query.order_binds,
+        &query.patterns,
+        query.post_values.as_ref(),
+    );
     apply_solution_modifiers(
         operator,
         query.grouping.as_ref(),
         &query.order_binds,
-        &query.ordering,
+        &ordering,
         projected.as_deref(),
         query.output.ungrouped_projection(),
         query.output.is_distinct(),
@@ -3334,6 +3342,56 @@ fn build_operator_tree_inner(
         detect_partitioned_group_by(query),
         variable_deps.as_ref(),
         planning,
+    )
+}
+
+/// The ORDER BY keys some stage of a query level can bind: its WHERE
+/// (`patterns`, a trailing VALUES), its grouping (keys, aggregate outputs,
+/// binds), its ORDER BY expressions, or a seed through its projection. A key
+/// none of them binds is unbound in every solution, so it orders nothing
+/// (an unbound key sorts the same in every row, SPARQL 1.1 §15.1): it is
+/// dropped, and `ORDER BY ?nosuch` returns the solutions unordered by it
+/// instead of failing the plan. A key some stage binds is kept, so a plan that
+/// loses one still fails the sort validation in [`apply_solution_modifiers`].
+///
+/// Borrows `ordering` unchanged in the usual case, where every key is
+/// projected, grouped or an ORDER BY expression: the WHERE is walked only for
+/// a key that is none of these.
+pub(crate) fn bindable_sort_keys<'a>(
+    ordering: &'a [SortSpec],
+    select: Option<&[VarId]>,
+    grouping: Option<&Grouping>,
+    order_binds: &[(VarId, Expression)],
+    patterns: &[Pattern],
+    post_values: Option<&Pattern>,
+) -> std::borrow::Cow<'a, [SortSpec]> {
+    use std::borrow::Cow;
+    let staged = |v: VarId| {
+        select.is_some_and(|s| s.contains(&v))
+            || order_binds.iter().any(|(out, _)| *out == v)
+            || grouping.is_some_and(|g| {
+                g.group_by_vars().any(|k| k == v)
+                    || g.aggregates().any(|spec| spec.output_var == v)
+                    || g.binds().any(|(out, _)| *out == v)
+            })
+    };
+    if ordering.iter().all(|spec| staged(spec.var)) {
+        return Cow::Borrowed(ordering);
+    }
+    let produced: HashSet<VarId> = crate::ir::pattern::produced_vars_of(patterns)
+        .into_iter()
+        .chain(post_values.into_iter().flat_map(Pattern::produced_vars))
+        .collect();
+    let bindable = |v: VarId| staged(v) || produced.contains(&v);
+    if ordering.iter().all(|spec| bindable(spec.var)) {
+        return Cow::Borrowed(ordering);
+    }
+    Cow::Owned(
+        ordering
+            .iter()
+            .filter(|spec| bindable(spec.var))
+            .cloned()
+            .collect(),
     )
 }
 
@@ -4708,8 +4766,10 @@ mod tests {
         );
     }
 
+    /// A sort key nothing binds orders nothing: it is dropped, not a plan
+    /// error. A key the WHERE binds is kept.
     #[test]
-    fn test_build_operator_tree_validates_sort_vars() {
+    fn test_build_operator_tree_drops_sort_keys_nothing_binds() {
         let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
@@ -4717,7 +4777,7 @@ mod tests {
             patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
             reasoning: ReasoningConfig::default(),
             grouping: None,
-            ordering: vec![SortSpec::asc(VarId(99))], // Invalid var
+            ordering: vec![SortSpec::asc(VarId(99)), SortSpec::desc(VarId(1))],
             order_binds: Vec::new(),
             limit: None,
             offset: None,
@@ -4728,14 +4788,54 @@ mod tests {
             unmatched_optional: Default::default(),
         };
 
+        let kept = bindable_sort_keys(
+            &query.ordering,
+            Some(&[VarId(0)]),
+            None,
+            &[],
+            &query.patterns,
+            None,
+        );
+        assert_eq!(
+            kept.iter().map(|spec| spec.var).collect::<Vec<_>>(),
+            vec![VarId(1)]
+        );
         let result = build_operator_tree(
             &query,
             None,
             &crate::temporal_mode::PlanningContext::current(),
         );
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    /// A sort key some stage binds, missing from the plan's schema, is a plan
+    /// that lost it: still an error, never a silently unsorted answer.
+    #[test]
+    fn test_apply_solution_modifiers_validates_sort_vars() {
+        use crate::binding::{Batch, Binding};
+        let batch = Batch::new(
+            Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice()),
+            vec![vec![Binding::Unbound], vec![Binding::Unbound]],
+        )
+        .unwrap();
+        let input: BoxedOperator = Box::new(crate::seed::BatchSeedOperator::from_batch(batch));
+        let result = apply_solution_modifiers(
+            input,
+            None,
+            &[],
+            &[SortSpec::asc(VarId(5))],
+            None,
+            UngroupedProjection::Reject,
+            false,
+            None,
+            None,
+            false,
+            None,
+            &crate::temporal_mode::PlanningContext::current(),
+        );
         match result {
-            Err(e) => assert!(e.to_string().contains("Sort variable")),
-            Ok(_) => panic!("Expected error for invalid sort var"),
+            Err(e) => assert!(e.to_string().contains("Sort variable"), "{e}"),
+            Ok(_) => panic!("a sort key missing from the plan's schema must fail"),
         }
     }
 
