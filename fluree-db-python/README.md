@@ -4,6 +4,15 @@ Python package for [Fluree](https://flur.ee), a graph database with time travel,
 history, and fine-grained policy. The engine runs in your Python process — there
 is no server to start.
 
+```sh
+pip install fluree                # or: pip install "fluree[pandas]"
+```
+
+Wheels are published for Linux (x86-64 and arm64, glibc 2.28 or later),
+macOS on Apple silicon, and Windows (x86-64), for CPython 3.10 and later —
+the platforms the Fluree CLI ships on. The package version is the version of
+the Fluree engine inside it.
+
 ```python
 import fluree
 
@@ -339,11 +348,16 @@ before Fluree was first used is fine on either.
 
 ## Development
 
+Building from source needs a Rust toolchain:
+
 ```sh
 uv venv && uv pip install maturin pytest pandas
 maturin develop          # build the extension into the active environment
 pytest
 ```
+
+Releases are built and published by `.github/workflows/python-release.yml`
+from the same version tags as the CLI; see `docs/contributing/releasing.md`.
 
 ## License
 

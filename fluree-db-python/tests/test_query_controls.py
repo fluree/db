@@ -95,7 +95,6 @@ class Interrupted(Exception):
 
 
 def test_signal_interrupts_a_running_query(ledger):
-    import os
     import signal
     import threading
 
@@ -103,7 +102,8 @@ def test_signal_interrupts_a_running_query(ledger):
         raise Interrupted
 
     previous = signal.signal(signal.SIGINT, on_sigint)
-    timer = threading.Timer(0.2, os.kill, (os.getpid(), signal.SIGINT))
+    # raise_signal, not os.kill: on Windows os.kill terminates the process.
+    timer = threading.Timer(0.2, signal.raise_signal, (signal.SIGINT,))
     try:
         started = time.monotonic()
         timer.start()

@@ -346,9 +346,11 @@ jobs:
   # restatement as the wasm32 job (an env RUSTFLAGS masks .cargo/config.toml).
   python:
     # The `fluree` Python package is tested by pytest (its Rust lib is
-    # `test = false`), so no job above runs its tests. One abi3 wheel per OS,
-    # tested on the oldest and newest supported Pythons. A debug build: the
-    # release profile's LTO costs minutes and buys nothing for a test run.
+    # `test = false`), so no job above runs its tests. One abi3 wheel per OS
+    # the package ships on (python-release.yml), tested on the oldest and
+    # newest supported Pythons. A debug build: the release profile's LTO costs
+    # minutes and buys nothing for a test run. Windows runs here so a
+    # Unix-only assumption fails a PR, not a release.
     strategy:
       fail-fast: false
       matrix:
@@ -358,11 +360,15 @@ jobs:
           # mold is Linux-only; clear the workflow-level linker flag.
           - os: macos-15
             rustflags: ""
+          - os: windows-2025
+            rustflags: ""
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
+      - if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.0
       - if: runner.os == 'Linux'
@@ -373,22 +379,30 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-python@v7
+        id: py310
         with:
-          python-version: |
-            3.10
-            3.14
+          python-version: "3.10"
+      - uses: actions/setup-python@v7
+        id: py314
+        with:
+          python-version: "3.14"
 
       - name: Build the wheel
+        shell: bash
         run: |
-          python3.14 -m pip install "maturin>=1.9,<2"
-          python3.14 -m maturin build --locked --manifest-path fluree-db-python/Cargo.toml --out dist
+          py="${{ steps.py314.outputs.python-path }}"
+          "$py" -m pip install "maturin>=1.9,<2"
+          "$py" -m maturin build --locked --manifest-path fluree-db-python/Cargo.toml --out dist
 
       - name: Test on Python 3.10 and 3.14
+        shell: bash
         run: |
-          for py in 3.10 3.14; do
-            "python$py" -m venv "venv-$py"
-            "venv-$py/bin/pip" install dist/*.whl pytest pandas
-            "venv-$py/bin/python" -m pytest fluree-db-python/tests
+          for v in 310 314; do
+            [ $v = 310 ] && py="${{ steps.py310.outputs.python-path }}" || py="${{ steps.py314.outputs.python-path }}"
+            "$py" -m venv "venv-$v"
+            bin="venv-$v/bin"; [ "$RUNNER_OS" = Windows ] && bin="venv-$v/Scripts"
+            "$bin/python" -m pip install dist/*.whl pytest pandas
+            "$bin/python" -m pytest fluree-db-python/tests
           done
 
       # The package ships `py.typed`, so its annotations are part of the API.
@@ -396,8 +410,8 @@ jobs:
         if: runner.os == 'Linux'
         working-directory: fluree-db-python
         run: |
-          ../venv-3.14/bin/pip install mypy pandas-stubs
-          ../venv-3.14/bin/python -m mypy
+          ../venv-314/bin/pip install mypy pandas-stubs
+          ../venv-314/bin/python -m mypy
 
   wasm-smoke:
     runs-on: ubuntu-24.04
