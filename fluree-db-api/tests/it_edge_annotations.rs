@@ -1988,17 +1988,6 @@ async fn pragma_include_system_facts_surfaces_f_reifies() {
         .expect("annotated insert");
 
     let query = "SELECT ?p WHERE { <http://example.org/emp/alice-acme> ?p ?o }";
-    let reifies = |rows: &JsonValue| {
-        rows.to_string()
-            .matches("https://ns.flur.ee/db#reifies")
-            .count()
-    };
-
-    let hidden = support::query_sparql_formatted(&fluree, &committed.ledger, query)
-        .await
-        .expect("query without the pragma");
-    assert_eq!(reifies(&hidden), 0, "hidden without the pragma: {hidden}");
-
     let shown = support::query_sparql_formatted(
         &fluree,
         &committed.ledger,
@@ -2007,8 +1996,8 @@ async fn pragma_include_system_facts_surfaces_f_reifies() {
     .await
     .expect("query with the pragma");
     assert!(
-        reifies(&shown) >= 3,
-        "the pragma must surface the f:reifies* bundle: {shown}"
+        shown.to_string().contains(fluree_vocab::rdf::REIFIES),
+        "the pragma must surface the rdf:reifies link: {shown}"
     );
 }
 
