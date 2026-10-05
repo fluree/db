@@ -514,3 +514,37 @@ async fn jsonld_unbound_projection_is_the_same_4xx_on_query_and_stream() {
     );
     assert_eq!(e.status_code(), 400, "stream: {message}");
 }
+
+/// A grouped SELECT expression that reads a non-key variable is the same named
+/// 400 on `/query` and on the stream, before it starts. The plan that finds it
+/// is built after the stream's head record, so the stream runs the plan's
+/// check first (the error used to arrive as a record after the 200).
+#[tokio::test]
+async fn jsonld_grouped_read_is_the_same_4xx_on_query_and_stream() {
+    let (fluree, ledger) = seed_areas().await;
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?a", "(as (+ (count ?e) (strlen (str ?e))) ?x)"],
+        "where": {"@id": "?e", "ex:area": "?a"},
+        "groupBy": ["?a"]
+    });
+    let expected = "the SELECT expression for ?x reads variable ?e, which is neither";
+
+    let Err(e) = support::query_jsonld(&fluree, &ledger, &query).await else {
+        panic!("/query: a grouped read of a non-key variable must be rejected");
+    };
+    let message = e.to_string();
+    assert!(message.contains(expected), "/query: {message}");
+    assert_eq!(e.status_code(), 400, "/query: {message}");
+
+    let graph = support::graphdb_from_ledger(&ledger);
+    let Err(e) = fluree
+        .plan_stream_query(&graph, &OwnedStreamQuery::JsonLd(query))
+        .await
+    else {
+        panic!("stream: a grouped read of a non-key variable must be rejected before it starts");
+    };
+    let message = e.to_string();
+    assert!(message.contains(expected), "stream: {message}");
+    assert_eq!(e.status_code(), 400, "stream: {message}");
+}

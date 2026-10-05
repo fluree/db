@@ -597,6 +597,10 @@ fn row_compactor(
 /// list element — a cartesian product across list columns. A projected
 /// variable nothing binds is refused as unbound. The plan's output is then set
 /// to refuse per-group lists outright.
+///
+/// A grouped query whose HAVING, SELECT expressions or ORDER BY read a
+/// variable its grouping does not produce is refused here too, with the error
+/// `/query` returns: the plan that finds it is built after the response starts.
 fn ensure_streamable(query: &mut fluree_db_query::ir::Query, vars: &VarRegistry) -> Result<()> {
     use fluree_db_query::ir::UngroupedProjection;
     let reject = |what: &str| {
@@ -622,15 +626,41 @@ fn ensure_streamable(query: &mut fluree_db_query::ir::Query, vars: &VarRegistry)
     if output.has_hydration() {
         return reject("hydration");
     }
-    if let (Some(grouping), UngroupedProjection::PerGroupList) =
-        (&query.grouping, output.ungrouped_projection())
-    {
+    let Some(grouping) = &query.grouping else {
+        query
+            .output
+            .set_ungrouped_projection(UngroupedProjection::Reject);
+        return Ok(());
+    };
+    // The variables the plan's WHERE binds, trailing VALUES included.
+    let where_vars: std::collections::HashSet<fluree_db_query::VarId> =
+        fluree_db_query::ir::pattern::produced_vars_of(&query.patterns)
+            .into_iter()
+            .chain(
+                query
+                    .post_values
+                    .iter()
+                    .flat_map(fluree_db_query::ir::Pattern::produced_vars),
+            )
+            .collect();
+    let where_list: Vec<fluree_db_query::VarId> = where_vars.iter().copied().collect();
+    if let Some(read) = grouping.first_ungrouped_read(
+        &where_list,
+        &query.order_binds,
+        &query.ordering,
+        output.projected_vars().as_deref(),
+        output.ungrouped_projection(),
+    ) {
+        return Err(ApiError::Query(
+            fluree_db_query::QueryError::UngroupedRead(read).name_variables(vars),
+        ));
+    }
+    if output.ungrouped_projection() == UngroupedProjection::PerGroupList {
         let produced: std::collections::HashSet<fluree_db_query::VarId> = grouping
             .group_by_vars()
             .chain(grouping.aggregates().map(|spec| spec.output_var))
             .chain(grouping.binds().map(|(var, _)| *var))
             .collect();
-        let where_vars = fluree_db_query::ir::pattern::produced_vars_of(&query.patterns);
         match output.projected_vars() {
             Some(projected) => {
                 if let Some(var) = projected.iter().find(|v| !produced.contains(v)) {
