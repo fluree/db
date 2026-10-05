@@ -470,6 +470,57 @@ async fn jsonld_grouped_read_errors_name_the_variable() {
     }
 }
 
+/// The same error from an update's `where`, which runs through the streaming
+/// WHERE cursor: the subquery is planned when the cursor is first pulled, and
+/// the error printed `VarId(0)` there. SPARQL UPDATE rejects the twin when it
+/// validates the request (the projection check), before any cursor runs; it is
+/// pinned for parity.
+#[tokio::test]
+async fn update_grouped_read_error_names_the_variable() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "jsonld-grouped/update-error-names:main";
+    let ledger = seed_areas(&fluree, ledger_id).await;
+    let ctx = json!({"ex": "http://example.org/"});
+    let update = json!({
+        "@context": ctx,
+        "where": [["query", {
+            "@context": ctx,
+            "select": ["?a", "?x"],
+            "where": {"@id": "?x", "ex:area": "?a"},
+            "groupBy": ["?a"]
+        }]],
+        "insert": {"@id": "?x", "ex:seen": true}
+    });
+    let Err(err) = fluree.update(ledger, &update).await else {
+        panic!("an update whose subquery projects a non-key variable must fail");
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("projected variable ?x is neither a GROUP BY key nor an aggregate result"),
+        "{msg}"
+    );
+    assert!(!msg.contains("VarId("), "{msg}");
+
+    let sparql = "PREFIX ex: <http://example.org/> \
+                  INSERT { ?x ex:seen true } \
+                  WHERE { { SELECT ?a ?x WHERE { ?x ex:area ?a } GROUP BY ?a } }";
+    let Err(err) = fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(sparql)
+        .commit()
+        .await
+    else {
+        panic!("the SPARQL UPDATE twin must fail");
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("variable ?x is projected but is neither a GROUP BY key"),
+        "{msg}"
+    );
+    assert!(!msg.contains("VarId("), "{msg}");
+}
+
 /// `ask` had no grouping stage and dropped `groupBy` / `having`, answering
 /// `true` for a `having` that rejects every group. It now refuses them, like
 /// SPARQL ASK.
