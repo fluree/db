@@ -3493,3 +3493,103 @@ async fn jsonld_update_template_reads_grouped_subquery_expression() {
         "one value per entity, from its group: {jsonld}"
     );
 }
+
+/// An IRI a `where` binds, in a namespace the ledger has not seen, is stored
+/// under the same Sid a direct write of it gets, as a subject and as an
+/// object: after the namespace is registered, a lookup by the IRI finds what
+/// both writes stored. It used to be stored under the encoder's fallback
+/// (`Sid(EMPTY, iri)`), which a lookup by the IRI no longer matches once
+/// the namespace has its code, so the bound write was lost to it. The JSON-LD
+/// update and the SPARQL UPDATE share the path.
+#[tokio::test]
+async fn where_bound_iri_in_a_new_namespace_is_stored_canonically() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let jsonld = json!({
+        "@context": {"ex": "http://example.org/"},
+        "where": [["values", ["?x", [{"@id": "urn:new:thing"}, {"@id": "urn:new:other"}]]]],
+        "insert": [
+            {"@id": "?x", "ex:p": "via-values"},
+            {"@id": "ex:holder", "ex:points": "?x"}
+        ]
+    });
+    let sparql = r#"PREFIX ex: <http://example.org/>
+        INSERT { ?x ex:p "via-values" . ex:holder ex:points ?x }
+        WHERE { VALUES ?x { <urn:new:thing> <urn:new:other> } }"#;
+    let mut missed = Vec::new();
+    for (i, surface) in ["JSON-LD", "SPARQL"].into_iter().enumerate() {
+        let ledger_id = format!("it/where-bound-canonical-{i}:main");
+        fluree
+            .create_ledger(&ledger_id)
+            .await
+            .expect("create ledger");
+        let graph = fluree.graph(&ledger_id);
+        let transact = if surface == "JSON-LD" {
+            graph.transact().update(&jsonld)
+        } else {
+            graph.transact().sparql_update(sparql)
+        };
+        transact
+            .commit()
+            .await
+            .unwrap_or_else(|e| panic!("{surface}: the bound write: {e}"));
+        fluree
+            .graph(&ledger_id)
+            .transact()
+            .insert(&json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "urn:new:thing",
+                "ex:q": "direct"
+            }))
+            .commit()
+            .await
+            .expect("the direct write");
+        let ledger = fluree.ledger(&ledger_id).await.expect("ledger");
+
+        let as_subject = support::query_sparql_formatted(
+            &fluree,
+            &ledger,
+            "SELECT ?p ?o WHERE { <urn:new:thing> ?p ?o } ORDER BY ?p",
+        )
+        .await
+        .expect("as subject");
+        if as_subject
+            != json!([
+                ["http://example.org/p", "via-values"],
+                ["http://example.org/q", "direct"]
+            ])
+        {
+            missed.push(format!("{surface}, as a subject: {as_subject}"));
+        }
+        let as_object = support::query_sparql_formatted(
+            &fluree,
+            &ledger,
+            "SELECT ?s WHERE { ?s <http://example.org/points> <urn:new:thing> }",
+        )
+        .await
+        .expect("as object");
+        if as_object != json!([["http://example.org/holder"]]) {
+            missed.push(format!("{surface}, as an object: {as_object}"));
+        }
+        let other = support::query_sparql_formatted(
+            &fluree,
+            &ledger,
+            "SELECT ?p ?o WHERE { <urn:new:other> ?p ?o }",
+        )
+        .await
+        .expect("the other IRI");
+        if other != json!([["http://example.org/p", "via-values"]]) {
+            missed.push(format!("{surface}, the other IRI as a subject: {other}"));
+        }
+        let pointed = support::query_sparql_formatted(
+            &fluree,
+            &ledger,
+            "SELECT ?o WHERE { <http://example.org/holder> <http://example.org/points> ?o } ORDER BY ?o",
+        )
+        .await
+        .expect("what the holder points to");
+        if pointed != json!([["urn:new:other"], ["urn:new:thing"]]) {
+            missed.push(format!("{surface}, both IRIs as objects: {pointed}"));
+        }
+    }
+    assert!(missed.is_empty(), "{missed:#?}");
+}
