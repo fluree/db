@@ -263,6 +263,10 @@ async fn grouped_select_expression_on_an_indexed_ledger_in_both_lanes() {
 
     let _guard = FastPathsGuard;
     let (store, tracing_guard) = span_capture::init_test_tracing();
+    // A query no fast path may answer runs the generic pipeline, whose only
+    // stamp is the fused chain it passed through (a sibling fast path, such as
+    // the count planner, would add its own).
+    let generic_only = |sites: &[String]| sites.iter().all(|s| s == "fused_chain");
     let proceeded = |before: usize| -> Vec<String> {
         store.find_events("fast-path outcome")[before..]
             .iter()
@@ -285,15 +289,21 @@ async fn grouped_select_expression_on_an_indexed_ledger_in_both_lanes() {
                     if must_fire { "" } else { "not " }
                 ));
             }
+            if !must_fire && !generic_only(&sites) {
+                misrouted.push(format!(
+                    "no fast path may answer [proceeded: {sites:?}]\n{body}"
+                ));
+            }
         }
     }
     for (site, body, _) in &values_cases {
         let before = store.find_events("fast-path outcome").len();
         run(&fluree, &db, &ledger, body).await;
         let sites = proceeded(before);
-        if sites.iter().any(|s| s == site) {
+        if sites.iter().any(|s| s == site) || !generic_only(&sites) {
             misrouted.push(format!(
-                "`{site}` must not proceed with a trailing VALUES [proceeded: {sites:?}]\n{body}"
+                "`{site}` (or any fast path) must not proceed with a trailing VALUES \
+                 [proceeded: {sites:?}]\n{body}"
             ));
         }
     }
