@@ -1974,3 +1974,59 @@ async fn fulltext_perf_50k_labels() {
         );
     }
 }
+
+/// The JSON-LD form of `f:fullTextDefaults` from the docs: the config node
+/// names the config graph with a per-node `@graph`, and its nested
+/// `f:FullTextDefaults` and `f:FullTextProperty` nodes must land there too.
+#[tokio::test]
+async fn fulltext_configured_through_jsonld_node_graph() {
+    use fluree_db_api::ReindexOptions;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/fulltext-config-jsonld:main";
+    let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": fulltext_context(),
+                "@graph": [{
+                    "@id": format!("urn:fluree:{ledger_id}:config:ledger"),
+                    "@type": "f:LedgerConfig",
+                    "@graph": format!("urn:fluree:{ledger_id}#config"),
+                    "f:fullTextDefaults": {
+                        "@type": "f:FullTextDefaults",
+                        "f:defaultLanguage": "en",
+                        "f:property": [
+                            { "@type": "f:FullTextProperty", "f:target": { "@id": "ex:title" } }
+                        ]
+                    }
+                }]
+            }),
+        )
+        .await
+        .expect("write config")
+        .ledger;
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": fulltext_context(),
+                "@graph": [
+                    { "@id": "ex:doc1", "ex:title": "Rust programming language guide" },
+                    { "@id": "ex:doc2", "ex:title": "Cooking recipes for pasta" }
+                ]
+            }),
+        )
+        .await
+        .expect("insert docs");
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    let loaded = fluree.ledger(ledger_id).await.expect("load");
+    let hits = query_fulltext_plain(&fluree, &loaded, "Rust").await;
+    let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, ["ex:doc1"], "{hits:?}");
+}
