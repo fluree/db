@@ -163,31 +163,46 @@ def test_snapshot_and_history(ledger):
         past.query('CREATE (:Person {name: "Zed"})')
 
 
-def test_cypher_transaction(ledger):
-    with ledger.cypher_transaction() as tx:
-        tx.run('CREATE (:Person {name: "Gus"})')
-        assert tx.run('MATCH (p {name: "Gus"}) RETURN p.name').single()[0] == "Gus"
+def test_cypher_in_a_transaction(ledger):
+    with ledger.transaction(message="gus") as txn:
+        assert txn.update('CREATE (:Person {name: "Gus"})') is None
+        txn.update("MATCH (p {name: $n}) SET p.age = $age", n="Gus", age=50)
+        # Cypher and SPARQL see each other's staged writes.
+        txn.update('INSERT { ?p <nick> "G" } WHERE { ?p <name> "Gus" ; <age> 50 }')
         assert ledger.query('MATCH (p {name: "Gus"}) RETURN p').single() is None
-        tx.run("MATCH (p {name: $n}) SET p.age = $age", n="Gus", age=50)
-    assert tx.committed.t == ledger.log()[0].t
-    assert ledger.query('MATCH (p {name: "Gus"}) RETURN p.age').single()[0] == 50
+    assert txn.committed.t == ledger.log()[0].t and ledger.log()[0].message == "gus"
+    record = ledger.query('MATCH (p {name: "Gus"}) RETURN p.age AS age, p.nick AS nick').single()
+    assert (record.age, record.nick) == (50, "G")
 
     with pytest.raises(RuntimeError):
-        with ledger.cypher_transaction() as tx:
-            tx.run('CREATE (:Person {name: "Hal"})')
+        with ledger.transaction() as txn:
+            txn.update('CREATE (:Person {name: "Hal"})')
             raise RuntimeError
     assert ledger.query('MATCH (p {name: "Hal"}) RETURN p').single() is None
-    with pytest.raises(InvalidRequestError):
-        tx.run("MATCH (p) RETURN p")
 
 
-def test_cypher_transaction_conflicts_when_the_ledger_moved(ledger):
-    tx = ledger.cypher_transaction()
-    tx.run('CREATE (:Person {name: "Ida"})')
+def test_cypher_return_in_a_transaction_is_a_read(ledger):
+    txn = ledger.transaction()
+    created = txn.update('CREATE (p:Person {name: "Ida"}) RETURN p').single()["p"]
+    assert created["name"] == "Ida"
     ledger.update('CREATE (:Person {name: "Jo"})')
     with pytest.raises(ConflictError):
-        tx.commit()
+        txn.commit()
     assert ledger.query('MATCH (p {name: "Ida"}) RETURN p').single() is None
+
+
+def test_cypher_without_return_is_staged_again(ledger):
+    txn = ledger.transaction()
+    txn.update('MATCH (p:Person {name: "Bob"}) SET p.age = 41')
+    ledger.update('CREATE (:Person {name: "Jo"})')
+    txn.commit()
+    assert ledger.query('MATCH (p {name: "Bob"}) RETURN p.age').single()[0] == 41
+    assert ledger.query('MATCH (p {name: "Jo"}) RETURN p').single() is not None
+
+
+def test_cypher_update_message(ledger):
+    commit = ledger.update('CREATE (:Person {name: "Kim"})', message="add Kim")
+    assert ledger.log()[0].message == "add Kim" and commit.t == ledger.log()[0].t
 
 
 def test_cypher_on_a_fresh_ledger(conn):
@@ -241,9 +256,9 @@ def test_aio_cypher():
             await ledger.update(GRAPH)
             result = await ledger.query("MATCH (p:Person) RETURN p.name ORDER BY p.name")
             assert names(result) == ["Alice", "Bob", "Carol"]
-            async with ledger.cypher_transaction() as tx:
-                await tx.run('CREATE (:Person {name: "Dee"})')
-            assert tx.committed is not None
+            async with ledger.transaction() as txn:
+                await txn.update('CREATE (:Person {name: "Dee"})')
+            assert txn.committed is not None
             past = await ledger.at(t=1)
             assert len(await past.query("MATCH (p:Person) RETURN p")) == 3
 

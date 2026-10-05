@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+from dataclasses import replace as _dc_replace
 import json
 import os
 import re
@@ -14,7 +15,7 @@ from collections.abc import Callable, Mapping
 from typing import Any, Literal as _Literal, TypeVar, Union
 
 from fluree import _fluree
-from fluree._cypher import CypherTransaction, _params, _table
+from fluree._cypher import _params, _table
 from fluree._records import (
     Branch,
     Change,
@@ -290,17 +291,20 @@ class Ledger:
         The language is told from the text (``language`` overrides it); a
         path is read as a file, ``.rq``/``.ru`` as SPARQL and
         ``.cypher``/``.cyp``/``.cql`` as Cypher. A Cypher write may be a ``;``
-        script, committed all or nothing; its ``$name`` parameters come from
+        script, committed all or nothing — and mixes with the other languages
+        inside a :meth:`transaction`; its ``$name`` parameters come from
         ``parameters`` and keyword arguments, and the records a ``RETURN``
         produces are the commit's ``result``.
         """
         kind, payload = _update_payload(transaction, language)
         params = _params(parameters, kwparameters)
         if kind == "cypher":
-            if message is not None:
-                raise InvalidRequestError("message= is not yet supported for Cypher writes")
-            commit, table = self._connection._native.cypher_update(self._id, payload, params, self._policy)
-            return Commit(**commit, result=_table(table) if table[0] else None)
+            # A Cypher write stages like any other, in a transaction of its
+            # own; one whose RETURN was read is run again on a conflict.
+            result, commit = self._retrying(
+                lambda txn: txn.update(payload, params, language="cypher"), message
+            )
+            return _dc_replace(commit, result=result)
         _no_parameters(params)
         return self._transact("update", kind, payload, message)
 
@@ -346,13 +350,19 @@ class Ledger:
         returns. An exception from ``fn`` rolls the transaction back and
         propagates.
         """
+        return self._retrying(lambda txn: fn(txn, *args, **kwargs), None)[0]
+
+    def _retrying(self, fn: Callable[[Transaction], _T], message: str | None) -> tuple[_T, Commit]:
+        """``fn(txn)`` and its committed transaction's :class:`Commit`, run
+        again on a conflict at commit."""
         for attempt in range(_TRANSACT_ATTEMPTS):
-            txn = self.transaction()
+            txn = self.transaction(message=message)
             try:
-                result = fn(txn, *args, **kwargs)
+                result = fn(txn)
                 if txn._native.is_open:
                     txn.commit()
-                return result
+                assert txn.committed is not None
+                return result, txn.committed
             except ConflictError:
                 # Only a conflict on this transaction's own commit is retried.
                 if txn._native.is_open or attempt + 1 == _TRANSACT_ATTEMPTS:
@@ -410,11 +420,6 @@ class Ledger:
             self._run, query, max_fuel, timeout,
             language=language, params=_params(parameters, kwparameters),
         )
-
-    def cypher_transaction(self) -> CypherTransaction:
-        """Open a :class:`CypherTransaction` for several Cypher statements
-        committed together."""
-        return CypherTransaction(self._connection._native.begin_cypher(self._id, self._policy))
 
     def stream(
         self,
@@ -995,9 +1000,9 @@ class Transaction:
 
     - a transaction that was only written to is staged again on top of it —
       each update's ``WHERE`` matches the new data;
-    - a transaction that was also *read* (``query`` or ``explain``)
-      raises :class:`ConflictError` on :meth:`commit`, since what was read may
-      have decided what was written. Run it again, or use
+    - a transaction that was also *read* (``query``, ``explain``, or the
+      ``RETURN`` records of a Cypher write) raises :class:`ConflictError` on
+      :meth:`commit`, since what was read may have decided what was written. Run it again, or use
       :meth:`Ledger.transact`, which does.
 
     As a context manager it commits on a clean exit and rolls back on an
@@ -1038,17 +1043,23 @@ class Transaction:
     def update(
         self,
         transaction: str | dict[str, Any] | os.PathLike[str],
+        parameters: Mapping[str, Any] | None = None,
         *,
         language: Language | None = None,
-    ) -> None:
-        """Stage an update; see :meth:`Ledger.update`."""
+        **kwparameters: Any,
+    ) -> Result | None:
+        """Stage an update — SPARQL UPDATE, a Cypher write, or JSON-LD; see
+        :meth:`Ledger.update`. A Cypher write returns the records of its
+        ``RETURN`` (``None`` without one); receiving them counts as reading
+        the transaction."""
         kind, payload = _update_payload(transaction, language)
+        params = _params(parameters, kwparameters)
         if kind == "cypher":
-            raise InvalidRequestError(
-                "Cypher writes inside transaction() are not supported yet; "
-                "use ledger.cypher_transaction()"
-            )
+            table = self._native.stage_cypher(payload, params)
+            return None if table is None else _table(table)
+        _no_parameters(params)
         self._native.stage("update", kind, payload)
+        return None
 
     def query(
         self,

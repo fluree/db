@@ -64,7 +64,7 @@ from fluree._records import (
     VerifyReport,
 )
 
-__all__ = ["Connection", "CypherTransaction", "Ledger", "RowStream", "Snapshot", "Transaction", "connect"]
+__all__ = ["Connection", "Ledger", "RowStream", "Snapshot", "Transaction", "connect"]
 
 T = TypeVar("T")
 
@@ -320,16 +320,6 @@ class Ledger:
             )
         )
 
-    def cypher_transaction(self) -> _Opening[CypherTransaction]:
-        """Open a :class:`CypherTransaction`. Await it, or use it with
-        ``async with`` to commit on a clean exit and roll back on an
-        exception."""
-
-        async def open() -> CypherTransaction:
-            return CypherTransaction(await _call(self._sync.cypher_transaction))
-
-        return _Opening(open)
-
     def stream(
         self,
         query: Query,
@@ -578,9 +568,14 @@ class Transaction:
         await _call(self._sync.upsert, data, format=format)
 
     async def update(
-        self, transaction: str | dict[str, Any] | os.PathLike[str], *, language: Language | None = None
-    ) -> None:
-        await _call(self._sync.update, transaction, language=language)
+        self,
+        transaction: str | dict[str, Any] | os.PathLike[str],
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: Language | None = None,
+        **kwparameters: Any,
+    ) -> Result | None:
+        return await _call(self._sync.update, transaction, parameters, language=language, **kwparameters)
 
     async def query(
         self,
@@ -619,37 +614,6 @@ class Transaction:
     async def _close(self) -> None:
         if self._sync._native.is_open:
             await self.rollback()
-
-
-class CypherTransaction:
-    """Cypher statements committed together; see
-    :class:`fluree.CypherTransaction`."""
-
-    __slots__ = ("_sync",)
-
-    def __init__(self, sync: fluree.CypherTransaction) -> None:
-        self._sync = sync
-
-    @property
-    def committed(self) -> Commit | None:
-        return self._sync.committed
-
-    async def __aenter__(self) -> CypherTransaction:
-        return self
-
-    async def __aexit__(self, exc_type: object, *exc: object) -> None:
-        await _call(self._sync.__exit__, exc_type, *exc)
-
-    async def run(
-        self, query: str, parameters: Mapping[str, Any] | None = None, **kwparameters: Any
-    ) -> Result:
-        return await _call(self._sync.run, query, parameters, **kwparameters)
-
-    async def commit(self) -> Commit:
-        return await _call(self._sync.commit)
-
-    async def rollback(self) -> None:
-        await _call(self._sync.rollback)
 
 
 _END = object()

@@ -36,6 +36,5 @@ fn _fluree(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<stream::RowStream>()?;
     m.add_class::<transaction::Transaction>()?;
     m.add_class::<query::Canceller>()?;
-    m.add_class::<cypher::CypherTransaction>()?;
     Ok(())
 }

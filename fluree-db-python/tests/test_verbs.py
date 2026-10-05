@@ -100,11 +100,9 @@ def test_unsupported_cypher_combinations(ledger):
         ledger.stream(CYPHER_NAMES)
     with pytest.raises(InvalidRequestError):
         ledger._connection.query(CYPHER_NAMES)
-    with pytest.raises(InvalidRequestError, match="cypher_transaction"):
+    with pytest.raises(InvalidRequestError, match=r"query\(\)"):
         with ledger.transaction() as txn:
-            txn.update('CREATE (:Person {name: "Gil"})')
-    with pytest.raises(InvalidRequestError):
-        ledger.update('CREATE (:Person {name: "Hal"})', message="not yet")
+            txn.update("MATCH (p) RETURN p")
     assert len(ledger.query(CYPHER_NAMES, timeout=30)) == 2
 
 

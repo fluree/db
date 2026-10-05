@@ -1,66 +1,18 @@
-"""Cypher: decoding typed result cells into Python values and graph objects,
-and explicit Cypher transactions."""
+"""Cypher: parameters in, and typed result cells decoded into Python values
+and graph objects."""
 
 from __future__ import annotations
 
 import datetime as _dt
 from collections.abc import Mapping
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from fluree._graph import Node, Path, Relationship
-from fluree._records import Commit, _jsonld_term, _node
+from fluree._records import _jsonld_term, _node
 from fluree._results import Result, _record_type
 from fluree._terms import _datetime
 from fluree.errors import InvalidRequestError
-
-if TYPE_CHECKING:
-    from fluree import _fluree
-
-
-class CypherTransaction:
-    """Cypher statements committed together, all or nothing.
-
-    Get one from :meth:`Ledger.cypher_transaction`. ``run`` executes a
-    statement: writes stage in the transaction, reads see what it has
-    staged, and nothing is visible on the ledger until :meth:`commit`. As a
-    context manager it commits on a clean exit and rolls back on an
-    exception. If another commit lands on the ledger first, :meth:`commit`
-    raises :class:`ConflictError`; run the transaction again.
-    """
-
-    __slots__ = ("_native", "committed")
-
-    def __init__(self, native: _fluree.CypherTransaction) -> None:
-        self._native = native
-        self.committed: Commit | None = None
-
-    def __repr__(self) -> str:
-        return f"<CypherTransaction {'open' if self._native.is_open else 'closed'}>"
-
-    def __enter__(self) -> CypherTransaction:
-        return self
-
-    def __exit__(self, exc_type: object, *exc: object) -> None:
-        if not self._native.is_open:
-            return
-        if exc_type is None:
-            self.commit()
-        else:
-            self.rollback()
-
-    def run(self, query: str, parameters: Mapping[str, Any] | None = None, **kwparameters: Any) -> Result:
-        """Run a Cypher statement (or ``;`` script) in the transaction.
-        Parameters (``$name``) come from ``parameters`` and keyword
-        arguments."""
-        return _table(self._native.run(query, _params(parameters, kwparameters)))
-
-    def commit(self) -> Commit:
-        self.committed = Commit(**self._native.commit())
-        return self.committed
-
-    def rollback(self) -> None:
-        self._native.rollback()
 
 
 def _params(parameters: Mapping[str, Any] | None, kwparameters: dict[str, Any]) -> dict[str, Any] | None:

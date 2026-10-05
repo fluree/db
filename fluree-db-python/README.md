@@ -126,12 +126,12 @@ commit.result.single()["p"]
   for it), `fluree.Relationship` (`type`, `start_node`, `end_node`) and
   `fluree.Path`.
 - A Cypher write runs through `update()`; the records its `RETURN` produces
-  are the commit's `result`. `with people.cypher_transaction() as tx:
-  tx.run(...)` groups statements into one atomic commit.
+  are the commit's `result`. Inside `with people.transaction() as txn:`,
+  `txn.update(...)` stages Cypher alongside SPARQL and JSON-LD writes, each
+  seeing the others, in one commit.
 - Cypher and SPARQL see the same data: Cypher's names are bare IRIs (`Person`
   is `<Person>`).
-- Not yet for Cypher: `max_fuel`, `profile()`, `stream()`, and `message=` on
-  writes.
+- Not yet for Cypher: `max_fuel`, `profile()` and `stream()`.
 
 ## History
 

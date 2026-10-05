@@ -19,7 +19,6 @@ JSON-LD or Turtle and query it with SPARQL or JSON-LD::
 """
 
 from fluree._connection import Connection, Ledger, QueryProfile, Snapshot, Transaction, connect
-from fluree._cypher import CypherTransaction
 from fluree._graph import Node, Path, Relationship
 from fluree._records import (
     Branch,
@@ -59,7 +58,6 @@ __all__ = [
     "Conflict",
     "ConflictError",
     "Connection",
-    "CypherTransaction",
     "FlureeError",
     "IndexStatus",
     "InvalidRequestError",

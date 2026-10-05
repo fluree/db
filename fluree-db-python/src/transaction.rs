@@ -1,12 +1,16 @@
 //! The native transaction behind `fluree.Transaction`: writes staged one at a
 //! time, readable before they commit, committed as one commit.
 
-use crate::connection::{commit_opts, operation, receipt_to_py, write_policy, Snapshot};
+use crate::connection::{commit_opts, operation, receipt_to_py, Snapshot};
+use crate::cypher;
 use crate::error::{api_error, invalid_request};
 use crate::runtime::{block_on, InRuntime};
+use fluree_db_api::cypher_import::split_statements;
+use fluree_db_api::cypher_write::cypher_statement_is_write;
+use fluree_db_api::QueryExecutionOptions;
 use fluree_db_api::{Fluree, GovernanceOptions, GraphDb};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyTuple};
 use std::sync::Mutex;
 
 #[pyclass(frozen, module = "fluree._fluree")]
@@ -35,11 +39,8 @@ impl Transaction {
         ledger: &str,
         policy: Option<GovernanceOptions>,
     ) -> PyResult<Self> {
-        let txn = block_on(py, async {
-            let context = write_policy(fluree, ledger, policy.as_ref()).await?;
-            fluree.begin_transaction(ledger, context).await
-        })?
-        .map_err(api_error)?;
+        let txn =
+            block_on(py, fluree.begin_transaction(ledger, policy.clone()))?.map_err(api_error)?;
         Ok(Self {
             fluree: InRuntime::new(fluree.clone()),
             ledger: ledger.to_string(),
@@ -79,6 +80,21 @@ impl Transaction {
     }
 }
 
+impl Transaction {
+    /// The staged state, governed and carrying the default context as
+    /// `Connection.snapshot` views are. Reading it marks the transaction read.
+    async fn view(&self, txn: &EngineTxn) -> fluree_db_api::Result<GraphDb> {
+        let fluree = &*self.fluree;
+        let view = txn.db().await?;
+        let view = match &self.policy {
+            Some(policy) => fluree.wrap_policy(view, policy).await?,
+            None => fluree.wrap_policy_defaults(view).await?,
+        };
+        let context = fluree.get_default_context(&self.ledger).await?;
+        Ok(view.with_default_context(context))
+    }
+}
+
 #[pymethods]
 impl Transaction {
     #[getter]
@@ -103,22 +119,57 @@ impl Transaction {
         self.with_txn(|txn| block_on(py, txn.get_mut().stage(operation))?.map_err(api_error))
     }
 
+    /// Stage a Cypher write — one statement or a `;` script, whose
+    /// statements stage in turn; a read statement in it reads the staged
+    /// state. Returns the last statement's table, or `None`.
+    #[pyo3(signature = (query, params = None))]
+    fn stage_cypher<'py>(
+        &self,
+        py: Python<'py>,
+        query: &str,
+        params: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        if !cypher::is_write(query)? {
+            return Err(crate::error::invalid_request(
+                "this Cypher statement only reads; run it with query()",
+            ));
+        }
+        let params = cypher::params(params)?;
+        let rows = self.with_txn(|txn| {
+            block_on(py, async {
+                let mut last = None;
+                for statement in split_statements(query) {
+                    last = if cypher_statement_is_write(&statement)? {
+                        txn.get_mut()
+                            .stage_cypher(&statement, params.clone())
+                            .await?
+                    } else {
+                        let view = self.view(txn).await?;
+                        Some(
+                            cypher::read_table(
+                                &self.fluree,
+                                &view,
+                                &statement,
+                                params.as_ref(),
+                                &QueryExecutionOptions::default(),
+                            )
+                            .await?,
+                        )
+                    };
+                }
+                Ok::<_, fluree_db_api::ApiError>(last)
+            })?
+            .map_err(api_error)
+        })?;
+        rows.map(|table| cypher::table_to_py(py, &table))
+            .transpose()
+    }
+
     /// The ledger as the staged writes leave it, governed and carrying the
     /// default context as `Connection.snapshot` views are.
     fn snapshot(&self, py: Python<'_>) -> PyResult<Snapshot> {
         let fluree = &*self.fluree;
-        let db = self.with_txn(|txn| {
-            block_on(py, async {
-                let view = txn.db().await?;
-                let view: GraphDb = match &self.policy {
-                    Some(policy) => fluree.wrap_policy(view, policy).await?,
-                    None => fluree.wrap_policy_defaults(view).await?,
-                };
-                let context = fluree.get_default_context(&self.ledger).await?;
-                Ok::<_, fluree_db_api::ApiError>(view.with_default_context(context))
-            })?
-            .map_err(api_error)
-        })?;
+        let db = self.with_txn(|txn| block_on(py, self.view(txn))?.map_err(api_error))?;
         Ok(Snapshot::new(fluree, db))
     }
 

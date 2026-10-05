@@ -488,29 +488,6 @@ impl Connection {
         cypher::read(py, fluree, &db, cypher, params.as_ref(), controls)
     }
 
-    /// A Cypher write — one statement or a `;` script — committed all or
-    /// nothing. Returns `(commit, (columns, rows))`, the rows a `RETURN`
-    /// produced.
-    #[pyo3(signature = (ledger, cypher, params = None, policy = None))]
-    fn cypher_update<'py>(
-        &self,
-        py: Python<'py>,
-        ledger: &str,
-        cypher: &str,
-        params: Option<&Bound<'py, PyAny>>,
-        policy: Option<&Bound<'py, PyAny>>,
-    ) -> PyResult<(Bound<'py, PyDict>, Bound<'py, PyTuple>)> {
-        if !cypher::is_write(cypher)? {
-            return Err(invalid_request(
-                "this Cypher statement only reads; run it with query()",
-            ));
-        }
-        let id = canonical(ledger)?;
-        let params = cypher::params(params)?;
-        let governance = governance(policy)?.unwrap_or_default();
-        cypher::write(py, &self.fluree, &id, cypher, params.as_ref(), governance)
-    }
-
     /// The plan a Cypher read would run with.
     #[pyo3(signature = (ledger, cypher, params = None, at = None, policy = None))]
     fn explain_cypher<'py>(
@@ -533,18 +510,6 @@ impl Connection {
         })?
         .map_err(api_error)?;
         from_json(py, &plan)
-    }
-
-    /// Open an explicit Cypher transaction on `ledger`.
-    #[pyo3(signature = (ledger, policy = None))]
-    fn begin_cypher(
-        &self,
-        py: Python<'_>,
-        ledger: &str,
-        policy: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<cypher::CypherTransaction> {
-        let governance = governance(policy)?.unwrap_or_default();
-        cypher::CypherTransaction::begin(py, &self.fluree, &canonical(ledger)?, governance)
     }
 
     /// Open a transaction on `ledger`; its writes are checked against
