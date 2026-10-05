@@ -1056,6 +1056,142 @@ async fn ledger_route_dataset_references_resolve_in_the_paths_ledger() {
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
+/// JSON-LD dataset shapes on the ledger route that name the path's ledger or
+/// one of its graphs read there, on both of the route's execution paths (the
+/// ledger's view, and the connection path `opts.default-allow` takes): the
+/// ledger's own address in any spelling names it, with a pin it reads the
+/// ledger at that time, a graph keyword in a `from` array names the ledger's
+/// graph, `opts.from` is read where the parser reads it (another ledger there
+/// is refused), and an empty `from` array is a client error.
+#[tokio::test]
+async fn ledger_route_jsonld_dataset_shapes_read_in_the_paths_ledger() {
+    let (_tmp, app) = scoped_app().await;
+    // A second default-graph name at t=2, so a pin at t=1 is visible.
+    let (status, _) = post(
+        &app,
+        &format!("/v1/fluree/upsert/{SCOPED_LEDGER}"),
+        "application/trig",
+        "@prefix ex: <http://ex.org/> .\nex:e1 ex:name \"E\" .\n".to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "second upsert");
+
+    let names_query = serde_json::json!({
+        "@context": {"ex": "http://ex.org/"},
+        "select": "?n",
+        "where": {"@id": "?s", "ex:name": "?n"}
+    });
+    let commits_query = serde_json::json!({
+        "@context": {"f": "https://ns.flur.ee/db#"},
+        "select": "?t",
+        "where": {"@id": "?c", "f:t": "?t"}
+    });
+    // (case, dataset keys, query, expected status, expected rows as text)
+    let cases: Vec<(&str, JsonValue, &JsonValue, StatusCode, Vec<&str>)> = vec![
+        (
+            "own short id",
+            serde_json::json!({"from": "dscope"}),
+            &names_query,
+            StatusCode::OK,
+            vec!["D", "E"],
+        ),
+        (
+            "own URN",
+            serde_json::json!({"from": "urn:fluree:dscope:main"}),
+            &names_query,
+            StatusCode::OK,
+            vec!["D", "E"],
+        ),
+        (
+            "own short id with a pin",
+            serde_json::json!({"from": "dscope@t:1"}),
+            &names_query,
+            StatusCode::OK,
+            vec!["D"],
+        ),
+        (
+            "own id with a pin",
+            serde_json::json!({"from": "dscope:main@t:1"}),
+            &names_query,
+            StatusCode::OK,
+            vec!["D"],
+        ),
+        (
+            "a keyword in a from array",
+            serde_json::json!({"from": ["txn-meta"]}),
+            &commits_query,
+            StatusCode::OK,
+            vec!["1", "2"],
+        ),
+        (
+            "an empty from array",
+            serde_json::json!({"from": []}),
+            &names_query,
+            StatusCode::BAD_REQUEST,
+            vec![],
+        ),
+        (
+            "opts.from naming a graph",
+            serde_json::json!({"opts": {"from": "dscope:main#http://ex.org/vocab#products"}}),
+            &names_query,
+            StatusCode::OK,
+            vec!["P"],
+        ),
+        (
+            "opts.from naming another ledger",
+            serde_json::json!({"opts": {"from": "other-ledger:main"}}),
+            &names_query,
+            StatusCode::BAD_REQUEST,
+            vec![],
+        ),
+    ];
+    let text = |v: &JsonValue| match v {
+        JsonValue::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let mut failures = Vec::new();
+    for (case, dataset, query, status_want, rows_want) in &cases {
+        for connection_path in [false, true] {
+            let mut body = (*query).clone();
+            for (k, v) in dataset.as_object().unwrap() {
+                body[k] = v.clone();
+            }
+            if connection_path {
+                body["opts"]["default-allow"] = JsonValue::Bool(true);
+            }
+            let (status, json) = post(
+                &app,
+                &format!("/v1/fluree/query/{SCOPED_LEDGER}"),
+                "application/json",
+                body.to_string(),
+            )
+            .await;
+            let lane = if connection_path {
+                "connection path"
+            } else {
+                "view"
+            };
+            if status != *status_want {
+                failures.push(format!("{case} ({lane}): {status} {json}"));
+                continue;
+            }
+            if status == StatusCode::OK {
+                let mut rows: Vec<String> = json
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{case}: no rows in {json}"))
+                    .iter()
+                    .map(text)
+                    .collect();
+                rows.sort();
+                if rows != *rows_want {
+                    failures.push(format!("{case} ({lane}): rows {rows:?}"));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
 /// On the ledger routes the ledger's own address with a reserved keyword
 /// names that reserved graph, in writes and reads alike, as its `urn:fluree:`
 /// form does: `L#config` writes and reads the config graph, a write to
