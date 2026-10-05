@@ -265,14 +265,25 @@ fn is_uncorrelated_exists(patterns: &[Pattern], batch_schema: &[VarId]) -> bool 
 }
 
 /// The seed an `EXISTS` body or a pattern comprehension correlates with: the
-/// row's bindings, except that a per-group list (`Binding::Grouped`, which a
-/// JSON-LD group row can carry for a projected non-key variable) seeds as
+/// row's bindings, except that a per-group list (`Binding::Grouped`) seeds as
 /// unbound. A list is not a term the pattern can match, and the group row does
 /// not bind that variable to one value, so it is free in the pattern, as any
 /// variable the grouping does not produce is ([`Expression::row_reads`]).
+///
+/// No query reaches the list case today, so a debug build asserts it away: a
+/// change that makes it reachable fails loudly there and needs its own test.
+/// Release builds keep the spec reading above.
 fn correlation_seed(batch: &Batch, row_idx: usize) -> SeedOperator {
     let width = batch.schema().len();
-    if !(0..width).any(|col| matches!(batch.get_by_col(row_idx, col), Binding::Grouped(_))) {
+    let carries_list =
+        (0..width).any(|col| matches!(batch.get_by_col(row_idx, col), Binding::Grouped(_)));
+    // Unreachable today: a variable only an EXISTS or comprehension body reads
+    // is not a row read, so dependency tracing keeps it out of the group row.
+    debug_assert!(
+        !carries_list,
+        "a per-group list reached an EXISTS / pattern-comprehension seed"
+    );
+    if !carries_list {
         return SeedOperator::from_batch_row(batch, row_idx);
     }
     let schema: Arc<[VarId]> = Arc::from(batch.schema().to_vec().into_boxed_slice());
