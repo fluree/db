@@ -13,6 +13,9 @@ use fluree_vocab::xsd;
 
 use super::{LowerError, LoweringContext, Result};
 
+/// `f:fulltext(?text, "query")`, the namespaced spelling of `fulltext`.
+const FULLTEXT_FUNCTION: &str = "https://ns.flur.ee/db#fulltext";
+
 impl<E: IriEncoder> LoweringContext<'_, E> {
     pub(super) fn lower_expression(&mut self, expr: &AstExpression) -> Result<Expression> {
         match expr {
@@ -328,6 +331,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             FunctionName::DotProduct => Function::DotProduct,
             FunctionName::CosineSimilarity => Function::CosineSimilarity,
             FunctionName::EuclideanDistance => Function::EuclideanDistance,
+            FunctionName::Fulltext => Function::Fulltext,
 
             // Handled by the `not_implemented` early return above.
             FunctionName::Triple
@@ -345,6 +349,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     "http://www.opengis.net/def/function/geosparql/distance" => {
                         Function::GeofDistance
                     }
+                    FULLTEXT_FUNCTION => Function::Fulltext,
                     // XSD datatype constructor (cast) functions — W3C SPARQL 1.1 §17.5
                     xsd::BOOLEAN => Function::XsdBoolean,
                     xsd::INTEGER => Function::XsdInteger,
