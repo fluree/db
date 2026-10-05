@@ -983,17 +983,17 @@ fn cypher_db(ledger: &MemoryLedger) -> fluree_db_api::GraphDb {
 }
 
 /// A grouped-read error does not print an internal variable. A Cypher
-/// property access (`e.area`) is a synthetic variable (`?#__prop_e_area`);
-/// ORDER BY reading it after an aggregating WITH used to be reported by that
-/// name.
+/// property access (`e.name`) is a synthetic variable (`?#__prop_e_name`);
+/// ORDER BY reading it after an aggregating WITH that does not project `e`
+/// (so `e` is out of scope there) used to be reported by that name.
 #[tokio::test]
 async fn cypher_grouped_read_error_names_no_internal_variable() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_typed_areas(&fluree, "grouped-projection/cypher-internal:main").await;
     let db = cypher_db(&ledger);
-    let query = "MATCH (e:E) WITH e, count(*) AS c ORDER BY e.area RETURN c";
+    let query = "MATCH (e:E) WITH e.area AS a, count(*) AS c ORDER BY e.name RETURN c";
     let Err(err) = fluree.query_cypher(&db, query).await else {
-        panic!("ORDER BY a non-key property after an aggregating WITH must fail: {query}");
+        panic!("ORDER BY a property of a node the WITH does not project must fail: {query}");
     };
     let message = err.to_string();
     assert!(
@@ -1002,6 +1002,116 @@ async fn cypher_grouped_read_error_names_no_internal_variable() {
     );
     for internal in ["?#", "?__", "VarId("] {
         assert!(!message.contains(internal), "{internal} in: {message}");
+    }
+}
+
+/// People who know each other, typed `ex:P`, with ages. Alice also likes Carol.
+async fn seed_people(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@graph": [
+                    {
+                        "@id": "ex:alice", "@type": "ex:P", "ex:age": 40,
+                        "ex:knows": [{"@id": "ex:bob"}, {"@id": "ex:carol"}],
+                        "ex:likes": {"@id": "ex:carol"}
+                    },
+                    {"@id": "ex:bob", "@type": "ex:P", "ex:age": 25, "ex:knows": {"@id": "ex:carol"}},
+                    {"@id": "ex:carol", "@type": "ex:P", "ex:age": 35},
+                    {
+                        "@id": "ex:dave", "@type": "ex:P", "ex:age": 50,
+                        "ex:knows": [{"@id": "ex:alice"}, {"@id": "ex:bob"}, {"@id": "ex:carol"}]
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger
+}
+
+/// After an aggregating `WITH` or `RETURN`, a property of a node the clause
+/// projects (a grouping key) is readable in the `WITH`'s `WHERE` and in either
+/// clause's `ORDER BY`: the key node is the same in every row of its group, so
+/// the property has one value per group (lowered as a `SAMPLE` of it). A
+/// composite alias (`count(f) + 0 AS c`) is visible to the `WITH`'s `WHERE`,
+/// and the variables of an `exists { … }` there are its own, not the
+/// aggregated `f`.
+#[tokio::test]
+async fn cypher_reads_a_key_nodes_property_after_grouping() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "grouped-projection/cypher-key-props:main").await;
+    let db = cypher_db(&ledger);
+    let cypher = |query: &'static str| {
+        let (fluree, db) = (&fluree, &db);
+        async move {
+            let rows = fluree
+                .query_cypher(db, query)
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{query}"))
+                .to_jsonld_async(db.as_graph_db_ref())
+                .await
+                .expect("jsonld");
+            normalize_rows(&rows)
+        }
+    };
+    for (query, expected) in [
+        (
+            "MATCH (p:P)-[:knows]->(f) WITH p, count(f) AS c WHERE c >= 1 AND p.age > 30 \
+             RETURN p.age, c",
+            json!([[40, 2], [50, 3]]),
+        ),
+        (
+            "MATCH (e:P) WITH e, count(*) AS c WHERE e.age > 30 RETURN e.age, c",
+            json!([[40, 1], [35, 1], [50, 1]]),
+        ),
+        (
+            "MATCH (p:P)-[:knows]->(f) WITH p, count(f) AS c ORDER BY p.age LIMIT 2 \
+             RETURN p.age, c",
+            json!([[25, 1], [40, 2]]),
+        ),
+        (
+            "MATCH (p:P)-[:knows]->(f) WITH p, count(f) AS c ORDER BY p.age DESC LIMIT 1 \
+             RETURN p.age, c",
+            json!([[50, 3]]),
+        ),
+        (
+            "MATCH (p:P)-[:knows]->(f) WITH p, count(f) + 0 AS c WHERE c > 1 RETURN p.age, c",
+            json!([[40, 2], [50, 3]]),
+        ),
+        (
+            "MATCH (p:P)-[:knows]->(f) WITH p, count(f) AS c \
+             WHERE exists { (p)-[:likes]->(f) } RETURN p.age, c",
+            json!([[40, 2]]),
+        ),
+    ] {
+        assert_eq!(cypher(query).await, normalize_rows(&expected), "{query}");
+    }
+
+    // An aggregating RETURN orders by a key node's property.
+    for (query, count) in [
+        (
+            "MATCH (p:P)-[:knows]->(f) RETURN p, count(f) AS c ORDER BY p.age DESC LIMIT 1",
+            3,
+        ),
+        (
+            "MATCH (p:P)-[:knows]->(f) RETURN p, count(f) AS c ORDER BY p.age LIMIT 1",
+            1,
+        ),
+    ] {
+        let cj = fluree
+            .query_cypher(&db, query)
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{query}"))
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .expect("cypher json");
+        let data = cj["results"][0]["data"].as_array().expect("rows");
+        assert_eq!(data.len(), 1, "{query}: {cj}");
+        assert_eq!(data[0]["row"][1], json!(count), "{query}: {cj}");
     }
 }
 

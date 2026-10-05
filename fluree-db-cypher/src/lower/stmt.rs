@@ -399,7 +399,7 @@ fn lower_return<E: IriEncoder>(
 
     let order_by = align_order_by_with_projection(&r.items, &r.order_by);
     reject_order_by_on_list(ctx, &order_by, &projection.list_outputs)?;
-    let ordering = lower_order_by(ctx, &order_by, patterns)?;
+    let mut ordering = lower_order_by(ctx, &order_by, patterns)?;
 
     // GROUP BY keys are only meaningful when aggregates exist; if not,
     // pass an empty list so Grouping::assemble produces None.
@@ -408,6 +408,17 @@ fn lower_return<E: IriEncoder>(
     } else {
         projection.group_keys
     };
+    let mut aggregates = projection.aggregates;
+    if !aggregates.is_empty() {
+        sample_key_properties(
+            ctx,
+            &group_keys,
+            &mut aggregates,
+            None,
+            &mut ordering,
+            patterns,
+        );
+    }
 
     Ok((
         output,
@@ -415,9 +426,60 @@ fn lower_return<E: IriEncoder>(
         limit,
         offset,
         group_keys,
-        projection.aggregates,
+        aggregates,
         projection.post_binds,
     ))
+}
+
+/// After an aggregating `WITH` or `RETURN`, a property read of a node the
+/// grouping keys on (`p.age` with `p` a key, in the `WITH`'s `WHERE` or either
+/// clause's `ORDER BY`) is lowered as an accessor triple in the body before
+/// grouping, so it reads a variable that is not a key. Every solution of a
+/// group has the same key node, so a single-valued property has one value per
+/// group: rewrite those reads to `SAMPLE`, which is then exact (the SPARQL
+/// rewrite, [`fluree_db_query::ir::sample_ungrouped_reads`], restricted to
+/// accessors of key nodes). A property of a node the clause does not project
+/// is left alone and stays a plan error: that node is out of scope there.
+fn sample_key_properties<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    keys: &[VarId],
+    aggregates: &mut Vec<AggregateSpec>,
+    having: Option<&mut fluree_db_query::ir::Expression>,
+    ordering: &mut [SortSpec],
+    patterns: &[Pattern],
+) {
+    // The accessor triples `resolve_property_accessor` emitted for key nodes:
+    // `OPTIONAL { ?key <p> ?#__prop_key_p }`.
+    let key_properties: std::collections::HashSet<VarId> = patterns
+        .iter()
+        .filter_map(|p| match p {
+            Pattern::Optional(inner) => match inner.as_slice() {
+                [Pattern::Triple(tp)] => {
+                    let (node, value) = (tp.s.as_var()?, tp.o.as_var()?);
+                    (keys.contains(&node)
+                        && ctx
+                            .vars
+                            .try_name(value)
+                            .is_some_and(|name| name.starts_with("?#__prop_")))
+                    .then_some(value)
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    if key_properties.is_empty() {
+        return;
+    }
+    fluree_db_query::ir::sample_ungrouped_reads(
+        keys,
+        aggregates,
+        having,
+        &mut [],
+        ordering,
+        || key_properties,
+        &mut |_| ctx.fresh_synth(),
+    );
 }
 
 /// Shared state used while lowering a projection list (RETURN, WITH).
@@ -1269,21 +1331,28 @@ fn lower_with<E: IriEncoder>(
         projection.group_keys
     };
 
-    let grouping = Grouping::assemble(
-        group_keys,
-        projection.aggregates,
-        projection.post_binds,
-        having,
-    )
-    .map_err(|e| LowerError::generic(e.to_string()))?;
-
     // ORDER BY may also reference property accessors; emit any
     // resulting auxiliary triples into the subquery body before we
     // hand patterns to SubqueryPattern. Align accessor/var keys that match an
     // aliased projection item to that alias (so they survive grouping).
     let order_by = align_order_by_with_projection(&w.items, &w.order_by);
     reject_order_by_on_list(ctx, &order_by, &list_outputs)?;
-    let ordering = lower_order_by(ctx, &order_by, &mut inner_patterns)?;
+    let mut ordering = lower_order_by(ctx, &order_by, &mut inner_patterns)?;
+
+    let mut aggregates = projection.aggregates;
+    let mut having = having;
+    if !aggregates.is_empty() {
+        sample_key_properties(
+            ctx,
+            &group_keys,
+            &mut aggregates,
+            having.as_mut(),
+            &mut ordering,
+            &inner_patterns,
+        );
+    }
+    let grouping = Grouping::assemble(group_keys, aggregates, projection.post_binds, having)
+        .map_err(|e| LowerError::generic(e.to_string()))?;
 
     // SubqueryOperator runs Project BEFORE Sort. Sort keys not in
     // `select` are dropped before the sort can see them, silently
