@@ -1024,6 +1024,27 @@ async fn sparql_values_bound_reifies_predicate_does_not_leak() {
     }
 }
 
+/// A VALUES row naming an `f:reifies*` IRI is refused wherever the VALUES
+/// block sits: inside the WHERE, or as the trailing VALUES clause, which is
+/// kept outside the WHERE patterns and used to skip the check.
+#[tokio::test]
+async fn sparql_values_row_naming_reifies_is_refused_in_both_positions() {
+    let (fluree, ledger) = seed_alice_engineer("it/sparql-ann/values-pred-positions").await;
+    let iri = "<https://ns.flur.ee/db#reifiesSubject>";
+    for sparql in [
+        format!("SELECT ?s ?o WHERE {{ VALUES ?p {{ {iri} }} ?s ?p ?o }}"),
+        format!("SELECT ?s ?o WHERE {{ ?s ?p ?o }} VALUES ?p {{ {iri} }}"),
+    ] {
+        let Err(err) = support::query_sparql(&fluree, &ledger, &sparql).await else {
+            panic!("a VALUES row naming f:reifiesSubject must be refused: {sparql}");
+        };
+        assert!(
+            err.to_string().contains("system-controlled"),
+            "{sparql}: {err}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn jsonld_values_bound_reifies_predicate_does_not_leak() {
     // READ-1 regression (JSON-LD): same leak as the SPARQL case but via

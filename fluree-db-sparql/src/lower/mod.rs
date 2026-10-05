@@ -139,6 +139,11 @@ pub fn lower_sparql_with_source<E: IriEncoder>(
     // contract-level boundary, identical for SPARQL and JSON-LD.
     if let Ok(query) = &result {
         reject_direct_reifies_in_patterns(&query.patterns)?;
+        // The trailing VALUES clause is kept out of `patterns`; its rows get
+        // the same check as an in-WHERE VALUES block's.
+        if let Some(post_values) = &query.post_values {
+            reject_direct_reifies_in_patterns(&post_values.to_patterns())?;
+        }
     }
 
     result
