@@ -35,6 +35,8 @@ mod it_reindex_class_stats;
 mod it_reindex_pre_build_perf;
 #[path = "it_reindex_schema.rs"]
 mod it_reindex_schema;
+#[path = "it_stats_sketch_format.rs"]
+mod it_stats_sketch_format;
 #[path = "it_time_travel_indexing.rs"]
 mod it_time_travel_indexing;
 #[path = "it_trigger_index_incremental.rs"]

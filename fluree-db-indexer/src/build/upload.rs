@@ -1,15 +1,18 @@
 //! CAS upload primitives and index artifact upload.
 //!
 //! Contains low-level helpers for writing content to a `ContentStore`
-//! (`upload_dict_blob`, `upload_dict_file`) and the bounded-parallelism
+//! (`upload_dict_blob`, `upload_dict_file`, `upload_stats_sketch`) and the bounded-parallelism
 //! `upload_indexes_to_cas` function for uploading index branches and leaves.
 
 use fluree_db_binary_index::RunSortOrder;
 use fluree_db_core::tracking::Tracker;
 use fluree_db_core::{ContentId, ContentKind, ContentStore, GraphId};
 
+use std::collections::HashMap;
+
 use crate::error::{IndexerError, Result};
 use crate::fuel::charge_extra_leaflets;
+use crate::stats::{GraphPropertyKey, HllSketchBlob, IdPropertyHll};
 
 use super::types::UploadedIndexes;
 
@@ -30,6 +33,25 @@ pub(crate) async fn upload_dict_blob(
         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
     tracing::debug!(cid = %cid, bytes = bytes.len(), "{msg}");
     Ok(cid)
+}
+
+/// Encode and upload the stats sketch. `None` when there is nothing to
+/// persist; otherwise the CID and the bytes written, for cache seeding.
+pub(crate) async fn upload_stats_sketch(
+    cs: &dyn ContentStore,
+    index_t: i64,
+    properties: &HashMap<GraphPropertyKey, IdPropertyHll>,
+) -> Result<Option<(ContentId, Vec<u8>)>> {
+    if properties.is_empty() {
+        return Ok(None);
+    }
+    let bytes = HllSketchBlob::from_properties(index_t, properties).to_bytes()?;
+    let cid = cs
+        .put(ContentKind::StatsSketch, &bytes)
+        .await
+        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+    tracing::debug!(%cid, bytes = bytes.len(), entries = properties.len(), "stats sketch uploaded");
+    Ok(Some((cid, bytes)))
 }
 
 /// Read a dict artifact file from disk and upload it to the content store.
