@@ -44,9 +44,6 @@
 
 #![cfg(all(feature = "iceberg", feature = "native"))]
 
-#[path = "support/span_capture.rs"]
-mod span_capture;
-
 use fluree_db_api::{ApiError, FlureeBuilder, FlureeR2rmlProvider, R2rmlCreateConfig};
 use futures::TryStreamExt;
 
@@ -1447,94 +1444,4 @@ async fn a_dropped_graph_source_no_longer_answers() {
         .await
         .unwrap_err();
     assert!(err.is_not_found(), "graph query after drop: {err}");
-}
-
-/// A routing canary pair for the fused R2RML aggregate (#1978): it folds the
-/// key-only grouping from column batches, and declines the same grouping with
-/// a SELECT expression, which it cannot evaluate (the generic pipeline runs it
-/// once per group). Each answer is checked against the fixture's five names.
-#[tokio::test(flavor = "current_thread")]
-async fn fused_aggregate_declines_a_grouped_select_expression() {
-    const SITE: &str = "fused_r2rml_aggregate";
-    let location = table_location();
-    allow_fixture_roots();
-    let fluree = FlureeBuilder::memory().build_memory();
-    let config = R2rmlCreateConfig::new_direct("local-people-agg", &location, PEOPLE_R2RML)
-        .with_mapping_media_type("text/turtle");
-    fluree
-        .create_r2rml_graph_source(config)
-        .await
-        .expect("create local-file graph source");
-
-    let rows_of = |v: &serde_json::Value| -> Vec<String> {
-        let mut vars: Vec<String> = v["head"]["vars"]
-            .as_array()
-            .expect("vars")
-            .iter()
-            .filter_map(|x| x.as_str().map(String::from))
-            .collect();
-        vars.sort();
-        let mut rows: Vec<String> = v["results"]["bindings"]
-            .as_array()
-            .unwrap_or_else(|| panic!("not SPARQL JSON: {v}"))
-            .iter()
-            .map(|b| {
-                vars.iter()
-                    .map(|var| format!("{var}={}", b[var]["value"].as_str().unwrap_or("")))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .collect();
-        rows.sort();
-        rows
-    };
-    let (store, _tracing_guard) = span_capture::init_test_tracing();
-    // A sibling test can register the stamp's callsite under the no-op global
-    // dispatcher while this subscriber is being installed, pinning its
-    // interest to "never". Hit the callsite once, then rebuild the cache.
-    fluree
-        .query_from()
-        .sparql("SELECT (COUNT(?s) AS ?n) FROM <local-people-agg:main> WHERE { ?s <http://example.org/name> ?name }")
-        .execute_formatted()
-        .await
-        .expect("warm-up");
-    tracing::callsite::rebuild_interest_cache();
-    for (sparql, expected, must_fire) in [
-        (
-            "SELECT ?name (COUNT(?s) AS ?n) FROM <local-people-agg:main> \
-             WHERE { ?s <http://example.org/name> ?name } GROUP BY ?name",
-            ["alice", "bob", "carol", "dave", "erin"]
-                .map(|name| format!("n=1 name={name}"))
-                .to_vec(),
-            true,
-        ),
-        (
-            "SELECT ?name (COUNT(?s) AS ?n) (?n * 10 AS ?m) FROM <local-people-agg:main> \
-             WHERE { ?s <http://example.org/name> ?name } GROUP BY ?name",
-            ["alice", "bob", "carol", "dave", "erin"]
-                .map(|name| format!("m=10 n=1 name={name}"))
-                .to_vec(),
-            false,
-        ),
-    ] {
-        let before = store.find_events("fast-path outcome").len();
-        let result = fluree
-            .query_from()
-            .sparql(sparql)
-            .execute_formatted()
-            .await
-            .unwrap_or_else(|e| panic!("{e}\n{sparql}"));
-        let proceeded: Vec<String> = store.find_events("fast-path outcome")[before..]
-            .iter()
-            .filter(|e| e.fields.get("outcome").map(String::as_str) == Some("proceed"))
-            .filter_map(|e| e.fields.get("site").cloned())
-            .collect();
-        assert_eq!(
-            proceeded.iter().any(|s| s == SITE),
-            must_fire,
-            "`{SITE}` must {}proceed [proceeded: {proceeded:?}]\n{sparql}",
-            if must_fire { "" } else { "not " }
-        );
-        assert_eq!(rows_of(&result), expected, "{sparql}");
-    }
 }

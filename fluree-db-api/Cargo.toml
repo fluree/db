@@ -198,6 +198,13 @@ name = "it_iceberg_local_fs"
 path = "tests/it_iceberg_local_fs.rs"
 required-features = ["iceberg", "native"]
 
+# Routing canary for the fused R2RML aggregate on the local Iceberg fixture.
+# Own binary: it asserts the absence of a span-capture event.
+[[test]]
+name = "it_fused_aggregate_routing"
+path = "tests/it_fused_aggregate_routing.rs"
+required-features = ["iceberg", "native"]
+
 # View-policy enforcement on R2RML / Iceberg graph sources, checked against a
 # native twin of the same fixture as the oracle.
 [[test]]
