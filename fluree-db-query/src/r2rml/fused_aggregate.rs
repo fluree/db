@@ -373,6 +373,11 @@ fn fused_r2rml_agg_enabled() -> bool {
     *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_FUSED_R2RML_AGG"))
 }
 
+/// The routing stamp the fused operator records at open: `Proceed` when it
+/// folds from column batches, `Fallback(GateDeclined)` when its open-time
+/// gates send the query to the fallback pipeline.
+pub const FUSED_R2RML_AGGREGATE_SITE: &str = "fused_r2rml_aggregate";
+
 /// Detect the fused shape: a single `GRAPH { triples }` block feeding an
 /// aggregation (implicit, or GROUP BY) of only `COUNT` / `SUM` / `AVG`, with no
 /// HAVING, post-binds, FILTER, ordering, or slicing. Whether the graph is
@@ -1749,8 +1754,13 @@ impl Operator for FusedR2rmlAggregateOperator {
         } else {
             None
         };
+        use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
         if self.resolved.is_none() {
             tracing::debug!("fused R2RML aggregate: gates failed, using fallback pipeline");
+            stamp_fast_path(
+                FUSED_R2RML_AGGREGATE_SITE,
+                FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
+            );
             self.use_fallback = true;
             self.fallback.open(ctx).await?;
         } else {
@@ -1758,6 +1768,7 @@ impl Operator for FusedR2rmlAggregateOperator {
                 aggs = self.aggregates.len(),
                 "fused R2RML aggregate: folding from column batches"
             );
+            stamp_fast_path(FUSED_R2RML_AGGREGATE_SITE, FastPathOutcome::Proceed);
         }
         self.state = OperatorState::Open;
         Ok(())
