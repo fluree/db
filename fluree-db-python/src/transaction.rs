@@ -1,7 +1,7 @@
 //! The native transaction behind `fluree.Transaction`: writes staged one at a
 //! time, readable before they commit, committed as one commit.
 
-use crate::connection::{commit_opts, operation, receipt_to_py, Snapshot};
+use crate::connection::{commit_opts, operation, receipt_to_py, Database, Snapshot};
 use crate::cypher;
 use crate::error::{api_error, invalid_request};
 use crate::runtime::{block_on, InRuntime};
@@ -15,7 +15,7 @@ use std::sync::Mutex;
 
 #[pyclass(frozen, module = "fluree._fluree")]
 pub(crate) struct Transaction {
-    fluree: InRuntime<Fluree>,
+    fluree: Database,
     ledger: String,
     policy: Option<GovernanceOptions>,
     state: Mutex<State>,
@@ -35,14 +35,15 @@ type EngineTxn = InRuntime<fluree_db_api::Transaction>;
 impl Transaction {
     pub(crate) fn begin(
         py: Python<'_>,
-        fluree: &Fluree,
+        database: &Database,
         ledger: &str,
         policy: Option<GovernanceOptions>,
     ) -> PyResult<Self> {
+        let fluree = database.get()?;
         let txn =
             block_on(py, fluree.begin_transaction(ledger, policy.clone()))?.map_err(api_error)?;
         Ok(Self {
-            fluree: InRuntime::new(fluree.clone()),
+            fluree: database.clone(),
             ledger: ledger.to_string(),
             policy,
             state: Mutex::new(State::Open(Box::new(InRuntime::new(txn)))),
@@ -121,12 +122,13 @@ impl Transaction {
         params: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let operation = operation(op, kind, payload, params)?;
+        self.fluree.get()?;
         self.with_txn(|txn| block_on(py, txn.get_mut()?.stage(operation))?.map_err(api_error))
     }
 
     /// Stage a Cypher write — one statement or a `;` script, whose
-    /// statements stage in turn; a read statement in it reads the staged
-    /// state. Returns the last statement's table, or `None`.
+    /// statements stage in turn, all or nothing; a read statement in it
+    /// reads the staged state. Returns the last statement's table, or `None`.
     #[pyo3(signature = (query, params = None))]
     fn stage_cypher<'py>(
         &self,
@@ -144,25 +146,33 @@ impl Transaction {
         let rows = self.with_txn(|txn| {
             let txn = txn.get_mut()?;
             block_on(py, async {
-                let mut last = None;
-                for statement in split_statements(query) {
-                    last = if cypher_statement_is_write(&statement)? {
-                        txn.stage_cypher(&statement, params.clone()).await?
-                    } else {
-                        let view = self.view(fluree, txn).await?;
-                        Some(
-                            cypher::read_table(
-                                fluree,
-                                &view,
-                                &statement,
-                                params.as_ref(),
-                                &QueryExecutionOptions::default(),
+                let savepoint = txn.savepoint();
+                let staged = async {
+                    let mut last = None;
+                    for statement in split_statements(query) {
+                        last = if cypher_statement_is_write(&statement)? {
+                            txn.stage_cypher(&statement, params.clone()).await?
+                        } else {
+                            let view = self.view(fluree, txn).await?;
+                            Some(
+                                cypher::read_table(
+                                    fluree,
+                                    &view,
+                                    &statement,
+                                    params.as_ref(),
+                                    &QueryExecutionOptions::default(),
+                                )
+                                .await?,
                             )
-                            .await?,
-                        )
-                    };
+                        };
+                    }
+                    Ok::<_, fluree_db_api::ApiError>(last)
                 }
-                Ok::<_, fluree_db_api::ApiError>(last)
+                .await;
+                if staged.is_err() {
+                    txn.rollback_to(savepoint).await?;
+                }
+                staged
             })?
             .map_err(api_error)
         })?;
@@ -176,7 +186,7 @@ impl Transaction {
         let fluree = self.fluree.get()?;
         let db =
             self.with_txn(|txn| block_on(py, self.view(fluree, txn.get()?))?.map_err(api_error))?;
-        Ok(Snapshot::new(fluree, db))
+        Ok(Snapshot::new(&self.fluree, db))
     }
 
     /// Commit the staged writes as one commit; returns the `Commit` dict.
@@ -187,6 +197,7 @@ impl Transaction {
         py: Python<'py>,
         message: Option<String>,
     ) -> PyResult<Bound<'py, PyDict>> {
+        self.fluree.get()?;
         let txn = self.check_out()?;
         let committed = InRuntime::into_inner(*txn)
             .and_then(|txn| block_on(py, async move { txn.commit(commit_opts(message)).await }));

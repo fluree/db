@@ -178,3 +178,35 @@ def test_transact_reruns_on_conflict():
             assert attempts == [30, 50]
 
     run(main())
+
+
+BIG = {"@context": CONTEXT, "@graph": [{"@id": f"ex:big{i}", "ex:n": i} for i in range(40_000)]}
+
+
+@pytest.mark.parametrize("how", ["async with", "transact"])
+def test_cancelling_a_task_mid_write_rolls_its_transaction_back(how):
+    async def main():
+        async with fluree.aio.connect(":memory:") as conn:
+            ledger = await conn.create("nums")
+            holder = {}
+
+            async def write(txn):
+                holder["txn"] = txn
+                await txn.insert(BIG)
+
+            async def in_block():
+                async with ledger.transaction() as txn:
+                    await write(txn)
+
+            task = asyncio.create_task(in_block() if how == "async with" else ledger.transact(write))
+            while "txn" not in holder:
+                await asyncio.sleep(0)
+            await asyncio.sleep(0.01)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not holder["txn"]._sync._native.is_open
+            assert holder["txn"].committed is None
+            assert await ledger.log() == []
+
+    run(main())

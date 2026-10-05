@@ -2,7 +2,7 @@
 //! query entry point.
 
 use crate::convert::{from_json, sparql_to_py, SparqlResult};
-use crate::error::{api_error, raise_status};
+use crate::error::{api_error, invalid_request, raise_status};
 use crate::runtime::block_on_cancellable;
 use fluree_db_api::QueryCancellation;
 use fluree_db_api::{ApiError, TrackedErrorResponse, TrackedQueryResponse, TrackingOptions};
@@ -10,7 +10,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use serde_json::Value as JsonValue;
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// `{"max_fuel": float | None, "timeout": float | None, "stats": bool,
 /// "cancel": Canceller | None}`
@@ -22,6 +22,32 @@ pub(crate) struct Controls {
     stats: bool,
     #[pyo3(from_py_with = cancellation)]
     cancel: Option<QueryCancellation>,
+}
+
+/// A `timeout` in seconds as a `Duration`, refused unless it is positive
+/// and short enough for a deadline.
+pub(crate) fn timeout_duration(seconds: Option<f64>) -> PyResult<Option<Duration>> {
+    let Some(seconds) = seconds else {
+        return Ok(None);
+    };
+    match Duration::try_from_secs_f64(seconds) {
+        Ok(timeout) if seconds > 0.0 && Instant::now().checked_add(timeout).is_some() => {
+            Ok(Some(timeout))
+        }
+        _ => Err(invalid_request(format!(
+            "timeout must be a positive number of seconds that fits a deadline, not {seconds}"
+        ))),
+    }
+}
+
+/// Refuse a `max_fuel` that is not a positive, finite amount.
+pub(crate) fn check_max_fuel(fuel: Option<f64>) -> PyResult<()> {
+    match fuel {
+        Some(fuel) if !(fuel.is_finite() && fuel > 0.0) => Err(invalid_request(format!(
+            "max_fuel must be a positive, finite number, not {fuel}"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 fn cancellation(obj: &Bound<'_, PyAny>) -> PyResult<Option<QueryCancellation>> {
@@ -68,6 +94,12 @@ impl Controls {
         self.timeout
     }
 
+    /// The timeout as a `Duration`, after checking both limits.
+    pub(crate) fn checked_timeout(&self) -> PyResult<Option<Duration>> {
+        check_max_fuel(self.max_fuel)?;
+        timeout_duration(self.timeout)
+    }
+
     /// The handle that cancels a query run under these controls.
     pub(crate) fn cancellation(&self) -> QueryCancellation {
         // Not `unwrap_or_default`: `QueryCancellation::default()` is the
@@ -86,8 +118,8 @@ impl Controls {
     where
         F: Future<Output = Result<Answer, Failure>> + Send,
     {
+        let timeout = self.checked_timeout()?;
         let cancellation = self.cancellation();
-        let timeout = self.timeout.map(Duration::from_secs_f64);
         block_on_cancellable(
             py,
             &cancellation,

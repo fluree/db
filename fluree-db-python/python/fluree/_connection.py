@@ -131,7 +131,12 @@ class Connection:
         return isinstance(ledger, str) and self._native.exists(ledger)
 
     def close(self) -> None:
-        """Flush pending writes and release the database."""
+        """Flush pending writes and release the database.
+
+        Afterwards the connection, and every ledger, snapshot, transaction
+        and stream opened through it, raises :class:`InvalidRequestError`;
+        an open transaction can still be rolled back. Closing again does
+        nothing."""
         self._native.close()
 
     def create(self, ledger: str, *, source: str | os.PathLike[str] | None = None) -> Ledger:
@@ -466,7 +471,7 @@ class Ledger:
         native = self._connection._native
         params = _params(parameters, kwparameters)
         if _query_language(query, language) == "cypher":
-            return native.explain_cypher(self._id, query, _cypher_params(params), None, self._policy)
+            return native.explain_cypher(self._id, _cypher_text(query), _cypher_params(params), None, self._policy)
         query, params = _explainable(query, language, params)
         return native.explain(self._id, query, None, self._policy, params)
 
@@ -476,7 +481,7 @@ class Ledger:
             return _table(native.cypher_query(self._id, query, params, None, self._policy, controls))
         if language == "sparql":
             return native.query_sparql(self._id, query, None, self._policy, controls, params)
-        return native.query_jsonld(self._id, self._govern(query), None, controls)
+        return native.query_jsonld(self._id, query, None, self._policy, controls)
 
     def snapshot(self) -> Snapshot:
         """The latest state, frozen: every query on it sees the same data."""
@@ -725,8 +730,6 @@ class Ledger:
             kind, payload = "graph", shapes_graph
         else:
             kind, payload = "attached", None
-        if timeout is not None and timeout <= 0:
-            raise InvalidRequestError("timeout must be positive")
         options = {
             "shapes_kind": kind,
             "shapes": payload,
@@ -944,16 +947,6 @@ class Ledger:
         native = self._connection._native
         return Commit(**native.transact(self._id, op, kind, payload, self._policy, message, params))
 
-    def _govern(self, query: Any) -> Any:
-        """Fold this handle's policy into a JSON-LD query's ``opts``. Options the
-        query sets itself win, as they do over request headers on the server."""
-        if self._policy is None or not isinstance(query, dict):
-            return query
-        opts = dict(query.get("opts") or {})
-        for key, value in self._policy.items():
-            opts.setdefault(key, value)
-        return {**query, "opts": opts}
-
 
 class Snapshot:
     """A ledger frozen at one point in time.
@@ -1087,7 +1080,7 @@ class Snapshot:
         """The plan the engine would run ``query`` with, without running it."""
         params = _params(parameters, kwparameters)
         if _query_language(query, language) == "cypher":
-            return self._native.explain_cypher(query, _cypher_params(params))
+            return self._native.explain_cypher(_cypher_text(query), _cypher_params(params))
         query, params = _explainable(query, language, params)
         return self._native.explain(query, params)
 
@@ -1231,8 +1224,6 @@ class QueryProfile:
 def _controls(
     max_fuel: float | None, timeout: float | None, stats: bool, cancel: _fluree.Canceller | None = None
 ) -> dict[str, Any] | None:
-    if timeout is not None and timeout <= 0:
-        raise InvalidRequestError("timeout must be positive")
     if not stats and max_fuel is None and timeout is None and cancel is None:
         return None
     return {
@@ -1254,18 +1245,18 @@ def _execute(
     language: Language | None = None,
     params: dict[str, Any] | None = None,
 ) -> Any:
-    language = _query_language(query, language)
-    if language == "cypher":
+    kind = _query_language(query, language)
+    if kind == "cypher":
         if stats or max_fuel is not None:
             raise InvalidRequestError("max_fuel and profile() are not yet supported for Cypher")
         return run(query, "cypher", _controls(None, timeout, False, cancel), _cypher_params(params))
     controls = _controls(max_fuel, timeout, stats, cancel)
-    sparql = language == "sparql"
+    sparql = kind == "sparql"
     if sparql:
-        raw = run(query, language, controls, _sparql_params(params))
+        raw = run(query, kind, controls, _sparql_params(params))
     else:
         _no_jsonld_parameters(params)
-        raw = run(_json_query(query), language, controls, None)
+        raw = run(_json_query(query), kind, controls, None)
     result, measured = raw if stats else (raw, None)
     if sparql:
         result = _sparql_result(result)
@@ -1402,6 +1393,12 @@ def _iri_ref(iri: str) -> str:
     if not iri or any(ch in _IRI_FORBIDDEN for ch in iri):
         raise InvalidRequestError(f"not an IRI: {iri!r}")
     return f"<{iri}>"
+
+
+def _cypher_text(query: Query) -> str:
+    if not isinstance(query, str):
+        raise TypeError(f"a Cypher query is text, not {type(query).__name__}")
+    return query
 
 
 def _looks_like_json(text: str) -> bool:

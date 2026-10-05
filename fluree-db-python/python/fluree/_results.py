@@ -3,10 +3,11 @@ eagerly as a :class:`Result` or streamed as a :class:`RowStream`."""
 
 from __future__ import annotations
 
+import functools
 import warnings
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from typing import TYPE_CHECKING, Any, overload
+from typing import TYPE_CHECKING, Any, SupportsIndex, overload
 
 from fluree._graph import _plain
 from fluree._terms import to_python
@@ -32,10 +33,10 @@ class Record(tuple):  # type: ignore[type-arg]
     _keys: tuple[str, ...] = ()
 
     @overload
-    def __getitem__(self, key: int | str) -> Any: ...
+    def __getitem__(self, key: SupportsIndex | str) -> Any: ...
     @overload
     def __getitem__(self, key: slice) -> tuple[Any, ...]: ...
-    def __getitem__(self, key: int | str | slice) -> Any:
+    def __getitem__(self, key: SupportsIndex | str | slice) -> Any:
         if isinstance(key, str):
             return super().__getitem__(self.index(key))
         return super().__getitem__(key)
@@ -78,11 +79,24 @@ class Record(tuple):  # type: ignore[type-arg]
         fields = " ".join(f"{k}={v!r}" for k, v in zip(self._keys, self))
         return f"<Record {fields}>"
 
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (_record, (self._keys, tuple(self)))
+
 
 def _record_type(keys: Iterable[str]) -> type[Record]:
     """A :class:`Record` subclass for one result's columns, so each record
     is a bare tuple."""
-    return type("Record", (Record,), {"__slots__": (), "_keys": tuple(keys)})
+    return _record_class(tuple(keys))
+
+
+@functools.lru_cache(maxsize=256)
+def _record_class(keys: tuple[str, ...]) -> type[Record]:
+    return type("Record", (Record,), {"__slots__": (), "_keys": keys})
+
+
+def _record(keys: tuple[str, ...], values: tuple[Any, ...]) -> Record:
+    """A record rebuilt by :mod:`pickle`."""
+    return _record_class(keys)(values)
 
 
 class Result(Sequence[Record]):
@@ -160,7 +174,8 @@ class Result(Sequence[Record]):
         relationships stay objects."""
         import pandas
 
-        return pandas.DataFrame.from_records(self._records, columns=self._keys)
+        # A Record is a tuple; its by-name `index` hides that from the stubs.
+        return pandas.DataFrame.from_records(self._records, columns=self._keys)  # type: ignore[arg-type]
 
     to_df = to_pandas
 
@@ -169,8 +184,15 @@ class RowStream(Iterator[Record]):
     """The records of a SELECT, read as the query produces them.
 
     Iterate it like a :class:`Result`; memory stays flat however many records
-    the query returns. Leaving it before the end — ``break``, :meth:`close`, or
-    the end of a ``with`` block — stops the query.
+    the query returns. The query runs until the stream ends, :meth:`close`
+    is called, or the stream is garbage-collected — so when reading may stop
+    early, use it as a context manager, which closes it at the end of the
+    block::
+
+        with ledger.stream(query) as rows:
+            for row in rows:
+                if done(row):
+                    break
     """
 
     __slots__ = ("_batch_size", "_buffer", "_keys", "_native", "_record")

@@ -155,6 +155,21 @@ def test_a_script_commits_all_or_nothing(ledger):
     assert ledger.query('MATCH (p {name: "Frank"}) RETURN p').single() is None
 
 
+def test_a_failed_script_in_a_transaction_stages_nothing(ledger):
+    with ledger.transaction() as txn:
+        txn.update('CREATE (:Person {name: "Gail"})')
+        for script in (
+            'CREATE (:Person {name: "Frank"}); THIS IS NOT CYPHER',
+            'CREATE (:Person {name: "Frank"}); MATCH (p:Person) SET p.x = $missing',
+            'CREATE (:Person {name: "Frank"}); MATCH (p:Person) RETURN $missing',
+        ):
+            with pytest.raises(fluree.FlureeError):
+                txn.update(script)
+            assert txn.query('MATCH (p {name: "Frank"}) RETURN p').single() is None
+    names = ledger.query('MATCH (p:Person) WHERE p.name IN ["Frank", "Gail"] RETURN p.name')
+    assert names.value(0) == ["Gail"]
+
+
 def test_snapshot_and_history(ledger):
     ledger.update('MATCH (p:Person {name: "Bob"}) SET p.age = 41')
     past = ledger.at(t=1)

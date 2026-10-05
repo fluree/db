@@ -28,7 +28,7 @@ Homepage = "https://flur.ee"
 Source = "https://github.com/fluree/db"
 
 [dependency-groups]
-dev = ["maturin>=1.9,<2", "pytest>=8"]
+dev = ["maturin>=1.9,<2", "pytest>=8", "mypy>=1.10", "pandas-stubs"]
 
 [tool.maturin]
 python-source = "python"
@@ -40,3 +40,7 @@ features = ["pyo3/extension-module", "pyo3/abi3-py310"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.mypy]
+files = ["python/fluree"]
+python_version = "3.10"

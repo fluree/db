@@ -48,7 +48,7 @@ from fluree._connection import (
     RevertStrategy,
 )
 from fluree._params import _params
-from fluree._results import Result
+from fluree._results import Record, Result
 from fluree._records import (
     Branch,
     Change,
@@ -568,12 +568,19 @@ class Snapshot:
 
 
 class Transaction:
-    """Writes committed together as one commit; see :class:`fluree.Transaction`."""
+    """Writes committed together as one commit; see :class:`fluree.Transaction`.
 
-    __slots__ = ("_sync",)
+    A write cannot be stopped part way, so cancelling a task that is waiting
+    on one leaves it running on its worker thread. Leaving ``async with``
+    (and :meth:`Ledger.transact` giving up) waits for that work to finish
+    before rolling back, and the cancellation then propagates.
+    """
+
+    __slots__ = ("_pending", "_sync")
 
     def __init__(self, sync: fluree.Transaction) -> None:
         self._sync = sync
+        self._pending: set[asyncio.Future[Any]] = set()
 
     @property
     def committed(self) -> Commit | None:
@@ -586,13 +593,13 @@ class Transaction:
         return self
 
     async def __aexit__(self, exc_type: object, *exc: object) -> None:
-        await _call(self._sync.__exit__, exc_type, *exc)
+        await asyncio.shield(self._finish(exc_type, *exc))
 
     async def insert(self, data: Data, *, format: Format | None = None) -> None:
-        await _call(self._sync.insert, data, format=format)
+        await self._call(self._sync.insert, data, format=format)
 
     async def upsert(self, data: Data, *, format: Format | None = None) -> None:
-        await _call(self._sync.upsert, data, format=format)
+        await self._call(self._sync.upsert, data, format=format)
 
     async def update(
         self,
@@ -602,7 +609,7 @@ class Transaction:
         language: Language | None = None,
         **kwparameters: Any,
     ) -> Result | None:
-        return await _call(self._sync.update, transaction, parameters, language=language, **kwparameters)
+        return await self._call(self._sync.update, transaction, parameters, language=language, **kwparameters)
 
     async def query(
         self,
@@ -615,12 +622,17 @@ class Transaction:
         **kwparameters: Any,
     ) -> Any:
         params = _params(parameters, kwparameters)
-        return await _query(
-            lambda c: _sync._execute(
-                self._sync._view()._run, query, max_fuel, timeout, False, c,
-                language=language, params=params,
+        canceller = _fluree.Canceller()
+        try:
+            return await self._call(
+                lambda: _sync._execute(
+                    self._sync._view()._run, query, max_fuel, timeout, False, canceller,
+                    language=language, params=params,
+                )
             )
-        )
+        except asyncio.CancelledError:
+            canceller.cancel()
+            raise
 
     async def explain(
         self,
@@ -630,23 +642,38 @@ class Transaction:
         language: Language | None = None,
         **kwparameters: Any,
     ) -> dict[str, Any]:
-        return await _call(self._sync.explain, query, parameters, language=language, **kwparameters)
+        return await self._call(self._sync.explain, query, parameters, language=language, **kwparameters)
 
     async def commit(self, *, message: str | None = None) -> Commit:
-        return await _call(self._sync.commit, message=message)
+        return await self._call(self._sync.commit, message=message)
 
     async def rollback(self) -> None:
-        await _call(self._sync.rollback)
+        await self._call(self._sync.rollback)
+
+    async def _call(self, fn: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
+        """``fn`` on a worker thread, which a cancelled caller leaves running
+        and :meth:`_settle` waits for."""
+        work = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
+        self._pending.add(work)
+        work.add_done_callback(self._pending.discard)
+        return await asyncio.shield(work)
+
+    async def _settle(self) -> None:
+        while self._pending:
+            await asyncio.gather(*self._pending, return_exceptions=True)
+
+    async def _finish(self, exc_type: object, *exc: object) -> None:
+        await self._settle()
+        await asyncio.to_thread(self._sync.__exit__, exc_type, *exc)
 
     async def _close(self) -> None:
-        if self._sync._native.is_open:
-            await self.rollback()
+        await asyncio.shield(self._finish(asyncio.CancelledError))
 
 
 _END = object()
 
 
-class RowStream(AsyncIterator[tuple[Any, ...]]):
+class RowStream(AsyncIterator[Record]):
     """Rows of a SELECT read as the query produces them; see
     :class:`fluree.RowStream`. ``async with`` closes it at the end of the
     block, and so does cancelling the task reading it."""
@@ -664,7 +691,7 @@ class RowStream(AsyncIterator[tuple[Any, ...]]):
     def __aiter__(self) -> RowStream:
         return self
 
-    async def __anext__(self) -> tuple[Any, ...]:
+    async def __anext__(self) -> Record:
         stream = await self._open()
         if stream is None:
             raise StopAsyncIteration

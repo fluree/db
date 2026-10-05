@@ -5,6 +5,7 @@
 //! pauses it. Python pulls rows in batches. Dropping the stream, or closing it,
 //! cancels the producer.
 
+use crate::connection::Database;
 use crate::convert::term;
 use crate::error::{class_for_status, raise_status};
 use crate::runtime::{runtime, InRuntime};
@@ -25,6 +26,7 @@ const POLL: Duration = Duration::from_millis(50);
 
 #[pyclass(frozen, module = "fluree._fluree")]
 pub(crate) struct RowStream {
+    database: Database,
     records: Mutex<Option<InRuntime<mpsc::Receiver<Bytes>>>>,
     cancellation: QueryCancellation,
     columns: Mutex<Option<Vec<String>>>,
@@ -34,12 +36,14 @@ pub(crate) struct RowStream {
 
 impl RowStream {
     pub(crate) fn new(
+        database: Database,
         records: mpsc::Receiver<Bytes>,
         cancellation: QueryCancellation,
         columns: Option<Vec<String>>,
         timeout: Option<f64>,
     ) -> Self {
         Self {
+            database,
             records: Mutex::new(Some(InRuntime::new(records))),
             cancellation,
             columns: Mutex::new(columns),
@@ -85,6 +89,11 @@ impl RowStream {
         let Some(records) = guard.as_mut() else {
             return Ok(None);
         };
+        if let Err(closed) = self.database.get() {
+            drop(guard);
+            self.finish();
+            return Err(closed);
+        }
         // A stream that never idles would otherwise never see its deadline.
         if self.deadline.is_some_and(|d| Instant::now() >= d) {
             drop(guard);

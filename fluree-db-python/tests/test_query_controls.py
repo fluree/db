@@ -60,9 +60,27 @@ def test_timeout_cancels_a_slow_query(ledger):
     assert len(ledger.query(NAMES)) == 300
 
 
-def test_timeout_must_be_positive(ledger):
-    with pytest.raises(ValueError):
-        ledger.query(NAMES, timeout=0)
+@pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf"), 1e300, 1e19])
+def test_a_timeout_must_be_positive_and_finite(ledger, timeout):
+    for call in (
+        lambda: ledger.query(NAMES, timeout=timeout),
+        lambda: ledger.query("MATCH (n) RETURN n", timeout=timeout),
+        lambda: ledger.stream(NAMES, timeout=timeout),
+        lambda: ledger.validate(timeout=timeout),
+        lambda: ledger.index(timeout=timeout),
+    ):
+        with pytest.raises(fluree.InvalidRequestError, match="timeout"):
+            call()
+
+
+@pytest.mark.parametrize("max_fuel", [0, -1, float("nan"), float("inf")])
+def test_max_fuel_must_be_positive_and_finite(ledger, max_fuel):
+    for call in (
+        lambda: ledger.query(NAMES, max_fuel=max_fuel),
+        lambda: ledger.validate(max_fuel=max_fuel),
+    ):
+        with pytest.raises(fluree.InvalidRequestError, match="max_fuel"):
+            call()
 
 
 @pytest.mark.parametrize("query", [NAMES, NAMES_JSONLD], ids=["sparql", "jsonld"])

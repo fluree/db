@@ -116,3 +116,47 @@ def test_denied_write_raises_permission_error(ledger):
 def test_with_policy_needs_an_option(ledger):
     with pytest.raises(ValueError):
         ledger.with_policy()
+
+
+def test_a_query_cannot_choose_its_own_policy(ledger):
+    """Policy belongs to the handle: a query passed in from elsewhere cannot
+    widen a governed handle, nor quietly fail to narrow an ungoverned one."""
+    alice = ledger.with_policy(identity=ALICE_IDENTITY)
+    widened = {**SSNS_JSONLD, "opts": {"defaultAllow": True, "identity": EX + "someoneElse"}}
+    pragma = "# PRAGMA default-allow true\n" + SSNS
+    for handle in (alice, ledger):
+        for read in (
+            lambda: handle.query(widened),
+            lambda: handle.query(pragma),
+            lambda: handle.snapshot().query(widened),
+            lambda: handle.snapshot().query(pragma),
+            lambda: list(handle.stream(widened)),
+            lambda: list(handle.stream(pragma)),
+            lambda: handle.explain(widened),
+            lambda: handle.explain(pragma),
+        ):
+            with pytest.raises(fluree.InvalidRequestError, match="with_policy"):
+                read()
+        with handle.transaction() as txn:
+            with pytest.raises(fluree.InvalidRequestError, match="with_policy"):
+                txn.query(widened)
+    assert alice.query(SSNS_JSONLD) == [["ex:alice", "111-11-1111"]]
+
+
+def test_a_write_cannot_choose_its_own_policy(ledger):
+    ctx = {"ex": EX}
+    for write in (
+        lambda: ledger.insert({"@context": ctx, "opts": {"identity": ALICE_IDENTITY}, "@id": "ex:x", "ex:n": 1}),
+        lambda: ledger.update({"@context": ctx, "opts": {"defaultAllow": False}, "insert": {"@id": "ex:x", "ex:n": 1}}),
+        lambda: ledger.update(f"# PRAGMA identity <{ALICE_IDENTITY}>\nPREFIX ex: <{EX}> INSERT DATA {{ ex:x ex:n 1 }}"),
+    ):
+        with pytest.raises(fluree.InvalidRequestError, match="with_policy"):
+            write()
+    assert ledger.query(f"PREFIX ex: <{EX}> ASK {{ ex:x ?p ?o }}") is False
+
+
+def test_a_connection_query_names_its_policy(ledger):
+    # A connection-level query has no handle, so it selects policy itself.
+    conn = ledger._connection
+    query = {**SSNS_JSONLD, "from": "people", "opts": {"identity": ALICE_IDENTITY}}
+    assert conn.query(query) == [["ex:alice", "111-11-1111"]]

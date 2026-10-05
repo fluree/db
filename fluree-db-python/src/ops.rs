@@ -2,8 +2,9 @@
 //! sweeps. Every function takes a canonical `name:branch` id and returns
 //! plain dicts; `fluree/_records.py` builds the result objects.
 
-use crate::convert::{from_json, to_json};
+use crate::convert::{from_json, to_jsonld};
 use crate::error::{api_error, fluree_error, invalid_request, raise_status};
+use crate::query::{check_max_fuel, timeout_duration};
 use crate::runtime::{block_on, block_on_cancellable};
 use fluree_db_api::validate::{ShapesSource, ValidateOptions};
 use fluree_db_api::{
@@ -14,7 +15,6 @@ use fluree_db_core::tracking::FuelExceededError;
 use fluree_db_core::QueryCancellation;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use std::time::Duration;
 
 /// Options for [`validate`], as `Ledger.validate` passes them.
 #[derive(FromPyObject)]
@@ -45,11 +45,12 @@ pub(crate) fn validate<'py>(
         "attached" => ShapesSource::Attached,
         "graph" => ShapesSource::Graph(text()?),
         "turtle" => ShapesSource::InlineTurtle(text()?),
-        "jsonld" => ShapesSource::InlineJsonLd(to_json(
+        "jsonld" => ShapesSource::InlineJsonLd(to_jsonld(
             shapes.ok_or_else(|| invalid_request("shapes are missing"))?,
         )?),
         other => return Err(invalid_request(format!("unknown shapes source {other:?}"))),
     };
+    check_max_fuel(args.max_fuel)?;
     let cancellation = QueryCancellation::new();
     let options = ValidateOptions {
         graph: args.graph,
@@ -58,7 +59,7 @@ pub(crate) fn validate<'py>(
         max_fuel: args.max_fuel.map(fluree_db_core::tracking::fuel_to_micro),
         cancellation: Some(cancellation.clone()),
     };
-    let timeout = args.timeout.map(Duration::from_secs_f64);
+    let timeout = timeout_duration(args.timeout)?;
     let report = block_on_cancellable(
         py,
         &cancellation,
@@ -117,7 +118,12 @@ pub(crate) fn index(
     timeout: Option<f64>,
 ) -> PyResult<i64> {
     let opts = TriggerIndexOptions {
-        timeout_ms: timeout.map(|t| (t * 1000.0).ceil() as u64),
+        timeout_ms: timeout_duration(timeout)?.map(|t| {
+            t.as_nanos()
+                .div_ceil(1_000_000)
+                .try_into()
+                .unwrap_or(u64::MAX)
+        }),
     };
     block_on(py, fluree.trigger_index(ledger, opts))?
         .map(|result| result.index_t)

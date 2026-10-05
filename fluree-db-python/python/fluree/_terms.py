@@ -39,7 +39,11 @@ class BlankNode(str):
 
 
 class LangString(str):
-    """A language-tagged string: a ``str`` with a ``language`` tag."""
+    """A language-tagged string: a ``str`` with a ``language`` tag.
+
+    It compares like a string: equal to a plain ``str`` with the same text,
+    and to another ``LangString`` with the same text and the same tag
+    (compared case-insensitively, as BCP 47 tags are)."""
 
     __slots__ = ("language",)
     language: str
@@ -54,8 +58,12 @@ class LangString(str):
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, LangString):
-            return str.__eq__(self, other) and self.language == other.language
+            return str.__eq__(self, other) and self.language.lower() == other.language.lower()
         return str.__eq__(self, other)
+
+    def __ne__(self, other: object) -> bool:
+        equal = self.__eq__(other)
+        return equal if equal is NotImplemented else not equal
 
     def __hash__(self) -> int:
         return str.__hash__(self)

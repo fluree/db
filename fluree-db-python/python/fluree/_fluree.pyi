@@ -78,7 +78,12 @@ class Connection:
         params: dict[str, Any] | None = None,
     ) -> Any: ...
     def query_jsonld(
-        self, ledger: str, query: Any, at: TimeSpec | None = None, controls: Controls | None = None
+        self,
+        ledger: str,
+        query: Any,
+        at: TimeSpec | None = None,
+        policy: dict[str, Any] | None = None,
+        controls: Controls | None = None,
     ) -> Any: ...
     def explain(
         self,

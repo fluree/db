@@ -241,3 +241,28 @@ def test_file_database_persists(tmp_path):
     with fluree.connect(tmp_path / "db") as conn:
         assert conn.ledgers() == ["kept:main"]
         assert conn.ledger("kept").query(PREFIX + "ASK { ex:a ex:n 1 }") is True
+
+
+def test_a_closed_connection_closes_what_was_opened_through_it():
+    conn = fluree.connect(":memory:")
+    ledger = conn.create("people")
+    ledger.insert({"@context": {"ex": EX}, "@id": "ex:a", "ex:name": "A"})
+    snapshot = ledger.snapshot()
+    stream = ledger.stream(f"PREFIX ex: <{EX}> SELECT ?n WHERE {{ ?s ex:name ?n }}")
+    txn = ledger.transaction()
+    txn.insert({"@context": {"ex": EX}, "@id": "ex:b", "ex:name": "B"})
+    conn.close()
+    for call in (
+        lambda: ledger.insert({"@context": {"ex": EX}, "@id": "ex:z", "ex:name": "Z"}),
+        lambda: ledger.query(f"PREFIX ex: <{EX}> ASK {{ ?s ?p ?o }}"),
+        lambda: conn.ledgers(),
+        lambda: conn.ledger("people"),
+        lambda: snapshot.query(f"PREFIX ex: <{EX}> ASK {{ ?s ?p ?o }}"),
+        lambda: next(stream),
+        lambda: txn.insert({"@context": {"ex": EX}, "@id": "ex:c", "ex:name": "C"}),
+        lambda: txn.commit(),
+    ):
+        with pytest.raises(fluree.InvalidRequestError, match="closed"):
+            call()
+    txn.rollback()
+    conn.close()

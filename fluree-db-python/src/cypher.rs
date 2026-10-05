@@ -21,7 +21,6 @@ use fluree_db_api::format::cypher_typed::{
 use fluree_db_api::{ApiError, CypherParamMap, Fluree, GraphDb, QueryExecutionOptions};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
-use std::time::Duration;
 
 type Table = (Vec<String>, Vec<Vec<CypherCell>>);
 
@@ -72,7 +71,7 @@ pub(crate) fn read<'py>(
     let table = block_on_cancellable(
         py,
         &cancellation,
-        controls.timeout().map(Duration::from_secs_f64),
+        controls.checked_timeout()?,
         read_table(fluree, db, cypher, params, &options),
     )?
     .map_err(api_error)?;

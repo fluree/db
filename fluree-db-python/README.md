@@ -49,6 +49,14 @@ with fluree.connect("./data") as conn:          # or fluree.connect(":memory:")
   exactly `data`, committing only the difference; `dry_run=True` counts what
   would change. Handy for mirroring an export from another system.
 
+A property value in a JSON-LD dict may be any value a query returns, and
+reads back as it went in: a `fluree.IRI` or `BlankNode` is a reference to that
+node, a `LangString` keeps its tag, a `Literal` its datatype, and a `Decimal`,
+`datetime`, `date` or `time` its XSD type. `fluree.Vector` and numpy arrays
+are embedding vectors. The same values work as query parameters and in JSON-LD
+`where` patterns. Keyword entries (`@id`, `@type`, `@context`) take plain
+strings.
+
 To make several writes one commit, use a transaction. Each write applies over
 the ones before it and is checked as it is staged; queries on the transaction
 read the staged state, which no one else sees until it commits:
@@ -62,7 +70,8 @@ print(txn.committed)     # the Commit; an exception in the block rolls back
 ```
 
 A write that fails (bad syntax, denied by policy, a SHACL violation) raises at
-once and is left out. The commit holds only the net change.
+once and is left out, all of it: a Cypher script that fails part way leaves
+none of its statements staged. The commit holds only the net change.
 
 If another commit lands first, a transaction that only wrote is staged again
 on top of it (each update's `WHERE` matches the new data). One that was also
@@ -96,8 +105,9 @@ frozen view that every query sees identically.
   Python type stays a `fluree.Literal`.
 - SPARQL `ASK` returns a `bool`, `CONSTRUCT` a JSON-LD document; JSON-LD
   queries (a `dict`) return their JSON result as Python objects.
-- `ledger.stream(query)` reads a large `SELECT` row by row in flat memory;
-  leaving the loop early stops the query.
+- `ledger.stream(query)` reads a large `SELECT` row by row in flat memory.
+  Open it with `with ledger.stream(query) as rows:` when the loop may stop
+  early: leaving the block stops the query.
 - `query(..., max_fuel=..., timeout=...)` bounds a query's work and time;
   `profile(query)` reports what it cost, and `explain(query)` shows the plan.
   Ctrl-C cancels a running query.
@@ -217,12 +227,18 @@ if preview.mergeable:
 - `ledger.revert(commits)` undoes one or more commits in a new commit;
   `revert_preview(...)` checks first.
 
+## Policy
 
 `ledger.with_policy(identity=..., policy_class=..., policy=..., values=...,
 default_allow=...)` returns a governed handle: reads through it are filtered by
 policy, and a write the policy does not allow raises
 `fluree.PermissionDeniedError`. History and commit contents are filtered the
 same way.
+
+Policy belongs to the handle. A query or write on a ledger that names its own
+policy — JSON-LD `"opts": {"identity": ...}` or a SPARQL `# PRAGMA identity` —
+raises `fluree.InvalidRequestError`, so a query passed in from elsewhere can
+never widen what a governed handle sees.
 
 ## Maintenance
 
@@ -276,7 +292,9 @@ async with fluree.aio.connect("./data") as conn:
 Each call runs on a worker thread while the event loop carries on.
 Cancelling a task that awaits a query (`asyncio.timeout`, a client that
 disconnects) stops the query in the engine; a write already under way still
-completes.
+completes. Cancelled inside `async with ledger.transaction()`, the block waits
+for that write to finish, rolls the transaction back, and re-raises the
+cancellation.
 
 ## Concurrency
 

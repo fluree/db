@@ -6,7 +6,7 @@
 use crate::branch;
 use crate::convert::{
     commit_ref, commit_summary, flake, from_json, jsonld_columns, sparql_columns, sparql_params,
-    time_spec, to_json,
+    time_spec, to_json, to_jsonld,
 };
 use crate::cypher;
 use crate::error::{api_error, fluree_error, invalid_request, not_found};
@@ -31,10 +31,47 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use serde_json::Value as JsonValue;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 #[pyclass(frozen, module = "fluree._fluree")]
 pub(crate) struct Connection {
+    fluree: Database,
+}
+
+/// The engine a connection opened, shared by the snapshots, transactions and
+/// streams opened through it, so closing the connection closes them too.
+#[derive(Clone)]
+pub(crate) struct Database(Arc<DatabaseState>);
+
+struct DatabaseState {
     fluree: InRuntime<Fluree>,
+    closed: AtomicBool,
+}
+
+impl Database {
+    fn new(fluree: Fluree) -> Self {
+        Self(Arc::new(DatabaseState {
+            fluree: InRuntime::new(fluree),
+            closed: AtomicBool::new(false),
+        }))
+    }
+
+    pub(crate) fn get(&self) -> PyResult<&Fluree> {
+        if self.0.closed.load(Ordering::Acquire) {
+            return Err(invalid_request("the connection is closed"));
+        }
+        self.0.fluree.get()
+    }
+
+    /// Close the connection, once; closing it again does nothing.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let fluree = self.0.fluree.get()?;
+        if self.0.closed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        block_on(py, fluree.disconnect())
+    }
 }
 
 /// A sync payload: JSON-LD, or Turtle / N-Triples / TriG text.
@@ -58,13 +95,22 @@ pub(crate) fn operation(
             "parameters apply to SPARQL and Cypher updates",
         ));
     }
+    let json = || -> PyResult<JsonValue> {
+        let json = to_jsonld(payload)?;
+        jsonld_policy_free(&json)?;
+        Ok(json)
+    };
     Ok(match (op, kind) {
-        ("insert", "jsonld") => TxnOperation::Insert(to_json(payload)?),
-        ("upsert", "jsonld") => TxnOperation::Upsert(to_json(payload)?),
-        ("update", "jsonld") => TxnOperation::Update(to_json(payload)?),
+        ("insert", "jsonld") => TxnOperation::Insert(json()?),
+        ("upsert", "jsonld") => TxnOperation::Upsert(json()?),
+        ("update", "jsonld") => TxnOperation::Update(json()?),
         ("insert", "turtle") => TxnOperation::InsertTurtle(payload.extract()?),
         ("upsert", "turtle") => TxnOperation::UpsertTurtle(payload.extract()?),
-        ("update", "sparql") => TxnOperation::SparqlUpdate(payload.extract()?, params),
+        ("update", "sparql") => {
+            let sparql: String = payload.extract()?;
+            sparql_policy_free(&sparql)?;
+            TxnOperation::SparqlUpdate(sparql, params)
+        }
         ("insert" | "upsert" | "update", other) => {
             return Err(invalid_request(format!(
                 "{other:?} is not a valid format for this operation"
@@ -142,6 +188,28 @@ fn governance(policy: Option<&Bound<'_, PyAny>>) -> PyResult<Option<GovernanceOp
         .map_err(|e| invalid_request(e.to_string()))
 }
 
+/// Policy belongs to the handle (`Ledger.with_policy`). A query or write
+/// that selects its own — JSON-LD `opts`, SPARQL `# PRAGMA` — is refused:
+/// on a view it would be ignored, and it must never widen a governed handle.
+fn refuse_inline_policy(inline: GovernanceOptions) -> PyResult<()> {
+    if inline.has_any_policy_inputs() {
+        return Err(invalid_request(
+            "policy is chosen with Ledger.with_policy(), not inside a query or transaction",
+        ));
+    }
+    Ok(())
+}
+
+fn jsonld_policy_free(json: &JsonValue) -> PyResult<()> {
+    refuse_inline_policy(
+        GovernanceOptions::from_json(json).map_err(|e| invalid_request(e.to_string()))?,
+    )
+}
+
+fn sparql_policy_free(sparql: &str) -> PyResult<()> {
+    refuse_inline_policy(GovernanceOptions::from_sparql(sparql))
+}
+
 /// A view of `ledger` at `spec`, governed by the ledger's policy defaults or
 /// by `policy`, carrying the ledger's default context so a query without
 /// `PREFIX` / `@context` resolves its prefixes, as the CLI and server do. A
@@ -171,7 +239,7 @@ impl Connection {
     fn memory() -> PyResult<Self> {
         let _runtime = enter()?;
         Ok(Self {
-            fluree: InRuntime::new(FlureeBuilder::memory().build_memory()),
+            fluree: Database::new(FlureeBuilder::memory().build_memory()),
         })
     }
 
@@ -185,7 +253,7 @@ impl Connection {
         }
         let fluree = builder.build().map_err(api_error)?;
         Ok(Self {
-            fluree: InRuntime::new(fluree),
+            fluree: Database::new(fluree),
         })
     }
 
@@ -197,7 +265,7 @@ impl Connection {
         let builder = FlureeBuilder::from_json_ld(&config).map_err(api_error)?;
         let fluree = block_on(py, builder.build_client())?.map_err(api_error)?;
         Ok(Self {
-            fluree: InRuntime::new(fluree),
+            fluree: Database::new(fluree),
         })
     }
 
@@ -259,7 +327,7 @@ impl Connection {
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
-        block_on(py, self.fluree.get()?.disconnect())
+        self.fluree.close(py)
     }
 
     /// Every branch of `ledger`'s ledger, by name.
@@ -462,7 +530,7 @@ impl Connection {
         let id = canonical(ledger)?;
         let policy = governance(policy)?;
         let payload = match kind {
-            "jsonld" => Payload::Json(to_json(payload)?),
+            "jsonld" => Payload::Json(to_jsonld(payload)?),
             "turtle" => Payload::Text(payload.extract()?),
             other => return Err(invalid_request(format!("cannot sync {other:?} data"))),
         };
@@ -556,12 +624,7 @@ impl Connection {
         ledger: &str,
         policy: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Transaction> {
-        Transaction::begin(
-            py,
-            self.fluree.get()?,
-            &canonical(ledger)?,
-            governance(policy)?,
-        )
+        Transaction::begin(py, &self.fluree, &canonical(ledger)?, governance(policy)?)
     }
 
     #[pyo3(signature = (ledger, sparql, at = None, policy = None, controls = None, params = None))]
@@ -580,6 +643,7 @@ impl Connection {
         let spec = time_spec(at)?;
         let policy = governance(policy)?;
         let params = sparql_params(params)?;
+        sparql_policy_free(sparql)?;
         let fluree = self.fluree.get()?;
         let controls = controls.unwrap_or_default();
         let (id, policy) = (&id, policy.as_ref());
@@ -597,36 +661,31 @@ impl Connection {
         answer.into_py(py, Some(sparql))
     }
 
-    /// A JSON-LD query through the ledger's query builder, which honors the
-    /// query's own `opts` (identity, policy) as well as configured defaults;
-    /// the Python layer folds a governed ledger's policy into those `opts`.
-    #[pyo3(signature = (ledger, query, at = None, controls = None))]
+    #[pyo3(signature = (ledger, query, at = None, policy = None, controls = None))]
     fn query_jsonld<'py>(
         &self,
         py: Python<'py>,
         ledger: &str,
         query: &Bound<'py, PyAny>,
         at: Option<&Bound<'py, PyTuple>>,
+        policy: Option<&Bound<'py, PyAny>>,
         controls: Option<Controls>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let id = canonical(ledger)?;
         let spec = time_spec(at)?;
-        let mut query = to_json(query)?;
+        let policy = governance(policy)?;
+        let query = to_jsonld(query)?;
+        jsonld_policy_free(&query)?;
         let fluree = self.fluree.get()?;
         let controls = controls.unwrap_or_default();
-        let id = &id;
+        let (id, policy, query) = (&id, policy.as_ref(), &query);
         let answer = controls.run(py, |cancel, controls| async move {
-            // This path takes no view, so the default context goes on the query.
-            if let Some(obj) = query
-                .as_object_mut()
-                .filter(|o| !o.contains_key("@context"))
-            {
-                if let Some(context) = fluree.get_default_context(id).await? {
-                    obj.insert("@context".to_string(), context);
-                }
-            }
-            let graph = fluree.graph_at(id, spec);
-            execute!(controls, cancel, graph.query().jsonld(&query))
+            let db = load(fluree, id, spec, policy).await?;
+            execute!(
+                controls,
+                cancel,
+                GraphSnapshotQueryBuilder::new_from_parts(fluree, &db).jsonld(query)
+            )
         })?;
         answer.into_py(py, None)
     }
@@ -674,7 +733,7 @@ impl Connection {
         query: &Bound<'py, PyAny>,
         controls: Option<Controls>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let query = to_json(query)?;
+        let query = to_jsonld(query)?;
         let fluree = self.fluree.get()?;
         let controls = controls.unwrap_or_default();
         let query = &query;
@@ -703,7 +762,7 @@ impl Connection {
         let query = QueryText::from_py(query, params)?;
         let fluree = self.fluree.get()?;
         let db = block_on(py, load(fluree, &id, spec, policy.as_ref()))?.map_err(api_error)?;
-        start_stream(py, fluree, db, query, controls.unwrap_or_default())
+        start_stream(py, &self.fluree, db, query, controls.unwrap_or_default())
     }
 
     /// The query plan for a SPARQL (text) or JSON-LD (object) query.
@@ -743,10 +802,7 @@ impl Connection {
         let policy = governance(policy)?;
         let fluree = self.fluree.get()?;
         let db = block_on(py, load(fluree, &id, spec, policy.as_ref()))?.map_err(api_error)?;
-        Ok(Snapshot {
-            fluree: InRuntime::new(fluree.clone()),
-            db: InRuntime::new(db),
-        })
+        Ok(Snapshot::new(&self.fluree, db))
     }
 
     /// Commit summaries, newest first, and the total number of commits.
@@ -958,14 +1014,14 @@ fn commit_detail_to_py<'py>(
 /// A ledger view frozen at one `t`: every query sees the same state.
 #[pyclass(frozen, module = "fluree._fluree")]
 pub(crate) struct Snapshot {
-    fluree: InRuntime<Fluree>,
+    fluree: Database,
     db: InRuntime<GraphDb>,
 }
 
 impl Snapshot {
-    pub(crate) fn new(fluree: &Fluree, db: GraphDb) -> Self {
+    pub(crate) fn new(fluree: &Database, db: GraphDb) -> Self {
         Self {
-            fluree: InRuntime::new(fluree.clone()),
+            fluree: fluree.clone(),
             db: InRuntime::new(db),
         }
     }
@@ -1032,6 +1088,7 @@ impl Snapshot {
         params: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let params = sparql_params(params)?;
+        sparql_policy_free(sparql)?;
         let controls = controls.unwrap_or_default();
         let (fluree, db) = (self.fluree.get()?, self.db.get()?);
         let answer = controls.run(py, |cancel, controls| async move {
@@ -1054,7 +1111,8 @@ impl Snapshot {
         query: &Bound<'py, PyAny>,
         controls: Option<Controls>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let query = to_json(query)?;
+        let query = to_jsonld(query)?;
+        jsonld_policy_free(&query)?;
         let controls = controls.unwrap_or_default();
         let (fluree, db, query) = (self.fluree.get()?, self.db.get()?, &query);
         let answer = controls.run(py, |cancel, controls| async move {
@@ -1078,7 +1136,7 @@ impl Snapshot {
         let query = QueryText::from_py(query, params)?;
         start_stream(
             py,
-            self.fluree.get()?,
+            &self.fluree,
             self.db.get()?.clone(),
             query,
             controls.unwrap_or_default(),
@@ -1102,7 +1160,7 @@ impl Snapshot {
 /// Plan a streaming SELECT against `db` and start its producer.
 fn start_stream(
     py: Python<'_>,
-    fluree: &Fluree,
+    database: &Database,
     db: GraphDb,
     query: QueryText,
     controls: Controls,
@@ -1117,6 +1175,8 @@ fn start_stream(
             (OwnedStreamQuery::JsonLd(json), columns, None)
         }
     };
+    controls.checked_timeout()?;
+    let fluree = database.get()?;
     let cancellation = controls.cancellation();
     let options = QueryExecutionOptions::new().with_cancellation(cancellation.clone());
     let options = match params {
@@ -1141,6 +1201,7 @@ fn start_stream(
             .await;
     });
     Ok(RowStream::new(
+        database.clone(),
         received,
         cancellation,
         columns,
@@ -1159,11 +1220,18 @@ impl QueryText {
     fn from_py(query: &Bound<'_, PyAny>, params: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
         let params = sparql_params(params)?;
         match query.extract::<String>() {
-            Ok(sparql) => Ok(Self::Sparql(sparql, params)),
+            Ok(sparql) => {
+                sparql_policy_free(&sparql)?;
+                Ok(Self::Sparql(sparql, params))
+            }
             Err(_) if params.is_some() => Err(invalid_request(
                 "parameters apply to SPARQL and Cypher queries; a JSON-LD query takes its values in the query",
             )),
-            Err(_) => Ok(Self::JsonLd(to_json(query)?)),
+            Err(_) => {
+                let json = to_jsonld(query)?;
+                jsonld_policy_free(&json)?;
+                Ok(Self::JsonLd(json))
+            }
         }
     }
 

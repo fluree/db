@@ -391,6 +391,14 @@ jobs:
             "venv-$py/bin/python" -m pytest fluree-db-python/tests
           done
 
+      # The package ships `py.typed`, so its annotations are part of the API.
+      - name: Type-check the package
+        if: runner.os == 'Linux'
+        working-directory: fluree-db-python
+        run: |
+          ../venv-3.14/bin/pip install mypy pandas-stubs
+          ../venv-3.14/bin/python -m mypy
+
   wasm-smoke:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
