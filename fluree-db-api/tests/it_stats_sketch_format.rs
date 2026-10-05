@@ -10,7 +10,10 @@ use crate::support;
 use crate::support::hooked_storage::{HookedStorage, IndexWriteCounts};
 use fluree_db_api::admin::ReindexOptions;
 use fluree_db_api::tx::IndexingMode;
-use fluree_db_api::{Fluree, IndexerConfig, LedgerState, NameServiceMode, TriggerIndexOptions};
+use fluree_db_api::{
+    CommitOpts, Fluree, IndexConfig, IndexerConfig, LedgerState, NameServiceMode,
+    TriggerIndexOptions, TxnOpts,
+};
 use fluree_db_binary_index::format::index_root::IndexRoot;
 use fluree_db_connection::config::ConnectionConfig;
 use fluree_db_core::graph_registry::{DEFAULT_GRAPH_ID, FIRST_USER_GRAPH_ID};
@@ -31,6 +34,15 @@ fn indexer_config() -> IndexerConfig {
         .with_leaflets_per_leaf(2)
         .with_incremental_enabled(true)
         .with_incremental_max_commits(10_000)
+}
+
+/// Commits never trigger a build, so the only builds are the ones a test
+/// asks for and each build's leaf writes can be measured without a race.
+fn no_auto_index() -> IndexConfig {
+    IndexConfig {
+        reindex_min_bytes: usize::MAX,
+        reindex_max_bytes: usize::MAX,
+    }
 }
 
 fn setup() -> (Fluree, Storage, LocalSet) {
@@ -62,7 +74,17 @@ async fn insert_values(
             .map(|i| json!({ "@id": format!("ex:s{i}"), "ex:val": i }))
             .collect::<Vec<_>>()
     });
-    fluree.insert(ledger, &tx).await.expect("insert").ledger
+    fluree
+        .insert_with_opts(
+            ledger,
+            &tx,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &no_auto_index(),
+        )
+        .await
+        .expect("insert")
+        .ledger
 }
 
 /// Index to head; returns the root and how many index leaves the build wrote.
@@ -335,6 +357,7 @@ async fn sparql_update(fluree: &Fluree, ledger_id: &str, update: String) {
         .graph(ledger_id)
         .transact()
         .sparql_update(&update)
+        .index_config(no_auto_index())
         .commit()
         .await
         .expect("sparql update");
@@ -362,12 +385,17 @@ async fn incremental_build_with_retractions_in_named_graphs_matches_full_rebuild
                 format!(
                     "PREFIX ex: <http://example.org/>\nINSERT DATA {{\n{}\n\
                      GRAPH ex:g1 {{\n{}\n{}\n}}\n\
-                     GRAPH ex:g2 {{\n{}\n{}\n}}\n}}",
+                     GRAPH ex:g2 {{\n{}\n{}\n}}\n\
+                     GRAPH ex:g3 {{\n{}\n}}\n}}",
                     triples(0..300, |i| format!("ex:s{i} ex:val {i} .")),
                     triples(0..200, |i| format!("ex:a{i} ex:val {i} .")),
                     triples(0..200, |i| format!("ex:a{i} ex:label \"a{i}\" .")),
                     triples(0..20, |i| format!("ex:b{i} ex:mixed {i} .")),
                     triples(20..40, |i| format!("ex:b{i} ex:mixed \"m{i}\" .")),
+                    // Never touched again: its leaves separate an incremental
+                    // build from a full rebuild, since the novelty below
+                    // reaches most leaves of the other graphs.
+                    triples(0..600, |i| format!("ex:c{i} ex:val {i} .")),
                 ),
             )
             .await;
