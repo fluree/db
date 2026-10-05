@@ -47,7 +47,7 @@ from fluree._connection import (
     RebaseStrategy,
     RevertStrategy,
 )
-from fluree._cypher import _params
+from fluree._params import _params
 from fluree._results import Result
 from fluree._records import (
     Branch,
@@ -151,25 +151,35 @@ class Connection:
     async def query(
         self,
         query: Query,
+        parameters: Mapping[str, Any] | None = None,
         *,
         language: Language | None = None,
         max_fuel: float | None = None,
         timeout: float | None = None,
+        **kwparameters: Any,
     ) -> Any:
+        params = _params(parameters, kwparameters)
         return await _query(
-            lambda c: _sync._execute(self._sync._run, query, max_fuel, timeout, False, c, language=language)
+            lambda c: _sync._execute(
+                self._sync._run, query, max_fuel, timeout, False, c, language=language, params=params
+            )
         )
 
     async def profile(
         self,
         query: Query,
+        parameters: Mapping[str, Any] | None = None,
         *,
         language: Language | None = None,
         max_fuel: float | None = None,
         timeout: float | None = None,
+        **kwparameters: Any,
     ) -> QueryProfile:
+        params = _params(parameters, kwparameters)
         return await _query(
-            lambda c: _sync._profile(self._sync._run, query, max_fuel, timeout, c, language=language)
+            lambda c: _sync._profile(
+                self._sync._run, query, max_fuel, timeout, c, language=language, params=params
+            )
         )
 
     async def restore(self, path: str | os.PathLike[str], ledger: str) -> Ledger:
@@ -323,15 +333,19 @@ class Ledger:
     def stream(
         self,
         query: Query,
+        parameters: Mapping[str, Any] | None = None,
         *,
         max_fuel: float | None = None,
         timeout: float | None = None,
         batch_size: int = 1000,
+        **kwparameters: Any,
     ) -> RowStream:
         """Read a SELECT's rows as they are produced: ``async for row in
         ledger.stream(...)``. The query starts on the first read."""
         return RowStream(
-            lambda: self._sync.stream(query, max_fuel=max_fuel, timeout=timeout, batch_size=batch_size)
+            lambda: self._sync.stream(
+                query, parameters, max_fuel=max_fuel, timeout=timeout, batch_size=batch_size, **kwparameters
+            )
         )
 
     async def explain(
@@ -504,13 +518,17 @@ class Snapshot:
     def stream(
         self,
         query: Query,
+        parameters: Mapping[str, Any] | None = None,
         *,
         max_fuel: float | None = None,
         timeout: float | None = None,
         batch_size: int = 1000,
+        **kwparameters: Any,
     ) -> RowStream:
         return RowStream(
-            lambda: self._sync.stream(query, max_fuel=max_fuel, timeout=timeout, batch_size=batch_size)
+            lambda: self._sync.stream(
+                query, parameters, max_fuel=max_fuel, timeout=timeout, batch_size=batch_size, **kwparameters
+            )
         )
 
     async def explain(

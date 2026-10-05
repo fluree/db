@@ -84,11 +84,13 @@ def test_language_override_and_files(ledger, tmp_path):
     assert ledger.query('MATCH (p {name: "Fay"}) RETURN p.name').single()[0] == "Fay"
 
 
-def test_parameters_are_cypher_only(ledger):
-    with pytest.raises(InvalidRequestError, match="Cypher only"):
-        ledger.query(SPARQL_NAMES, name="Alice")
-    with pytest.raises(InvalidRequestError, match="Cypher only"):
-        ledger.update(f'PREFIX ex: <{EX}> INSERT DATA {{ ex:x ex:name "X" }}', name="X")
+def test_parameters_in_every_language(ledger):
+    sparql = f"PREFIX ex: <{EX}> SELECT ?age WHERE {{ ?s ex:name $name ; ex:age ?age }}"
+    cypher = "MATCH (p:Person {name: $name}) RETURN p.age AS age"
+    assert ledger.query(sparql, name="Alice").value("age") == [30]
+    assert ledger.query(cypher, name="Carol").value("age") == [40]
+    with pytest.raises(InvalidRequestError, match="JSON-LD"):
+        ledger.query({"select": ["?s"], "where": {"@id": "?s"}}, name="Alice")
 
 
 def test_unsupported_cypher_combinations(ledger):

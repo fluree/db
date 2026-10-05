@@ -19,6 +19,20 @@ pub(crate) fn to_json(obj: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
     Ok(pythonize::depythonize(obj)?)
 }
 
+/// SPARQL parameters: a dict of variable name to JSON-LD value, `None` when empty.
+pub(crate) fn sparql_params(
+    params: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Option<fluree_db_api::SparqlParamMap>> {
+    let Some(params) = params else {
+        return Ok(None);
+    };
+    match to_json(params)? {
+        JsonValue::Object(map) if map.is_empty() => Ok(None),
+        JsonValue::Object(map) => Ok(Some(map)),
+        _ => Err(invalid_request("SPARQL parameters must be a dict")),
+    }
+}
+
 pub(crate) fn from_json<'py>(py: Python<'py>, value: &JsonValue) -> PyResult<Bound<'py, PyAny>> {
     Ok(pythonize::pythonize(py, value)?)
 }

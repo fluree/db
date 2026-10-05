@@ -105,6 +105,21 @@ frozen view that every query sees identically.
   several.
 - `ledger.set_context({...})` sets the default JSON-LD context: queries that
   omit `PREFIX` or `@context` resolve prefixes against it.
+- Parameters bind values by name, from a dict or keyword arguments, in
+  `query()`, `update()`, `stream()`, `explain()` and `profile()`. In SPARQL a
+  parameter replaces its variable (`?name` or `$name`) wherever it appears, as
+  if the value were written there:
+
+  ```python
+  people.query("SELECT ?s WHERE { ?s ex:name $name ; ex:age ?age FILTER(?age > $min) }",
+               name="Alice", min=21)
+  ```
+
+  A value is an `IRI`, `BlankNode`, `LangString` or `Literal`, a Python
+  `str`, `int`, `float`, `bool`, `Decimal`, `datetime`, `date` or `time`, or
+  a Cypher `Node` (its `element_id`). A parameter the query never mentions
+  raises `InvalidRequestError` rather than leaving a misspelt variable
+  unbound. JSON-LD queries take none.
 
 ### Cypher
 
@@ -120,7 +135,7 @@ commit = people.update("CREATE (p:Person {name: $name}) RETURN p", name="Eve")
 commit.result.single()["p"]
 ```
 
-- `$name` parameters come from a dict or keyword arguments.
+- `$name` parameters come from a dict or keyword arguments, as for SPARQL.
 - Nodes, relationships and paths come back as `fluree.Node` (properties read
   like a dict, plus `labels` and `element_id` — the same `IRI` SPARQL returns
   for it), `fluree.Relationship` (`type`, `start_node`, `end_node`) and

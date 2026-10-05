@@ -108,14 +108,16 @@ impl Transaction {
     }
 
     /// Stage one write over those before it; see `Connection.transact`.
+    #[pyo3(signature = (op, kind, payload, params = None))]
     fn stage(
         &self,
         py: Python<'_>,
         op: &str,
         kind: &str,
         payload: &Bound<'_, PyAny>,
+        params: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
-        let operation = operation(op, kind, payload)?;
+        let operation = operation(op, kind, payload, params)?;
         self.with_txn(|txn| block_on(py, txn.get_mut().stage(operation))?.map_err(api_error))
     }
 

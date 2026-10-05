@@ -1,10 +1,8 @@
-"""Cypher: parameters in, and typed result cells decoded into Python values
-and graph objects."""
+"""Cypher: typed result cells decoded into Python values and graph objects."""
 
 from __future__ import annotations
 
 import datetime as _dt
-from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any
 
@@ -13,25 +11,6 @@ from fluree._records import _jsonld_term, _node
 from fluree._results import Result, _record_type
 from fluree._terms import _datetime
 from fluree.errors import InvalidRequestError
-
-
-def _params(parameters: Mapping[str, Any] | None, kwparameters: dict[str, Any]) -> dict[str, Any] | None:
-    merged = {**(parameters or {}), **kwparameters}
-    return {k: _param(v) for k, v in merged.items()} or None
-
-
-def _param(value: Any) -> Any:
-    if isinstance(value, Node):
-        return value.element_id
-    if isinstance(value, (_dt.datetime, _dt.date, _dt.time)):
-        return value.isoformat()
-    if isinstance(value, Decimal):
-        return str(value)
-    if isinstance(value, Mapping):
-        return {str(k): _param(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return [_param(v) for v in value]
-    return value
 
 
 def _table(table: tuple[list[str], list[tuple[Any, ...]]]) -> Result:

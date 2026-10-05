@@ -5,8 +5,8 @@
 
 use crate::branch;
 use crate::convert::{
-    commit_ref, commit_summary, flake, from_json, jsonld_columns, sparql_columns, time_spec,
-    to_json,
+    commit_ref, commit_summary, flake, from_json, jsonld_columns, sparql_columns, sparql_params,
+    time_spec, to_json,
 };
 use crate::cypher;
 use crate::error::{api_error, fluree_error, invalid_request, not_found};
@@ -19,7 +19,7 @@ use fluree_db_api::{
     build_transact_policy_context, export::ExportFormat, ApiError, CommitDetail, CommitReceipt,
     CommitRef, DataSetDb, DropMode, Fluree, FlureeBuilder, FormatterConfig, GovernanceOptions,
     GraphDb, GraphSnapshotQueryBuilder, OwnedStreamQuery, ParsedContext, PolicyContext,
-    QueryExecutionOptions, TimeSpec, Tracker, TxnOperation,
+    QueryExecutionOptions, SparqlParamMap, TimeSpec, Tracker, TxnOperation,
 };
 use fluree_db_api::{CommitOpts, GraphPayload, GraphSel, SyncGraphOpts, TxnOpts};
 use fluree_db_core::commit::{TxnMetaEntry, TxnMetaValue};
@@ -37,27 +37,34 @@ pub(crate) struct Connection {
     fluree: InRuntime<Fluree>,
 }
 
-/// A write from its operation (`insert`, `upsert`, `update`) and payload
-/// format: `"jsonld"` (a JSON-able object), `"turtle"` (insert and upsert),
-/// or `"sparql"` (update).
 /// A sync payload: JSON-LD, or Turtle / N-Triples / TriG text.
 enum Payload {
     Json(JsonValue),
     Text(String),
 }
 
+/// A write from its operation (`insert`, `upsert`, `update`) and payload
+/// format: `"jsonld"` (a JSON-able object), `"turtle"` (insert and upsert),
+/// or `"sparql"` (update, which alone takes `params`).
 pub(crate) fn operation(
     op: &str,
     kind: &str,
     payload: &Bound<'_, PyAny>,
+    params: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<TxnOperation> {
+    let params = sparql_params(params)?;
+    if params.is_some() && (op, kind) != ("update", "sparql") {
+        return Err(invalid_request(
+            "parameters apply to SPARQL and Cypher updates",
+        ));
+    }
     Ok(match (op, kind) {
         ("insert", "jsonld") => TxnOperation::Insert(to_json(payload)?),
         ("upsert", "jsonld") => TxnOperation::Upsert(to_json(payload)?),
         ("update", "jsonld") => TxnOperation::Update(to_json(payload)?),
         ("insert", "turtle") => TxnOperation::InsertTurtle(payload.extract()?),
         ("upsert", "turtle") => TxnOperation::UpsertTurtle(payload.extract()?),
-        ("update", "sparql") => TxnOperation::SparqlUpdate(payload.extract()?),
+        ("update", "sparql") => TxnOperation::SparqlUpdate(payload.extract()?, params),
         ("insert" | "upsert" | "update", other) => {
             return Err(invalid_request(format!(
                 "{other:?} is not a valid format for this operation"
@@ -326,7 +333,7 @@ impl Connection {
     }
 
     /// Commit one write; see [`operation`] for `op`, `kind` and `payload`.
-    #[pyo3(signature = (ledger, op, kind, payload, policy = None, message = None))]
+    #[pyo3(signature = (ledger, op, kind, payload, policy = None, message = None, params = None))]
     #[allow(clippy::too_many_arguments)]
     fn transact<'py>(
         &self,
@@ -337,10 +344,11 @@ impl Connection {
         payload: &Bound<'py, PyAny>,
         policy: Option<&Bound<'py, PyAny>>,
         message: Option<String>,
+        params: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let id = canonical(ledger)?;
         let policy = governance(policy)?;
-        let operation = operation(op, kind, payload)?;
+        let operation = operation(op, kind, payload, params)?;
         let fluree = &*self.fluree;
         let receipt = block_on(py, async {
             let policy = write_policy(fluree, &id, policy.as_ref()).await?;
@@ -352,7 +360,10 @@ impl Connection {
                 TxnOperation::Upsert(v) => tx.upsert(v),
                 TxnOperation::UpsertTurtle(s) => tx.upsert_turtle(s),
                 TxnOperation::Update(v) => tx.update(v),
-                TxnOperation::SparqlUpdate(s) => tx.sparql_update(s),
+                TxnOperation::SparqlUpdate(s, None) => tx.sparql_update(s),
+                TxnOperation::SparqlUpdate(s, Some(params)) => {
+                    tx.sparql_update_with_params(s, params)
+                }
             };
             let tx = tx.commit_opts(commit_opts(message));
             let tx = match policy {
@@ -524,7 +535,8 @@ impl Connection {
         Transaction::begin(py, &self.fluree, &canonical(ledger)?, governance(policy)?)
     }
 
-    #[pyo3(signature = (ledger, sparql, at = None, policy = None, controls = None))]
+    #[pyo3(signature = (ledger, sparql, at = None, policy = None, controls = None, params = None))]
+    #[allow(clippy::too_many_arguments)]
     fn query_sparql<'py>(
         &self,
         py: Python<'py>,
@@ -533,22 +545,25 @@ impl Connection {
         at: Option<&Bound<'py, PyTuple>>,
         policy: Option<&Bound<'py, PyAny>>,
         controls: Option<Controls>,
+        params: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let id = canonical(ledger)?;
         let spec = time_spec(at)?;
         let policy = governance(policy)?;
+        let params = sparql_params(params)?;
         let fluree = &*self.fluree;
         let controls = controls.unwrap_or_default();
         let (id, policy) = (&id, policy.as_ref());
         let answer = controls.run(py, |cancel, controls| async move {
             let db = load(fluree, id, spec, policy).await?;
-            execute!(
-                controls,
-                cancel,
-                GraphSnapshotQueryBuilder::new_from_parts(fluree, &db)
-                    .sparql(sparql)
-                    .format(FormatterConfig::sparql_json())
-            )
+            let builder = GraphSnapshotQueryBuilder::new_from_parts(fluree, &db)
+                .sparql(sparql)
+                .format(FormatterConfig::sparql_json());
+            let builder = match params {
+                Some(params) => builder.params(params),
+                None => builder,
+            };
+            execute!(controls, cancel, builder)
         })?;
         answer.into_py(py, Some(sparql))
     }
@@ -590,15 +605,17 @@ impl Connection {
     /// A connection-level SPARQL query: its `FROM` / `FROM NAMED` / `TO`
     /// clauses pick the ledgers and times, so it can span ledgers or read a
     /// ledger's history.
-    #[pyo3(signature = (sparql, policy = None, controls = None))]
+    #[pyo3(signature = (sparql, policy = None, controls = None, params = None))]
     fn query_sparql_from<'py>(
         &self,
         py: Python<'py>,
         sparql: &str,
         policy: Option<&Bound<'py, PyAny>>,
         controls: Option<Controls>,
+        params: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let policy = governance(policy)?;
+        let params = sparql_params(params)?;
         let fluree = &*self.fluree;
         let controls = controls.unwrap_or_default();
         let answer = controls.run(py, |cancel, controls| async move {
@@ -608,6 +625,10 @@ impl Connection {
                 .format(FormatterConfig::sparql_json());
             let builder = match policy {
                 Some(opts) => builder.connection_opts(opts),
+                None => builder,
+            };
+            let builder = match params {
+                Some(params) => builder.params(params),
                 None => builder,
             };
             execute!(controls, cancel, builder)
@@ -635,7 +656,8 @@ impl Connection {
     }
 
     /// Start a streaming SELECT; rows are read from the returned stream.
-    #[pyo3(signature = (ledger, query, at = None, policy = None, controls = None))]
+    #[pyo3(signature = (ledger, query, at = None, policy = None, controls = None, params = None))]
+    #[allow(clippy::too_many_arguments)]
     fn stream(
         &self,
         py: Python<'_>,
@@ -644,18 +666,19 @@ impl Connection {
         at: Option<&Bound<'_, PyTuple>>,
         policy: Option<&Bound<'_, PyAny>>,
         controls: Option<Controls>,
+        params: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<RowStream> {
         let id = canonical(ledger)?;
         let spec = time_spec(at)?;
         let policy = governance(policy)?;
-        let query = QueryText::from_py(query)?;
+        let query = QueryText::from_py(query, params)?;
         let fluree = &*self.fluree;
         let db = block_on(py, load(fluree, &id, spec, policy.as_ref()))?.map_err(api_error)?;
         start_stream(py, fluree, db, query, controls.unwrap_or_default())
     }
 
     /// The query plan for a SPARQL (text) or JSON-LD (object) query.
-    #[pyo3(signature = (ledger, query, at = None, policy = None))]
+    #[pyo3(signature = (ledger, query, at = None, policy = None, params = None))]
     fn explain<'py>(
         &self,
         py: Python<'py>,
@@ -663,11 +686,12 @@ impl Connection {
         query: &Bound<'py, PyAny>,
         at: Option<&Bound<'py, PyTuple>>,
         policy: Option<&Bound<'py, PyAny>>,
+        params: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let id = canonical(ledger)?;
         let spec = time_spec(at)?;
         let policy = governance(policy)?;
-        let query = QueryText::from_py(query)?;
+        let query = QueryText::from_py(query, params)?;
         let fluree = &*self.fluree;
         let plan = block_on(py, async {
             let db = load(fluree, &id, spec, policy.as_ref()).await?;
@@ -968,23 +992,26 @@ impl Snapshot {
         from_json(py, &plan)
     }
 
-    #[pyo3(signature = (sparql, controls = None))]
+    #[pyo3(signature = (sparql, controls = None, params = None))]
     fn query_sparql<'py>(
         &self,
         py: Python<'py>,
         sparql: &str,
         controls: Option<Controls>,
+        params: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let params = sparql_params(params)?;
         let controls = controls.unwrap_or_default();
         let (fluree, db) = (&*self.fluree, &*self.db);
         let answer = controls.run(py, |cancel, controls| async move {
-            execute!(
-                controls,
-                cancel,
-                GraphSnapshotQueryBuilder::new_from_parts(fluree, db)
-                    .sparql(sparql)
-                    .format(FormatterConfig::sparql_json())
-            )
+            let builder = GraphSnapshotQueryBuilder::new_from_parts(fluree, db)
+                .sparql(sparql)
+                .format(FormatterConfig::sparql_json());
+            let builder = match params {
+                Some(params) => builder.params(params),
+                None => builder,
+            };
+            execute!(controls, cancel, builder)
         })?;
         answer.into_py(py, Some(sparql))
     }
@@ -1009,14 +1036,15 @@ impl Snapshot {
         answer.into_py(py, None)
     }
 
-    #[pyo3(signature = (query, controls = None))]
+    #[pyo3(signature = (query, controls = None, params = None))]
     fn stream(
         &self,
         py: Python<'_>,
         query: &Bound<'_, PyAny>,
         controls: Option<Controls>,
+        params: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<RowStream> {
-        let query = QueryText::from_py(query)?;
+        let query = QueryText::from_py(query, params)?;
         start_stream(
             py,
             &self.fluree,
@@ -1026,12 +1054,14 @@ impl Snapshot {
         )
     }
 
+    #[pyo3(signature = (query, params = None))]
     fn explain<'py>(
         &self,
         py: Python<'py>,
         query: &Bound<'py, PyAny>,
+        params: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let query = QueryText::from_py(query)?;
+        let query = QueryText::from_py(query, params)?;
         let plan = block_on(py, query.explain(&self.fluree, &self.db))?.map_err(api_error)?;
         from_json(py, &plan)
     }
@@ -1045,18 +1075,22 @@ fn start_stream(
     query: QueryText,
     controls: Controls,
 ) -> PyResult<RowStream> {
-    let (input, columns) = match query {
-        QueryText::Sparql(sparql) => {
+    let (input, columns, params) = match query {
+        QueryText::Sparql(sparql, params) => {
             let columns = sparql_columns(&sparql);
-            (OwnedStreamQuery::Sparql(sparql), columns)
+            (OwnedStreamQuery::Sparql(sparql), columns, params)
         }
         QueryText::JsonLd(json) => {
             let columns = jsonld_columns(&json);
-            (OwnedStreamQuery::JsonLd(json), columns)
+            (OwnedStreamQuery::JsonLd(json), columns, None)
         }
     };
     let cancellation = controls.cancellation();
     let options = QueryExecutionOptions::new().with_cancellation(cancellation.clone());
+    let options = match params {
+        Some(params) => options.with_params(params),
+        None => options,
+    };
     // A single-ledger dataset keeps the view's policy with the producer.
     let dataset = DataSetDb::single(db);
     let plan = block_on(
@@ -1082,23 +1116,32 @@ fn start_stream(
     ))
 }
 
-/// A query to explain or stream: SPARQL text or a JSON-LD object.
+/// A query to explain or stream: SPARQL text with its parameters, or a
+/// JSON-LD object.
 enum QueryText {
-    Sparql(String),
+    Sparql(String, Option<SparqlParamMap>),
     JsonLd(JsonValue),
 }
 
 impl QueryText {
-    fn from_py(query: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn from_py(query: &Bound<'_, PyAny>, params: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+        let params = sparql_params(params)?;
         match query.extract::<String>() {
-            Ok(sparql) => Ok(Self::Sparql(sparql)),
+            Ok(sparql) => Ok(Self::Sparql(sparql, params)),
+            Err(_) if params.is_some() => Err(invalid_request(
+                "parameters apply to SPARQL and Cypher queries; a JSON-LD query takes its values in the query",
+            )),
             Err(_) => Ok(Self::JsonLd(to_json(query)?)),
         }
     }
 
     async fn explain(&self, fluree: &Fluree, db: &GraphDb) -> fluree_db_api::Result<JsonValue> {
         match self {
-            Self::Sparql(sparql) => fluree.explain_sparql(db, sparql).await,
+            Self::Sparql(sparql, params) => {
+                fluree
+                    .explain_sparql_with_params(db, sparql, params.as_ref())
+                    .await
+            }
             Self::JsonLd(query) => fluree.explain(db, query).await,
         }
     }
