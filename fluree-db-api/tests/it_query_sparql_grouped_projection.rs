@@ -935,6 +935,17 @@ async fn ask_and_construct_group() {
             "ASK { ?e ex:nosuch ?a } HAVING (COUNT(?e) = 0)".to_string(),
             true,
         ),
+        // A non-key variable in an EXISTS body is free over the group row, in
+        // an ASK as in a SELECT: EXISTS holds for every group, NOT EXISTS for
+        // none.
+        (
+            format!(r#"ASK {W} GROUP BY ?a HAVING (EXISTS {{ ?e ex:area "Net" }})"#),
+            true,
+        ),
+        (
+            format!(r#"ASK {W} GROUP BY ?a HAVING (NOT EXISTS {{ ?e ex:area "Net" }})"#),
+            false,
+        ),
     ] {
         assert_eq!(ask(body.clone()).await, json!(expected), "{body}");
     }
