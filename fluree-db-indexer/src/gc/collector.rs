@@ -1776,7 +1776,7 @@ mod tests {
         );
     }
 
-    /// Production's regime — a live 30-minute age guard and fresh garbage
+    /// Production's regime — a live age guard and fresh garbage
     /// records — with no ceiling set, which is the default. Every version is
     /// inside the guard, so GC must leave all of them alone. That is the
     /// reader-safety property the guard exists for: a query that started
