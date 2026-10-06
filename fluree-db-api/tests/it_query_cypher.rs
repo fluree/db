@@ -11056,3 +11056,60 @@ async fn cypher_null_from_optional_match_matches_nothing_inside_exists() {
         ]
     );
 }
+
+/// A Cypher read honors the caller's execution options and tracker: a fuel
+/// limit stops it, the tracker reports what it cost, and a cancelled handle
+/// stops it — as for SPARQL and JSON-LD.
+#[tokio::test]
+async fn cypher_reads_honor_fuel_limits_and_cancellation() {
+    use fluree_db_api::{QueryCancellation, QueryExecutionOptions, Tracker, TrackingOptions};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:limits");
+    let people: Vec<JsonValue> = (0..60)
+        .map(|i| json!({"@id": format!("p{i}"), "@type": "Person", "n": i}))
+        .collect();
+    let committed = fluree
+        .insert(ledger0, &json!({"@context": ctx(), "@graph": people}))
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+    let cross = "MATCH (a:Person), (b:Person), (c:Person) RETURN count(*) AS n";
+    let options = QueryExecutionOptions::default();
+
+    let tracked = |max_fuel: Option<u64>| {
+        Tracker::new(TrackingOptions {
+            track_time: true,
+            track_fuel: true,
+            track_policy: false,
+            max_fuel,
+        })
+    };
+    let tracker = tracked(None);
+    let result = fluree
+        .query_cypher_with_tracker(&db, cross, None, &options, &tracker)
+        .await
+        .expect("unlimited");
+    assert_eq!(result.row_count(), 1);
+    let fuel = tracker.tally().and_then(|t| t.fuel).expect("fuel tallied");
+    assert!(fuel > 0.0, "{fuel}");
+
+    let err = fluree
+        .query_cypher_with_tracker(&db, cross, None, &options, &tracked(Some(1)))
+        .await
+        .expect_err("fuel limit");
+    assert!(err.to_string().to_lowercase().contains("fuel"), "{err}");
+
+    let cancellation = QueryCancellation::new();
+    cancellation.cancel();
+    let err = fluree
+        .query_cypher_with_options(
+            &db,
+            cross,
+            None,
+            &QueryExecutionOptions::new().with_cancellation(cancellation),
+        )
+        .await
+        .expect_err("cancelled");
+    assert!(err.to_string().to_lowercase().contains("cancel"), "{err}");
+}

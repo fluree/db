@@ -511,6 +511,21 @@ impl Fluree {
         params: Option<&fluree_db_cypher::ParamMap>,
         options: &QueryExecutionOptions,
     ) -> Result<QueryResult> {
+        self.query_cypher_with_tracker(db, cypher, params, options, &Tracker::disabled())
+            .await
+    }
+
+    /// [`Self::query_cypher_with_options`], charging `tracker` — the fuel
+    /// limit it carries stops the query, and its tally reports what the query
+    /// cost.
+    pub async fn query_cypher_with_tracker(
+        &self,
+        db: &GraphDb,
+        cypher: &str,
+        params: Option<&fluree_db_cypher::ParamMap>,
+        options: &QueryExecutionOptions,
+        tracker: &Tracker,
+    ) -> Result<QueryResult> {
         let parse_start = fluree_db_core::clock::Instant::now();
         let (vars, mut parsed) = parse_cypher_to_ir(
             cypher,
@@ -525,7 +540,7 @@ impl Fluree {
         maybe_wrap_for_graph_source(db, &mut parsed);
         guard_graph_source_patterns(db, &parsed, QuerySyntax::Cypher)?;
 
-        self.execute_cypher_ir(db, vars, parsed, parse_ms, options.server_identity.as_ref())
+        self.execute_cypher_ir(db, vars, parsed, parse_ms, options, tracker)
             .await
     }
 
@@ -548,7 +563,15 @@ impl Fluree {
         guard_graph_source_patterns(db, &parsed, QuerySyntax::Cypher)?;
         // Code-built probe ASTs carry no query-time reasoning or datalog
         // overrides, so override control has nothing to gate: anonymous.
-        self.execute_cypher_ir(db, vars, parsed, 0.0, None).await
+        self.execute_cypher_ir(
+            db,
+            vars,
+            parsed,
+            0.0,
+            &QueryExecutionOptions::default(),
+            &Tracker::disabled(),
+        )
+        .await
     }
 
     /// Execute a constructed Cypher read AST whose leading `InlineRows`
@@ -614,7 +637,15 @@ impl Fluree {
         guard_graph_source_patterns(db, &parsed, QuerySyntax::Cypher)?;
         // Code-built probe ASTs carry no query-time reasoning or datalog
         // overrides, so override control has nothing to gate: anonymous.
-        self.execute_cypher_ir(db, vars, parsed, 0.0, None).await
+        self.execute_cypher_ir(
+            db,
+            vars,
+            parsed,
+            0.0,
+            &QueryExecutionOptions::default(),
+            &Tracker::disabled(),
+        )
+        .await
     }
 
     async fn execute_cypher_ir(
@@ -623,19 +654,18 @@ impl Fluree {
         vars: crate::VarRegistry,
         parsed: fluree_db_query::ir::Query,
         parse_ms: f64,
-        server_identity: Option<&VerifiedIdentity>,
+        options: &QueryExecutionOptions,
+        tracker: &Tracker,
     ) -> Result<QueryResult> {
         let plan_start = fluree_db_core::clock::Instant::now();
         let executable = self
-            .build_executable_for_view(db, &parsed, server_identity)
+            .build_executable_for_view(db, &parsed, options.server_identity.as_ref())
             .await?;
         let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 
-        let tracker = Tracker::disabled();
-        let options = QueryExecutionOptions::default();
         let exec_start = fluree_db_core::clock::Instant::now();
         let batches = self
-            .execute_view_internal(db, &vars, &executable, &tracker, &options)
+            .execute_view_internal(db, &vars, &executable, tracker, options)
             .await?;
         let exec_ms = exec_start.elapsed().as_secs_f64() * 1000.0;
 
