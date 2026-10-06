@@ -21,6 +21,10 @@
 //! reads: each such query must decline the fast path its WHERE and grouping
 //! would otherwise take, and answer with the VALUES applied.
 //!
+//! A JSON-LD per-group list of IRIs is encoded on this ledger: the JSON-LD
+//! formatters, DOM and streaming, must materialize an encoded binding inside
+//! a per-group list.
+//!
 //! Own binary: it toggles the process-global fast-path kill switch.
 
 #![cfg(feature = "native")]
@@ -28,7 +32,8 @@
 #[path = "support/span_capture.rs"]
 mod span_capture;
 
-use fluree_db_api::{set_fast_paths_disabled, FlureeBuilder};
+use fluree_db_api::format::format_results_string;
+use fluree_db_api::{set_fast_paths_disabled, FlureeBuilder, FormatterConfig};
 use serde_json::{json, Value};
 use std::io::Write;
 use tempfile::TempDir;
@@ -58,6 +63,28 @@ fn sorted(rows: &Value) -> Vec<Value> {
     rows
 }
 
+/// [`sorted`], with each list cell (a per-group list) sorted too: the order of
+/// a group's members is the order its rows reached the grouping.
+fn sorted_lists(rows: &Value) -> Vec<Value> {
+    let rows: Vec<Value> = rows
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| {
+            let cells = row.as_array().expect("row").iter().map(|cell| match cell {
+                Value::Array(list) => {
+                    let mut list = list.clone();
+                    list.sort_by_key(std::string::ToString::to_string);
+                    Value::Array(list)
+                }
+                other => other.clone(),
+            });
+            Value::Array(cells.collect())
+        })
+        .collect();
+    sorted(&Value::Array(rows))
+}
+
 /// Run one SPARQL `body` (prefix added) and render its rows as JSON-LD.
 async fn run(
     fluree: &fluree_db_api::Fluree,
@@ -72,6 +99,33 @@ async fn run(
         .unwrap_or_else(|e| panic!("{e}\n{query}"))
         .to_jsonld(&ledger.snapshot)
         .expect("to_jsonld")
+}
+
+/// Run one JSON-LD `query` and render its rows through both JSON-LD
+/// formatters, the DOM one and the streaming one, which must agree.
+async fn run_jsonld(
+    fluree: &fluree_db_api::Fluree,
+    db: &fluree_db_api::GraphDb,
+    ledger: &fluree_db_api::LedgerState,
+    query: &Value,
+) -> Value {
+    let result = fluree
+        .query(db, query)
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{query}"));
+    let dom = result
+        .to_jsonld(&ledger.snapshot)
+        .unwrap_or_else(|e| panic!("to_jsonld: {e}\n{query}"));
+    let streamed = format_results_string(
+        &result,
+        &result.context,
+        &ledger.snapshot,
+        &FormatterConfig::jsonld(),
+    )
+    .unwrap_or_else(|e| panic!("format_results_string: {e}\n{query}"));
+    let streamed: Value = serde_json::from_str(&streamed).expect("streamed JSON");
+    assert_eq!(dom, streamed, "DOM and streaming JSON-LD differ\n{query}");
+    dom
 }
 
 /// A fast path's routing pair: the stamp `site` its operator records when it
@@ -310,6 +364,22 @@ async fn grouped_select_expression_on_an_indexed_ledger_in_both_lanes() {
     drop(tracing_guard);
     assert!(misrouted.is_empty(), "\n{}", misrouted.join("\n\n"));
 
+    // A per-group list of IRIs.
+    let ctx = json!({"ex": "http://example.org/"});
+    let jsonld_cases = vec![(
+        json!({
+            "@context": ctx,
+            "select": ["?a", "?e"],
+            "where": {"@id": "?e", "ex:area": "?a"},
+            "groupBy": "?a"
+        }),
+        json!([
+            ["Local", ["ex:e4", "ex:e5"]],
+            ["Net", ["ex:e1", "ex:e2", "ex:e3"]],
+            ["Remote", ["ex:e6"]]
+        ]),
+    )];
+
     for disabled in [false, true] {
         set_fast_paths_disabled(disabled);
         for (body, expected) in &cases {
@@ -318,6 +388,14 @@ async fn grouped_select_expression_on_an_indexed_ledger_in_both_lanes() {
                 sorted(&rows),
                 sorted(expected),
                 "fast paths disabled = {disabled}\n{body}"
+            );
+        }
+        for (query, expected) in &jsonld_cases {
+            let rows = run_jsonld(&fluree, &db, &ledger, query).await;
+            assert_eq!(
+                sorted_lists(&rows),
+                sorted_lists(expected),
+                "fast paths disabled = {disabled}\n{query}"
             );
         }
     }
