@@ -711,10 +711,11 @@ impl UngroupedRead {
             }
             ReadStage::UnboundAggregateInput => match read {
                 Some(var) => format!(
-                    "an aggregate reads variable {var}, which is unbound: nothing in the \
-                     query binds it"
+                    "an aggregate reads variable {var}, which is unbound: nothing before \
+                     the grouping binds it"
                 ),
-                None => "an aggregate reads a variable that nothing in the query binds".to_string(),
+                None => "an aggregate reads a variable that nothing before the grouping binds"
+                    .to_string(),
             },
             ReadStage::BoundAggregateOutput => match read {
                 Some(var) => {

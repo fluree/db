@@ -426,6 +426,30 @@ async fn aggregate_over_a_variable_nothing_binds_is_a_named_error() {
     }
 }
 
+/// Cypher's aggregate of a sibling aggregate's output (`count(f) AS c, sum(c)`)
+/// is the same plan error, named; it printed `VarId(n)`.
+#[tokio::test]
+async fn cypher_aggregate_of_a_sibling_aggregate_is_a_named_error() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "grouped-projection/cypher-sibling-aggregate:main").await;
+    let db = cypher_db(&ledger);
+    for q in [
+        "MATCH (p:P)-[:knows]->(f) WITH p, count(f) AS c, sum(c) AS s RETURN p.name, s",
+        "MATCH (p:P)-[:knows]->(f) RETURN p.name, count(f) AS c, sum(c) AS s",
+    ] {
+        let Err(err) = fluree.query_cypher(&db, q).await else {
+            panic!("an aggregate of a sibling aggregate must fail: {q}");
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("an aggregate reads variable c, which is unbound"),
+            "{q}: {message}"
+        );
+        assert!(!message.contains("VarId("), "{q}: {message}");
+        assert_eq!(err.status_code(), 400, "{q}: {message}");
+    }
+}
+
 /// The value HAVING tests is the value the alias returns: the expression runs
 /// once per group, before HAVING, never again. Over 40 groups a
 /// non-deterministic alias splits them, and every returned value passes.
