@@ -535,12 +535,56 @@ pub(crate) struct SparqlConstraintCtx<'a> {
     pub failures: Option<&'a ConstraintFailures>,
 }
 
+/// Whether an error of a constraint's query ends the validation whatever the
+/// constraint's severity: the request's budgets (fuel, deadline, memory), its
+/// access to storage, catalogs and policy, the state of the data, and internal
+/// faults. The others are the constraint's own query failing to run, which the
+/// shape's severity and the graph's mode decide ([`ConstraintFailure`]). The
+/// match names every variant, so a new error must be placed here.
+fn raised_whatever_the_severity(e: &QueryError) -> bool {
+    match e {
+        QueryError::FuelLimitExceeded(_)
+        | QueryError::Cancelled { .. }
+        | QueryError::MemoryBudgetExceeded { .. }
+        | QueryError::ResourceLimit(_)
+        | QueryError::NeedFetch(_)
+        | QueryError::StorageAccessDenied { .. }
+        | QueryError::CatalogCredentialsNotVended { .. }
+        | QueryError::CatalogAccessDenied { .. }
+        | QueryError::Policy(_)
+        | QueryError::TimeRangeNotCovered { .. }
+        | QueryError::SnapshotNotFound { .. }
+        | QueryError::NoSnapshotAtTime { .. }
+        | QueryError::R2rml(_)
+        | QueryError::Core(_)
+        | QueryError::Batch(_)
+        | QueryError::Internal(_)
+        | QueryError::DictionaryLookup(_)
+        | QueryError::OperatorNotOpened
+        | QueryError::OperatorAlreadyOpened
+        | QueryError::OperatorClosed => true,
+        QueryError::InvalidQuery(_)
+        | QueryError::UngroupedRead(_)
+        | QueryError::VariableNotFound(_)
+        | QueryError::NoSuitableIndex
+        | QueryError::InvalidFilter(_)
+        | QueryError::InvalidExpression(_)
+        | QueryError::UnsupportedMode(_)
+        | QueryError::UnsupportedFeature(_)
+        | QueryError::R2rmlUnsupportedPattern { .. }
+        | QueryError::Arithmetic(_)
+        | QueryError::Comparison(_) => false,
+    }
+}
+
 /// Run one `sh:sparql` constraint for `focus`: each solution is a result.
 ///
-/// A constraint that cannot run is raised as [`ShaclError::SparqlConstraint`],
+/// A constraint that cannot run (its query does not parse, lower or plan, or
+/// fails for a reason of its own) is raised as [`ShaclError::SparqlConstraint`],
 /// or recorded in `exec.failures` with the shape's `severity` when the pass
-/// collects failures (no results, and the pass continues). Any other error
-/// (a runtime query error such as an exhausted budget) is always raised.
+/// collects failures (no results, and the pass continues). The request's
+/// budgets, storage access and internal faults are always raised
+/// ([`raised_whatever_the_severity`]).
 pub(crate) async fn validate_sparql_constraint(
     db: GraphDbRef<'_>,
     focus: &Sid,
@@ -598,9 +642,10 @@ async fn run_sparql_constraint(
             .decode_sid(sid)
             .unwrap_or_else(|| sid.to_string())
     };
+    // Every failure names the constraint and the shape that owns it.
     let constraint_failure = |message: String| ShaclError::SparqlConstraint {
         constraint: iri(&constraint.source),
-        message,
+        message: format!("on shape {}: {message}", iri(source_shape)),
     };
 
     let ast = constraint
@@ -669,14 +714,19 @@ async fn run_sparql_constraint(
         },
     )
     .await
-    .map_err(|e| match e.name_variables(&vars) {
-        // A query the planner rejects (e.g. a projected variable its grouping
-        // does not produce) is a broken constraint: a validation failure
-        // naming the shape, like a query that does not parse.
-        QueryError::InvalidQuery(message) => {
-            constraint_failure(format!("on shape {}: {message}", iri(source_shape)))
+    .map_err(|e| {
+        let e = e.name_variables(&vars);
+        if raised_whatever_the_severity(&e) {
+            ShaclError::QueryError(e)
+        } else {
+            // A query that cannot run (the planner rejects it, or it reads a
+            // variable nothing binds) is a broken constraint: a validation
+            // failure naming the shape, like a query that does not parse.
+            constraint_failure(match e {
+                QueryError::InvalidQuery(message) => message,
+                other => other.to_string(),
+            })
         }
-        other => ShaclError::QueryError(other),
     })?;
 
     // Decode context for late-materialized (encoded) bindings.

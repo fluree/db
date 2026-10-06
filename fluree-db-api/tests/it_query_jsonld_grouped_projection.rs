@@ -598,6 +598,28 @@ async fn jsonld_values_reach_generated_binds() {
     );
 }
 
+/// The JSON-LD twin of `aggregate_over_a_variable_nothing_binds_is_a_named_error`.
+#[tokio::test]
+async fn jsonld_aggregate_over_a_variable_nothing_binds_is_a_named_error() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "jsonld-grouped/aggregate-nosuch:main").await;
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["(as (sum ?nosuch) ?s)"],
+        "where": {"@id": "?e", "ex:area": "?a"}
+    });
+    let Err(err) = support::query_jsonld(&fluree, &ledger, &query).await else {
+        panic!("an aggregate over a variable nothing binds must fail");
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("an aggregate reads variable ?nosuch, which is unbound"),
+        "{message}"
+    );
+    assert!(!message.contains("VarId("), "{message}");
+    assert_eq!(err.status_code(), 400, "{message}");
+}
+
 /// `groupBy` / `having` group an `ask`: it is true when some group passes
 /// `having` (the SPARQL ASK twin is `ask_and_construct_group`). They used to be
 /// refused, and before that dropped (`true` for a `having` that rejects every

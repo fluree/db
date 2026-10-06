@@ -634,6 +634,8 @@ pub enum ReadStage {
     /// The projection, of a variable nothing in the query binds: not the
     /// WHERE, the grouping or a trailing VALUES.
     UnboundProjection,
+    /// An aggregate's input, a variable nothing before grouping binds.
+    UnboundAggregateInput,
 }
 
 impl UngroupedRead {
@@ -701,6 +703,13 @@ impl UngroupedRead {
                 );
                 format!("{var} is unbound: nothing in the query binds it")
             }
+            ReadStage::UnboundAggregateInput => match read {
+                Some(var) => format!(
+                    "an aggregate reads variable {var}, which is unbound: nothing in the \
+                     query binds it"
+                ),
+                None => "an aggregate reads a variable that nothing in the query binds".to_string(),
+            },
         }
     }
 }

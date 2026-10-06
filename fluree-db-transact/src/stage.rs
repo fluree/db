@@ -3822,6 +3822,9 @@ pub async fn validate_view_with_shacl(
     // graph, fails the transaction with the constraint's error (fail closed);
     // on a Warning or Info shape, or in a Warn-mode graph, it is logged and
     // the transaction goes on, as a result there would.
+    // The constraint fails the same way for every focus node it ran on: log
+    // each distinct failure once, with the number of focus nodes.
+    let mut logged: Vec<(fluree_db_shacl::ConstraintFailure, usize)> = Vec::new();
     for failure in constraint_failures.take() {
         let fatal = failure.severity == fluree_db_shacl::Severity::Violation
             && matches!(
@@ -3831,10 +3834,21 @@ pub async fn validate_view_with_shacl(
         if fatal {
             return Err(failure.into_error().into());
         }
+        match logged.iter_mut().find(|(seen, _)| {
+            seen.constraint == failure.constraint
+                && seen.message == failure.message
+                && seen.graph_id == failure.graph_id
+        }) {
+            Some((_, focus_nodes)) => *focus_nodes += 1,
+            None => logged.push((failure, 1)),
+        }
+    }
+    for (failure, focus_nodes) in logged {
         tracing::warn!(
             constraint = %failure.constraint,
             severity = ?failure.severity,
             graph = failure.graph_id,
+            focus_nodes,
             message = %failure.message,
             "sh:sparql constraint could not run (non-violation severity or warn-mode graph, continuing)"
         );

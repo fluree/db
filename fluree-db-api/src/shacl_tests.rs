@@ -5500,11 +5500,13 @@ async fn ledger_with_failing_player_constraint(
 }
 
 /// An `sh:sparql` constraint that cannot run (its query does not parse, lower
-/// or plan) follows the shape's severity and the graph's validation mode, as a
-/// result would: on a Violation shape in a reject-mode graph it fails the
-/// transaction with the constraint's error (fail closed); on a Warning or Info
-/// shape, or in a warn-mode graph, it is logged and the write commits. Every
-/// such failure used to fail the transaction, whatever the severity or mode.
+/// or plan, or an aggregate reads a variable nothing binds) follows the shape's
+/// severity and the graph's validation mode, as a result would: on a Violation
+/// shape in a reject-mode graph it fails the transaction with the constraint's
+/// error, which names the shape and any variable (fail closed); on a Warning
+/// or Info shape, or in a warn-mode graph, it is logged and the write commits.
+/// Every such failure used to fail the transaction, whatever the severity or
+/// mode, and the unbound aggregate input printed a raw variable id.
 #[tokio::test]
 async fn shacl_sparql_constraint_failure_follows_severity_and_mode() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -5526,10 +5528,17 @@ async fn shacl_sparql_constraint_failure_follows_severity_and_mode() {
             "SELECT $this WHERE { $this nope:score ?value }",
             "failed to lower sh:select query",
         ),
+        (
+            "aggregate",
+            "SELECT $this WHERE { $this <http://example.org/ns/score> ?s } \
+             GROUP BY $this HAVING (SUM(?nosuch) > 0)",
+            "an aggregate reads variable ?nosuch, which is unbound",
+        ),
     ];
     // (severity, warn-mode graph, the write commits)
     let cells = [
         (None, false, false),
+        (Some("sh:Violation"), false, false),
         (Some("sh:Violation"), true, true),
         (Some("sh:Warning"), false, true),
         (Some("sh:Warning"), true, true),
@@ -5561,6 +5570,11 @@ async fn shacl_sparql_constraint_failure_follows_severity_and_mode() {
                         "{cell}"
                     );
                     assert!(message.contains(says), "{cell}: {message}");
+                    assert!(
+                        message.contains("on shape http://example.org/ns/PlayerShape:"),
+                        "{cell}: {message}"
+                    );
+                    assert!(!message.contains("VarId("), "{cell}: {message}");
                 }
                 (outcome, _) => panic!(
                     "{cell}: expected {}, got {outcome:?}",

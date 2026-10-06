@@ -3669,9 +3669,12 @@ pub(crate) fn apply_solution_modifiers(
         for spec in &aggregates_vec {
             if let Some(input_var) = spec.function.input_var() {
                 if !current_schema.contains(&input_var) {
-                    return Err(QueryError::VariableNotFound(format!(
-                        "Aggregate input variable {input_var:?} not found in schema"
-                    )));
+                    // Typed so callers holding the registry name the variable
+                    // (`QueryError::name_variables`).
+                    return Err(QueryError::UngroupedRead(crate::ir::UngroupedRead {
+                        var: input_var,
+                        stage: crate::ir::ReadStage::UnboundAggregateInput,
+                    }));
                 }
                 if spec.output_var != input_var && current_schema.contains(&spec.output_var) {
                     return Err(QueryError::InvalidQuery(format!(

@@ -384,6 +384,48 @@ async fn having_reads_a_select_alias() {
     assert_eq!(result.row_count(), 0, "HAVING (?nosuch = 1)");
 }
 
+/// An aggregate over a variable nothing binds is a plan error naming the
+/// variable, a 400 on both query paths; it printed `Aggregate input variable
+/// VarId(n) not found in schema`, a 500 on the tracked path.
+#[tokio::test]
+async fn aggregate_over_a_variable_nothing_binds_is_a_named_error() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "grouped-projection/aggregate-nosuch:main").await;
+    for body in [
+        format!("SELECT (SUM(?nosuch) AS ?s) {W}"),
+        format!("SELECT ?a {W} GROUP BY ?a HAVING (SUM(?nosuch) > 0)"),
+    ] {
+        let query = format!("{PREFIX}{body}");
+        let Err(err) = support::query_sparql(&fluree, &ledger, &query).await else {
+            panic!("an aggregate over a variable nothing binds must fail: {body}");
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("an aggregate reads variable ?nosuch, which is unbound"),
+            "{body}: {message}"
+        );
+        assert!(!message.contains("VarId("), "{body}: {message}");
+        assert_eq!(err.status_code(), 400, "{body}: {message}");
+
+        let Err(tracked) = support::graphdb_from_ledger(&ledger)
+            .query(&fluree)
+            .sparql(&query)
+            .execute_tracked()
+            .await
+        else {
+            panic!("the tracked query must fail too: {body}");
+        };
+        assert_eq!(tracked.status, 400, "{body}: {}", tracked.error);
+        assert!(
+            tracked
+                .error
+                .contains("an aggregate reads variable ?nosuch, which is unbound"),
+            "{body}: {}",
+            tracked.error
+        );
+    }
+}
+
 /// The value HAVING tests is the value the alias returns: the expression runs
 /// once per group, before HAVING, never again. Over 40 groups a
 /// non-deterministic alias splits them, and every returned value passes.
