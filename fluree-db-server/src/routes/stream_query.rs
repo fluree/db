@@ -393,10 +393,16 @@ async fn stream_query_inner(
             ));
         }
 
-        // Mirror /query's ledger-scoped preprocessing: normalize `from` against
-        // the path ledger, fold header opts in, enforce bearer scope over the
-        // path ledger and every referenced graph, then apply auth-derived
-        // identity + default policy class.
+        // Mirror /query's ledger-scoped preprocessing: enforce bearer scope
+        // over the path ledger before anything is read from it, normalize
+        // `from` against it, fold header opts in, enforce bearer scope over
+        // every referenced graph, then apply auth-derived identity + default
+        // policy class.
+        if let Some(p) = bearer.0.as_ref() {
+            if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger)?) {
+                return Err(ServerError::not_found("Ledger not found"));
+            }
+        }
         let registry = if fluree_db_api::jsonld_names_dataset(&query_json) {
             crate::routes::query::scope_registry(&state, &path.id).await
         } else {
@@ -404,11 +410,6 @@ async fn stream_query_inner(
         };
         normalize_ledger_scoped_from(&path.id, registry.as_ref(), &mut query_json)?;
         inject_headers_into_query(&mut query_json, &headers);
-        if let Some(p) = bearer.0.as_ref() {
-            if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger)?) {
-                return Err(ServerError::not_found("Ledger not found"));
-            }
-        }
         enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
         let plan_options =
             crate::query_control::options_for_identity(headers.server_identity.as_ref());

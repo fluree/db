@@ -1214,6 +1214,15 @@ pub async fn query_ledger(
         }
     };
 
+    // Enforce bearer ledger scope for unsigned requests, before anything is
+    // read from the ledger (its graph registry included).
+    if let Some(p) = bearer.0.as_ref() {
+        if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger)?) {
+            set_span_error_code(&span, "error:Forbidden");
+            return Err(ServerError::not_found("Ledger not found"));
+        }
+    }
+
     // Ledger-scoped endpoint: resolve `from` / `fromNamed` in the path's ledger,
     // rejecting attempts to target a different ledger than the URL.
     let registry = if fluree_db_api::jsonld_names_dataset(&query_json) {
@@ -1227,14 +1236,7 @@ pub async fn query_ledger(
     // Inject header values into query opts
     inject_headers_into_query(&mut query_json, &headers);
 
-    // Enforce bearer ledger scope for unsigned requests
-    if let Some(p) = bearer.0.as_ref() {
-        if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger)?) {
-            set_span_error_code(&span, "error:Forbidden");
-            return Err(ServerError::not_found("Ledger not found"));
-        }
-    }
-    // ...and over every additional ledger a `fromNamed` (or normalized `from`)
+    // ...and enforce it over every additional ledger a `fromNamed` (or normalized `from`)
     // references — a scoped token must not reach an out-of-scope ledger via a
     // named graph even on the ledger-scoped endpoint.
     enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
@@ -1639,6 +1641,15 @@ pub async fn explain_ledger(
             }
         };
 
+        // Enforce bearer ledger scope for unsigned requests, before anything
+        // is read from the ledger (its graph registry included).
+        if let Some(p) = bearer.0.as_ref() {
+            if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger)?) {
+                set_span_error_code(&span, "error:Forbidden");
+                return Err(ServerError::not_found("Ledger not found"));
+            }
+        }
+
         // Ledger-scoped endpoint: resolve `from` / `fromNamed` in the path's
         // ledger, rejecting attempts to target a different ledger than the URL.
         let registry = if fluree_db_api::jsonld_names_dataset(&query_json) {
@@ -1652,14 +1663,6 @@ pub async fn explain_ledger(
         // Inject header values into query opts
         inject_headers_into_query(&mut query_json, &headers);
         enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
-
-        // Enforce bearer ledger scope for unsigned requests
-        if let Some(p) = bearer.0.as_ref() {
-            if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger)?) {
-                set_span_error_code(&span, "error:Forbidden");
-                return Err(ServerError::not_found("Ledger not found"));
-            }
-        }
 
         let min_t_requirements =
             collect_jsonld_min_t_requirements(&headers, &query_json, Some(&ledger_id))?;
