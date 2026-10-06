@@ -709,12 +709,7 @@ pub(crate) fn binding_to_numeric(binding: &Binding) -> Option<NumericValue> {
             if *o_kind == ObjKind::NUM_INT.as_u8() {
                 Some(NumericValue::Long(ObjKey::from_u64(*o_key).decode_i64()))
             } else if *o_kind == ObjKind::NUM_F64.as_u8() {
-                let d = ObjKey::from_u64(*o_key).decode_f64();
-                if d.is_nan() {
-                    None
-                } else {
-                    Some(NumericValue::Double(d))
-                }
+                Some(NumericValue::Double(ObjKey::from_u64(*o_key).decode_f64()))
             } else {
                 None
             }
@@ -723,17 +718,14 @@ pub(crate) fn binding_to_numeric(binding: &Binding) -> Option<NumericValue> {
     }
 }
 
+/// NaN and ±INF are numbers like any other double: SUM and AVG are built on
+/// `op:numeric-add` (SPARQL 1.1 §18.5.1.3, §18.5.1.4), so a NaN member makes
+/// the result NaN and `INF + -INF` is NaN.
 pub(crate) fn flake_value_to_numeric(val: &FlakeValue) -> Option<NumericValue> {
     match val {
         FlakeValue::Long(n) => Some(NumericValue::Long(*n)),
         FlakeValue::Boolean(b) => Some(NumericValue::Long(i64::from(*b))),
-        FlakeValue::Double(d) => {
-            if d.is_nan() {
-                None
-            } else {
-                Some(NumericValue::Double(*d))
-            }
-        }
+        FlakeValue::Double(d) => Some(NumericValue::Double(*d)),
         FlakeValue::BigInt(b) => Some(NumericValue::BigInt((**b).clone())),
         FlakeValue::Decimal(d) => Some(NumericValue::Decimal((**d).clone())),
         _ => None,
@@ -1187,6 +1179,42 @@ mod tests {
         let (val, dt) = result.as_lit().expect("empty AVG must be a literal 0");
         assert_eq!(*val, FlakeValue::Long(0));
         assert_eq!(dt.datatype(), &xsd_integer());
+    }
+
+    #[test]
+    fn test_agg_sum_and_avg_add_special_doubles() {
+        // SUM is op:numeric-add and AVG is SUM / COUNT (SPARQL 1.1 §18.5.1.3,
+        // §18.5.1.4): IEEE arithmetic, so a NaN member gives NaN and
+        // INF + -INF is NaN.
+        let dbl = |d: f64| Binding::lit(FlakeValue::Double(d), xsd_double());
+        let encoded = |d: f64| Binding::EncodedLit {
+            o_kind: fluree_db_core::value_id::ObjKind::NUM_F64.as_u8(),
+            o_key: fluree_db_core::value_id::ObjKey::encode_f64(d).as_u64(),
+            p_id: 0,
+            dt_id: 0,
+            lang_id: 0,
+            i_val: i32::MIN,
+            t: 0,
+        };
+        let double_of = |b: Binding| match b.as_lit() {
+            Some((FlakeValue::Double(d), _)) => *d,
+            other => panic!("expected a double, got {other:?}"),
+        };
+        for values in [
+            vec![dbl(1.0), dbl(f64::NAN)],
+            vec![
+                Binding::lit(FlakeValue::Long(1), xsd_integer()),
+                dbl(f64::NAN),
+            ],
+            vec![dbl(1.0), encoded(f64::NAN)],
+            vec![dbl(f64::INFINITY), dbl(f64::NEG_INFINITY)],
+        ] {
+            assert!(double_of(agg_sum(&values)).is_nan(), "SUM {values:?}");
+            assert!(double_of(agg_avg(&values)).is_nan(), "AVG {values:?}");
+        }
+        let values = vec![dbl(f64::INFINITY), encoded(2.5)];
+        assert_eq!(double_of(agg_sum(&values)), f64::INFINITY);
+        assert_eq!(double_of(agg_avg(&values)), f64::INFINITY);
     }
 
     #[test]
