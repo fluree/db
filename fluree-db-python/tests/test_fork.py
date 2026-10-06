@@ -12,8 +12,6 @@ import pytest
 
 pytestmark = pytest.mark.skipif(not hasattr(__import__("os"), "fork"), reason="no fork on this platform")
 
-MACOS = sys.platform == "darwin"
-
 SETUP = """
 import faulthandler, os, sys, tempfile, multiprocessing
 import fluree
@@ -92,26 +90,15 @@ def test_a_child_exits_cleanly_holding_inherited_objects(tmp_path):
     assert lines == ["STATUS 0"]
 
 
-@pytest.mark.skipif(MACOS, reason="macOS refuses the engine in a forked child; see the next test")
-def test_a_forked_child_opens_its_own_connection(tmp_path):
-    lines = run(tmp_path, """
-        conn, people = started(path)
-        in_child(lambda: work(path))
-        with multiprocessing.get_context("fork").Pool(2) as pool:
-            print("POOL", pool.map(work, [path, path]))
-        print("PARENT", people.query(Q).values())
-    """)
-    assert lines == ["OK [['A']]", "STATUS 0", "POOL [[['A']], [['A']]]", "PARENT [['A']]"]
-
-
-@pytest.mark.skipif(not MACOS, reason="macOS only")
-def test_macos_refuses_the_engine_in_a_forked_child(tmp_path):
+def test_a_child_forked_after_the_engine_started_refuses_it(tmp_path):
+    # Its lock state names the parent's threads, which the child lacks; a
+    # spawned process starts clean.
     lines = run(tmp_path, """
         conn, people = started(path)
         in_child(lambda: work(path))
         with multiprocessing.get_context("spawn").Pool(1) as pool:
             print("SPAWN", pool.map(work, [path]))
+        print("PARENT", people.query(Q).values())
     """)
-    assert lines[0].startswith("ERR") and "'spawn'" in lines[0]
-    assert lines[1] == "STATUS 0"
-    assert lines[2] == "SPAWN [[['A']]]"
+    assert lines[0].startswith("ERR") and "forked after Fluree started" in lines[0] and "'spawn'" in lines[0]
+    assert lines[1:] == ["STATUS 0", "SPAWN [[['A']]]", "PARENT [['A']]"]

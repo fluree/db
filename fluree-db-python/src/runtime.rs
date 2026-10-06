@@ -26,10 +26,9 @@ const STACK: usize = 8 * 1024 * 1024;
 const INLINE_STACK: usize = 4 * 1024 * 1024;
 
 /// The engine runtime of one process. A forked child inherits its parent's
-/// runtime without the threads that drive it, so a child that uses the engine
-/// starts a runtime of its own (except on macOS; see [`engine`]); the
-/// inherited one is leaked, never dropped, since dropping it would wait on
-/// threads that do not exist.
+/// runtime without the threads that drive it, and cannot start one of its
+/// own (see [`engine`]); the inherited one is leaked, never dropped, since
+/// dropping it would wait on threads that do not exist.
 struct Engine {
     runtime: Runtime,
     pid: u32,
@@ -43,13 +42,16 @@ fn engine() -> PyResult<&'static Engine> {
     if let Some(engine) = current(pid) {
         return Ok(engine);
     }
-    // On macOS the system dispatch library, which Rust's timed waits use,
-    // aborts in a child forked from a process that used it, so a forked child
-    // cannot run an engine of its own.
-    if cfg!(target_os = "macos") && !ENGINE.load(Ordering::Acquire).is_null() {
+    // A child forked after the engine started inherits lock state that
+    // names the parent's threads, which do not exist in the child: idle
+    // engine threads wait in a process-wide table of parked threads, and the
+    // child reuses their stacks for its own, so a later lock in the child
+    // follows those entries into overwritten memory. On macOS the system
+    // dispatch library, which timed waits use, aborts there as well.
+    if !ENGINE.load(Ordering::Acquire).is_null() {
         return Err(fluree_error(
-            "on macOS, a process forked after Fluree started cannot use it; use the \
-             multiprocessing 'spawn' start method (the macOS default) or 'forkserver'",
+            "a process forked after Fluree started cannot use it; use the multiprocessing \
+             'spawn' or 'forkserver' start method, or first use Fluree after the fork",
         ));
     }
     let _starting = STARTING.lock().unwrap_or_else(PoisonError::into_inner);
@@ -232,8 +234,8 @@ impl<T> InRuntime<T> {
             return Ok(());
         }
         Err(fluree_error(
-            "this was opened in the parent of a forked process; open a new connection \
-             in this process",
+            "this was opened in the parent of a forked process, which cannot use Fluree; \
+             use the multiprocessing 'spawn' or 'forkserver' start method",
         ))
     }
 }
