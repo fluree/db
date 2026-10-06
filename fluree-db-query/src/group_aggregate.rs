@@ -186,9 +186,7 @@ pub(crate) fn materialize_encoded(binding: &Binding, gv: Option<&BinaryGraphView
                 Ok(fluree_db_core::FlakeValue::Ref(sid)) => Binding::sid(sid),
                 Ok(val) => {
                     let dt_sid = store
-                        .dt_sids()
-                        .get(*dt_id as usize)
-                        .cloned()
+                        .resolve_dt_id_sid_for_value(*dt_id, &val)
                         .unwrap_or_else(|| Sid::new(0, ""));
                     let meta = store.decode_meta(*lang_id, *i_val);
                     let dtc = meta

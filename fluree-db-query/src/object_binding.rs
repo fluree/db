@@ -162,6 +162,9 @@ pub(crate) fn late_materialized_object_binding(
             i_val: encoded_i_val(o_i),
             t,
         }),
+        // The arena holds overflow integers and decimals alike, so `dt_id` is
+        // a placeholder: decode, then resolve via
+        // `BinaryIndexStore::resolve_dt_id_sid_for_value`.
         DecodeKind::NumBigArena => Some(Binding::EncodedLit {
             o_kind: ObjKind::NUM_BIG.as_u8(),
             o_key,

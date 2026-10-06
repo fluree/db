@@ -2067,6 +2067,28 @@ impl BinaryIndexStore {
             .or_else(|| val.overflow_numeric_datatype_sid())
     }
 
+    /// Resolve the datatype Sid of a decoded `EncodedLit` — the `dt_id`-keyed
+    /// twin of [`resolve_datatype_sid_for_value`].
+    ///
+    /// Every NUM_BIG `EncodedLit` carries `dt_id = DECIMAL`, because the scan
+    /// cannot tell an overflow `xsd:integer` from an `xsd:decimal` without
+    /// decoding. The decoded value's variant therefore wins over `dt_id`. Any
+    /// site that turns a decoded `EncodedLit` into a typed term must resolve
+    /// its datatype here; one that reads `dt_sids()` directly reports overflow
+    /// integers as `xsd:decimal` and keys them apart from decoded copies of
+    /// the same value (issue #1329). A triple-term `EncodedLit` carries no
+    /// `dt_id` either.
+    ///
+    /// [`resolve_datatype_sid_for_value`]: Self::resolve_datatype_sid_for_value
+    pub fn resolve_dt_id_sid_for_value(&self, dt_id: u16, val: &FlakeValue) -> Option<Sid> {
+        val.overflow_numeric_datatype_sid()
+            .or_else(|| {
+                val.is_triple_term()
+                    .then(|| fluree_db_core::triple_term_datatype_sid().clone())
+            })
+            .or_else(|| self.dt_sids().get(dt_id as usize).cloned())
+    }
+
     /// Look up an o_type table entry by o_type value. O(1).
     pub fn lookup_o_type(&self, o_type: u16) -> Option<&OTypeTableEntry> {
         self.o_type_index

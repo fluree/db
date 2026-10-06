@@ -48,6 +48,14 @@ Overview of Fluree's Rust crate architecture:
 - Storage crates
 - Dependency relationships
 
+### [License FAQ](license-faq.md)
+
+What the Business Source License allows:
+- Production use and the Database Service restriction
+- Building applications and data products on Fluree
+- Change Date and version coverage
+- Contributions and commercial licensing
+
 ## Quick Reference
 
 ### Common Namespaces

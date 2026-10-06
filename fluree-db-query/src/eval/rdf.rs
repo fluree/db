@@ -8,6 +8,7 @@ use crate::error::{QueryError, Result};
 use crate::ir::{Expression, Function};
 use crate::object_binding::{late_materialized_object_binding, materialized_object_binding};
 use fluree_db_binary_index::BinaryIndexStore;
+use fluree_db_core::value_id::ObjKind;
 use fluree_db_core::{DatatypeDictId, Sid};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -101,6 +102,40 @@ fn datatype_of_binding(
 ) -> Result<Option<ComparableValue>> {
     match binding {
         Binding::Lit { dtc, .. } => Ok(Some(ComparableValue::Sid(dtc.datatype().clone()))),
+        // A NUM_BIG `dt_id` reads DECIMAL for overflow integers too; only the
+        // decoded value names the datatype (issue #1329).
+        Binding::EncodedLit {
+            o_kind,
+            o_key,
+            p_id,
+            dt_id,
+            lang_id,
+            ..
+        } if *o_kind == ObjKind::NUM_BIG.as_u8() => {
+            let decoded = ctx.and_then(|c| {
+                let store = c.binary_store.as_deref()?;
+                let val = c.decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id)?;
+                Some((store, val))
+            });
+            let Some((store, val)) = decoded else {
+                return Err(QueryError::InvalidExpression(
+                    "DATATYPE requires a literal or IRI argument".to_string(),
+                ));
+            };
+            let val = val.map_err(|e| {
+                QueryError::execution(format!(
+                    "DATATYPE could not decode overflow numeric (o_key={o_key}, p_id={p_id}): {e}"
+                ))
+            })?;
+            let dt_sid = store
+                .resolve_dt_id_sid_for_value(*dt_id, &val)
+                .ok_or_else(|| {
+                    QueryError::InvalidExpression(format!(
+                        "DATATYPE could not resolve datatype id {dt_id}"
+                    ))
+                })?;
+            Ok(Some(ComparableValue::Sid(dt_sid)))
+        }
         Binding::EncodedLit { dt_id, .. } => {
             let dt_id = DatatypeDictId::from_u16(*dt_id);
             if let Some(sid) = reserved_datatype_sid(dt_id) {

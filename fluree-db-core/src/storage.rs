@@ -1848,10 +1848,16 @@ pub trait StorageCas: Debug + Send + Sync {
     ///
     /// The closure should be a pure function of its input — it may be called
     /// multiple times on retry.
+    ///
+    /// The closure is `'static` so an implementation can run it off the
+    /// calling task, for example on a blocking thread.
     async fn compare_and_swap<T, F>(&self, address: &str, f: F) -> StorageExtResult<CasOutcome<T>>
     where
-        F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError> + Send + Sync,
-        T: Send;
+        F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError>
+            + Send
+            + Sync
+            + 'static,
+        T: Send + 'static;
 }
 
 #[cfg(test)]

@@ -745,7 +745,7 @@ impl crate::BranchLifecycle for FileNameService {
 
         let outcome = self
             .storage
-            .compare_and_swap(&address, |bytes| {
+            .compare_and_swap(&address, move |bytes| {
                 let Some(data) = bytes else {
                     return Ok(CasAction::Abort(()));
                 };
@@ -954,11 +954,12 @@ impl CommitPublisher for FileNameService {
         let ledger_name_c = ledger_name.clone();
         let branch_c = branch.clone();
         let cid_str = commit_id.to_string();
+        let cid_c = cid_str.clone();
 
         let outcome = self
             .storage
-            .compare_and_swap(&address, |bytes| {
-                let cid_val = Some(cid_str.clone());
+            .compare_and_swap(&address, move |bytes| {
+                let cid_val = Some(cid_c.clone());
 
                 match bytes {
                     Some(data) => {
@@ -1036,7 +1037,7 @@ impl IndexPublisher for FileNameService {
         let cid_str = index_id.to_string();
 
         self.storage
-            .compare_and_swap(&address, |bytes| {
+            .compare_and_swap(&address, move |bytes| {
                 if let Some(data) = bytes {
                     let existing: NsIndexFileV2 = deserialize_json(data)?;
                     if index_t <= existing.index.t {
@@ -1073,7 +1074,7 @@ impl AdminPublisher for FileNameService {
         let cid_str = index_id.to_string();
 
         self.storage
-            .compare_and_swap(&address, |bytes| {
+            .compare_and_swap(&address, move |bytes| {
                 let should_update = match bytes {
                     Some(data) => {
                         let existing: NsIndexFileV2 = deserialize_json(data)?;
@@ -1125,7 +1126,7 @@ impl GraphSourcePublisher for FileNameService {
         let source_type_str = source_type.to_type_string();
 
         self.storage
-            .compare_and_swap::<(), _>(&address, |bytes| {
+            .compare_and_swap::<(), _>(&address, move |bytes| {
                 // Publishing config is what creating or reconfiguring a graph
                 // source does, so the record comes out active — including a
                 // record retracted by an earlier drop. Preserving the
@@ -1169,7 +1170,7 @@ impl GraphSourcePublisher for FileNameService {
         let branch_c = branch.to_string();
 
         self.storage
-            .compare_and_swap(&address, |bytes| {
+            .compare_and_swap(&address, move |bytes| {
                 // Strictly monotonic: only update if new_t > existing_t
                 if let Some(data) = bytes {
                     let existing: GraphSourceIndexFileV2WithT = deserialize_json(data)?;
@@ -1398,7 +1399,7 @@ impl RefPublisher for FileNameService {
                 let phase = std::time::Instant::now();
                 let outcome = self
                     .storage
-                    .compare_and_swap(&address, |bytes| {
+                    .compare_and_swap(&address, move |bytes| {
                         let existing: Option<NsFileV2> = bytes.map(deserialize_json).transpose()?;
 
                         let current_ref = existing.as_ref().map(|f| RefValue {
@@ -1475,16 +1476,16 @@ impl RefPublisher for FileNameService {
                 // head through this path (transact/commit.rs → compare_and_set_ref
                 // / fast_forward_commit). Best-effort; never fail the publish.
                 if matches!(result, CasResult::Updated) {
-                    if let Some(cid) = new_clone.id.as_ref() {
+                    if let Some(cid) = new.id.as_ref() {
                         // Appended off this call: the publish is inside a
                         // ledger's commit window, and the index is a
                         // discovery accelerator whose reader sorts by `t`
                         // and falls back to the chain walk for any gap, so
                         // neither ordering nor timing is load-bearing.
                         let path = self.commits_path(&ledger_name, &branch);
-                        let line = commit_index_line(new_clone.t, &cid.to_string());
+                        let line = commit_index_line(new.t, &cid.to_string());
                         let ledger_id = ledger_id.to_string();
-                        let t = new_clone.t;
+                        let t = new.t;
                         spawn_detached(async move {
                             if let Err(e) = append_commit_index_line(&path, &line).await {
                                 tracing::debug!(error = %e, ledger_id, t, "commit-index append failed (non-fatal)");
@@ -1524,7 +1525,7 @@ impl RefPublisher for FileNameService {
 
                 let outcome = self
                     .storage
-                    .compare_and_swap(&address, |bytes| {
+                    .compare_and_swap(&address, move |bytes| {
                         let existing: Option<NsIndexFileV2> =
                             bytes.map(deserialize_json).transpose()?;
 
@@ -1621,7 +1622,7 @@ impl StatusPublisher for FileNameService {
 
         let outcome = self
             .storage
-            .compare_and_swap(&address, |bytes| {
+            .compare_and_swap(&address, move |bytes| {
                 let existing: Option<NsFileV2> = bytes.map(deserialize_json).transpose()?;
 
                 let current = existing.as_ref().map(NsFileV2::to_status_value);
@@ -1695,7 +1696,7 @@ impl ConfigPublisher for FileNameService {
 
         let outcome = self
             .storage
-            .compare_and_swap(&address, |bytes| {
+            .compare_and_swap(&address, move |bytes| {
                 let existing: Option<NsFileV2> = bytes.map(deserialize_json).transpose()?;
 
                 let current = existing.as_ref().map(NsFileV2::to_config_value);
