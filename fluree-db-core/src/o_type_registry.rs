@@ -93,6 +93,7 @@ impl OTypeRegistry {
             ObjKind::YEAR_MONTH_DUR => OType::XSD_YEAR_MONTH_DURATION,
             ObjKind::DAY_TIME_DUR => OType::XSD_DAY_TIME_DURATION,
             ObjKind::GEO_POINT => OType::GEO_POINT,
+            ObjKind::TRIPLE_TERM => OType::TRIPLE_TERM,
 
             // Blank nodes are currently represented as REF_ID SIDs whose namespace code is
             // `namespaces::BLANK_NODE`. We intentionally map all REF_ID to `OType::IRI_REF`

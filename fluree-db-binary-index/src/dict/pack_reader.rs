@@ -478,6 +478,7 @@ fn fetch_and_load(
     // Fast paths: check if something appeared since construction.
     if let Some(path) = ctx.cs.resolve_local_path(pack_cid) {
         let backing = load_pack_backing(&path)?;
+        fluree_db_core::io_stats::record(|| "pack", "local", backing.bytes().len());
         let meta = parse_pack_meta(backing.bytes())?;
         validate_lazy_meta(&meta, expected_first_id, expected_last_id, ctx)?;
         return Ok(LazyLoaded { meta, backing });
@@ -487,6 +488,7 @@ fn fetch_and_load(
     let disk_cache = ctx.cs.permits_plaintext_cache();
     if disk_cache && cache_path.exists() {
         let backing = load_pack_backing(cache_path)?;
+        fluree_db_core::io_stats::record(|| "pack", "cache", backing.bytes().len());
         let meta = parse_pack_meta(backing.bytes())?;
         validate_lazy_meta(&meta, expected_first_id, expected_last_id, ctx)?;
         return Ok(LazyLoaded { meta, backing });

@@ -8,8 +8,8 @@ use super::ast::{
     UnresolvedConstructTemplate, UnresolvedDatatypeConstraint, UnresolvedExpression,
     UnresolvedForwardItem, UnresolvedHydrationSpec, UnresolvedNestedSelectSpec, UnresolvedOptions,
     UnresolvedPathExpr, UnresolvedPattern, UnresolvedProjection, UnresolvedQuery, UnresolvedRoot,
-    UnresolvedSortDirection, UnresolvedSortSpec, UnresolvedTerm, UnresolvedTriplePattern,
-    UnresolvedValue,
+    UnresolvedSortDirection, UnresolvedSortSpec, UnresolvedTerm, UnresolvedTermObject,
+    UnresolvedTermPattern, UnresolvedTriplePattern, UnresolvedValue,
 };
 use super::encode::{IriEncoder, NoEncoder};
 use super::error::{ParseError, Result};
@@ -451,6 +451,7 @@ pub fn lower_unresolved_pattern<E: IriEncoder>(
                 edge: lowered_edge,
                 annotation: lowered_annotation,
                 body: lowered_body,
+                term: crate::ir::term_components::fresh_term_var(vars),
             }])
         }
         UnresolvedPattern::AnnotationTarget {
@@ -459,13 +460,29 @@ pub fn lower_unresolved_pattern<E: IriEncoder>(
             body,
         } => {
             let lowered_annotation = lower_ref_term(annotation, encoder, vars)?;
-            let lowered_edge = lower_triple_pattern(edge, encoder, vars)?;
-            let lowered_body = lower_unresolved_patterns(body, encoder, vars, pp_counter)?;
-            Ok(vec![Pattern::AnnotationTarget {
-                annotation: lowered_annotation,
-                edge: lowered_edge,
-                body: lowered_body,
-            }])
+            let mut out = Vec::new();
+            let lowered_edge = lower_term_pattern(edge, encoder, vars, &mut out)?;
+            crate::ir::lower_reified_link(
+                lowered_annotation,
+                lowered_edge,
+                encoder,
+                vars,
+                &mut out,
+            );
+            out.extend(lower_unresolved_patterns(body, encoder, vars, pp_counter)?);
+            Ok(out)
+        }
+        UnresolvedPattern::TripleTermValue {
+            subject,
+            predicate,
+            term,
+        } => {
+            let subject = lower_ref_term(subject, encoder, vars)?;
+            let predicate = lower_ref_term(predicate, encoder, vars)?;
+            let mut out = Vec::new();
+            let term = lower_term_pattern(term, encoder, vars, &mut out)?;
+            crate::ir::lower_term_value(subject, predicate, term, encoder, vars, &mut out);
+            Ok(out)
         }
     }
 }
@@ -497,6 +514,43 @@ fn lower_values_cell<E: IriEncoder>(cell: &UnresolvedValue, encoder: &E) -> Resu
                 .encode_iri(iri)
                 .ok_or_else(|| ParseError::UnknownNamespace(iri.to_string()))?;
             Ok(Binding::sid(sid))
+        }
+        UnresolvedValue::TripleTerm {
+            subject,
+            predicate,
+            object,
+        } => {
+            let encode = |iri: &str| {
+                encoder
+                    .encode_iri(iri)
+                    .ok_or_else(|| ParseError::UnknownNamespace(iri.to_string()))
+            };
+            let (o, dt, lang) = match lower_values_cell(object, encoder)? {
+                Binding::Sid { sid, .. } => (
+                    FlakeValue::Ref(sid),
+                    fluree_db_core::edge::id_datatype_sid(),
+                    None,
+                ),
+                Binding::Lit { val, dtc, .. } => {
+                    let lang = dtc.lang_tag().map(str::to_string);
+                    (val, dtc.datatype().clone(), lang)
+                }
+                _ => {
+                    return Err(ParseError::InvalidWhere(
+                        "a triple term's object in values must be a constant".to_string(),
+                    ))
+                }
+            };
+            Ok(Binding::lit(
+                FlakeValue::TripleTerm(Box::new(fluree_db_core::TripleTermValue {
+                    s: encode(subject)?,
+                    p: encode(predicate)?,
+                    o,
+                    dt,
+                    lang,
+                })),
+                fluree_db_core::triple_term_datatype_sid().clone(),
+            ))
         }
         UnresolvedValue::Literal { value, dtc } => {
             // Build initial FlakeValue from the literal
@@ -584,6 +638,38 @@ pub fn coerce_value_by_datatype(value: FlakeValue, datatype_iri: &str) -> Result
 }
 
 /// Lower an unresolved triple pattern to a resolved TriplePattern
+/// A triple term's triple; a nested term object lowers to a term variable
+/// (or a composed constant) whose patterns go into `out`.
+fn lower_term_pattern<E: IriEncoder>(
+    tp: &UnresolvedTermPattern,
+    encoder: &E,
+    vars: &mut VarRegistry,
+    out: &mut Vec<Pattern>,
+) -> Result<TriplePattern> {
+    match &tp.o {
+        UnresolvedTermObject::Value { o, dtc } => lower_triple_pattern(
+            &UnresolvedTriplePattern {
+                s: tp.s.clone(),
+                p: tp.p.clone(),
+                o: o.clone(),
+                dtc: dtc.clone(),
+            },
+            encoder,
+            vars,
+        ),
+        UnresolvedTermObject::Term(inner) => {
+            let inner = lower_term_pattern(inner, encoder, vars, out)?;
+            let (o, dtc) = crate::ir::lower_term_object(inner, encoder, vars, out);
+            Ok(TriplePattern {
+                s: lower_ref_term(&tp.s, encoder, vars)?,
+                p: lower_ref_term(&tp.p, encoder, vars)?,
+                o,
+                dtc,
+            })
+        }
+    }
+}
+
 fn lower_triple_pattern<E: IriEncoder>(
     pattern: &UnresolvedTriplePattern,
     encoder: &E,
@@ -1472,11 +1558,59 @@ fn lower_construct_patterns<E: IriEncoder>(
                 };
                 lower_construct_patterns(patterns, Some(&name), encoder, vars, out)?;
             }
+            UnresolvedPattern::TripleTermValue {
+                subject,
+                predicate,
+                term,
+            } => {
+                let o = construct_term_var(term, encoder, vars, out)?;
+                out.push_pattern(
+                    TriplePattern::new(
+                        lower_ref_term(subject, encoder, vars)?,
+                        lower_ref_term(predicate, encoder, vars)?,
+                        Term::Var(o),
+                    ),
+                    graph.cloned(),
+                );
+            }
             // Filters, optionals and binds have no meaning in a template.
             _ => {}
         }
     }
     Ok(())
+}
+
+/// A template variable standing for the triple term `term` instantiates to,
+/// its nested term registered first.
+fn construct_term_var<E: IriEncoder>(
+    term: &UnresolvedTermPattern,
+    encoder: &E,
+    vars: &mut VarRegistry,
+    out: &mut ConstructTemplate,
+) -> Result<VarId> {
+    let pattern = match &term.o {
+        UnresolvedTermObject::Value { o, dtc } => lower_triple_pattern(
+            &UnresolvedTriplePattern {
+                s: term.s.clone(),
+                p: term.p.clone(),
+                o: o.clone(),
+                dtc: dtc.clone(),
+            },
+            encoder,
+            vars,
+        )?,
+        UnresolvedTermObject::Term(inner) => {
+            let o = construct_term_var(inner, encoder, vars, out)?;
+            TriplePattern::new(
+                lower_ref_term(&term.s, encoder, vars)?,
+                lower_ref_term(&term.p, encoder, vars)?,
+                Term::Var(o),
+            )
+        }
+    };
+    let var = vars.get_or_insert(&format!("?__tt{}", vars.len()));
+    out.push_term_template(var, pattern);
+    Ok(var)
 }
 
 // ============================================================================
@@ -1813,6 +1947,12 @@ fn lower_function_name(name: &str) -> Function {
         "datatype" => Function::Datatype { strict: false },
         "langmatches" => Function::LangMatches,
         "sameterm" => Function::SameTerm,
+        // RDF 1.2 triple terms (SPARQL's TRIPLE, SUBJECT, PREDICATE, OBJECT, isTRIPLE)
+        "triple" => Function::Triple,
+        "subject" => Function::TripleSubject,
+        "predicate" => Function::TriplePredicate,
+        "object" => Function::TripleObject,
+        "istriple" | "is-triple" => Function::IsTriple,
         // Fluree-specific: transaction time
         "t" => Function::T,
         "op" => Function::Op,

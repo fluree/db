@@ -132,9 +132,9 @@ pub(crate) async fn attach_garbage_manifest(
 
 /// Load and decode the previous index root.
 ///
-/// Best-effort: any load/decode failure degrades to `None`. The annotation
-/// arm then stays in scan-fallback, and the garbage manifest is omitted
-/// rather than written empty, instead of failing the rebuild.
+/// Best-effort: any load/decode failure degrades to `None`, and the garbage
+/// manifest is omitted rather than written empty, instead of failing the
+/// rebuild.
 async fn load_prev_root(
     content_store: &dyn ContentStore,
     prev_root_id: &ContentId,
@@ -146,7 +146,7 @@ async fn load_prev_root(
 /// The CIDs `new_root` supersedes: everything the prior root reached that
 /// this one no longer does.
 ///
-/// "Reachable" includes leaves behind named-graph and annotation branch
+/// "Reachable" includes leaves behind named-graph and legacy arena branch
 /// manifests via `collect_root_cas_ids_expanded`. Diffing only the direct
 /// CAS refs (`all_cas_ids()`) would silently leak those leaves on every
 /// reindex.
@@ -216,35 +216,16 @@ pub(crate) struct Fir6Inputs {
     /// resolver encoded decimals — a mismatch would split decimal identity
     /// across the inline/arena boundary.
     pub decimal_encoding: fluree_db_core::DecimalEncoding,
-    /// Edge-annotation event coverage envelope (M2b slice 3g).
-    ///
-    /// Routed from `IndexerConfig.attachment_events` through
-    /// `rebuild.rs`. Same coverage semantics as the incremental
-    /// path, but without a base arena to merge against:
-    ///
-    /// - `Authoritative(events)` — caller guarantees full history;
-    ///   seal the arena from this set.
-    /// - `Augment(events)` / `Unknown` / `None` — we can't prove
-    ///   completeness without a base arena (the rebuild path
-    ///   doesn't yet collect events from the resolver). Stay in
-    ///   scan-fallback (`annotation_index = None`) until an
-    ///   explicitly `Authoritative` source is supplied — i.e. a
-    ///   future rebuild whose caller passes the full event set,
-    ///   or an incremental pass that can prove its overlay
-    ///   coverage is authoritative. Augment alone cannot reseal
-    ///   from this state because the indexer has no way to
-    ///   recover the missing history.
-    pub attachment_events: Option<crate::config::AttachmentEventCoverage>,
     /// The index version this root supersedes — the prior head root's CID and
     /// `index_t` (`NsRecord`'s `index_head_id` and `index_t`) — when one
     /// exists.
     ///
-    /// Serves two purposes. It becomes the published root's `prev_index` link,
-    /// which GC and drop walk to enumerate superseded artifacts. It also lets
-    /// the `Augment` arena arm recover the base arena's event history from the
-    /// prior root — without it a full rebuild under `Augment` coverage
-    /// silently drops a previously-sealed arena.
+    /// It becomes the published root's `prev_index` link, which GC and drop
+    /// walk to enumerate superseded artifacts.
     pub prev_index: Option<BinaryPrevIndexRef>,
+    /// Triple-term dictionary interned by this build, if any reification
+    /// links were synthesized.
+    pub term_dict: Option<fluree_db_binary_index::TermDictRefs>,
 }
 
 /// Encode an `IndexRoot` (FIR6), write to CAS, and return an `IndexResult`.
@@ -267,8 +248,7 @@ pub(crate) async fn encode_and_write_root_v6(
         inputs.index_t,
     )?;
 
-    // Loaded once and shared: the annotation arm reads its sealed arena and
-    // the garbage manifest diffs against its reachable set.
+    // The garbage manifest diffs against the prior root's reachable set.
     let prev_root = match inputs.prev_index.as_ref() {
         Some(prev) => load_prev_root(content_store, &prev.id).await,
         None => None,
@@ -298,14 +278,14 @@ pub(crate) async fn encode_and_write_root_v6(
         .cloned()
         .collect();
 
-    // Sticky bit: `true` once any `f:reifies*` predicate has been
-    // observed in the ledger's history. Detection is cheap — if any
-    // of the seven reserved reifies SIDs appears in the indexer's
-    // accumulated predicate dictionary, annotations exist (or did).
+    // Sticky bit: `true` once `rdf:reifies` or a legacy `f:reifies*`
+    // predicate has been observed in the ledger's history. Detection is
+    // cheap — if one appears in the indexer's accumulated predicate
+    // dictionary, annotations exist (or did).
     // Once a predicate enters the dict it stays there across
     // reindexes, so this naturally inherits sticky-bit semantics.
     let has_annotations = inputs.predicate_sids.iter().any(|(ns, name)| {
-        fluree_db_core::is_reserved_reifies_predicate(&fluree_db_core::Sid::new(*ns, name.as_str()))
+        fluree_db_core::is_annotation_predicate(&fluree_db_core::Sid::new(*ns, name.as_str()))
     });
 
     let mut root = IndexRoot {
@@ -338,13 +318,8 @@ pub(crate) async fn encode_and_write_root_v6(
         // Same source as the resolver's policy for this run (see Fir6Inputs).
         decimal_encoding: inputs.decimal_encoding,
         has_annotations,
-        annotation_index: None,
-        // Sticky bit flipped to `true` below if the rebuild path
-        // seals an `Authoritative` arena. Rebuilds always start
-        // from scratch with no prior root, so this is the only
-        // signal carried forward — defensive-drop semantics live
-        // exclusively on the incremental path.
-        had_annotation_arena: false,
+        legacy_annotation_arena: None,
+        term_dict: inputs.term_dict,
         has_list_meta: Some(inputs.saw_list_meta),
     };
 
@@ -352,164 +327,6 @@ pub(crate) async fn encode_and_write_root_v6(
     // The root carries this as `total_commit_size`; ensure stats reflect it.
     if let Some(stats) = root.stats.as_mut() {
         stats.distribute_total_size_by_flakes(root.total_commit_size);
-    }
-
-    // ---- Annotation arena seal (M2b slice 3g, full-rebuild path) ----
-    //
-    // Same coverage envelope as the incremental Phase 3d, but
-    // without a previous arena to merge against (full rebuild
-    // starts from scratch). Decision matrix:
-    //
-    //   Authoritative(events) → caller asserts complete history;
-    //                            seal authoritative arena.
-    //   Augment(events)       → caller has events but can't prove
-    //                            completeness; without a base arena
-    //                            to merge with, we have no way to
-    //                            recover historical attachments
-    //                            beyond the supplied events. Stay
-    //                            in scan-fallback (annotation_index
-    //                            = None) until an explicitly
-    //                            `Authoritative` source is provided
-    //                            (a future rebuild whose caller
-    //                            passes the full event set, or
-    //                            resolver-side event collection
-    //                            that lets the indexer produce its
-    //                            own complete history). Augment
-    //                            alone cannot reseal from this
-    //                            state — the indexer cannot
-    //                            reconstruct the missing history.
-    //   Unknown / None        → no caller events; no-op.
-    //
-    // Events clipped to t <= inputs.index_t for the same reason as
-    // incremental: keeps `AnnotationIndexRoot.max_t <=
-    // IndexRoot.index_t`.
-    use crate::config::AttachmentEventCoverage;
-    let job_t = inputs.index_t;
-    match inputs.attachment_events {
-        Some(AttachmentEventCoverage::Authoritative(mut events)) => {
-            events.retain(|(_, _, t, _)| *t <= job_t);
-            let result = crate::build::annotation_arena::build_and_persist_annotation_arena(
-                content_store,
-                None,
-                events,
-            )
-            .await?;
-            if let Some(ref ann) = result.new_index {
-                debug_assert!(
-                    ann.max_t <= job_t,
-                    "AnnotationIndexRoot.max_t ({}) must not exceed IndexRoot.index_t ({})",
-                    ann.max_t,
-                    job_t
-                );
-            }
-            if result.new_index.is_some() {
-                // Sticky flag: an arena was sealed at this t. Even if
-                // a later pass defensively drops it, this bit stays
-                // true so the provider's bootstrap scan-fallback is
-                // suppressed.
-                root.had_annotation_arena = true;
-            }
-            root.annotation_index = result.new_index;
-            // No previous arena → no leaves to GC; replaced_leaf_cids
-            // is empty by construction.
-            debug_assert!(result.replaced_leaf_cids.is_empty());
-        }
-        Some(AttachmentEventCoverage::Augment(events)) => {
-            // A full rebuild starts from scratch, but the *previous root*
-            // may carry a sealed arena whose event history plus the
-            // Augment delta is complete — the same merge contract the
-            // incremental Phase 3d applies. Without recovering it here, a
-            // full reindex under `Augment` coverage silently drops a
-            // previously-sealed arena (and the sticky bit then blocks the
-            // bootstrap scan from ever resealing).
-            let prev_arena = prev_root
-                .as_ref()
-                .and_then(|prev| prev.annotation_index.clone());
-            match prev_arena {
-                Some(prev) => {
-                    let reader =
-                        fluree_db_binary_index::annotation_arena::AnnotationArenaReader::new(
-                            &prev,
-                            content_store,
-                        );
-                    match reader.collect_all_forward_events().await {
-                        Ok(mut merged) => {
-                            merged.extend(events);
-                            // Full-tuple sort + dedup: an event indexed by a
-                            // prior pass may also still sit in the running
-                            // overlay's delta.
-                            merged.sort();
-                            merged.dedup();
-                            merged.retain(|(_, _, t, _)| *t <= job_t);
-                            // `previous_index: None`: the prior arena's blobs
-                            // stay reachable from the previous root and follow
-                            // the same old-generation GC lifecycle as every
-                            // other replaced artifact of a full rebuild.
-                            // Identical re-sealed leaves re-derive the same
-                            // CIDs, so nothing is duplicated.
-                            let result =
-                                crate::build::annotation_arena::build_and_persist_annotation_arena(
-                                    content_store,
-                                    None,
-                                    merged,
-                                )
-                                .await?;
-                            if let Some(ref ann) = result.new_index {
-                                debug_assert!(
-                                    ann.max_t <= job_t,
-                                    "AnnotationIndexRoot.max_t ({}) must not exceed \
-                                     IndexRoot.index_t ({})",
-                                    ann.max_t,
-                                    job_t
-                                );
-                            }
-                            if result.new_index.is_some() {
-                                root.had_annotation_arena = true;
-                            }
-                            root.annotation_index = result.new_index;
-                            tracing::debug!(
-                                ledger_id = %inputs.ledger_id,
-                                "full-rebuild resealed annotation arena from previous \
-                                 root's arena + Augment delta"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                ledger_id = %inputs.ledger_id,
-                                error = %e,
-                                "failed to read previous arena events for Augment \
-                                 merge; leaving annotation_index=None (scan-fallback)"
-                            );
-                        }
-                    }
-                }
-                None => {
-                    tracing::warn!(
-                        ledger_id = %inputs.ledger_id,
-                        "full-rebuild path received Augment coverage but has no \
-                         base arena to merge with; cannot prove history \
-                         completeness. Leaving annotation_index=None — the next \
-                         incremental pass with running overlay coverage will \
-                         seal an authoritative arena."
-                    );
-                }
-            }
-        }
-        Some(AttachmentEventCoverage::Unknown) | None => {
-            // Non-annotation ledger fast path or scan-fallback state.
-        }
-    }
-
-    // Sticky-bit coercion: see the canonical contract on
-    // `IndexRoot.had_annotation_arena` in
-    // `fluree-db-binary-index/src/format/index_root.rs`. Mirrors
-    // `IncrementalRootBuilder::build()` — every indexer pass on
-    // an annotation-bearing ledger represents history the indexer
-    // owns; the provider must not later reconstruct a live-only
-    // `Authoritative` arena from such a root. Bulk import is the
-    // only path that leaves the bit false.
-    if root.has_annotations {
-        root.had_annotation_arena = true;
     }
 
     // GC and drop both enumerate superseded artifacts by walking the
@@ -640,9 +457,9 @@ mod tests {
             garbage: None,
             sketch_ref: None,
             has_annotations: false,
-            had_annotation_arena: false,
             has_list_meta: None,
-            annotation_index: None,
+            legacy_annotation_arena: None,
+            term_dict: None,
             o_type_table: IndexRoot::build_o_type_table(&[], &[]),
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
             decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,

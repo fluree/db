@@ -204,6 +204,22 @@ A `{| ... |}` block without a reifier, or a blank-node reifier (`~ _:r`), mints 
 node for each solution, like `[ ]`. The block's properties become ordinary triples about the
 reifier.
 
+A reified triple, `<< s p o ~ r >>`, in a template subject or object stands for its reifier
+and writes `r`'s reification of `s p o` without asserting it; without `~ r` the reifier is a
+fresh blank node per solution:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+# Record each claim without asserting it
+CONSTRUCT { << ?s ex:worksFor ?o >> ex:source ex:hrExport }
+WHERE { ?s ex:claimsEmployer ?o }
+```
+
+In the `CONSTRUCT WHERE` shorthand the template is the pattern, and an anonymous `{| ... |}`
+(or a bare `~`) in it is a blank node there too: the result names a fresh reifier, not the
+one the pattern matched.
+
 In a JSON-LD query, put `@annotation` on the object, as when writing an annotation. An
 `@annotation` without an `@id` mints a fresh reifier per solution:
 
@@ -360,12 +376,14 @@ details of each.
 
 - `GRAPH` blocks cannot nest, and the `CONSTRUCT WHERE` shorthand has no `GRAPH` form (its
   template is a basic graph pattern, per SPARQL 1.1).
-- A triple term in a template is accepted only as the object of `rdf:reifies`; nested triple
-  terms and property paths inside a template annotation block are rejected.
-- `?r rdf:reifies <<( s p o )>>` in a template also writes `s p o`, the same as the annotation
-  tail `s p o ~ ?r`. Fluree reifies asserted edges only, as every write form does (see
-  [Edge annotations](../concepts/edge-annotations.md)), so a result never carries a reifier
-  without its triple.
+- A template writes a triple term under any predicate, nested ones included, built from each
+  solution (`CONSTRUCT { ?d ex:mentions <<( ?s ex:p ?o )>> }`); a term with an unbound component
+  writes nothing. A template variable bound to a stored triple term (`CONSTRUCT { ?d ex:mentions
+  ?t }`) writes the term. Property paths inside a template annotation block are rejected.
+- `?r rdf:reifies <<( s p o )>>` in a template writes the reification without `s p o`, as RDF
+  1.2 defines it; the annotation tail `s p o ~ ?r` writes both. `?r rdf:reifies ?t`, with `?t`
+  bound to a triple term, writes the same as the first. A JSON-LD result writes a reification
+  whose triple it does not carry as the reifier's `@reifies`.
 - A SPARQL datalog rule whose head (the template) annotates an edge or writes into a named
   graph is rejected: rules infer default-graph triples only.
 

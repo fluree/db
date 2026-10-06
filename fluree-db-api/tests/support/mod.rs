@@ -146,19 +146,9 @@ pub async fn query_jsonld_tracked(
     db.query(fluree).jsonld(query_json).execute_tracked().await
 }
 
-/// Decode every edge-annotation bundle whose reified SUBJECT is `subject_iri`
-/// within graph `g_id` of `ledger`, via `EdgeKey::from_reifies_facts` — the
-/// exact path both readers (JSON-LD hydration + attachment indexer) take.
-///
-/// Panics on a decode error (`GraphMismatch` / `Duplicate` — the silent-drop
-/// failure mode of a bad graph re-home), so a returned key is proof the bundle
-/// is self-consistent. Locating the reifier by `f:reifiesSubject` (not by
-/// `@id`) works for both anonymous and explicit reifiers. Returned keys are
-/// ordered by reifier Sid.
-///
-/// Uses point (`Eq`) POST + SPOT lookups rather than an unbounded scan so it
-/// works on both the novelty path and the V3 binary-index provider (which
-/// rejects `RangeTest::Ge` full scans).
+/// The edges reified in graph `g_id` of `ledger` whose subject is
+/// `subject_iri`, one per live `rdf:reifies` link, ordered by reifier Sid.
+/// Each key's `g` is the graph's Sid (`None` for the default graph).
 pub async fn decode_annotations_for_subject(
     ledger: &LedgerState,
     g_id: fluree_db_core::GraphId,
@@ -173,75 +163,44 @@ pub async fn decode_annotations_for_subject(
         .snapshot
         .encode_iri(subject_iri)
         .expect("encode subject IRI");
-    let reifies_subject_pid = fluree_db_core::namespaces::reifies_subject_sid().clone();
+    let g = (g_id != 0).then(|| {
+        let iri = ledger
+            .snapshot
+            .graph_registry
+            .iri_for_graph_id(g_id)
+            .expect("registered graph");
+        ledger.snapshot.encode_iri(iri).expect("encode graph IRI")
+    });
 
-    // Reifier subjects: POST lookup of f:reifiesSubject → subject, in g_id.
-    let pointers = range_with_overlay(
+    let mut links = range_with_overlay(
         &ledger.snapshot,
         g_id,
         ledger.novelty.as_ref(),
-        IndexType::Post,
+        IndexType::Psot,
         RangeTest::Eq,
-        RangeMatch::predicate_object(reifies_subject_pid, FlakeValue::Ref(subject_sid)),
+        RangeMatch::new().with_predicate(fluree_db_core::rdf_reifies_sid().clone()),
         RangeOptions::new().with_to_t(ledger.t()),
     )
     .await
-    .expect("scan f:reifiesSubject pointers");
+    .expect("scan rdf:reifies links");
+    links.sort_by(|a, b| a.s.cmp(&b.s));
 
-    let mut reifiers: Vec<fluree_db_core::Sid> = pointers
-        .iter()
+    links
+        .into_iter()
         .filter(|f| f.op)
-        .map(|f| f.s.clone())
-        .collect();
-    reifiers.sort();
-    reifiers.dedup();
-
-    let mut keys = Vec::with_capacity(reifiers.len());
-    for ann_sid in reifiers {
-        let subject_flakes = range_with_overlay(
-            &ledger.snapshot,
-            g_id,
-            ledger.novelty.as_ref(),
-            IndexType::Spot,
-            RangeTest::Eq,
-            RangeMatch::subject(ann_sid.clone()),
-            RangeOptions::new().with_to_t(ledger.t()),
-        )
-        .await
-        .expect("scan annotation subject flakes");
-        // Index-decoded flakes carry `g: None` — the graph is the index they
-        // came from, not a field on the flake — while `f:reifiesGraph` names
-        // the graph. `from_reifies_facts` reconciles the two, so without this
-        // stamp an indexed named-graph bundle decodes as `GraphMismatch` and
-        // this helper reports a defect that isn't there. Production scans of a
-        // reifier's own facts stamp for the same reason (`stamp_graph` in
-        // `fluree-db-transact`).
-        let g_sid = subject_flakes.iter().find_map(|f| {
-            (f.op && f.p.name.as_ref() == fluree_vocab::db::REIFIES_GRAPH)
-                .then(|| match &f.o {
-                    FlakeValue::Ref(sid) => Some(sid.clone()),
-                    _ => None,
-                })
-                .flatten()
-        });
-        let bundle: Vec<_> = subject_flakes
-            .iter()
-            .filter(|f| f.op && fluree_db_core::is_reserved_reifies_predicate(&f.p))
-            .cloned()
-            .map(|mut f| {
-                f.g = g_sid.clone();
-                f
-            })
-            .collect();
-        let key = EdgeKey::from_reifies_facts(&bundle).unwrap_or_else(|e| {
-            panic!(
-                "from_reifies_facts failed for reifier {ann_sid} in g_id {g_id}: \
-                 {e:?}; bundle: {bundle:#?}"
-            )
-        });
-        keys.push(key);
-    }
-    keys
+        .filter_map(|f| match f.o {
+            FlakeValue::TripleTerm(term) if term.s == subject_sid => Some(EdgeKey {
+                g: g.clone(),
+                s: term.s,
+                p: term.p,
+                o: term.o,
+                dt: term.dt,
+                lang: term.lang,
+                list_i: None,
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Create a genesis ledger state for the given ledger ID.
@@ -407,58 +366,13 @@ pub fn start_background_indexer_local(
     (local, handle)
 }
 
-/// Variant that wires an `AttachmentEventsProvider` against a
-/// running `Fluree`'s `LedgerManager`. Tests that exercise the M2b
-/// arena-seal path use this so the worker resolves per-job
-/// attachment events from the live overlay.
-///
-/// The provider returns `Augment(events)` — the safe default
-/// matching the api's production behavior.
+/// [`start_background_indexer_local`] over a running `Fluree`'s backend and
+/// nameservice.
 #[cfg(feature = "native")]
-pub fn start_background_indexer_with_attachments(
+pub fn start_background_indexer_for(
     fluree: &fluree_db_api::Fluree,
     config: fluree_db_indexer::IndexerConfig,
 ) -> (LocalSet, fluree_db_indexer::IndexerHandle) {
-    use async_trait::async_trait;
-    use fluree_db_indexer::{AttachmentEventCoverage, AttachmentEventsProvider};
-
-    struct TestProvider {
-        manager: Arc<fluree_db_api::LedgerManager>,
-    }
-
-    impl std::fmt::Debug for TestProvider {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("TestProvider").finish()
-        }
-    }
-
-    #[async_trait]
-    impl AttachmentEventsProvider for TestProvider {
-        async fn attachment_events(
-            &self,
-            ledger_id: &fluree_db_api::LedgerId,
-        ) -> Option<AttachmentEventCoverage> {
-            use fluree_db_api::ledger_manager::RunningCoverage;
-            let result = self
-                .manager
-                .try_running_attachment_events(ledger_id)
-                .await?;
-            Some(match result.coverage {
-                RunningCoverage::Authoritative => {
-                    AttachmentEventCoverage::Authoritative(result.events)
-                }
-                RunningCoverage::Augment => AttachmentEventCoverage::Augment(result.events),
-            })
-        }
-    }
-
-    let manager = fluree
-        .ledger_manager()
-        .expect("test must be built with with_ledger_cache_config")
-        .clone();
-    let provider: Arc<dyn AttachmentEventsProvider> = Arc::new(TestProvider { manager });
-    let config = config.with_attachment_events_provider(provider);
-
     start_background_indexer_local(
         fluree.backend().clone(),
         fluree
@@ -981,4 +895,77 @@ pub async fn run_collector_and_fork_drop_scenario(
     // And the worker still builds once the drop's window has closed.
     round(main_id.clone(), 7).await;
     assert_dicts_present(main_id.clone(), "after a build following the drop").await;
+}
+
+/// Commits `ex:alice ex:worksFor ex:acme`, annotated the way releases before
+/// `rdf:reifies` links stored it: an `f:reifies*` bundle on
+/// `ex:emp/alice-acme`, beside the body `ex:role "Engineer"`. No writer
+/// produces bundles any more.
+pub async fn commit_legacy_bundle(
+    fluree: &fluree_db_api::Fluree,
+    ledger: LedgerState,
+) -> LedgerState {
+    use fluree_db_core::namespaces::{
+        reifies_object_sid, reifies_predicate_sid, reifies_subject_sid,
+    };
+    use fluree_db_core::{Flake, FlakeValue, Sid};
+
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+    let mut ex = |name: &str| ns.sid_for_iri(&format!("http://example.org/{name}"));
+    let (alice, works_for, acme, ann, role) = (
+        ex("alice"),
+        ex("worksFor"),
+        ex("acme"),
+        ex("emp/alice-acme"),
+        ex("role"),
+    );
+    let t = ledger.t() + 1;
+    let id_dt = fluree_db_core::edge::id_datatype_sid();
+    let flake = |s: &Sid, p: &Sid, o: FlakeValue, dt: Sid| {
+        Flake::new(s.clone(), p.clone(), o, dt, t, true, None)
+    };
+    let flakes = vec![
+        flake(
+            &alice,
+            &works_for,
+            FlakeValue::Ref(acme.clone()),
+            id_dt.clone(),
+        ),
+        flake(
+            &ann,
+            reifies_subject_sid(),
+            FlakeValue::Ref(alice.clone()),
+            id_dt.clone(),
+        ),
+        flake(
+            &ann,
+            reifies_predicate_sid(),
+            FlakeValue::Ref(works_for.clone()),
+            id_dt.clone(),
+        ),
+        flake(&ann, reifies_object_sid(), FlakeValue::Ref(acme), id_dt),
+        flake(
+            &ann,
+            &role,
+            FlakeValue::String("Engineer".into()),
+            fluree_db_core::edge::xsd_string_datatype_sid(),
+        ),
+    ];
+    let view =
+        fluree_db_transact::stage_flakes(ledger, flakes, fluree_db_transact::StageOptions::new())
+            .await
+            .expect("stage the legacy bundle");
+    fluree
+        .commit_staged(
+            view,
+            ns,
+            &fluree_db_ledger::IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
+            fluree_db_transact::CommitOpts::default(),
+        )
+        .await
+        .expect("commit the legacy bundle")
+        .1
 }

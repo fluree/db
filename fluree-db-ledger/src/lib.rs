@@ -46,6 +46,20 @@ use fluree_db_novelty::{
 use futures::StreamExt;
 use std::sync::Arc;
 
+/// Install an empty attachment base when the index never held an annotation,
+/// so novelty derives reification links without waiting for the binary store.
+/// An index with annotations gets its base when the store attaches. Returns
+/// the links of commits that were waiting on it.
+pub(crate) fn link_base_without_annotations(
+    novelty: &mut Novelty,
+    snapshot: &LedgerSnapshot,
+) -> Result<Vec<Flake>> {
+    if snapshot.has_annotations {
+        return Ok(Vec::new());
+    }
+    Ok(novelty.set_attachment_base(fluree_db_novelty::LinkBase::empty(snapshot.t))?)
+}
+
 /// Type-erased binary index store for query engine access.
 ///
 /// Allows `LedgerState` to carry a `BinaryIndexStore` without
@@ -116,6 +130,15 @@ impl HeadTemporal {
             received_time_ms,
         })
     }
+}
+
+/// The index root a [`LedgerState`] load decoded, as kept by its decoder,
+/// with the root's content id.
+pub type DecodedIndexRoot<R> = (ContentId, R);
+
+/// The default root decode: the snapshot's metadata, nothing kept.
+fn decode_snapshot(bytes: Vec<u8>) -> Result<(LedgerSnapshot, ())> {
+    Ok((LedgerSnapshot::from_root_bytes(&bytes)?, ()))
 }
 
 /// Ledger state combining indexed LedgerSnapshot with novelty overlay
@@ -198,6 +221,23 @@ impl LedgerState {
         ledger_id: &str,
         backend: &StorageBackend,
     ) -> Result<Self> {
+        Ok(
+            Self::load_decoding_root(ns, ledger_id, backend, decode_snapshot)
+                .await?
+                .0,
+        )
+    }
+
+    /// [`Self::load`] with the caller decoding the index root: `decode` turns
+    /// the root's bytes into the snapshot and whatever else the caller keeps
+    /// of it (the binary index store needs the whole root), which comes back
+    /// with the state, so the root is fetched and decoded once.
+    pub async fn load_decoding_root<R: Send>(
+        ns: &dyn NameServiceLookup,
+        ledger_id: &str,
+        backend: &StorageBackend,
+        decode: impl FnOnce(Vec<u8>) -> Result<(LedgerSnapshot, R)> + Send,
+    ) -> Result<(Self, Option<DecodedIndexRoot<R>>)> {
         let record = ns
             .lookup(ledger_id)
             .await?
@@ -217,11 +257,11 @@ impl LedgerState {
         // ancestor namespaces for pre-branch-point content.
         if record.source_branch.is_some() {
             let store = Self::build_branched_store(ns, &record, backend).await?;
-            return Self::load_with_store(store, record).await;
+            return Self::load_with_store_decoding_root(store, record, decode).await;
         }
 
         let store = backend.content_store(&record.ledger_id);
-        Self::load_with_store(store, record).await
+        Self::load_with_store_decoding_root(store, record, decode).await
     }
 
     /// Build a recursive `BranchedContentStore` by walking the branch ancestry.
@@ -246,11 +286,39 @@ impl LedgerState {
         store: C,
         record: NsRecord,
     ) -> Result<Self> {
+        Ok(
+            Self::load_with_store_decoding_root(store, record, decode_snapshot)
+                .await?
+                .0,
+        )
+    }
+
+    /// [`Self::load_with_store`] with the caller decoding the index root; see
+    /// [`Self::load_decoding_root`].
+    pub async fn load_with_store_decoding_root<C: ContentStore + Clone + 'static, R: Send>(
+        store: C,
+        record: NsRecord,
+        decode: impl FnOnce(Vec<u8>) -> Result<(LedgerSnapshot, R)> + Send,
+    ) -> Result<(Self, Option<DecodedIndexRoot<R>>)> {
+        let (snapshot, root) = match &record.index_head_id {
+            Some(id) => {
+                let (snapshot, kept) = decode(store.get(id).await?)?;
+                (Some(snapshot), Some((id.clone(), kept)))
+            }
+            None => (None, None),
+        };
+        let state = Self::load_from_snapshot(store, record, snapshot).await?;
+        Ok((state, root))
+    }
+
+    async fn load_from_snapshot<C: ContentStore + Clone + 'static>(
+        store: C,
+        record: NsRecord,
+        snapshot: Option<LedgerSnapshot>,
+    ) -> Result<Self> {
         // Handle missing index (genesis fallback)
-        let (mut snapshot, mut dict_novelty) = match &record.index_head_id {
-            Some(index_cid) => {
-                let root_bytes = store.get(index_cid).await?;
-                let loaded = LedgerSnapshot::from_root_bytes(&root_bytes)?;
+        let (mut snapshot, mut dict_novelty) = match snapshot {
+            Some(loaded) => {
                 let dn = DictNovelty::with_watermarks(
                     loaded.subject_watermarks.clone(),
                     loaded.string_watermark,
@@ -276,11 +344,18 @@ impl LedgerState {
         if snapshot.ledger_id != record.ledger_id {
             snapshot.ledger_id = record.ledger_id.clone();
         }
+        if snapshot.needs_link_reindex {
+            tracing::warn!(
+                ledger_id = %record.ledger_id,
+                "index predates RDF 1.2 triple-term links; annotation reads fail until a full \
+                 reindex (`fluree reindex <ledger>`)"
+            );
+        }
 
         // Load novelty from commits since index_t
         let head_commit_id = match &record.commit_head_id {
             Some(head_cid) if record.commit_t > snapshot.t => {
-                let (novelty_overlay, head_id, head_temporal) = Self::load_novelty(
+                let (mut novelty_overlay, head_id, head_temporal) = Self::load_novelty(
                     store,
                     head_cid,
                     snapshot.t,
@@ -289,6 +364,8 @@ impl LedgerState {
                     &mut dict_novelty,
                 )
                 .await?;
+                let links = link_base_without_annotations(&mut novelty_overlay, &snapshot)?;
+                dict_novelty.populate_from_flakes(&links);
                 let head_index_id = record.index_head_id.clone();
                 let mut runtime_small_dicts = RuntimeSmallDicts::new();
                 runtime_small_dicts.populate_from_flakes_iter(
@@ -315,10 +392,11 @@ impl LedgerState {
         };
 
         let head_index_id = record.index_head_id.clone();
-        let novelty_t = snapshot.t;
+        let mut novelty = Novelty::new(snapshot.t);
+        link_base_without_annotations(&mut novelty, &snapshot)?;
         Ok(Self {
             snapshot: Arc::new(snapshot),
-            novelty: Arc::new(Novelty::new(novelty_t)),
+            novelty: Arc::new(novelty),
             dict_novelty: Arc::new(dict_novelty),
             schema_hierarchy_cache: Arc::new(fluree_db_core::SchemaHierarchyCache::default()),
             shacl_compile_cache: Arc::new(parking_lot::RwLock::new(None)),
@@ -475,11 +553,14 @@ impl LedgerState {
     }
 
     /// Create a new ledger state from components
-    pub fn new(snapshot: LedgerSnapshot, novelty: Novelty) -> Self {
-        let dict_novelty = DictNovelty::with_watermarks(
+    pub fn new(snapshot: LedgerSnapshot, mut novelty: Novelty) -> Self {
+        let links = link_base_without_annotations(&mut novelty, &snapshot)
+            .expect("an empty attachment base derives links without reading anything");
+        let mut dict_novelty = DictNovelty::with_watermarks(
             snapshot.subject_watermarks.clone(),
             snapshot.string_watermark,
         );
+        dict_novelty.populate_from_flakes(&links);
         let mut runtime_small_dicts = RuntimeSmallDicts::new();
         runtime_small_dicts
             .populate_from_flakes_iter(novelty.iter_flakes(fluree_db_core::IndexType::Post));
@@ -626,6 +707,7 @@ impl LedgerState {
         // Clear novelty up to new index_t
         let mut new_novelty = (*self.novelty).clone();
         new_novelty.clear_up_to(new_snapshot.t);
+        link_base_without_annotations(&mut new_novelty, &new_snapshot)?;
 
         // Reset dict_novelty with new watermarks from the index root
         let mut new_dict_novelty = DictNovelty::with_watermarks(
@@ -702,6 +784,7 @@ impl LedgerState {
         // Clear novelty up to new index_t
         let mut new_novelty = (*self.novelty).clone();
         new_novelty.clear_up_to(new_snapshot.t);
+        let links = link_base_without_annotations(&mut new_novelty, &new_snapshot)?;
         // Note: use `size > 0` not `is_empty()` — after clear_up_to the arena still
         // holds dead flakes, but `size` tracks only active bytes.
         let has_remaining_novelty = new_novelty.size > 0;
@@ -777,6 +860,9 @@ impl LedgerState {
             &self.snapshot.subject_watermarks,
             self.snapshot.string_watermark,
         );
+        if retired.is_some() && !links.is_empty() {
+            Arc::make_mut(&mut self.dict_novelty).populate_from_flakes(&links);
+        }
         let new_runtime_small_dicts = match retired {
             Some(_) => Arc::clone(&self.runtime_small_dicts),
             None => {
@@ -862,7 +948,9 @@ impl LedgerState {
 
         Arc::make_mut(&mut self.dict_novelty).populate_from_flakes(&flakes);
         Arc::make_mut(&mut self.runtime_small_dicts).populate_from_flakes(&flakes);
-        Arc::make_mut(&mut self.novelty).apply_commit(flakes, next_t, &reverse_graph)?;
+        let links =
+            Arc::make_mut(&mut self.novelty).apply_commit(flakes, next_t, &reverse_graph)?;
+        Arc::make_mut(&mut self.dict_novelty).populate_from_flakes(&links);
 
         Ok(())
     }
@@ -992,7 +1080,9 @@ impl LedgerState {
         // avoids the unconditional deep clone the previous clone-then-swap forced.
         Arc::make_mut(&mut self.dict_novelty).populate_from_flakes(&all_flakes);
         Arc::make_mut(&mut self.runtime_small_dicts).populate_from_flakes(&all_flakes);
-        Arc::make_mut(&mut self.novelty).apply_commit(all_flakes, commit_t, &reverse_graph)?;
+        let links =
+            Arc::make_mut(&mut self.novelty).apply_commit(all_flakes, commit_t, &reverse_graph)?;
+        Arc::make_mut(&mut self.dict_novelty).populate_from_flakes(&links);
 
         // Update state
         self.head_commit_id = Some(commit_id.clone());
@@ -1125,11 +1215,11 @@ mod tests {
     /// Used by `test_apply_index_equal_t_noop` to produce two FIR6
     /// blobs with the same `index_t` but different CIDs without
     /// resorting to trailing-byte padding (which the strict
-    /// `FIR6: trailing bytes after annotation_index` check rejects).
+    /// `FIR6: trailing bytes` check rejects).
     fn build_test_fir6_with_base(ledger_id: &str, index_t: i64, base_t: i64) -> Vec<u8> {
         // Mirror `fluree-db-core::db::decode_fir6_metadata` exactly.
         // The decoder now enforces a strict trailing-byte check
-        // (`FIR6: trailing bytes after annotation_index`), so any
+        // (`FIR6: trailing bytes`), so any
         // section that doesn't exactly match what the decoder reads
         // will surface either as truncation or trailing-byte error.
         // Keep this skeleton in lockstep with the decoder.
@@ -1191,7 +1281,7 @@ mod tests {
         // named graph routing
         buf.extend_from_slice(&0u16.to_le_bytes()); // named_count = 0
 
-        // No optional sections (flags=0); no annotation_index section.
+        // No optional sections (flags=0).
         // The strict trailing-byte check requires exactly zero bytes
         // beyond this point.
 

@@ -814,6 +814,37 @@ impl ContentStore for Arc<dyn ContentStore> {
 // StorageContentStore (bridge adapter: existing Storage → ContentStore)
 // ============================================================================
 
+/// `FLUREE_FORCE_REMOTE_READS=1` makes a local store behave like a remote
+/// one for reads: no resolved local paths and no resident bytes, so every
+/// artifact goes through `get` / `get_range` and the disk artifact cache,
+/// exactly as it would against S3. A measurement switch; see `io_stats`.
+fn force_remote_reads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FLUREE_FORCE_REMOTE_READS").is_ok_and(|v| v != "0"))
+}
+
+/// Count one remote read. Dictionary blobs share a codec, so they are told
+/// apart by their format magic.
+fn record_read(id: &ContentId, source: &'static str, bytes: &[u8]) {
+    if !crate::io_stats::enabled() {
+        return;
+    }
+    let label = match (id.content_kind(), bytes.get(..4)) {
+        (Some(ContentKind::DictBlob { .. }), Some(b"FPK1")) => match bytes.get(5) {
+            Some(0) => "string-pack".to_string(),
+            Some(1) => "subject-pack".to_string(),
+            Some(2) => "term-pack".to_string(),
+            _ => "pack".to_string(),
+        },
+        (Some(ContentKind::DictBlob { .. }), Some(b"DLR1")) => "dict-leaf".to_string(),
+        (Some(ContentKind::DictBlob { .. }), Some(b"DTB1")) => "dict-branch".to_string(),
+        (Some(ContentKind::DictBlob { .. }), _) => "dictblob".to_string(),
+        (Some(k), _) => format!("{k:?}").to_lowercase(),
+        (None, _) => "unknown".to_string(),
+    };
+    crate::io_stats::record(|| label, source, bytes.len());
+}
+
 /// Bridge adapter that wraps an existing `S: Storage` to provide `ContentStore`.
 ///
 /// This is the critical piece for incremental migration: code that already has
@@ -953,17 +984,24 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         // backend called it absent. Rebuilding a bare `not_found(address)` here
         // throws both away, and this is the error a caller actually sees.
         let primary = match self.storage.read_bytes(&address).await {
-            Ok(bytes) => return Ok(bytes),
+            Ok(bytes) => {
+                record_read(id, "store", &bytes);
+                return Ok(bytes);
+            }
             Err(crate::error::Error::NotFound(reason)) => reason,
             Err(e) => return Err(e),
         };
         // Fallback: dicts moved from per-branch to @shared namespace
         if let Some(legacy) = self.legacy_dict_address(id) {
-            return self.storage.read_bytes(&legacy).await;
+            let bytes = self.storage.read_bytes(&legacy).await?;
+            record_read(id, "store", &bytes);
+            return Ok(bytes);
         }
         // Fallback: index roots stored with .json before .fir6 rename
         if let Some(legacy) = self.legacy_index_root_address(id) {
-            return self.storage.read_bytes(&legacy).await;
+            let bytes = self.storage.read_bytes(&legacy).await?;
+            record_read(id, "store", &bytes);
+            return Ok(bytes);
         }
         Err(crate::error::Error::not_found(primary))
     }
@@ -1062,6 +1100,9 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
     }
 
     fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
+        if force_remote_reads() {
+            return None;
+        }
         // CID-keyed straight through — no address formatting on the lookup.
         // A resident tier indexes by CID regardless of which (current or
         // legacy) address the bytes were fetched from.
@@ -1081,6 +1122,9 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
     }
 
     fn resolve_local_path(&self, id: &ContentId) -> Option<std::path::PathBuf> {
+        if force_remote_reads() {
+            return None;
+        }
         let address = self.cid_to_address(id).ok()?;
         if let Some(path) = self.storage.resolve_local_path(&address) {
             return Some(path);
@@ -1100,7 +1144,10 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         let address = self.cid_to_address(id)?;
         // Same reason-preservation as `get` above.
         let primary = match self.storage.read_byte_range(&address, range.clone()).await {
-            Ok(bytes) => return Ok(bytes),
+            Ok(bytes) => {
+                record_read(id, "store-range", &bytes);
+                return Ok(bytes);
+            }
             Err(crate::error::Error::NotFound(reason)) => reason,
             Err(e) => return Err(e),
         };

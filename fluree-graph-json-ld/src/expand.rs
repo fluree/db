@@ -629,11 +629,22 @@ fn expand_node_internal(
 
                 // Handle @id
                 if expanded_key == "@id" || k == "@id" {
-                    if let JsonValue::String(s) = v {
-                        result.insert(
-                            "@id".to_string(),
-                            json!(iri_dispatch(s, &context_with_types, false, strict)?),
-                        );
+                    match v {
+                        JsonValue::String(s) => {
+                            result.insert(
+                                "@id".to_string(),
+                                json!(iri_dispatch(s, &context_with_types, false, strict)?),
+                            );
+                        }
+                        // A triple term, `{"@id": {"@id": s, p: o}}`: the
+                        // embedded node naming its triple.
+                        JsonValue::Object(_) => {
+                            result.insert(
+                                "@id".to_string(),
+                                expand_node_internal(v, &context_with_types, &key_idx, strict)?,
+                            );
+                        }
+                        _ => {}
                     }
                     continue;
                 }

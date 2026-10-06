@@ -182,6 +182,23 @@ path = "tests/grp_graphsource.rs"
 name = "grp_import"
 path = "tests/grp_import.rs"
 
+# Own binary: the triple-term link lowering tests set a process-wide flag.
+[[test]]
+name = "grp_triple_terms"
+path = "tests/grp_triple_terms.rs"
+
+# Standalone: wildcard join routing and the process-global fast-path switch.
+[[test]]
+name = "it_wildcard_batched_join"
+path = "tests/it_wildcard_batched_join.rs"
+required-features = ["native"]
+
+# Standalone: independent scan replay routing and the global fast-path switch.
+[[test]]
+name = "it_independent_scan_replay"
+path = "tests/it_independent_scan_replay.rs"
+required-features = ["native"]
+
 # Standalone (NOT in grp_import): re-execs itself and lowers RLIMIT_NOFILE
 # hard+soft in the child, which must not share a process with other tests.
 [[test]]
@@ -413,6 +430,11 @@ path = "tests/it_bm25_sync_scoping.rs"
 [[test]]
 name = "it_minmax_fast_path_fired"
 path = "tests/it_minmax_fast_path_fired.rs"
+
+# Standalone routing-stamp test, same convention as above.
+[[test]]
+name = "it_scan_count_drain"
+path = "tests/it_scan_count_drain.rs"
 
 # Standalone (not in grp_transact): asserts on the `upsert deletion subject
 # pre-check` tracing event via the thread-local span capture, so it must be the
@@ -651,6 +673,10 @@ name = "query_hot_negation_count"
 harness = false
 
 [[bench]]
+name = "query_hot_annotation_links"
+harness = false
+
+[[bench]]
 name = "query_hot_limit_startup"
 harness = false
 
@@ -671,14 +697,6 @@ workspace = true
 name = "policy_authorization"
 harness = false
 required-features = ["credential"]
-
-[[bench]]
-name = "annotation_hydration"
-harness = false
-
-[[bench]]
-name = "annotation_planner"
-harness = false
 
 [[bench]]
 name = "annotation_varlength_probe"

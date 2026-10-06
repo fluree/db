@@ -27,13 +27,14 @@ use std::time::Duration;
 
 use std::path::PathBuf;
 
+use fluree_db_binary_index::IndexRoot;
 use fluree_db_binary_index::{BinaryIndexStore, LeafletCache};
-use fluree_db_core::db::{LedgerSnapshot, LedgerSnapshotMetadata};
+use fluree_db_core::db::LedgerSnapshot;
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::ledger_config::LedgerConfig;
 use fluree_db_core::trace_first_parent_commits_by_id;
 use fluree_db_core::{ContentId, ContentStore, LedgerId, Sid, StorageBackend};
-use fluree_db_ledger::{LedgerState, TypeErasedStore};
+use fluree_db_ledger::{DecodedIndexRoot, LedgerState, TypeErasedStore};
 use fluree_db_nameservice::NsRecord;
 use rustc_hash::FxHashSet;
 use std::collections::VecDeque;
@@ -718,23 +719,10 @@ impl LedgerHandle {
         drop(prev_store);
 
         // Build metadata-only LedgerSnapshot from FIR6 root.
-        let meta = LedgerSnapshotMetadata {
-            ledger_id: LedgerId::parse(&root.ledger_id)
-                .map_err(|e| ApiError::internal(format!("index root ledger id: {e}")))?,
-            t: root.index_t,
-            base_t: root.base_t,
-            namespace_codes: root.namespace_codes.into_iter().collect(),
-            ns_split_mode: root.ns_split_mode,
-            stats: root.stats.map(Arc::new),
-            schema: root.schema,
-            subject_watermarks: root.subject_watermarks,
-            string_watermark: root.string_watermark,
-            graph_iris: root.graph_iris,
-            has_annotations: root.has_annotations,
-            annotation_index: root.annotation_index.clone(),
-            had_annotation_arena: root.had_annotation_arena,
-            has_list_meta: root.has_list_meta,
-        };
+        let mut root = root;
+        let meta = root
+            .take_snapshot_metadata()
+            .map_err(|e| ApiError::internal(e.to_string()))?;
         tracing::Span::current().record("index_t", meta.t);
         let db = LedgerSnapshot::new_meta(meta)
             .map_err(|e| ApiError::internal(format!("graph registry from root: {e}")))?;
@@ -785,6 +773,15 @@ impl LedgerHandle {
             let sync_ns_us = phase.elapsed().as_micros() as u64;
             let phase = Instant::now();
             let arc_store = Arc::new(store);
+            let links = install_link_base(&mut state, &arc_store)?;
+            if !links.is_empty() {
+                fluree_db_binary_index::dict_novelty_safe::populate_dict_novelty_safe(
+                    Arc::make_mut(&mut state.dict_novelty),
+                    Some(&arc_store),
+                    links.iter(),
+                )
+                .map_err(|e| ApiError::internal(format!("populate_dict_novelty_safe: {e}")))?;
+            }
             crate::runtime_dicts::reseed_runtime_small_dicts_from_previous(&mut state, &arc_store);
             let reseed_us = phase.elapsed().as_micros() as u64;
 
@@ -798,12 +795,6 @@ impl LedgerHandle {
             );
             let snap = Arc::make_mut(&mut state.snapshot);
             snap.range_provider = Some(Arc::new(provider));
-            // Plumb the CAS handle so arena-backed annotation reads can
-            // resolve `AnnotationIndexRoot.{forward,reverse}_branch_cid`.
-            // Without this, `LedgerSnapshot::has_arena_reader()` always
-            // returns false and the formatter / cascade falls back to
-            // the M2a scan path even on snapshots with on-disk arenas.
-            snap.content_store = Some(Arc::clone(&cs));
 
             #[cfg(any(target_arch = "wasm32", feature = "residency"))]
             prefetch_novelty_translation(&arc_store, &state.dict_novelty).await;
@@ -1144,7 +1135,23 @@ async fn prefetch_novelty_translation(
 /// 404 on a fresh branch that hasn't yet had its own index built.
 ///
 /// `prev` is the store this load replaces, if any (a reload of a cached
-/// ledger); artifacts the new root shares with it are carried over.
+/// ledger); artifacts the new root shares with it are carried over. `root` is
+/// the index root the state load already decoded ([`decode_index_root`]), if
+/// any.
+/// Decode an index root once for both consumers: the snapshot's metadata
+/// (stats and schema move into it) and, kept, the rest of the root for
+/// [`load_and_attach_binary_store`].
+pub(crate) fn decode_index_root(
+    bytes: Vec<u8>,
+) -> fluree_db_ledger::Result<(LedgerSnapshot, IndexRoot)> {
+    let invalid = |e: std::io::Error| {
+        fluree_db_core::Error::invalid_index(format!("index root: FIR6 decode: {e}"))
+    };
+    let mut root = IndexRoot::decode(&bytes).map_err(invalid)?;
+    let meta = root.take_snapshot_metadata().map_err(invalid)?;
+    Ok((LedgerSnapshot::new_meta(meta)?, root))
+}
+
 pub(crate) async fn load_and_attach_binary_store(
     backend: &StorageBackend,
     nameservice: &dyn fluree_db_nameservice::NameServiceLookup,
@@ -1152,6 +1159,7 @@ pub(crate) async fn load_and_attach_binary_store(
     cache_dir: &std::path::Path,
     leaflet_cache: Option<Arc<LeafletCache>>,
     prev: Option<&BinaryIndexStore>,
+    root: Option<DecodedIndexRoot<IndexRoot>>,
 ) -> std::result::Result<Option<Arc<BinaryIndexStore>>, ApiError> {
     let record = match state.ns_record.as_ref() {
         Some(r) => r,
@@ -1170,27 +1178,29 @@ pub(crate) async fn load_and_attach_binary_store(
     let cs: Arc<dyn ContentStore> =
         fluree_db_nameservice::branched_content_store_for_record(backend, nameservice, record)
             .await?;
-    let root_started = Instant::now();
-    let bytes = cs
-        .get(&index_cid)
-        .await
-        .map_err(|e| ApiError::internal(format!("failed to read index root: {e}")))?;
-    let root_read_us = root_started.elapsed().as_micros() as u64;
-    let decode_started = Instant::now();
-
-    // Decode FIR6 root metadata to populate snapshot watermarks.
-    // `LedgerSnapshot::from_root_bytes` only parses the header; watermarks are needed for
-    // DictNovelty/DictOverlay correctness (especially bound-object filters and overlay merges).
-    let root = fluree_db_binary_index::IndexRoot::decode(&bytes)
-        .map_err(|e| ApiError::internal(format!("failed to decode FIR6 root: {e}")))?;
-    tracing::debug!(
-        target: "fluree::open",
-        ledger = %record.ledger_id,
-        bytes = bytes.len(),
-        root_read_us,
-        root_decode_us = decode_started.elapsed().as_micros() as u64,
-        "binary index root loaded"
-    );
+    let root = match root {
+        Some((id, root)) if id == index_cid => root,
+        _ => {
+            let root_started = Instant::now();
+            let bytes = cs
+                .get(&index_cid)
+                .await
+                .map_err(|e| ApiError::internal(format!("failed to read index root: {e}")))?;
+            let root_read_us = root_started.elapsed().as_micros() as u64;
+            let decode_started = Instant::now();
+            let root = IndexRoot::decode(&bytes)
+                .map_err(|e| ApiError::internal(format!("failed to decode FIR6 root: {e}")))?;
+            tracing::debug!(
+                target: "fluree::open",
+                ledger = %record.ledger_id,
+                bytes = bytes.len(),
+                root_read_us,
+                root_decode_us = decode_started.elapsed().as_micros() as u64,
+                "binary index root loaded"
+            );
+            root
+        }
+    };
 
     let mut store = BinaryIndexStore::load_from_root_v6_reusing(
         Arc::clone(&cs),
@@ -1223,6 +1233,9 @@ pub(crate) async fn load_and_attach_binary_store(
     // Sync namespace codes between store and snapshot (bimap validation).
     crate::ns_helpers::sync_store_and_snapshot_ns(&mut store, Arc::make_mut(&mut state.snapshot))?;
 
+    let arc_store = Arc::new(store);
+    install_link_base(state, &arc_store)?;
+
     // Re-populate DictNovelty from already-loaded novelty flakes, but *only* for
     // entries not present in the persisted dictionaries (canonical IDs must win).
     //
@@ -1232,13 +1245,12 @@ pub(crate) async fn load_and_attach_binary_store(
         let dn = Arc::make_mut(&mut state.dict_novelty);
         fluree_db_binary_index::dict_novelty_safe::populate_dict_novelty_safe(
             dn,
-            Some(&store),
+            Some(&arc_store),
             novelty.iter_flakes(fluree_db_core::IndexType::Post),
         )
         .map_err(|e| ApiError::internal(format!("populate_dict_novelty_safe: {e}")))?;
     }
 
-    let arc_store = Arc::new(store);
     crate::runtime_dicts::reseed_runtime_small_dicts(state, &arc_store);
     let ns_fallback = Some(state.snapshot.shared_namespaces());
     let provider = BinaryRangeProvider::new(
@@ -1251,13 +1263,6 @@ pub(crate) async fn load_and_attach_binary_store(
     // loaded BinaryIndexStore, DictNovelty, and runtime dictionary state.
     let snap = Arc::make_mut(&mut state.snapshot);
     snap.range_provider = Some(Arc::new(provider));
-    // Plumb the CAS handle so arena-backed annotation reads can resolve
-    // `AnnotationIndexRoot.{forward,reverse}_branch_cid`. Mirror of the
-    // identical line in `apply_index_v2` — fresh-load path needs the
-    // same wiring as the cache-update path or `has_arena_reader()`
-    // would always be false on snapshots loaded outside the
-    // LedgerManager handle path.
-    snap.content_store = Some(Arc::clone(&cs));
 
     #[cfg(any(target_arch = "wasm32", feature = "residency"))]
     prefetch_novelty_translation(&arc_store, &state.dict_novelty).await;
@@ -1271,6 +1276,25 @@ pub(crate) async fn load_and_attach_binary_store(
     Ok(Some(arc_store))
 }
 
+/// Point novelty's reification links at the index `store` serves, deriving
+/// the links of commits applied before it was known. A ledger whose index
+/// never held an annotation already has its base.
+fn install_link_base(
+    state: &mut LedgerState,
+    store: &Arc<BinaryIndexStore>,
+) -> Result<Vec<fluree_db_core::Flake>> {
+    if !state.snapshot.has_annotations {
+        return Ok(Vec::new());
+    }
+    let base = fluree_db_novelty::LinkBase::new(
+        Arc::new(fluree_db_query::IndexAttachments::new(Arc::clone(store))),
+        state.snapshot.t,
+    );
+    Arc::make_mut(&mut state.novelty)
+        .set_attachment_base(base)
+        .map_err(|e| ApiError::internal(format!("derive reification links: {e}")))
+}
+
 // ============================================================================
 // LedgerManager - Connection-level cache
 // ============================================================================
@@ -1279,33 +1303,6 @@ pub(crate) async fn load_and_attach_binary_store(
 ///
 /// Provides single-flight loading (concurrent requests share one I/O operation)
 /// and idle eviction.
-/// Coverage envelope returned alongside the running ledger's
-/// attachment events.
-///
-/// Distinguishes "we walked every commit since genesis" (safe to
-/// publish as `Authoritative`) from "we only have the post-index
-/// tail" (must be merged with a base arena via `Augment`).
-#[derive(Debug, Clone, Copy)]
-pub enum RunningCoverage {
-    /// Snapshot.t == 0: no index has ever run, so the running
-    /// `AttachmentNovelty` was built by walking every commit since
-    /// genesis. Provider can return `Authoritative`.
-    Authoritative,
-    /// Snapshot.t > 0: an index has run. The running
-    /// `AttachmentNovelty` may be the full history (continuously-
-    /// running ledger) or only the post-index tail (after a
-    /// reload). We can't distinguish, so the provider must return
-    /// `Augment`.
-    Augment,
-}
-
-/// Result of `LedgerManager::try_running_attachment_events`.
-#[derive(Debug, Clone)]
-pub struct RunningAttachmentEvents {
-    pub coverage: RunningCoverage,
-    pub events: Vec<(fluree_db_core::EdgeKey, fluree_db_core::Sid, i64, bool)>,
-}
-
 pub struct LedgerManager {
     /// Cached ledger handles + loading state
     ///
@@ -1416,85 +1413,9 @@ impl LedgerManager {
         matches!(watermark, Some(w) if w > cached_t)
     }
 
-    /// Snapshot the running ledger's attachment-event delta in the
-    /// shape the indexer's arena builder expects, plus the coverage
-    /// envelope describing what the events span.
-    ///
-    /// Returns `None` when:
-    /// - the ledger isn't currently loaded into this manager (no
-    ///   running overlay to snapshot — the indexer treats this as
-    ///   "delta unknown" and defensively drops any base arena),
-    /// - the ledger is loading (we don't block the indexer's job
-    ///   dispatch on a load).
-    ///
-    /// Returns `Some(vec)` (possibly empty) when the snapshot was
-    /// observed cleanly — the empty case explicitly asserts "no
-    /// events since the base arena," which the indexer treats as
-    /// "delta is empty" and seals an authoritative (unchanged)
-    /// arena.
-    pub async fn try_running_attachment_events(
-        &self,
-        ledger_id: &LedgerId,
-    ) -> Option<RunningAttachmentEvents> {
-        let handle = self.ready_handle(ledger_id).await?;
-        let view = handle.snapshot().await;
-        // Coverage heuristic: when the snapshot's `t` is zero, no
-        // index has ever run on this ledger, so the running
-        // `AttachmentNovelty` was built by walking every commit
-        // since genesis — it carries the complete event history.
-        // Once `snapshot.t > 0`, we can't distinguish a continuously-
-        // running ledger (full history preserved across reindexes)
-        // from a reloaded one (only post-index tail in the overlay),
-        // so the safe call is `Augment`.
-        let coverage = if view.snapshot.t == 0 {
-            RunningCoverage::Authoritative
-        } else {
-            RunningCoverage::Augment
-        };
-        let events: Vec<_> = view.novelty.attachments.iter_event_pairs().collect();
-        Some(RunningAttachmentEvents { coverage, events })
-    }
-
-    /// Side-effect-free variant of `get_or_load` +
-    /// [`Self::try_running_attachment_events`] for a ledger that is NOT
-    /// resident in the cache: load a transient `LedgerState` straight from
-    /// the backend (never inserted into the cache — cache insertion from a
-    /// background context disturbs the running handle's novelty
-    /// bookkeeping; see
-    /// `it_select_star_novelty_retract::expansion_applies_novelty_retractions`)
-    /// and snapshot its attachment events. The load replays every
-    /// post-index commit into the transient novelty, so a never-indexed
-    /// ledger yields the complete event history (`Authoritative` at
-    /// `snapshot.t == 0`) — exactly what a first background index build
-    /// needs to seal an authoritative arena for a write-only ingest flow.
-    pub async fn transient_attachment_events(
-        &self,
-        ledger_id: &LedgerId,
-    ) -> Option<RunningAttachmentEvents> {
-        let canonical_alias = ledger_id.clone();
-        let state = LedgerState::load(&self.nameservice_mode, &canonical_alias, &self.backend)
-            .await
-            .ok()?;
-        // Same coverage heuristic as `try_running_attachment_events`: a
-        // fresh load at snapshot.t == 0 walked every commit since genesis.
-        let coverage = if state.snapshot.t == 0 {
-            RunningCoverage::Authoritative
-        } else {
-            RunningCoverage::Augment
-        };
-        let events: Vec<_> = state.novelty.attachments.iter_event_pairs().collect();
-        Some(RunningAttachmentEvents { coverage, events })
-    }
-
     /// Return a read-only `LedgerView` for a currently-loaded ledger
     /// without forcing a load. Returns `None` when the ledger isn't
     /// in the cache.
-    ///
-    /// Used by `ApiAttachmentEventsProvider`'s bulk-import seal path:
-    /// when the running overlay reports no events but the snapshot's
-    /// sticky bit says annotations exist (the post-import state),
-    /// the provider needs the snapshot + range_provider to scan the
-    /// base index for `f:reifies*` flakes itself.
     pub async fn get_loaded_view(&self, ledger_id: &LedgerId) -> Option<LedgerView> {
         let handle = self.ready_handle(ledger_id).await?;
         Some(handle.snapshot().await)
@@ -1645,9 +1566,14 @@ impl LedgerManager {
         // ledger cache into a global mutex for the duration of any cold load.
         // Note: we pass the original address to nameservice (it handles
         // resolution), but cache under the canonical address.
-        let load_result = LedgerState::load(&self.nameservice_mode, ledger_id, &self.backend)
-            .await
-            .map_err(ApiError::from); // Convert LedgerError to ApiError
+        let load_result = LedgerState::load_decoding_root(
+            &self.nameservice_mode,
+            ledger_id,
+            &self.backend,
+            decode_index_root,
+        )
+        .await
+        .map_err(ApiError::from); // Convert LedgerError to ApiError
         tracing::debug!(
             alias = %canonical_alias,
             ok = load_result.is_ok(),
@@ -1655,7 +1581,7 @@ impl LedgerManager {
         );
 
         let publish = match load_result {
-            Ok(mut state) => {
+            Ok((mut state, root)) => {
                 // Attempt to load binary index store (v2 only).
                 // Non-fatal: if loading fails, log and continue without binary index.
                 let binary_store = match load_and_attach_binary_store(
@@ -1665,6 +1591,7 @@ impl LedgerManager {
                     &self.config.cache_dir,
                     self.config.leaflet_cache.clone(),
                     None,
+                    root,
                 )
                 .await
                 {
@@ -1928,11 +1855,16 @@ impl LedgerManager {
                 // not held over any of this and is acquired after the swap, so
                 // the two locks never overlap (avoids the entries↔state ordering
                 // hazard with `current_t`).
-                let loaded = LedgerState::load(&self.nameservice_mode, ledger_id, &self.backend)
-                    .await
-                    .map_err(ApiError::from);
+                let loaded = LedgerState::load_decoding_root(
+                    &self.nameservice_mode,
+                    ledger_id,
+                    &self.backend,
+                    decode_index_root,
+                )
+                .await
+                .map_err(ApiError::from);
                 let result = match loaded {
-                    Ok(mut new_state) => {
+                    Ok((mut new_state, root)) => {
                         // Attempt to load binary index store (v2 only) — still off-lock.
                         // Artifacts shared with the store being replaced are
                         // carried over; the slot is read on its own (no
@@ -1945,6 +1877,7 @@ impl LedgerManager {
                             &self.config.cache_dir,
                             self.config.leaflet_cache.clone(),
                             prev_store.as_deref(),
+                            root,
                         )
                         .await
                         {
@@ -3179,7 +3112,7 @@ mod tests {
         // must park on `state`, not on `entries`.
         let reader_a = {
             let mgr = Arc::clone(&mgr);
-            tokio::spawn(async move { mgr.try_running_attachment_events(&id("busy:main")).await })
+            tokio::spawn(async move { mgr.get_loaded_view(&id("busy:main")).await })
         };
         let reader_b = {
             let mgr = Arc::clone(&mgr);

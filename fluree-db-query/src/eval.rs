@@ -51,7 +51,7 @@ pub use value::{ArithmeticError, ComparableValue, ComparisonError, NullValueErro
 use crate::binding::{Binding, BindingRow, RowAccess};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
-use crate::ir::{Expression, FlakeValue};
+use crate::ir::{Expression, FlakeValue, Function};
 use crate::parse::UnresolvedDatatypeConstraint;
 use crate::var_registry::VarId;
 use fluree_db_core::ids::DatatypeDictId;
@@ -151,108 +151,7 @@ impl Expression {
         ctx: Option<&ExecutionContext<'_>>,
     ) -> Result<Option<ComparableValue>> {
         match self {
-            Expression::Var(var) => match row.get(*var) {
-                Some(Binding::Lit { val, dtc, .. }) => Ok(lit_to_comparable(val, dtc, ctx)),
-                Some(Binding::EncodedLit {
-                    o_kind,
-                    o_key,
-                    p_id,
-                    dt_id,
-                    lang_id,
-                    ..
-                }) => {
-                    let Some(decoded) = ctx.and_then(|c| {
-                        c.decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
-                    }) else {
-                        return Ok(None);
-                    };
-                    let val = decoded.map_err(|e| {
-                        decode_lookup_error(
-                            "decode encoded literal",
-                            format!(
-                                "o_kind={o_kind}, o_key={o_key}, p_id={p_id}, dt_id={dt_id}, lang_id={lang_id}"
-                            ),
-                            e,
-                        )
-                    })?;
-                    // xsd:float is folded to `FlakeValue::Double` at decode (the
-                    // NUM_F64 fast path in `context.rs`), dropping the float tag
-                    // the Lit path keeps via `lit_to_comparable`. Re-tag it from
-                    // the in-scope `dt_id` so `datatype(?f + ?f)` stays xsd:float
-                    // on the late-materialized (`EncodedLit`) path — one integer
-                    // compare on the hot decode arm (#1470).
-                    if *dt_id == DatatypeDictId::FLOAT.as_u16() {
-                        if let FlakeValue::Double(d) = val {
-                            return Ok(Some(ComparableValue::Float(d as f32)));
-                        }
-                    }
-                    // A stored language-tagged literal decodes to a bare string
-                    // (`FlakeValue::String` cannot carry the tag), so `=`/`!=`/
-                    // `IN` were tag-blind exactly on the production-typical
-                    // indexed path while the Lit path compares tag-aware
-                    // (#1468). Re-tag from the in-scope `lang_id` — symmetric
-                    // to the FLOAT re-tag above and to the `lang_id` check in
-                    // `binding_effective_bool`; one integer compare on the hot
-                    // arm, the meta decode only runs for lang-tagged rows.
-                    if *lang_id != 0 && matches!(&val, FlakeValue::String(_)) {
-                        return match ctx.and_then(|c| c.lang_tag_for_id(*lang_id)) {
-                            Some(tag) => Ok(Some(ComparableValue::TypedLiteral {
-                                val,
-                                dtc: Some(crate::parse::UnresolvedDatatypeConstraint::LangTag(tag)),
-                            })),
-                            // An UNRESOLVABLE nonzero lang_id (an
-                            // overlay-ephemeral id the persisted store can't
-                            // see — unreachable through today's scan paths,
-                            // pinned by the post-index-novelty test) must
-                            // surface as an unknown value, never degrade to a
-                            // tag-blind bare string (the exact silent-equality
-                            // bug this arm exists to fix).
-                            None => Ok(None),
-                        };
-                    }
-                    Ok(ComparableValue::try_from(&val).ok())
-                }
-                Some(Binding::Sid { sid, .. }) => Ok(Some(ComparableValue::Sid(sid.clone()))),
-                Some(Binding::IriMatch { iri, .. }) => {
-                    Ok(Some(ComparableValue::Iri(Arc::clone(iri))))
-                }
-                Some(Binding::Iri(iri)) => Ok(Some(ComparableValue::Iri(Arc::clone(iri)))),
-                Some(Binding::EncodedSid { s_id, .. }) => {
-                    let Some(resolved) = ctx.and_then(|c| c.resolve_subject_iri(*s_id)) else {
-                        return Ok(None);
-                    };
-                    match resolved {
-                        Ok(iri) => Ok(Some(ComparableValue::Iri(Arc::from(iri)))),
-                        Err(e) => Err(decode_lookup_error(
-                            "resolve subject IRI",
-                            format!("s_id={s_id}"),
-                            e,
-                        )),
-                    }
-                }
-                Some(Binding::EncodedPid { p_id }) => {
-                    let Some(store) = ctx.and_then(|c| c.binary_store.as_deref()) else {
-                        return Ok(None);
-                    };
-                    match store.resolve_predicate_iri(*p_id) {
-                        Some(iri) => Ok(Some(ComparableValue::Iri(Arc::from(iri)))),
-                        None => Err(QueryError::dictionary_lookup(format!(
-                            "resolve predicate IRI: unknown p_id={p_id}"
-                        ))),
-                    }
-                }
-                Some(Binding::Unbound | Binding::Poisoned) | None => Ok(None),
-                Some(Binding::Grouped(_)) => {
-                    debug_assert!(false, "Grouped binding in filter evaluation");
-                    Ok(None)
-                }
-                // A path or list is not a scalar — no comparable value. The
-                // relevant functions (`length`, `size`/`head`/…) read the
-                // binding directly via dispatch / the binding-producing path.
-                Some(
-                    Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_),
-                ) => Ok(None),
-            },
+            Expression::Var(var) => binding_to_comparable(row.get(*var), ctx),
 
             // FlakeValue::Null is the only variant TryFrom rejects (with
             // NullValueError); a constant Null evaluates to "no value".
@@ -267,8 +166,9 @@ impl Expression {
             | Expression::Reduce { .. }
             | Expression::PatternComprehension { .. } => Ok(None),
 
-            // A resolved value (pattern-comprehension list) — its comparable form.
-            Expression::Resolved(b) => Ok(list::element_to_comparable(b)),
+            // A resolved value: its comparable form, decoded exactly as a
+            // bound variable is, so a literal keeps its datatype or tag.
+            Expression::Resolved(b) => binding_to_comparable(Some(b.as_ref()), ctx),
 
             // A list predicate is a boolean scalar.
             Expression::ListPredicate {
@@ -390,6 +290,27 @@ impl Expression {
         // A pre-resolved value (a pattern-comprehension list) is returned as-is.
         if let Expression::Resolved(b) = self {
             return Ok((**b).clone());
+        }
+
+        if let Expression::Call {
+            func: Function::Triple,
+            args,
+        } = self
+        {
+            return Ok(rdf::triple_binding(args, row, ctx)?.unwrap_or(Binding::Unbound));
+        }
+
+        // A term accessor on a late-materialized handle binds the component
+        // encoded, without materializing the term.
+        if let Expression::Call {
+            func:
+                func @ (Function::TripleSubject | Function::TriplePredicate | Function::TripleObject),
+            args,
+        } = self
+        {
+            if let Some(binding) = rdf::term_component_binding(func, args, row, ctx)? {
+                return Ok(binding);
+            }
         }
 
         // Scoped list-iteration and eval-time member access produce structured
@@ -527,6 +448,115 @@ pub(crate) fn stored_float_f64<R: RowAccess>(
 /// xsd:double and xsd:string/plain-string paths yield the same `ComparableValue`
 /// but each pay one cheap datatype check (float-vs-double, resp.
 /// xsd:string-vs-foreign/lang). Foreign string literals are rare (BSBM has none).
+/// The comparable form of a binding, decoding an encoded one through `ctx`.
+/// Every expression surface that reads a binding goes through here so a
+/// variable and a resolved constant compare the same way.
+pub(crate) fn binding_to_comparable(
+    binding: Option<&Binding>,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    match binding {
+        Some(Binding::Lit { val, dtc, .. }) => Ok(lit_to_comparable(val, dtc, ctx)),
+        Some(Binding::EncodedLit {
+            o_kind,
+            o_key,
+            p_id,
+            dt_id,
+            lang_id,
+            ..
+        }) => {
+            let Some(decoded) =
+                ctx.and_then(|c| c.decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id))
+            else {
+                return Ok(None);
+            };
+            let val = decoded.map_err(|e| {
+                decode_lookup_error(
+                    "decode encoded literal",
+                    format!(
+                        "o_kind={o_kind}, o_key={o_key}, p_id={p_id}, dt_id={dt_id}, lang_id={lang_id}"
+                    ),
+                    e,
+                )
+            })?;
+            // xsd:float is folded to `FlakeValue::Double` at decode (the
+            // NUM_F64 fast path in `context.rs`), dropping the float tag
+            // the Lit path keeps via `lit_to_comparable`. Re-tag it from
+            // the in-scope `dt_id` so `datatype(?f + ?f)` stays xsd:float
+            // on the late-materialized (`EncodedLit`) path — one integer
+            // compare on the hot decode arm (#1470).
+            if *dt_id == DatatypeDictId::FLOAT.as_u16() {
+                if let FlakeValue::Double(d) = val {
+                    return Ok(Some(ComparableValue::Float(d as f32)));
+                }
+            }
+            // A stored language-tagged literal decodes to a bare string
+            // (`FlakeValue::String` cannot carry the tag), so `=`/`!=`/
+            // `IN` were tag-blind exactly on the production-typical
+            // indexed path while the Lit path compares tag-aware
+            // (#1468). Re-tag from the in-scope `lang_id` — symmetric
+            // to the FLOAT re-tag above and to the `lang_id` check in
+            // `binding_effective_bool`; one integer compare on the hot
+            // arm, the meta decode only runs for lang-tagged rows.
+            if *lang_id != 0 && matches!(&val, FlakeValue::String(_)) {
+                return match ctx.and_then(|c| c.lang_tag_for_id(*lang_id)) {
+                    Some(tag) => Ok(Some(ComparableValue::TypedLiteral {
+                        val,
+                        dtc: Some(crate::parse::UnresolvedDatatypeConstraint::LangTag(tag)),
+                    })),
+                    // An UNRESOLVABLE nonzero lang_id (an
+                    // overlay-ephemeral id the persisted store can't
+                    // see — unreachable through today's scan paths,
+                    // pinned by the post-index-novelty test) must
+                    // surface as an unknown value, never degrade to a
+                    // tag-blind bare string (the exact silent-equality
+                    // bug this arm exists to fix).
+                    None => Ok(None),
+                };
+            }
+            Ok(ComparableValue::try_from(&val).ok())
+        }
+        Some(Binding::Sid { sid, .. }) => Ok(Some(ComparableValue::Sid(sid.clone()))),
+        Some(Binding::IriMatch { iri, .. }) => Ok(Some(ComparableValue::Iri(Arc::clone(iri)))),
+        Some(Binding::Iri(iri)) => Ok(Some(ComparableValue::Iri(Arc::clone(iri)))),
+        Some(Binding::EncodedSid { s_id, .. }) => {
+            let Some(resolved) = ctx.and_then(|c| c.resolve_subject_iri(*s_id)) else {
+                return Ok(None);
+            };
+            match resolved {
+                Ok(iri) => Ok(Some(ComparableValue::Iri(Arc::from(iri)))),
+                Err(e) => Err(decode_lookup_error(
+                    "resolve subject IRI",
+                    format!("s_id={s_id}"),
+                    e,
+                )),
+            }
+        }
+        Some(Binding::EncodedPid { p_id }) => {
+            let Some(store) = ctx.and_then(|c| c.binary_store.as_deref()) else {
+                return Ok(None);
+            };
+            match store.resolve_predicate_iri(*p_id) {
+                Some(iri) => Ok(Some(ComparableValue::Iri(Arc::from(iri)))),
+                None => Err(QueryError::dictionary_lookup(format!(
+                    "resolve predicate IRI: unknown p_id={p_id}"
+                ))),
+            }
+        }
+        Some(Binding::Unbound | Binding::Poisoned) | None => Ok(None),
+        Some(Binding::Grouped(_)) => {
+            debug_assert!(false, "Grouped binding in filter evaluation");
+            Ok(None)
+        }
+        // A path or list is not a scalar — no comparable value. The
+        // relevant functions (`length`, `size`/`head`/…) read the
+        // binding directly via dispatch / the binding-producing path.
+        Some(Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_)) => {
+            Ok(None)
+        }
+    }
+}
+
 fn lit_to_comparable(
     val: &FlakeValue,
     dtc: &DatatypeConstraint,

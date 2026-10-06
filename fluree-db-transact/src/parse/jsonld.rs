@@ -14,7 +14,8 @@
 use super::txn_meta::extract_txn_meta;
 use crate::error::{Result, TransactError};
 use crate::ir::{
-    GraphSel, InlineValues, TemplateGraph, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType,
+    GraphSel, InlineValues, TemplateGraph, TemplateTerm, TemplateTripleTerm, TripleTemplate, Txn,
+    TxnOpts, TxnType,
 };
 use crate::namespace::NamespaceRegistry;
 use fluree_db_core::DatatypeConstraint;
@@ -159,11 +160,16 @@ pub fn parse_transaction(
         std::borrow::Cow::Borrowed(json)
     };
 
-    match txn_type {
+    let mut txn = match txn_type {
         TxnType::Insert => parse_insert(&lowered, opts, ns_registry),
         TxnType::Upsert => parse_upsert(&lowered, opts, ns_registry),
         TxnType::Update => parse_update(&lowered, opts, ns_registry),
+    }?;
+    if matches!(lowered, std::borrow::Cow::Owned(_)) {
+        super::edge_annotations::fold_slots_into_links(&mut txn.insert_templates)?;
+        super::edge_annotations::fold_slots_into_links(&mut txn.delete_templates)?;
     }
+    Ok(txn)
 }
 
 /// Parse a graph-sync transaction (see [`Txn::sync_graph`]).
@@ -224,33 +230,6 @@ pub fn parse_graph_insert(
     for t in &mut txn.insert_templates {
         t.graph = TemplateGraph::Iri(Arc::clone(&target));
     }
-    // Edge annotations were lowered against a payload with no graph identity,
-    // so their `f:reifies*` bundles carry no `f:reifiesGraph`. Re-homing the
-    // bundle into the target graph without one produces a bundle whose
-    // flake-level graph disagrees with the edge graph it encodes
-    // (`EdgeKey::from_reifies_facts` → `GraphMismatch`, refused at stage).
-    // Anchor every reifier to the target graph, exactly as the named-`@graph`
-    // lowering does for an annotated edge written inside a graph block.
-    let reifies_subject = fluree_db_core::Sid::new(
-        fluree_vocab::namespaces::FLUREE_DB,
-        fluree_vocab::db::REIFIES_SUBJECT,
-    );
-    let reifies_graph = fluree_db_core::Sid::new(
-        fluree_vocab::namespaces::FLUREE_DB,
-        fluree_vocab::db::REIFIES_GRAPH,
-    );
-    let anchors: Vec<TripleTemplate> = txn
-        .insert_templates
-        .iter()
-        .filter(|t| matches!(&t.predicate, TemplateTerm::Sid(p) if *p == reifies_subject))
-        .map(|t| {
-            let mut anchor = t.clone();
-            anchor.predicate = TemplateTerm::Sid(reifies_graph.clone());
-            anchor.object = TemplateTerm::Sid(ns_registry.sid_for_iri(graph_iri));
-            anchor
-        })
-        .collect();
-    txn.insert_templates.extend(anchors);
     txn.write_graphs.insert(graph_iri.clone());
     Ok(txn)
 }
@@ -939,14 +918,17 @@ impl<'a> TemplateParseCtx<'a> {
 /// stored data). Stable `_:fdb-` ids never appear here — the term parsers
 /// resolve them to constant `TemplateTerm::Sid`s.
 fn first_blank_node_in_templates(templates: &[TripleTemplate]) -> Option<&str> {
-    templates.iter().find_map(|t| {
-        [&t.subject, &t.predicate, &t.object]
-            .into_iter()
-            .find_map(|term| match term {
-                TemplateTerm::BlankNode(label) => Some(label.as_str()),
-                _ => None,
-            })
-    })
+    let mut found = None;
+    for t in templates {
+        for term in [&t.subject, &t.predicate, &t.object] {
+            term.for_each_leaf(&mut |leaf| {
+                if let (None, TemplateTerm::BlankNode(label)) = (found, leaf) {
+                    found = Some(label.as_str());
+                }
+            });
+        }
+    }
+    found
 }
 
 fn parse_update_templates_with_ctx(
@@ -1631,6 +1613,15 @@ fn parse_expanded_value_with_ctx(
 ) -> Result<ParsedValue> {
     match value {
         Value::Object(obj) => {
+            if let Some(Value::Object(term)) = obj.get("@id") {
+                if obj.len() > 1 {
+                    return Err(TransactError::Parse(
+                        "a triple term ({\"@id\": {...}}) is a value and cannot carry properties"
+                            .to_string(),
+                    ));
+                }
+                return parse_expanded_triple_term_with_ctx(term, ctx);
+            }
             // Check for @id (reference)
             if let Some(id) = obj.get("@id") {
                 // If the object has additional keys, materialize it as a nested node.
@@ -1735,6 +1726,39 @@ fn parse_expanded_value_with_ctx(
             "Unsupported value: {value:?}"
         ))),
     }
+}
+
+/// `{"@id": {"@id": s, p: o}}`: the triple term `<<( s p o )>>`.
+fn parse_expanded_triple_term_with_ctx(
+    term: &serde_json::Map<String, Value>,
+    ctx: &mut TemplateParseCtx<'_>,
+) -> Result<ParsedValue> {
+    let invalid = |msg: &str| TransactError::Parse(format!("triple term: {msg}"));
+    let parts = fluree_graph_json_ld::triple_term::triple_term_parts(term).map_err(invalid)?;
+    let s = parse_expanded_id_with_ctx(parts.subject, ctx)?;
+    let key = parts.predicate;
+    let values = parts.object;
+    let p = if key.starts_with('?') {
+        TemplateTerm::Var(ctx.vars.get_or_insert(key))
+    } else {
+        TemplateTerm::Sid(ctx.ns_registry.sid_for_iri(key))
+    };
+    // A node with properties would assert them; a list or another term is
+    // not one object.
+    let mut asserted = Vec::new();
+    let mut objects = parse_expanded_objects_with_ctx(values, ctx, &mut asserted)?;
+    let o = match objects.pop() {
+        Some(o) if objects.is_empty() && asserted.is_empty() && o.list_index.is_none() => o,
+        _ => return Err(invalid("it must describe exactly one triple")),
+    };
+    Ok(ParsedValue::new(TemplateTerm::TripleTerm(Box::new(
+        TemplateTripleTerm {
+            s,
+            p,
+            o: o.term,
+            dtc: o.dtc,
+        },
+    ))))
 }
 
 // Compatibility wrapper used by unit tests.

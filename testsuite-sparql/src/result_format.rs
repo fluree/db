@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use anyhow::{bail, Context, Result};
-use fluree_graph_ir::{Graph as IrGraph, GraphCollectorSink, Term as IrTerm};
+use fluree_graph_ir::{Dataset as IrDataset, Graph as IrGraph, GraphCollectorSink, Term as IrTerm};
 use fluree_graph_turtle::parse as parse_turtle;
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -33,6 +33,22 @@ pub enum RdfTerm {
         datatype: Option<String>,
         language: Option<String>,
     },
+    /// A triple term, `<<( s p o )>>`.
+    Triple(Box<Triple>),
+}
+
+impl RdfTerm {
+    pub(crate) fn has_blank_node(&self) -> bool {
+        match self {
+            RdfTerm::BlankNode(_) => true,
+            RdfTerm::Triple(t) => {
+                t.subject.has_blank_node()
+                    || t.predicate.has_blank_node()
+                    || t.object.has_blank_node()
+            }
+            RdfTerm::Iri(_) | RdfTerm::Literal { .. } => false,
+        }
+    }
 }
 
 /// An RDF triple in a CONSTRUCT/DESCRIBE result graph.
@@ -205,6 +221,7 @@ pub fn project_to_csv_space(results: SparqlResults) -> SparqlResults {
                                     language: None,
                                 },
                                 RdfTerm::BlankNode(b) => RdfTerm::BlankNode(b),
+                                RdfTerm::Triple(t) => RdfTerm::Triple(t),
                                 RdfTerm::Literal { value, .. } => RdfTerm::Literal {
                                     value,
                                     datatype: None,
@@ -405,6 +422,27 @@ pub fn parse_srx(xml: &str) -> Result<SparqlResults> {
         },
     }
 
+    /// An open `<triple>`: the position its next term fills, and its terms.
+    #[derive(Default)]
+    struct TripleFrame {
+        slot: usize,
+        parts: [Option<RdfTerm>; 3],
+    }
+
+    /// Put a finished term in the innermost open triple, else the binding.
+    fn place(
+        term: RdfTerm,
+        frames: &mut [TripleFrame],
+        current_binding_name: &Option<String>,
+        current_solution: &mut Option<HashMap<String, RdfTerm>>,
+    ) {
+        if let Some(frame) = frames.last_mut() {
+            frame.parts[frame.slot] = Some(term);
+        } else if let (Some(name), Some(solution)) = (current_binding_name, current_solution) {
+            solution.insert(name.clone(), term);
+        }
+    }
+
     /// Complete a finished element — on a real `Event::End`, or immediately
     /// for a self-closing `Event::Empty` (which emits NO matching End event,
     /// so its completion must never wait for one). Returns `Some` when the
@@ -416,6 +454,7 @@ pub fn parse_srx(xml: &str) -> Result<SparqlResults> {
         current_binding_name: &mut Option<String>,
         current_solution: &mut Option<HashMap<String, RdfTerm>>,
         current_term: &mut Option<TermKind>,
+        frames: &mut Vec<TripleFrame>,
     ) -> Option<SparqlResults> {
         match local_name {
             b"result" => {
@@ -428,40 +467,42 @@ pub fn parse_srx(xml: &str) -> Result<SparqlResults> {
             }
             b"uri" => {
                 if let Some(TermKind::Uri) = current_term {
-                    if let Some(name) = current_binding_name.as_ref() {
-                        if let Some(solution) = current_solution.as_mut() {
-                            solution.insert(name.clone(), RdfTerm::Iri(text_buf.to_string()));
-                        }
-                    }
+                    let term = RdfTerm::Iri(text_buf.to_string());
+                    place(term, frames, current_binding_name, current_solution);
                 }
                 *current_term = None;
             }
             b"bnode" => {
                 if let Some(TermKind::Bnode) = current_term {
-                    if let Some(name) = current_binding_name.as_ref() {
-                        if let Some(solution) = current_solution.as_mut() {
-                            solution.insert(name.clone(), RdfTerm::BlankNode(text_buf.to_string()));
-                        }
-                    }
+                    let term = RdfTerm::BlankNode(text_buf.to_string());
+                    place(term, frames, current_binding_name, current_solution);
                 }
                 *current_term = None;
             }
             b"literal" => {
                 if let Some(TermKind::Literal { datatype, language }) = current_term.clone() {
-                    if let Some(name) = current_binding_name.as_ref() {
-                        if let Some(solution) = current_solution.as_mut() {
-                            solution.insert(
-                                name.clone(),
-                                RdfTerm::Literal {
-                                    value: text_buf.to_string(),
-                                    datatype,
-                                    language,
-                                },
-                            );
-                        }
-                    }
+                    let term = RdfTerm::Literal {
+                        value: text_buf.to_string(),
+                        datatype,
+                        language,
+                    };
+                    place(term, frames, current_binding_name, current_solution);
                 }
                 *current_term = None;
+            }
+            b"triple" => {
+                if let Some(TripleFrame {
+                    parts: [Some(subject), Some(predicate), Some(object)],
+                    ..
+                }) = frames.pop()
+                {
+                    let term = RdfTerm::Triple(Box::new(Triple {
+                        subject,
+                        predicate,
+                        object,
+                    }));
+                    place(term, frames, current_binding_name, current_solution);
+                }
             }
             b"boolean" => {
                 let val = text_buf.trim();
@@ -475,6 +516,7 @@ pub fn parse_srx(xml: &str) -> Result<SparqlResults> {
     let mut current_term: Option<TermKind> = None;
     let mut text_buf = String::new();
     let mut in_boolean = false;
+    let mut frames: Vec<TripleFrame> = Vec::new();
 
     loop {
         let event = reader.read_event();
@@ -535,6 +577,16 @@ pub fn parse_srx(xml: &str) -> Result<SparqlResults> {
                         in_boolean = true;
                         text_buf.clear();
                     }
+                    b"triple" => frames.push(TripleFrame::default()),
+                    slot @ (b"subject" | b"predicate" | b"object") => {
+                        if let Some(frame) = frames.last_mut() {
+                            frame.slot = match slot {
+                                b"subject" => 0,
+                                b"predicate" => 1,
+                                _ => 2,
+                            };
+                        }
+                    }
                     _ => {}
                 }
                 // A self-closing element (`<result/>`, `<literal/>`, …)
@@ -548,6 +600,7 @@ pub fn parse_srx(xml: &str) -> Result<SparqlResults> {
                         &mut current_binding_name,
                         &mut current_solution,
                         &mut current_term,
+                        &mut frames,
                     ) {
                         return Ok(result);
                     }
@@ -561,6 +614,7 @@ pub fn parse_srx(xml: &str) -> Result<SparqlResults> {
                     &mut current_binding_name,
                     &mut current_solution,
                     &mut current_term,
+                    &mut frames,
                 ) {
                     return Ok(result);
                 }
@@ -641,6 +695,14 @@ pub fn parse_srj(json: &str) -> Result<SparqlResults> {
 fn parse_srj_term(value: &serde_json::Value) -> Option<RdfTerm> {
     let obj = value.as_object()?;
     let term_type = obj.get("type")?.as_str()?;
+    if term_type == "triple" {
+        let triple = obj.get("value")?;
+        return Some(RdfTerm::Triple(Box::new(Triple {
+            subject: parse_srj_term(triple.get("subject")?)?,
+            predicate: parse_srj_term(triple.get("predicate")?)?,
+            object: parse_srj_term(triple.get("object")?)?,
+        })));
+    }
     let val = obj.get("value")?.as_str()?;
 
     match term_type {
@@ -695,15 +757,152 @@ pub fn parse_expected_graph(url: &str) -> Result<Vec<Triple>> {
     let mut sink = GraphCollectorSink::new();
     parse_turtle(&with_base, &mut sink)
         .with_context(|| format!("Parsing expected graph: {url}"))?;
-    let graph = sink.into_graph();
-    Ok(graph
+    Ok(graph_triples(&sink.into_graph()))
+}
+
+/// A dataset's default graph and its named graphs, by name.
+pub type ExpectedDataset = (Vec<Triple>, Vec<(String, Vec<Triple>)>);
+
+/// An expected-state file's default graph and named graphs. A `.trig` file
+/// names its graphs in `GRAPH` blocks; any other file is one default graph.
+pub fn parse_expected_dataset(url: &str) -> Result<ExpectedDataset> {
+    if !url.ends_with(".trig") {
+        return Ok((parse_expected_graph(url)?, Vec::new()));
+    }
+    let content =
+        read_file_to_string(url).with_context(|| format!("Reading expected graph file: {url}"))?;
+    let dataset = trig_dataset(&format!("@base <{url}> .\n{content}"))
+        .with_context(|| format!("Parsing expected TriG {url}"))?;
+    let named = dataset
+        .named
+        .iter()
+        .map(|(name, graph)| (term_label(name), graph_triples(graph)))
+        .collect();
+    Ok((graph_triples(&dataset.default), named))
+}
+
+fn term_label(term: &IrTerm) -> String {
+    match term {
+        IrTerm::Iri(iri) => iri.to_string(),
+        IrTerm::BlankNode(id) => format!("_:{}", id.as_str()),
+        other => format!("{other:?}"),
+    }
+}
+
+/// A TriG document as a dataset, parsed the way TriG ingest parses it: the
+/// default graph through the Turtle parser, `GRAPH` blocks through
+/// [`fluree_db_transact::parse_trig_phase1`].
+pub fn trig_dataset(input: &str) -> Result<IrDataset> {
+    use fluree_db_transact::{RawObject, RawTerm};
+    use fluree_graph_ir::Datatype;
+    let phase1 =
+        fluree_db_transact::parse_trig_phase1(input).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut sink = GraphCollectorSink::new();
+    parse_turtle(&phase1.turtle, &mut sink)?;
+    let mut dataset = IrDataset::new();
+    dataset.default = sink.into_graph();
+
+    for block in &phase1.named_graphs {
+        let node = |term: &RawTerm| -> Result<IrTerm> {
+            Ok(match term {
+                RawTerm::Iri(iri) => match iri.strip_prefix("_:") {
+                    Some(label) => IrTerm::blank(label),
+                    None => IrTerm::iri(iri),
+                },
+                RawTerm::PrefixedName { prefix, local } => {
+                    let ns = block
+                        .prefixes
+                        .get(prefix.as_str())
+                        .with_context(|| format!("undefined prefix {prefix}:"))?;
+                    IrTerm::iri(format!("{ns}{local}"))
+                }
+            })
+        };
+        fn object(o: &RawObject, node: &dyn Fn(&RawTerm) -> Result<IrTerm>) -> Result<IrTerm> {
+            Ok(match o {
+                RawObject::Iri(iri) => node(&RawTerm::Iri(iri.clone()))?,
+                RawObject::PrefixedName { prefix, local } => node(&RawTerm::PrefixedName {
+                    prefix: prefix.clone(),
+                    local: local.clone(),
+                })?,
+                RawObject::String(s) => IrTerm::string(s),
+                RawObject::Integer(n) => IrTerm::integer(*n),
+                RawObject::Double(d) => IrTerm::double(*d),
+                RawObject::Boolean(b) => IrTerm::boolean(*b),
+                RawObject::TypedLiteral { value, datatype } => {
+                    IrTerm::typed(value, Datatype::from_iri(datatype))
+                }
+                RawObject::LangString { value, lang } => IrTerm::lang_string(value, lang),
+                RawObject::TripleTerm {
+                    subject,
+                    predicate,
+                    object: o,
+                } => IrTerm::triple(node(subject)?, node(predicate)?, object(o, node)?),
+            })
+        }
+        let graph = dataset.graph_mut(Some(&node(&RawTerm::Iri(block.iri.clone()))?));
+        for t in &block.triples {
+            let subject = node(
+                t.subject
+                    .as_ref()
+                    .context("named graph triple without subject")?,
+            )?;
+            let predicate = node(&t.predicate)?;
+            for o in &t.objects {
+                graph.add_triple(subject.clone(), predicate.clone(), object(o, &node)?);
+            }
+        }
+        for r in &block.reified {
+            graph.add_reification(
+                node(&r.subject)?,
+                node(&r.predicate)?,
+                object(&r.object, &node)?,
+                node(&r.reifier)?,
+            );
+        }
+    }
+    Ok(dataset)
+}
+
+/// `reifier`'s attachment to `(s, p, o)`: `reifier rdf:reifies <<( s p o )>>`.
+pub(crate) fn reification_triples(
+    reifier: RdfTerm,
+    s: RdfTerm,
+    p: RdfTerm,
+    o: RdfTerm,
+) -> [Triple; 1] {
+    [Triple {
+        subject: reifier,
+        predicate: RdfTerm::Iri(RDF_REIFIES.to_string()),
+        object: RdfTerm::Triple(Box::new(Triple {
+            subject: s,
+            predicate: p,
+            object: o,
+        })),
+    }]
+}
+
+const RDF_REIFIES: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
+
+/// A parsed graph's triples, with each reification as its `rdf:reifies` triple.
+fn graph_triples(graph: &IrGraph) -> Vec<Triple> {
+    let mut out: Vec<Triple> = graph
         .iter()
         .map(|t| Triple {
             subject: ir_term_to_rdf_term(&t.s),
             predicate: ir_term_to_rdf_term(&t.p),
             object: ir_term_to_rdf_term(&t.o),
         })
-        .collect())
+        .collect();
+    for r in graph.reifications() {
+        out.extend(reification_triples(
+            ir_term_to_rdf_term(&r.reifier),
+            ir_term_to_rdf_term(&r.triple.s),
+            ir_term_to_rdf_term(&r.triple.p),
+            ir_term_to_rdf_term(&r.triple.o),
+        ));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -733,15 +932,7 @@ fn parse_ttl_result(content: &str, url: &str) -> Result<SparqlResults> {
     if is_result_set {
         parse_dawg_result_set_from_graph(&graph)
     } else {
-        let triples: Vec<Triple> = graph
-            .iter()
-            .map(|t| Triple {
-                subject: ir_term_to_rdf_term(&t.s),
-                predicate: ir_term_to_rdf_term(&t.p),
-                object: ir_term_to_rdf_term(&t.o),
-            })
-            .collect();
-        Ok(SparqlResults::Graph(triples))
+        Ok(SparqlResults::Graph(graph_triples(&graph)))
     }
 }
 
@@ -1050,6 +1241,11 @@ pub(crate) fn ir_term_to_rdf_term(term: &IrTerm) -> RdfTerm {
                 language: language_opt,
             }
         }
+        IrTerm::TripleTerm(t) => RdfTerm::Triple(Box::new(Triple {
+            subject: ir_term_to_rdf_term(&t[0]),
+            predicate: ir_term_to_rdf_term(&t[1]),
+            object: ir_term_to_rdf_term(&t[2]),
+        })),
     }
 }
 
@@ -1145,7 +1341,9 @@ impl JsonLdContext {
 ///
 /// Expects a JSON-LD `@graph` array (or a single node object). Each node has
 /// `@id` as the subject; every other key is a predicate whose values are objects.
-/// Compact IRIs are expanded against the result's `@context`.
+/// Compact IRIs are expanded against the result's `@context`. A value's
+/// `@annotation` and a node's `@reifies` become `rdf:reifies` triples,
+/// as the expected graph's reifications do.
 pub fn fluree_construct_to_sparql_results(json: &serde_json::Value) -> Result<SparqlResults> {
     let ctx = JsonLdContext::parse(json);
     let nodes = if let Some(graph) = json.get("@graph").and_then(|g| g.as_array()) {
@@ -1178,6 +1376,31 @@ pub fn fluree_construct_to_sparql_results(json: &serde_json::Value) -> Result<Sp
                 continue;
             }
 
+            if key == "@reifies" {
+                for block in json_values(value) {
+                    let Some(block) = block.as_object() else {
+                        continue;
+                    };
+                    let Some(s) = block.get("@id").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let s = id_term(s, &ctx);
+                    for (p, o) in block.iter().filter(|(k, _)| !k.starts_with('@')) {
+                        for o in json_values(o) {
+                            if let Some(o) = json_ld_value_to_rdf_term(&o, &ctx) {
+                                triples.extend(reification_triples(
+                                    subject.clone(),
+                                    s.clone(),
+                                    RdfTerm::Iri(ctx.expand_vocab(p)),
+                                    o,
+                                ));
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
             if key == "@type" {
                 let rdf_type =
                     RdfTerm::Iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type".to_string());
@@ -1205,6 +1428,16 @@ pub fn fluree_construct_to_sparql_results(json: &serde_json::Value) -> Result<Sp
 
             for val in &values {
                 if let Some(term) = json_ld_value_to_rdf_term(val, &ctx) {
+                    for reifier in val.get("@annotation").map(json_values).unwrap_or_default() {
+                        if let Some(r) = reifier.get("@id").and_then(|v| v.as_str()) {
+                            triples.extend(reification_triples(
+                                id_term(r, &ctx),
+                                subject.clone(),
+                                predicate.clone(),
+                                term.clone(),
+                            ));
+                        }
+                    }
                     triples.push(Triple {
                         subject: subject.clone(),
                         predicate: predicate.clone(),
@@ -1218,12 +1451,39 @@ pub fn fluree_construct_to_sparql_results(json: &serde_json::Value) -> Result<Sp
     Ok(SparqlResults::Graph(triples))
 }
 
+/// A JSON-LD value position's values: an array's elements, or itself.
+fn json_values(value: &serde_json::Value) -> Vec<serde_json::Value> {
+    match value {
+        serde_json::Value::Array(values) => values.clone(),
+        other => vec![other.clone()],
+    }
+}
+
+/// A node identifier: a blank node label or an expanded IRI.
+fn id_term(id: &str, ctx: &JsonLdContext) -> RdfTerm {
+    match id.strip_prefix("_:") {
+        Some(label) => RdfTerm::BlankNode(label.to_string()),
+        None => RdfTerm::Iri(ctx.expand_id(id)),
+    }
+}
+
 /// Convert a JSON-LD value node to an [`RdfTerm`].
 ///
 /// Handles `{"@id": "..."}`, `{"@value": "...", "@type": "...", "@language": "..."}`,
 /// and plain string/number values.
 fn json_ld_value_to_rdf_term(val: &serde_json::Value, ctx: &JsonLdContext) -> Option<RdfTerm> {
     if let Some(obj) = val.as_object() {
+        // Triple term: {"@id": {"@id": s, p: o}}
+        if let Some(node) = obj.get("@id").and_then(|v| v.as_object()) {
+            let subject = id_term(node.get("@id")?.as_str()?, ctx);
+            let (p, o) = node.iter().find(|(k, _)| !k.starts_with('@'))?;
+            let object = json_ld_value_to_rdf_term(json_values(o).first()?, ctx)?;
+            return Some(RdfTerm::Triple(Box::new(Triple {
+                subject,
+                predicate: RdfTerm::Iri(ctx.expand_vocab(p)),
+                object,
+            })));
+        }
         // Node reference: {"@id": "http://..."}
         if let Some(id) = obj.get("@id").and_then(|v| v.as_str()) {
             return Some(match id.strip_prefix("_:") {

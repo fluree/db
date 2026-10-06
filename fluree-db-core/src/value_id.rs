@@ -121,13 +121,17 @@ impl ObjKind {
     /// Precision: approximately 0.3mm at the equator.
     pub const GEO_POINT: Self = Self(0x14);
 
+    /// RDF 1.2 triple term — triple-term dictionary handle (full u64,
+    /// `(inner p_id << 32) | seq`). Only ever produced by the index-side
+    /// interning of reification links; commits carry the materialized term.
+    pub const TRIPLE_TERM: Self = Self(0x15);
     /// Exact inline `xsd:decimal` — `o_key` is an order-preserving base-10 float
     /// code (see [`ObjKey::encode_decimal`]). Canonical (equal values → identical
     /// bits) AND value-ordered (raw `u64` order == numeric order), so it supports
     /// equality, dedup, joins, and range / ORDER BY pushdown. Distinct from
     /// [`NUM_BIG`](Self::NUM_BIG) (arena handle) — inline decimals carry the exact
     /// value with no arena.
-    pub const NUM_DEC: Self = Self(0x15);
+    pub const NUM_DEC: Self = Self(0x16);
 
     /// Get the raw `u8` discriminant.
     #[inline]
@@ -172,7 +176,8 @@ impl fmt::Debug for ObjKind {
             0x12 => write!(f, "ObjKind::YearMonthDur"),
             0x13 => write!(f, "ObjKind::DayTimeDur"),
             0x14 => write!(f, "ObjKind::GeoPoint"),
-            0x15 => write!(f, "ObjKind::NumDec"),
+            0x15 => write!(f, "ObjKind::TripleTerm"),
+            0x16 => write!(f, "ObjKind::NumDec"),
             0xFF => write!(f, "ObjKind::Max"),
             n => write!(f, "ObjKind({n:#04x})"),
         }

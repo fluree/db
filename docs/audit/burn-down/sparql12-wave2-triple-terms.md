@@ -349,9 +349,13 @@ schedule the eval epic. Verified against the core:
   triple term a single `Sid`/`u64` arena handle inside `FlakeValue`/`Binding` so
   the row width and cache footprint of the scan/join path don't grow. Guard with
   `query_hot_bsbm` / `query_hot_bsbm_bi`.
-- **`Opst` (object-leading index) is documented refs-only**
-  (`comparator.rs:30,79-83`). Looking up a triple-term object by value needs
-  index-selection work too.
+- **`Opst` (object-leading index) holds every object type**, segmented by
+  `o_type` (`fluree-db-core/src/comparator.rs`, module doc). `IndexType::for_query`
+  gates OPST on `o_is_ref` as a conservative default only; `BinaryScanOperator`
+  already takes OPST for any constant object. A triple-term object therefore
+  needs its own `o_type` partition and index-selection work, not a refs-only
+  exception. (An earlier revision of this memo called OPST refs-only; that was
+  stale.)
 
 **Net:** comparator functions are largely safe (raw-byte compare); the cost and
 risk are in the **enum/encoder/decoder/hash/Display arms + a new arena + enum

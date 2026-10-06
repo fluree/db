@@ -15,18 +15,17 @@
 //! ## Reachability of the three counters over HTTP
 //!
 //! - `x-fluree-export-named-graphs-omitted` — asserted both ways here.
-//! - `x-fluree-export-annotations-unresolved` — asserted absent here, on both
-//!   annotation sources an HTTP client can reach. Its non-zero case needs the
-//!   base-index scan, which requires a process-global env var, so it lives in
-//!   the standalone `export_scan_source` target.
+//! - `x-fluree-export-annotations-unresolved` — asserted absent here, before
+//!   and after an index build. Its non-zero case (a link whose base edge is
+//!   not asserted) is pinned by the CLI suite.
 //! - `x-fluree-export-annotations-out-of-scope` — emitted, and asserted
 //!   absent, but **not asserted non-zero**. The counter is
-//!   `named − in_scope`: a reifier a marker pointed at whose own bundle the
+//!   `named − in_scope`: a reifier a marker pointed at whose own link the
 //!   export never saw. The write path co-locates the two — an annotation's
-//!   `f:reifies*` rows are written into the same graph as the edge they
-//!   describe (`EdgeKey::to_reifies_facts`) — so no selection of graphs can
-//!   include the marker and exclude the bundle. Like the two below, it is a
-//!   corruption-class guard rather than a reachable state.
+//!   `rdf:reifies` link is written into the same graph as the edge it names —
+//!   so no selection of graphs can include the marker and exclude the link.
+//!   Like the two below, it is a corruption-class guard rather than a
+//!   reachable state.
 //! - `x-fluree-export-rows-skipped` — asserted absent. Every site that
 //!   increments it is a dictionary miss (a subject or predicate id with no
 //!   IRI), which no well-formed request produces; reaching it over the wire
@@ -246,25 +245,22 @@ async fn a_complete_export_carries_no_omission_headers() {
     }
 }
 
-/// Both annotation sources an HTTP client can reach — the novelty overlay
-/// before an index exists, and the sealed arena after `POST /reindex` — carry
-/// annotations written inside a named graph. Neither drops anything, so
-/// neither reports anything.
+/// An annotation written inside a named graph resolves both from novelty,
+/// before an index exists, and from the index after `POST /reindex`. Neither
+/// drops anything, so neither reports anything.
 ///
 /// The pairing is the point. A test that only asserts the header is absent
 /// passes on any fixture that never reached the code emitting it; this one
-/// asserts the marker is present in the body for the same fixture, and its
-/// counterpart in `export_scan_source` shows the header firing on the one
-/// source that does drop it.
+/// asserts the marker is present in the body for the same fixture.
 #[tokio::test]
-async fn an_annotated_named_graph_resolves_from_both_reachable_sources() {
+async fn an_annotated_named_graph_resolves_before_and_after_indexing() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
     create_ledger(&app, "ann:main").await;
     upsert_trig(&app, "ann:main", ANNOTATED_NAMED_GRAPH).await;
 
-    for stage in ["novelty overlay", "sealed arena"] {
-        if stage == "sealed arena" {
+    for stage in ["novelty", "index"] {
+        if stage == "index" {
             reindex(&app, "ann:main").await;
         }
         let (status, headers, body) = export(

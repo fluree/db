@@ -57,7 +57,6 @@ rust-stemmers = "1.2"
 
 [dev-dependencies]
 async-trait.workspace = true
-fluree-db-novelty = { path = "../fluree-db-novelty" }
 
 [lints]
 workspace = true

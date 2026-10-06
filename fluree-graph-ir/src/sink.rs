@@ -301,13 +301,41 @@ pub trait GraphSink {
         false
     }
 
+    /// Whether this sink accepts triple-term values (`<<( s p o )>>` as an
+    /// object). Parsers MUST check this before calling
+    /// [`Self::term_triple`]; defaults to `false`.
+    fn supports_triple_terms(&self) -> bool {
+        false
+    }
+
+    /// The triple-term value `<<( subject predicate object )>>`, valid for
+    /// the current statement like a literal. Only called when
+    /// [`Self::supports_triple_terms`] returns `true`; the default refuses.
+    fn term_triple(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+    ) -> std::result::Result<TermId, SinkError> {
+        let _ = (subject, predicate, object);
+        debug_assert!(
+            self.supports_triple_terms(),
+            "term_triple called on a sink that does not support triple terms"
+        );
+        Err(SinkError::rejected(
+            "this sink cannot represent triple terms",
+        ))
+    }
+
     /// Emit an RDF 1.2 reified-triple event: `reifier` reifies the base
     /// triple `(subject, predicate, object)`.
     ///
     /// Contract:
-    /// - The parser has ALREADY emitted the base triple via
-    ///   [`Self::emit_triple`] (Fluree's edge-annotation model reifies an
-    ///   asserted edge). This event only records the reifier attachment.
+    /// - This event records only the reifier attachment. The base triple is
+    ///   asserted only by the annotation syntax (`s p o ~ r` / `{| … |}`),
+    ///   whose parser emits it via [`Self::emit_triple`] first; a reified
+    ///   triple (`<< s p o >>`, `r rdf:reifies <<( s p o )>>`) does not
+    ///   assert it.
     /// - The parser mints a FRESH blank-node reifier per anonymous
     ///   occurrence (`<< s p o >>` / `{| … |}` without `~ reifier`) and
     ///   never deduplicates reifiers by base-triple identity; sinks must
@@ -447,7 +475,10 @@ impl GraphCollectorSink {
         if cfg!(debug_assertions) {
             for &slot in &self.literal_slots[..self.literal_cursor] {
                 debug_assert!(
-                    matches!(self.terms[slot as usize], Term::Literal { .. }),
+                    matches!(
+                        self.terms[slot as usize],
+                        Term::Literal { .. } | Term::TripleTerm(_)
+                    ),
                     "retiring non-literal slot {slot}: {:?} — literal_slots is polluted, \
                      recycling it would clobber a producer-cached term id",
                     self.terms[slot as usize]
@@ -544,6 +575,24 @@ impl GraphSink for GraphCollectorSink {
             language: None,
         };
         self.add_literal_term(term)
+    }
+
+    fn supports_triple_terms(&self) -> bool {
+        true
+    }
+
+    fn term_triple(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+    ) -> std::result::Result<TermId, SinkError> {
+        let term = Term::triple(
+            self.get_term(subject).clone(),
+            self.get_term(predicate).clone(),
+            self.get_term(object).clone(),
+        );
+        Ok(self.add_literal_term(term))
     }
 
     /// Retire this statement's literal slots for reuse, and move the rewind

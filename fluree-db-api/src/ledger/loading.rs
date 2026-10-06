@@ -3,16 +3,23 @@ use std::sync::Arc;
 use crate::ledger_view::{CommitRef, LedgerView};
 use crate::time_resolve;
 use crate::{ApiError, Fluree, HistoricalLedgerView, LedgerState, Result, TimeSpec};
+use fluree_db_binary_index::IndexRoot;
 use fluree_db_core::ContentStore;
 use fluree_db_core::LedgerId;
 use fluree_db_core::{collect_first_parent_cids, load_commit_envelope_by_id, CommitId, ContentId};
+use fluree_db_ledger::DecodedIndexRoot;
 use fluree_db_nameservice::{NameServiceError, NsRecord};
 use fluree_db_query::QueryError;
 
 impl Fluree {
     /// Attach the binary index store and range provider to an already-loaded
     /// ledger state when its nameservice record points at a binary index root.
-    pub(crate) async fn attach_index(&self, state: &mut LedgerState) -> Result<()> {
+    /// `root` is the index root the state load already decoded, if any.
+    pub(crate) async fn attach_index(
+        &self,
+        state: &mut LedgerState,
+        root: Option<DecodedIndexRoot<IndexRoot>>,
+    ) -> Result<()> {
         crate::ledger_manager::load_and_attach_binary_store(
             self.backend(),
             self.nameservice(),
@@ -20,6 +27,7 @@ impl Fluree {
             &self.binary_store_cache_dir(),
             Some(Arc::clone(self.leaflet_cache())),
             None,
+            root,
         )
         .await?;
         Ok(())
@@ -54,8 +62,13 @@ impl Fluree {
     where
         C: ContentStore + Clone + 'static,
     {
-        let mut state = LedgerState::load_with_store(store, record).await?;
-        self.attach_index(&mut state).await?;
+        let (mut state, root) = LedgerState::load_with_store_decoding_root(
+            store,
+            record,
+            crate::ledger_manager::decode_index_root,
+        )
+        .await?;
+        self.attach_index(&mut state, root).await?;
         Ok(state)
     }
 
@@ -79,9 +92,14 @@ impl Fluree {
     /// same lock) would deadlock the transact path — and the failure mode is
     /// a hang, not a red test. Anything added here must stay manager-free.
     pub(crate) async fn load_ledger_uncached(&self, ledger_id: &str) -> Result<LedgerState> {
-        let mut state =
-            LedgerState::load(&self.nameservice_mode, ledger_id, self.backend()).await?;
-        self.attach_index(&mut state).await?;
+        let (mut state, root) = LedgerState::load_decoding_root(
+            &self.nameservice_mode,
+            ledger_id,
+            self.backend(),
+            crate::ledger_manager::decode_index_root,
+        )
+        .await?;
+        self.attach_index(&mut state, root).await?;
         // Default context is not loaded here. Opt-in callers route through
         // `Fluree::db_with_default_context` / `db_at_with_default_context`,
         // which fetch and attach the context onto the returned `GraphDb`.

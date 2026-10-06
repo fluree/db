@@ -61,6 +61,13 @@ pub enum UnresolvedValue {
         /// Datatype IRI or language tag constraint
         dtc: Option<UnresolvedDatatypeConstraint>,
     },
+    /// A triple term, `{"@id": {"@id": s, p: o}}`: subject and predicate
+    /// IRIs, and an object that is an IRI, a literal or a nested term.
+    TripleTerm {
+        subject: Arc<str>,
+        predicate: Arc<str>,
+        object: Box<UnresolvedValue>,
+    },
     /// An already-resolved binding, passed through resolution verbatim.
     /// Never produced by any parser — the Cypher sequential write driver
     /// seeds row tables (bindings extracted from a prior query result)
@@ -1163,11 +1170,50 @@ pub enum UnresolvedPattern {
         /// or named IRI).
         annotation: UnresolvedTerm,
         /// The base edge being reified (subject, predicate, object).
-        edge: UnresolvedTriplePattern,
+        edge: UnresolvedTermPattern,
         /// Patterns about the annotation subject (lowered from the
         /// non-`@`-keyword properties of the enclosing node).
         body: Vec<UnresolvedPattern>,
     },
+
+    /// `subject predicate <<( s p o )>>`: a triple term as a value.
+    TripleTermValue {
+        subject: UnresolvedTerm,
+        predicate: UnresolvedTerm,
+        term: UnresolvedTermPattern,
+    },
+}
+
+/// The triple of a triple term `<<( s p o )>>`, whose object may be another
+/// triple term.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnresolvedTermPattern {
+    pub s: UnresolvedTerm,
+    pub p: UnresolvedTerm,
+    pub o: UnresolvedTermObject,
+}
+
+/// The object of an [`UnresolvedTermPattern`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnresolvedTermObject {
+    Value {
+        o: UnresolvedTerm,
+        dtc: Option<UnresolvedDatatypeConstraint>,
+    },
+    Term(Box<UnresolvedTermPattern>),
+}
+
+impl From<UnresolvedTriplePattern> for UnresolvedTermPattern {
+    fn from(tp: UnresolvedTriplePattern) -> Self {
+        Self {
+            s: tp.s,
+            p: tp.p,
+            o: UnresolvedTermObject::Value {
+                o: tp.o,
+                dtc: tp.dtc,
+            },
+        }
+    }
 }
 
 impl UnresolvedPattern {
@@ -1322,11 +1368,11 @@ impl UnresolvedQuery {
                     UnresolvedPattern::Graph {
                         patterns: inner, ..
                     } => collect(inner, out),
-                    UnresolvedPattern::EdgeAnnotation { edge, body, .. }
-                    | UnresolvedPattern::AnnotationTarget { edge, body, .. } => {
+                    UnresolvedPattern::EdgeAnnotation { edge, body, .. } => {
                         out.push(edge);
                         collect(body, out);
                     }
+                    UnresolvedPattern::AnnotationTarget { body, .. } => collect(body, out),
                     UnresolvedPattern::Filter(_)
                     | UnresolvedPattern::Bind { .. }
                     | UnresolvedPattern::Unwind { .. }
@@ -1335,7 +1381,8 @@ impl UnresolvedQuery {
                     | UnresolvedPattern::Path { .. }
                     | UnresolvedPattern::Subquery(_)
                     | UnresolvedPattern::IndexSearch(_)
-                    | UnresolvedPattern::VectorSearch(_) => {}
+                    | UnresolvedPattern::VectorSearch(_)
+                    | UnresolvedPattern::TripleTermValue { .. } => {}
                 }
             }
         }

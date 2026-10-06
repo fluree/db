@@ -15,7 +15,6 @@
 
 pub mod aggregate;
 pub(crate) mod aggregate_complement_fold;
-pub mod annotation_edge_probe;
 pub mod binary_history;
 pub mod binary_range;
 pub mod binary_scan;
@@ -105,6 +104,7 @@ pub(crate) mod stats_cache;
 pub mod stats_query;
 pub mod subquery;
 pub mod temporal_mode;
+pub mod term_components;
 pub mod union;
 pub mod unwind;
 pub mod values;
@@ -114,7 +114,7 @@ pub mod vector;
 // Re-exports
 pub use aggregate::AggregateOperator;
 pub use binary_history::BinaryHistoryScanOperator;
-pub use binary_range::BinaryRangeProvider;
+pub use binary_range::{BinaryRangeProvider, IndexAttachments};
 pub use binary_scan::BinaryScanOperator;
 pub use bind::BindOperator;
 pub use binding::{
@@ -126,8 +126,9 @@ pub use dataset_operator::{DatasetBuilder, DatasetOperator, ScanDatasetBuilder};
 pub use distinct::DistinctOperator;
 pub use error::{QueryError, Result};
 pub use execute::{
-    build_operator_tree, execute, expand_edge_annotation_patterns, fast_paths_disabled,
-    run_operator, set_fast_paths_disabled, ContextConfig, ExecutableQuery,
+    build_operator_tree, execute, expand_edge_annotation_patterns,
+    expand_edge_annotation_patterns_for, fast_paths_disabled, run_operator,
+    set_fast_paths_disabled, ContextConfig, ExecutableQuery,
 };
 pub use exists::ExistsOperator;
 pub use explain::{

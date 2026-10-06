@@ -139,23 +139,7 @@ async fn main() {
     );
 
     let db = fluree.db("probe:kb").await.expect("db");
-    eprintln!(
-        "annotation_index={} content_store={}",
-        db.snapshot.annotation_index.is_some(),
-        db.snapshot.content_store.is_some()
-    );
-    if std::env::var("PROBE_REINDEX2").is_ok() {
-        fluree
-            .reindex("probe:kb", ReindexOptions::default())
-            .await
-            .expect("reindex2");
-        let handle = fluree.ledger("probe:kb").await.expect("reload");
-        eprintln!(
-            "after second reindex (fresh ledger load): annotation_index={} has_annotations={}",
-            handle.snapshot.annotation_index.is_some(),
-            handle.snapshot.has_annotations
-        );
-    }
+    eprintln!("has_annotations={}", db.snapshot.has_annotations);
 
     // Baseline: point lookup by known value (customer: single-digit ms).
     let point = format!(

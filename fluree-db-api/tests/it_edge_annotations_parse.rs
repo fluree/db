@@ -72,7 +72,9 @@ async fn insert_with_edge_alias_succeeds_under_m1() {
 }
 
 #[tokio::test]
-async fn insert_with_reifies_unsupported() {
+async fn insert_with_reifies_links_without_asserting() {
+    // `@reifies` makes the node a reifier of the triple it describes,
+    // without asserting that triple (RDF 1.2 `r rdf:reifies <<( s p o )>>`).
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:reifies-insert";
     let ledger0 = genesis_ledger(&fluree, ledger_id);
@@ -81,17 +83,66 @@ async fn insert_with_reifies_unsupported() {
         "@context": ctx(),
         "@id": "ex:employment-1",
         "ex:role": "Engineer",
-        "@reifies": {
-            "@id": "ex:alice",
-            "ex:worksFor": { "@id": "ex:acme" }
-        }
+        "@reifies": [
+            { "@id": "ex:alice", "ex:worksFor": { "@id": "ex:acme" } },
+            { "@id": "ex:alice", "ex:age": 42 }
+        ]
     });
+    let committed = fluree.insert(ledger0, &txn).await.expect("@reifies insert");
 
-    let err = fluree
-        .insert(ledger0, &txn)
-        .await
-        .expect_err("M0: @reifies on insert is rejected");
-    assert!(err.to_string().contains("@reifies"));
+    let rows = |query: serde_json::Value| {
+        let (fluree, ledger) = (&fluree, &committed.ledger);
+        async move {
+            support::query_jsonld_formatted(fluree, ledger, &query)
+                .await
+                .expect("query")
+                .as_array()
+                .expect("rows")
+                .clone()
+        }
+    };
+    let reified = rows(json!({
+        "@context": ctx(),
+        "select": ["?r", "?role"],
+        "where": {
+            "@id": "?r",
+            "@reifies": { "@id": "ex:alice", "ex:worksFor": { "@id": "ex:acme" } },
+            "ex:role": "?role"
+        }
+    }))
+    .await;
+    assert_eq!(reified, vec![json!(["ex:employment-1", "Engineer"])]);
+    let literal = rows(json!({
+        "@context": ctx(),
+        "select": ["?r"],
+        "where": { "@id": "?r", "@reifies": { "@id": "ex:alice", "ex:age": 42 } }
+    }))
+    .await;
+    assert_eq!(literal, vec![json!(["ex:employment-1"])]);
+
+    let asserted = rows(json!({
+        "@context": ctx(),
+        "select": ["?p", "?o"],
+        "where": { "@id": "ex:alice", "?p": "?o" }
+    }))
+    .await;
+    assert!(
+        asserted.is_empty(),
+        "the reified triples are not asserted: {asserted:?}"
+    );
+    let annotated = rows(json!({
+        "@context": ctx(),
+        "select": ["?role"],
+        "where": {
+            "@id": "ex:alice",
+            "ex:worksFor": { "@id": "ex:acme", "@annotation": { "ex:role": "?role" } }
+        }
+    }))
+    .await;
+    assert!(
+        annotated.is_empty(),
+        "annotation syntax needs the asserted edge: {annotated:?}"
+    );
 }
 
 #[tokio::test]

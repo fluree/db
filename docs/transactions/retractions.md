@@ -197,25 +197,15 @@ Deletes order and all its items.
 
 ## Edge-Annotation Cascade
 
-When a transaction retracts a base edge that has annotations attached (see [Insert: Edge Annotations](insert.md#edge-annotations)), the transactor automatically retracts the link that attaches each annotation to that edge. Without this cascade, retracted edges would still surface their annotations through `@reifies` queries.
+A transaction retracts the triples it names and nothing else (see [Insert: Edge Annotations](insert.md#edge-annotations)). As RDF 1.2 defines it, deleting a triple does not delete the statements of a reifier that reifies it: the reifier's `rdf:reifies` link and its body outlive the edge. The annotation syntax (`{| |}`, `~`, JSON-LD `@annotation`, Cypher relationships) joins the edge, so it stops matching those claims; the reified-triple form (`<< s p o ~ ?r >>`, `@reifies`) still finds them.
 
-**Base-edge retract** — fires on every annotated retract:
+Because the link names the triple, not one assertion of it, re-asserting a deleted edge brings its earlier claims back: an `@annotation` deleted with its edge reappears when the bare edge is inserted again. To remove the claims for good, delete them through `@reifies` or `<< s p o ~ ?r >>` (an anonymous reifier is reachable only that way), or use LPG mode below.
 
-- The attachment linking each currently-asserted annotation to the edge is retracted in the same transaction.
-- Anonymous (blank-node) annotation subjects also have their body metadata retracted, since the synthetic SID is unaddressable once the attachment is gone.
-- Explicit-IRI annotation subjects keep their body metadata as ordinary RDF on the named subject (default RDF mode). To extend cleanup to explicit-IRI annotations as well, set `opts.lpgEdgeLifecycle: true` on the transaction — this matches the property-graph relationship lifecycle.
+**The annotation form of a *delete* is a base-edge retract.** `DELETE DATA { :alice :knows :bob ~ :claim1 {| … |} }` — and the bare `~ :claim1` tail with no block — expand to include the base triple, because RDF 1.2 annotation syntax both reifies *and asserts* the triple it annotates. The annotation syntax therefore stops matching **every** claim on that edge, not only the one named. An `upsert` that changes an annotated edge's object does the same thing, with no delete written at all. See [Which spelling does what](../concepts/edge-annotations.md#which-spelling-does-what) for the full table.
 
-**The annotation form of a *delete* is a base-edge retract.** `DELETE DATA { :alice :knows :bob ~ :claim1 {| … |} }` — and the bare `~ :claim1` tail with no block — expand to include the base triple, because RDF 1.2 annotation syntax both reifies *and asserts* the triple it annotates. They therefore fire the cascade above against **every** claim on that edge, not only the one named, and a sibling claim is left with its body intact but nothing to attach to. An `upsert` that changes an annotated edge's object does the same thing, with no delete written at all. See [Which spelling does what](../concepts/edge-annotations.md#which-spelling-does-what) for the full table, including the two spellings that withdraw or detach a single claim.
+**LPG mode** (`opts.lpgEdgeLifecycle: true`, which Cypher `DELETE` sets) adds the property-graph relationship lifecycle: retracting an edge retracts every link naming it, and a reifier left with no link loses its body. The cascade is graph-aware: named-graph links are retracted in the same named graph as the edge they reify.
 
-**Metadata-only retract** — fires when the user retracts every body fact of an annotation subject without touching the base edge:
-
-- The attachment is also retracted, so the annotation is fully disposed of and inline `@annotation` queries no longer surface it.
-- Same-transaction replacements (delete one body fact, insert another on the same annotation in a single update) keep the attachment — the post-transaction metadata set is non-empty, so the cascade reads "the user is updating, not removing."
-- Partial retracts (some body facts gone, others still asserted) keep the attachment — the annotation is still meaningful.
-
-The cascade is graph-aware: named-graph annotations are retracted in the same named graph as the edge they reify, never by mismatched-graph retracts.
-
-Manage annotation lifecycle through `@annotation` and the cascade above — the [reserved system predicates](../reference/vocabulary.md#edge-annotation-predicates-reserved) that back annotations can't be written by hand on any surface.
+Manage annotation lifecycle through `@annotation` and LPG mode — the [reserved system predicates](../reference/vocabulary.md#edge-annotation-predicates-reserved) that back older annotations can't be written by hand on any surface.
 
 ## Soft Delete vs Hard Retraction
 

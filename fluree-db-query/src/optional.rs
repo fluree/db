@@ -1728,6 +1728,8 @@ fn filter_tolerates_unbound(expr: &crate::ir::Expression) -> bool {
 fn pattern_filters_tolerate_unbound(p: &Pattern) -> bool {
     match p {
         Pattern::Filter(expr) => filter_tolerates_unbound(expr),
+        // An unbound variable is free inside EXISTS, not an error.
+        Pattern::Exists(_) => true,
         Pattern::DefaultGraphSource { patterns } => {
             patterns.iter().any(pattern_filters_tolerate_unbound)
         }
@@ -1754,31 +1756,31 @@ fn pattern_filters_tolerate_unbound(p: &Pattern) -> bool {
 /// (`r2rml_star_is_hash_join_safe`, its own sub-switch). type-var / wildcard /
 /// bound-subject shapes stay EXCLUDED pending their own differential evidence.
 ///
-/// The Cypher edge-annotation expansion wraps its `[base edge + f:reifies*]`
-/// chain in `Pattern::DefaultGraphSource`; in single-source mode that wrapper is
-/// a build-once no-op whose per-seed evaluation is likewise a pure restriction by
-/// the correlation tuple, so it is admitted recursively (multi-source datasets are
-/// excluded at the `build_batch` dataset gate). Merged with the R2RML admission
-/// above (DEC-004 F2): the two arms are disjoint `Pattern` variants, so both the
-/// R2RML batched-OPTIONAL family and the Cypher value-only annotation probe keep
-/// their admission unchanged.
+/// The edge-annotation expansion (a Cypher relationship binding) yields the
+/// annotation's `rdf:reifies` link, its term components and an existence check
+/// on the base edge: a pure relation between the term and its components, and
+/// a check over the row's own bindings, so its per-seed evaluation is a pure
+/// restriction by the correlation tuple too. Under a default-graph union the
+/// chain is wrapped in `Pattern::DefaultGraphSource`, admitted recursively here
+/// and excluded at the `build_batch` dataset gate.
 fn inner_pattern_is_hash_join_safe(p: &Pattern) -> bool {
     match p {
         Pattern::Triple(_) | Pattern::Filter(_) | Pattern::PropertyPath(_) => true,
+        // Without this arm a value-only Cypher relationship binding
+        // (`OPTIONAL { EdgeAnnotation }`) fell to the per-row rebuild path:
+        // ~25ms/row of replanning that turned a 21k-row UNWIND reindex query
+        // into minutes of CPU.
+        Pattern::TermComponents(_) => true,
+        // The expansion's existence check on the base edge: like a triple, it
+        // reads only the row's own bindings.
+        Pattern::Exists(inner) => inner.iter().all(|p| matches!(p, Pattern::Triple(_))),
         Pattern::R2rml(rp) => {
             batched_optional_r2rml_enabled()
                 && (r2rml_leaf_is_hash_join_safe(rp)
                     || (batched_optional_r2rml_star_enabled() && r2rml_star_is_hash_join_safe(rp)))
         }
-        // The edge-annotation expansion wraps its `[base + f:reifies*]` chain in
-        // `DefaultGraphSource` (per-source correlation). In single-source mode the
-        // wrapper is a build-once no-op, and its per-seed evaluation is a pure
-        // restriction by the correlation tuple — the same property the bare-triple
-        // chain has. Without this arm a value-only Cypher relationship binding
-        // (`OPTIONAL { EdgeAnnotation }`) fell to the per-row rebuild path:
-        // ~25ms/row of replanning that turned a 21k-row UNWIND reindex query into
-        // minutes of CPU. Multi-source datasets are excluded at the `build_batch`
-        // gate (dataset presence check).
+        // The expansion's per-source wrapper; multi-source datasets are
+        // excluded at the `build_batch` gate (dataset presence check).
         Pattern::DefaultGraphSource { patterns } => {
             patterns.iter().all(inner_pattern_is_hash_join_safe)
         }
@@ -1865,225 +1867,6 @@ fn r2rml_star_is_hash_join_safe(rp: &crate::ir::adapters::R2rmlPattern) -> bool 
         && rp.type_var.is_none()
         && rp.predicate_var.is_none()
         && rp.subject_constant.is_none()
-}
-
-/// Batched builder for the value-only Cypher relationship binding:
-/// `OPTIONAL { DefaultGraphSource[base edge + 3 f:reifies* triples] }` with
-/// every base-edge position bound by the required row (or constant).
-///
-/// The generic path evaluates that chain per required row (or per seeded
-/// tuple), and with no stats for the system `f:reifies*` predicates the
-/// join can drive from `f:reifiesPredicate` — per row it enumerates
-/// ~(sidecar / #relationship-types) candidate reifiers and
-/// existence-checks each with its own scan. On a reified ledger that
-/// turned a 21k-row UNWIND into minutes of CPU and an OOM.
-///
-/// This builder instead drains the three `f:reifies*` predicates ONCE per
-/// required batch through ordinary planned scans (overlay-merged and
-/// policy-filtered like any scan), builds `subject → reifiers` /
-/// `reifier → (predicate, object)` maps, and answers every row by hash
-/// lookup. Falls back to the generic per-row path (held as `fallback`)
-/// for history queries, attached datasets, and multi-ledger contexts.
-pub struct AnnotationValueOptionalBuilder {
-    fallback: PlanTreeOptionalBuilder,
-    /// The three reifies triples, with their original vars — executed
-    /// unseeded so each drains its whole (overlay-merged) predicate.
-    r_subj: TriplePattern,
-    r_pred: TriplePattern,
-    r_obj: TriplePattern,
-    ann_var: VarId,
-    s_src: crate::annotation_edge_probe::EdgePos,
-    p_src: crate::annotation_edge_probe::EdgePos,
-    o_src: crate::annotation_edge_probe::EdgePos,
-    stats: Option<Arc<StatsView>>,
-    planning: PlanningContext,
-}
-
-impl AnnotationValueOptionalBuilder {
-    /// Recognize and construct; `None` defers to the general builder.
-    pub(crate) fn try_new(
-        required_schema: Arc<[VarId]>,
-        inner_patterns: Vec<Pattern>,
-        stats: Option<Arc<StatsView>>,
-        planning: PlanningContext,
-    ) -> Option<Self> {
-        use crate::annotation_edge_probe::{recognize_annotation_edge, EdgePos};
-
-        let [Pattern::DefaultGraphSource { patterns: chain }] = inner_patterns.as_slice() else {
-            return None;
-        };
-        let shape = recognize_annotation_edge(chain)?;
-        if !shape.body.is_empty() {
-            return None;
-        }
-        let p_src = match &shape.p_pred {
-            Ref::Var(v) => EdgePos::Var(*v),
-            Ref::Sid(sid) => EdgePos::Const(sid.clone()),
-            Ref::Iri(_) => return None,
-        };
-        // Every variable edge position must be bound by the required row —
-        // that's what makes the per-row evaluation a pure (s, p, o) lookup.
-        for pos in [&shape.s_pos, &p_src, &shape.o_pos] {
-            if let EdgePos::Var(v) = pos {
-                if !required_schema.contains(v) {
-                    return None;
-                }
-            }
-        }
-        let (Pattern::Triple(r_subj), Pattern::Triple(r_pred), Pattern::Triple(r_obj)) =
-            (&chain[1], &chain[2], &chain[3])
-        else {
-            return None;
-        };
-        let (r_subj, r_pred, r_obj) = (r_subj.clone(), r_pred.clone(), r_obj.clone());
-
-        let fallback =
-            PlanTreeOptionalBuilder::new(required_schema, inner_patterns, stats.clone(), planning);
-        // The reifier must be the only optional-only variable; anything else
-        // means the shape produces bindings this lane doesn't reconstruct.
-        if fallback.optional_only_vars() != [shape.ann_var] {
-            return None;
-        }
-        Some(Self {
-            fallback,
-            r_subj,
-            r_pred,
-            r_obj,
-            ann_var: shape.ann_var,
-            s_src: shape.s_pos,
-            p_src,
-            o_src: shape.o_pos,
-            stats,
-            planning,
-        })
-    }
-
-    /// The sidecar maps for this execution, drained on first use.
-    ///
-    /// The memo lives on the `ExecutionContext`, not on this builder: the
-    /// drain costs O(#annotations in the ledger) whatever the result size, and
-    /// a bounded variable-length Cypher range plans one of these builders per
-    /// hop of per chain (`*1..3` six, `*1..5` fifteen). A per-operator cache
-    /// answers the repeat within one operator — a 54k-row result re-drained
-    /// the whole sidecar ~55 times, once per required batch — but leaves the
-    /// repeat *across* operators, which is the larger multiple and the one a
-    /// user can grow just by widening the range.
-    async fn sidecar_maps(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        view: Option<&fluree_db_binary_index::BinaryGraphView>,
-    ) -> Result<Arc<crate::annotation_edge_probe::AnnotationSidecarMaps>> {
-        crate::annotation_edge_probe::AnnotationSidecarMaps::shared(
-            &self.r_subj,
-            &self.r_pred,
-            &self.r_obj,
-            self.stats.clone(),
-            &self.planning,
-            ctx,
-            view,
-        )
-        .await
-    }
-
-    fn row_sid(
-        &self,
-        pos: &crate::annotation_edge_probe::EdgePos,
-        batch: &Batch,
-        row: usize,
-        view: Option<&fluree_db_binary_index::BinaryGraphView>,
-    ) -> Result<Option<fluree_db_core::Sid>> {
-        use crate::annotation_edge_probe::EdgePos;
-        match pos {
-            EdgePos::Const(sid) => Ok(Some(sid.clone())),
-            EdgePos::Var(v) => match batch.get(row, *v) {
-                Some(b) => crate::annotation_edge_probe::binding_sid(b, view),
-                None => Ok(None),
-            },
-        }
-    }
-}
-
-#[async_trait]
-impl OptionalBuilder for AnnotationValueOptionalBuilder {
-    fn build(
-        &self,
-        required_batch: &Batch,
-        row: usize,
-        ctx: &ExecutionContext<'_>,
-    ) -> Result<Option<BoxedOperator>> {
-        self.fallback.build(required_batch, row, ctx)
-    }
-
-    async fn build_batch(
-        &self,
-        required_batch: &Batch,
-        start_row: usize,
-        ctx: &ExecutionContext<'_>,
-    ) -> Result<Option<Vec<OptionalBatchRow>>> {
-        if start_row >= required_batch.len()
-            || self.planning.is_history()
-            || ctx.dataset.is_some()
-            || ctx.is_multi_ledger()
-        {
-            return Ok(None);
-        }
-        let view = ctx.graph_view();
-        let view = view.as_ref();
-
-        // One pass over each reifies predicate (overlay-merged, policy-
-        // filtered planned scans) — cached across required batches — then
-        // pure hash lookups per row.
-        let maps = self.sidecar_maps(ctx, view).await?;
-        let opt_schema: Arc<[VarId]> = Arc::from(vec![self.ann_var].into_boxed_slice());
-        let mut pending = Vec::with_capacity(required_batch.len() - start_row);
-        for row in start_row..required_batch.len() {
-            let key = (
-                self.row_sid(&self.s_src, required_batch, row, view)?,
-                self.row_sid(&self.p_src, required_batch, row, view)?,
-            );
-            let o =
-                crate::annotation_edge_probe::row_obj_key(required_batch, row, &self.o_src, view);
-            let ((Some(s), Some(p)), false) = (
-                key,
-                matches!(o, crate::group_aggregate::GroupKeyOwned::Absent),
-            ) else {
-                pending.push((row, Vec::new()));
-                continue;
-            };
-            let anns: Vec<Binding> = maps
-                .anns_for(&s, &p, &o)
-                .iter()
-                .map(|ann| Binding::sid(ann.clone()))
-                .collect();
-            if anns.is_empty() {
-                pending.push((row, Vec::new()));
-            } else {
-                let batch = Batch::new(opt_schema.clone(), vec![anns])?;
-                pending.push((row, vec![batch]));
-            }
-        }
-        tracing::debug!(
-            rows = pending.len(),
-            "annotation value-only optional batched probe complete"
-        );
-        Ok(Some(pending))
-    }
-
-    fn schema(&self) -> &[VarId] {
-        self.fallback.schema()
-    }
-
-    fn optional_only_vars(&self) -> &[VarId] {
-        self.fallback.optional_only_vars()
-    }
-
-    fn unify_instructions(&self) -> &[UnifyInstruction] {
-        self.fallback.unify_instructions()
-    }
-
-    fn unmatched_optional(&self) -> UnmatchedOptional {
-        self.planning.unmatched_optional
-    }
 }
 
 /// True iff `v` occurs in the inner patterns ONLY as the object of one or more
@@ -3150,6 +2933,33 @@ mod tests {
         // Check unify instructions (for ?s)
         assert_eq!(builder.unify_instructions().len(), 1);
         assert_eq!(builder.unify_instructions()[0].left_col, 0); // ?s in required
+    }
+
+    #[test]
+    fn annotation_term_components_are_hash_join_safe() {
+        use crate::ir::{Component, TermComponentsPattern};
+        assert!(inner_pattern_is_hash_join_safe(&Pattern::TermComponents(
+            TermComponentsPattern {
+                term: VarId(0),
+                subject: Component::Var(VarId(1)),
+                predicate: Component::Any,
+                object: Component::Var(VarId(2)),
+            }
+        )));
+        let edge = Pattern::Triple(TriplePattern::new(
+            Ref::Var(VarId(1)),
+            Ref::Var(VarId(3)),
+            Term::Var(VarId(2)),
+        ));
+        assert!(inner_pattern_is_hash_join_safe(&Pattern::Exists(vec![
+            edge.clone()
+        ])));
+        assert!(!inner_pattern_is_hash_join_safe(&Pattern::Exists(vec![
+            Pattern::Optional(vec![edge.clone()])
+        ])));
+        assert!(pattern_filters_tolerate_unbound(&Pattern::Exists(vec![
+            edge
+        ])));
     }
 
     // PR-4b: the batched-OPTIONAL admission for R2RML inners is NARROW — only a

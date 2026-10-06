@@ -25,6 +25,7 @@ Fluree implements the W3C RDF 1.1 specification:
 Fluree implements the RDF 1.2 reification model used for edge annotations:
 - `rdf:reifies` with triple terms (`<<( s p o )>>`) as the reified object
 - Reifiers identified by IRI, blank node, or variable
+- Triple terms as values under any predicate, on every write surface
 
 Fluree also exposes a non-standard extension that reads commit metadata off a
 quoted triple (`<< s p o >> f:t ?t`, `f:op ?op`) for transaction-time and
@@ -34,18 +35,16 @@ Turtle 1.2 annotation syntax is accepted on ingest — `{| ... |}` annotation
 tails, the `~` reifier, `<< s p o >>` reified triples and
 `r rdf:reifies <<( s p o )>>` — on every Turtle write path (insert, upsert,
 import, graph sync over the CLI or `/sync`), inside TriG `GRAPH { }` blocks, and in N-Triples and
-N-Quads files. All forms assert the base triple: Fluree reifies asserted
-edges, so `<< s p o >>` is asserting here where RDF 1.2 makes it
-non-asserting. The `VERSION "1.2"` / `@version`
+N-Quads files. As in RDF 1.2, only the annotation syntax asserts the triple;
+`<< s p o >>` and `rdf:reifies <<( s p o )>>` reify it without asserting it.
+The `VERSION "1.2"` / `@version`
 directive and `--ltr` / `--rtl` base-direction language tags are accepted.
-The vendored W3C RDF 1.1 and RDF 1.2 Turtle suites run in CI
-(`testsuite-sparql/tests/w3c_rdf.rs`), with known gaps in the skip register.
+The vendored W3C RDF 1.1 and RDF 1.2 Turtle, N-Triples, N-Quads and TriG
+suites run in CI (`testsuite-sparql/tests/w3c_rdf.rs`), with known gaps in the
+skip register.
 
 Not yet supported:
-- Triple terms as arbitrary object values: `<<( ... )>>` is accepted on
-  ingest only as the object of `rdf:reifies`
-- Triple terms in subject position and nested triple terms
-- Multiple triples reified by a single annotation
+- Annotation-of-annotation (a `{| ... |}` or `<< ... >>` inside an annotation body)
 
 See [Edge annotations](../concepts/edge-annotations.md).
 
@@ -191,16 +190,17 @@ Supported query and update annotation syntax:
 - Named reifiers: `?s ?p ?o ~ ?r {| ... |}` (IRI, blank-node, or variable reifier)
 - `rdf:reifies` form with `<<( s p o )>>` triple terms
 - Annotations in `INSERT DATA` / `DELETE DATA`
-- Annotations in `CONSTRUCT` templates (`~ ?r`, `{| ... |}`, and `?r rdf:reifies <<( s p o )>>`),
+- Annotations in `CONSTRUCT` templates (`~ ?r`, `{| ... |}`, `<< s p o >>` reified triples and
+  `?r rdf:reifies <<( s p o )>>`),
   written by every result format
 
+Also supported: triple terms as values, nested ones included, in patterns, `VALUES`,
+`INSERT DATA` / `DELETE DATA` / `DELETE WHERE` and templates; value equality (`=`) on
+triple terms; and the triple-term functions `TRIPLE()`, `SUBJECT()`, `PREDICATE()`,
+`OBJECT()` and `isTRIPLE()`.
+
 Not yet supported:
-- Triple-term accessor functions: `TRIPLE()`, `SUBJECT()`, `PREDICATE()`,
-  `OBJECT()`, `isTRIPLE()`
-- Triple terms as arbitrary values (a `CONSTRUCT` template accepts one only as the object of
-  `rdf:reifies`) or in subject position; multi-triple and nested annotations
-- Named-graph edge annotations in SPARQL UPDATE (default graph only)
-- W3C SPARQL 1.2 test-suite execution (manifests present but not yet run)
+- Nested annotations (annotation-of-annotation)
 
 **Specification:** https://www.w3.org/TR/sparql12-query/
 
@@ -487,7 +487,7 @@ Export Fluree data to:
 - SPARQL 1.1 Federation: remote `SERVICE` endpoints (local-ledger `SERVICE` is supported)
 - Remote `LOAD` in SPARQL UPDATE
 - GeoSPARQL: remaining OGC functions (only `geof:distance` is implemented today)
-- RDF 1.2 / SPARQL 1.2: triple terms as values and the triple-term accessor functions; the RDF 1.2 Turtle evaluation suite (blocked on triple terms)
+- RDF 1.2 / SPARQL 1.2: annotation-of-annotation
 
 **Storage:**
 - Additional cloud providers (GCP, Azure)

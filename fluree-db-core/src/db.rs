@@ -62,55 +62,10 @@ pub struct LedgerSnapshotMetadata {
     /// `fluree-db-transact::stage` so non-annotation ledgers skip
     /// the per-retract POST scan entirely.
     pub has_annotations: bool,
-    /// Optional inline pointer to the on-disk annotation arenas.
-    ///
-    /// Combined with `has_annotations` and `had_annotation_arena`:
-    /// - `has_annotations=false, annotation_index=None` — hard
-    ///   guarantee: zero attachments.
-    /// - `has_annotations=true, annotation_index=Some(_)` — builder
-    ///   ran; arenas authoritative through `max_t`, novelty covers
-    ///   the tail.
-    /// - `has_annotations=true, annotation_index=None,
-    ///   had_annotation_arena=false` — fresh bulk-import state, no
-    ///   indexer pass has yet processed the annotation-bearing
-    ///   flakes. Readers fall back to scan; the provider may
-    ///   bootstrap an `Authoritative` arena from a one-time
-    ///   base-index scan.
-    /// - `has_annotations=true, annotation_index=None,
-    ///   had_annotation_arena=true` — indexer-owned annotation
-    ///   history with no current arena (defensive drop, or an
-    ///   indexer pass that processed annotation events without
-    ///   sealing). Readers fall back to scan; the provider MUST
-    ///   NOT bootstrap from a live-only scan — the indexer
-    ///   already owns history the live base doesn't fully
-    ///   reflect, so a live-only reseal would silently drop
-    ///   retract/reassert rows.
-    /// - `has_annotations=false, annotation_index=Some(_)` is an
-    ///   invariant violation; the FIR6 encoder coerces the sticky
-    ///   bit when an arena is present.
-    pub annotation_index: Option<crate::AnnotationIndexRoot>,
-    /// Sticky bit governing the `ApiAttachmentEventsProvider`'s
-    /// base-index scan-fallback. Despite the name, the
-    /// load-bearing meaning is "base-index bootstrap is **not**
-    /// allowed" — it's true on *any* indexer-produced root that
-    /// has annotation history (`has_annotations=true`), regardless
-    /// of whether an arena was actually sealed by that pass.
-    ///
-    /// Only fresh bulk-import roots leave the bit false, because
-    /// the import pipeline writes annotation flakes directly to
-    /// the base index without an indexer-owned event stream.
-    /// Those roots are the unique state where the provider may
-    /// reconstruct an `Authoritative` arena from a one-time
-    /// base-index scan.
-    ///
-    /// Once set, never cleared — including across defensive
-    /// drops, no-provider indexer passes, and any other state
-    /// transition. The FIR6 encoder coerces the bit on whenever
-    /// `annotation_index.is_some()`; the decoder coerces on whenever
-    /// either the extended-flags bit is set *or* an
-    /// `annotation_index` is present (handles pre-this-change
-    /// roots that already sealed an arena).
-    pub had_annotation_arena: bool,
+
+    /// The index holds annotations but predates RDF 1.2 triple-term links,
+    /// so it cannot answer a link read until it is rebuilt from commits.
+    pub needs_link_reindex: bool,
 
     /// Whether any indexed row carries an RDF-list position. `Some(false)`
     /// lets the write path skip list-meta hydration; `None` means the root
@@ -193,19 +148,6 @@ pub struct LedgerSnapshot {
     /// automatically.
     pub range_provider: Option<Arc<dyn RangeProvider>>,
 
-    /// Optional CAS handle for arena-backed reads.
-    ///
-    /// Set by ledger-load paths that have a content store available
-    /// (the same one backing `range_provider`). Formatter / cascade
-    /// callers consult [`Self::annotation_index`] alongside this field
-    /// to decide whether to use the on-disk arena or fall back to the
-    /// scan-based hydration path.
-    ///
-    /// `Arc<dyn ContentStore>` (rather than a borrowed reference)
-    /// because the snapshot is `Clone` and outlives any individual
-    /// query / cascade scope.
-    pub content_store: Option<Arc<dyn crate::storage::ContentStore>>,
-
     /// Ledger-wide graph IRI → GraphId registry.
     ///
     /// Populated from index root (via `seed_from_root_iris`) or ledger creation
@@ -220,29 +162,10 @@ pub struct LedgerSnapshot {
     /// fast-path so non-annotation ledgers pay zero per-retract
     /// cost.
     pub has_annotations: bool,
-    /// On-disk annotation-arena pointer (forward/reverse branch CIDs +
-    /// stats). See `crate::annotation_index` for the truth table that
-    /// pairs this field with `has_annotations` and
-    /// `had_annotation_arena`.
-    pub annotation_index: Option<crate::AnnotationIndexRoot>,
-    /// Sticky bit governing whether the
-    /// `ApiAttachmentEventsProvider` is allowed to bootstrap an
-    /// `Authoritative` annotation arena from a one-time base-index
-    /// scan. Despite the name, the load-bearing meaning is
-    /// "base-index bootstrap is **not** allowed":
-    /// - `false` only on fresh bulk-import roots (no indexer pass
-    ///   has touched the annotation history yet) — bootstrap is
-    ///   safe because the live base IS the complete history.
-    /// - `true` on any indexer-produced root with
-    ///   `has_annotations=true`, including defensive drops and
-    ///   indexer passes that didn't seal an arena — bootstrap is
-    ///   unsafe because the indexer owns history the live base
-    ///   doesn't fully reflect.
-    ///
-    /// Sticky: once set, never cleared. Carried in
-    /// `IndexRoot.had_annotation_arena` via the FIR6 extended-flags
-    /// byte.
-    pub had_annotation_arena: bool,
+
+    /// The index holds annotations but predates RDF 1.2 triple-term links,
+    /// so it cannot answer a link read until it is rebuilt from commits.
+    pub needs_link_reindex: bool,
 
     /// Whether any indexed row carries an RDF-list position. `Some(false)`
     /// lets the write path skip list-meta hydration; `None` means the root
@@ -270,10 +193,8 @@ impl Clone for LedgerSnapshot {
             range_provider: self.range_provider.clone(),
             graph_registry: self.graph_registry.clone(),
             has_annotations: self.has_annotations,
-            annotation_index: self.annotation_index.clone(),
-            had_annotation_arena: self.had_annotation_arena,
+            needs_link_reindex: self.needs_link_reindex,
             has_list_meta: self.has_list_meta,
-            content_store: self.content_store.clone(),
         }
     }
 }
@@ -328,12 +249,10 @@ impl LedgerSnapshot {
             string_watermark: 0,
             range_provider: None,
             has_annotations: false,
-            annotation_index: None,
-            had_annotation_arena: false,
+            needs_link_reindex: false,
             // An empty snapshot has no indexed rows, so "no list rows" is
             // exact — everything lives in novelty, which tracks its own bit.
             has_list_meta: Some(false),
-            content_store: None,
         }
     }
 
@@ -370,10 +289,8 @@ impl LedgerSnapshot {
             range_provider: None,
             graph_registry,
             has_annotations: meta.has_annotations,
-            annotation_index: meta.annotation_index,
-            had_annotation_arena: meta.had_annotation_arena,
+            needs_link_reindex: meta.needs_link_reindex,
             has_list_meta: meta.has_list_meta,
-            content_store: None,
         })
     }
 
@@ -396,24 +313,6 @@ impl LedgerSnapshot {
     pub fn with_range_provider(mut self, provider: Arc<dyn RangeProvider>) -> Self {
         self.range_provider = Some(provider);
         self
-    }
-
-    /// Attach a content store handle. Required (alongside
-    /// [`Self::annotation_index`]) for arena-backed annotation reads;
-    /// callers that only need range queries can leave this `None`.
-    pub fn with_content_store(mut self, store: Arc<dyn crate::storage::ContentStore>) -> Self {
-        self.content_store = Some(store);
-        self
-    }
-
-    /// True iff this snapshot has both the index root section
-    /// pointing at on-disk arenas AND a CAS handle to read them. The
-    /// hot path for arena-backed lookups gates on this — when `false`,
-    /// callers fall back to the M2a scan-based hydration / cascade
-    /// paths.
-    #[inline]
-    pub fn has_arena_reader(&self) -> bool {
-        self.annotation_index.is_some() && self.content_store.is_some()
     }
 
     /// Encode an IRI to a SID using this db's namespace codes.
@@ -707,23 +606,18 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     /// by the cascade fast-path in `fluree-db-transact::stage` to
     /// skip the per-retract POST scan on non-annotation ledgers.
     const FLAG_HAS_ANNOTATIONS: u8 = 1 << 6;
-    /// Optional `AnnotationIndexRoot` section is present in the inline
-    /// tail. Decoder uses ciborium; metadata-only callers skip it.
-    const FLAG_HAS_ANNOTATION_INDEX: u8 = 1 << 7;
+    /// Legacy: the root carries a retired annotation-arena section, skipped.
+    const FLAG_LEGACY_ANNOTATION_ARENA: u8 = 1 << 7;
     let has_annotations = flags & FLAG_HAS_ANNOTATIONS != 0;
-    let has_annotation_index_section = flags & FLAG_HAS_ANNOTATION_INDEX != 0;
+    let has_legacy_arena_section = flags & FLAG_LEGACY_ANNOTATION_ARENA != 0;
 
     // Extended-flags byte at bytes[6] (must match
-    // binary-index IndexRoot's `FLAG_EXT_*` set). Old roots
-    // wrote `0u16` to this position so the raw bit decodes
-    // false; the post-decode coercion below handles legacy
-    // roots whose `annotation_index` was sealed before this
-    // change shipped.
-    const FLAG_EXT_HAD_ANNOTATION_ARENA: u8 = 1 << 0;
+    // binary-index IndexRoot's `FLAG_EXT_*` set). Bit 0 is retired.
     const FLAG_EXT_LIST_META_TRACKED: u8 = 1 << 1;
     const FLAG_EXT_HAS_LIST_META: u8 = 1 << 2;
+    const FLAG_EXT_HAS_TERM_DICT: u8 = 1 << 3;
     let flags_ext = bytes[6];
-    let had_annotation_arena = flags_ext & FLAG_EXT_HAD_ANNOTATION_ARENA != 0;
+    let has_term_dict_section = flags_ext & FLAG_EXT_HAS_TERM_DICT != 0;
     let has_list_meta = if flags_ext & FLAG_EXT_LIST_META_TRACKED == 0 {
         None
     } else {
@@ -837,6 +731,41 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         let leaf_count = read_u32(bytes, pos)? as usize;
         for _ in 0..leaf_count {
             skip_cid(bytes, pos)?;
+        }
+        Ok(())
+    }
+
+    /// Skip the triple-term dictionary section. Matches
+    /// `write_term_dict_refs` in binary-index: version, per-predicate forward
+    /// packs, reverse tree refs, per-predicate watermarks, term count, and
+    /// from version 2 the optional object reverse tree.
+    fn skip_term_dict_refs(bytes: &[u8], pos: &mut usize) -> std::io::Result<()> {
+        let version = read_u8(bytes, pos)?;
+        if !(1..=2).contains(&version) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("FIR6: unsupported term dict section version {version}"),
+            ));
+        }
+        let p_count = read_u32(bytes, pos)? as usize;
+        for _ in 0..p_count {
+            let _p_id = read_u32(bytes, pos)?;
+            let pack_count = read_u16(bytes, pos)? as usize;
+            for _ in 0..pack_count {
+                let _first = read_u64(bytes, pos)?;
+                let _last = read_u64(bytes, pos)?;
+                skip_cid(bytes, pos)?;
+            }
+        }
+        skip_dict_tree_refs(bytes, pos)?;
+        let wm_count = read_u32(bytes, pos)? as usize;
+        for _ in 0..wm_count {
+            let _p_id = read_u32(bytes, pos)?;
+            let _wm = read_u32(bytes, pos)?;
+        }
+        let _term_count = read_u64(bytes, pos)?;
+        if version >= 2 && read_u8(bytes, pos)? != 0 {
+            skip_dict_tree_refs(bytes, pos)?;
         }
         Ok(())
     }
@@ -1030,51 +959,27 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         skip_cid(bytes, &mut pos)?;
     }
 
-    // Optional `AnnotationIndexRoot` section. Decoded eagerly via
-    // ciborium so the metadata-only fast path surfaces the same
-    // pointer that `IndexRoot::decode` would produce. The section
-    // is small (a couple of CIDs and counters), so eager decode
-    // costs ~tens of bytes — comparable to `stats`/`schema` already
-    // parsed above.
-    let annotation_index = if has_annotation_index_section {
+    if has_legacy_arena_section {
         let len = read_u32(bytes, &mut pos)? as usize;
-        ensure(bytes, pos, len, "annotation_index section")?;
-        let ann =
-            ciborium::de::from_reader::<crate::AnnotationIndexRoot, _>(&bytes[pos..pos + len])
-                .map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("FIR6: annotation_index decode: {e}"),
-                    )
-                })?;
+        ensure(bytes, pos, len, "legacy annotation arena section")?;
         pos += len;
-        Some(ann)
-    } else {
-        None
-    };
+    }
 
-    // Trailing-byte sentinel: any unread bytes after the annotation
-    // section indicate a future format extension or a writer bug.
+    // Optional triple-term dictionary section: the metadata view has no use
+    // for it, so it is skipped structurally.
+    if has_term_dict_section {
+        skip_term_dict_refs(bytes, &mut pos)?;
+    }
+
+    // Trailing-byte sentinel: any unread bytes after the last section
+    // indicate a future format extension or a writer bug.
     // Surface that explicitly rather than silently drop the bytes.
     if pos != bytes.len() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!(
-                "FIR6: trailing bytes after annotation_index ({} unread)",
-                bytes.len() - pos
-            ),
+            format!("FIR6: trailing bytes ({} unread)", bytes.len() - pos),
         ));
     }
-
-    // Decode-side coercion (mirrors `IndexRoot::decode`'s
-    // backward-compat fix): a root with a populated
-    // `annotation_index` implies `had_annotation_arena = true`,
-    // even if the extended-flags byte is zero (pre-this-change
-    // FIR6 roots that already had a sealed arena). Without this,
-    // a later defensive drop on such a root would land in the
-    // bootstrap-eligible state and the provider's base-index
-    // scan-fallback would silently lose retract/reassert history.
-    let had_annotation_arena = had_annotation_arena || annotation_index.is_some();
 
     Ok(LedgerSnapshotMetadata {
         ledger_id,
@@ -1088,8 +993,7 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         string_watermark,
         graph_iris,
         has_annotations,
-        annotation_index,
-        had_annotation_arena,
+        needs_link_reindex: has_annotations && !has_term_dict_section,
         has_list_meta,
     })
 }
@@ -1135,43 +1039,6 @@ mod tests {
     }
 
     #[test]
-    fn has_arena_reader_requires_both_index_and_store() {
-        // Genesis snapshot: neither annotation_index nor content_store
-        // — has_arena_reader returns false.
-        let snap = LedgerSnapshot::genesis("test:main");
-        assert!(!snap.has_arena_reader(), "genesis has no arena");
-
-        // Adding only the content store still doesn't enable arena
-        // reads — the snapshot must also point at on-disk arenas.
-        let store = Arc::new(crate::storage::MemoryContentStore::new())
-            as Arc<dyn crate::storage::ContentStore>;
-        let snap = snap.with_content_store(store);
-        assert!(
-            !snap.has_arena_reader(),
-            "store without annotation_index does not enable arena reads"
-        );
-
-        // Adding annotation_index with no store still doesn't suffice.
-        let mut snap = snap;
-        snap.content_store = None;
-        snap.annotation_index = Some(crate::AnnotationIndexRoot {
-            version: 1,
-            max_t: 0,
-            forward_branch_cid: ContentId::new(ContentKind::AnnotationForwardBranch, b"empty-fwd"),
-            reverse_branch_cid: ContentId::new(ContentKind::AnnotationReverseBranch, b"empty-rev"),
-            stats: crate::AnnotationStats::default(),
-        });
-        assert!(
-            !snap.has_arena_reader(),
-            "annotation_index without store does not enable arena reads"
-        );
-
-        // Both present — arena reader is available.
-        snap.content_store = Some(Arc::new(crate::storage::MemoryContentStore::new()));
-        assert!(snap.has_arena_reader());
-    }
-
-    #[test]
     fn test_encode_decode_sid() {
         let mut ns = HashMap::new();
         ns.insert(0u16, String::new());
@@ -1188,8 +1055,7 @@ mod tests {
             string_watermark: 0,
             graph_iris: vec![],
             has_annotations: false,
-            annotation_index: None,
-            had_annotation_arena: false,
+            needs_link_reindex: false,
             has_list_meta: None,
         })
         .unwrap();

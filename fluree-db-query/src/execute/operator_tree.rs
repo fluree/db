@@ -2249,7 +2249,9 @@ fn detect_union_star_count_all(
 /// query with fast paths on and off and asserts identical results, and as
 /// an operational escape hatch when triaging a suspected fast-path bug.
 /// It is NOT a tuning knob: runtime operator-internal optimizations
-/// (cursor selection, batched joins) are unaffected.
+/// (cursor selection, fixed-predicate batched joins) are unaffected. The
+/// wildcard-predicate join, independent-scan replay and independent-join count
+/// lanes also honor this switch for differential tests.
 static FAST_PATHS_DISABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -2421,6 +2423,32 @@ fn result_is_multiplicity_blind(query: &Query) -> bool {
     }
 }
 
+/// The query with the reified-edge components nothing reads removed (see
+/// `elide_unread_term_binds`), or `None` when it has none to drop.
+fn elide_unread_term_binds_in_query(query: &Query) -> Option<Query> {
+    let deps = compute_variable_deps(query);
+    let required = deps.as_ref().map(|d| d.required_where_vars.as_slice());
+    let needed: HashSet<VarId> = match required {
+        Some(req) => req.iter().copied().collect(),
+        None => {
+            let mut counts: HashMap<VarId, usize> = HashMap::new();
+            let mut vars: HashSet<VarId> = HashSet::new();
+            collect_var_stats(&query.patterns, &mut counts, &mut vars);
+            vars.extend(counts.keys().copied());
+            vars
+        }
+    };
+    let patterns = crate::execute::where_plan::elide_unread_term_binds(
+        &query.patterns,
+        &needed,
+        required,
+        &HashSet::new(),
+    )?;
+    let mut query = query.clone();
+    query.patterns = patterns;
+    Some(query)
+}
+
 fn build_operator_tree_inner(
     query: &Query,
     stats: Option<Arc<StatsView>>,
@@ -2458,6 +2486,18 @@ fn build_operator_tree_inner(
     // over-count a triple shared across members. Decline them and let the
     // general pipeline run over the deduplicating `DatasetOperator`.
     let enable_fused_fast_paths = enable_fused_fast_paths && !planning.multi_default_graph;
+
+    // Drop the reified-edge positions nothing reads before any fast path
+    // looks at the pattern list, so a `COUNT(*)` over `<< ?s ?p ?o >>` is the
+    // plain two-triple join the count planner handles.
+    let elided_query;
+    let query = match elide_unread_term_binds_in_query(query) {
+        Some(q) => {
+            elided_query = q;
+            &elided_query
+        }
+        None => query,
+    };
 
     // Expression-based ORDER BY (`query.order_binds`) is materialized only by the
     // generic pipeline's dedicated post-grouping bind stage. No fast path runs

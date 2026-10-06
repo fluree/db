@@ -11,6 +11,7 @@
 //! 2. Output records: `Vec<RunRecordV2>` + `Vec<u8>` (parallel ops)
 //! 3. `OTypeRegistry` built from root's `datatype_iris` + `language_tags`
 
+use crate::run_index::resolve::link_synth::SlotValue;
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
@@ -69,6 +70,8 @@ pub enum IncrementalResolveError {
     Resolve(ResolverError),
     /// I/O error.
     Io(io::Error),
+    /// The window cannot be applied incrementally; a full rebuild can.
+    NeedsRebuild(String),
 }
 
 impl std::fmt::Display for IncrementalResolveError {
@@ -79,6 +82,7 @@ impl std::fmt::Display for IncrementalResolveError {
             Self::CommitChain(msg) => write!(f, "commit chain: {msg}"),
             Self::Resolve(e) => write!(f, "resolve: {e}"),
             Self::Io(e) => write!(f, "I/O: {e}"),
+            Self::NeedsRebuild(msg) => write!(f, "needs a full rebuild: {msg}"),
         }
     }
 }
@@ -202,6 +206,12 @@ pub struct IncrementalNovelty {
     pub base_numbig_counts: HashMap<(u16, u32), usize>,
     /// String text bytes for fulltext assertion entries.
     pub fulltext_string_bytes: HashMap<u32, Vec<u8>>,
+    /// Triple terms first interned by this window as `(p_id, seq, key bytes)`,
+    /// ascending by `(p_id, seq)`; their handles continue above the base
+    /// root's per-predicate watermarks.
+    pub new_terms: Vec<(u32, u32, Vec<u8>)>,
+    /// Per-predicate term watermarks after this window (base merged with new).
+    pub term_watermarks: Vec<(u32, u32)>,
 }
 
 // ============================================================================
@@ -280,6 +290,14 @@ pub async fn resolve_incremental_commits_v6(
 
     // 4. Seed SharedResolverState from V6 root.
     let mut shared = SharedResolverState::from_index_root(&root)?;
+    // Incremental builds resolve term ordinals in step 9a, so links are
+    // synthesized — except over an annotated index built before links, whose
+    // earlier annotations only a full rebuild links: a term dictionary started
+    // here would cover the window alone, and readers take its presence to mean
+    // every annotation is linked.
+    if !(root.has_annotations && root.term_dict.is_none()) {
+        shared.link_synth.enable();
+    }
 
     // Enable spatial hook for non-POINT geometry detection.
     shared.spatial_hook = Some(crate::spatial_hook::SpatialHook::new());
@@ -568,6 +586,7 @@ pub async fn resolve_incremental_commits_v6(
             commit_count,
             "V6 incremental resolve: timings (no records)"
         );
+        let base_term_watermarks = root_term_watermarks(&root);
         return Ok(IncrementalNovelty {
             records: Vec::new(),
             ops: Vec::new(),
@@ -586,6 +605,8 @@ pub async fn resolve_incremental_commits_v6(
             base_vector_counts,
             base_numbig_counts,
             fulltext_string_bytes: HashMap::new(),
+            new_terms: Vec::new(),
+            term_watermarks: base_term_watermarks,
         });
     }
 
@@ -605,7 +626,7 @@ pub async fn resolve_incremental_commits_v6(
 
     // 7. Reconcile chunk-local IDs to global IDs (same algorithm as V5).
     let t_reconcile_start = Instant::now();
-    let reconcile = reconcile_chunk_to_global(
+    let mut reconcile = reconcile_chunk_to_global(
         &chunk,
         &subject_tree,
         &string_tree,
@@ -652,6 +673,190 @@ pub async fn resolve_incremental_commits_v6(
         remap_record(record, &reconcile.subject_remap, &reconcile.string_remap)?;
     }
     let t_remap_records_ms = t0.elapsed().as_millis() as u64;
+
+    // 9a. Triple terms: remap the chunk's term table the same way, then give
+    //     every link record its global handle — an existing one from the base
+    //     dictionary, or a fresh one above the base watermarks.
+    let mut chunk_terms = chunk.terms;
+    for term in &mut chunk_terms {
+        crate::run_index::resolve::resolver::remap_term_record(
+            term,
+            &reconcile.subject_remap,
+            &reconcile.string_remap,
+        )
+        .map_err(|e| IncrementalResolveError::Resolve(ResolverError::Resolve(e)))?;
+    }
+    // Attachment ops replay per reifier from the attachment the base index
+    // holds, so a re-point that touched one slot still moves the link.
+    let mut attachments = chunk.attachments;
+    for op in &mut attachments {
+        op.remap(&reconcile.subject_remap, &reconcile.string_remap)
+            .map_err(|e| IncrementalResolveError::Io(io::Error::other(e)))?;
+    }
+    let prior_attachments = if attachments.is_empty() {
+        HashMap::new()
+    } else {
+        let mut keys: Vec<(u16, u64)> = attachments.iter().map(|a| (a.g_id, a.ann)).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        base_attachment_states(
+            Arc::clone(&cs),
+            &root,
+            config.artifact_cache_dir.as_deref(),
+            &shared.predicates,
+            shared.link_synth.slots(),
+            &keys,
+            &mut WindowStrings {
+                new: &mut reconcile.new_strings,
+                watermark: &mut reconcile.updated_string_watermark,
+                index: None,
+            },
+        )
+        .await
+        .map_err(IncrementalResolveError::Io)?
+    };
+    let (new_terms, term_watermarks) = {
+        let base_refs = root.term_dict.as_ref();
+        let base_reader = match base_refs {
+            Some(refs) => {
+                let cache_dir = config
+                    .artifact_cache_dir
+                    .clone()
+                    .unwrap_or_else(std::env::temp_dir);
+                Some(
+                    fluree_db_binary_index::dict::TermDictReader::from_refs_reusing(
+                        Arc::clone(&cs),
+                        &cache_dir,
+                        refs,
+                        None,
+                        None,
+                    )
+                    .await
+                    .map_err(|e| {
+                        IncrementalResolveError::DictTreeLoad(format!("term dictionary: {e}"))
+                    })?,
+                )
+            }
+            None => None,
+        };
+        let base_wms: Vec<(u32, u32)> = base_refs.map(|r| r.watermarks.clone()).unwrap_or_default();
+        let mut builder =
+            fluree_db_binary_index::dict::TermDictBuilder::above_watermarks(&base_wms);
+        // The window's terms, inner terms first, each level's base handles
+        // in one batched lookup: a reverse lookup reads a whole tree leaf.
+        let handles = crate::run_index::resolve::resolver::intern_chunk_terms(
+            &chunk_terms,
+            &o_type_registry,
+            &mut |keys| {
+                let found = match &base_reader {
+                    Some(reader) => reader.find_handles(keys)?,
+                    None => vec![None; keys.len()],
+                };
+                keys.iter()
+                    .zip(found)
+                    .map(|(&key, found)| match found {
+                        Some(handle) => Ok(handle),
+                        None => builder.get_or_insert(key),
+                    })
+                    .collect()
+            },
+        )?;
+        let triple_term = ObjKind::TRIPLE_TERM.as_u8();
+        for record in &mut v1_records {
+            if record.o_kind != triple_term {
+                continue;
+            }
+            record.o_key = *handles.get(record.o_key as usize).ok_or_else(|| {
+                IncrementalResolveError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("term ordinal {} out of range", record.o_key),
+                ))
+            })?;
+        }
+        let prior = |g_id: u16, ann: u64| {
+            prior_attachments
+                .get(&(g_id, ann))
+                .copied()
+                .unwrap_or([None; 3])
+        };
+        let link_ids = if attachments.is_empty() {
+            None
+        } else {
+            Some(shared.link_synth.link_ids().ok_or_else(|| {
+                IncrementalResolveError::Io(io::Error::other("attachment ops without link ids"))
+            })?)
+        };
+        // A re-point needs the base handle of the term it retracts; a dry
+        // replay names the terms the real one will ask for.
+        let mut base_handles = HashMap::new();
+        if let (Some(reader), Some(link_ids)) = (&base_reader, link_ids) {
+            let mut wanted = Vec::new();
+            crate::run_index::resolve::link_synth::replay_attachments(
+                &mut attachments,
+                prior,
+                &o_type_registry,
+                link_ids,
+                &mut |key| {
+                    wanted.push(key);
+                    Ok(0)
+                },
+                &mut |_| Ok(()),
+            )?;
+            wanted.sort_unstable();
+            wanted.dedup();
+            for (key, handle) in wanted.iter().zip(reader.find_handles(&wanted)?) {
+                if let Some(handle) = handle {
+                    base_handles.insert(*key, handle);
+                }
+            }
+        }
+        let mut handle_for = |key: fluree_db_core::triple_term::TermKey| -> io::Result<u64> {
+            match base_handles.get(&key) {
+                Some(&handle) => Ok(handle),
+                None => builder.get_or_insert(key),
+            }
+        };
+        if let Some(link_ids) = link_ids {
+            let emitted = crate::run_index::resolve::link_synth::replay_attachments(
+                &mut attachments,
+                prior,
+                &o_type_registry,
+                link_ids,
+                &mut handle_for,
+                &mut |record| {
+                    v1_records.push(record);
+                    Ok(())
+                },
+            )?;
+            tracing::debug!(
+                links = emitted,
+                reifiers = prior_attachments.len(),
+                "V6 incremental resolve: links replayed"
+            );
+        }
+        let new_terms: Vec<(u32, u32, Vec<u8>)> = builder
+            .entries_sorted()
+            .into_iter()
+            .map(|(h, key)| {
+                (
+                    fluree_db_core::triple_term::term_handle_p_id(h),
+                    fluree_db_core::triple_term::term_handle_seq(h),
+                    key.to_be_bytes().to_vec(),
+                )
+            })
+            .collect();
+        let mut wms: std::collections::BTreeMap<u32, u32> = base_wms.into_iter().collect();
+        for (p_id, wm) in builder.watermarks() {
+            wms.insert(p_id, wm);
+        }
+        (new_terms, wms.into_iter().collect::<Vec<_>>())
+    };
+    drop(chunk_terms);
+    if root.has_annotations && root.term_dict.is_none() && !new_terms.is_empty() {
+        return Err(IncrementalResolveError::NeedsRebuild(
+            "the window holds triple terms over an annotated index built before links".to_string(),
+        ));
+    }
 
     // VECTOR_ID handles are already globally-correct: chunk inserts
     // appended to the pre-loaded base arena (step 4b) so they return
@@ -766,7 +971,17 @@ pub async fn resolve_incremental_commits_v6(
         base_vector_counts,
         base_numbig_counts,
         fulltext_string_bytes,
+        new_terms,
+        term_watermarks,
     })
+}
+
+/// The base root's per-predicate term watermarks, or none.
+fn root_term_watermarks(root: &IndexRoot) -> Vec<(u32, u32)> {
+    root.term_dict
+        .as_ref()
+        .map(|r| r.watermarks.clone())
+        .unwrap_or_default()
 }
 
 // ============================================================================
@@ -1084,6 +1299,137 @@ async fn seed_vector_fact_handles(
         }
     }
     Ok(())
+}
+
+/// The attachment the base index holds for each `(g_id, reifier)`: its live
+/// `f:reifies*` rows, read in one batched SPOT pass per graph. The
+/// predicate slot's row refers to the predicate IRI as a subject; it maps
+/// back to the predicate id through the dictionary.
+async fn base_attachment_states(
+    cs: Arc<dyn ContentStore>,
+    root: &IndexRoot,
+    cache_dir: Option<&Path>,
+    predicates: &crate::run_index::resolve::global_dict::PredicateDict,
+    slots: [Option<u32>; 3],
+    keys: &[(u16, u64)],
+    strings: &mut WindowStrings<'_>,
+) -> io::Result<HashMap<(u16, u64), [Option<SlotValue>; 3]>> {
+    use crate::run_index::resolve::link_synth::ObjectId;
+    use fluree_db_binary_index::read::binary_index_store::BinaryIndexStore;
+    use fluree_db_core::o_type::OType;
+    use fluree_db_core::triple_term::{is_lexical_term_object, lexical_term_object};
+
+    let mut states = HashMap::new();
+    if keys.is_empty() || slots.iter().all(Option::is_none) {
+        return Ok(states);
+    }
+    let cache_dir = cache_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    let store = Arc::new(
+        BinaryIndexStore::load_from_root_v6(Arc::clone(&cs), root, &cache_dir, None).await?,
+    );
+    let iri_ref = OType::IRI_REF.as_u16();
+    // Attachments name few distinct predicates; resolve each sid once.
+    let mut predicate_ids: HashMap<u64, u32> = HashMap::new();
+    // `keys` is sorted, so each graph's reifiers are one contiguous run.
+    for run in keys.chunk_by(|a, b| a.0 == b.0) {
+        let g_id = run[0].0;
+        let anns: Vec<u64> = run.iter().map(|&(_, ann)| ann).collect();
+        let rows = fluree_db_binary_index::batched_lookup_subject_properties(
+            &store,
+            g_id,
+            &anns,
+            root.index_t,
+        )?;
+        for ann in anns {
+            let mut state: [Option<SlotValue>; 3] = [None; 3];
+            for &(p_id, o_type, o_key) in rows.get(&ann).map_or(&[][..], Vec::as_slice) {
+                let Some(slot) = slots.iter().position(|s| *s == Some(p_id)) else {
+                    continue;
+                };
+                state[slot] = match slot {
+                    0 if o_type == iri_ref => Some(SlotValue::Subject(o_key)),
+                    // A read failure or a predicate the dictionary does not
+                    // hold must fail the build: treated as "no predicate", an
+                    // object-only re-point would replay from and to an
+                    // incomplete attachment and leave the old link in place.
+                    1 if o_type == iri_ref => {
+                        let p_id = match predicate_ids.get(&o_key) {
+                            Some(&p_id) => p_id,
+                            None => {
+                                let iri = store.resolve_subject_iri(o_key)?;
+                                let p_id = predicates.get(&iri).ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        format!(
+                                            "reifier {ann} is attached to predicate {iri}, \
+                                             which the dictionary does not hold"
+                                        ),
+                                    )
+                                })?;
+                                predicate_ids.insert(o_key, p_id);
+                                p_id
+                            }
+                        };
+                        Some(SlotValue::Predicate(p_id))
+                    }
+                    // An arena handle names the value only within this graph
+                    // and slot predicate; the window's ops carry the form.
+                    2 if is_lexical_term_object(OType::from_u16(o_type))
+                        || o_type == OType::XSD_DECIMAL_INLINE.as_u16() =>
+                    {
+                        let value = store.decode_value_v3(o_type, o_key, p_id, g_id)?;
+                        let (term_o_type, form) = lexical_term_object(&value).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("reifier {ann}: arena object {value:?} has no term form"),
+                            )
+                        })?;
+                        let id = match store.find_string_id(&form)? {
+                            Some(id) => id,
+                            None => strings.intern(form),
+                        };
+                        Some(SlotValue::Object(ObjectId::Typed {
+                            o_type: term_o_type.as_u16(),
+                            o_key: u64::from(id),
+                        }))
+                    }
+                    2 => Some(SlotValue::Object(ObjectId::Typed { o_type, o_key })),
+                    _ => None,
+                };
+            }
+            states.insert((g_id, ann), state);
+        }
+    }
+    Ok(states)
+}
+
+/// The strings this window adds to the dictionary, which the canonical
+/// object form of a base attachment can still join after reconciliation.
+struct WindowStrings<'a> {
+    new: &'a mut Vec<(u32, Vec<u8>)>,
+    watermark: &'a mut u32,
+    index: Option<HashMap<Vec<u8>, u32>>,
+}
+
+impl WindowStrings<'_> {
+    /// The id `form` has in this window, allocating one above the watermark.
+    fn intern(&mut self, form: String) -> u32 {
+        let new = &*self.new;
+        let index = self
+            .index
+            .get_or_insert_with(|| new.iter().map(|(id, b)| (b.clone(), *id)).collect());
+        if let Some(&id) = index.get(form.as_bytes()) {
+            return id;
+        }
+        *self.watermark += 1;
+        let id = *self.watermark;
+        let bytes = form.into_bytes();
+        index.insert(bytes.clone(), id);
+        self.new.push((id, bytes));
+        id
+    }
 }
 
 /// Fetch one commit blob, honoring the optional artifact cache.
@@ -1940,5 +2286,21 @@ mod tests {
                 lang_rec(1, 1, 10, 2, 6, OP_RETRACT),
             ])
         );
+    }
+
+    #[test]
+    fn a_base_object_form_joins_the_window_strings() {
+        let mut new = vec![(11, b"15e-1".to_vec())];
+        let mut watermark = 11;
+        let mut strings = WindowStrings {
+            new: &mut new,
+            watermark: &mut watermark,
+            index: None,
+        };
+        assert_eq!(strings.intern("15e-1".into()), 11);
+        assert_eq!(strings.intern("225e-2".into()), 12);
+        assert_eq!(strings.intern("225e-2".into()), 12);
+        assert_eq!(watermark, 12);
+        assert_eq!(new, vec![(11, b"15e-1".to_vec()), (12, b"225e-2".to_vec())]);
     }
 }

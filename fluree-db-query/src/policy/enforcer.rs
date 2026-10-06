@@ -4,7 +4,9 @@
 
 use super::QueryPolicyExecutor;
 use crate::error::Result;
-use fluree_db_core::{Flake, GraphId, LedgerSnapshot, OverlayProvider, Sid, Tracker};
+use fluree_db_core::{
+    Flake, FlakeValue, GraphId, LedgerSnapshot, OverlayProvider, Sid, Tracker, TripleTermValue,
+};
 use fluree_db_policy::{is_schema_flake, PolicyContext};
 use std::sync::Arc;
 
@@ -82,6 +84,17 @@ impl QueryPolicyEnforcer {
         }
     }
 
+    /// Whether the view policy can hide any flake at all. Gates the lanes'
+    /// triple-term check: an uncovered predicate's term rows are hidden only
+    /// through the restrictions on the triples they name.
+    pub fn view_restricts_anything(&self) -> bool {
+        let view = self.policy.wrapper().view();
+        !(view.by_property.is_empty()
+            && view.by_class.is_empty()
+            && view.by_subject.is_empty()
+            && view.defaults.is_empty())
+    }
+
     /// Filter a batch of flakes by policy using explicit graph parameters.
     ///
     /// This is the **correct** method for dataset mode - it uses the graph's
@@ -117,10 +130,20 @@ impl QueryPolicyEnforcer {
 
         // Create executor using the GRAPH's snapshot/overlay/to_t (not ctx-level!)
         let executor = QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t);
+        self.cache_term_subject_classes(snapshot, g_id, overlay, to_t, &flakes)
+            .await?;
 
         let mut result = Vec::with_capacity(flakes.len());
 
         for flake in flakes {
+            // A term names its triple even under a schema predicate, so it is
+            // checked before the schema exemption.
+            if !self
+                .term_visible(g_id, to_t, &flake.o, &executor, tracker)
+                .await?
+            {
+                continue;
+            }
             // Schema flakes always allowed
             if is_schema_flake(&flake.p, &flake.o) {
                 result.push(flake);
@@ -177,13 +200,22 @@ impl QueryPolicyEnforcer {
             return Ok(true);
         }
 
+        // Create executor using the GRAPH's snapshot/overlay/to_t
+        let executor = QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t);
+        self.cache_term_subject_classes(snapshot, g_id, overlay, to_t, std::slice::from_ref(flake))
+            .await?;
+        // Before the schema exemption: a term names its triple under any predicate.
+        if !self
+            .term_visible(g_id, to_t, &flake.o, &executor, tracker)
+            .await?
+        {
+            return Ok(false);
+        }
+
         // Schema flakes always allowed
         if is_schema_flake(&flake.p, &flake.o) {
             return Ok(true);
         }
-
-        // Create executor using the GRAPH's snapshot/overlay/to_t
-        let executor = QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t);
 
         // Get subject classes from cache
         let subject_classes = self
@@ -201,6 +233,66 @@ impl QueryPolicyEnforcer {
                 &executor,
                 tracker,
             )
+            .await
+            .map_err(|e| crate::error::QueryError::Policy(e.to_string()))
+    }
+
+    /// A triple-term object shows the triple it names, so a flake holding one
+    /// (an `rdf:reifies` link) is visible only when that triple would be, and
+    /// so on through a nested term. Other objects pass.
+    async fn term_visible(
+        &self,
+        g_id: GraphId,
+        to_t: i64,
+        object: &FlakeValue,
+        executor: &QueryPolicyExecutor<'_>,
+        tracker: &Tracker,
+    ) -> Result<bool> {
+        let mut object = object;
+        while let FlakeValue::TripleTerm(term) = object {
+            let classes = self
+                .policy
+                .get_cached_subject_classes(g_id, to_t, &term.s)
+                .unwrap_or_default();
+            let allowed = self
+                .policy
+                .allow_view_flake_async(&term.s, &term.p, &term.o, &classes, executor, tracker)
+                .await
+                .map_err(|e| crate::error::QueryError::Policy(e.to_string()))?;
+            if !allowed {
+                return Ok(false);
+            }
+            object = &term.o;
+        }
+        Ok(true)
+    }
+
+    /// Cache the classes of the subjects of every triple term among `flakes`'
+    /// objects, which `term_visible` checks like any flake subject.
+    async fn cache_term_subject_classes(
+        &self,
+        snapshot: &LedgerSnapshot,
+        g_id: GraphId,
+        overlay: &dyn OverlayProvider,
+        to_t: i64,
+        flakes: &[Flake],
+    ) -> Result<()> {
+        let mut subjects: Vec<Sid> = Vec::new();
+        for flake in flakes {
+            let mut object = &flake.o;
+            while let FlakeValue::TripleTerm(term) = object {
+                let TripleTermValue { s, o, .. } = &**term;
+                subjects.push(s.clone());
+                object = o;
+            }
+        }
+        if subjects.is_empty() {
+            return Ok(());
+        }
+        subjects.sort();
+        subjects.dedup();
+        let db = fluree_db_core::GraphDbRef::new(snapshot, g_id, overlay, to_t);
+        self.populate_class_cache_for_graph(db, &subjects)
             .await
             .map_err(|e| crate::error::QueryError::Policy(e.to_string()))
     }

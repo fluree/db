@@ -20,7 +20,7 @@
 use crate::flake::{Flake, FlakeMeta};
 use crate::sid::{Sid, SidInterner};
 use crate::temporal::{Date, DateTime, Time};
-use crate::value::FlakeValue;
+use crate::value::{FlakeValue, TripleTermValue};
 use bigdecimal::BigDecimal;
 use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
@@ -125,9 +125,24 @@ pub enum TransportValue {
     /// JSON value as string
     #[serde(rename = "json")]
     Json(String),
+    /// RDF 1.2 triple term
+    #[serde(rename = "triple")]
+    TripleTerm(Box<TransportTripleTerm>),
     /// Null value
     #[serde(rename = "null")]
     Null,
+}
+
+/// Transport form of [`TripleTermValue`]: SIDs and the object value in their
+/// transport encodings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TransportTripleTerm {
+    pub s: TransportSid,
+    pub p: TransportSid,
+    pub o: TransportValue,
+    pub dt: TransportSid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
 }
 
 impl From<&FlakeValue> for TransportValue {
@@ -154,6 +169,15 @@ impl From<&FlakeValue> for TransportValue {
             FlakeValue::Vector(v) => TransportValue::Vector(v.to_vec()),
             FlakeValue::Json(s) => TransportValue::Json(s.clone()),
             FlakeValue::GeoPoint(bits) => TransportValue::String(bits.to_string()),
+            FlakeValue::TripleTerm(t) => {
+                TransportValue::TripleTerm(Box::new(TransportTripleTerm {
+                    s: TransportSid::from(&t.s),
+                    p: TransportSid::from(&t.p),
+                    o: TransportValue::from(&t.o),
+                    dt: TransportSid::from(&t.dt),
+                    lang: t.lang.clone(),
+                }))
+            }
             FlakeValue::Null => TransportValue::Null,
         }
     }
@@ -202,6 +226,15 @@ impl TransportValue {
             }
             TransportValue::Vector(v) => Ok(FlakeValue::Vector(v.as_slice().into())),
             TransportValue::Json(s) => Ok(FlakeValue::Json(s.clone())),
+            TransportValue::TripleTerm(t) => {
+                Ok(FlakeValue::TripleTerm(Box::new(TripleTermValue {
+                    s: t.s.to_sid(interner),
+                    p: t.p.to_sid(interner),
+                    o: t.o.to_flake_value(interner)?,
+                    dt: t.dt.to_sid(interner),
+                    lang: t.lang.clone(),
+                })))
+            }
             TransportValue::Null => Ok(FlakeValue::Null),
         }
     }

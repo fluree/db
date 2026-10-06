@@ -256,8 +256,12 @@ impl Operator for BindOperator {
                     match existing {
                         Some(Binding::Unbound) | None => true, // Unbound - can bind
                         Some(existing_val) => {
-                            // Check if same value
-                            existing_val == &computed || matches!(computed, Binding::Unbound)
+                            matches!(computed, Binding::Unbound)
+                                || crate::object_binding::bind_unifies(
+                                    existing_val,
+                                    &computed,
+                                    Some(ctx),
+                                )
                         }
                     }
                 };

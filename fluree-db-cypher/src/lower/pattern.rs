@@ -1120,6 +1120,7 @@ fn build_fixed_chain<E: IriEncoder>(
                 edge: TriplePattern::new(gs, ctx.iri_ref(type_iri.to_string()), go.into()),
                 annotation: ann,
                 body,
+                term: ctx.fresh_synth(),
             });
         } else {
             push_hop(
@@ -1142,15 +1143,11 @@ fn build_fixed_chain<E: IriEncoder>(
 }
 
 /// Whether a per-edge annotation probe can bind anything in this view:
-/// `f:reifies*` must be in the dictionary, and the caller must not have proved
-/// (index stats + overlay) that no `f:reifies*` fact exists. When it cannot,
-/// every relationship value is the synthesized one and the probe is pure cost.
+/// `rdf:reifies` must be in the dictionary, and the caller must not have
+/// proved (index stats + overlay) that no link exists. When it cannot, every
+/// relationship value is the synthesized one and the probe is pure cost.
 fn annotation_probe_possible<E: IriEncoder>(ctx: &LoweringContext<'_, E>) -> bool {
-    ctx.reified_edges_possible
-        && ctx
-            .encoder
-            .encode_iri(fluree_vocab::reifies_iris::SUBJECT)
-            .is_some()
+    ctx.reified_edges_possible && ctx.encoder.encode_iri(fluree_vocab::rdf::REIFIES).is_some()
 }
 
 /// Build the relationship-list value for a fixed chain — one element per hop —
@@ -1212,6 +1209,7 @@ fn build_rel_list_expr<E: IriEncoder>(
                 edge,
                 annotation: Ref::Var(ann),
                 body: Vec::new(),
+                term: ctx.fresh_synth(),
             }]));
             rels.push(Expression::call(
                 Function::Coalesce,
@@ -1416,6 +1414,7 @@ fn push_rel_triple<E: IriEncoder>(
                         edge: TriplePattern::new(s, pred, edge_o),
                         annotation: Ref::Var(ann),
                         body: Vec::new(),
+                        term: ctx.fresh_synth(),
                     }]));
                     Expression::call(Function::Coalesce, vec![Expression::Var(ann), rel_value])
                 } else {
@@ -1445,6 +1444,7 @@ fn push_rel_triple<E: IriEncoder>(
                 edge,
                 annotation: ann,
                 body,
+                term: ctx.fresh_synth(),
             });
             Ok(())
         }
@@ -1457,6 +1457,7 @@ fn push_rel_triple<E: IriEncoder>(
                 edge,
                 annotation: ann,
                 body,
+                term: ctx.fresh_synth(),
             });
             Ok(())
         }

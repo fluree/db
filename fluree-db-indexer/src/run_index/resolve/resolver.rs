@@ -14,7 +14,7 @@ use bigdecimal::BigDecimal;
 use chrono;
 use fluree_db_binary_index::format::run_record::{RunRecord, LIST_INDEX_NONE};
 use fluree_db_core::commit::codec::envelope::CodecEnvelope;
-use fluree_db_core::commit::codec::raw_reader::{CommitOps, RawObject, RawOp};
+use fluree_db_core::commit::codec::raw_reader::{CommitOps, RawObject, RawOp, RawTripleTerm};
 use fluree_db_core::commit::codec::{load_commit_ops, CommitCodecError};
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::temporal::{
@@ -832,6 +832,9 @@ impl CommitResolver {
         dicts: &mut GlobalDicts,
         is_assert: bool,
     ) -> Result<Option<(ObjKind, ObjKey)>, String> {
+        if let RawObject::TripleTerm(_) = obj {
+            return Err("triple-term objects are resolved by the chunked builds".into());
+        }
         // Vector handling is unique: assertions allocate + record fact identity;
         // retractions look up by fact identity (NOT by value, to avoid aliasing
         // between distinct subjects with the same vector value); unmatched
@@ -890,6 +893,7 @@ impl CommitResolver {
             };
         }
         let result = match obj {
+            RawObject::TripleTerm(_) => unreachable!("returned above"),
             RawObject::Long(v) => Ok((ObjKind::NUM_INT, ObjKey::encode_i64(*v))),
             RawObject::Double(v) => {
                 // NOTE: Do not optimize integral doubles to NUM_INT here.
@@ -1119,6 +1123,9 @@ pub struct SharedResolverState {
     pub graphs: super::global_dict::PredicateDict,
     /// Global language tag dict (shared across all chunks — no per-chunk remap needed).
     pub languages: super::global_dict::LanguageTagDict,
+    /// RDF 1.2 link synthesis for `f:reifies*` bundles; off until a build
+    /// path that resolves term ordinals enables it.
+    pub link_synth: super::link_synth::LinkSynth,
     /// Per-graph, per-predicate overflow numeric arenas (BigInt/BigDecimal).
     /// Outer key = g_id, inner key = p_id.
     pub numbigs:
@@ -1210,6 +1217,7 @@ impl SharedResolverState {
             schema_hook: None,
             decimal_encoding: fluree_db_core::DecimalEncoding::default(),
             saw_list_meta: false,
+            link_synth: super::link_synth::LinkSynth::new(),
         }
     }
 
@@ -1341,6 +1349,7 @@ impl SharedResolverState {
             // it never mixes inline and arena encodings under one identity.
             decimal_encoding: root.decimal_encoding(),
             saw_list_meta: false,
+            link_synth: super::link_synth::LinkSynth::new(),
         })
     }
 
@@ -1485,6 +1494,15 @@ impl SharedResolverState {
                 return Ok(());
             };
 
+            self.link_synth.observe(
+                &raw_op,
+                &record,
+                &mut self.predicates,
+                &mut self.datatypes,
+                &self.ns_prefixes,
+                chunk,
+            );
+
             // Feed raw op to spatial hook (needs raw WKT string + resolved IDs).
             // Note: record.s_id is chunk-local here; subject IDs in spatial entries
             // must be remapped after dict merge (Phase C).
@@ -1618,6 +1636,71 @@ impl SharedResolverState {
         }))
     }
 
+    /// A link's triple term, written straight into a commit: the term becomes
+    /// a pseudo-record in the chunk's term table, resolved as the base
+    /// triple's own record would be, and the link carries its ordinal — the
+    /// bulk-import sink's form, which the build remaps and interns.
+    fn resolve_term_chunk(
+        &mut self,
+        term: &RawTripleTerm<'_>,
+        g_id: GraphId,
+        chunk: &mut RebuildChunk,
+        is_assert: bool,
+    ) -> Result<(ObjKind, ObjKey), String> {
+        let p_id = self.resolve_predicate(term.p.0, term.p.1);
+        let dt = checked_dt_id(self.resolve_datatype(term.dt.0, term.dt.1))?;
+        // An arena handle names a value only within one graph and predicate;
+        // a term keys the object by its canonical form.
+        let lexical = match &term.o {
+            RawObject::BigIntStr(_) | RawObject::DecimalStr(_) | RawObject::Vector(_) => {
+                let value = fluree_db_core::FlakeValue::try_from(term.o.clone())
+                    .map_err(|e| e.to_string())?;
+                fluree_db_core::triple_term::lexical_term_object(&value)
+            }
+            _ => None,
+        };
+        let (o_kind, o_key) = match lexical {
+            Some((o_type, form)) => {
+                let kind = if o_type == fluree_db_core::o_type::OType::VECTOR {
+                    ObjKind::VECTOR_ID
+                } else {
+                    ObjKind::NUM_BIG
+                };
+                let id = chunk.strings.get_or_insert(form.as_bytes());
+                (kind, ObjKey::encode_u32_id(id))
+            }
+            None => self
+                .resolve_object_chunk(
+                    &term.o,
+                    g_id,
+                    term.s.0,
+                    term.s.1,
+                    p_id,
+                    LIST_INDEX_NONE,
+                    dt,
+                    chunk,
+                    is_assert,
+                )?
+                .ok_or("a triple term's object resolved to nothing")?,
+        };
+        let s_id = self.resolve_subject_chunk(term.s.0, term.s.1, chunk);
+        let lang_id = self.languages.get_or_insert(term.lang);
+        let ordinal = chunk.terms.len() as u64;
+        chunk.terms.push(RunRecord {
+            g_id,
+            s_id: SubjectId::from_u64(s_id),
+            p_id,
+            dt,
+            o_kind: o_kind.as_u8(),
+            op: 1,
+            o_key: o_key.as_u64(),
+            t: 0,
+            lang_id,
+            i: LIST_INDEX_NONE,
+        });
+        Ok((ObjKind::TRIPLE_TERM, ObjKey::from_u64(ordinal)))
+    }
+
     /// Resolve subject to a chunk-local sequential u64 ID.
     fn resolve_subject_chunk(&mut self, ns_code: u16, name: &str, chunk: &mut RebuildChunk) -> u64 {
         chunk.subjects.get_or_insert(ns_code, name.as_bytes())
@@ -1669,6 +1752,11 @@ impl SharedResolverState {
         chunk: &mut RebuildChunk,
         is_assert: bool,
     ) -> Result<Option<(ObjKind, ObjKey)>, String> {
+        if let RawObject::TripleTerm(term) = obj {
+            return self
+                .resolve_term_chunk(term, g_id, chunk, is_assert)
+                .map(Some);
+        }
         // Vector handling — see `CommitResolver::resolve_object` for details.
         // Fact-identity `(s_id, p_id, o_i, f32_bits)` → handle is required so:
         // (a) two distinct subjects with the same vector value don't alias,
@@ -1723,6 +1811,7 @@ impl SharedResolverState {
             };
         }
         let result = match obj {
+            RawObject::TripleTerm(_) => unreachable!("returned above"),
             RawObject::Long(v) => Ok((ObjKind::NUM_INT, ObjKey::encode_i64(*v))),
             RawObject::Double(v) => {
                 // NOTE: Do not optimize integral doubles to NUM_INT here.
@@ -2172,6 +2261,12 @@ pub struct RebuildChunk {
     pub strings: super::chunk_dict::ChunkStringDict,
     /// Buffered RunRecords (with chunk-local subject/string IDs).
     pub records: Vec<RunRecord>,
+    /// Reified base edges as pseudo-records, addressed by ordinal from the
+    /// link records' `o_key` (the bulk-import sink's form; see `link_synth`).
+    pub terms: Vec<RunRecord>,
+    /// `f:reifies*` ops for the build to replay into link records once ids
+    /// are global (see `link_synth`).
+    pub attachments: Vec<super::link_synth::AttachmentOp>,
     /// Running count of flakes (records) in this chunk.
     pub flake_count: u64,
 }
@@ -2182,6 +2277,8 @@ impl RebuildChunk {
             subjects: super::chunk_dict::ChunkSubjectDict::new(),
             strings: super::chunk_dict::ChunkStringDict::new(),
             records: Vec::new(),
+            terms: Vec::new(),
+            attachments: Vec::new(),
             flake_count: 0,
         }
     }
@@ -2247,6 +2344,97 @@ impl std::error::Error for ResolverError {}
 ///
 /// Returns `None` if parsing fails (caller skips emission rather than
 /// poisoning the index with `0`).
+/// Remap a chunk term-table entry ([`SharedResolverState::resolve_term_chunk`])
+/// to global ids: its subject, and a ref or string-keyed object. A term keys
+/// a decimal, big-integer or vector object by the string id of its canonical
+/// form, so those kinds remap as strings here, though in an ordinary record
+/// they hold arena handles.
+pub fn remap_term_record(
+    term: &mut RunRecord,
+    subject_remap: &[u64],
+    string_remap: &[u32],
+) -> Result<(), String> {
+    let local_s = term.s_id.as_u64() as usize;
+    let global_s = *subject_remap
+        .get(local_s)
+        .ok_or_else(|| format!("term subject remap miss: local_s={local_s}"))?;
+    term.s_id = SubjectId::from_u64(global_s);
+    match ObjKind::from_u8(term.o_kind) {
+        ObjKind::REF_ID => {
+            let local_o = term.o_key as usize;
+            term.o_key = *subject_remap
+                .get(local_o)
+                .ok_or_else(|| format!("term object remap miss: local_o={local_o}"))?;
+        }
+        ObjKind::LEX_ID | ObjKind::JSON_ID | ObjKind::NUM_BIG | ObjKind::VECTOR_ID => {
+            let local_str = ObjKey::from_u64(term.o_key).decode_u32_id() as usize;
+            let global_str = *string_remap
+                .get(local_str)
+                .ok_or_else(|| format!("term string remap miss: local_str={local_str}"))?;
+            term.o_key = ObjKey::encode_u32_id(global_str).as_u64();
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The handle of each entry of a chunk's term table, from `intern`, which
+/// maps a batch of keys to handles. An entry whose object is a triple term
+/// holds that term's ordinal, always a lower one; entries go one nesting level
+/// per batch, so an inner term's handle is in place for its outer term's key.
+pub fn intern_chunk_terms(
+    terms: &[RunRecord],
+    registry: &fluree_db_core::o_type_registry::OTypeRegistry,
+    intern: &mut dyn FnMut(&[fluree_db_core::triple_term::TermKey]) -> io::Result<Vec<u64>>,
+) -> io::Result<Vec<u64>> {
+    let triple_term = ObjKind::TRIPLE_TERM.as_u8();
+    let mut depth: Vec<usize> = Vec::with_capacity(terms.len());
+    for (i, term) in terms.iter().enumerate() {
+        let level = if term.o_kind == triple_term {
+            let inner = term.o_key as usize;
+            if inner >= i {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("term {i} names term {inner}, which does not precede it"),
+                ));
+            }
+            depth[inner] + 1
+        } else {
+            0
+        };
+        depth.push(level);
+    }
+    let mut handles = vec![0u64; terms.len()];
+    let levels = depth.iter().max().map_or(0, |max| max + 1);
+    for level in 0..levels {
+        let at: Vec<usize> = (0..terms.len()).filter(|&i| depth[i] == level).collect();
+        let keys: Vec<_> = at
+            .iter()
+            .map(|&i| {
+                let term = &terms[i];
+                fluree_db_core::triple_term::TermKey {
+                    s_id: term.s_id.as_u64(),
+                    p_id: term.p_id,
+                    o_type: registry.resolve(
+                        ObjKind::from_u8(term.o_kind),
+                        DatatypeDictId::from_u16(term.dt),
+                        term.lang_id,
+                    ),
+                    o_key: if term.o_kind == triple_term {
+                        handles[term.o_key as usize]
+                    } else {
+                        term.o_key
+                    },
+                }
+            })
+            .collect();
+        for (&i, handle) in at.iter().zip(intern(&keys)?) {
+            handles[i] = handle;
+        }
+    }
+    Ok(handles)
+}
+
 fn iso_to_epoch_ms(iso: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(iso)
         .ok()
@@ -2279,6 +2467,44 @@ fn split_iri_to_value_type_tag(
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[cfg(test)]
+mod term_remap_tests {
+    use super::*;
+
+    fn term(o_kind: ObjKind, o_key: u64) -> RunRecord {
+        RunRecord {
+            g_id: 0,
+            s_id: SubjectId::from_u64(1),
+            p_id: 0,
+            dt: 0,
+            o_kind: o_kind.as_u8(),
+            op: 1,
+            o_key,
+            t: 0,
+            lang_id: 0,
+            i: LIST_INDEX_NONE,
+        }
+    }
+
+    #[test]
+    fn lexical_term_objects_remap_as_strings() {
+        let subjects = [10, 11, 12];
+        let strings = [20, 21];
+        let remapped = |kind: ObjKind, o_key: u64| {
+            let mut t = term(kind, o_key);
+            remap_term_record(&mut t, &subjects, &strings).unwrap();
+            (t.s_id.as_u64(), t.o_key)
+        };
+        let str1 = ObjKey::encode_u32_id(1).as_u64();
+        let global = ObjKey::encode_u32_id(21).as_u64();
+        for kind in [ObjKind::NUM_BIG, ObjKind::VECTOR_ID, ObjKind::LEX_ID] {
+            assert_eq!(remapped(kind, str1), (11, global), "{kind:?}");
+        }
+        assert_eq!(remapped(ObjKind::REF_ID, 2), (11, 12));
+        assert_eq!(remapped(ObjKind::NUM_INT, 7), (11, 7));
+    }
+}
 
 #[cfg(test)]
 mod tests {

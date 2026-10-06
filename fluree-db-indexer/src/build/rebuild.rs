@@ -106,6 +106,7 @@ pub async fn rebuild_index_from_commits_with_store<C>(
 where
     C: ContentStore + Clone + Send + Sync + 'static,
 {
+    use crate::run_index::resolve::link_synth::AttachmentOp;
     use futures::stream::StreamExt;
     use run_index::resolver::{RebuildChunk, SharedResolverState};
     use run_index::spool::SortedCommitInfo;
@@ -276,6 +277,8 @@ where
             // format: small exact decimals encode inline, the rest fall back to
             // the arena. Existing ledgers keep their format until reindexed.
             shared.decimal_encoding = fluree_db_core::DecimalEncoding::InlineWhenFits;
+            // Rebuilds resolve the term ordinals in Phase C, so links are synthesized.
+            shared.link_synth.enable();
 
             // Pre-insert rdf:type into predicate dictionary so class tracking
             // works from the very first commit.
@@ -447,12 +450,31 @@ where
             let mut subject_dicts = Vec::with_capacity(chunks.len());
             let mut string_dicts = Vec::with_capacity(chunks.len());
             let mut chunk_records: Vec<Vec<RunRecord>> = Vec::with_capacity(chunks.len());
+            let mut chunk_terms: Vec<Vec<RunRecord>> = Vec::with_capacity(chunks.len());
+            let mut chunk_attachments: Vec<Vec<AttachmentOp>> = Vec::with_capacity(chunks.len());
 
             for chunk in chunks {
                 subject_dicts.push(chunk.subjects);
                 string_dicts.push(chunk.strings);
                 chunk_records.push(chunk.records);
+                chunk_terms.push(chunk.terms);
+                chunk_attachments.push(chunk.attachments);
             }
+            // Every chunk's attachment ops, global ids, for one replay after
+            // the loop: a reifier's ops span chunks.
+            let mut all_attachments: Vec<AttachmentOp> = Vec::new();
+
+            // Triple-term interning happens here, once ids are global: the
+            // registry gives each term entry its `o_type`, the builder its
+            // handle. Custom datatypes are all known after Phase B.
+            let term_registry = {
+                let reserved = fluree_db_core::DatatypeDictId::RESERVED_COUNT as usize;
+                let custom: Vec<String> = (reserved..shared.datatypes.len() as usize)
+                    .filter_map(|i| shared.datatypes.resolve(i as u32).map(str::to_string))
+                    .collect();
+                fluree_db_core::o_type_registry::OTypeRegistry::new(&custom)
+            };
+            let mut term_builder = fluree_db_binary_index::dict::TermDictBuilder::new();
 
             let (subject_merge, subject_remaps) =
                 run_index::dict_merge::merge_subject_dicts(&subject_dicts);
@@ -573,6 +595,45 @@ where
                     // else: inline types, no remap needed
                 }
 
+                // Term entries get the same remap; link records then trade
+                // their ordinal for the global handle.
+                let terms = &mut chunk_terms[ci];
+                for term in terms.iter_mut() {
+                    crate::run_index::resolve::resolver::remap_term_record(
+                        term, s_remap, str_remap,
+                    )
+                    .map_err(|e| IndexerError::StorageWrite(format!("chunk {ci}: {e}")))?;
+                }
+                let mut attachments = std::mem::take(&mut chunk_attachments[ci]);
+                for op in &mut attachments {
+                    op.remap(s_remap, str_remap)
+                        .map_err(|e| IndexerError::StorageWrite(format!("chunk {ci}: {e}")))?;
+                }
+                all_attachments.append(&mut attachments);
+
+                let handles = crate::run_index::resolve::resolver::intern_chunk_terms(
+                    terms,
+                    &term_registry,
+                    &mut |keys| {
+                        keys.iter()
+                            .map(|&k| term_builder.get_or_insert(k))
+                            .collect()
+                    },
+                )
+                .map_err(|e| IndexerError::StorageWrite(format!("chunk {ci}: {e}")))?;
+                let triple_term = fluree_db_core::value_id::ObjKind::TRIPLE_TERM.as_u8();
+                for record in records.iter_mut() {
+                    if record.o_kind != triple_term {
+                        continue;
+                    }
+                    record.o_key = *handles.get(record.o_key as usize).ok_or_else(|| {
+                        IndexerError::StorageWrite(format!(
+                            "term ordinal {} out of range in chunk {ci}",
+                            record.o_key
+                        ))
+                    })?;
+                }
+
                 // Sort by (g_id, SPOT).
                 records.sort_unstable_by(fluree_db_binary_index::format::run_record::cmp_g_spot);
 
@@ -612,6 +673,14 @@ where
                         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
                 }
 
+                // The chunk is on disk; release its buffers now rather than
+                // after the loop, so the peak is one chunk plus the link
+                // replay, not every chunk.
+                records.clear();
+                records.shrink_to_fit();
+                terms.clear();
+                terms.shrink_to_fit();
+
                 sorted_commit_infos.push(SortedCommitInfo {
                     path: fsc_path,
                     record_count: spool_info.record_count,
@@ -621,13 +690,58 @@ where
                     string_count: string_dicts[ci].len() as u64,
                     types_map_path: Some(types_path),
                     duplicates_removed: 0,
+                    term_table: None,
                 });
             }
+
+            // Link records: replay every reifier's attachment history from
+            // nothing, streamed straight into one more sorted commit file.
+            let links_emitted = if all_attachments.is_empty() {
+                0
+            } else {
+                let link_ids = shared.link_synth.link_ids().ok_or_else(|| {
+                    IndexerError::StorageWrite("attachment ops without link ids".into())
+                })?;
+                let ci = chunk_records.len();
+                let fsc_path = commits_dir.join("links.fsc");
+                let mut spool_writer = run_index::spool::SpoolWriter::new(&fsc_path, ci)
+                    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+                let emitted = crate::run_index::resolve::link_synth::replay_attachments(
+                    &mut all_attachments,
+                    |_, _| [None; 3],
+                    &term_registry,
+                    link_ids,
+                    &mut |key| term_builder.get_or_insert(key),
+                    &mut |record| spool_writer.push(&record),
+                )
+                .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+                drop(all_attachments);
+                let spool_info = spool_writer
+                    .finish()
+                    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+                if emitted > 0 {
+                    sorted_commit_infos.push(SortedCommitInfo {
+                        path: fsc_path,
+                        record_count: spool_info.record_count,
+                        byte_len: spool_info.byte_len,
+                        chunk_idx: ci,
+                        subject_count: 0,
+                        string_count: 0,
+                        types_map_path: None,
+                        duplicates_removed: 0,
+                        term_table: None,
+                    });
+                } else {
+                    let _ = std::fs::remove_file(&fsc_path);
+                }
+                emitted
+            };
 
             // Records are persisted to .fsc files on disk — free the in-memory
             // copies immediately. For large datasets (e.g. 60M flakes) this
             // reclaims ~2-6 GB of heap before the index build phase.
             drop(chunk_records);
+            drop(chunk_terms);
             drop(subject_remaps);
             drop(string_remaps);
             drop(subject_dicts);
@@ -801,6 +915,7 @@ where
                     remap_progress: None,
                     build_progress: None,
                     stage_marker: None,
+                    term_builder: None,
                 };
 
                 let v3_result = crate::build_indexes_from_remapped_commits(
@@ -928,7 +1043,7 @@ where
                 crate::run_index::build::ClassMembership::build_from_global_types(&types_paths)
                     .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
 
-            let spot_class_stats = {
+            let (spot_class_stats, live_term_rows) = {
                 use crate::run_index::build::SpotClassStatsCollector;
                 use crate::run_index::runs::spool::V1SpoolMergeAdapter;
                 use fluree_db_binary_index::format::run_record_v2::cmp_v2_g_spot;
@@ -955,16 +1070,32 @@ where
 
                 // Iterate with dedup: next_deduped() returns the winning record
                 // per identity group (highest t wins). Feed assertions to collector.
+                //
+                // Link counts come from here, not from pass 1: a commit chain can
+                // re-assert a live link (a bulk import restating an annotation),
+                // which pass 1 counts once per copy.
+                let mut live_term_rows: std::collections::BTreeMap<(u32, u32), u64> =
+                    std::collections::BTreeMap::new();
                 while let Some((winner, op)) = merge
                     .next_deduped()
                     .map_err(|e| IndexerError::StorageWrite(e.to_string()))?
                 {
                     if op == 1 {
+                        if fluree_db_core::o_type::OType::from_u16(winner.o_type)
+                            == fluree_db_core::o_type::OType::TRIPLE_TERM
+                        {
+                            let inner = fluree_db_core::triple_term::term_handle_p_id(winner.o_key);
+                            *live_term_rows.entry((winner.p_id, inner)).or_insert(0) += 1;
+                        }
                         collector.on_record(&winner);
                     }
                 }
+                let live_term_rows: Vec<(u32, u32, u64)> = live_term_rows
+                    .into_iter()
+                    .map(|((p_id, inner), n)| (p_id, inner, n))
+                    .collect();
 
-                collector.finish()
+                (collector.finish(), live_term_rows)
             };
 
             // ---- Build IndexStats for FIR6 root ----
@@ -1022,6 +1153,16 @@ where
 
                 let root_classes =
                     fluree_db_core::index_stats::union_per_graph_classes(&final_graphs);
+                let links = crate::stats::link_stat_entries(
+                    &live_term_rows,
+                    shared.predicates.get(fluree_vocab::rdf::REIFIES),
+                    |p_id| {
+                        predicate_sids
+                            .get(p_id as usize)
+                            .cloned()
+                            .unwrap_or_default()
+                    },
+                );
 
                 is::IndexStats {
                     flakes: id_stats_result.total_flakes,
@@ -1035,6 +1176,7 @@ where
                     // hook, so the historical tag sets cover every `t` the
                     // ledger has ever had.
                     historical_since_t: Some(0),
+                    links: Some(links),
                 }
             };
 
@@ -1056,6 +1198,23 @@ where
                 upload_dicts_from_disk(&content_store, &run_dir, &shared.ns_prefixes, false)
                     .instrument(tracing::debug_span!("upload_dicts_v3"))
                     .await?;
+
+            let term_dict = if term_builder.is_empty() {
+                None
+            } else {
+                let term_count = term_builder.len();
+                let refs = term_builder
+                    .upload(&content_store)
+                    .await
+                    .map_err(|e| IndexerError::StorageWrite(format!("term dictionary: {e}")))?;
+                tracing::info!(
+                    term_count,
+                    predicates = refs.forward_packs.len(),
+                    links = links_emitted,
+                    "triple-term dictionary uploaded"
+                );
+                Some(refs)
+            };
 
             // Build namespace codes BTreeMap from shared.ns_prefixes.
             let ns_codes: std::collections::BTreeMap<u16, String> = shared
@@ -1189,8 +1348,8 @@ where
                 // Same source as the resolver above: the root version must match
                 // how decimals were just encoded.
                 decimal_encoding: shared.decimal_encoding,
-                attachment_events: config.attachment_events.clone(),
                 prev_index: prev_index.clone(),
+                term_dict,
             };
 
             let result = super::root_assembly::encode_and_write_root_v6(

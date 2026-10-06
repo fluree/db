@@ -95,7 +95,8 @@ fn infer_node_kind(value: &FlakeValue) -> Option<NodeKind> {
         | FlakeValue::Json(_)
         | FlakeValue::GeoPoint(_) => Some(NodeKind::Literal),
         FlakeValue::Vector(_) => Some(NodeKind::Literal), // Treat vectors as literals
-        FlakeValue::Null => None,
+        // RDF 1.2 triple terms are neither IRIs, blank nodes nor literals.
+        FlakeValue::TripleTerm(_) | FlakeValue::Null => None,
     }
 }
 

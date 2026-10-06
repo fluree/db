@@ -50,15 +50,15 @@ use fluree_db_sparql::ast::{
     AnnotationUnit, AnnotationVerb, BlankNode, BlankNodeValue, GraphMgmtRef, GraphOrDefault,
     GraphPattern, GraphRefAll, GraphTransfer, Iri, IriValue, Literal,
     LiteralValue as SparqlLiteralValue, Load, Modify, PredicateTerm, Prologue, PropertyPath,
-    QuadData, QuadPattern, QuadPatternElement, QueryBody, ReifierId, SparqlAst, SubjectTerm, Term,
-    TriplePattern, UpdateOperation,
+    QuadData, QuadPattern, QuadPatternElement, QueryBody, QuotedTriple, ReifierId, SparqlAst,
+    SubjectTerm, Term, TriplePattern, TripleTerm as SparqlTripleTerm, UpdateOperation,
 };
 use fluree_db_sparql::SourceSpan;
 use thiserror::Error;
 
 use crate::ir::{
     GraphMgmtOp, GraphSel, GraphTarget, SparqlWhereClause, TemplateGraph, TemplateTerm,
-    TripleTemplate, Txn, TxnOpts, TxnType,
+    TemplateTripleTerm, TripleTemplate, Txn, TxnOpts, TxnType,
 };
 use crate::namespace::NamespaceRegistry;
 use fluree_vocab::{fluree, xsd};
@@ -272,49 +272,31 @@ fn anon_in_mode_msg(op: &'static str) -> &'static str {
     }
 }
 
-/// Expand any annotated triples in a Vec into the equivalent set of
-/// unannotated triples: the base triple, the `f:reifies*` bundle
-/// (subject/predicate/object only — graph/datatype/lang/listIndex are
-/// derived at flake time), and the body's predicate-object pairs.
-///
-/// Default-graph only in v1; an annotation tail inside a `GRAPH` block
-/// is rejected by the caller before this is invoked.
+/// Expand any reified or annotated triples in a Vec into the equivalent set
+/// of plain triples, as RDF 1.2 defines them. A reified triple (`<< s p o ~
+/// r >>`) becomes its reifier plus `r rdf:reifies <<( s p o )>>`, without
+/// `s p o`; an annotated triple becomes the base triple, `reifier rdf:reifies
+/// <<( s p o )>>` per annotation, and the body's predicate-object pairs.
 fn expand_annotated_triples(
     triples: &mut Vec<TriplePattern>,
     mode: AnnotationExpansionMode,
     bnodes: &mut BlankNodeCounter,
 ) -> Result<(), LowerError> {
-    use fluree_vocab::reifies_iris;
-
     let original = std::mem::take(triples);
     let mut out: Vec<TriplePattern> = Vec::with_capacity(original.len());
 
-    for tp in original {
+    for mut tp in original {
+        if let SubjectTerm::QuotedTriple(qt) = &tp.subject {
+            tp.subject = reify(qt, mode, bnodes, &mut out)?;
+        }
+        if let Term::QuotedTriple(qt) = &tp.object {
+            tp.object = reify(qt, mode, bnodes, &mut out)?.into();
+        }
         let Some(annotation) = tp.annotation.clone() else {
             out.push(tp);
             continue;
         };
 
-        // Reject RDF-star quoted-triple subjects explicitly. The
-        // legacy `<< s p o >>` quoted-triple form has no compatible
-        // representation in the f:reifies* bundle (the base triple
-        // would need to embed inside f:reifiesSubject's object slot
-        // which violates the bundle shape), and `subject_to_object`
-        // below would otherwise hit its `unreachable!()` panic.
-        // Surface this as an explicit `UnsupportedFeature` so the
-        // user sees a real error rather than a transactor panic.
-        if let SubjectTerm::QuotedTriple(qt) = &tp.subject {
-            return Err(LowerError::UnsupportedFeature {
-                feature: "RDF-star quoted-triple subject combined with an RDF 1.2 \
-                          annotation tail (`{| ... |}`) in SPARQL UPDATE",
-                span: qt.span,
-            });
-        }
-
-        // Same for an RDF 1.2 triple-term subject (`<<( s p o )>>`,
-        // accept-then-defer, D-1): this expansion pre-pass runs BEFORE the
-        // quad-pattern lowering whose TripleTerm arms defer cleanly, and
-        // `subject_to_object` below would hit its `unreachable!()` panic.
         if let SubjectTerm::TripleTerm(tt) = &tp.subject {
             return Err(LowerError::UnsupportedFeature {
                 feature: "SPARQL 1.2 triple-term subject combined with an RDF 1.2 \
@@ -323,10 +305,9 @@ fn expand_annotated_triples(
             });
         }
 
-        // Reify the base edge and emit base + per-unit bundle + body.
         // The base triple stripped of its annotation goes through
-        // unchanged; each annotation unit (`~ r? {| … |}?`) contributes
-        // its own reifier bundle.
+        // unchanged; each annotation unit (`~ r? {| … |}?`) contributes its
+        // own reifier.
         let span = tp.span;
 
         // Base triple (without annotation)
@@ -340,53 +321,17 @@ fn expand_annotated_triples(
         for unit in &annotation.units {
             let reifier = resolve_reifier(unit, mode, bnodes)?;
 
-            // f:reifies* bundle: SUBJECT, PREDICATE, OBJECT, and (for a
-            // language-tagged object) LANG. f:reifiesGraph is omitted
-            // (default graph only) — WITH-scoped templates are rejected
-            // upstream by `reject_with_scoped_annotations` so this default
-            // identity never gets graph-stamped. f:reifiesDatatype rides on
-            // the f:reifiesObject flake's flake-level dt (the decoder derives
-            // it), and f:reifiesListIndex is deferred (v1).
-            let pred_iri =
-                |s: &'static str| -> PredicateTerm { PredicateTerm::Iri(Iri::full(s, span)) };
             out.push(TriplePattern::new(
                 reifier.clone(),
-                pred_iri(reifies_iris::SUBJECT),
-                subject_to_object(&tp.subject),
+                PredicateTerm::Iri(Iri::full(fluree_vocab::rdf::REIFIES, span)),
+                Term::TripleTerm(Box::new(SparqlTripleTerm {
+                    subject: tp.subject.clone(),
+                    predicate: tp.predicate.clone(),
+                    object: tp.object.clone(),
+                    span,
+                })),
                 span,
             ));
-            out.push(TriplePattern::new(
-                reifier.clone(),
-                pred_iri(reifies_iris::PREDICATE),
-                predicate_to_object(&tp.predicate),
-                span,
-            ));
-            out.push(TriplePattern::new(
-                reifier.clone(),
-                pred_iri(reifies_iris::OBJECT),
-                tp.object.clone(),
-                span,
-            ));
-
-            // f:reifiesLang — required for a language-tagged object.
-            // `EdgeKey::from_reifies_facts` reads `lang` from a dedicated
-            // f:reifiesLang flake, NOT from the f:reifiesObject flake's
-            // `m.lang`. Without this triple the decoded EdgeKey carries
-            // `lang = None` while the base edge's EdgeKey carries
-            // `lang = Some(tag)`, so the forward-map lookup misses: the
-            // annotation silently vanishes from `@annotation` hydration
-            // and the bundle is never cascaded on base-edge retract.
-            // Mirrors the JSON-LD writer (`build_annotation_sibling`).
-            if let Term::Literal(lit) = &tp.object {
-                if let SparqlLiteralValue::LangTagged { lang, .. } = &lit.value {
-                    out.push(TriplePattern::new(
-                        reifier.clone(),
-                        pred_iri(reifies_iris::LANG),
-                        Term::Literal(Literal::string(lang.as_ref(), span)),
-                        span,
-                    ));
-                }
-            }
 
             // Body entries become (reifier, ann_pred, ann_obj) triples.
             // Property-path verbs (legal in query annotation blocks)
@@ -418,37 +363,45 @@ fn expand_annotated_triples(
     Ok(())
 }
 
-/// Convert a SPARQL subject term into the corresponding object term so
-/// the `f:reifiesSubject` pointer can carry it. Subjects and objects
-/// share the IRI / blank-node / variable cases; literals never appear
-/// as subjects so the case is unreachable in practice.
-fn subject_to_object(s: &SubjectTerm) -> Term {
-    match s {
-        SubjectTerm::Var(v) => Term::Var(v.clone()),
-        SubjectTerm::Iri(i) => Term::Iri(i.clone()),
-        SubjectTerm::BlankNode(b) => Term::BlankNode(b.clone()),
-        SubjectTerm::QuotedTriple(_) => {
-            unreachable!("RDF-star quoted triples are rejected before annotation expansion")
-        }
-        SubjectTerm::TripleTerm(_) => {
-            unreachable!("SPARQL 1.2 triple-term values are rejected before annotation expansion")
-        }
-    }
+/// The reifier `qt` denotes, after pushing its `rdf:reifies` link (and any
+/// nested reified triple's) onto `out`.
+fn reify(
+    qt: &QuotedTriple,
+    mode: AnnotationExpansionMode,
+    bnodes: &mut BlankNodeCounter,
+    out: &mut Vec<TriplePattern>,
+) -> Result<SubjectTerm, LowerError> {
+    let subject = match qt.subject.as_ref() {
+        SubjectTerm::QuotedTriple(inner) => reify(inner, mode, bnodes, out)?,
+        subject => subject.clone(),
+    };
+    let object = match qt.object.as_ref() {
+        Term::QuotedTriple(inner) => reify(inner, mode, bnodes, out)?.into(),
+        object => object.clone(),
+    };
+    let unit = AnnotationUnit {
+        reifier: qt.reifier.as_ref().and_then(|r| r.id.clone()),
+        block: None,
+        span: qt.span,
+    };
+    let reifier = resolve_reifier(&unit, mode, bnodes)?;
+    out.push(TriplePattern::new(
+        reifier.clone(),
+        PredicateTerm::Iri(Iri::full(fluree_vocab::rdf::REIFIES, qt.span)),
+        Term::TripleTerm(Box::new(SparqlTripleTerm {
+            subject,
+            predicate: qt.predicate.clone(),
+            object,
+            span: qt.span,
+        })),
+        qt.span,
+    ));
+    Ok(reifier)
 }
 
-/// Convert a predicate (IRI or var) into the object slot for
-/// `f:reifiesPredicate`.
-fn predicate_to_object(p: &PredicateTerm) -> Term {
-    match p {
-        PredicateTerm::Var(v) => Term::Var(v.clone()),
-        PredicateTerm::Iri(i) => Term::Iri(i.clone()),
-    }
-}
-
-/// Walk the QuadPatternElement list and expand every annotated triple
-/// in-place. Annotation tails inside a GRAPH block are rejected with a
-/// "deferred to a follow-up" message so the v1 default-graph contract
-/// stays unambiguous.
+/// Walk the QuadPatternElement list and expand every reified or annotated
+/// triple in-place, inside `GRAPH` blocks too: the link and body land in the
+/// block's graph, beside the triple.
 fn expand_annotated_triples_in_quad_pattern(
     pattern: &mut QuadPattern,
     mode: AnnotationExpansionMode,
@@ -463,16 +416,10 @@ fn expand_annotated_triples_in_quad_pattern(
             QuadPatternElement::Triple(t) => default_triples.push(*t),
             QuadPatternElement::Graph {
                 name,
-                triples,
+                mut triples,
                 span,
             } => {
-                if triples.iter().any(|t| t.annotation.is_some()) {
-                    return Err(LowerError::UnsupportedFeature {
-                        feature: "annotation tail inside a GRAPH block in SPARQL UPDATE \
-                                  (default-graph only in v1)",
-                        span,
-                    });
-                }
+                expand_annotated_triples(&mut triples, mode, bnodes)?;
                 graph_blocks.push(QuadPatternElement::Graph {
                     name,
                     triples,
@@ -557,6 +504,23 @@ fn reject_user_authored_reifies(
 
     for tp in triples {
         check_predicate(&tp.predicate, prologue)?;
+        // `rdf:reifies` names a triple term; any other object is a data
+        // error the link lowering would read as a link.
+        if let PredicateTerm::Iri(iri) = &tp.predicate {
+            if expand_iri(iri, prologue)? == fluree_vocab::rdf::REIFIES
+                && !matches!(
+                    tp.object,
+                    fluree_db_sparql::ast::Term::QuotedTriple(_)
+                        | fluree_db_sparql::ast::Term::TripleTerm(_)
+                )
+            {
+                return Err(LowerError::UnsupportedFeature {
+                    feature: "rdf:reifies with an ordinary object in SPARQL UPDATE (it takes \
+                              a triple term — write `<< s p o >>` or `~ <reifier>`)",
+                    span: iri.span,
+                });
+            }
+        }
         if let Some(ann) = &tp.annotation {
             for unit in &ann.units {
                 if let Some(block) = &unit.block {
@@ -641,35 +605,6 @@ fn reject_user_authored_reifies_in_quad_pattern(
             }
             QuadPatternElement::Graph { triples, .. } => {
                 reject_user_authored_reifies(triples, prologue)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Reject RDF 1.2 annotation tails on `WITH <g>`-scoped template triples.
-///
-/// `WITH <g>` re-homes default-position template triples into `<g>` *after*
-/// annotation expansion, but the v1 expansion omits `f:reifiesGraph` — the
-/// synthetic bundle encodes a default-graph edge identity. Stamping the WITH
-/// graph id over that bundle would mint graph-tagged reifications whose edge
-/// identity is still default-graph, so the forward-map lookup misses: the
-/// annotation never hydrates and never cascades on base-edge retract. Reject
-/// until graph-aware expansion (emitting `f:reifiesGraph`) lands. Annotation
-/// tails inside explicit `GRAPH { ... }` blocks are already rejected by
-/// [`expand_annotated_triples_in_quad_pattern`]; this covers the top-level
-/// (WITH-scoped) triples it would otherwise expand as default-graph.
-fn reject_with_scoped_annotations(pattern: &QuadPattern) -> Result<(), LowerError> {
-    for el in &pattern.patterns {
-        if let QuadPatternElement::Triple(tp) = el {
-            if tp.annotation.is_some() {
-                return Err(LowerError::UnsupportedFeature {
-                    feature: "RDF 1.2 annotation tail (`{| ... |}`) on a WITH-scoped \
-                              SPARQL UPDATE template (SPARQL UPDATE annotations are \
-                              default-graph only; use the JSON-LD @annotation surface to \
-                              annotate an edge in a named graph)",
-                    span: tp.span,
-                });
             }
         }
     }
@@ -1172,15 +1107,14 @@ fn lower_delete_where(
         &mut local_bnodes,
     )?;
 
-    // `GRAPH <iri> { ... }` blocks route through the same Modify machinery
-    // that DELETE/INSERT ... WHERE uses (staging-time SPARQL WHERE lowering +
-    // graph-scoped delete templates). The triple-only fast path below stays
-    // byte-identical for patterns without GRAPH blocks.
-    if expanded_pattern
-        .patterns
-        .iter()
-        .any(|el| matches!(el, QuadPatternElement::Graph { .. }))
-    {
+    // `GRAPH <iri> { ... }` blocks and triple-term objects route through the
+    // same Modify machinery that DELETE/INSERT ... WHERE uses (staging-time
+    // SPARQL WHERE lowering + graph-scoped delete templates). The triple-only
+    // fast path below stays byte-identical for patterns without either.
+    if expanded_pattern.patterns.iter().any(|el| match el {
+        QuadPatternElement::Graph { .. } => true,
+        QuadPatternElement::Triple(t) => matches!(t.object, Term::TripleTerm(_)),
+    }) {
         return lower_delete_where_with_graphs(&expanded_pattern, prologue, ns, vars, opts);
     }
 
@@ -1204,7 +1138,6 @@ fn lower_delete_where(
         let s = subject_to_unresolved_delete_where(&tp.subject, prologue, &mut bnode_vars)?;
         let p = predicate_to_unresolved(&tp.predicate, prologue)?;
         let obj = object_to_unresolved_delete_where(&tp.object, prologue, &mut bnode_vars)?;
-
         where_patterns.push(UnresolvedPattern::Triple(UnresolvedTriplePattern {
             s,
             p,
@@ -1338,15 +1271,23 @@ fn rewrite_blank_nodes_to_vars(pattern: &QuadPattern) -> QuadPattern {
 
     let mut rewrite_triple = |tp: &TriplePattern| -> TriplePattern {
         let mut out = tp.clone();
-        if let SubjectTerm::BlankNode(bn) = &tp.subject {
-            if let Some(v) = rewrite_bnode(bn) {
-                out.subject = SubjectTerm::Var(v);
+        let mut rewrite = |subject: &mut SubjectTerm, object: &mut Term| {
+            if let SubjectTerm::BlankNode(bn) = subject {
+                if let Some(v) = rewrite_bnode(bn) {
+                    *subject = SubjectTerm::Var(v);
+                }
             }
-        }
-        if let Term::BlankNode(bn) = &tp.object {
-            if let Some(v) = rewrite_bnode(bn) {
-                out.object = Term::Var(v);
+            if let Term::BlankNode(bn) = object {
+                if let Some(v) = rewrite_bnode(bn) {
+                    *object = Term::Var(v);
+                }
             }
+        };
+        rewrite(&mut out.subject, &mut out.object);
+        let mut object = &mut out.object;
+        while let Term::TripleTerm(tt) = object {
+            rewrite(&mut tt.subject, &mut tt.object);
+            object = &mut tt.object;
         }
         out
     };
@@ -1488,9 +1429,6 @@ fn lower_modify(
     let delete_templates = if let Some(delete_clause) = &modify.delete_clause {
         reject_blank_nodes_in_delete_quad_pattern(delete_clause, "DELETE templates")?;
         reject_user_authored_reifies_in_quad_pattern(delete_clause, prologue)?;
-        if default_template_graph.is_some() {
-            reject_with_scoped_annotations(delete_clause)?;
-        }
         let mut expanded = delete_clause.clone();
         expand_annotated_triples_in_quad_pattern(
             &mut expanded,
@@ -1512,9 +1450,6 @@ fn lower_modify(
 
     let insert_templates = if let Some(insert_clause) = &modify.insert_clause {
         reject_user_authored_reifies_in_quad_pattern(insert_clause, prologue)?;
-        if default_template_graph.is_some() {
-            reject_with_scoped_annotations(insert_clause)?;
-        }
         let mut expanded = insert_clause.clone();
         expand_annotated_triples_in_quad_pattern(
             &mut expanded,
@@ -1661,7 +1596,7 @@ fn subject_to_unresolved_delete_where(
             span: qt.span,
         }),
         SubjectTerm::TripleTerm(tt) => Err(LowerError::UnsupportedFeature {
-            feature: "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
+            feature: "a triple term (`<<( s p o )>>`) as a subject",
             span: tt.span,
         }),
     }
@@ -1714,7 +1649,7 @@ fn object_to_unresolved_delete_where(
             span: qt.span,
         }),
         Term::TripleTerm(tt) => Err(LowerError::UnsupportedFeature {
-            feature: "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
+            feature: "a triple term nested in a triple term",
             span: tt.span,
         }),
     }
@@ -1727,8 +1662,31 @@ fn lower_triple_to_delete_template_delete_where(
     vars: &mut VarRegistry,
     bnodes: &mut BlankNodeVarNamer,
 ) -> Result<TripleTemplate, LowerError> {
-    // Subject
-    let subject = match &triple.subject {
+    let subject = delete_where_subject_template(&triple.subject, prologue, ns, vars, bnodes)?;
+    let predicate = delete_where_predicate_template(&triple.predicate, prologue, ns, vars)?;
+    let (object, dtc) = delete_where_object_template(&triple.object, prologue, ns, vars, bnodes)?;
+
+    Ok(TripleTemplate {
+        subject,
+        predicate,
+        object,
+        dtc,
+        list_index: None,
+        graph: TemplateGraph::Default,
+        graph_from_template_default: false,
+    })
+}
+
+/// A DELETE WHERE subject as a template term, a blank node lowered to the
+/// variable its WHERE side binds.
+fn delete_where_subject_template(
+    term: &SubjectTerm,
+    prologue: &Prologue,
+    ns: &mut NamespaceRegistry,
+    vars: &mut VarRegistry,
+    bnodes: &mut BlankNodeVarNamer,
+) -> Result<TemplateTerm, LowerError> {
+    Ok(match term {
         SubjectTerm::Var(v) => TemplateTerm::Var(vars.get_or_insert(&format!("?{}", v.name))),
         SubjectTerm::Iri(iri) => {
             let expanded = expand_iri(iri, prologue)?;
@@ -1756,24 +1714,37 @@ fn lower_triple_to_delete_template_delete_where(
         }
         SubjectTerm::TripleTerm(tt) => {
             return Err(LowerError::UnsupportedFeature {
-                feature:
-                    "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
+                feature: "a triple term (`<<( s p o )>>`) as a subject",
                 span: tt.span,
             });
         }
-    };
+    })
+}
 
-    // Predicate
-    let predicate = match &triple.predicate {
+fn delete_where_predicate_template(
+    term: &PredicateTerm,
+    prologue: &Prologue,
+    ns: &mut NamespaceRegistry,
+    vars: &mut VarRegistry,
+) -> Result<TemplateTerm, LowerError> {
+    Ok(match term {
         PredicateTerm::Var(v) => TemplateTerm::Var(vars.get_or_insert(&format!("?{}", v.name))),
         PredicateTerm::Iri(iri) => {
             let expanded = expand_iri(iri, prologue)?;
             TemplateTerm::Sid(ns.sid_for_iri(&expanded))
         }
-    };
+    })
+}
 
-    // Object + datatype constraint (for literals)
-    let (object, dtc) = match &triple.object {
+/// A DELETE WHERE object as a template term and its datatype constraint.
+fn delete_where_object_template(
+    term: &Term,
+    prologue: &Prologue,
+    ns: &mut NamespaceRegistry,
+    vars: &mut VarRegistry,
+    bnodes: &mut BlankNodeVarNamer,
+) -> Result<(TemplateTerm, Option<DatatypeConstraint>), LowerError> {
+    Ok(match term {
         Term::Var(v) => (
             TemplateTerm::Var(vars.get_or_insert(&format!("?{}", v.name))),
             None,
@@ -1805,23 +1776,14 @@ fn lower_triple_to_delete_template_delete_where(
                 span: qt.span,
             });
         }
+        // `lower_delete_where` sends a triple-term object down the
+        // graph-pattern lane.
         Term::TripleTerm(tt) => {
             return Err(LowerError::UnsupportedFeature {
-                feature:
-                    "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
+                feature: "a triple term on the triple-only DELETE WHERE lane",
                 span: tt.span,
             });
         }
-    };
-
-    Ok(TripleTemplate {
-        subject,
-        predicate,
-        object,
-        dtc,
-        list_index: None,
-        graph: TemplateGraph::Default,
-        graph_from_template_default: false,
     })
 }
 
@@ -1936,7 +1898,7 @@ fn subject_to_template(
             span: qt.span,
         }),
         SubjectTerm::TripleTerm(tt) => Err(LowerError::UnsupportedFeature {
-            feature: "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
+            feature: "a triple term (`<<( s p o )>>`) as a subject",
             span: tt.span,
         }),
     }
@@ -2001,10 +1963,19 @@ fn object_to_template(
             feature: "RDF 1.2 reified triple (`<< s p o >>`) in SPARQL UPDATE (deferred)",
             span: qt.span,
         }),
-        Term::TripleTerm(tt) => Err(LowerError::UnsupportedFeature {
-            feature: "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
-            span: tt.span,
-        }),
+        Term::TripleTerm(tt) => {
+            let s = subject_to_template(&tt.subject, prologue, ns, vars, bnodes)?;
+            let p = predicate_to_template(&tt.predicate, prologue, ns, vars)?;
+            let (o, dtc) = match &tt.object {
+                Term::Literal(lit) => {
+                    let result = literal_to_template(lit, prologue, ns)?;
+                    (result.term, result.dtc)
+                }
+                other => (object_to_template(other, prologue, ns, vars, bnodes)?, None),
+            };
+            let term = TemplateTripleTerm { s, p, o, dtc };
+            Ok(TemplateTerm::TripleTerm(Box::new(term)))
+        }
     }
 }
 
@@ -2803,21 +2774,28 @@ mod tests {
         );
     }
 
-    /// The pre-existing QuotedTriple twin of the guard: `<< s p o >>` subject
-    /// + annotation tail is likewise a clean error, not a panic.
+    /// A reified triple stands for its reifier and is not asserted: `<< s p
+    /// o >> q o2 {| a b |}` writes the reifier's link, `r q o2` and that
+    /// triple's annotation, and no `s p o`.
     #[test]
-    fn test_quoted_triple_subject_with_annotation_tail_is_rejected() {
-        let result = parse_and_lower(
+    fn test_reified_triple_subject_with_annotation_tail_does_not_assert_it() {
+        let txn = parse_and_lower(
             r"PREFIX ex: <http://example.org/>
                INSERT DATA { << ex:s ex:p ex:o >> ex:q ex:o2 {| ex:a ex:b |} }",
-        );
+        )
+        .expect("lower");
+        let links = txn
+            .insert_templates
+            .iter()
+            .filter(|t| matches!(&t.object, TemplateTerm::TripleTerm(_)))
+            .count();
+        assert_eq!(links, 2, "the reified triple's link and the annotation's");
         assert!(
-            matches!(
-                &result,
-                Err(LowerError::UnsupportedFeature { feature, .. })
-                    if feature.contains("quoted-triple subject")
-            ),
-            "expected a clean quoted-triple-subject UnsupportedFeature, got {result:?}"
+            !txn.insert_templates
+                .iter()
+                .any(|t| matches!(&t.subject, TemplateTerm::Sid(sid) if &*sid.name == "s")),
+            "the reified triple is not asserted: {:?}",
+            txn.insert_templates
         );
     }
 

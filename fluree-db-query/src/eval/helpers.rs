@@ -665,6 +665,7 @@ fn hash_flake_value(value: &FlakeValue, state: &mut impl Hasher) {
         }
         FlakeValue::Json(v) => v.hash(state),
         FlakeValue::GeoPoint(v) => v.0.hash(state),
+        FlakeValue::TripleTerm(t) => t.hash(state),
         FlakeValue::Null => {}
     }
 }

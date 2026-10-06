@@ -33,16 +33,15 @@
 //! let slice = novelty.slice_for_range(g_id, IndexType::Spot, Some(&first), Some(&rhs), false);
 //! ```
 
-pub mod attachments;
 mod commit;
 mod commit_flakes;
 pub mod delta;
 mod error;
 mod fact_state;
+mod links;
 mod runtime_stats;
 mod stats;
 
-pub use attachments::{AttachmentNovelty, ForwardRow, ReverseRow};
 pub use commit::{
     collect_dag_cids, collect_first_parent_cids, collect_first_parent_cids_with_split_mode,
     find_common_ancestor, load_commit_by_id, load_commit_envelope_by_id,
@@ -61,6 +60,7 @@ pub use fluree_db_core::commit::codec::envelope::{MAX_GRAPH_DELTA_ENTRIES, MAX_G
 pub use fluree_db_core::commit::codec::format::{CommitSignature, ALGO_ED25519};
 pub use fluree_db_core::commit::codec::verify_commit_blob;
 pub use fluree_db_credential::SigningKey;
+pub use links::LinkBase;
 pub use runtime_stats::{
     assemble_fast_stats, assemble_fast_stats_with, assemble_full_stats, assemble_full_stats_with,
     assemble_planner_stats, merge_is_identity, resolve_runtime_predicate_id, stats_merge_site,
@@ -559,16 +559,18 @@ pub struct Novelty {
     /// cached config is current. Stays 0 for ledgers that never write config.
     pub config_write_t: i64,
 
-    /// Edge-annotation attachment overlay (M1 — derived from the
-    /// `f:reifies*` system flakes flowing through the same pipeline).
-    /// Updated automatically by [`Self::apply_commit`] /
-    /// [`Self::bulk_apply_commits`] from the post-dedup flake set.
-    pub attachments: AttachmentNovelty,
-
     /// Current-state fact index for RDF set-semantics dedup (latest op per
     /// identity, per graph, within this novelty window). Persistent map, so it
     /// clones in O(1). The dedup oracle behind the seam; see [`fact_state`].
     fact_state: NoveltyFactState,
+
+    /// The index's attachments, which reification links are derived against
+    /// (see [`links`]); `None` until the ledger installs it.
+    link_base: Option<LinkBase>,
+    /// Every commit at or before this `t` has its links in novelty.
+    links_through: i64,
+    /// An annotation flake has been applied; sticky.
+    saw_annotations: bool,
 }
 
 #[inline]
@@ -590,9 +592,17 @@ impl Novelty {
             shacl_epoch: 0,
             has_list_meta: false,
             config_write_t: 0,
-            attachments: AttachmentNovelty::new(),
             fact_state: NoveltyFactState::new(),
+            link_base: None,
+            links_through: t,
+            saw_annotations: false,
         }
+    }
+
+    /// True once novelty has applied an annotation: an `rdf:reifies` link or
+    /// a legacy `f:reifies*` bundle flake.
+    pub fn has_annotations(&self) -> bool {
+        self.saw_annotations
     }
 
     /// Resolve a flake's graph ID from its `Flake.g` field.
@@ -853,16 +863,19 @@ impl Novelty {
     /// Unknown graph Sids cause an error — no silent fallback to the default
     /// graph.
     ///
-    /// Atomic: graph routing (the only fallible step) is resolved before any
-    /// mutation, so an error leaves novelty untouched.
+    /// Atomic: graph routing and link derivation (the fallible steps) run
+    /// before any mutation, so an error leaves novelty untouched.
+    ///
+    /// Returns the reification links derived for the commit (see [`links`]),
+    /// which the caller's dictionary novelty must register.
     pub fn apply_commit(
         &mut self,
         flakes: Vec<Flake>,
         commit_t: i64,
         reverse_graph: &HashMap<Sid, GraphId>,
-    ) -> Result<()> {
+    ) -> Result<Vec<Flake>> {
         if flakes.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let span = tracing::debug_span!(
@@ -901,8 +914,23 @@ impl Novelty {
             }
         }
 
+        // Links read the index, so they are derived before any mutation too.
+        let links_current = self.current_link_base().is_some();
+        let mut derived: Vec<Flake> = Vec::new();
+        if let Some(base) = self.current_link_base() {
+            let touched = links::touched_reifiers(routed.iter().map(|(f, g)| (*g, f)));
+            if !touched.is_empty() {
+                let links = self.derive_links(base, &touched, self.t)?;
+                derived = links.iter().map(|(_, f)| f.clone()).collect();
+                routed.extend(links.into_iter().map(|(g_id, f)| (f, g_id)));
+            }
+        }
+
         // From here on every step is infallible.
         self.t = self.t.max(commit_t);
+        if links_current {
+            self.links_through = self.t;
+        }
         self.epoch += 1; // Bump epoch once per commit
         self.refresh_content_version();
 
@@ -920,11 +948,6 @@ impl Novelty {
         // is updated only after this loop).
         let mut per_graph: HashMap<GraphId, Vec<Flake>> = HashMap::new();
         let mut deduped = 0u64;
-        // Capture post-dedup `f:reifies*` flakes so the attachment overlay
-        // observer sees exactly the flakes that landed in novelty. The
-        // reserved-predicate test is a single SID compare — negligible even on
-        // ledgers that never use annotations.
-        let mut accepted_reifies: Vec<Flake> = Vec::new();
         let mut schema_touched = false;
         let mut shacl_touched = false;
         for (flake, g_id) in routed {
@@ -932,9 +955,7 @@ impl Novelty {
                 deduped += 1;
                 continue;
             }
-            if fluree_db_core::namespaces::is_reserved_reifies_predicate(&flake.p) {
-                accepted_reifies.push(flake.clone());
-            }
+            self.saw_annotations |= fluree_db_core::is_annotation_predicate(&flake.p);
             // Asserting OR retracting a hierarchy edge changes the RDFS
             // schema — invalidate the shared hierarchy cache. Likewise any
             // SHACL-vocabulary flake invalidates the compiled-shapes cache.
@@ -967,13 +988,6 @@ impl Novelty {
             );
         }
 
-        // Update the attachment overlay from the post-dedup set. The observer
-        // skips quietly when no `f:reifies*` flakes are present — most commits
-        // never touch annotations.
-        if !accepted_reifies.is_empty() {
-            self.attachments.observe_flakes(&accepted_reifies)?;
-        }
-
         // Build + append one immutable segment per touched graph. No merge into
         // existing storage — this is the per-commit O(novelty) → O(batch)
         // collapse. Small per-commit batches sort sequentially (rayon hand-off
@@ -986,7 +1000,7 @@ impl Novelty {
             self.push_segment(g_id, seg);
         }
 
-        Ok(())
+        Ok(derived)
     }
 
     /// Bulk-apply many commits' flakes in a single pass (first-load / catch-up).
@@ -1044,6 +1058,24 @@ impl Novelty {
                 self.has_list_meta |= flake_has_list_meta(&flake);
                 per_graph.entry(g_id).or_default().push(flake);
             }
+        }
+
+        let links_current = self.current_link_base().is_some();
+        if let Some(base) = self.current_link_base() {
+            let touched = links::touched_reifiers(
+                per_graph
+                    .iter()
+                    .flat_map(|(g_id, flakes)| flakes.iter().map(move |f| (*g_id, f))),
+            );
+            if !touched.is_empty() {
+                let links = self.derive_links(base, &touched, self.t)?;
+                for (g_id, flake) in links {
+                    per_graph.entry(g_id).or_default().push(flake);
+                }
+            }
+        }
+        if links_current {
+            self.links_through = max_t;
         }
 
         if per_graph.is_empty() {
@@ -1123,15 +1155,10 @@ impl Novelty {
             }
 
             // Maintain the current-state index so later apply_commit calls dedup
-            // against bulk-loaded facts, and capture `f:reifies*` flakes for the
-            // attachment overlay observer (cheap clone, rare relative to data
-            // flakes). `kept` is in (s,p,o,dt,m,t,op) order, so the last record
-            // per identity is its highest-t (latest) op.
-            let mut accepted_reifies: Vec<Flake> = Vec::new();
+            // against bulk-loaded facts. `kept` is in (s,p,o,dt,m,t,op) order, so
+            // the last record per identity is its highest-t (latest) op.
             for flake in &kept {
-                if fluree_db_core::namespaces::is_reserved_reifies_predicate(&flake.p) {
-                    accepted_reifies.push(flake.clone());
-                }
+                self.saw_annotations |= fluree_db_core::is_annotation_predicate(&flake.p);
                 self.fact_state.record(g_id, flake);
             }
 
@@ -1144,15 +1171,6 @@ impl Novelty {
             // after a bulk import that writes config.
             if g_id == CONFIG_GRAPH_ID {
                 self.config_write_t = self.config_write_t.max(max_t);
-            }
-
-            // Update attachment overlay after the per-graph batch is committed.
-            // Malformed bundles are skipped + warned + counted on
-            // `attachments.observed_malformed_bundle_count` (see
-            // `AttachmentNovelty::observe_flakes`); `?` only propagates
-            // infrastructure-level errors.
-            if !accepted_reifies.is_empty() {
-                self.attachments.observe_flakes(&accepted_reifies)?;
             }
         }
 
@@ -1182,6 +1200,9 @@ impl Novelty {
     /// after each index rebuild rather than mutated in-place, so this is rarely
     /// the hot path.
     pub fn clear_up_to(&mut self, cutoff_t: i64) {
+        // Commits at or before the cutoff have their links in the index now.
+        self.trim_link_base(cutoff_t);
+        self.links_through = self.links_through.max(cutoff_t.min(self.t));
         if self.flake_count == 0 {
             return;
         }
