@@ -405,22 +405,28 @@ impl FlakeValue {
         }
     }
 
-    /// Compare two numeric values mathematically.
+    /// Compare two numeric values mathematically: the value comparison of
+    /// XPath `op:numeric-less-than` / `op:numeric-equal` (F&O 3.1 §4.3).
     ///
-    /// Returns `None` if either value is not numeric.
+    /// Returns `None` if either value is not numeric, or either is NaN: NaN is
+    /// incomparable, so every `<`, `>`, `=` with it is false. `+INF` is above
+    /// and `-INF` below every other number, of any numeric type.
     ///
     /// This implements "number is a number" semantics:
     /// - `Long(3) < Double(3.5) < Long(4)`
     /// - Equal values compare as Equal regardless of type
+    ///
+    /// The storage order (`Ord`), which must be total, is [`Self::cmp`]: it
+    /// places NaN after `+INF`.
     pub fn numeric_cmp(&self, other: &Self) -> Option<Ordering> {
+        if let Some(ord) = Self::special_double_cmp(self, other) {
+            return ord;
+        }
         match (self, other) {
             // === Fast paths: same type ===
             (FlakeValue::Long(a), FlakeValue::Long(b)) => Some(a.cmp(b)),
-            (FlakeValue::Double(a), FlakeValue::Double(b)) => {
-                // Handle NaN: use bit comparison as fallback for total ordering
-                a.partial_cmp(b)
-                    .or_else(|| Some(a.to_bits().cmp(&b.to_bits())))
-            }
+            // Neither is NaN or infinite here (handled above).
+            (FlakeValue::Double(a), FlakeValue::Double(b)) => a.partial_cmp(b),
             (FlakeValue::BigInt(a), FlakeValue::BigInt(b)) => Some((**a).cmp(&**b)),
             (FlakeValue::Decimal(a), FlakeValue::Decimal(b)) => {
                 a.partial_cmp(b).or(Some(Ordering::Equal))
@@ -504,6 +510,56 @@ impl FlakeValue {
         }
     }
 
+    /// The cases of [`Self::numeric_cmp`] a non-finite double decides, so the
+    /// arms below only ever see finite doubles. `None` = no special double
+    /// involved; `Some(None)` = incomparable (NaN, or a non-numeric operand).
+    fn special_double_cmp(a: &Self, b: &Self) -> Option<Option<Ordering>> {
+        let special = |v: &Self| match v {
+            FlakeValue::Double(d) if !d.is_finite() => Some(*d),
+            _ => None,
+        };
+        let (sa, sb) = (special(a), special(b));
+        if sa.is_none() && sb.is_none() {
+            return None;
+        }
+        if !a.is_numeric() || !b.is_numeric() {
+            return Some(None);
+        }
+        // `+INF` > everything, `-INF` < everything; a double holds the value,
+        // so two infinities of one sign are equal.
+        let rank = |v: &Self, s: Option<f64>| -> Option<i8> {
+            match s {
+                Some(d) if d.is_nan() => None,
+                Some(d) if d > 0.0 => Some(1),
+                Some(_) => Some(-1),
+                None => {
+                    debug_assert!(v.is_numeric());
+                    Some(0)
+                }
+            }
+        };
+        Some(match (rank(a, sa), rank(b, sb)) {
+            (Some(x), Some(y)) => Some(x.cmp(&y)),
+            _ => None, // NaN on either side
+        })
+    }
+
+    /// The storage order of two numeric values: [`Self::numeric_cmp`], made
+    /// total by placing NaN after `+INF` (all NaNs equal). This is the order
+    /// of index keys ([`crate::value_id::total_cmp_f64`]) and of ORDER BY.
+    fn numeric_total_cmp(&self, other: &Self) -> Option<Ordering> {
+        if !self.is_numeric() || !other.is_numeric() {
+            return None;
+        }
+        let nan = |v: &Self| matches!(v, FlakeValue::Double(d) if d.is_nan());
+        Some(match (nan(self), nan(other)) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => self.numeric_cmp(other)?,
+        })
+    }
+
     /// Check if i64 is exactly representable as f64 (within 2^53)
     fn i64_fits_f64(v: i64) -> bool {
         const MAX_SAFE: i64 = 1 << 53;
@@ -517,9 +573,9 @@ impl FlakeValue {
             (FlakeValue::Ref(a), FlakeValue::Ref(b)) => a.cmp(b),
             (FlakeValue::Boolean(a), FlakeValue::Boolean(b)) => a.cmp(b),
             (FlakeValue::Long(a), FlakeValue::Long(b)) => a.cmp(b),
-            (FlakeValue::Double(a), FlakeValue::Double(b)) => a
-                .partial_cmp(b)
-                .unwrap_or_else(|| a.to_bits().cmp(&b.to_bits())),
+            (FlakeValue::Double(a), FlakeValue::Double(b)) => {
+                crate::value_id::total_cmp_f64(*a, *b)
+            }
             (FlakeValue::BigInt(a), FlakeValue::BigInt(b)) => a.cmp(b),
             (FlakeValue::Decimal(a), FlakeValue::Decimal(b)) => {
                 a.partial_cmp(b).unwrap_or(Ordering::Equal)
@@ -579,9 +635,6 @@ impl FlakeValue {
     pub fn canonical_hash(&self) -> u64 {
         use xxhash_rust::xxh64::xxh64;
 
-        // Canonical NaN bit pattern for deterministic hashing (quiet NaN)
-        const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
-
         // Type tag prefixes prevent collisions (e.g., string "true" vs boolean true)
         match self {
             FlakeValue::Null => xxh64(b"\x00null", 0),
@@ -599,14 +652,9 @@ impl FlakeValue {
                 xxh64(&buf, 0)
             }
             FlakeValue::Double(f) => {
-                // CRITICAL: Canonicalize NaN and -0.0/+0.0 for determinism
-                let canonical_bits = if f.is_nan() {
-                    CANONICAL_NAN_BITS // Fixed bit pattern for ALL NaN values
-                } else if *f == 0.0 {
-                    0u64 // Normalize -0.0 to +0.0 (both compare equal)
-                } else {
-                    f.to_bits()
-                };
+                // CRITICAL: Canonicalize NaN and -0.0/+0.0 for determinism —
+                // the same bits the index key and the total order use.
+                let canonical_bits = crate::value_id::canonical_f64_bits(*f);
                 let mut buf = [0u8; 9];
                 buf[0] = 0x03; // type tag
                 buf[1..].copy_from_slice(&canonical_bits.to_le_bytes());
@@ -746,13 +794,7 @@ impl FlakeValue {
                 hasher.update(&[0x0C]); // type tag
                 hasher.update(&(v.len() as u64).to_le_bytes());
                 for f in v.iter() {
-                    let canonical_bits = if f.is_nan() {
-                        CANONICAL_NAN_BITS
-                    } else if *f == 0.0 {
-                        0u64
-                    } else {
-                        f.to_bits()
-                    };
+                    let canonical_bits = crate::value_id::canonical_f64_bits(*f);
                     hasher.update(&canonical_bits.to_le_bytes());
                 }
                 hasher.digest()
@@ -772,9 +814,11 @@ impl FlakeValue {
 
 impl PartialEq for FlakeValue {
     fn eq(&self, other: &Self) -> bool {
-        // For numeric types, use numeric_cmp for value equality
+        // For numeric types, equality by value across numeric types.
         if self.is_numeric() && other.is_numeric() {
-            return self.numeric_cmp(other) == Some(Ordering::Equal);
+            // Storage identity, not XPath `=`: a NaN equals itself here (so a
+            // stored NaN can be found and retracted), as in `Ord` and `Hash`.
+            return self.numeric_total_cmp(other) == Some(Ordering::Equal);
         }
 
         // For temporal types of the same kind, use temporal_cmp
@@ -830,12 +874,10 @@ impl Ord for FlakeValue {
         // 2. Both numeric → compare by mathematical value
         // Equal numeric values return Equal so cmp_object can use dt as tie-breaker
         // "number is a number": equal values are equal regardless of numeric type
-        if self.is_numeric() && other.is_numeric() {
-            if let Some(ord) = self.numeric_cmp(other) {
-                return ord;
-            }
-            // numeric_cmp returned None - shouldn't happen for two numeric values
-            // Fall through to discriminant comparison as defensive measure
+        // Total over every numeric value, NaN included (after +INF), as `Ord`
+        // requires.
+        if let Some(ord) = self.numeric_total_cmp(other) {
+            return ord;
         }
 
         // 3. Both temporal → compare by instant (if same temporal type)

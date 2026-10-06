@@ -382,15 +382,15 @@ fn count_rows_for_predicate_numeric_compare_post(
                 // now without opening any leaves.
                 return Ok(None);
             }
-            let Some(threshold_key) = encode_numeric_threshold_for_otype(otype, threshold)? else {
+            let Some(interval) = threshold_key_interval(otype, compare, threshold) else {
                 // Threshold not encodable for the uniform o_type (e.g. a
                 // decimal constant over integer rows): same doomed scan.
                 return Ok(None);
             };
-            if leaflet_fully_excluded(compare, min_ok, max_ok, threshold_key) {
+            if leaflet_fully_excluded(min_ok, max_ok, interval) {
                 return Ok(Some(0));
             }
-            if leaflet_fully_matches(compare, min_ok, max_ok, threshold_key) {
+            if leaflet_fully_matches(min_ok, max_ok, interval) {
                 return Ok(Some(count_rows_for_predicate_psot(store, g_id, p_id)?));
             }
         } else if otype_unsupported_numeric(min_ot) || otype_unsupported_numeric(max_ot) {
@@ -534,9 +534,8 @@ fn count_numeric_compare_in_leaf_slice(
             if !matches!(otype, OType::XSD_INTEGER | OType::XSD_DOUBLE) {
                 return Ok(None);
             }
-            let threshold_key = match encode_numeric_threshold_for_otype(otype, threshold)? {
-                Some(key) => key,
-                None => return Ok(None),
+            let Some(interval) = threshold_key_interval(otype, compare, threshold) else {
+                return Ok(None);
             };
 
             let first = read_ordered_key_v2(RunSortOrder::Post, &entry.first_key);
@@ -546,78 +545,83 @@ fn count_numeric_compare_in_leaf_slice(
                 return Ok(None);
             }
 
-            if leaflet_fully_matches(compare, first.o_key, last.o_key, threshold_key) {
+            if leaflet_fully_matches(first.o_key, last.o_key, interval) {
                 total = total.saturating_add(entry.row_count as u64);
                 continue;
             }
-            if leaflet_fully_excluded(compare, first.o_key, last.o_key, threshold_key) {
+            if leaflet_fully_excluded(first.o_key, last.o_key, interval) {
                 continue;
             }
 
             let batch = handle
                 .load_columns(leaflet_idx, &projection, RunSortOrder::Post)
                 .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
-            total = total.saturating_add(count_matching_rows_in_sorted_batch(
-                &batch,
-                compare,
-                threshold_key,
-            ) as u64);
+            total =
+                total.saturating_add(count_matching_rows_in_sorted_batch(&batch, interval) as u64);
         }
     }
 
     Ok(Some(total))
 }
 
-fn encode_numeric_threshold_for_otype(otype: OType, threshold: &FlakeValue) -> Result<Option<u64>> {
-    let key = match (otype, threshold) {
-        (OType::XSD_INTEGER, FlakeValue::Long(n)) => ObjKey::encode_i64(*n).as_u64(),
-        (OType::XSD_DOUBLE, FlakeValue::Long(n)) => ObjKey::encode_f64(*n as f64)
-            .map_err(|_| QueryError::execution("cannot encode f64 threshold".to_string()))?
-            .as_u64(),
-        (OType::XSD_DOUBLE, FlakeValue::Double(d)) => ObjKey::encode_f64(*d)
-            .map_err(|_| QueryError::execution("cannot encode f64 threshold".to_string()))?
-            .as_u64(),
-        _ => return Ok(None),
-    };
-    Ok(Some(key))
-}
+/// The rows of one o_type that `?o <compare> threshold` selects, as an
+/// inclusive `o_key` interval (keys are order-preserving per o_type).
+///
+/// - `None`: the threshold is not comparable by key for this o_type (e.g. a
+///   decimal threshold over integer rows); the caller defers.
+/// - `Some(None)`: the comparison selects no row of this o_type.
+/// - `Some(Some((lo, hi)))`: it selects exactly the keys in `lo..=hi`.
+///
+/// Every comparison with NaN is false (XPath F&O 3.1 §4.3.2): a NaN threshold
+/// selects nothing, and a double interval stops at `+INF`'s key, below NaN's.
+type KeyInterval = Option<(u64, u64)>;
 
-fn leaflet_fully_matches(compare: NumericCompareOp, first: u64, last: u64, threshold: u64) -> bool {
-    match compare {
-        NumericCompareOp::Gt => first > threshold,
-        NumericCompareOp::Ge => first >= threshold,
-        NumericCompareOp::Lt => last < threshold,
-        NumericCompareOp::Le => last <= threshold,
-    }
-}
-
-fn leaflet_fully_excluded(
+fn threshold_key_interval(
+    otype: OType,
     compare: NumericCompareOp,
-    first: u64,
-    last: u64,
-    threshold: u64,
-) -> bool {
-    match compare {
-        NumericCompareOp::Gt => last <= threshold,
-        NumericCompareOp::Ge => last < threshold,
-        NumericCompareOp::Lt => first >= threshold,
-        NumericCompareOp::Le => first > threshold,
-    }
+    threshold: &FlakeValue,
+) -> Option<KeyInterval> {
+    let (key, max) = match (otype, threshold) {
+        (OType::XSD_INTEGER, FlakeValue::Long(n)) => (ObjKey::encode_i64(*n).as_u64(), u64::MAX),
+        (OType::XSD_DOUBLE, FlakeValue::Long(n)) => (
+            ObjKey::encode_f64(*n as f64).as_u64(),
+            ObjKey::F64_COMPARABLE_MAX.as_u64(),
+        ),
+        (OType::XSD_DOUBLE, FlakeValue::Double(d)) => {
+            if d.is_nan() {
+                return Some(None);
+            }
+            (
+                ObjKey::encode_f64(*d).as_u64(),
+                ObjKey::F64_COMPARABLE_MAX.as_u64(),
+            )
+        }
+        _ => return None,
+    };
+    let interval = match compare {
+        NumericCompareOp::Gt => key.checked_add(1).map(|lo| (lo, max)),
+        NumericCompareOp::Ge => Some((key, max)),
+        NumericCompareOp::Lt => key.checked_sub(1).map(|hi| (0, hi)),
+        NumericCompareOp::Le => Some((0, key)),
+    };
+    Some(interval.filter(|(lo, hi)| lo <= hi))
+}
+
+fn leaflet_fully_matches(first: u64, last: u64, interval: KeyInterval) -> bool {
+    interval.is_some_and(|(lo, hi)| first >= lo && last <= hi)
+}
+
+fn leaflet_fully_excluded(first: u64, last: u64, interval: KeyInterval) -> bool {
+    interval.is_none_or(|(lo, hi)| last < lo || first > hi)
 }
 
 fn count_matching_rows_in_sorted_batch(
     batch: &fluree_db_binary_index::ColumnBatch,
-    compare: NumericCompareOp,
-    threshold: u64,
+    interval: KeyInterval,
 ) -> usize {
-    let lower = lower_bound_okey(batch, threshold);
-    let upper = upper_bound_okey(batch, threshold);
-    match compare {
-        NumericCompareOp::Gt => batch.row_count.saturating_sub(upper),
-        NumericCompareOp::Ge => batch.row_count.saturating_sub(lower),
-        NumericCompareOp::Lt => lower,
-        NumericCompareOp::Le => upper,
-    }
+    interval.map_or(0, |(lo, hi)| {
+        upper_bound_okey(batch, hi).saturating_sub(lower_bound_okey(batch, lo))
+    })
 }
 
 fn lower_bound_okey(batch: &fluree_db_binary_index::ColumnBatch, threshold: u64) -> usize {
@@ -648,16 +652,11 @@ fn upper_bound_okey(batch: &fluree_db_binary_index::ColumnBatch, threshold: u64)
     lo
 }
 
-/// Scalar form of the numeric comparison on the order-preserving `o_key` encoding
-/// (the same encoding the binary-search bounds rely on).
+/// Scalar form of the numeric comparison on the order-preserving `o_key`
+/// encoding (the same intervals the binary-search bounds use).
 #[inline]
-fn okey_matches(compare: NumericCompareOp, o_key: u64, threshold: u64) -> bool {
-    match compare {
-        NumericCompareOp::Gt => o_key > threshold,
-        NumericCompareOp::Ge => o_key >= threshold,
-        NumericCompareOp::Lt => o_key < threshold,
-        NumericCompareOp::Le => o_key <= threshold,
-    }
+fn okey_matches(o_key: u64, interval: KeyInterval) -> bool {
+    interval.is_some_and(|(lo, hi)| lo <= o_key && o_key <= hi)
 }
 
 /// Overlay/time-travel lane for the numeric-compare count: counts rows of `p_id`
@@ -682,8 +681,8 @@ fn count_numeric_compare_overlay_parallel(
     compare: NumericCompareOp,
     threshold: &FlakeValue,
 ) -> Result<Option<u64>> {
-    let tk_int = encode_numeric_threshold_for_otype(OType::XSD_INTEGER, threshold)?;
-    let tk_dbl = encode_numeric_threshold_for_otype(OType::XSD_DOUBLE, threshold)?;
+    let tk_int = threshold_key_interval(OType::XSD_INTEGER, compare, threshold);
+    let tk_dbl = threshold_key_interval(OType::XSD_DOUBLE, compare, threshold);
 
     // Pre-check the base predicate's POST extent: if the base rows are
     // uniformly an unsupported o_type (e.g. all-decimal), or the threshold
@@ -733,7 +732,7 @@ fn count_numeric_compare_overlay_parallel(
                 _ => return false,
             };
             match tk {
-                Some(tk) => okey_matches(compare, o_key, tk),
+                Some(interval) => okey_matches(o_key, interval),
                 None => {
                     // Threshold not encodable for this row's o_type (e.g. a
                     // decimal threshold against integer rows): the comparison
@@ -2312,6 +2311,44 @@ mod tests {
     const STRING: u8 = 1;
     const INTEGER: u8 = 2;
     const UNKNOWN: u8 = 255;
+
+    #[test]
+    fn double_key_intervals_follow_numeric_comparison() {
+        use NumericCompareOp::{Ge, Gt, Le, Lt};
+        let values = [f64::NEG_INFINITY, -1.5, 0.0, 2.5, f64::INFINITY, f64::NAN];
+        let keys: Vec<u64> = values
+            .iter()
+            .map(|d| ObjKey::encode_f64(*d).as_u64())
+            .collect();
+        let selected = |compare: NumericCompareOp, threshold: FlakeValue| -> Vec<usize> {
+            let interval = threshold_key_interval(OType::XSD_DOUBLE, compare, &threshold)
+                .expect("a double threshold is comparable by key");
+            (0..keys.len())
+                .filter(|&i| okey_matches(keys[i], interval))
+                .collect()
+        };
+        // XPath comparisons (F&O 3.1 §4.3.2): +INF is above and -INF below
+        // every other number, and NaN satisfies none of them.
+        assert_eq!(selected(Gt, FlakeValue::Double(0.0)), [3, 4]);
+        assert_eq!(selected(Gt, FlakeValue::Long(0)), [3, 4]);
+        assert_eq!(selected(Lt, FlakeValue::Long(0)), [0, 1]);
+        assert_eq!(
+            selected(Ge, FlakeValue::Double(f64::NEG_INFINITY)),
+            [0, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            selected(Le, FlakeValue::Double(f64::INFINITY)),
+            [0, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            selected(Lt, FlakeValue::Double(f64::INFINITY)),
+            [0, 1, 2, 3]
+        );
+        assert!(selected(Gt, FlakeValue::Double(f64::INFINITY)).is_empty());
+        for compare in [Gt, Ge, Lt, Le] {
+            assert!(selected(compare, FlakeValue::Double(f64::NAN)).is_empty());
+        }
+    }
 
     #[test]
     fn literal_fold_sums_non_ref_tags() {

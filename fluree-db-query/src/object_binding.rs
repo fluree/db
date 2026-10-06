@@ -302,7 +302,7 @@ pub(crate) fn encoded_equivalent(binding: &Binding, store: &BinaryIndexStore) ->
                     } else {
                         return None;
                     };
-                    let key = ObjKey::encode_f64(*v).ok()?;
+                    let key = ObjKey::encode_f64(*v);
                     (ObjKind::NUM_F64.as_u8(), key.as_u64(), dt_id, 0)
                 }
                 // The temporal types `embedded_temporal_encoding` keeps

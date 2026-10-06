@@ -569,8 +569,7 @@ impl CommitResolver {
                     ));
                 }
                 // Always encode as NUM_F64 to avoid NUM_INT + dt DOUBLE edge cases
-                let key = ObjKey::encode_f64(*n)
-                    .map_err(|e| ResolverError::Resolve(format!("txn_meta double: {e}")))?;
+                let key = ObjKey::encode_f64(*n);
                 Ok((ObjKind::NUM_F64, key, DatatypeDictId::DOUBLE.as_u16(), 0))
             }
             TxnMetaValue::Boolean(b) => Ok((
@@ -876,8 +875,8 @@ impl CommitResolver {
                 // NOTE: Do not optimize integral doubles to NUM_INT here.
                 // The decode path uses the property's datatype to select
                 // DecodeKind, and F64→I64 mismatch corrupts values. (fluree/db-r#142)
-                let key = ObjKey::encode_f64(*v)
-                    .map_err(|e| format!("f64 encode for p_id={p_id}: {e}"))?;
+                // Every double, ±INF and NaN included, has an index key.
+                let key = ObjKey::encode_f64(*v);
                 Ok((ObjKind::NUM_F64, key))
             }
             RawObject::Str(s) => {
@@ -1689,8 +1688,8 @@ impl SharedResolverState {
                 // NOTE: Do not optimize integral doubles to NUM_INT here.
                 // The decode path uses the property's datatype to select
                 // DecodeKind, and F64→I64 mismatch corrupts values. (fluree/db-r#142)
-                let key = ObjKey::encode_f64(*v)
-                    .map_err(|e| format!("f64 encode for p_id={p_id}: {e}"))?;
+                // Every double, ±INF and NaN included, has an index key.
+                let key = ObjKey::encode_f64(*v);
                 Ok((ObjKind::NUM_F64, key))
             }
             RawObject::Str(s) => {
@@ -2066,8 +2065,7 @@ impl SharedResolverState {
                         "txn_meta does not support non-finite double values".into(),
                     ));
                 }
-                let key = ObjKey::encode_f64(*n)
-                    .map_err(|e| ResolverError::Resolve(format!("txn_meta double: {e}")))?;
+                let key = ObjKey::encode_f64(*n);
                 Ok((ObjKind::NUM_F64, key, DatatypeDictId::DOUBLE.as_u16(), 0))
             }
             TxnMetaValue::Boolean(b) => Ok((

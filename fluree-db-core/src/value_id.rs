@@ -60,8 +60,10 @@ impl ObjKind {
     /// Signed 64-bit integer, order-preserving XOR-sign encoding.
     pub const NUM_INT: Self = Self(0x03);
 
-    /// IEEE 754 f64, order-preserving total-order bit transform.
-    /// NaN and ±Inf are rejected at ingest; `-0.0` is canonicalized to `+0.0`.
+    /// IEEE 754 f64, order-preserving total-order bit transform. Every value
+    /// has a key: `-INF` below every finite value, `+INF` above, and NaN
+    /// (canonicalized to one quiet NaN) above `+INF`. `-0.0` is canonicalized
+    /// to `+0.0`. See [`ObjKey::encode_f64`].
     pub const NUM_F64: Self = Self(0x04);
 
     /// IRI reference — u32 subject dictionary ID (zero-extended in ObjKey).
@@ -189,13 +191,38 @@ const SIGN_FLIP: u64 = 1u64 << 63;
 /// Sign bit mask for f64 bits.
 const F64_SIGN_BIT: u64 = 1u64 << 63;
 
+/// The bits every NaN is stored as: the positive quiet NaN. Its index key
+/// (`0xFFF8_0000_0000_0000`) sits above `+INF`'s and below [`ObjKey::MAX`].
+pub const CANONICAL_NAN_BITS: u64 = 0x7FF8_0000_0000_0000;
+
+/// The bits a double is stored and compared as: every NaN as
+/// [`CANONICAL_NAN_BITS`], `-0.0` as `+0.0`, anything else as itself.
+#[inline]
+pub fn canonical_f64_bits(value: f64) -> u64 {
+    if value.is_nan() {
+        CANONICAL_NAN_BITS
+    } else if value == 0.0 {
+        0
+    } else {
+        value.to_bits()
+    }
+}
+
+/// The one storage order of doubles, shared by the index keys
+/// ([`ObjKey::encode_f64`]) and value comparison (`FlakeValue`'s `Ord`):
+/// `-INF < finite values < +INF < NaN`, with `-0.0 == +0.0` and all NaNs
+/// equal. A total order, as `Ord` requires.
+///
+/// This is the order of stored values, not SPARQL value comparison: there
+/// every comparison with NaN is false (XPath F&O 3.1 §4.3).
+#[inline]
+pub fn total_cmp_f64(a: f64, b: f64) -> std::cmp::Ordering {
+    f64::from_bits(canonical_f64_bits(a)).total_cmp(&f64::from_bits(canonical_f64_bits(b)))
+}
+
 /// Error returned when a value cannot be stored in the index.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ObjKeyError {
-    /// f64 is NaN — not representable in ordered index.
-    NaN,
-    /// f64 is +Inf or -Inf — not representable in ordered index.
-    Infinite,
     /// Latitude is outside [-90, 90] or non-finite.
     GeoLatitudeOutOfRange,
     /// Longitude is outside [-180, 180] or non-finite.
@@ -205,8 +232,6 @@ pub enum ObjKeyError {
 impl fmt::Display for ObjKeyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NaN => write!(f, "NaN is not allowed in index values"),
-            Self::Infinite => write!(f, "infinite values are not allowed in index values"),
             Self::GeoLatitudeOutOfRange => {
                 write!(f, "latitude must be finite and in range [-90, 90]")
             }
@@ -225,6 +250,12 @@ impl ObjKey {
 
     /// The maximum key — used for unbounded upper range bounds within a kind.
     pub const MAX: Self = Self(u64::MAX);
+
+    /// The greatest `NUM_F64` key a numeric comparison can select: `+INF`'s
+    /// (`encode_f64(f64::INFINITY)`). Only NaN's key is above it, and every
+    /// `<`, `>`, `<=`, `>=` with NaN is false (XPath F&O 3.1 §4.3), so an
+    /// unbounded-above numeric range over doubles stops here.
+    pub const F64_COMPARABLE_MAX: Self = Self(0xFFF0_0000_0000_0000);
 
     // ---- Signed integer encoding (NumInt, Date, DateTime) ----
 
@@ -245,33 +276,32 @@ impl ObjKey {
 
     // ---- Float encoding (NumF64) ----
 
-    /// Encode a finite `f64` as an order-preserving `u64`.
+    /// Encode any `f64` as an order-preserving `u64`.
     ///
-    /// Rejects NaN and ±Inf. Canonicalizes `-0.0` to `+0.0`.
+    /// Every value has a key, so every `xsd:double` / `xsd:float` value can be
+    /// indexed. The key order is the order of [`total_cmp_f64`]:
+    /// `-INF < finite values < +INF < NaN`.
+    ///
+    /// Canonicalizes `-0.0` to `+0.0` and every NaN to [`CANONICAL_NAN_BITS`],
+    /// so equal values (and all NaNs) share one key.
     ///
     /// The transform:
     /// - For positive (sign bit clear): flip only the sign bit → maps `+0.0`
-    ///   to `2^63` and larger positives to larger `u64` values.
-    /// - For negative (sign bit set): flip ALL bits → maps `-0.0` to `2^63 - 1`
-    ///   (but we canonicalize to +0.0 first) and more-negative values to smaller
-    ///   `u64` values.
+    ///   to `2^63`, larger positives to larger `u64` values, `+INF`
+    ///   (`0x7FF0…`) to `0xFFF0…` and the canonical NaN (`0x7FF8…`) to
+    ///   `0xFFF8…`, still below [`ObjKey::MAX`].
+    /// - For negative (sign bit set): flip ALL bits → more-negative values map
+    ///   to smaller `u64` values, and `-INF` (`0xFFF0…`) to `0x000F…`, below
+    ///   every finite value.
     #[inline]
-    pub fn encode_f64(value: f64) -> Result<Self, ObjKeyError> {
-        if value.is_nan() {
-            return Err(ObjKeyError::NaN);
-        }
-        if value.is_infinite() {
-            return Err(ObjKeyError::Infinite);
-        }
-        // Canonicalize -0.0 → +0.0
-        let value = if value == 0.0 { 0.0 } else { value };
-        let bits = value.to_bits();
+    pub fn encode_f64(value: f64) -> Self {
+        let bits = canonical_f64_bits(value);
         let key = if bits & F64_SIGN_BIT != 0 {
             !bits // negative: flip all bits
         } else {
             bits ^ F64_SIGN_BIT // positive: flip sign bit only
         };
-        Ok(Self(key))
+        Self(key)
     }
 
     /// Decode an order-preserving `u64` back to `f64`.
@@ -1041,7 +1071,7 @@ mod tests {
     #[test]
     fn test_num_f64_round_trip() {
         for &v in &[0.0f64, 1.0, -1.0, 0.5, -0.5, 3.13, -2.77, 1e10, -1e10] {
-            let key = ObjKey::encode_f64(v).unwrap();
+            let key = ObjKey::encode_f64(v);
             let decoded = key.decode_f64();
             assert_eq!(decoded.to_bits(), v.to_bits(), "round-trip failed for {v}");
         }
@@ -1049,24 +1079,24 @@ mod tests {
 
     #[test]
     fn test_num_f64_extremes() {
-        let key_min = ObjKey::encode_f64(-f64::MAX).unwrap();
-        let key_max = ObjKey::encode_f64(f64::MAX).unwrap();
+        let key_min = ObjKey::encode_f64(-f64::MAX);
+        let key_max = ObjKey::encode_f64(f64::MAX);
         assert_eq!(key_min.decode_f64(), -f64::MAX);
         assert_eq!(key_max.decode_f64(), f64::MAX);
         assert!(key_min < key_max);
 
-        let key_min_pos = ObjKey::encode_f64(f64::MIN_POSITIVE).unwrap();
-        let key_zero = ObjKey::encode_f64(0.0).unwrap();
+        let key_min_pos = ObjKey::encode_f64(f64::MIN_POSITIVE);
+        let key_zero = ObjKey::encode_f64(0.0);
         assert!(key_zero < key_min_pos);
     }
 
     #[test]
     fn test_num_f64_ordering() {
-        let neg_big = ObjKey::encode_f64(-1000.0).unwrap();
-        let neg_small = ObjKey::encode_f64(-0.001).unwrap();
-        let zero = ObjKey::encode_f64(0.0).unwrap();
-        let pos_small = ObjKey::encode_f64(0.001).unwrap();
-        let pos_big = ObjKey::encode_f64(1000.0).unwrap();
+        let neg_big = ObjKey::encode_f64(-1000.0);
+        let neg_small = ObjKey::encode_f64(-0.001);
+        let zero = ObjKey::encode_f64(0.0);
+        let pos_small = ObjKey::encode_f64(0.001);
+        let pos_big = ObjKey::encode_f64(1000.0);
 
         assert!(neg_big < neg_small);
         assert!(neg_small < zero);
@@ -1076,42 +1106,91 @@ mod tests {
 
     #[test]
     fn test_num_f64_sign_boundary() {
-        let neg = ObjKey::encode_f64(-f64::MIN_POSITIVE).unwrap();
-        let zero = ObjKey::encode_f64(0.0).unwrap();
-        let pos = ObjKey::encode_f64(f64::MIN_POSITIVE).unwrap();
+        let neg = ObjKey::encode_f64(-f64::MIN_POSITIVE);
+        let zero = ObjKey::encode_f64(0.0);
+        let pos = ObjKey::encode_f64(f64::MIN_POSITIVE);
         assert!(neg < zero);
         assert!(zero < pos);
     }
 
     #[test]
     fn test_num_f64_neg_zero_canonicalization() {
-        let pos_zero = ObjKey::encode_f64(0.0).unwrap();
-        let neg_zero = ObjKey::encode_f64(-0.0).unwrap();
+        let pos_zero = ObjKey::encode_f64(0.0);
+        let neg_zero = ObjKey::encode_f64(-0.0);
         assert_eq!(pos_zero, neg_zero);
     }
 
+    /// Every double has a key: `-INF` below every finite value, `+INF` above,
+    /// and NaN above `+INF` but below [`ObjKey::MAX`], so an unbounded upper
+    /// range bound still covers it.
     #[test]
-    fn test_num_f64_reject_nan() {
-        assert_eq!(ObjKey::encode_f64(f64::NAN), Err(ObjKeyError::NaN));
+    fn test_num_f64_specials_have_ordered_keys() {
+        let ninf = ObjKey::encode_f64(f64::NEG_INFINITY);
+        let min = ObjKey::encode_f64(-f64::MAX);
+        let max = ObjKey::encode_f64(f64::MAX);
+        let inf = ObjKey::encode_f64(f64::INFINITY);
+        let nan = ObjKey::encode_f64(f64::NAN);
+        assert!(ObjKey::ZERO < ninf);
+        assert!(ninf < min);
+        assert!(max < inf);
+        assert!(inf < nan);
+        assert!(nan < ObjKey::MAX);
+        assert_eq!(inf, ObjKey::F64_COMPARABLE_MAX);
+        assert_eq!(ninf.decode_f64(), f64::NEG_INFINITY);
+        assert_eq!(inf.decode_f64(), f64::INFINITY);
+        assert!(nan.decode_f64().is_nan());
+        assert_eq!(nan.decode_f64().to_bits(), CANONICAL_NAN_BITS);
     }
 
+    /// Every NaN bit pattern (sign, payload, signalling) shares one key.
     #[test]
-    fn test_num_f64_reject_infinity() {
-        assert_eq!(
-            ObjKey::encode_f64(f64::INFINITY),
-            Err(ObjKeyError::Infinite)
-        );
-        assert_eq!(
-            ObjKey::encode_f64(f64::NEG_INFINITY),
-            Err(ObjKeyError::Infinite)
-        );
+    fn test_num_f64_nan_is_canonical() {
+        let canonical = ObjKey::encode_f64(f64::NAN);
+        for bits in [
+            0x7FF8_0000_0000_0001u64,
+            0xFFF8_0000_0000_0000,
+            0x7FF0_0000_0000_0001,
+            0xFFFF_FFFF_FFFF_FFFF,
+        ] {
+            let nan = f64::from_bits(bits);
+            assert!(nan.is_nan());
+            assert_eq!(ObjKey::encode_f64(nan), canonical, "{bits:#x}");
+        }
+    }
+
+    /// Key order is the order of [`total_cmp_f64`].
+    #[test]
+    fn test_num_f64_key_order_matches_total_cmp() {
+        let values = [
+            f64::NEG_INFINITY,
+            -f64::MAX,
+            -1.5,
+            -f64::MIN_POSITIVE,
+            -0.0,
+            0.0,
+            f64::MIN_POSITIVE,
+            2.5,
+            f64::MAX,
+            f64::INFINITY,
+            f64::NAN,
+            -f64::NAN,
+        ];
+        for a in values {
+            for b in values {
+                assert_eq!(
+                    ObjKey::encode_f64(a).cmp(&ObjKey::encode_f64(b)),
+                    total_cmp_f64(a, b),
+                    "{a} vs {b}"
+                );
+            }
+        }
     }
 
     #[test]
     fn test_num_f64_probability_ordering() {
         // Simulate the probability workload that caused rank exhaustion
         let mut keys: Vec<ObjKey> = (1..=999)
-            .map(|i| ObjKey::encode_f64(i as f64 / 1000.0).unwrap())
+            .map(|i| ObjKey::encode_f64(i as f64 / 1000.0))
             .collect();
         let sorted = {
             let mut s = keys.clone();
@@ -1359,7 +1438,7 @@ mod tests {
         let null = (ObjKind::NULL, ObjKey::ZERO);
         let bool_f = (ObjKind::BOOL, ObjKey::encode_bool(false));
         let int_0 = (ObjKind::NUM_INT, ObjKey::encode_i64(0));
-        let f64_0 = (ObjKind::NUM_F64, ObjKey::encode_f64(0.0).unwrap());
+        let f64_0 = (ObjKind::NUM_F64, ObjKey::encode_f64(0.0));
         let ref_0 = (ObjKind::REF_ID, ObjKey::encode_u32_id(0));
         let lex_0 = (ObjKind::LEX_ID, ObjKey::encode_u32_id(0));
         let date_0 = (ObjKind::DATE, ObjKey::encode_date(0));

@@ -875,7 +875,7 @@ mod tests {
             SubjectId::from_u64(1),
             1,
             ObjKind::NUM_F64,
-            ObjKey::encode_f64(0.001).unwrap(),
+            ObjKey::encode_f64(0.001),
             1,
             true,
             DatatypeDictId::DOUBLE.as_u16(),
