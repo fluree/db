@@ -362,12 +362,13 @@ The fix is to wrap setup work that touches the runtime in `rt.block_on`:
 let rt = bench_runtime();
 
 b.iter_batched(
-    // setup — wrap in block_on so the reactor is alive while
-    // FlureeBuilder::file(...).build() runs.
+    // Setup runs in block_on, so the reactor is alive while
+    // FlureeBuilder::file(...).build_async() runs.
     || rt.block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
-            .build()
+            .build_async()
+            .await
             .unwrap();
         (dir, fluree)
     }),

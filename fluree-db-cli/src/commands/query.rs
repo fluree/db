@@ -403,7 +403,7 @@ pub async fn run(
             Ok(gs) => gs,
             Err(CliError::NoActiveLedger) if force_connection => {
                 context::QueryTarget::Ledger(LedgerMode::Local {
-                    fluree: Box::new(context::build_fluree(dirs)?),
+                    fluree: Box::new(context::build_fluree(dirs).await?),
                     alias: String::new(),
                 })
             }

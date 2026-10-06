@@ -39,7 +39,7 @@ use fluree_db_api::{FlureeBuilder, ReindexOptions, ReindexResult};
 
 // Create Fluree instance
 let fluree = FlureeBuilder::file("/path/to/data")
-    .build()
+    .build_async()
     .await?;
 
 // Reindex with default options
@@ -55,7 +55,7 @@ println!("Root ID: {}", result.root_id);
 use fluree_db_api::{FlureeBuilder, ReindexOptions};
 use fluree_db_indexer::IndexerConfig;
 
-let fluree = FlureeBuilder::file("/path/to/data").build().await?;
+let fluree = FlureeBuilder::file("/path/to/data").build_async().await?;
 
 let result = fluree.reindex("mydb:main", ReindexOptions::default()
     // Use custom index node sizes

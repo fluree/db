@@ -412,7 +412,7 @@ pub async fn run(
         )));
     }
 
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
 
     match from {
         Some(path) if is_flpack_path(path) => {
@@ -1297,7 +1297,7 @@ pub async fn run_memory_import(
     let include_user = !no_user;
     let commits = git_memory_commits(&repo_root, include_user)?;
 
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
 
     // Create ledger + transact memory schema
     fluree

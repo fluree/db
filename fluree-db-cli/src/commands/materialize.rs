@@ -113,7 +113,7 @@ pub async fn run(dirs: &FlureeDir, params: &MaterializeParams<'_>) -> CliResult<
     // import producer thread. Reclaimed by the OS at process exit. Keeping ONE
     // provider (hence one catalog session) across the build is required for the
     // snapshot pin + watermark capture.
-    let fluree: &'static Fluree = Box::leak(Box::new(context::build_fluree(dirs)?));
+    let fluree: &'static Fluree = Box::leak(Box::new(context::build_fluree(dirs).await?));
     let provider = Arc::new(FlureeR2rmlProvider::new(fluree));
 
     // CRITICAL-1 (#1529 review): a failed parity gate drops the WHOLE ledger NAME
