@@ -673,6 +673,10 @@ name = "query_hot_negation_count"
 harness = false
 
 [[bench]]
+name = "query_hot_annotation_links"
+harness = false
+
+[[bench]]
 name = "query_hot_limit_startup"
 harness = false
 
