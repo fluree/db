@@ -51,12 +51,10 @@ use super::pushdown::extract_bounds_from_filters;
 // ============================================================================
 //
 // `Pattern::EdgeAnnotation { edge, annotation, body }` is flattened
-// at planner time into the equivalent triple chain over the
-// `f:reifies*` system predicates. The standard scan / join machinery
-// handles the rest. This avoids a custom operator and exercises the
-// existing visibility / policy / dedup paths automatically — the
-// base edge triple's standard scan provides the visibility check
-// "for free".
+// at planner time into the body, the reifier's `rdf:reifies` link with
+// its term components, and an existence check on the base edge. The
+// standard scan / join machinery handles the rest. Policy on the link is
+// checked on its triple term (`QueryPolicyEnforcer::term_visible`).
 
 /// Expand every `Pattern::EdgeAnnotation` in `patterns` into its
 /// triple-chain equivalent, recursing through every container pattern (`Optional`, `Union`, `Minus`, `Exists`,
@@ -534,6 +532,53 @@ pub(crate) fn choose_exists_strategy(
     }
 }
 
+/// Row estimate for the patterns ahead of an EXISTS. A term decomposition
+/// whose term a triple of the block binds decodes one term per row, joining
+/// its components to that triple; the branch estimate would price it as a
+/// scan of every term. Estimate it as that join: each component variable
+/// stands for the term variable.
+fn estimate_outer_rows(patterns: &[Pattern], stats: &StatsView) -> f64 {
+    let triple_vars: HashSet<VarId> = patterns
+        .iter()
+        .filter(|p| matches!(p, Pattern::Triple(_)))
+        .flat_map(Pattern::produced_vars)
+        .collect();
+    let mut alias: HashMap<VarId, VarId> = HashMap::new();
+    for p in patterns {
+        if let Pattern::TermComponents(tc) = p {
+            if triple_vars.contains(&tc.term) {
+                for c in tc.components() {
+                    if let crate::ir::Component::Var(v) = c {
+                        alias.insert(*v, tc.term);
+                    }
+                }
+            }
+        }
+    }
+    let aliased = |v: &VarId| *alias.get(v).unwrap_or(v);
+    let rows: Vec<Pattern> = patterns
+        .iter()
+        .filter(|p| !matches!(p, Pattern::TermComponents(tc) if triple_vars.contains(&tc.term)))
+        .map(|p| match p {
+            Pattern::Triple(tp) if !alias.is_empty() => {
+                let mut tp = tp.clone();
+                if let Ref::Var(v) = &mut tp.s {
+                    *v = aliased(v);
+                }
+                if let Ref::Var(v) = &mut tp.p {
+                    *v = aliased(v);
+                }
+                if let Term::Var(v) = &mut tp.o {
+                    *v = aliased(v);
+                }
+                Pattern::Triple(tp)
+            }
+            other => other.clone(),
+        })
+        .collect();
+    crate::planner::estimate_branch_cardinality(&rows, Some(stats))
+}
+
 /// Build the operator for an EXISTS / NOT EXISTS using [`choose_exists_strategy`].
 ///
 /// Picks `SemijoinOperator` (build-once + hash probe) when the inner pattern is
@@ -542,8 +587,12 @@ pub(crate) fn choose_exists_strategy(
 /// / `Pattern::NotExists` dispatch and the `OPTIONAL { ... } FILTER(!bound(?v))`
 /// rewrite — the latter relied on `ExistsOperator` unconditionally before this
 /// helper existed, which timed out on large outer streams.
+///
+/// `outer_patterns` are the patterns the child evaluates, whose estimate
+/// against the inner body's lets the semijoin choose a seeded build.
 fn build_exists_strategy(
     child: BoxedOperator,
+    outer_patterns: &[Pattern],
     inner_patterns: &[Pattern],
     negated: bool,
     stats: Option<Arc<StatsView>>,
@@ -559,14 +608,24 @@ fn build_exists_strategy(
                 inner_pattern_count = inner_patterns.len(),
                 "exists dispatch",
             );
-            Box::new(SemijoinOperator::new(
+            let estimates = stats.as_deref().map(|s| {
+                (
+                    estimate_outer_rows(outer_patterns, s),
+                    crate::planner::estimate_branch_cardinality(inner_patterns, Some(s)),
+                )
+            });
+            let op = SemijoinOperator::new(
                 child,
                 inner_patterns.to_vec(),
                 key_vars,
                 negated,
                 stats,
                 planning,
-            ))
+            );
+            Box::new(match estimates {
+                Some((outer, inner)) => op.with_estimates(outer, inner),
+                None => op,
+            })
         }
         ExistsStrategy::Exists { reason } => {
             tracing::debug!(
@@ -3067,6 +3126,7 @@ pub fn build_where_operators_seeded_with_needed(
                             if !v_bound_in_outer && !v_appears_later && v_bound_by_inner {
                                 operator = Some(build_exists_strategy(
                                     child,
+                                    &patterns[..i],
                                     inner_patterns,
                                     true,
                                     stats.clone(),
@@ -3172,6 +3232,7 @@ pub fn build_where_operators_seeded_with_needed(
                 let negated = matches!(&patterns[i], Pattern::NotExists(_));
                 operator = Some(build_exists_strategy(
                     child,
+                    &patterns[..i],
                     inner_patterns,
                     negated,
                     stats.clone(),
