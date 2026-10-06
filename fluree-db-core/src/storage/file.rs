@@ -1489,9 +1489,16 @@ impl StorageRead for FileStorage {
                     if is_tmp_artifact(&entry.file_name().to_string_lossy()) {
                         continue;
                     }
-                    // Convert back to relative path from base
+                    // Convert back to relative path from base. An address
+                    // separates with `/` on every platform: a Windows path's
+                    // `\` would name a file no live address matches, which
+                    // a sweep reads as an orphan and deletes.
                     if let Ok(relative) = path.strip_prefix(&self.base_path) {
-                        let relative_str = relative.to_string_lossy().to_string();
+                        let relative_str = relative
+                            .components()
+                            .map(|c| c.as_os_str().to_string_lossy())
+                            .collect::<Vec<_>>()
+                            .join("/");
                         // Check if it matches the file prefix (if any)
                         if file_prefix.is_empty() || relative_str.starts_with(path_prefix) {
                             // Return as fluree:file:// address
@@ -2449,6 +2456,23 @@ mod tests {
 
         let listed = storage.list_prefix("d").await.unwrap();
         assert_eq!(listed, vec!["fluree:file://d/real.json".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_prefix_addresses_separate_with_slashes() {
+        let (_dir, storage) = storage();
+        storage
+            .write_bytes("fluree:file://d/e/real.json", b"v")
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.list_prefix("d").await.unwrap(),
+            vec!["fluree:file://d/e/real.json".to_string()]
+        );
+        assert_eq!(
+            storage.list_prefix("d/e/re").await.unwrap(),
+            vec!["fluree:file://d/e/real.json".to_string()]
+        );
     }
 
     #[tokio::test]
