@@ -101,6 +101,13 @@ fn datatype_of_binding(
     strict: bool,
 ) -> Result<Option<ComparableValue>> {
     match binding {
+        Binding::Lit {
+            val: fluree_db_core::FlakeValue::TripleTerm(_),
+            ..
+        } => Ok(triple_term_datatype(strict)),
+        Binding::EncodedLit { o_kind, .. } if *o_kind == ObjKind::TRIPLE_TERM.as_u8() => {
+            Ok(triple_term_datatype(strict))
+        }
         Binding::Lit { dtc, .. } => Ok(Some(ComparableValue::Sid(dtc.datatype().clone()))),
         // A NUM_BIG `dt_id` reads DECIMAL for overflow integers too; only the
         // decoded value names the datatype (issue #1329).
@@ -182,6 +189,13 @@ fn datatype_of_binding(
     }
 }
 
+/// A triple term is neither literal nor IRI: SPARQL's DATATYPE is a type
+/// error; the JSON-LD surface names the term's kind, as it names `@id` for
+/// an IRI.
+fn triple_term_datatype(strict: bool) -> Option<ComparableValue> {
+    (!strict).then(|| ComparableValue::Sid(fluree_db_core::triple_term_datatype_sid().clone()))
+}
+
 /// Datatype of a computed value (the `DATATYPE(<expr>)` path): the datatype
 /// the value would carry if bound — matching storage/arithmetic tagging
 /// (a plain integer result is `xsd:integer`, RDF 1.1).
@@ -205,6 +219,10 @@ fn datatype_of_comparable(
         ComparableValue::Time(_) => dts.xsd_time.clone(),
         ComparableValue::Vector(_) => dts.fluree_vector.clone(),
         ComparableValue::GeoPoint(_) => dts.geo_wkt_literal.clone(),
+        ComparableValue::TypedLiteral {
+            val: fluree_db_core::FlakeValue::TripleTerm(_),
+            ..
+        } => return Ok(triple_term_datatype(strict)),
         ComparableValue::TypedLiteral { dtc, .. } => match dtc {
             Some(UnresolvedDatatypeConstraint::LangTag(_)) => dts.rdf_lang_string.clone(),
             Some(UnresolvedDatatypeConstraint::Explicit(iri)) => {

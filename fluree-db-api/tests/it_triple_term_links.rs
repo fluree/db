@@ -2748,6 +2748,23 @@ async fn assert_term_values(
     assert_eq!(got.len(), docs, "[{label}] a built term joins: {got:?}");
     let got = run("SELECT ?r WHERE { ?r rdf:reifies ?t }").await;
     assert!(got.is_empty(), "[{label}] a value is not a link: {got:?}");
+    // A triple term is its own kind of term: no literal, IRI or blank node,
+    // and DATATYPE is a type error. Stored and built alike.
+    for source in [
+        "ex:doc ex:mentions ?t",
+        "BIND(TRIPLE(ex:s, ex:p, ex:o) AS ?t)",
+    ] {
+        let got = run(&format!(
+            "SELECT ?lit ?iri ?blank ?dt WHERE {{ {source} BIND(isLITERAL(?t) AS ?lit) \
+             BIND(isIRI(?t) AS ?iri) BIND(isBLANK(?t) AS ?blank) BIND(DATATYPE(?t) AS ?dt) }}"
+        ))
+        .await;
+        assert_eq!(
+            got,
+            strings(&[&["false", "false", "false", "null"]]),
+            "[{label}] {source}"
+        );
+    }
 
     let jsonld = |term: JsonValue| {
         json!({
@@ -2776,6 +2793,31 @@ async fn assert_term_values(
     .await
     .expect("JSON-LD constant term");
     assert_eq!(got, json!([]), "[{label}] another term does not match");
+
+    // JSON-LD's twin: not a literal, and its datatype names the term kind.
+    let got = support::query_jsonld_formatted(
+        fluree,
+        ledger,
+        &json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": ["?lit", "?dt"],
+            "where": [
+                {"@id": "ex:doc", "ex:mentions": "?t"},
+                ["bind", "?lit", "(isLiteral ?t)", "?dt", "(datatype ?t)"]
+            ]
+        }),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("[{label}] JSON-LD term kind: {e}"));
+    assert_eq!(
+        got[0][0],
+        json!(false),
+        "[{label}] JSON-LD isLiteral: {got}"
+    );
+    assert!(
+        got[0][1].to_string().contains("tripleTerm"),
+        "[{label}] JSON-LD datatype: {got}"
+    );
 
     // A term as a JSON-LD `values` cell, twin of SPARQL's `VALUES ?t { <<( … )>> }`.
     let values = |predicate: &str, term: JsonValue| {
@@ -2812,6 +2854,32 @@ async fn assert_term_values(
             "[{label}] JSON-LD values term {term}: {got}"
         );
     }
+}
+
+/// A triple term is not a literal to the indexed literal count either.
+#[tokio::test]
+async fn literal_count_leaves_triple_terms_out() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/triple-term-links:literal-count";
+    fluree
+        .upsert_turtle(
+            support::genesis_ledger(&fluree, ledger_id),
+            "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:name \"x\" .\n\
+             ex:a ex:knows ex:b .\n\
+             ex:doc ex:mentions <<( ex:s ex:p ex:o )>> .\n",
+        )
+        .await
+        .expect("seed");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    let got = run_link_query(
+        &fluree,
+        &ledger,
+        "SELECT (COUNT(?o) AS ?n) WHERE { ?s ?p ?o FILTER(isLITERAL(?o)) }".to_string(),
+    )
+    .await;
+    assert_eq!(got, strings(&[&["1"]]));
 }
 
 /// A triple term is a value under any predicate, not only as a link's

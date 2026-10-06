@@ -2024,9 +2024,10 @@ fn count_literal_rows_from_stats(stats: &fluree_db_core::IndexStats, g_id: Graph
     (literals > 0).then_some(literals)
 }
 
+/// A triple term is neither a node reference nor a literal.
 fn is_literal_otype(ot_u16: u16) -> bool {
     let ot = OType::from_u16(ot_u16);
-    !ot.is_node_ref()
+    !ot.is_node_ref() && ot != OType::TRIPLE_TERM
 }
 
 fn count_literal_rows_psot(store: &BinaryIndexStore, g_id: GraphId) -> Result<u64> {
