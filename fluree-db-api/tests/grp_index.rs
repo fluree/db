@@ -43,3 +43,5 @@ mod it_time_travel_indexing;
 mod it_trigger_index_incremental;
 #[path = "it_typed_literal_index.rs"]
 mod it_typed_literal_index;
+#[path = "it_xsd_double_special_values.rs"]
+mod it_xsd_double_special_values;

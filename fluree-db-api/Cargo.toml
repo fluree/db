@@ -351,6 +351,12 @@ name = "it_geo_search_routing"
 path = "tests/it_geo_search_routing.rs"
 required-features = ["native"]
 
+# Own binary: toggles the fast-path kill switch and asserts routing.
+[[test]]
+name = "it_xsd_double_fast_paths"
+path = "tests/it_xsd_double_fast_paths.rs"
+required-features = ["native"]
+
 # Own binary: toggles the process-global fast-path kill switch.
 [[test]]
 name = "it_datetime_component_presence"

@@ -11168,3 +11168,20 @@ async fn cypher_write_reads_count_against_its_fuel_limit() {
     let fuel = committed.tally.and_then(|t| t.fuel).expect("fuel tallied");
     assert!(fuel > 50.0, "{fuel}");
 }
+
+/// `toFloat` reads a string as Cypher reads a float: `Infinity`, `-Infinity`
+/// and `NaN`, and `inf` in any case, as well as the numerals.
+#[tokio::test]
+async fn cypher_to_float_reads_infinity_and_nan() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, "it/cypher:to-float");
+    let rows = cypher_rows(
+        &fluree,
+        &graphdb_from_ledger(&ledger),
+        r#"RETURN toFloat('Infinity') AS a, toFloat('-Infinity') AS b,
+                  toFloat('NaN') AS c, toFloat('inf') AS d, toFloat('INF') AS e,
+                  toFloat('2.5') AS f"#,
+    )
+    .await;
+    assert_eq!(rows, vec![json!(["INF", "-INF", "NaN", "INF", "INF", 2.5])]);
+}
