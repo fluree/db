@@ -13,6 +13,18 @@ use tokio::runtime::{EnterGuard, Runtime};
 /// How often a waiting query checks its deadline and Python's signals.
 const POLL: Duration = Duration::from_millis(50);
 
+/// The stack of every thread that polls engine futures, as the CLI gives its
+/// runtime. Engine futures nest deeply (most of all in debug builds), past
+/// the 2 MB of a tokio worker or a Windows Python thread; stacks are committed
+/// lazily, so the headroom costs no resident memory.
+const STACK: usize = 8 * 1024 * 1024;
+
+/// The stack a calling thread must have left to poll an engine future itself
+/// rather than on a thread of [`STACK`] size. The main and default threads of
+/// Linux and macOS have it; Windows threads (2 MB) and ones sized down with
+/// `threading.stack_size` do not.
+const INLINE_STACK: usize = 4 * 1024 * 1024;
+
 /// The engine runtime of one process. A forked child inherits its parent's
 /// runtime without the threads that drive it, so a child that uses the engine
 /// starts a runtime of its own (except on macOS; see [`engine`]); the
@@ -47,6 +59,7 @@ fn engine() -> PyResult<&'static Engine> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("fluree-engine")
+        .thread_stack_size(STACK)
         .build()
         .map_err(|e| fluree_error(format!("failed to start the Fluree engine runtime: {e}")))?;
     let engine: &'static Engine = Box::leak(Box::new(Engine { runtime, pid }));
@@ -61,7 +74,10 @@ fn current(pid: u32) -> Option<&'static Engine> {
     (engine.pid == pid).then_some(engine)
 }
 
-/// Run an engine future to completion with the GIL released.
+/// Run an engine future to completion with the GIL released, on a thread of
+/// its own when the calling thread has too little stack left to poll it.
+/// The future is boxed first, since moving it to that thread by value copies
+/// it through several frames of the caller's stack.
 ///
 /// The call cannot be interrupted part way: a signal that arrives meanwhile
 /// (Ctrl-C) is handled by Python as soon as it returns.
@@ -70,8 +86,31 @@ where
     F: Future + Send,
     F::Output: Send,
 {
+    let fut = Box::pin(fut);
     let runtime = &engine()?.runtime;
-    Ok(py.detach(|| runtime.block_on(fut)))
+    if stacker::remaining_stack().is_some_and(|left| left >= INLINE_STACK) {
+        return Ok(py.detach(|| runtime.block_on(fut)));
+    }
+    py.detach(|| {
+        std::thread::scope(|scope| {
+            let worker = spawn_scoped(scope, || runtime.block_on(fut))?;
+            // A panic in the engine resurfaces here, as it would have inline.
+            Ok(worker
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+        })
+    })
+}
+
+fn spawn_scoped<'scope, T: Send + 'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    f: impl FnOnce() -> T + Send + 'scope,
+) -> PyResult<std::thread::ScopedJoinHandle<'scope, T>> {
+    std::thread::Builder::new()
+        .name("fluree-call".into())
+        .stack_size(STACK)
+        .spawn_scoped(scope, f)
+        .map_err(|e| fluree_error(format!("failed to start an engine thread: {e}")))
 }
 
 /// Run a query future that observes `cancellation`, cancelling it at the
@@ -91,14 +130,15 @@ where
     F: Future + Send,
     F::Output: Send,
 {
+    let fut = Box::pin(fut);
     let runtime = &engine()?.runtime;
     let deadline = timeout.map(|t| Instant::now() + t);
     py.detach(|| {
         std::thread::scope(|scope| {
             let (done, finished) = mpsc::sync_channel(1);
-            scope.spawn(move || {
+            spawn_scoped(scope, move || {
                 let _ = done.send(runtime.block_on(fut));
-            });
+            })?;
             let mut interrupted: Option<PyErr> = None;
             loop {
                 match finished.recv_timeout(POLL) {

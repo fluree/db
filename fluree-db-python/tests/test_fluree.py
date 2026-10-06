@@ -225,6 +225,33 @@ def test_threads_query_concurrently(people):
     assert errors == []
 
 
+SMALL_STACK = """
+import threading, fluree
+threading.stack_size(512 * 1024)
+def work():
+    with fluree.connect(":memory:") as conn:
+        ledger = conn.create("t")
+        ledger.insert({"@id": "http://example.org/a", "http://example.org/n": 1})
+        assert len(ledger.query("SELECT ?n WHERE { ?s <http://example.org/n> ?n }")) == 1
+        ledger.query("SELECT ?n WHERE { ?s <http://example.org/n> ?n }", timeout=60)
+thread = threading.Thread(target=work)
+thread.start()
+thread.join()
+print("done")
+"""
+
+
+def test_engine_calls_from_a_thread_with_a_small_stack():
+    # A Python thread's stack can be smaller than the engine needs (2 MB on
+    # Windows); engine calls must not run on it. A subprocess, since an
+    # overflow aborts the process.
+    import subprocess
+    import sys
+
+    run = subprocess.run([sys.executable, "-c", SMALL_STACK], capture_output=True, text=True, timeout=120)
+    assert run.returncode == 0 and run.stdout.strip() == "done", run.stderr[-2000:]
+
+
 def test_bulk_import(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
