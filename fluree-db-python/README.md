@@ -433,7 +433,13 @@ from the same version tags as the CLI; see `docs/contributing/releasing.md`.
 
 ## License
 
-Business Source License 1.1. Embedding Fluree as a component of your own
-application or service is permitted; offering it to third parties as a hosted
-database service is not. Each version converts to the Apache License 2.0 four
-years after its release. See the LICENSE file in the repository root.
+Licensed under the
+[Business Source License 1.1](https://github.com/fluree/db/blob/main/LICENSE),
+with a Change Date to Apache License 2.0 as specified in that file.
+
+In short: you may use Fluree in production for anything except offering
+Fluree itself to others as a hosted or managed database. Building your own
+applications and data products on Fluree is permitted, including publishing a
+dataset you curate with a public, read-only query endpoint. See the
+[License FAQ](https://github.com/fluree/db/blob/main/docs/reference/license-faq.md)
+for details.
