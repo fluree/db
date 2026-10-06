@@ -15,8 +15,9 @@ pytestmark = pytest.mark.skipif(not hasattr(__import__("os"), "fork"), reason="n
 MACOS = sys.platform == "darwin"
 
 SETUP = """
-import os, sys, tempfile, multiprocessing
+import faulthandler, os, sys, tempfile, multiprocessing
 import fluree
+faulthandler.enable()
 EX = "http://example.org/"
 Q = f"PREFIX ex: <{EX}> SELECT ?n WHERE {{ ?s ex:name ?n }}"
 
@@ -51,6 +52,8 @@ def run(tmp_path, body: str) -> list[str]:
     script.write_text(SETUP + '\nif __name__ == "__main__":\n' + main)
     done = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=120)
     assert done.returncode == 0, done.stderr
+    # A child that dies leaves its last words here, shown when a case fails.
+    sys.stderr.write(done.stderr)
     return done.stdout.splitlines()
 
 

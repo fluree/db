@@ -1,4 +1,5 @@
 import datetime as dt
+import sys
 import time
 
 import pytest
@@ -60,7 +61,12 @@ def test_timeout_cancels_a_slow_query(ledger):
     assert len(ledger.query(NAMES)) == 300
 
 
-@pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf"), 1e300, 1e19])
+# 1e19 seconds fits a Duration but overflows a Unix deadline; Windows'
+# clock reaches that far.
+UNIX_ONLY = pytest.mark.skipif(sys.platform == "win32", reason="a deadline that far fits Windows' clock")
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf"), 1e300, pytest.param(1e19, marks=UNIX_ONLY)])
 def test_a_timeout_must_be_positive_and_finite(ledger, timeout):
     for call in (
         lambda: ledger.query(NAMES, timeout=timeout),
