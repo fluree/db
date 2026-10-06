@@ -44,7 +44,7 @@ Available feature flags:
 - `vector` - Embedded vector similarity search (HNSW indexes via usearch)
 - `search-remote-client` - Remote search service client (HTTP client for remote BM25 and vector search services)
 - `aws-testcontainers` - Opt-in LocalStack-backed S3/DynamoDB tests (auto-start via testcontainers)
-- `full` - Convenience bundle: `native`, `credential`, `iceberg`, `sql`, `shacl`, `ipfs`, `graphql` (excludes `delta`, `aws`, `vector`)
+- `full` - Convenience bundle: `native`, `credential`, `iceberg`, `sql`, `shacl`, `ipfs`, `graphql` (excludes `delta`, `aws`, `vector`, `search-remote-client`)
 
 ## Quick Start
 

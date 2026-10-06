@@ -40,8 +40,10 @@ fn every_command_has_an_about() {
 }
 
 /// clap reflows doc comments into paragraphs unless the item carries
-/// `verbatim_doc_comment`, which collapses an indented example block onto the
-/// `Examples:` line. That also blinds `examples_invoke_their_own_command`.
+/// `verbatim_doc_comment`, which collapses an indented example block onto its
+/// header line. Whatever the header (`Examples:`, `Example:`, `Usage:`), the
+/// first invocation then shares a line with it, so `": fluree "` marks the
+/// reflow. That also blinds `examples_invoke_their_own_command`.
 #[test]
 fn example_blocks_keep_their_line_breaks() {
     let mut reflowed = Vec::new();
@@ -56,11 +58,10 @@ fn example_blocks_keep_their_line_breaks() {
                 .filter_map(|a| a.get_long_help())
                 .map(ToString::to_string),
         );
-        if texts
-            .iter()
-            .flat_map(|t| t.lines())
-            .any(|l| l.trim_start().starts_with("Examples:") && l.trim() != "Examples:")
-        {
+        if texts.iter().flat_map(|t| t.lines()).any(|l| {
+            l.contains(": fluree ")
+                || (l.trim_start().starts_with("Examples:") && l.trim() != "Examples:")
+        }) {
             reflowed.push(path);
         }
     }
@@ -83,11 +84,11 @@ fn examples_invoke_their_own_command() {
         let long = long.to_string();
         let mut in_examples = false;
         for line in long.lines().map(str::trim) {
-            if line == "Examples:" {
+            if matches!(line, "Examples:" | "Example:" | "Usage:") {
                 in_examples = true;
             } else if in_examples && line.starts_with("fluree ") {
                 in_examples = false;
-                if !line.starts_with(&own) {
+                if line != own && !line.starts_with(&format!("{own} ")) {
                     stray.push(format!("{path}: {line}"));
                 }
             }
