@@ -69,6 +69,8 @@ jobs:
       - name: Test the wheel on Python 3.10 and 3.14
         shell: bash
         run: |
+          py="${{ steps.py314.outputs.python-path }}"
+          "$py" -c 'import glob, zipfile; names = zipfile.ZipFile(glob.glob("dist/*.whl")[0]).namelist(); assert any(n.endswith(".dist-info/licenses/LICENSE") for n in names), "the wheel carries no LICENSE"'
           for py in "${{ steps.py310.outputs.python-path }}" "${{ steps.py314.outputs.python-path }}"; do
             rm -rf venv && "$py" -m venv venv
             bin=venv/bin; [ "$RUNNER_OS" = Windows ] && bin=venv/Scripts

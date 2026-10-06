@@ -2,7 +2,9 @@
 name = "fluree-db-python"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+# The repository's LICENSE, which maturin puts in the wheel; the license
+# expression (BUSL-1.1) comes from pyproject.toml.
+license-file = "../LICENSE"
 repository.workspace = true
 description = "Native core of the `fluree` Python package"
 # Distributed as the `fluree` wheel (built by maturin), not on crates.io.

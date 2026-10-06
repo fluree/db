@@ -393,6 +393,7 @@ jobs:
           py="${{ steps.py314.outputs.python-path }}"
           "$py" -m pip install "maturin>=1.9,<2"
           "$py" -m maturin build --locked --manifest-path fluree-db-python/Cargo.toml --out dist
+          "$py" -c 'import glob, zipfile; names = zipfile.ZipFile(glob.glob("dist/*.whl")[0]).namelist(); assert any(n.endswith(".dist-info/licenses/LICENSE") for n in names), "the wheel carries no LICENSE"'
 
       - name: Test on Python 3.10 and 3.14
         shell: bash
