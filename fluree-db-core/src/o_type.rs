@@ -347,10 +347,10 @@ impl OType {
         self.0 >= Self::XSD_DOUBLE.0 && self.0 <= Self::XSD_DECIMAL.0
     }
 
-    /// True if this is any numeric type (integer or float, inline only).
+    /// True if this is an inline numeric type (integer, float, or exact decimal).
     #[inline]
     pub const fn is_numeric(self) -> bool {
-        self.is_integer() || self.is_float()
+        self.is_integer() || self.is_float() || self.0 == Self::XSD_DECIMAL_INLINE.0
     }
 
     /// True if this is a temporal type (date/time/dateTime/gYear/etc./durations).
@@ -674,6 +674,9 @@ mod tests {
 
         assert!(OType::XSD_INTEGER.is_numeric());
         assert!(OType::XSD_DOUBLE.is_numeric());
+        assert!(OType::XSD_DECIMAL_INLINE.is_numeric());
+        assert!(!OType::XSD_DECIMAL_INLINE.is_float());
+        assert!(!OType::NUM_BIG_OVERFLOW.is_numeric());
         assert!(!OType::XSD_DATE.is_numeric());
 
         assert!(OType::XSD_DATE.is_temporal());
