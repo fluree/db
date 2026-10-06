@@ -609,7 +609,9 @@ impl Grouping {
 }
 
 /// A post-grouping read of a variable the grouping does not produce (see
-/// [`Grouping::first_ungrouped_read`]).
+/// [`Grouping::first_ungrouped_read`]), or another grouping-stage error about
+/// one variable: an aggregate reading a variable nothing binds, or an
+/// aggregate output that is already bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UngroupedRead {
     /// The variable read.
@@ -636,6 +638,10 @@ pub enum ReadStage {
     UnboundProjection,
     /// An aggregate's input, a variable nothing before grouping binds.
     UnboundAggregateInput,
+    /// An aggregate's output, a variable the WHERE pattern already binds.
+    BoundAggregateOutput,
+    /// An aggregate's output that another aggregate outputs too.
+    RepeatedAggregateOutput,
 }
 
 impl UngroupedRead {
@@ -709,6 +715,18 @@ impl UngroupedRead {
                      query binds it"
                 ),
                 None => "an aggregate reads a variable that nothing in the query binds".to_string(),
+            },
+            ReadStage::BoundAggregateOutput => match read {
+                Some(var) => {
+                    format!("aggregate output variable {var} is already bound in the WHERE pattern")
+                }
+                None => {
+                    "an aggregate output variable is already bound in the WHERE pattern".to_string()
+                }
+            },
+            ReadStage::RepeatedAggregateOutput => match read {
+                Some(var) => format!("variable {var} is the output of more than one aggregate"),
+                None => "a variable is the output of more than one aggregate".to_string(),
             },
         }
     }

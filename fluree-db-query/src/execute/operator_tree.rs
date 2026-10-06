@@ -3417,6 +3417,12 @@ pub(crate) fn bindable_sort_keys<'a>(
     )
 }
 
+/// A grouping-stage plan error about one variable, typed so callers holding
+/// the query's registry name the variable (`QueryError::name_variables`).
+fn grouping_var_error(var: VarId, stage: crate::ir::ReadStage) -> QueryError {
+    QueryError::UngroupedRead(crate::ir::UngroupedRead { var, stage })
+}
+
 /// Apply the SPARQL solution-modifier tail to an already-built WHERE operator.
 ///
 /// Shared by the top-level query pipeline (`build_operator_tree_inner`) and the
@@ -3669,30 +3675,28 @@ pub(crate) fn apply_solution_modifiers(
         for spec in &aggregates_vec {
             if let Some(input_var) = spec.function.input_var() {
                 if !current_schema.contains(&input_var) {
-                    // Typed so callers holding the registry name the variable
-                    // (`QueryError::name_variables`).
-                    return Err(QueryError::UngroupedRead(crate::ir::UngroupedRead {
-                        var: input_var,
-                        stage: crate::ir::ReadStage::UnboundAggregateInput,
-                    }));
+                    return Err(grouping_var_error(
+                        input_var,
+                        crate::ir::ReadStage::UnboundAggregateInput,
+                    ));
                 }
                 if spec.output_var != input_var && current_schema.contains(&spec.output_var) {
-                    return Err(QueryError::InvalidQuery(format!(
-                        "Aggregate output variable {:?} already exists in schema",
-                        spec.output_var
-                    )));
+                    return Err(grouping_var_error(
+                        spec.output_var,
+                        crate::ir::ReadStage::BoundAggregateOutput,
+                    ));
                 }
             } else if current_schema.contains(&spec.output_var) {
-                return Err(QueryError::InvalidQuery(format!(
-                    "Aggregate output variable {:?} already exists in schema",
-                    spec.output_var
-                )));
+                return Err(grouping_var_error(
+                    spec.output_var,
+                    crate::ir::ReadStage::BoundAggregateOutput,
+                ));
             }
             if !seen_output_vars.insert(spec.output_var) {
-                return Err(QueryError::InvalidQuery(format!(
-                    "Duplicate aggregate output variable {:?}",
-                    spec.output_var
-                )));
+                return Err(grouping_var_error(
+                    spec.output_var,
+                    crate::ir::ReadStage::RepeatedAggregateOutput,
+                ));
             }
         }
 

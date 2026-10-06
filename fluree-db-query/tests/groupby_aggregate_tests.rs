@@ -707,7 +707,8 @@ async fn test_aggregate_output_onto_group_by_key_errors() {
         .await
         .unwrap_err();
     assert!(
-        err.to_string().contains("already exists in schema"),
+        err.to_string()
+            .contains("is already bound in the WHERE pattern"),
         "unexpected error: {err}"
     );
 }

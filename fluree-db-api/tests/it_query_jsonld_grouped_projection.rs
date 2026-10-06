@@ -598,26 +598,49 @@ async fn jsonld_values_reach_generated_binds() {
     );
 }
 
-/// The JSON-LD twin of `aggregate_over_a_variable_nothing_binds_is_a_named_error`.
+/// The JSON-LD twin of `aggregate_over_a_variable_nothing_binds_is_a_named_error`,
+/// with the aggregate-output errors SPARQL's validator catches first (JSON-LD
+/// reaches the plan-time check): each names its variable, a 400. They printed
+/// `Aggregate output variable VarId(n) already exists in schema` and
+/// `Duplicate aggregate output variable VarId(n)`.
 #[tokio::test]
-async fn jsonld_aggregate_over_a_variable_nothing_binds_is_a_named_error() {
+async fn jsonld_aggregate_variable_errors_name_the_variable() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = seed_areas(&fluree, "jsonld-grouped/aggregate-nosuch:main").await;
-    let query = json!({
-        "@context": {"ex": "http://example.org/"},
-        "select": ["(as (sum ?nosuch) ?s)"],
-        "where": {"@id": "?e", "ex:area": "?a"}
-    });
-    let Err(err) = support::query_jsonld(&fluree, &ledger, &query).await else {
-        panic!("an aggregate over a variable nothing binds must fail");
-    };
-    let message = err.to_string();
-    assert!(
-        message.contains("an aggregate reads variable ?nosuch, which is unbound"),
-        "{message}"
-    );
-    assert!(!message.contains("VarId("), "{message}");
-    assert_eq!(err.status_code(), 400, "{message}");
+    let ledger = seed_areas(&fluree, "jsonld-grouped/aggregate-variable-errors:main").await;
+    let cases = [
+        (
+            json!(["(as (sum ?nosuch) ?s)"]),
+            None,
+            "an aggregate reads variable ?nosuch, which is unbound",
+        ),
+        (
+            json!(["?a", "(as (count ?e) ?a)"]),
+            Some("?a"),
+            "aggregate output variable ?a is already bound in the WHERE pattern",
+        ),
+        (
+            json!(["?a", "(as (count ?e) ?n)", "(as (sum ?e) ?n)"]),
+            Some("?a"),
+            "variable ?n is the output of more than one aggregate",
+        ),
+    ];
+    for (select, group_by, says) in cases {
+        let mut query = json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": select,
+            "where": {"@id": "?e", "ex:area": "?a"}
+        });
+        if let Some(key) = group_by {
+            query["groupBy"] = json!(key);
+        }
+        let Err(err) = support::query_jsonld(&fluree, &ledger, &query).await else {
+            panic!("must fail: {query}");
+        };
+        let message = err.to_string();
+        assert!(message.contains(says), "{query}: {message}");
+        assert!(!message.contains("VarId("), "{query}: {message}");
+        assert_eq!(err.status_code(), 400, "{query}: {message}");
+    }
 }
 
 /// `groupBy` / `having` group an `ask`: it is true when some group passes

@@ -5534,6 +5534,12 @@ async fn shacl_sparql_constraint_failure_follows_severity_and_mode() {
              GROUP BY $this HAVING (SUM(?nosuch) > 0)",
             "an aggregate reads variable ?nosuch, which is unbound",
         ),
+        (
+            "output",
+            "SELECT $this (MIN(?s) AS ?m) (MAX(?s) AS ?m) \
+             WHERE { $this <http://example.org/ns/score> ?s } GROUP BY $this",
+            "variable ?m is the output of more than one aggregate",
+        ),
     ];
     // (severity, warn-mode graph, the write commits)
     let cells = [

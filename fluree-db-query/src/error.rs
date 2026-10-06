@@ -44,7 +44,9 @@ pub enum QueryError {
     InvalidQuery(String),
 
     /// An invalid query (the plan-time grouped-read check): after grouping, a
-    /// stage reads a variable the grouping neither keys, aggregates nor binds.
+    /// stage reads a variable the grouping neither keys, aggregates nor binds;
+    /// or an aggregate reads a variable nothing binds, or outputs one that is
+    /// already bound.
     ///
     /// Typed rather than [`Self::InvalidQuery`] because the planner has no
     /// variable names: it carries the variable's id, and
