@@ -54,7 +54,7 @@ Every annotation pattern reads the link. Reified-triple patterns (`<< s p o ~ ?r
 
 Annotation syntax (`s p o ~ ?r {| ... |}`, JSON-LD `@annotation`, Cypher relationship properties) keeps its `Pattern::EdgeAnnotation` through lowering, and `expand_edge_annotation_patterns_for` (`where_plan.rs`) expands it at planning into the body, the link with its term components (`link_patterns`), and the base edge: the annotation syntax asserts its triple, so a reifier of an unasserted triple must not match it. The base edge comes last in the chain, so where estimates tie it is a bound existence probe. The chain is wrapped in `Pattern::DefaultGraphSource` only when the default graph is a union of two or more graphs (`PlanningContext::default_graph_union`).
 
-A reified-triple pattern names its triple without joining it, so visibility is checked on the term: `QueryPolicyEnforcer` lets a flake whose object is a triple term through only when the triple that term names would be visible, recursively for nested terms. A policy hiding `ex:worksFor` therefore hides the links to `ex:worksFor` edges on every route.
+A reified-triple pattern names its triple without joining it, so visibility is checked on the term: `QueryPolicyEnforcer` lets a flake whose object is a triple term through only when the triple that term names would be visible, recursively for nested terms. A policy hiding `ex:worksFor` therefore hides the links to `ex:worksFor` edges on every route. The scan and probe lanes do no per-flake filtering, so under a view policy that restricts anything they decline any predicate whose objects may be triple terms: `rdf:reifies`, and any predicate whose observed datatypes include the untagged kind triple terms carry, or are unknown (`cursor_fast_path_for_predicate`).
 
 A link is ordinary data: wildcard scans (`?s ?p ?o`) and wildcard hydration return it like any triple, and hydration renders its triple term as an embedded node. An `@annotation` body leaves its reifier's link out, since the body hangs from it, and so do Cypher property maps, where the link is the relationship itself.
 
@@ -66,7 +66,7 @@ Earlier releases stored an annotation as an `f:reifies*` bundle (`f:reifiesSubje
 
 Index roots from those releases may also carry an annotation-arena section. Readers skip it, keeping only the arena's two branch CIDs, and the next index build releases the arena's blobs as garbage.
 
-An annotated index built before links has no term dictionary. Link reads on it fail asking for a rebuild (`fluree reindex`) rather than answering without its annotations. An incremental build over it declines once its window holds a triple term — a term dictionary covering the window alone would lift that refusal — and the index build falls back to a full rebuild, which links every annotation in history.
+An annotated index built before links has no term dictionary, and its snapshot says so (`LedgerSnapshot::needs_link_reindex`), so a host can schedule the rebuild. Every read of its annotations fails asking for a rebuild (`fluree reindex`, or `Fluree::reindex`) rather than answering without them: link queries, export, and hydration's `@annotation` (`require_link_index`). An incremental build over it declines once its window holds a triple term — a term dictionary covering the window alone would lift that refusal — and the index build falls back to a full rebuild, which links every annotation in history.
 
 ## See also
 

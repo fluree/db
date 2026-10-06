@@ -289,6 +289,7 @@ The two forms differ in visibility: an anonymous annotation is an edge property 
 | Visible in `select: "*"` | No — hidden from wildcard subject expansion | Yes |
 | Visible in graph crawl | Only via `@annotation` projection | Yes, like any subject |
 | Retract base edge → link and body removed | Only in LPG mode | Only in LPG mode |
+| Re-assert a retracted edge → earlier claims return | Yes, outside LPG mode; remove them through `@reifies` or `<< s p o ~ ?r >>` | Yes, outside LPG mode; delete the reifier's triples |
 
 The anonymous-hide rule means a user wildcard query against Alice doesn't suddenly start returning a sea of internal annotation SIDs once you adopt edge metadata. Annotations participate in queries that ask for them and stay out of the way otherwise.
 

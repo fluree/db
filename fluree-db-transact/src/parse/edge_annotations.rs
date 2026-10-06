@@ -90,8 +90,8 @@ pub(crate) enum ReifiedObjectShape {
         /// `value.get("@type")`.
         value: Value,
         /// `@language` payload if explicit. Drives `f:reifiesLang`
-        /// emission — required so `EdgeKey::from_reifies_facts` decodes
-        /// to the same `lang` the base flake carries via `flake.m.lang`.
+        /// emission — required so the link `fold_slots_into_links` builds
+        /// names the same `lang` the base flake carries via `flake.m.lang`.
         language: Option<String>,
     },
     /// Object is a triple term: the node naming its triple,
@@ -345,8 +345,8 @@ pub(crate) fn classify_reified_object(map: &Map<String, Value>) -> Result<Reifie
 }
 
 /// Build the JSON payload for `f:reifiesObject` plus the optional
-/// `f:reifiesLang` companion. Mirrors [`EdgeKey::to_reifies_facts`]
-/// so writers and the binary decoder agree on bundle shape.
+/// `f:reifiesLang` companion, which [`fold_slots_into_links`] reads back
+/// into the link's triple term.
 ///
 /// Returns `(object_payload, lang)`:
 /// - `Iri` → `({"@id": "..."}, None)`
@@ -1395,10 +1395,10 @@ fn build_annotation_sibling(
 
     // f:reifiesObject and (optional) f:reifiesLang. For a literal
     // object, the value payload is the canonical value-object built by
-    // the classifier; `EdgeKey::from_reifies_facts` derives `lang` from
-    // a separate `f:reifiesLang` flake, so language-tagged literals
-    // MUST emit it explicitly — otherwise the decoded EdgeKey would
-    // not match the writer's base-edge EdgeKey.
+    // the classifier; `fold_slots_into_links` takes the term's `lang`
+    // from a separate `f:reifiesLang` slot, so language-tagged literals
+    // MUST emit it explicitly — otherwise the link's term would not
+    // name the base edge.
     let (object_payload, lang_payload) = emit_reifies_object_payload(object);
     ann_map.insert(reifies_iris::OBJECT.to_string(), object_payload);
     if let Some(lang) = lang_payload {
@@ -1406,9 +1406,8 @@ fn build_annotation_sibling(
     }
 
     // f:reifiesGraph — emitted iff the reified edge lives in a named
-    // graph. Default-graph edges omit it (absence = default), which
-    // matches the encoding in `EdgeKey::to_reifies_facts` and the
-    // bundle validator's "at most one" rule for `f:reifiesGraph`.
+    // graph. Default-graph edges omit it (absence = default);
+    // `fold_slots_into_links` puts the link in its template's graph.
     //
     // The synthetic annotation node *also* lives in the same named
     // graph as the edge it reifies, so we set its own `@graph`
@@ -1422,10 +1421,7 @@ fn build_annotation_sibling(
 
     // f:reifiesDatatype is intentionally omitted at lowering time —
     // we don't know the object's datatype before JSON-LD expansion.
-    // The decoder treats it as optional and derives the canonical
-    // datatype from the flake-level `dt` of `f:reifiesObject`. The
-    // in-Rust `EdgeKey::to_reifies_facts` builder still emits both
-    // for diagnostic clarity.
+    // `fold_slots_into_links` takes it from the `f:reifiesObject` value.
 
     Ok(Some(Value::Object(ann_map)))
 }
@@ -2981,8 +2977,8 @@ mod tests {
             sibling.get(reifies_iris::OBJECT).unwrap(),
             &json!({"@value": "chat", "@language": "fr"})
         );
-        // f:reifiesLang explicit — required for EdgeKey::from_reifies_facts
-        // to decode the same `lang` the base flake carries via flake.m.lang.
+        // f:reifiesLang explicit — required for the folded link to name
+        // the same `lang` the base flake carries via flake.m.lang.
         assert_eq!(sibling.get(reifies_iris::LANG).unwrap(), &json!("fr"));
     }
 
@@ -3426,9 +3422,7 @@ mod tests {
     #[test]
     fn annotation_in_default_graph_omits_reifies_graph() {
         // Default-graph edges encode "default" as the *absence* of
-        // `f:reifiesGraph` — matching the bundle validator's
-        // "at most one" rule and `EdgeKey::from_reifies_facts`'s
-        // None-means-default semantics.
+        // `f:reifiesGraph`.
         let doc = json!({
             "@id": "ex:alice",
             "ex:worksFor": {
