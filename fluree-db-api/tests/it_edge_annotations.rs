@@ -4959,7 +4959,7 @@ async fn policy_hiding_base_edge_blocks_annotation_rooted_query() {
 
 /// A link `r rdf:reifies <<( s p o )>>` names its triple, so a policy hiding
 /// the triple hides the link on every route to it, not only `@reifies`, and so
-/// does a triple term held under any other predicate. Checked from novelty, from
+/// does a triple term held under any other predicate, a schema one included. Checked from novelty, from
 /// an index (where the scan and probe lanes run), and from novelty over one.
 #[tokio::test]
 async fn policy_hiding_base_edge_hides_its_link() {
@@ -4978,7 +4978,9 @@ async fn policy_hiding_base_edge_hides_its_link() {
             },
             {
                 "@id": "ex:doc",
-                "ex:mentions": {"@id": {"@id": "ex:bob", "ex:worksFor": {"@id": "ex:initech"}}}
+                "ex:mentions": {"@id": {"@id": "ex:bob", "ex:worksFor": {"@id": "ex:initech"}}},
+                "http://www.w3.org/2000/01/rdf-schema#range":
+                    {"@id": {"@id": "ex:dan", "ex:worksFor": {"@id": "ex:umbrella"}}}
             }
         ]
     });
@@ -5044,6 +5046,13 @@ async fn policy_hiding_base_edge_hides_its_link() {
                 (
                     format!("SELECT ?s ?o WHERE {{ ?d {mentions_iri} <<( ?s {works_for} ?o )>> }}"),
                     mentions,
+                ),
+                // A schema predicate's exemption does not cover the term.
+                (
+                    "SELECT ?s WHERE { ?d <http://www.w3.org/2000/01/rdf-schema#range> ?t \
+                     BIND(SUBJECT(?t) AS ?s) }"
+                        .to_string(),
+                    1,
                 ),
             ] {
                 let count = |db: fluree_db_api::GraphDb| {

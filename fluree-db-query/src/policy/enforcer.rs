@@ -136,15 +136,17 @@ impl QueryPolicyEnforcer {
         let mut result = Vec::with_capacity(flakes.len());
 
         for flake in flakes {
-            // Schema flakes always allowed
-            if is_schema_flake(&flake.p, &flake.o) {
-                result.push(flake);
-                continue;
-            }
+            // A term names its triple even under a schema predicate, so it is
+            // checked before the schema exemption.
             if !self
                 .term_visible(g_id, to_t, &flake.o, &executor, tracker)
                 .await?
             {
+                continue;
+            }
+            // Schema flakes always allowed
+            if is_schema_flake(&flake.p, &flake.o) {
+                result.push(flake);
                 continue;
             }
 
@@ -198,20 +200,21 @@ impl QueryPolicyEnforcer {
             return Ok(true);
         }
 
-        // Schema flakes always allowed
-        if is_schema_flake(&flake.p, &flake.o) {
-            return Ok(true);
-        }
-
         // Create executor using the GRAPH's snapshot/overlay/to_t
         let executor = QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t);
         self.cache_term_subject_classes(snapshot, g_id, overlay, to_t, std::slice::from_ref(flake))
             .await?;
+        // Before the schema exemption: a term names its triple under any predicate.
         if !self
             .term_visible(g_id, to_t, &flake.o, &executor, tracker)
             .await?
         {
             return Ok(false);
+        }
+
+        // Schema flakes always allowed
+        if is_schema_flake(&flake.p, &flake.o) {
+            return Ok(true);
         }
 
         // Get subject classes from cache
