@@ -327,11 +327,11 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 Ok(FlakeValue::Long(i))
             }
             xsd::DECIMAL => parse_decimal_value(value, datatype.span),
+            // The write surfaces' parser, so a query literal accepts exactly
+            // the XSD lexical forms a transaction does.
             xsd::DOUBLE | xsd::FLOAT => {
-                let d: f64 = value
-                    .parse()
-                    .map_err(|_| LowerError::invalid_decimal(value, datatype.span))?;
-                Ok(FlakeValue::Double(d))
+                fluree_db_core::coerce::coerce_string_value(value, dt_iri.as_str())
+                    .map_err(|_| LowerError::invalid_decimal(value, datatype.span))
             }
             xsd::BOOLEAN => {
                 let b = value == "true" || value == "1";

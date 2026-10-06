@@ -12,6 +12,10 @@
 //! through these helpers so Fluree emits one consistent, spec-aligned form.
 //! JSON-LD (and other JSON-native typed output) is deliberately excluded:
 //! there a double is a native JSON number, never a lexical string.
+//!
+//! The reverse direction, lexical form to value, is [`parse_xsd_double`] and
+//! [`parse_xsd_float`]: the one definition of which spellings are `xsd:double`
+//! and `xsd:float` lexical forms.
 
 use std::fmt::{self, Write as _};
 
@@ -216,6 +220,62 @@ pub fn write_canonical_xsd_double(out: &mut Vec<u8>, d: f64) {
     out.extend_from_slice(buf.as_bytes());
 }
 
+/// The value of an `xsd:double` lexical form, or `None` when the string is not
+/// in the lexical space (XSD 1.1 Part 2 §3.3.5).
+///
+/// The lexical space is the numerals (`1`, `-1.5`, `.5`, `1.`, `+1.5E-3`) and
+/// the four special spellings `INF`, `+INF`, `-INF` and `NaN`. A numeral too
+/// large in magnitude for a double maps to `INF` / `-INF`, as XSD 1.1's rounding
+/// rule prescribes. Anything else is not an `xsd:double` lexical form:
+/// `inf`, `Infinity`, `nan`, a signed `NaN`, or surrounding whitespace.
+///
+/// Every place that turns an `xsd:double` or `xsd:float` lexical form into a
+/// value should go through this function or [`parse_xsd_float`], so that every
+/// write and query surface accepts the same set of spellings.
+#[must_use]
+pub fn parse_xsd_double(lexical: &str) -> Option<f64> {
+    match special_value(lexical) {
+        Some(special) => Some(special),
+        None if is_numeral_alphabet(lexical) => lexical.parse::<f64>().ok(),
+        None => None,
+    }
+}
+
+/// [`parse_xsd_double`] for `xsd:float` (XSD 1.1 Part 2 §3.3.4): the same
+/// lexical space, mapped to the nearest single-precision value. A numeral
+/// beyond the single-precision range maps to `INF` / `-INF`.
+#[must_use]
+pub fn parse_xsd_float(lexical: &str) -> Option<f32> {
+    match special_value(lexical) {
+        Some(special) => Some(special as f32),
+        None if is_numeral_alphabet(lexical) => lexical.parse::<f32>().ok(),
+        None => None,
+    }
+}
+
+/// The four special spellings of the `xsd:double` / `xsd:float` lexical space.
+fn special_value(lexical: &str) -> Option<f64> {
+    match lexical {
+        "INF" | "+INF" => Some(f64::INFINITY),
+        "-INF" => Some(f64::NEG_INFINITY),
+        "NaN" => Some(f64::NAN),
+        _ => None,
+    }
+}
+
+/// Whether every byte can occur in an XSD numeral: a digit, a sign, the
+/// decimal point or an exponent marker.
+///
+/// Rust's float grammar is XSD's numeral grammar plus the words `inf`,
+/// `infinity` and `nan` in any case. Those words are the only accepted inputs
+/// that contain any other byte, so a string that passes this check is accepted
+/// by Rust's parser exactly when it is an XSD numeral.
+fn is_numeral_alphabet(lexical: &str) -> bool {
+    lexical
+        .bytes()
+        .all(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'e' | b'E'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +392,96 @@ mod tests {
             let parsed: f32 = canonical_xsd_float(input).parse().expect("parse back");
             assert_eq!(parsed.to_bits(), input.to_bits(), "round trip of {input:?}");
         }
+    }
+
+    #[test]
+    fn parse_accepts_the_xsd_lexical_space() {
+        let cases: &[(&str, f64)] = &[
+            ("1", 1.0),
+            ("-1", -1.0),
+            ("+1", 1.0),
+            ("1.5", 1.5),
+            ("-1.5", -1.5),
+            (".5", 0.5),
+            ("1.", 1.0),
+            ("1.5E3", 1500.0),
+            ("1.5e3", 1500.0),
+            ("1.5E+3", 1500.0),
+            ("-1.5E-3", -0.0015),
+            ("1E0", 1.0),
+            ("0", 0.0),
+            ("-0", -0.0),
+            ("INF", f64::INFINITY),
+            ("+INF", f64::INFINITY),
+            ("-INF", f64::NEG_INFINITY),
+        ];
+        for &(lexical, expected) in cases {
+            let parsed = parse_xsd_double(lexical).unwrap_or_else(|| panic!("{lexical} parses"));
+            assert_eq!(parsed.to_bits(), expected.to_bits(), "{lexical}");
+            let parsed = parse_xsd_float(lexical).unwrap_or_else(|| panic!("{lexical} parses"));
+            assert_eq!(parsed.to_bits(), (expected as f32).to_bits(), "{lexical}");
+        }
+        assert!(parse_xsd_double("NaN").is_some_and(f64::is_nan));
+        assert!(parse_xsd_float("NaN").is_some_and(f32::is_nan));
+    }
+
+    #[test]
+    fn parse_maps_out_of_range_numerals_to_infinity() {
+        assert_eq!(parse_xsd_double("1e400"), Some(f64::INFINITY));
+        assert_eq!(parse_xsd_double("-1e400"), Some(f64::NEG_INFINITY));
+        assert_eq!(parse_xsd_float("3.5e38"), Some(f32::INFINITY));
+        assert_eq!(parse_xsd_float("-3.5e38"), Some(f32::NEG_INFINITY));
+        // Below the smallest subnormal: rounds to zero, keeping the sign.
+        assert_eq!(parse_xsd_double("1e-400").map(f64::to_bits), Some(0));
+    }
+
+    #[test]
+    fn parse_refuses_spellings_outside_the_lexical_space() {
+        for lexical in [
+            "inf",
+            "Inf",
+            "-inf",
+            "+inf",
+            "infinity",
+            "Infinity",
+            "-Infinity",
+            "INFINITY",
+            "nan",
+            "NAN",
+            "-NaN",
+            "+NaN",
+            "",
+            " 1",
+            "1 ",
+            " INF",
+            "1.5f",
+            "0x10",
+            "1_000",
+            ".",
+            "e5",
+            "1e",
+            "1e+",
+            "--1",
+            "1.2.3",
+            "abc",
+        ] {
+            assert_eq!(parse_xsd_double(lexical), None, "{lexical:?}");
+            assert_eq!(parse_xsd_float(lexical), None, "{lexical:?}");
+        }
+    }
+
+    #[test]
+    fn parse_reads_back_every_canonical_form() {
+        for &(input, canonical) in CASES {
+            let parsed = parse_xsd_double(canonical).expect("canonical form parses");
+            assert_eq!(parsed.to_bits(), input.to_bits(), "{canonical}");
+        }
+        for special in [f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                parse_xsd_double(&canonical_xsd_double(special)),
+                Some(special)
+            );
+        }
+        assert!(parse_xsd_double(&canonical_xsd_double(f64::NAN)).is_some_and(f64::is_nan));
     }
 }

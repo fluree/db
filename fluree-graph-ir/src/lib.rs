@@ -55,6 +55,6 @@ pub use sink::{GraphCollectorSink, GraphSink, SinkError, SinkResult, TermId};
 pub use term::{BlankId, LiteralValue, Term};
 pub use triple::Triple;
 pub use xsd_double::{
-    canonical_xsd_double, canonical_xsd_float, push_canonical_xsd_double,
-    write_canonical_xsd_double, XsdFloat,
+    canonical_xsd_double, canonical_xsd_float, parse_xsd_double, parse_xsd_float,
+    push_canonical_xsd_double, write_canonical_xsd_double, XsdFloat,
 };

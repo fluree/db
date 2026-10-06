@@ -1262,10 +1262,9 @@ pub fn parse_double(value: &serde_json::Value) -> Result<FlakeValue, String> {
                 Err("Cannot convert to double".to_string())
             }
         }
-        serde_json::Value::String(s) => s
-            .parse::<f64>()
+        serde_json::Value::String(s) => fluree_graph_ir::parse_xsd_double(s)
             .map(FlakeValue::Double)
-            .map_err(|e| format!("Invalid double '{s}': {e}")),
+            .ok_or_else(|| format!("Invalid double '{s}': not an xsd:double lexical form")),
         _ => Err("Expected number or string for double".to_string()),
     }
 }

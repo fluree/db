@@ -746,8 +746,11 @@ pub(crate) fn flake_value_to_numeric(val: &FlakeValue) -> Option<NumericValue> {
 /// precision — see `eval/cast.rs`), so SUM/AVG/etc. would otherwise silently
 /// drop it (`flake_value_to_numeric` has no `String` arm) and return unbound.
 /// Parse the string when the literal's datatype is a numeric XSD type. Yields
-/// `Double` (f64 is exact for f32-sourced values); NaN is dropped like other
-/// non-finite aggregate inputs.
+/// `Double` (f64 is exact for f32-sourced values).
+///
+/// Only the `xsd:double` lexical space is read, so a string that is not a
+/// number of the datatype (`"inf"`, or `"NaN"` under `xsd:decimal`, which has
+/// no NaN) is not numeric and makes SUM/AVG a type error.
 fn string_lit_to_numeric(
     val: &FlakeValue,
     dtc: &fluree_db_core::DatatypeConstraint,
@@ -755,11 +758,17 @@ fn string_lit_to_numeric(
     let FlakeValue::String(s) = val else {
         return None;
     };
-    if !is_numeric_xsd_datatype(dtc.datatype()) {
+    let dt = dtc.datatype();
+    if !is_numeric_xsd_datatype(dt) {
         return None;
     }
-    let d = s.parse::<f64>().ok()?;
-    (!d.is_nan()).then_some(NumericValue::Double(d))
+    let d = fluree_graph_ir::parse_xsd_double(s)?;
+    let floating = dt.namespace_code == fluree_vocab::namespaces::XSD
+        && matches!(
+            dt.name.as_ref(),
+            fluree_vocab::xsd_names::FLOAT | fluree_vocab::xsd_names::DOUBLE
+        );
+    (floating || d.is_finite()).then_some(NumericValue::Double(d))
 }
 
 /// Whether `sid` is a numeric XSD datatype (the family that should accumulate
@@ -1178,6 +1187,38 @@ mod tests {
         let (val, dt) = result.as_lit().expect("empty AVG must be a literal 0");
         assert_eq!(*val, FlakeValue::Long(0));
         assert_eq!(dt.datatype(), &xsd_integer());
+    }
+
+    #[test]
+    fn test_agg_sum_reads_string_backed_numbers_in_the_xsd_lexical_space() {
+        let typed = |s: &str, dt: Sid| Binding::lit(FlakeValue::String(s.to_string()), dt);
+        let xsd_float = || {
+            Sid::new(
+                fluree_vocab::namespaces::XSD,
+                fluree_vocab::xsd_names::FLOAT,
+            )
+        };
+        // The query-time xsd:float cast is string-backed; its special values
+        // are numbers.
+        let sum = agg_sum(&[typed("NaN", xsd_float()), typed("1.5", xsd_float())]);
+        assert!(matches!(sum.as_lit(), Some((FlakeValue::Double(d), _)) if d.is_nan()));
+        // A spelling outside the lexical space is not a number, and neither is
+        // a special value under a datatype without one: SUM is a type error.
+        for value in [
+            typed("inf", xsd_double()),
+            typed("Infinity", xsd_float()),
+            typed("NaN", xsd_decimal()),
+            typed("INF", xsd_integer()),
+        ] {
+            let values = [
+                value.clone(),
+                Binding::lit(FlakeValue::Long(1), xsd_integer()),
+            ];
+            assert!(
+                matches!(agg_sum(&values), Binding::Unbound),
+                "{value:?} must not be summed"
+            );
+        }
     }
 
     #[test]

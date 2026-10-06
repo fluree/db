@@ -309,7 +309,7 @@ pub fn coerce_value(value: FlakeValue, datatype_iri: &str) -> CoercionResult<Fla
 
         // String → Double/Float
         (FlakeValue::String(s), dt) if dt == xsd::DOUBLE || dt == xsd::FLOAT => {
-            parse_string_to_double(s)
+            parse_string_to_double(s, dt)
         }
 
         // String → DateTime
@@ -469,7 +469,7 @@ pub fn coerce_string_value(s: &str, datatype_iri: &str) -> CoercionResult<FlakeV
             .map_err(|_| CoercionError::parse_failed(s, "xsd:decimal", None)),
 
         // Double/Float
-        xsd::DOUBLE | xsd::FLOAT => parse_string_to_double(s),
+        xsd::DOUBLE | xsd::FLOAT => parse_string_to_double(s, datatype_iri),
 
         // Boolean
         xsd::BOOLEAN => match s {
@@ -786,17 +786,26 @@ fn parse_string_to_integer(s: &str, datatype_iri: &str) -> CoercionResult<FlakeV
     ))
 }
 
-/// Parse a string to a double value
-fn parse_string_to_double(s: &str) -> CoercionResult<FlakeValue> {
-    let parsed = match s {
-        "INF" | "+INF" => Ok(f64::INFINITY),
-        "-INF" => Ok(f64::NEG_INFINITY),
-        "NaN" => Ok(f64::NAN),
-        _ => s.parse::<f64>(),
-    };
-    parsed
+/// Parse an `xsd:double` or `xsd:float` lexical form to a double value.
+///
+/// Only the XSD lexical space is accepted ([`fluree_graph_ir::parse_xsd_double`]):
+/// numerals plus `INF`, `+INF`, `-INF` and `NaN`. Other spellings such as `inf`,
+/// `Infinity` or `nan` are not lexical forms of either datatype.
+fn parse_string_to_double(s: &str, datatype_iri: &str) -> CoercionResult<FlakeValue> {
+    fluree_graph_ir::parse_xsd_double(s)
         .map(FlakeValue::Double)
-        .map_err(|_| CoercionError::parse_failed(s, "xsd:double", None))
+        .ok_or_else(|| {
+            let target = if datatype_iri == xsd::FLOAT {
+                "xsd:float"
+            } else {
+                "xsd:double"
+            };
+            CoercionError::parse_failed(
+                s,
+                target,
+                Some("expected a numeral such as 1.5 or 1.5E3, or INF, +INF, -INF or NaN"),
+            )
+        })
 }
 
 /// Validate that an i64 value is within range for the target integer datatype
@@ -1001,6 +1010,40 @@ mod tests {
         let result = coerce_value(FlakeValue::BigInt(Box::new(big)), xsd::DOUBLE);
         assert!(result.is_ok());
         assert!(matches!(result.unwrap(), FlakeValue::Double(_)));
+    }
+
+    #[test]
+    fn test_coerce_double_special_spellings() {
+        for dt in [xsd::DOUBLE, xsd::FLOAT] {
+            for (lexical, expected) in [
+                ("INF", f64::INFINITY),
+                ("+INF", f64::INFINITY),
+                ("-INF", f64::NEG_INFINITY),
+                ("1e400", f64::INFINITY),
+                ("-1e400", f64::NEG_INFINITY),
+            ] {
+                assert!(
+                    matches!(coerce_string_value(lexical, dt), Ok(FlakeValue::Double(d)) if d == expected),
+                    "{lexical}^^{dt}"
+                );
+            }
+            assert!(matches!(
+                coerce_string_value("NaN", dt),
+                Ok(FlakeValue::Double(d)) if d.is_nan()
+            ));
+        }
+    }
+
+    #[test]
+    fn test_coerce_double_refuses_non_xsd_spellings() {
+        for dt in [xsd::DOUBLE, xsd::FLOAT] {
+            for lexical in ["inf", "-inf", "Infinity", "-Infinity", "nan", "NAN", "-NaN"] {
+                let err = coerce_string_value(lexical, dt).expect_err(lexical);
+                assert!(err.message.contains("Cannot parse"), "{}", err.message);
+                let via_value = coerce_value(FlakeValue::String(lexical.to_string()), dt);
+                assert!(via_value.is_err(), "{lexical}^^{dt}");
+            }
+        }
     }
 
     // -------------------------------------------------------------------
