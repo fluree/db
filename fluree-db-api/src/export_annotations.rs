@@ -139,7 +139,7 @@ impl<'a> AnnotationProbe<'a> {
             in_scope: Mutex::new(HashSet::new()),
         };
         // Unknown counts on an index mean an index of unknown size; without
-        // one, the links are novelty's.
+        // one, the links are novelty's, which `preload` counts as it reads.
         let indexed_links = match ledger.snapshot.stats.as_ref() {
             Some(stats) => stats
                 .links
@@ -148,19 +148,19 @@ impl<'a> AnnotationProbe<'a> {
             None => Some(0),
         };
         if indexed_links.is_some_and(|n| n <= preload_max_links) {
-            probe.preloaded = Some(
-                probe
-                    .preload()
-                    .await
-                    .map_err(|e| crate::ApiError::internal(e.to_string()))?,
-            );
+            probe.preloaded = probe
+                .preload(preload_max_links)
+                .await
+                .map_err(|e| crate::ApiError::internal(e.to_string()))?;
         }
         Ok(Some(probe))
     }
 
     /// Read every live link, telling markers from rows by one lookup per
-    /// `(graph, subject, predicate)`.
-    async fn preload(&self) -> io::Result<Preloaded> {
+    /// `(graph, subject, predicate)`; `None` once more than `max_links` are
+    /// read, novelty's included.
+    async fn preload(&self, max_links: u64) -> io::Result<Option<Preloaded>> {
+        let mut read: u64 = 0;
         let graphs = std::iter::once(0).chain(
             self.ledger
                 .snapshot
@@ -178,6 +178,10 @@ impl<'a> AnnotationProbe<'a> {
                     RangeMatch::predicate(fluree_db_core::rdf_reifies_sid().clone()),
                 )
                 .await?;
+            read += flakes.len() as u64;
+            if read > max_links {
+                return Ok(None);
+            }
             // Moved, not cloned: the map holds each term's parts.
             let graph_links = links.entry(g_id).or_default();
             for flake in flakes {
@@ -235,7 +239,7 @@ impl<'a> AnnotationProbe<'a> {
         for reifiers in links.values_mut().flat_map(HashMap::values_mut) {
             reifiers.sort();
         }
-        Ok(Preloaded { links, unasserted })
+        Ok(Some(Preloaded { links, unasserted }))
     }
 
     async fn range(
@@ -390,6 +394,30 @@ pub(crate) trait ReifierSubject {
 mod tests {
     use crate::export::ExportFormat;
     use crate::{FlureeBuilder, ReindexOptions};
+
+    /// The preload bound counts novelty's links, which index stats do not.
+    #[tokio::test]
+    async fn preload_bound_counts_novelty_links() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let id = "export/preload-bound:main";
+        let ledger = fluree.create_ledger(id).await.unwrap();
+        let ledger = fluree
+            .upsert_turtle(
+                ledger,
+                "VERSION \"1.2\"\n@prefix ex: <http://example.org/> .\n\
+                 ex:alice ex:worksFor ex:acme ~ ex:claim1 {| ex:role \"Engineer\" |} .\n",
+            )
+            .await
+            .unwrap()
+            .ledger;
+        for (max, preloaded) in [(0, false), (1, true)] {
+            let probe = super::AnnotationProbe::for_ledger(&ledger, ledger.t(), max)
+                .await
+                .unwrap()
+                .expect("an annotated ledger");
+            assert_eq!(probe.preloaded.is_some(), preloaded, "max_links={max}");
+        }
+    }
 
     /// Per-batch probes write exactly what the up-front read writes, in every
     /// format, over indexed links and novelty ones; a term only novelty holds
