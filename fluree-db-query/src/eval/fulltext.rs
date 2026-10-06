@@ -23,6 +23,13 @@ use std::sync::Arc;
 
 use once_cell::sync::Lazy;
 
+// moka's eviction clock reads std::time::Instant at cache construction, which
+// aborts on wasm32-unknown-unknown; use core's clock-free LRU stand-in there.
+#[cfg(target_arch = "wasm32")]
+use fluree_db_core::wasm_cache::Cache as SyncCache;
+#[cfg(not(target_arch = "wasm32"))]
+use moka::sync::Cache as SyncCache;
+
 use crate::binding::RowAccess;
 use crate::context::ExecutionContext;
 use crate::error::Result;
@@ -39,11 +46,6 @@ use fluree_db_core::ids::DatatypeDictId;
 use fluree_db_core::value_id::ObjKind;
 use fluree_db_core::{FlakeValue, OverlayProvider, Sid};
 use fluree_vocab::namespaces::FLUREE_DB;
-
-/// Lazily-initialized English analyzer (reused for the `@fulltext` datatype
-/// path which is always English — kept for backward compatibility of
-/// non-config callers; new code should prefer `Analyzer::for_language(...)`).
-static ENGLISH_ANALYZER: Lazy<Analyzer> = Lazy::new(Analyzer::english_default);
 
 /// BM25 parameters
 const K1: f64 = 1.2;
@@ -122,8 +124,8 @@ impl Hash for NoveltyCacheKey {
     }
 }
 
-static NOVELTY_CACHE: Lazy<moka::sync::Cache<NoveltyCacheKey, Arc<NoveltyFulltextDelta>>> =
-    Lazy::new(|| moka::sync::Cache::builder().max_capacity(64).build());
+static NOVELTY_CACHE: Lazy<SyncCache<NoveltyCacheKey, Arc<NoveltyFulltextDelta>>> =
+    Lazy::new(|| SyncCache::builder().max_capacity(64).build());
 
 // =============================================================================
 // Delta build
@@ -316,11 +318,11 @@ fn get_or_build_delta(
     p_id: u32,
     lang_id: u16,
 ) -> Option<Arc<NoveltyFulltextDelta>> {
+    if !crate::fast_path_common::overlay_has_novelty(ctx) {
+        return None;
+    }
     let overlay = ctx.overlay?;
     let epoch = overlay.epoch();
-    if epoch == 0 {
-        return None; // No novelty
-    }
     let binary_store = ctx.binary_store.as_ref()?;
 
     // Resolve target predicate Sid for overlay filtering
@@ -419,83 +421,202 @@ fn effective_df(
     df.min(n_prime)
 }
 
-/// Score an indexed doc (from arena DocBoW) with unified BM25.
-///
-/// Iterates query terms directly against DocBoW via binary search —
-/// no HashMap<String,u32> allocation per row.
-fn score_bm25_indexed(
-    arena: &FulltextArena,
-    doc_bow: &DocBoW,
-    query_terms: &[String],
-    delta: Option<&NoveltyFulltextDelta>,
-) -> f64 {
-    let stats = compute_effective_stats(arena, delta);
-    let dl = doc_bow.doc_len as f64;
-    let mut score = 0.0;
-
-    for term in query_terms {
-        let df = effective_df(term, arena, delta, stats.n);
-        let idf = ((stats.n - df + 0.5) / (df + 0.5) + 1.0).ln();
-
-        // Look up TF via arena term_id → binary search in DocBoW.terms
-        let tf = arena
-            .term_id(term)
-            .and_then(|tid| doc_bow.terms.binary_search_by_key(&tid, |(id, _)| *id).ok())
-            .map(|idx| doc_bow.terms[idx].1 as f64)
-            .unwrap_or(0.0);
-
-        if tf > 0.0 {
-            let tf_norm = (tf * (K1 + 1.0)) / (tf + K1 * (1.0 - B + B * dl / stats.avgdl));
-            score += idf * tf_norm;
-        }
-    }
-
-    score
-}
-
-/// Score a novelty/decoded doc with unified BM25 using explicit term_freqs.
-fn score_bm25_novelty(
-    doc_term_freqs: &HashMap<String, u32>,
-    doc_len: u32,
-    query_terms: &[String],
-    arena: &FulltextArena,
-    delta: Option<&NoveltyFulltextDelta>,
-) -> f64 {
-    let stats = compute_effective_stats(arena, delta);
-    let dl = doc_len as f64;
-    let mut score = 0.0;
-
-    for term in query_terms {
-        let df = effective_df(term, arena, delta, stats.n);
-        let idf = ((stats.n - df + 0.5) / (df + 0.5) + 1.0).ln();
-
-        let tf = doc_term_freqs.get(term.as_str()).copied().unwrap_or(0) as f64;
-
-        if tf > 0.0 {
-            let tf_norm = (tf * (K1 + 1.0)) / (tf + K1 * (1.0 - B + B * dl / stats.avgdl));
-            score += idf * tf_norm;
-        }
-    }
-
-    score
-}
-
-/// Analyze query text with the default English analyzer and deduplicate stems.
-///
-/// Used on the `@fulltext`-datatype path where the bucket is always English.
-/// For language-aware lookup the caller should use
-/// [`analyze_and_dedup_query_with`] with the bucket's analyzer so the query
-/// stems match the arena's indexed stems.
-fn analyze_and_dedup_query(query_text: &str) -> Vec<String> {
-    analyze_and_dedup_query_with(&ENGLISH_ANALYZER, query_text)
-}
-
 /// Analyze query text with the caller-provided analyzer and deduplicate stems.
 fn analyze_and_dedup_query_with(analyzer: &Analyzer, query_text: &str) -> Vec<String> {
     let mut terms = analyzer.analyze_to_strings(query_text);
     terms.sort();
     terms.dedup();
     terms
+}
+
+// =============================================================================
+// Prepared per-query scoring
+// =============================================================================
+
+/// One analyzed query stem with its precomputed scoring inputs.
+struct PreparedTerm {
+    /// The analyzed stem — used to probe novelty-doc term freqs.
+    stem: String,
+    /// Arena term id, if the stem is indexed — used to probe DocBoW.
+    arena_term_id: Option<u32>,
+    /// Effective-IDF weight: `ln((N' - df' + 0.5) / (df' + 0.5) + 1)`,
+    /// where `N'`/`df'` are arena stats merged with the novelty delta.
+    idf: f64,
+}
+
+/// Query-invariant scoring state for one `(arena bucket, query string)` pair.
+///
+/// `eval_fulltext` runs once per bound row; everything here — bucket
+/// analyzer choice, query tokenize+stem, per-term arena term ids, IDF
+/// weights, effective corpus stats — depends only on the bucket and the
+/// query string. Computed once and cached (`PREPARED_CACHE`), so scoring a
+/// row reduces to a `doc_bow` probe plus one binary search per query term.
+struct PreparedFulltextQuery {
+    /// Bucket language — needed again only on the fallback path where an
+    /// unindexed document's text must be analyzed per row.
+    language: Language,
+    /// One entry per distinct query stem, in sorted stem order (the order
+    /// the analyze+dedup produces, so score accumulation matches the
+    /// unprepared reference formula term-for-term).
+    terms: Vec<PreparedTerm>,
+    /// Effective average document length (arena + novelty delta).
+    avgdl: f64,
+}
+
+impl PreparedFulltextQuery {
+    /// Compute prepared state for `stems` against one arena bucket.
+    ///
+    /// Pure function of its inputs — the caching / context plumbing lives in
+    /// [`get_or_prepare`].
+    fn compute(
+        arena: &FulltextArena,
+        delta: Option<&NoveltyFulltextDelta>,
+        language: Language,
+        stems: Vec<String>,
+    ) -> Self {
+        let stats = compute_effective_stats(arena, delta);
+        let terms = stems
+            .into_iter()
+            .map(|stem| {
+                let df = effective_df(&stem, arena, delta, stats.n);
+                let idf = ((stats.n - df + 0.5) / (df + 0.5) + 1.0).ln();
+                PreparedTerm {
+                    arena_term_id: arena.term_id(&stem),
+                    idf,
+                    stem,
+                }
+            })
+            .collect();
+        Self {
+            language,
+            terms,
+            avgdl: stats.avgdl,
+        }
+    }
+
+    /// BM25 TF-saturation component for one term occurrence count.
+    #[inline]
+    fn tf_norm(&self, tf: f64, dl: f64) -> f64 {
+        (tf * (K1 + 1.0)) / (tf + K1 * (1.0 - B + B * dl / self.avgdl))
+    }
+
+    /// Score an indexed doc from its arena BoW — no text analysis, no
+    /// string hashing: one `u32` binary search per query term.
+    fn score_indexed(&self, doc_bow: &DocBoW) -> f64 {
+        let dl = doc_bow.doc_len as f64;
+        let mut score = 0.0;
+        for term in &self.terms {
+            let tf = term
+                .arena_term_id
+                .and_then(|tid| doc_bow.terms.binary_search_by_key(&tid, |(id, _)| *id).ok())
+                .map(|idx| doc_bow.terms[idx].1 as f64)
+                .unwrap_or(0.0);
+            if tf > 0.0 {
+                score += term.idf * self.tf_norm(tf, dl);
+            }
+        }
+        score
+    }
+
+    /// Score an unindexed (novelty/decoded) doc from analyzed term freqs.
+    fn score_novelty_doc(&self, doc_term_freqs: &HashMap<String, u32>, doc_len: u32) -> f64 {
+        let dl = doc_len as f64;
+        let mut score = 0.0;
+        for term in &self.terms {
+            let tf = doc_term_freqs.get(term.stem.as_str()).copied().unwrap_or(0) as f64;
+            if tf > 0.0 {
+                score += term.idf * self.tf_norm(tf, dl);
+            }
+        }
+        score
+    }
+}
+
+/// Cache key for prepared per-query scoring state.
+///
+/// `store_id` is the process-unique `BinaryIndexStore` instance id — it
+/// changes on every store reload/rebuild, so prepared term ids can never
+/// outlive the arena whose term dictionary they index into. `epoch`/`to_t`
+/// invalidate on novelty change (they parameterize the delta baked into the
+/// IDF weights).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PreparedKey {
+    store_id: u64,
+    epoch: u64,
+    to_t: i64,
+    g_id: fluree_db_core::GraphId,
+    p_id: u32,
+    lang_id: u16,
+    analyzer_version: u8,
+    query: Arc<str>,
+}
+
+static PREPARED_CACHE: Lazy<SyncCache<PreparedKey, Arc<PreparedFulltextQuery>>> =
+    Lazy::new(|| SyncCache::builder().max_capacity(64).build());
+
+thread_local! {
+    /// One-slot memo in front of `PREPARED_CACHE`: rows arrive in long runs
+    /// of the same `(bucket, query)`, so consecutive hits skip the moka
+    /// probe (and its key hash of the query string) entirely.
+    static LAST_PREPARED: std::cell::RefCell<Option<(PreparedKey, Arc<PreparedFulltextQuery>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Get (or compute and cache) the prepared scoring state for one arena
+/// bucket and query string.
+fn get_or_prepare(
+    ctx: &ExecutionContext<'_>,
+    arena: &FulltextArena,
+    g_id: fluree_db_core::GraphId,
+    p_id: u32,
+    lang_id: u16,
+    query_str: &Arc<str>,
+) -> Arc<PreparedFulltextQuery> {
+    let key = PreparedKey {
+        store_id: ctx.binary_store.as_ref().map(|s| s.store_id()).unwrap_or(0),
+        epoch: ctx
+            .overlay
+            .map(fluree_db_core::OverlayProvider::epoch)
+            .unwrap_or(0),
+        to_t: ctx.to_t,
+        g_id,
+        p_id,
+        lang_id,
+        analyzer_version: ANALYZER_VERSION,
+        query: Arc::clone(query_str),
+    };
+
+    if let Some(hit) = LAST_PREPARED.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(k, _)| *k == key)
+            .map(|(_, v)| Arc::clone(v))
+    }) {
+        return hit;
+    }
+
+    let prepared = PREPARED_CACHE.get_with(key.clone(), || {
+        // Bucket's BCP-47 tag → analyzer; same choice that built the arena.
+        let bucket_tag: String = ctx
+            .binary_store
+            .as_ref()
+            .and_then(|s| s.resolve_language_tag(lang_id))
+            .unwrap_or_else(|| "en".to_string());
+        let language = Language::from_bcp47(&bucket_tag);
+        let stems = analyze_and_dedup_query_with(Analyzer::shared(language), query_str);
+        let delta = get_or_build_delta(ctx, g_id, p_id, lang_id);
+        Arc::new(PreparedFulltextQuery::compute(
+            arena,
+            delta.as_deref(),
+            language,
+            stems,
+        ))
+    });
+
+    LAST_PREPARED.with(|slot| {
+        *slot.borrow_mut() = Some((key, Arc::clone(&prepared)));
+    });
+    prepared
 }
 
 // =============================================================================
@@ -577,27 +698,15 @@ pub fn eval_fulltext<R: RowAccess>(
                         .fulltext_providers
                         .and_then(|providers| providers.get(&(g_id, *p_id, lookup_lang_id)))
                     {
-                        // Bucket's BCP-47 tag → analyzer; same choice that built the arena.
-                        let bucket_tag: String = ctx
-                            .binary_store
-                            .as_ref()
-                            .and_then(|s| s.resolve_language_tag(lookup_lang_id))
-                            .unwrap_or_else(|| "en".to_string());
-                        let bucket_language = Language::from_bcp47(&bucket_tag);
-                        let bucket_analyzer = Analyzer::for_language(bucket_language);
-                        let query_terms =
-                            analyze_and_dedup_query_with(&bucket_analyzer, &query_str);
-                        if query_terms.is_empty() {
+                        let prepared =
+                            get_or_prepare(ctx, arena, g_id, *p_id, lookup_lang_id, &query_str);
+                        if prepared.terms.is_empty() {
                             return Ok(Some(ComparableValue::Double(0.0)));
                         }
 
-                        let delta = get_or_build_delta(ctx, g_id, *p_id, lookup_lang_id);
-
                         if let Some(bow) = arena.doc_bow(*o_key as u32) {
                             // Indexed doc: score directly from arena BoW
-                            let score =
-                                score_bm25_indexed(arena, bow, &query_terms, delta.as_deref());
-                            return Ok(Some(ComparableValue::Double(score)));
+                            return Ok(Some(ComparableValue::Double(prepared.score_indexed(bow))));
                         }
 
                         // Doc not in arena (novelty doc appearing as EncodedLit — rare).
@@ -606,15 +715,10 @@ pub fn eval_fulltext<R: RowAccess>(
                             if let Ok(FlakeValue::String(text)) =
                                 gv.decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
                             {
-                                let doc_term_freqs = bucket_analyzer.analyze_to_term_freqs(&text);
+                                let doc_term_freqs = Analyzer::shared(prepared.language)
+                                    .analyze_to_term_freqs(&text);
                                 let doc_len = doc_term_freqs.values().sum::<u32>();
-                                let score = score_bm25_novelty(
-                                    &doc_term_freqs,
-                                    doc_len,
-                                    &query_terms,
-                                    arena,
-                                    delta.as_deref(),
-                                );
+                                let score = prepared.score_novelty_doc(&doc_term_freqs, doc_len);
                                 return Ok(Some(ComparableValue::Double(score)));
                             }
                         }
@@ -657,47 +761,79 @@ pub fn eval_fulltext<R: RowAccess>(
             p_id: lit_p_id,
             ..
         } => {
-            // Check if the datatype matches @fulltext (Sid fields: namespace_code, name)
-            let dt = dtc.datatype();
-            if !(dt.namespace_code == FLUREE_DB && dt.name.as_ref() == "fullText") {
-                return Ok(None);
-            }
-
             let text = match val {
                 FlakeValue::String(s) => s.as_str(),
                 _ => return Ok(None),
             };
 
-            // If p_id is available (from early materialization), use unified BM25
+            // Check if the datatype matches @fulltext (Sid fields: namespace_code, name)
+            let dt = dtc.datatype();
+            let is_fulltext_dt = dt.namespace_code == FLUREE_DB && dt.name.as_ref() == "fullText";
+
+            // Arena-based unified BM25 scoring — mirrors the EncodedLit arm.
+            //
+            // Materialized rows are the NORM whenever the ledger carries
+            // novelty: BinaryScanOperator disables late materialization for
+            // overlay epochs != 0, so every scanned value arrives here as
+            // `Binding::Lit` with `p_id` attached. Configured (non-`@fulltext`)
+            // values must score via their arena on this path too, otherwise
+            // `fulltext()` goes unbound for EVERY row the moment one
+            // unindexed commit exists.
             if let (Some(p_id), Some(ctx)) = (lit_p_id, ctx) {
                 let g_id = ctx.binary_g_id;
-                // `@fulltext`-datatype values carry no lang tag — always route
-                // through the English bucket, keyed by the dict-assigned `"en"` lang_id.
-                let lookup_lang_id = ctx.english_lang_id.unwrap_or(0);
+                // Resolve arena lang_id:
+                //   1. `@fulltext` datatype (never lang-tagged) → English bucket.
+                //   2. lang-tagged (rdf:langString) → the tag's dict-assigned id.
+                //   3. untagged strings → English bucket.
+                let lookup_lang_id = match dtc.lang_tag() {
+                    Some(tag) => ctx
+                        .binary_store
+                        .as_ref()
+                        .and_then(|s| s.resolve_lang_id(tag))
+                        .unwrap_or(0),
+                    None => ctx.english_lang_id.unwrap_or(0),
+                };
                 if let Some(arena) = ctx
                     .fulltext_providers
                     .and_then(|providers| providers.get(&(g_id, *p_id, lookup_lang_id)))
                 {
-                    let query_terms = analyze_and_dedup_query(&query_str);
-                    if query_terms.is_empty() {
+                    let prepared =
+                        get_or_prepare(ctx, arena, g_id, *p_id, lookup_lang_id, &query_str);
+                    if prepared.terms.is_empty() {
                         return Ok(Some(ComparableValue::Double(0.0)));
                     }
 
-                    let delta = get_or_build_delta(ctx, g_id, *p_id, lookup_lang_id);
-                    let doc_term_freqs = ENGLISH_ANALYZER.analyze_to_term_freqs(text);
+                    // Indexed fast path: a materialized row usually carries a
+                    // value that IS in the arena — resolve its string_id and
+                    // score from the precomputed BoW instead of re-analyzing
+                    // the document text per row.
+                    if let Some(bow) = ctx
+                        .binary_store
+                        .as_ref()
+                        .and_then(|store| {
+                            resolve_string_id(store, ctx.dict_novelty.as_deref(), text)
+                        })
+                        .and_then(|string_id| arena.doc_bow(string_id))
+                    {
+                        return Ok(Some(ComparableValue::Double(prepared.score_indexed(bow))));
+                    }
+
+                    // Genuinely unindexed value (novelty doc): analyze and
+                    // score with unified BM25.
+                    let doc_term_freqs =
+                        Analyzer::shared(prepared.language).analyze_to_term_freqs(text);
                     let doc_len = doc_term_freqs.values().sum::<u32>();
-                    let score = score_bm25_novelty(
-                        &doc_term_freqs,
-                        doc_len,
-                        &query_terms,
-                        arena,
-                        delta.as_deref(),
-                    );
+                    let score = prepared.score_novelty_doc(&doc_term_freqs, doc_len);
                     return Ok(Some(ComparableValue::Double(score)));
                 }
             }
 
-            // Fallback: TF-saturation (no arena or no p_id)
+            // No arena (or no p_id): preserve pre-config semantics —
+            // non-`@fulltext` string values stay unbound; `@fulltext` values
+            // fall back to TF-saturation.
+            if !is_fulltext_dt {
+                return Ok(None);
+            }
             let score = score_tf_saturation(text, &query_str);
             Ok(Some(ComparableValue::Double(score)))
         }
@@ -710,7 +846,7 @@ pub fn eval_fulltext<R: RowAccess>(
 /// Fallback path used when no FulltextArena is available. Uses only per-document
 /// term-frequency saturation without corpus-wide IDF or avgdl normalization.
 fn score_tf_saturation(doc_text: &str, query_text: &str) -> f64 {
-    let analyzer = &*ENGLISH_ANALYZER;
+    let analyzer = Analyzer::shared(Language::English);
 
     let query_terms = analyzer.analyze_to_strings(query_text);
     if query_terms.is_empty() {
@@ -803,13 +939,23 @@ mod tests {
         assert_eq!(score, 0.0);
     }
 
+    /// Prepared English-bucket scoring state for `query` against `arena`.
+    fn prepare(
+        arena: &FulltextArena,
+        delta: Option<&NoveltyFulltextDelta>,
+        query: &str,
+    ) -> PreparedFulltextQuery {
+        let stems = analyze_and_dedup_query_with(Analyzer::shared(Language::English), query);
+        PreparedFulltextQuery::compute(arena, delta, Language::English, stems)
+    }
+
     /// Helper to build a FulltextArena from text strings (analyze + insert).
     ///
     /// Uses two-pass approach to avoid term_id shifting:
     /// 1. Collect all unique terms from all documents
     /// 2. Build BoWs with stable term_ids
     fn build_test_arena(docs: &[(u32, &str)]) -> FulltextArena {
-        let analyzer = &*ENGLISH_ANALYZER;
+        let analyzer = Analyzer::shared(Language::English);
         let mut arena = FulltextArena::new();
 
         // Pass 1: collect all unique terms across all documents
@@ -854,16 +1000,16 @@ mod tests {
             (30, "database query engine performance"),
         ]);
 
-        let query_terms = analyze_and_dedup_query("cargo");
+        let prepared = prepare(&arena, None, "cargo");
 
-        // score_bm25_indexed with no delta
+        // Indexed scoring with no delta
         let bow_10 = arena.doc_bow(10).unwrap();
         let bow_20 = arena.doc_bow(20).unwrap();
         let bow_30 = arena.doc_bow(30).unwrap();
 
-        let score_10 = score_bm25_indexed(&arena, bow_10, &query_terms, None);
-        let score_20 = score_bm25_indexed(&arena, bow_20, &query_terms, None);
-        let score_30 = score_bm25_indexed(&arena, bow_30, &query_terms, None);
+        let score_10 = prepared.score_indexed(bow_10);
+        let score_20 = prepared.score_indexed(bow_20);
+        let score_30 = prepared.score_indexed(bow_30);
 
         assert!(score_10 > 0.0, "Doc with 'cargo' should score > 0");
         assert!(score_20 > 0.0, "Doc with 'cargo' should score > 0");
@@ -883,16 +1029,17 @@ mod tests {
             (20, "database performance tuning"),
         ]);
 
-        let query_terms = analyze_and_dedup_query("cargo runner");
+        let prepared = prepare(&arena, None, "cargo runner");
 
         // Score with unified (no delta) should produce same result as arena.score_bm25
         let bow = arena.doc_bow(10).unwrap();
-        let unified_score = score_bm25_indexed(&arena, bow, &query_terms, None);
+        let unified_score = prepared.score_indexed(bow);
 
         // Compare with arena's own scoring
-        let arena_term_ids: Vec<u32> = query_terms
+        let arena_term_ids: Vec<u32> = prepared
+            .terms
             .iter()
-            .filter_map(|t| arena.term_id(t))
+            .filter_map(|t| t.arena_term_id)
             .collect();
         let arena_score = arena.score_bm25(10, &arena_term_ids);
 
@@ -909,8 +1056,6 @@ mod tests {
             (20, "database performance tuning"),
         ]);
 
-        let query_terms = analyze_and_dedup_query("cargo");
-
         // Create a delta simulating one novelty assertion with "cargo" in it
         let delta = NoveltyFulltextDelta {
             delta_df: HashMap::from([("cargo".to_string(), 1)]),
@@ -919,8 +1064,8 @@ mod tests {
         };
 
         let bow = arena.doc_bow(10).unwrap();
-        let score_no_delta = score_bm25_indexed(&arena, bow, &query_terms, None);
-        let score_with_delta = score_bm25_indexed(&arena, bow, &query_terms, Some(&delta));
+        let score_no_delta = prepare(&arena, None, "cargo").score_indexed(bow);
+        let score_with_delta = prepare(&arena, Some(&delta), "cargo").score_indexed(bow);
 
         // With an extra doc containing "cargo", the IDF of "cargo" should decrease
         // (it's now present in more documents), so the score should be lower
@@ -937,16 +1082,15 @@ mod tests {
             (20, "database performance tuning"),
         ]);
 
-        let query_terms = analyze_and_dedup_query("cargo");
+        let prepared = prepare(&arena, None, "cargo");
 
         // A novelty doc with the same content as doc 10 should score identically
-        let doc_term_freqs = ENGLISH_ANALYZER.analyze_to_term_freqs("cargo nextest runner");
+        let doc_term_freqs =
+            Analyzer::shared(Language::English).analyze_to_term_freqs("cargo nextest runner");
         let doc_len = doc_term_freqs.values().sum::<u32>();
 
-        let indexed_score =
-            score_bm25_indexed(&arena, arena.doc_bow(10).unwrap(), &query_terms, None);
-        let novelty_score =
-            score_bm25_novelty(&doc_term_freqs, doc_len, &query_terms, &arena, None);
+        let indexed_score = prepared.score_indexed(arena.doc_bow(10).unwrap());
+        let novelty_score = prepared.score_novelty_doc(&doc_term_freqs, doc_len);
 
         assert!(
             (indexed_score - novelty_score).abs() < 1e-10,
@@ -981,7 +1125,8 @@ mod tests {
     #[test]
     fn test_analyze_and_dedup_query() {
         // Duplicate terms should be deduplicated
-        let terms = analyze_and_dedup_query("cargo cargo cargo");
+        let terms =
+            analyze_and_dedup_query_with(Analyzer::shared(Language::English), "cargo cargo cargo");
         // After stemming, "cargo" stays "cargo", should appear once
         let cargo_count = terms.iter().filter(|t| t.as_str() == "cargo").count();
         assert_eq!(

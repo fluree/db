@@ -392,7 +392,7 @@ impl Operator for Bm25SearchOperator {
             // IMPORTANT: In dataset mode, there is no meaningful dataset-level `to_t`.
             // Passing `None` avoids inventing a cross-ledger time and lets the provider
             // select the latest snapshot (or apply its own semantics).
-            let as_of_t = if ctx.dataset.is_some() {
+            let as_of_t = if ctx.explicit_dataset().is_some() {
                 None
             } else {
                 Some(ctx.to_t)
@@ -419,7 +419,7 @@ impl Operator for Bm25SearchOperator {
             self.use_search_provider = false;
 
             // IMPORTANT: In dataset mode, there is no meaningful dataset-level `to_t`.
-            let as_of_t = if ctx.dataset.is_some() {
+            let as_of_t = if ctx.explicit_dataset().is_some() {
                 None
             } else {
                 Some(ctx.to_t)
@@ -523,7 +523,7 @@ impl Operator for Bm25SearchOperator {
                     })?;
 
                     // IMPORTANT: In dataset mode, there is no meaningful dataset-level `to_t`.
-                    let as_of_t = if ctx.dataset.is_some() {
+                    let as_of_t = if ctx.explicit_dataset().is_some() {
                         None
                     } else {
                         Some(ctx.to_t)
@@ -722,7 +722,7 @@ mod tests {
     }
 
     fn make_test_snapshot() -> LedgerSnapshot {
-        let mut snapshot = LedgerSnapshot::genesis("test/main");
+        let mut snapshot = LedgerSnapshot::genesis("test:main");
         // Ensure example IRIs used by BM25 tests are encodable to SIDs.
         snapshot
             .insert_namespace_code(100, "http://example.org/".to_string())

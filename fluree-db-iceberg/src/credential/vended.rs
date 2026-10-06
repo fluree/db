@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// Temporary storage credentials vended by a REST catalog.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VendedCredentials {
     /// AWS access key ID
     pub access_key_id: String,
@@ -25,6 +25,23 @@ pub struct VendedCredentials {
     pub path_style: bool,
 }
 
+/// Redacting `Debug`: never leak the secret access key or session token via a
+/// `{:?}` in a log or error. The access key ID is an identifier (not usable
+/// without the secret) and is shown to aid debugging.
+impl std::fmt::Debug for VendedCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VendedCredentials")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"***")
+            .field("session_token", &self.session_token.as_ref().map(|_| "***"))
+            .field("expires_at", &self.expires_at)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("path_style", &self.path_style)
+            .finish()
+    }
+}
+
 impl VendedCredentials {
     /// Parse credentials from REST catalog response config map.
     ///
@@ -33,7 +50,8 @@ impl VendedCredentials {
     /// - `s3.secret-access-key`
     /// - `s3.session-token`
     /// - `s3.endpoint`
-    /// - `s3.region`
+    /// - `client.region` (Iceberg-REST spec key, e.g. sent by Snowflake Horizon),
+    ///   with `s3.region` accepted as a defensive fallback
     /// - `s3.path-style-access`
     /// - `expiration-time` or `s3.session-token-expires-at-ms`
     pub fn from_config_map(config: &HashMap<String, serde_json::Value>) -> Result<Option<Self>> {
@@ -63,8 +81,11 @@ impl VendedCredentials {
             .and_then(|v| v.as_str())
             .map(std::string::ToString::to_string);
 
+        // The Iceberg-REST spec carries the region as `client.region` (this is what
+        // Snowflake Horizon / Polaris send). Prefer it, falling back to `s3.region`.
         let region = config
-            .get("s3.region")
+            .get("client.region")
+            .or_else(|| config.get("s3.region"))
             .and_then(|v| v.as_str())
             .map(std::string::ToString::to_string);
 
@@ -279,6 +300,68 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_client_region_preferred() {
+        // The Iceberg-REST spec key `client.region` (what Snowflake Horizon sends)
+        // must be honored even when no `s3.region` is present.
+        let mut config = HashMap::new();
+        config.insert(
+            "s3.access-key-id".to_string(),
+            serde_json::json!("AKIATEST"),
+        );
+        config.insert(
+            "s3.secret-access-key".to_string(),
+            serde_json::json!("secret123"),
+        );
+        config.insert("client.region".to_string(), serde_json::json!("us-east-2"));
+
+        let creds = VendedCredentials::from_config_map(&config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(creds.region, Some("us-east-2".to_string()));
+    }
+
+    #[test]
+    fn test_parse_client_region_beats_s3_region() {
+        // When both are present, `client.region` wins.
+        let mut config = HashMap::new();
+        config.insert(
+            "s3.access-key-id".to_string(),
+            serde_json::json!("AKIATEST"),
+        );
+        config.insert(
+            "s3.secret-access-key".to_string(),
+            serde_json::json!("secret123"),
+        );
+        config.insert("client.region".to_string(), serde_json::json!("us-east-2"));
+        config.insert("s3.region".to_string(), serde_json::json!("us-east-1"));
+
+        let creds = VendedCredentials::from_config_map(&config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(creds.region, Some("us-east-2".to_string()));
+    }
+
+    #[test]
+    fn test_parse_s3_region_fallback() {
+        // With only the legacy `s3.region` key present, it is still parsed.
+        let mut config = HashMap::new();
+        config.insert(
+            "s3.access-key-id".to_string(),
+            serde_json::json!("AKIATEST"),
+        );
+        config.insert(
+            "s3.secret-access-key".to_string(),
+            serde_json::json!("secret123"),
+        );
+        config.insert("s3.region".to_string(), serde_json::json!("us-east-1"));
+
+        let creds = VendedCredentials::from_config_map(&config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(creds.region, Some("us-east-1".to_string()));
+    }
+
+    #[test]
     fn test_parse_credentials_partial() {
         let mut config = HashMap::new();
         // Only access key, no secret
@@ -404,5 +487,26 @@ mod tests {
 
         cache.invalidate(&key).await;
         assert!(cache.get(&key).await.is_none());
+    }
+
+    #[test]
+    fn debug_redacts_secret_and_session_token() {
+        let creds = VendedCredentials {
+            access_key_id: "AKIAEXAMPLE".to_string(),
+            secret_access_key: "super-secret-key".to_string(),
+            session_token: Some("super-secret-session".to_string()),
+            expires_at: None,
+            endpoint: None,
+            region: Some("us-east-1".to_string()),
+            path_style: false,
+        };
+        let dbg = format!("{creds:?}");
+        assert!(!dbg.contains("super-secret-key"), "secret leaked: {dbg}");
+        assert!(
+            !dbg.contains("super-secret-session"),
+            "session token leaked: {dbg}"
+        );
+        // The access key ID (an identifier, unusable without the secret) is shown.
+        assert!(dbg.contains("AKIAEXAMPLE"));
     }
 }

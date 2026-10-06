@@ -168,7 +168,7 @@ fn tokenize_sexpr_inner(
                     current.clear();
                 }
                 chars.next(); // consume opening quote
-                              // Read until closing quote
+                              // Read until closing quote, honoring \" and \\
                 let mut string_val = String::new();
                 let mut closed = false;
                 while let Some(&sc) = chars.peek() {
@@ -176,6 +176,18 @@ fn tokenize_sexpr_inner(
                         chars.next(); // consume closing quote
                         closed = true;
                         break;
+                    }
+                    if sc == '\\' {
+                        chars.next(); // consume backslash
+                        match chars.peek() {
+                            Some(&esc @ ('"' | '\\')) => {
+                                string_val.push(esc);
+                                chars.next();
+                            }
+                            // Unrecognized escape: keep the backslash verbatim
+                            _ => string_val.push('\\'),
+                        }
+                        continue;
                     }
                     string_val.push(sc);
                     chars.next();
@@ -257,9 +269,14 @@ pub fn split_first_token(s: &str) -> Result<(&str, &str)> {
 pub fn find_matching_paren(s: &str) -> Result<usize> {
     let mut depth = 0;
     let mut in_quote = false;
-    for (i, c) in s.chars().enumerate() {
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
         if in_quote {
-            if c == '"' {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
                 in_quote = false;
             }
             continue;
@@ -294,8 +311,21 @@ pub fn find_matching_paren(s: &str) -> Result<usize> {
 /// ```
 pub fn find_matching_bracket(s: &str) -> Result<usize> {
     let mut depth = 0;
-    for (i, c) in s.chars().enumerate() {
+    let mut in_quote = false;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if in_quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_quote = false;
+            }
+            continue;
+        }
         match c {
+            '"' => in_quote = true,
             '[' => depth += 1,
             ']' => {
                 depth -= 1;
@@ -365,6 +395,28 @@ mod tests {
         let bare = tokenize_sexpr("(coalesce ?v false)").unwrap();
         let b_list = bare[0].as_list().unwrap();
         assert!(matches!(&b_list[2], SexprToken::Atom(s) if s == "false"));
+    }
+
+    #[test]
+    fn test_tokenize_escaped_quote_in_string() {
+        let tokens = tokenize_sexpr(r#"(concat ?x "he said \"hi\" (loudly)")"#).unwrap();
+        let list = tokens[0].as_list().unwrap();
+        assert_eq!(list.len(), 3);
+        assert!(matches!(&list[2], SexprToken::String(s) if s == r#"he said "hi" (loudly)"#));
+    }
+
+    #[test]
+    fn test_find_matching_paren_skips_escaped_quotes() {
+        let s = r#"(fulltext ?c "a \") b") tail"#;
+        let end = find_matching_paren(s).unwrap();
+        assert_eq!(&s[..=end], r#"(fulltext ?c "a \") b")"#);
+    }
+
+    #[test]
+    fn test_find_matching_bracket_skips_quoted_brackets() {
+        let s = r#"["a]b" "c" ] tail"#;
+        let end = find_matching_bracket(s).unwrap();
+        assert_eq!(&s[..=end], r#"["a]b" "c" ]"#);
     }
 
     #[test]

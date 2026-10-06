@@ -12,10 +12,12 @@
 //! - `owl` - OWL vocabulary (http://www.w3.org/2002/07/owl#)
 //! - `namespaces` - Namespace codes used for IRI encoding
 //! - `errors` - Error type compact IRIs for API responses
+//! - `iri` - IRI reference resolution against a base (RFC 3986 §5)
 
 use std::sync::Arc;
 
 pub mod errors;
+pub mod iri;
 
 /// Constraint on the datatype of an unresolved literal, using IRI strings.
 ///
@@ -212,64 +214,6 @@ pub mod xsd {
 
     /// xsd:hexBinary IRI
     pub const HEX_BINARY: &str = "http://www.w3.org/2001/XMLSchema#hexBinary";
-
-    // ========================================================================
-    // Datatype Normalization Helpers
-    // ========================================================================
-    //
-    // These functions normalize XSD datatypes to canonical forms for storage.
-    // This ensures consistency between transact and query paths.
-
-    /// Normalize integer-family datatypes to xsd:integer
-    ///
-    /// XSD defines a type hierarchy where int, short, byte, long are subtypes
-    /// of integer. For storage consistency, we normalize all of these to
-    /// xsd:integer since they all map to the same Rust type (i64 or BigInt).
-    ///
-    /// # Arguments
-    /// * `datatype_iri` - The full IRI of the datatype
-    ///
-    /// # Returns
-    /// * `xsd:integer` IRI if input is an integer-family type
-    /// * The original IRI unchanged otherwise
-    #[inline]
-    pub fn normalize_integer_family(datatype_iri: &str) -> &str {
-        match datatype_iri {
-            LONG | INT | SHORT | BYTE | UNSIGNED_LONG | UNSIGNED_INT | UNSIGNED_SHORT
-            | UNSIGNED_BYTE | NON_NEGATIVE_INTEGER | POSITIVE_INTEGER | NON_POSITIVE_INTEGER
-            | NEGATIVE_INTEGER => INTEGER,
-            _ => datatype_iri,
-        }
-    }
-
-    /// Normalize float to double
-    ///
-    /// XSD float and double both map to f64 in Rust. Normalize to double
-    /// for storage consistency.
-    #[inline]
-    pub fn normalize_float_family(datatype_iri: &str) -> &str {
-        match datatype_iri {
-            FLOAT => DOUBLE,
-            _ => datatype_iri,
-        }
-    }
-
-    /// Normalize all numeric datatypes to their canonical storage form
-    ///
-    /// Combines integer-family and float-family normalization:
-    /// - xsd:int, xsd:short, xsd:byte, xsd:long → xsd:integer
-    /// - xsd:float → xsd:double
-    /// - All other types pass through unchanged
-    #[inline]
-    pub fn normalize_numeric_datatype(datatype_iri: &str) -> &str {
-        match datatype_iri {
-            LONG | INT | SHORT | BYTE | UNSIGNED_LONG | UNSIGNED_INT | UNSIGNED_SHORT
-            | UNSIGNED_BYTE | NON_NEGATIVE_INTEGER | POSITIVE_INTEGER | NON_POSITIVE_INTEGER
-            | NEGATIVE_INTEGER => INTEGER,
-            FLOAT => DOUBLE,
-            _ => datatype_iri,
-        }
-    }
 
     /// Check if a datatype IRI is a numeric type
     #[inline]
@@ -833,6 +777,63 @@ pub mod jsonld_names {
     pub const CONTEXT: &str = "context";
 }
 
+/// GraphQL-over-SHACL vocabulary.
+///
+/// `http://datashapes.org/graphql#` is the de-facto shared vocabulary for
+/// projecting SHACL shapes as a GraphQL schema — TopBraid EDG and GraphDB 11
+/// both read it, so shapes authored for either port here unchanged. Terms
+/// Fluree needs that the shared vocabulary does not define live under
+/// [`fluree::DB`] instead of being invented in someone else's namespace.
+pub mod graphql {
+    /// The `graphql:` namespace IRI.
+    pub const NS: &str = "http://datashapes.org/graphql#";
+
+    /// `graphql:Schema` — a named, curated selection of shapes to expose.
+    /// Its presence is what selects tier 3.
+    pub const SCHEMA: &str = "http://datashapes.org/graphql#Schema";
+
+    /// `graphql:publicShape` — exposed as a type *and* as root query fields.
+    pub const PUBLIC_SHAPE: &str = "http://datashapes.org/graphql#publicShape";
+
+    /// `graphql:protectedShape` — exposed as a type, reachable only by
+    /// following a reference; no root query fields of its own.
+    pub const PROTECTED_SHAPE: &str = "http://datashapes.org/graphql#protectedShape";
+
+    /// `graphql:privateShape` — not exposed. References to it degrade to the
+    /// `Node` placeholder rather than naming a type the caller cannot query.
+    pub const PRIVATE_SHAPE: &str = "http://datashapes.org/graphql#privateShape";
+
+    /// `graphql:name` — the GraphQL name for a schema, type, or field,
+    /// overriding both the derived name and `sh:name`.
+    pub const NAME: &str = "http://datashapes.org/graphql#name";
+
+    /// `graphql:isInterface` — the shape's class is abstract: it becomes an
+    /// interface, and the classes below it implement it.
+    pub const IS_INTERFACE: &str = "http://datashapes.org/graphql#isInterface";
+
+    /// `graphql:isIDField` — the property carries the object's identity.
+    pub const IS_ID_FIELD: &str = "http://datashapes.org/graphql#isIDField";
+
+    // ── Fluree extensions ────────────────────────────────────────────────
+    // Under Fluree's own namespace: the shared vocabulary defines no
+    // equivalent, and minting terms in a namespace we do not own would make
+    // shapes that only Fluree can read look like portable ones.
+
+    /// `f:graphqlPluralName` — the root list/count field name, overriding
+    /// the naive pluralisation.
+    pub const PLURAL_NAME: &str = "https://ns.flur.ee/db#graphqlPluralName";
+
+    /// `f:graphqlEnableMutations` — opt in to `create_`/`update_`/`delete_`
+    /// root fields for this schema. Off unless stated: a derived schema
+    /// should never become a write surface by accident.
+    pub const ENABLE_MUTATIONS: &str = "https://ns.flur.ee/db#graphqlEnableMutations";
+
+    /// `f:graphqlIriBase` — the namespace new subjects are minted under.
+    /// Required for mutations that create nodes: there is no safe default,
+    /// since a wrong guess writes IRIs that cannot be un-minted.
+    pub const IRI_BASE: &str = "https://ns.flur.ee/db#graphqlIriBase";
+}
+
 /// SHACL vocabulary constants
 pub mod shacl {
     /// SHACL namespace IRI
@@ -873,6 +874,27 @@ pub mod shacl {
 
     /// sh:path IRI
     pub const PATH: &str = "http://www.w3.org/ns/shacl#path";
+
+    /// sh:inversePath IRI
+    pub const INVERSE_PATH: &str = "http://www.w3.org/ns/shacl#inversePath";
+
+    /// sh:alternativePath IRI
+    pub const ALTERNATIVE_PATH: &str = "http://www.w3.org/ns/shacl#alternativePath";
+
+    /// sh:zeroOrMorePath IRI
+    pub const ZERO_OR_MORE_PATH: &str = "http://www.w3.org/ns/shacl#zeroOrMorePath";
+
+    /// sh:oneOrMorePath IRI
+    pub const ONE_OR_MORE_PATH: &str = "http://www.w3.org/ns/shacl#oneOrMorePath";
+
+    /// sh:zeroOrOnePath IRI
+    pub const ZERO_OR_ONE_PATH: &str = "http://www.w3.org/ns/shacl#zeroOrOnePath";
+
+    /// sh:node IRI
+    pub const NODE: &str = "http://www.w3.org/ns/shacl#node";
+
+    /// sh:deactivated IRI
+    pub const DEACTIVATED: &str = "http://www.w3.org/ns/shacl#deactivated";
 
     // ========================================================================
     // Cardinality Constraints
@@ -1009,6 +1031,28 @@ pub mod shacl {
     pub const LANGUAGE_IN: &str = "http://www.w3.org/ns/shacl#languageIn";
 
     // ========================================================================
+    // SPARQL-based Constraints (SHACL-SPARQL §5)
+    // ========================================================================
+
+    /// sh:sparql IRI
+    pub const SPARQL: &str = "http://www.w3.org/ns/shacl#sparql";
+
+    /// sh:select IRI
+    pub const SELECT: &str = "http://www.w3.org/ns/shacl#select";
+
+    /// sh:prefixes IRI
+    pub const PREFIXES: &str = "http://www.w3.org/ns/shacl#prefixes";
+
+    /// sh:declare IRI
+    pub const DECLARE: &str = "http://www.w3.org/ns/shacl#declare";
+
+    /// sh:prefix IRI
+    pub const PREFIX: &str = "http://www.w3.org/ns/shacl#prefix";
+
+    /// sh:namespace IRI
+    pub const NAMESPACE: &str = "http://www.w3.org/ns/shacl#namespace";
+
+    // ========================================================================
     // Node Kind Values
     // ========================================================================
 
@@ -1059,6 +1103,12 @@ pub mod shacl {
     /// sh:description IRI
     pub const DESCRIPTION: &str = "http://www.w3.org/ns/shacl#description";
 
+    /// sh:order IRI
+    pub const ORDER: &str = "http://www.w3.org/ns/shacl#order";
+
+    /// sh:defaultValue IRI
+    pub const DEFAULT_VALUE: &str = "http://www.w3.org/ns/shacl#defaultValue";
+
     // ========================================================================
     // Validation Report
     // ========================================================================
@@ -1096,6 +1146,122 @@ pub mod shacl {
 
     /// sh:resultMessage IRI
     pub const RESULT_MESSAGE: &str = "http://www.w3.org/ns/shacl#resultMessage";
+
+    // ========================================================================
+    // Constraint Component IRIs (sh:sourceConstraintComponent values)
+    // ========================================================================
+
+    /// sh:MinCountConstraintComponent IRI
+    pub const MIN_COUNT_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#MinCountConstraintComponent";
+
+    /// sh:MaxCountConstraintComponent IRI
+    pub const MAX_COUNT_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#MaxCountConstraintComponent";
+
+    /// sh:DatatypeConstraintComponent IRI
+    pub const DATATYPE_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#DatatypeConstraintComponent";
+
+    /// sh:NodeKindConstraintComponent IRI
+    pub const NODE_KIND_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#NodeKindConstraintComponent";
+
+    /// sh:ClassConstraintComponent IRI
+    pub const CLASS_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#ClassConstraintComponent";
+
+    /// sh:MinInclusiveConstraintComponent IRI
+    pub const MIN_INCLUSIVE_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#MinInclusiveConstraintComponent";
+
+    /// sh:MaxInclusiveConstraintComponent IRI
+    pub const MAX_INCLUSIVE_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#MaxInclusiveConstraintComponent";
+
+    /// sh:MinExclusiveConstraintComponent IRI
+    pub const MIN_EXCLUSIVE_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#MinExclusiveConstraintComponent";
+
+    /// sh:MaxExclusiveConstraintComponent IRI
+    pub const MAX_EXCLUSIVE_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#MaxExclusiveConstraintComponent";
+
+    /// sh:PatternConstraintComponent IRI
+    pub const PATTERN_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#PatternConstraintComponent";
+
+    /// sh:MinLengthConstraintComponent IRI
+    pub const MIN_LENGTH_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#MinLengthConstraintComponent";
+
+    /// sh:MaxLengthConstraintComponent IRI
+    pub const MAX_LENGTH_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#MaxLengthConstraintComponent";
+
+    /// sh:HasValueConstraintComponent IRI
+    pub const HAS_VALUE_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#HasValueConstraintComponent";
+
+    /// sh:InConstraintComponent IRI
+    pub const IN_CONSTRAINT_COMPONENT: &str = "http://www.w3.org/ns/shacl#InConstraintComponent";
+
+    /// sh:EqualsConstraintComponent IRI
+    pub const EQUALS_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#EqualsConstraintComponent";
+
+    /// sh:DisjointConstraintComponent IRI
+    pub const DISJOINT_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#DisjointConstraintComponent";
+
+    /// sh:LessThanConstraintComponent IRI
+    pub const LESS_THAN_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#LessThanConstraintComponent";
+
+    /// sh:LessThanOrEqualsConstraintComponent IRI
+    pub const LESS_THAN_OR_EQUALS_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#LessThanOrEqualsConstraintComponent";
+
+    /// sh:UniqueLangConstraintComponent IRI
+    pub const UNIQUE_LANG_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#UniqueLangConstraintComponent";
+
+    /// sh:LanguageInConstraintComponent IRI
+    pub const LANGUAGE_IN_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#LanguageInConstraintComponent";
+
+    /// sh:QualifiedMinCountConstraintComponent IRI
+    pub const QUALIFIED_MIN_COUNT_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#QualifiedMinCountConstraintComponent";
+
+    /// sh:QualifiedMaxCountConstraintComponent IRI
+    pub const QUALIFIED_MAX_COUNT_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#QualifiedMaxCountConstraintComponent";
+
+    /// sh:NodeConstraintComponent IRI
+    pub const NODE_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#NodeConstraintComponent";
+
+    /// sh:NotConstraintComponent IRI
+    pub const NOT_CONSTRAINT_COMPONENT: &str = "http://www.w3.org/ns/shacl#NotConstraintComponent";
+
+    /// sh:AndConstraintComponent IRI
+    pub const AND_CONSTRAINT_COMPONENT: &str = "http://www.w3.org/ns/shacl#AndConstraintComponent";
+
+    /// sh:OrConstraintComponent IRI
+    pub const OR_CONSTRAINT_COMPONENT: &str = "http://www.w3.org/ns/shacl#OrConstraintComponent";
+
+    /// sh:XoneConstraintComponent IRI
+    pub const XONE_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#XoneConstraintComponent";
+
+    /// sh:ClosedConstraintComponent IRI
+    pub const CLOSED_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#ClosedConstraintComponent";
+
+    /// sh:SPARQLConstraintComponent IRI
+    pub const SPARQL_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#SPARQLConstraintComponent";
 }
 
 /// SHACL vocabulary local names (for SID construction)
@@ -1148,6 +1314,25 @@ pub mod shacl_names {
     pub const PATH: &str = "path";
 
     // ========================================================================
+    // Property Path Expressions
+    // ========================================================================
+
+    /// sh:inversePath local name (inverse path `^p`)
+    pub const INVERSE_PATH: &str = "inversePath";
+
+    /// sh:alternativePath local name (alternative path `p1|p2`, points to an RDF list)
+    pub const ALTERNATIVE_PATH: &str = "alternativePath";
+
+    /// sh:zeroOrMorePath local name (`p*`)
+    pub const ZERO_OR_MORE_PATH: &str = "zeroOrMorePath";
+
+    /// sh:oneOrMorePath local name (`p+`)
+    pub const ONE_OR_MORE_PATH: &str = "oneOrMorePath";
+
+    /// sh:zeroOrOnePath local name (`p?`)
+    pub const ZERO_OR_ONE_PATH: &str = "zeroOrOnePath";
+
+    // ========================================================================
     // Cardinality Constraints
     // ========================================================================
 
@@ -1166,6 +1351,9 @@ pub mod shacl_names {
 
     /// sh:nodeKind local name
     pub const NODE_KIND: &str = "nodeKind";
+
+    /// sh:node local name (value/focus must conform to the referenced node shape)
+    pub const NODE: &str = "node";
 
     /// sh:class local name
     pub const CLASS: &str = "class";
@@ -1281,6 +1469,28 @@ pub mod shacl_names {
     pub const LANGUAGE_IN: &str = "languageIn";
 
     // ========================================================================
+    // SPARQL-based Constraints (SHACL-SPARQL §5)
+    // ========================================================================
+
+    /// sh:sparql local name
+    pub const SPARQL: &str = "sparql";
+
+    /// sh:select local name
+    pub const SELECT: &str = "select";
+
+    /// sh:prefixes local name
+    pub const PREFIXES: &str = "prefixes";
+
+    /// sh:declare local name
+    pub const DECLARE: &str = "declare";
+
+    /// sh:prefix local name
+    pub const PREFIX: &str = "prefix";
+
+    /// sh:namespace local name
+    pub const NAMESPACE: &str = "namespace";
+
+    // ========================================================================
     // Node Kind Values
     // ========================================================================
 
@@ -1306,6 +1516,9 @@ pub mod shacl_names {
     // Severity Levels
     // ========================================================================
 
+    /// sh:deactivated local name (true = the shape is ignored entirely)
+    pub const DEACTIVATED: &str = "deactivated";
+
     /// sh:severity local name
     pub const SEVERITY: &str = "severity";
 
@@ -1330,6 +1543,12 @@ pub mod shacl_names {
 
     /// sh:description local name
     pub const DESCRIPTION: &str = "description";
+
+    /// sh:order local name
+    pub const ORDER: &str = "order";
+
+    /// sh:defaultValue local name
+    pub const DEFAULT_VALUE: &str = "defaultValue";
 
     // ========================================================================
     // Validation Report
@@ -1374,6 +1593,11 @@ pub mod fluree {
     /// Fluree DB system namespace IRI (canonical base for all Fluree system vocabulary)
     pub const DB: &str = "https://ns.flur.ee/db#";
 
+    /// Constraint component reported when a `sh:path` could not be compiled
+    /// (Fluree extension; W3C SHACL has no component for this condition)
+    pub const UNRESOLVABLE_PATH_CONSTRAINT_COMPONENT: &str =
+        "https://ns.flur.ee/db#UnresolvablePathConstraintComponent";
+
     /// Fluree URN prefix for ledger-scoped identifiers.
     ///
     /// Used as a namespace prefix so `encode_iri` can decompose ledger-scoped IRIs.
@@ -1382,6 +1606,19 @@ pub mod fluree {
 
     /// db:rule IRI - datalog rule definition predicate
     pub const RULE: &str = "https://ns.flur.ee/db#rule";
+
+    /// db:sparql datatype IRI — marks a string literal as SPARQL source text.
+    ///
+    /// Used on `f:query` (policy condition, ASK/SELECT form) and `f:rule`
+    /// (datalog rule, CONSTRUCT...WHERE form) literals to select the SPARQL
+    /// parser instead of the default JSON-LD query interpretation
+    /// (`@json` / `rdf:JSON` literals).
+    pub const SPARQL: &str = "https://ns.flur.ee/db#sparql";
+
+    /// db:cypher datatype IRI — reserved for openCypher-language policy /
+    /// rule literals. Not yet accepted by the policy or rule extractors;
+    /// registered so the IRI is stable when support lands.
+    pub const CYPHER: &str = "https://ns.flur.ee/db#cypher";
 
     /// Fluree commit subject identifier scheme (not a predicate vocabulary)
     pub const COMMIT: &str = "fluree:commit:sha256:";
@@ -1405,13 +1642,19 @@ pub mod fluree {
 
     /// "This commit" placeholder IRI (scheme form, used without prefix definition)
     pub const COMMIT_THIS_SCHEME: &str = "fluree:commit:this";
+
+    /// db:Node — existence marker class for LPG nodes created with no labels
+    /// and no properties (Cypher `CREATE ()`). An RDF subject needs at least
+    /// one triple to exist; this class provides it. Hidden from Cypher
+    /// `labels()`.
+    pub const NODE: &str = "https://ns.flur.ee/db#Node";
 }
 
 /// Namespace codes for IRI encoding
 ///
 /// Codes 0 through `USER_START - 1` are reserved for built-in namespaces.
 /// User-defined namespaces are allocated contiguously starting at `USER_START`.
-/// Code `OVERFLOW` (0xFFFF) is reserved for IRIs whose namespace could not
+/// Code `OVERFLOW` (0xFFFE) is reserved for IRIs whose namespace could not
 /// be assigned a code (full IRI stored as the SID name).
 pub mod namespaces {
     /// Code 0: empty / relative IRI prefix (@base resolution)
@@ -1467,6 +1710,13 @@ pub mod namespaces {
     /// Note: 0xFFFF is reserved for `Sid::max()` sentinel, so overflow
     /// uses 0xFFFE.
     pub const OVERFLOW: u16 = 0xFFFE;
+
+    /// Whether a SID name in this namespace already is the full IRI, so
+    /// decoding must not look up a prefix.
+    #[inline]
+    pub const fn is_full_iri(ns_code: u16) -> bool {
+        ns_code == EMPTY || ns_code == OVERFLOW
+    }
 }
 
 /// Common predicate local names (for schema extraction, validation, etc.)
@@ -1555,8 +1805,17 @@ pub mod db {
     /// db:previous - reference to previous commit
     pub const PREVIOUS: &str = "previous";
 
-    /// db:time - commit timestamp (epoch milliseconds)
+    /// db:time - commit timestamp (epoch milliseconds). This is the commit's
+    /// *event time*: user-suppliable (backdated historical loads) and the
+    /// axis `@iso:` time travel resolves against. Defaults to wall clock.
     pub const TIME: &str = "time";
+
+    /// db:receivedAt - wall-clock time the commit was actually recorded
+    /// (epoch milliseconds). System-controlled: emitted only on ledgers that
+    /// have used a caller-supplied event time (sticky dual-stamp mode), so
+    /// normal ledgers carry no extra metadata. The `@recorded:` time-travel
+    /// selector resolves against this axis for audit queries.
+    pub const RECEIVED_AT: &str = "receivedAt";
 
     /// db:message - commit message (optional)
     pub const MESSAGE: &str = "message";
@@ -1596,6 +1855,12 @@ pub mod db {
     /// db:rule - datalog rule definition
     pub const RULE: &str = "rule";
 
+    /// db:sparql - datatype local name for SPARQL source literals
+    pub const SPARQL: &str = "sparql";
+
+    /// db:cypher - datatype local name reserved for openCypher source literals
+    pub const CYPHER: &str = "cypher";
+
     /// db:op - operation type in RDF-Star annotations (assert/retract)
     pub const OP: &str = "op";
 
@@ -1604,6 +1869,17 @@ pub mod db {
 
     /// db:ledgerIndex - nameservice field: pointer to latest ledger index root
     pub const LEDGER_INDEX: &str = "ledgerIndex";
+
+    /// db:importSource - bulk-import manifest: the document a blank-node scope
+    /// was minted from, as a path relative to the import root (or a remote
+    /// address relative to its listing prefix).
+    ///
+    /// Written into the `txn-meta` graph, one triple per source document, with
+    /// the scope's blank node as subject:
+    /// `_:fdb-d<scope> db:importSource "sub/dir/data.ttl"`. Every id minted
+    /// from that document starts with that scope, so it is what turns an
+    /// opaque `_:fdb-…` back into the file it came from.
+    pub const IMPORT_SOURCE: &str = "importSource";
 
     // ========================================================================
     // Edge-annotation system predicates (durable attachment encoding)
@@ -1789,6 +2065,12 @@ pub mod ns_types {
 
     /// `https://ns.flur.ee/db#R2rmlMapping` - R2RML relational mapping
     pub const R2RML_MAPPING: &str = "https://ns.flur.ee/db#R2rmlMapping";
+
+    /// `https://ns.flur.ee/db#SqlMapping` - R2RML mapping over a SQL endpoint
+    pub const SQL_MAPPING: &str = "https://ns.flur.ee/db#SqlMapping";
+
+    /// `https://ns.flur.ee/db#DeltaMapping` - R2RML mapping over Delta Lake tables
+    pub const DELTA_MAPPING: &str = "https://ns.flur.ee/db#DeltaMapping";
 }
 
 /// Graph source nameservice field local names (under `https://ns.flur.ee/db#`)
@@ -1839,6 +2121,18 @@ pub mod policy_iris {
     /// `https://ns.flur.ee/db#modify` - modify action IRI
     pub const MODIFY: &str = "https://ns.flur.ee/db#modify";
 
+    /// `https://ns.flur.ee/db#create` - create write verb (subject is new
+    /// in this transaction's post-state)
+    pub const CREATE: &str = "https://ns.flur.ee/db#create";
+
+    /// `https://ns.flur.ee/db#update` - update write verb (subject exists
+    /// before and after this transaction)
+    pub const UPDATE: &str = "https://ns.flur.ee/db#update";
+
+    /// `https://ns.flur.ee/db#delete` - delete write verb (subject is
+    /// removed by this transaction)
+    pub const DELETE: &str = "https://ns.flur.ee/db#delete";
+
     /// `https://ns.flur.ee/db#onProperty` - property-level targeting
     pub const ON_PROPERTY: &str = "https://ns.flur.ee/db#onProperty";
 
@@ -1850,6 +2144,17 @@ pub mod policy_iris {
 
     /// `https://ns.flur.ee/db#query` - policy query predicate
     pub const QUERY: &str = "https://ns.flur.ee/db#query";
+
+    /// `https://ns.flur.ee/db#queryState` - which transaction state the
+    /// policy's `f:query` condition evaluates against
+    pub const QUERY_STATE: &str = "https://ns.flur.ee/db#queryState";
+
+    /// `https://ns.flur.ee/db#preState` - pre-transaction state (default)
+    pub const PRE_STATE: &str = "https://ns.flur.ee/db#preState";
+
+    /// `https://ns.flur.ee/db#postState` - post-transaction state
+    /// (committed + staged flakes)
+    pub const POST_STATE: &str = "https://ns.flur.ee/db#postState";
 
     /// `https://ns.flur.ee/db#required` - required flag
     pub const REQUIRED: &str = "https://ns.flur.ee/db#required";
@@ -1939,6 +2244,12 @@ pub mod config_iris {
     /// `f:reasoningMaxSeconds` — integer, max wall-clock seconds before OWL2-RL
     /// materialization is capped (incomplete closure)
     pub const REASONING_MAX_SECONDS: &str = "https://ns.flur.ee/db#reasoningMaxSeconds";
+
+    /// `f:reasoningMaxMemoryMb` — integer, max megabytes of derived facts
+    /// before materialization is capped (incomplete closure). Defaults to a
+    /// ceiling derived from `f:reasoningMaxFacts`, so the fact cap normally
+    /// binds first and this one only catches abnormally large facts.
+    pub const REASONING_MAX_MEMORY_MB: &str = "https://ns.flur.ee/db#reasoningMaxMemoryMb";
 
     /// `f:ontologyImportMap` — list of OntologyImportBinding
     pub const ONTOLOGY_IMPORT_MAP: &str = "https://ns.flur.ee/db#ontologyImportMap";
@@ -2069,6 +2380,38 @@ pub mod config_iris {
 
     /// `f:target` — property IRI that a `FullTextProperty` entry applies to.
     pub const FULL_TEXT_TARGET: &str = "https://ns.flur.ee/db#target";
+
+    // ---- Serving defaults fields (ledger-scoped) ----
+
+    /// `f:servingDefaults` — serving-posture defaults on LedgerConfig.
+    /// Ledger-scoped: ignored on GraphConfig, not subject to override control.
+    /// Declares which serving tiers the ledger's origin server offers; gates
+    /// apply only on the origin (transaction-role) serving surface, never on
+    /// read-only peers/mounts querying their own replicated copy.
+    pub const SERVING_DEFAULTS: &str = "https://ns.flur.ee/db#servingDefaults";
+
+    /// `f:serveQuery` — boolean, origin serves query execution for this
+    /// ledger. Absent means allowed.
+    pub const SERVE_QUERY: &str = "https://ns.flur.ee/db#serveQuery";
+
+    /// `f:serveBlocks` — boolean, origin serves raw CAS blocks (storage
+    /// proxy / peer replication) for this ledger. Absent means allowed.
+    pub const SERVE_BLOCKS: &str = "https://ns.flur.ee/db#serveBlocks";
+
+    /// `f:publicVisibility` — boolean, ledger may be discovered and read
+    /// without authentication. Absent means false (token required).
+    pub const PUBLIC_VISIBILITY: &str = "https://ns.flur.ee/db#publicVisibility";
+
+    // ---- Query defaults fields (ledger-scoped) ----
+
+    /// `f:queryDefaults` — query-time defaults on LedgerConfig.
+    /// Ledger-scoped: ignored on GraphConfig, not subject to override control.
+    pub const QUERY_DEFAULTS: &str = "https://ns.flur.ee/db#queryDefaults";
+
+    /// `f:unionDefaultGraph` — boolean, a query that does not choose its own
+    /// default graph reads the union of the ledger's default graph and its
+    /// named graphs. Absent means false.
+    pub const UNION_DEFAULT_GRAPH: &str = "https://ns.flur.ee/db#unionDefaultGraph";
 }
 
 // ============================================================================

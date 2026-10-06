@@ -95,6 +95,11 @@ pub enum TransactError {
     #[error("Empty transaction: no flakes to commit")]
     EmptyTransaction,
 
+    /// Invalid commit event time (unparseable, future-dated, or earlier
+    /// than the head commit's event time)
+    #[error("Invalid event time: {0}")]
+    InvalidEventTime(String),
+
     /// Novelty at maximum size (backpressure)
     #[error("Novelty at maximum size, reindexing required")]
     NoveltyAtMax,
@@ -106,6 +111,26 @@ pub enum TransactError {
         delta_bytes: usize,
         max_bytes: usize,
     },
+
+    /// The write would bring the ledger past the number of datatypes its
+    /// index can store. Not retryable: datatype IDs are never released.
+    #[error(
+        "datatype limit exceeded: the ledger holds {used} of at most {max} non-reserved \
+         datatypes, and this write would add {adding} more"
+    )]
+    DatatypeLimitExceeded {
+        used: usize,
+        adding: usize,
+        max: usize,
+    },
+
+    /// Whole-graph scan larger than the memory backstop
+    #[error(
+        "whole-graph operation would materialize more than {limit} currently-asserted flakes; \
+         this is the memory backstop for graph sync / CLEAR / DROP / COPY / MOVE — raise or \
+         disable it with FLUREE_MAX_GRAPH_SCAN_FLAKES (0 disables)"
+    )]
+    WholeGraphScanTooLarge { limit: usize },
 
     /// Invalid template term
     #[error("Invalid template term: {0}")]
@@ -149,6 +174,77 @@ pub enum TransactError {
     /// `f:enforceUnique`).
     #[error("Transaction invariant violation: {0}")]
     InvariantViolation(String),
+
+    /// A transaction named a reserved system graph as a write target:
+    /// `urn:fluree:{ledger}#config` (g_id 2) or `#txn-meta` (g_id 1). These
+    /// graphs are Fluree-internal — `#config` seeds SHACL/uniqueness governance
+    /// and cross-ledger rules, `#txn-meta` holds commit metadata — and are never
+    /// part of the W3C dataset. Mirrors the cross-ledger resolver's
+    /// reserved-graph guard.
+    ///
+    /// Raised from two kinds of site, with deliberately different coverage:
+    ///
+    /// - **Whole-graph verbs** — SPARQL/builder graph management
+    ///   (CLEAR/DROP/COPY/MOVE/ADD target, source, or destination) and graph
+    ///   sync — refuse **both** reserved graphs. They destroy or re-home a
+    ///   graph wholesale, which no user operation may do to either.
+    /// - **Ordinary data writes** (`GRAPH <iri> { … }`, `WITH <iri>`,
+    ///   `CREATE GRAPH <iri>`) refuse **`#txn-meta` only**. Forged commit
+    ///   records steer `resolve_commit_prefix` / `commit_to_t`, so a record
+    ///   sharing a real commit's prefix shadows that commit on every
+    ///   commit-lookup surface. `#config` stays writable because
+    ///   `docs/ledger-config/` documents maintaining ledger configuration
+    ///   through an ordinary transaction; that asymmetry is intentional.
+    #[error("transaction targets reserved system graph <{graph_iri}>; refusing")]
+    ReservedGraphTarget {
+        /// The reserved graph IRI the operation attempted to target.
+        graph_iri: String,
+    },
+
+    /// A write named `urn:default` as a named graph: a `GRAPH` template or
+    /// data quad, a TriG block, a bulk-import block, a graph-management
+    /// operand or a sync target. The name stands for the default graph
+    /// wherever a graph is read, so a named graph by that name would hold data
+    /// no read of `urn:default` reaches.
+    #[error(
+        "<urn:default> names the default graph, not a named graph: write default-graph \
+         triples without GRAPH, or name it DEFAULT in graph management"
+    )]
+    DefaultGraphNameAsGraph,
+
+    /// A bulk RDF import (`fluree create --from`, the server's source-import
+    /// route) carried a `GRAPH <urn:fluree:{ledger}#config> { … }` block.
+    ///
+    /// Distinct from [`TransactError::ReservedGraphTarget`] on purpose. A
+    /// write to `#txn-meta` is a *security* refusal — forged commit records
+    /// steer the commit resolvers. `#config` is a *capability* gap: ordinary
+    /// transactions may write ledger configuration (see `docs/ledger-config/`),
+    /// but the bulk-import index pipeline has no pass that builds g_id 2 from
+    /// data chunks, so an imported config block would be persisted and
+    /// unreadable. The two must not read alike or the reader draws the wrong
+    /// conclusion about which one is a policy and which one is a limitation.
+    #[error(
+        "bulk import cannot populate the ledger config graph <{graph_iri}>; \
+         create the ledger first, then set its configuration with a transaction"
+    )]
+    ConfigGraphImportUnsupported {
+        /// The ledger-scoped config graph IRI the import attempted to fill.
+        graph_iri: String,
+    },
+
+    /// A SPARQL/builder graph-management transfer (ADD/COPY/MOVE) named a
+    /// source graph that has never been registered — a typo'd or never-written
+    /// IRI. Per SPARQL 1.1 Update §3.2, ADD/COPY/MOVE from a nonexistent source
+    /// raise an error unless `SILENT`; without this guard COPY/MOVE clear the
+    /// destination and copy nothing back in, silently emptying it (roadmap O3).
+    /// An emptied-but-once-registered graph resolves to a real g_id (the
+    /// registry is additive-only, D-6) and is a legitimate empty source — it
+    /// proceeds, and does not raise this error.
+    #[error("source graph <{graph_iri}> does not exist for ADD/COPY/MOVE; use SILENT to ignore")]
+    SourceGraphNotFound {
+        /// The missing source graph IRI the transfer attempted to read.
+        graph_iri: String,
+    },
 
     /// Unique constraint violation (`f:enforceUnique`).
     ///

@@ -205,6 +205,8 @@ When a transaction retracts a base edge that has annotations attached (see [Inse
 - Anonymous (blank-node) annotation subjects also have their body metadata retracted, since the synthetic SID is unaddressable once the attachment is gone.
 - Explicit-IRI annotation subjects keep their body metadata as ordinary RDF on the named subject (default RDF mode). To extend cleanup to explicit-IRI annotations as well, set `opts.lpgEdgeLifecycle: true` on the transaction — this matches the property-graph relationship lifecycle.
 
+**The annotation form of a *delete* is a base-edge retract.** `DELETE DATA { :alice :knows :bob ~ :claim1 {| … |} }` — and the bare `~ :claim1` tail with no block — expand to include the base triple, because RDF 1.2 annotation syntax both reifies *and asserts* the triple it annotates. They therefore fire the cascade above against **every** claim on that edge, not only the one named, and a sibling claim is left with its body intact but nothing to attach to. An `upsert` that changes an annotated edge's object does the same thing, with no delete written at all. See [Which spelling does what](../concepts/edge-annotations.md#which-spelling-does-what) for the full table, including the two spellings that withdraw or detach a single claim.
+
 **Metadata-only retract** — fires when the user retracts every body fact of an annotation subject without touching the base edge:
 
 - The attachment is also retracted, so the annotation is fully disposed of and inline `@annotation` queries no longer surface it.

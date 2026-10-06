@@ -34,7 +34,8 @@ use fluree_db_core::{
 use fluree_db_nameservice::NameServiceLookup;
 
 use fluree_db_novelty::{
-    generate_commit_flakes, stamp_graph_on_commit_flakes, trace_commits_by_id, Novelty,
+    generate_commit_flakes, stamp_commit_flakes_dropping_forgeries,
+    trace_first_parent_commits_by_id, warn_if_forged_commit_flakes_dropped, Novelty,
 };
 use fluree_vocab::namespaces::{FLUREE_COMMIT, JSON_LD, RDF, XSD};
 use fluree_vocab::{rdf_names, xsd_names};
@@ -194,8 +195,8 @@ impl HistoricalLedgerView {
 
     /// Load novelty from commits within a specific range
     ///
-    /// Walks the commit chain backwards from `head_cid` using the content store,
-    /// including only commits where `index_t < commit.t <= target_t`.
+    /// Walks the first-parent lineage backwards from `head_cid` using the
+    /// content store, including only commits where `index_t < commit.t <= target_t`.
     ///
     /// Uses a deferred batch approach: collect flakes during the HEAD→oldest walk,
     /// apply namespace/graph deltas, build reverse_graph, then replay oldest→newest.
@@ -232,7 +233,7 @@ impl HistoricalLedgerView {
         // Collect (data flakes + commit-meta flakes, deferred txn-meta, t) per commit.
         let mut commit_batches: Vec<(Vec<Flake>, Option<DeferredTxnMeta>, i64)> = Vec::new();
 
-        let stream = trace_commits_by_id(store, head_cid.clone(), index_t);
+        let stream = trace_first_parent_commits_by_id(store, head_cid.clone(), index_t);
         futures::pin_mut!(stream);
 
         let mut commit_count = 0;
@@ -298,9 +299,12 @@ impl HistoricalLedgerView {
         let txn_meta_graph_sid = snapshot.encode_iri(&txn_meta_iri);
 
         // Stamp commit metadata flakes with txn-meta graph SID
+        // Same pass also drops blob flakes impersonating commit provenance —
+        // see the note in `LedgerState::load_novelty` and #1846.
         if let Some(ref g_sid) = txn_meta_graph_sid {
-            for (flakes, _, _) in &mut commit_batches {
-                stamp_graph_on_commit_flakes(flakes, g_sid);
+            for (flakes, _, t) in &mut commit_batches {
+                let dropped = stamp_commit_flakes_dropping_forgeries(flakes, g_sid);
+                warn_if_forged_commit_flakes_dropped(dropped, ledger_id, *t);
             }
         }
 
@@ -469,6 +473,12 @@ impl OverlayProvider for HistoricalLedgerView {
 
     fn epoch(&self) -> u64 {
         self.overlay.as_ref().map(|n| n.epoch).unwrap_or(0)
+    }
+
+    fn overlay_flake_count(&self, g_id: GraphId) -> Option<usize> {
+        self.overlay
+            .as_ref()
+            .map_or(Some(0), |n| n.overlay_flake_count(g_id))
     }
 
     fn for_each_overlay_flake(

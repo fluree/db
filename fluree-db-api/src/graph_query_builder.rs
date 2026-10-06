@@ -102,12 +102,6 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
         self
     }
 
-    /// Enable BM25/Vector index providers for graph source queries.
-    pub fn with_index_providers(mut self) -> Self {
-        self.core.set_index_providers();
-        self
-    }
-
     /// Enable R2RML/Iceberg support (feature-gated).
     ///
     /// Attaches actual R2RML provider objects so that GRAPH patterns
@@ -137,7 +131,50 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
         }
     }
 
-    /// Load the view, using graph source fallback when enabled.
+    /// Wrap a loaded view in the request's policy.
+    ///
+    /// A request selecting any policy is wrapped with it, gated on
+    /// `has_any_policy_inputs` as on the `from`-driven path. One selecting nothing
+    /// leaves the ledger's or source's configured defaults in force, and those
+    /// leave an unconfigured ledger untouched.
+    ///
+    /// A SPARQL request selects policy with its `# PRAGMA identity` /
+    /// `policy-class` / `policy-values` / `default-allow` directives, the
+    /// counterpart of JSON-LD's body `opts`.
+    ///
+    /// The verified identity does not arrive in the body either: it rides the
+    /// builder's execution options from the auth layer, and without it an
+    /// `f:IdentityRestricted` override control refuses a request the config would
+    /// permit.
+    async fn wrap_request_policy(&self, view: GraphDb) -> Result<GraphDb> {
+        let mut opts = match self.core.input.as_ref() {
+            Some(crate::view::QueryInput::JsonLd(json)) => {
+                // A malformed `opts` block is the caller's mistake, so a 400.
+                // `ApiError::query` would report it as an internal 500.
+                crate::GovernanceOptions::from_json(json)
+                    .map_err(|e| ApiError::invalid_query(e.to_string()))?
+            }
+            Some(crate::view::QueryInput::Sparql(sparql)) => {
+                crate::GovernanceOptions::from_sparql(sparql)
+            }
+            None => crate::GovernanceOptions::default(),
+        };
+        opts.server_identity = self.core.execution.server_identity.clone();
+        // `has_any_policy_inputs`, not the narrower `selects_policy_set`: the
+        // latter ignores a `default-allow: false` that arrives on its own, and
+        // such a request must not take the unrestricted path.
+        if opts.has_any_policy_inputs() {
+            self.graph.fluree.wrap_policy(view, &opts).await
+        } else {
+            self.graph.fluree.wrap_policy_defaults(view).await
+        }
+    }
+
+    /// Load the view for this handle's ledger and time, falling back to a graph
+    /// source when enabled, and return it wrapped in the request's policy.
+    ///
+    /// Execution receives the view already wrapped and does not wrap it again.
+    /// See [`Self::wrap_request_policy`] for which requests engage enforcement.
     async fn load_view(&self) -> Result<crate::view::GraphDb> {
         let result = self
             .graph
@@ -157,24 +194,32 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
                 .is_err_and(super::error::ApiError::is_not_found)
         {
             let ledger_id = &self.graph.ledger_id;
-            let gs_id = fluree_db_core::normalize_ledger_id(ledger_id)
-                .unwrap_or_else(|_| ledger_id.to_string());
+            // The id may carry a `#graph` fragment; the source is the id before it.
+            let gs_id = fluree_db_core::LedgerRef::parse(ledger_id)?.id.to_string();
 
             if let Some((r2rml, _)) = &self.core.r2rml {
                 if r2rml.has_r2rml_mapping(&gs_id).await {
-                    let snapshot = fluree_db_core::LedgerSnapshot::genesis(&gs_id);
-                    let state = fluree_db_ledger::LedgerState::new(
-                        snapshot,
-                        fluree_db_novelty::Novelty::new(0),
-                    );
-                    let mut db = crate::view::GraphDb::from_ledger_state(&state);
-                    db.graph_source_id = Some(gs_id.into());
-                    return Ok(db);
+                    // The shared resolver builds the genesis view, carries (or
+                    // refuses) the handle's pin, and resolves the model config a
+                    // governed source presents to `wrap_policy`. A `None` here
+                    // is a record that vanished between the two lookups: keep
+                    // the NotFound the ledger load produced.
+                    let Some(db) = self
+                        .graph
+                        .fluree
+                        .resolve_graph_source_at(ledger_id, &self.graph.time_spec)
+                        .await?
+                    else {
+                        return result;
+                    };
+                    // A governed source's configured defaults are its model's
+                    // policy, resolved onto the view above.
+                    return self.wrap_request_policy(db).await;
                 }
             }
         }
 
-        result
+        self.wrap_request_policy(result?).await
     }
 
     /// Execute the query and return raw [`QueryResult`].
@@ -231,6 +276,26 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
             .take()
             .unwrap_or_else(|| self.core.default_format());
         let input = self.core.input.take().unwrap();
+
+        // A subgraph ("crawl") projection over an R2RML graph source cannot use
+        // native binary-index hydration (the source has no flakes); expand it
+        // through the R2RML operator instead. Only a wildcard `["*"]` crawl is
+        // handled here — any other shape returns `None` and falls through to the
+        // normal path unchanged.
+        #[cfg(feature = "iceberg")]
+        if let Some(expanded) = crate::graph_source::crawl::maybe_expand_crawl(
+            self.graph.fluree,
+            &view,
+            input.as_jsonld(),
+            r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref())),
+            execution.clone(),
+            &format_config,
+        )
+        .await?
+        {
+            return Ok(expanded);
+        }
+
         let result = match r2rml.as_ref() {
             Some((provider, table_provider)) => {
                 self.graph
@@ -251,14 +316,7 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
                     .await?
             }
         };
-        match view.policy() {
-            Some(policy) => Ok(result
-                .format_async_with_policy(view.as_graph_db_ref(), &format_config, policy)
-                .await?),
-            None => Ok(result
-                .format_async(view.as_graph_db_ref(), &format_config)
-                .await?),
-        }
+        Ok(result.format_async_for_view(&view, &format_config).await?)
     }
 
     /// Execute with tracking (fuel, time, policy stats).
@@ -274,12 +332,43 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
         let db = self
             .load_view()
             .await
-            .map_err(|e| TrackedErrorResponse::new(404, e.to_string(), None))?;
+            // Not a blanket 404: `load_view` now also reports a malformed `opts`
+            // block, which is a 400, and a load can fail for other reasons too.
+            .map_err(|e| TrackedErrorResponse::new(e.status_code(), e.to_string(), None))?;
         let r2rml = self.core.r2rml.take();
         let format_config = self.core.format.take();
         let tracking = self.core.tracking.take();
         let execution = self.core.execution.clone();
         let input = self.core.input.take().unwrap();
+
+        // Intercept a virtual-dataset subgraph crawl BEFORE dispatch, exactly
+        // like `execute_formatted` — otherwise the same crawl issued with
+        // tracking headers falls through to native hydration and returns [].
+        // The crawl has no fuel/policy/time stats, so it returns a 200 with
+        // empty tracking (mirrors `FromQueryBuilder::execute_tracked`).
+        #[cfg(feature = "iceberg")]
+        {
+            let fc = format_config
+                .clone()
+                .unwrap_or_else(|| self.core.default_format());
+            match crate::graph_source::crawl::maybe_expand_crawl(
+                self.graph.fluree,
+                &db,
+                input.as_jsonld(),
+                r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref())),
+                execution.clone(),
+                &fc,
+            )
+            .await
+            {
+                Ok(Some(expanded)) => {
+                    return Ok(TrackedQueryResponse::success(expanded, None));
+                }
+                Ok(None) => {}
+                Err(e) => return Err(TrackedErrorResponse::new(500, e.to_string(), None)),
+            }
+        }
+
         match r2rml.as_ref() {
             Some((provider, table_provider)) => {
                 self.graph
@@ -381,12 +470,6 @@ impl<'a: 'v, 'v> GraphSnapshotQueryBuilder<'a, 'v> {
         self
     }
 
-    /// Enable BM25/Vector index providers for graph source queries.
-    pub fn with_index_providers(mut self) -> Self {
-        self.core.set_index_providers();
-        self
-    }
-
     /// Enable R2RML/Iceberg support (feature-gated).
     #[cfg(feature = "iceberg")]
     pub fn with_r2rml(mut self) -> Self {
@@ -473,14 +556,9 @@ impl<'a: 'v, 'v> GraphSnapshotQueryBuilder<'a, 'v> {
                     .await?
             }
         };
-        match self.view.policy() {
-            Some(policy) => Ok(result
-                .format_async_with_policy(self.view.as_graph_db_ref(), &format_config, policy)
-                .await?),
-            None => Ok(result
-                .format_async(self.view.as_graph_db_ref(), &format_config)
-                .await?),
-        }
+        Ok(result
+            .format_async_for_view(self.view, &format_config)
+            .await?)
     }
 
     /// Execute with tracking (fuel, time, policy stats).

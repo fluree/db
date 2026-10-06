@@ -6,6 +6,7 @@
 //! types used by the sync layer.
 
 use crate::watch::RemoteEvent;
+use fluree_db_core::LedgerId;
 use fluree_db_nameservice::{GraphSourceRecord, GraphSourceType, NsRecord};
 use fluree_sse::{SSE_KIND_GRAPH_SOURCE, SSE_KIND_LEDGER};
 
@@ -55,7 +56,6 @@ struct NsRetractedEnvelope {
 struct LedgerSseRecord {
     /// Canonical ledger alias, e.g. "books:main"
     ledger_id: String,
-    branch: String,
     #[serde(default)]
     commit_head_id: Option<String>,
     commit_t: i64,
@@ -73,8 +73,6 @@ struct LedgerSseRecord {
 struct GraphSourceSseRecord {
     /// Canonical graph source alias, e.g. "search:main"
     graph_source_id: String,
-    name: String,
-    branch: String,
     /// String form of graph source type, e.g. "f:Bm25Index"
     source_type: String,
     config: String,
@@ -90,14 +88,20 @@ fn parse_ns_record(data: &str) -> Result<Option<RemoteEvent>, ServerSseParseErro
     match payload.kind.as_str() {
         SSE_KIND_LEDGER => {
             let record: LedgerSseRecord = serde_json::from_value(payload.record)?;
+            let Some(id) = parse_event_id(&record.ledger_id) else {
+                return Ok(None);
+            };
             Ok(Some(RemoteEvent::LedgerUpdated(ledger_sse_to_ns_record(
-                record,
+                id, record,
             ))))
         }
         SSE_KIND_GRAPH_SOURCE => {
             let record: GraphSourceSseRecord = serde_json::from_value(payload.record)?;
+            let Some(id) = parse_event_id(&record.graph_source_id) else {
+                return Ok(None);
+            };
             Ok(Some(RemoteEvent::GraphSourceUpdated(
-                gs_sse_to_graph_source_record(record),
+                gs_sse_to_graph_source_record(id, record),
             )))
         }
         // Unknown kind is not an error; ignore for forwards compatibility.
@@ -107,26 +111,35 @@ fn parse_ns_record(data: &str) -> Result<Option<RemoteEvent>, ServerSseParseErro
 
 fn parse_ns_retracted(data: &str) -> Result<Option<RemoteEvent>, ServerSseParseError> {
     let payload: NsRetractedEnvelope = serde_json::from_str(data)?;
+    let Some(id) = parse_event_id(&payload.resource_id) else {
+        return Ok(None);
+    };
 
     match payload.kind.as_str() {
-        SSE_KIND_LEDGER => Ok(Some(RemoteEvent::LedgerRetracted {
-            ledger_id: payload.resource_id,
-        })),
+        SSE_KIND_LEDGER => Ok(Some(RemoteEvent::LedgerRetracted { ledger_id: id })),
         SSE_KIND_GRAPH_SOURCE => Ok(Some(RemoteEvent::GraphSourceRetracted {
-            graph_source_id: payload.resource_id,
+            graph_source_id: id,
         })),
         _ => Ok(None),
     }
 }
 
-fn ledger_sse_to_ns_record(record: LedgerSseRecord) -> NsRecord {
+/// An id this peer cannot represent is one resource it cannot mirror, not a
+/// schema mismatch: skip the event rather than count it toward the
+/// consecutive-parse-error limit that tears the stream down.
+fn parse_event_id(raw: &str) -> Option<LedgerId> {
+    LedgerId::parse(raw)
+        .inspect_err(|e| tracing::warn!(error = %e, "skipping SSE event for unparseable id"))
+        .ok()
+}
+
+fn ledger_sse_to_ns_record(ledger_id: LedgerId, record: LedgerSseRecord) -> NsRecord {
     use fluree_db_core::ContentId;
 
-    let (ledger_name, branch) = split_ledger_id_or_fallback(&record.ledger_id, &record.branch);
     NsRecord {
-        ledger_id: record.ledger_id.clone(),
-        name: ledger_name,
-        branch,
+        name: ledger_id.name().to_string(),
+        branch: ledger_id.branch().to_string(),
+        ledger_id,
         commit_head_id: record
             .commit_head_id
             .and_then(|s| s.parse::<ContentId>().ok()),
@@ -143,13 +156,16 @@ fn ledger_sse_to_ns_record(record: LedgerSseRecord) -> NsRecord {
     }
 }
 
-fn gs_sse_to_graph_source_record(record: GraphSourceSseRecord) -> GraphSourceRecord {
+fn gs_sse_to_graph_source_record(
+    graph_source_id: LedgerId,
+    record: GraphSourceSseRecord,
+) -> GraphSourceRecord {
     use fluree_db_core::ContentId;
 
     GraphSourceRecord {
-        graph_source_id: record.graph_source_id,
-        name: record.name,
-        branch: record.branch,
+        name: graph_source_id.name().to_string(),
+        branch: graph_source_id.branch().to_string(),
+        graph_source_id,
         source_type: GraphSourceType::from_type_string(&record.source_type),
         config: record.config,
         dependencies: record.dependencies,
@@ -157,14 +173,6 @@ fn gs_sse_to_graph_source_record(record: GraphSourceSseRecord) -> GraphSourceRec
         index_t: record.index_t,
         retracted: record.retracted,
     }
-}
-
-/// Split a ledger_id into (name, branch) using the canonical alias parser.
-///
-/// Falls back to (ledger_id, fallback_branch) if parsing fails.
-fn split_ledger_id_or_fallback(ledger_id: &str, fallback_branch: &str) -> (String, String) {
-    fluree_db_core::ledger_id::split_ledger_id(ledger_id)
-        .unwrap_or_else(|_| (ledger_id.to_string(), fallback_branch.to_string()))
 }
 
 #[cfg(test)]
@@ -204,6 +212,119 @@ mod tests {
             }
             other => panic!("expected LedgerUpdated, got {other:?}"),
         }
+    }
+
+    /// `source_branch` and `branches` are carried from the wire.
+    ///
+    /// They were previously hardcoded to `None`/`0` here regardless of what
+    /// the server sent, so a branched ledger arrived at the peer looking
+    /// unbranched. Pinned because this is a deliberate behavior change made
+    /// alongside a large restructure of the subscription task, and without a
+    /// test a regression here has no failing test and no clean bisect
+    /// boundary between "the refactor broke it" and "the intended change
+    /// broke it".
+    #[test]
+    fn ledger_event_carries_branch_metadata_from_the_wire() {
+        let event = SseEvent {
+            event_type: Some("ns-record".to_string()),
+            data: r#"{
+                "action": "ns-record",
+                "kind": "ledger",
+                "resource_id": "mydb:feature",
+                "record": {
+                    "ledger_id": "mydb:feature",
+                    "branch": "feature",
+                    "commit_t": 7,
+                    "index_t": 0,
+                    "retracted": false,
+                    "source_branch": "main",
+                    "branches": 3
+                },
+                "emitted_at": "2025-01-01T00:00:00Z"
+            }"#
+            .to_string(),
+            id: None,
+        };
+
+        match parse_server_sse_event(&event).unwrap() {
+            Some(RemoteEvent::LedgerUpdated(record)) => {
+                assert_eq!(record.source_branch.as_deref(), Some("main"));
+                assert_eq!(record.branches, 3);
+            }
+            other => panic!("expected LedgerUpdated, got {other:?}"),
+        }
+
+        // Absent on the wire is still the old default, not an error: the
+        // fields are `#[serde(default)]` so an older server stays readable.
+        let older = SseEvent {
+            event_type: Some("ns-record".to_string()),
+            data: r#"{
+                "action": "ns-record",
+                "kind": "ledger",
+                "resource_id": "mydb:main",
+                "record": {
+                    "ledger_id": "mydb:main",
+                    "branch": "main",
+                    "commit_t": 1,
+                    "index_t": 0,
+                    "retracted": false
+                },
+                "emitted_at": "2025-01-01T00:00:00Z"
+            }"#
+            .to_string(),
+            id: None,
+        };
+        match parse_server_sse_event(&older).unwrap() {
+            Some(RemoteEvent::LedgerUpdated(record)) => {
+                assert_eq!(record.source_branch, None);
+                assert_eq!(record.branches, 0);
+            }
+            other => panic!("expected LedgerUpdated, got {other:?}"),
+        }
+    }
+
+    /// A `ledger_id` the parser rejects degrades to the verbatim id plus the
+    /// wire's `branch`, rather than erroring the event and tearing down the
+    /// stream.
+    ///
+    /// The trade is deliberate: one unreadable record should not stop a peer
+    /// from receiving every other ledger's updates. Pinned so the choice is
+    /// visible — the failure mode it accepts is a record whose `name` is not
+    /// a real name, which is strictly better than a dead subscription.
+    #[test]
+    fn an_unparseable_ledger_id_degrades_rather_than_killing_the_stream() {
+        let event = SseEvent {
+            event_type: Some("ns-record".to_string()),
+            data: r#"{
+                "action": "ns-record",
+                "kind": "ledger",
+                "resource_id": "mydb:main:extra",
+                "record": {
+                    "ledger_id": "mydb:main:extra",
+                    "branch": "main",
+                    "commit_t": 2,
+                    "index_t": 0,
+                    "retracted": false
+                },
+                "emitted_at": "2025-01-01T00:00:00Z"
+            }"#
+            .to_string(),
+            id: None,
+        };
+
+        // Precondition: this id really is one the canonical parser rejects,
+        // so the test exercises the fallback rather than the happy path.
+        assert!(
+            fluree_db_core::ledger_id::split_ledger_id("mydb:main:extra").is_err(),
+            "fixture must be an id the parser rejects, or this test is vacuous"
+        );
+
+        // Skipped (Ok(None)), not an Err: an Err counts toward the
+        // consecutive-parse-error limit that tears the stream down.
+        assert!(
+            matches!(parse_server_sse_event(&event), Ok(None)),
+            "an unrepresentable id must be skipped, not fail the stream"
+        );
     }
 
     #[test]

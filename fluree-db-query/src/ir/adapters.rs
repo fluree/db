@@ -6,6 +6,7 @@
 //! Iceberg table reachable via R2RML mappings — and gives it a plug shape
 //! that fits where a `Pattern::Triple` would otherwise sit.
 
+use crate::ir::Expression;
 use crate::var_registry::VarId;
 use fluree_db_core::Sid;
 
@@ -470,10 +471,9 @@ pub enum S2QueryGeom {
 }
 
 impl S2SearchPattern {
-    /// Create a new within pattern
-    pub fn within(subject_var: VarId, query_geom: S2QueryGeom) -> Self {
+    fn new(operation: S2SpatialOp, subject_var: VarId, query_geom: S2QueryGeom) -> Self {
         Self {
-            operation: S2SpatialOp::Within,
+            operation,
             subject_var,
             query_geom,
             predicate: None,
@@ -481,45 +481,26 @@ impl S2SearchPattern {
             limit: None,
             spatial_index_alias: None,
         }
+    }
+
+    /// Create a new within pattern
+    pub fn within(subject_var: VarId, query_geom: S2QueryGeom) -> Self {
+        Self::new(S2SpatialOp::Within, subject_var, query_geom)
     }
 
     /// Create a new contains pattern
     pub fn contains(subject_var: VarId, query_geom: S2QueryGeom) -> Self {
-        Self {
-            operation: S2SpatialOp::Contains,
-            subject_var,
-            query_geom,
-            predicate: None,
-            distance_var: None,
-            limit: None,
-            spatial_index_alias: None,
-        }
+        Self::new(S2SpatialOp::Contains, subject_var, query_geom)
     }
 
     /// Create a new intersects pattern
     pub fn intersects(subject_var: VarId, query_geom: S2QueryGeom) -> Self {
-        Self {
-            operation: S2SpatialOp::Intersects,
-            subject_var,
-            query_geom,
-            predicate: None,
-            distance_var: None,
-            limit: None,
-            spatial_index_alias: None,
-        }
+        Self::new(S2SpatialOp::Intersects, subject_var, query_geom)
     }
 
     /// Create a new nearby pattern
     pub fn nearby(subject_var: VarId, center: S2QueryGeom, radius_meters: f64) -> Self {
-        Self {
-            operation: S2SpatialOp::Nearby { radius_meters },
-            subject_var,
-            query_geom: center,
-            predicate: None,
-            distance_var: None,
-            limit: None,
-            spatial_index_alias: None,
-        }
+        Self::new(S2SpatialOp::Nearby { radius_meters }, subject_var, center)
     }
 
     /// Set the predicate IRI for index routing
@@ -594,13 +575,44 @@ pub struct R2rmlPattern {
     /// Graph source alias (e.g., "airlines-r2rml:main")
     pub graph_source_id: String,
 
-    /// Variable to bind the subject IRI
-    pub subject_var: VarId,
+    /// Variable to bind the subject IRI.
+    ///
+    /// `None` when the triple has a constant (bound) subject — see
+    /// `subject_constant`. Exactly one of `subject_var` / `subject_constant`
+    /// is set.
+    pub subject_var: Option<VarId>,
+
+    /// A constant (bound) subject in the triple pattern (`<store/5> <pred> ?o`):
+    /// the subject is a fixed IRI, not a variable. The operator materializes each
+    /// row's subject and keeps only rows whose subject equals this IRI, binding
+    /// no subject variable. Enforced as the pattern's semantics (independent of
+    /// scan pushdown).
+    pub subject_constant: Option<String>,
 
     /// Variable to bind the object value (optional)
     ///
     /// If None, this pattern only materializes subjects (e.g., for rdf:type patterns).
     pub object_var: Option<VarId>,
+
+    /// Variable to bind the predicate IRI (optional).
+    ///
+    /// Set for a variable-predicate pattern (`?s ?p ?o` or `<iri> ?p ?o`). The
+    /// operator binds this variable to each materialized triple's predicate IRI
+    /// (the `rr:predicate` of the POM the object came from), so a wildcard scan
+    /// yields the predicate as well as subject/object rather than leaving `?p`
+    /// unbound. `None` for a constant-predicate or subject-only pattern.
+    pub predicate_var: Option<VarId>,
+
+    /// Variable to bind the subject's class IRI(s) for a variable `rdf:type`
+    /// pattern (`?s rdf:type ?type`, i.e. FQL `@type: ?type` / SPARQL `?s a ?t`).
+    ///
+    /// When set, the operator emits one row per class the row's TriplesMap
+    /// declares (`rr:class`), binding this variable to that class IRI — the same
+    /// scan a bound `class_filter` performs, but projecting the class instead of
+    /// filtering on it. A row whose map declares no class produces no binding
+    /// (the subject has no `rdf:type` triple). `object_var` stays `None`; the
+    /// class is drawn from the mapping, not a table column.
+    pub type_var: Option<VarId>,
 
     /// Specific TriplesMap IRI to use (optional)
     ///
@@ -618,6 +630,18 @@ pub struct R2rmlPattern {
     /// Limits scan to TriplesMap(s) that produce this rdf:type.
     pub class_filter: Option<String>,
 
+    /// PR-3 fix (b'): a co-located `rdf:type` class that was NOT fused into this
+    /// star for materialization (`class_fusion_is_safe` refused — the class lives
+    /// in a different TriplesMap than the base predicate), but whose class-declaring
+    /// TriplesMaps are subject-template-DISJOINT from every other map that resolves
+    /// here (`wildcard_class_fusion_is_safe`). Set only in that provably-safe case,
+    /// it lets TriplesMap resolution prune the star's fan-out to class-declaring
+    /// maps WITHOUT changing materialization: the class is still enforced by its own
+    /// standalone scan joined on the subject, and disjointness guarantees the pruned
+    /// maps' subjects could never survive that join anyway. Unlike `class_filter`,
+    /// this NEVER affects rdf:type emission — resolution pruning only.
+    pub class_prune_hint: Option<String>,
+
     /// Pushed-down scan filters for Iceberg file pruning, resolved at execution
     /// from FILTER comparisons on this pattern's object variables. Conservative:
     /// the in-engine FILTER still runs, so these only skip data files.
@@ -633,25 +657,83 @@ pub struct R2rmlPattern {
     /// product over multi-valued predicates) binding the subject and every
     /// object var, instead of producing one pattern per triple and joining them.
     pub star_bindings: Vec<(String, VarId)>,
+
+    /// Same-subject star: additional `(predicate IRI, required constant)` equality
+    /// constraints checked in the SAME table scan, fused from constant-object
+    /// triples (`?s <pred> <const>`) that share `subject_var` with a star base.
+    /// A row survives only when, for every entry, the predicate produces at least
+    /// one object equal to the constant — an existence filter that produces no
+    /// variable, avoiding a separate scan + self-join.
+    pub star_constraints: Vec<(String, crate::r2rml::ObjectConstant)>,
+
+    /// A scan-local FILTER fully consumed into this scan by the planner: every
+    /// variable it references is produced by this pattern alone. The operator
+    /// applies it to its output rows (same evaluator as the in-engine FILTER, so
+    /// results are unchanged), which lets the downstream LIMIT row budget reach
+    /// the scan — the standalone `FilterOperator` that would otherwise block the
+    /// budget is dropped. `None` when no filter was consumed.
+    pub consumed_filter: Option<Expression>,
+
+    /// A constant object in the triple pattern (`?s <pred> <const>`): the object
+    /// is not a variable but a required literal or IRI. `object_var` is `None`;
+    /// the operator keeps a subject only when this predicate's object equals the
+    /// constant (enforced as the pattern's semantics, independent of scan
+    /// pushdown). A scalar literal also emits a `ScanFilter` for row-group + row
+    /// pruning; IRI constants are operator-enforced only.
+    pub object_constant: Option<crate::r2rml::ObjectConstant>,
 }
 
 impl R2rmlPattern {
+    #[inline]
+    fn with_subject(
+        graph_source_id: String,
+        subject_var: Option<VarId>,
+        subject_constant: Option<String>,
+        object_var: Option<VarId>,
+    ) -> Self {
+        Self {
+            graph_source_id,
+            subject_var,
+            subject_constant,
+            object_var,
+            predicate_var: None,
+            type_var: None,
+            triples_map_iri: None,
+            predicate_filter: None,
+            class_filter: None,
+            class_prune_hint: None,
+            star_bindings: Vec::new(),
+            star_constraints: Vec::new(),
+            scan_filters: Vec::new(),
+            consumed_filter: None,
+            object_constant: None,
+        }
+    }
+
     /// Create a new R2RML pattern with subject and object variables.
     pub fn new(
         graph_source_id: impl Into<String>,
         subject_var: VarId,
         object_var: Option<VarId>,
     ) -> Self {
-        Self {
-            graph_source_id: graph_source_id.into(),
-            subject_var,
+        Self::with_subject(graph_source_id.into(), Some(subject_var), None, object_var)
+    }
+
+    /// Create a new R2RML pattern with a constant (bound) subject IRI.
+    ///
+    /// The subject is not a variable; the operator keeps only table rows whose
+    /// materialized subject equals `subject_constant` and binds no subject var.
+    pub fn new_bound_subject(
+        graph_source_id: impl Into<String>,
+        subject_constant: impl Into<String>,
+        object_var: Option<VarId>,
+    ) -> Self {
+        Self::with_subject(
+            graph_source_id.into(),
+            None,
+            Some(subject_constant.into()),
             object_var,
-            triples_map_iri: None,
-            predicate_filter: None,
-            class_filter: None,
-            star_bindings: Vec::new(),
-            scan_filters: Vec::new(),
-        }
+        )
     }
 
     /// Set the predicate filter.
@@ -666,19 +748,41 @@ impl R2rmlPattern {
         self
     }
 
+    /// Set the predicate variable (`?s ?p ?o` / `<iri> ?p ?o`), bound by the
+    /// operator to each materialized triple's predicate IRI.
+    pub fn with_predicate_var(mut self, var: VarId) -> Self {
+        self.predicate_var = Some(var);
+        self
+    }
+
+    /// Set the type variable (`?s rdf:type ?type`), bound by the operator to the
+    /// subject's declared class IRI(s).
+    pub fn with_type_var(mut self, var: VarId) -> Self {
+        self.type_var = Some(var);
+        self
+    }
+
     /// Set the class filter.
     pub fn with_class(mut self, class: impl Into<String>) -> Self {
         self.class_filter = Some(class.into());
         self
     }
 
-    /// Variables this pattern produces. R2RML patterns have no input
-    /// variables (only the static graph_source_id and metadata filters), so
-    /// referenced and produced are the same set.
+    /// Variables this pattern binds from the table scan. Filter dependencies
+    /// are included separately by [`Self::referenced_vars`].
     pub fn produced_vars(&self) -> Vec<VarId> {
-        let mut vars = vec![self.subject_var];
+        let mut vars = Vec::new();
+        if let Some(sv) = self.subject_var {
+            vars.push(sv);
+        }
         if let Some(obj_var) = self.object_var {
             vars.push(obj_var);
+        }
+        if let Some(pv) = self.predicate_var {
+            vars.push(pv);
+        }
+        if let Some(tv) = self.type_var {
+            vars.push(tv);
         }
         for (_, var) in &self.star_bindings {
             vars.push(*var);
@@ -687,7 +791,93 @@ impl R2rmlPattern {
     }
 
     /// Variables mentioned anywhere in this pattern.
+    ///
+    /// EXHAUSTIVELY destructures `R2rmlPattern` (no `..`) so a newly added
+    /// var-bearing field breaks compilation here until it is classified — this
+    /// set feeds correlation analysis (the batched-OPTIONAL hash-join partition,
+    /// `optional.rs`) and planner var-dependency, where a silently-omitted var
+    /// would mis-partition (wrong answers). Unlike `produced_vars`, this also
+    /// includes the FILTER operands (`scan_filters`, `consumed_filter`) so it is
+    /// correct by construction rather than by their "operands ⊆ produced-vars"
+    /// invariants.
     pub fn referenced_vars(&self) -> Vec<VarId> {
-        self.produced_vars()
+        let R2rmlPattern {
+            graph_source_id: _,
+            subject_var,
+            subject_constant: _,
+            object_var,
+            predicate_var,
+            type_var,
+            triples_map_iri: _,
+            predicate_filter: _,
+            class_filter: _,
+            class_prune_hint: _,
+            scan_filters,
+            star_bindings,
+            star_constraints: _, // constant-object existence filters — no variable
+            consumed_filter,
+            object_constant: _,
+        } = self;
+        let mut vars = Vec::new();
+        for v in [subject_var, object_var, predicate_var, type_var]
+            .into_iter()
+            .flatten()
+        {
+            vars.push(*v);
+        }
+        for (_, v) in star_bindings {
+            vars.push(*v);
+        }
+        for pd in scan_filters {
+            vars.push(pd.var);
+        }
+        if let Some(expr) = consumed_filter {
+            vars.extend(expr.referenced_vars());
+        }
+        vars
+    }
+}
+
+#[cfg(test)]
+mod r2rml_pattern_var_tests {
+    use super::*;
+    use crate::ir::expression::Expression;
+    use crate::r2rml::{ScanCmpOp, ScanValue};
+
+    // PR-4b P1 precursor: `referenced_vars` must surface EVERY var-bearing field,
+    // or correlation analysis (the batched-OPTIONAL hash-join partition) could
+    // drop a shared var and mis-partition. The exhaustive destructure in
+    // `referenced_vars` makes a newly added field a compile error until it is
+    // classified; this test asserts the CURRENT var-bearing fields are all wired,
+    // including the FILTER operands (`scan_filters`, `consumed_filter`) that the
+    // old `produced_vars`-delegating impl relied on invariants to cover.
+    #[test]
+    fn referenced_vars_surfaces_every_var_bearing_field() {
+        let mut p = R2rmlPattern::new("gs:main", VarId(1), Some(VarId(2)));
+        p.predicate_var = Some(VarId(3));
+        p.type_var = Some(VarId(4));
+        p.star_bindings = vec![("http://ex/p".to_string(), VarId(5))];
+        p.scan_filters = vec![ScanPushdown {
+            var: VarId(6),
+            op: ScanCmpOp::Eq,
+            value: ScanValue::Int(0),
+        }];
+        p.consumed_filter = Some(Expression::Var(VarId(7)));
+
+        let refs: std::collections::HashSet<VarId> = p.referenced_vars().into_iter().collect();
+        for v in [
+            VarId(1),
+            VarId(2),
+            VarId(3),
+            VarId(4),
+            VarId(5),
+            VarId(6),
+            VarId(7),
+        ] {
+            assert!(
+                refs.contains(&v),
+                "referenced_vars() omitted {v:?} — a var-bearing field is unwired"
+            );
+        }
     }
 }

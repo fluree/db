@@ -20,12 +20,18 @@ path = "src/lib.rs"
 # reuses the dist binary) can use S3 storage + DynamoDB nameservice via
 # connection config. Dormant unless configured; ~+2 MB over the AWS SDK that
 # `iceberg` already pulls in.
-default = ["server", "iceberg", "shacl", "aws"]
+default = ["server", "iceberg", "sql", "delta", "shacl", "aws", "graphql"]
 server = ["dep:fluree-db-server"]
 iceberg = ["fluree-db-api/iceberg"]
-aws = ["fluree-db-server/aws"]
+# SQL graph sources (R2RML over a Trino-protocol endpoint)
+sql = ["iceberg", "fluree-db-api/sql", "fluree-db-server?/sql"]
+# Delta Lake graph sources (R2RML over Delta tables)
+delta = ["iceberg", "fluree-db-api/delta", "fluree-db-server?/delta"]
+aws = ["fluree-db-server/aws", "fluree-db-nameservice-sync/aws"]
 # SHACL constraint validation at transaction time
 shacl = ["fluree-db-api/shacl"]
+# GraphQL over the schema derived from a ledger's data
+graphql = ["dep:fluree-db-graphql", "fluree-db-api/graphql", "fluree-db-server?/graphql"]
 # Use mimalloc as the global allocator (better multicore allocation throughput
 # for query/import/materialization paths). Opt-in; enable in release packaging.
 mimalloc = ["dep:mimalloc"]
@@ -39,22 +45,33 @@ otel = [
 [dependencies]
 # Optional global allocator (see the `mimalloc` feature).
 mimalloc = { workspace = true, optional = true }
+fluree-db-graphql = { path = "../fluree-db-graphql", optional = true }
 fluree-db-api = { path = "../fluree-db-api" }
 # Temp dir for streaming CSV → .jsonl into the bulk import pipeline.
 tempfile = "3"
+# `fluree load` reads CSV rows client-side into batched Cypher upserts.
+csv = "1.4"
 fluree-db-novelty = { path = "../fluree-db-novelty" }
 fluree-db-nameservice = { path = "../fluree-db-nameservice" }
 fluree-db-core = { path = "../fluree-db-core" }
+fluree-graph-turtle = { path = "../fluree-graph-turtle" }
+fluree-db-transact = { path = "../fluree-db-transact" }
 fluree-db-indexer = { path = "../fluree-db-indexer" }
 fluree-vocab = { path = "../fluree-vocab" }
 fluree-db-query = { path = "../fluree-db-query" }
 fluree-db-binary-index = { path = "../fluree-db-binary-index" }
+# Shared R2RML media-type resolver (MappingFormat) so the CLI infers the same
+# ext→format table the server uses, instead of a divergent local copy (#1397).
+fluree-db-r2rml = { path = "../fluree-db-r2rml" }
 
 # Developer memory layer (store + CLI subcommands)
 fluree-db-memory = { path = "../fluree-db-memory" }
 
 # Embedded docs lookup (human `fluree docs` CLI subcommand)
 fluree-db-docs = { path = "../fluree-db-docs" }
+
+# Document ingestion (`fluree doc`): parse, chunk, embed
+fluree-db-doc = { path = "../fluree-db-doc" }
 
 # Unified MCP service (stdio) — selectable memory/docs toolsets
 fluree-db-mcp = { path = "../fluree-db-mcp" }
@@ -63,6 +80,7 @@ fluree-db-mcp = { path = "../fluree-db-mcp" }
 fluree-db-server = { path = "../fluree-db-server", optional = true }
 
 clap = { workspace = true }
+chrono.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -81,13 +99,13 @@ tracing-subscriber = { workspace = true }
 libc = "0.2"
 
 # OpenTelemetry (optional, enabled by `otel` feature)
-tracing-opentelemetry = { version = "0.32.1", optional = true }
-opentelemetry = { version = "0.31.0", optional = true }
-opentelemetry-otlp = { version = "0.31.0", optional = true, features = [
+tracing-opentelemetry = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true, features = [
     "grpc-tonic",
     "http-proto",
 ] }
-opentelemetry_sdk = { version = "0.31.0", optional = true, features = [
+opentelemetry_sdk = { workspace = true, optional = true, features = [
     "rt-tokio",
     "experimental_trace_batch_span_processor_with_async_runtime",
 ] }
@@ -105,7 +123,7 @@ sha2.workspace = true
 # Remote ledger client (track mode) + OIDC discovery/exchange
 # `stream` enables streaming a .flpack file body to POST /import without
 # buffering the whole archive; `tokio-util` io gives ReaderStream for it.
-reqwest = { workspace = true, features = ["stream"] }
+reqwest = { workspace = true, features = ["form", "stream"] }
 tokio-util = { version = "0.7", features = ["io"] }
 bytes.workspace = true
 urlencoding = { workspace = true }
@@ -121,6 +139,13 @@ parking_lot = "0.12"
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+# Drive the server's router in-process (behind the `server` feature) so the
+# tracking headers this CLI emits are tested against the parser that consumes
+# them, rather than each side being asserted in isolation.
+axum = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 # Used by `create --from` integration tests to produce .gz / .zst fixtures inline.
 flate2 = { workspace = true }
 zstd = { workspace = true }

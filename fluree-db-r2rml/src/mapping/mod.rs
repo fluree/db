@@ -12,4 +12,4 @@ mod triples_map;
 pub use compiled::CompiledR2rmlMapping;
 pub use ref_object_map::{JoinCondition, RefObjectMap};
 pub use term_map::{ConstantValue, ObjectMap, PredicateMap, PredicateObjectMap, TermType};
-pub use triples_map::{extract_template_columns, LogicalTable, SubjectMap, TriplesMap};
+pub use triples_map::{extract_template_columns, GraphMap, LogicalTable, SubjectMap, TriplesMap};

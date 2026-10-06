@@ -84,6 +84,19 @@ impl Fluree {
         db: &GraphDb,
         input: &OwnedStreamQuery,
     ) -> Result<StreamQueryPlan> {
+        self.plan_stream_query_with_options(db, input, &QueryExecutionOptions::default())
+            .await
+    }
+
+    /// [`Fluree::plan_stream_query`] with execution options. Planning consults
+    /// `server_identity`, the auth-layer-verified caller identity that
+    /// `f:overrideControl` gates on; the default is anonymous.
+    pub async fn plan_stream_query_with_options(
+        &self,
+        db: &GraphDb,
+        input: &OwnedStreamQuery,
+        options: &QueryExecutionOptions,
+    ) -> Result<StreamQueryPlan> {
         let input = input.as_input();
 
         let (vars, mut parsed) = match &input {
@@ -104,10 +117,17 @@ impl Fluree {
         };
 
         super::query::maybe_wrap_for_graph_source(db, &mut parsed);
+        super::query::guard_graph_source_patterns(
+            db,
+            &parsed,
+            super::query::QuerySyntax::of(&input),
+        )?;
 
         ensure_streamable(&parsed.output)?;
 
-        let executable = self.build_executable_for_view(db, &parsed).await?;
+        let executable = self
+            .build_executable_for_view(db, &parsed, options.server_identity.as_ref())
+            .await?;
 
         Ok(StreamQueryPlan {
             vars,
@@ -125,6 +145,11 @@ impl Fluree {
     ///
     /// Intended to be `tokio::spawn`ed by the HTTP handler. Owns the
     /// `LedgerState` (the `GraphDb` borrows it) so it outlives the request.
+    ///
+    /// NOT wrapped by the residency retry loop (`query_with_options`): rows
+    /// are emitted before execution completes, so a residency miss
+    /// mid-stream cannot be re-run transparently. Residency-mode peers
+    /// (wasm32 browser) must use the buffered query entry instead.
     pub async fn run_stream_query(
         &self,
         ledger: LedgerState,
@@ -195,12 +220,16 @@ impl Fluree {
             .await;
 
         let terminal = match exec {
-            Ok(()) => ndjson_stream::end_record(
-                sink.rows,
-                meta.t,
-                tracker.current_fuel(),
-                tracker.tally().and_then(|t| t.time).as_deref(),
-            ),
+            Ok(()) => {
+                let tally = tracker.tally();
+                ndjson_stream::end_record(
+                    sink.rows,
+                    meta.t,
+                    tracker.current_fuel(),
+                    tally.as_ref().and_then(|t| t.time.as_deref()),
+                    tally.as_ref().and_then(|t| t.policy_enforcement.as_ref()),
+                )
+            }
             Err(err) => {
                 ndjson_stream::error_record(query_error_code(&err), &err.to_string(), sink.rows)
             }
@@ -221,8 +250,18 @@ impl Fluree {
         options: &QueryExecutionOptions,
         sink: &mut S,
     ) -> std::result::Result<(), fluree_db_query::QueryError> {
+        // Sibling of the buffered `execute_view_tracked_with_r2rml`: record
+        // whether policy governs this request before executing, so the terminal
+        // `end` record answers "was this enforced?" the same way the buffered
+        // response does.
+        tracker.record_policy_enforcement(db.policy_enforcement());
+
         let db_ref = db.as_graph_db_ref();
-        let prepare_config = PrepareConfig::current(db.binary_store.as_ref());
+        let union = super::union_default_dataset(db, executable);
+        let mut prepare_config = PrepareConfig::current(db.binary_store.as_ref());
+        prepare_config.planning = prepare_config
+            .planning
+            .with_multi_default_graph(union.is_some());
         let prepared = fluree_db_query::execute::prepare_execution_with_config(
             db_ref,
             executable,
@@ -235,6 +274,7 @@ impl Fluree {
         // buffered `execute_view_internal_with_r2rml`); no-op without `iceberg`
         // and never consulted for plain queries.
         let r2rml = crate::r2rml_provider!(self);
+        crate::graph_source::pin_graph_source_times([db], &r2rml)?;
         view_context_config!(
             config,
             self,
@@ -244,6 +284,7 @@ impl Fluree {
             options,
             Some((&r2rml, &r2rml)),
         );
+        config.dataset = union.as_ref();
 
         execute_prepared_streaming(db_ref, vars, prepared, config, sink).await
     }
@@ -254,7 +295,22 @@ impl Fluree {
     /// — single-source specs yield a single-graph dataset — so the streaming
     /// producer is uniform.
     pub async fn build_stream_dataset(&self, query_json: &serde_json::Value) -> Result<DataSetDb> {
-        let (spec, qc_opts) = crate::query::helpers::parse_dataset_spec(query_json)?;
+        self.build_stream_dataset_with_options(query_json, &QueryExecutionOptions::default())
+            .await
+    }
+
+    /// [`Fluree::build_stream_dataset`] with execution options, whose
+    /// `server_identity` is stamped onto the parsed governance so global and
+    /// per-source policy overrides are gated on the verified caller.
+    pub async fn build_stream_dataset_with_options(
+        &self,
+        query_json: &serde_json::Value,
+        options: &QueryExecutionOptions,
+    ) -> Result<DataSetDb> {
+        let (spec, qc_opts) = crate::query::helpers::parse_dataset_spec_as(
+            query_json,
+            options.server_identity.as_ref(),
+        )?;
         if spec.is_empty() {
             return Err(ApiError::query(
                 "Missing ledger specification in connection query",
@@ -301,6 +357,23 @@ impl Fluree {
         dataset: &DataSetDb,
         input: &OwnedStreamQuery,
     ) -> Result<StreamDatasetPlan> {
+        self.plan_stream_query_dataset_with_options(
+            dataset,
+            input,
+            &QueryExecutionOptions::default(),
+        )
+        .await
+    }
+
+    /// [`Fluree::plan_stream_query_dataset`] with execution options. Planning
+    /// consults `server_identity`, the auth-layer-verified caller identity that
+    /// `f:overrideControl` gates on; the default is anonymous.
+    pub async fn plan_stream_query_dataset_with_options(
+        &self,
+        dataset: &DataSetDb,
+        input: &OwnedStreamQuery,
+        options: &QueryExecutionOptions,
+    ) -> Result<StreamDatasetPlan> {
         let primary = dataset
             .primary()
             .ok_or_else(|| ApiError::query("Dataset has no graphs for query execution"))?;
@@ -321,9 +394,16 @@ impl Fluree {
         };
 
         super::query::maybe_wrap_for_graph_source(primary, &mut parsed);
+        super::query::guard_dataset_graph_source_patterns(
+            dataset,
+            &parsed,
+            super::query::QuerySyntax::of(&input),
+        )?;
         ensure_streamable(&parsed.output)?;
 
-        let executable = self.build_executable_for_dataset(dataset, &parsed).await?;
+        let executable = self
+            .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
+            .await?;
         Ok(StreamDatasetPlan {
             vars,
             parsed,
@@ -419,12 +499,16 @@ impl Fluree {
             .await;
 
         let terminal = match exec {
-            Ok(()) => ndjson_stream::end_record(
-                sink.rows,
-                meta.t,
-                tracker.current_fuel(),
-                tracker.tally().and_then(|t| t.time).as_deref(),
-            ),
+            Ok(()) => {
+                let tally = tracker.tally();
+                ndjson_stream::end_record(
+                    sink.rows,
+                    meta.t,
+                    tracker.current_fuel(),
+                    tally.as_ref().and_then(|t| t.time.as_deref()),
+                    tally.as_ref().and_then(|t| t.policy_enforcement.as_ref()),
+                )
+            }
             Err(err) => {
                 ndjson_stream::error_record(api_error_code(&err), &err.to_string(), sink.rows)
             }
@@ -445,6 +529,10 @@ fn query_error_code(e: &fluree_db_query::QueryError) -> &'static str {
         } => "timeout",
         QE::Cancelled { .. } => "cancelled",
         QE::ResourceLimit(_) => "resource_limit",
+        // Virtual-dataset (R2RML) unsupported-pattern refusal — a distinct code
+        // (mirrors the server `@type` `err:r2rml/UnsupportedPattern`) so the
+        // streaming path is as machine-discriminable as the buffered one.
+        QE::R2rmlUnsupportedPattern { .. } => "r2rml_unsupported_pattern",
         QE::InvalidQuery(_) | QE::InvalidFilter(_) | QE::InvalidExpression(_) => "invalid_query",
         _ => "internal",
     }
@@ -538,5 +626,33 @@ impl BatchSink for NdjsonRowSink<'_> {
             }
         })?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_streamable;
+    use fluree_db_query::ir::{ConstructTemplate, QueryOutput};
+
+    /// The WHERE-dedup license for CONSTRUCT and ASK (#1700 follow-up;
+    /// `result_is_multiplicity_blind` in fluree-db-query's
+    /// `execute::operator_tree`) counts on this endpoint refusing both output
+    /// forms: a streaming serializer emits solutions as they arrive and cannot
+    /// canonicalize after the fact, so if either rejection is ever lifted the
+    /// new path must dedup its triples itself — or the license must be
+    /// revoked. See `every_output_format_collapses_or_rejects_construct` in
+    /// `it_query_construct.rs` for the non-streaming half of the same gate.
+    #[test]
+    fn streaming_endpoint_keeps_rejecting_construct_and_ask() {
+        assert!(
+            ensure_streamable(&QueryOutput::Construct(ConstructTemplate::new(Vec::new()))).is_err(),
+            "streaming CONSTRUCT would bypass Graph::canonicalize and observe \
+             WHERE-level dedup"
+        );
+        assert!(
+            ensure_streamable(&QueryOutput::Ask).is_err(),
+            "streaming ASK has no row stream to emit; its boolean is computed \
+             from solution-sequence emptiness on the buffered path"
+        );
     }
 }

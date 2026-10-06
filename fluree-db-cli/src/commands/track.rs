@@ -5,12 +5,13 @@
 //! blocks are needed.
 
 use crate::cli::TrackAction;
-use crate::config::{TomlSyncConfigStore, TrackedLedgerConfig};
+use crate::config::{TomlSyncConfigStore, TrackMode, TrackedLedgerConfig};
 use crate::context::build_client_from_auth;
 use crate::error::{CliError, CliResult};
 use colored::Colorize;
 use comfy_table::{Cell, Table};
 use fluree_db_api::server_defaults::FlureeDir;
+use fluree_db_api::LedgerId;
 use fluree_db_nameservice::RemoteName;
 use fluree_db_nameservice_sync::{RemoteEndpoint, SyncConfigStore};
 
@@ -22,24 +23,34 @@ pub async fn run(action: TrackAction, dirs: &FlureeDir) -> CliResult<()> {
             ledger,
             remote,
             remote_alias,
+            mode,
         } => {
+            let mode = match mode.as_deref() {
+                Some("peer") => TrackMode::Peer,
+                // clap's value_parser restricts to proxy|peer.
+                _ => TrackMode::Proxy,
+            };
             run_add(
                 &store,
                 &ledger,
                 remote.as_deref(),
                 remote_alias.as_deref(),
+                mode,
                 dirs,
             )
             .await
         }
         TrackAction::Remove { ledger } => {
-            let normalized = crate::context::to_ledger_id(&ledger);
+            let normalized = crate::context::to_ledger_id(&ledger)?;
             run_remove(&store, &normalized)
         }
         TrackAction::List => run_list(&store),
         TrackAction::Status { ledger } => {
-            let normalized = ledger.as_deref().map(crate::context::to_ledger_id);
-            run_status(&store, normalized.as_deref()).await
+            let normalized = ledger
+                .as_deref()
+                .map(crate::context::to_ledger_id)
+                .transpose()?;
+            run_status(&store, normalized.as_ref()).await
         }
     }
 }
@@ -49,6 +60,7 @@ async fn run_add(
     ledger: &str,
     remote_name: Option<&str>,
     remote_alias: Option<&str>,
+    mode: TrackMode,
     dirs: &FlureeDir,
 ) -> CliResult<()> {
     // Resolve remote: explicit arg, or default if exactly one remote configured
@@ -89,8 +101,8 @@ async fn run_add(
 
     // Normalize aliases to include branch (e.g., "test4" → "test4:main")
     // so resolution works with both "test4" and "test4:main".
-    let local_alias = crate::context::to_ledger_id(ledger);
-    let effective_remote_alias = crate::context::to_ledger_id(remote_alias.unwrap_or(ledger));
+    let local_alias = crate::context::to_ledger_id(ledger)?;
+    let effective_remote_alias = crate::context::to_ledger_id(remote_alias.unwrap_or(ledger))?;
 
     // Check mutual exclusion: refuse if local ledger exists
     let fluree = crate::context::build_fluree(dirs)?;
@@ -148,7 +160,8 @@ async fn run_add(
     let config = TrackedLedgerConfig {
         local_alias: local_alias.clone(),
         remote: remote.name.as_str().to_string(),
-        remote_alias: effective_remote_alias.to_string(),
+        remote_alias: effective_remote_alias.clone(),
+        mode,
     };
 
     store.add_tracked(config)?;
@@ -162,7 +175,7 @@ async fn run_add(
     Ok(())
 }
 
-fn run_remove(store: &TomlSyncConfigStore, ledger: &str) -> CliResult<()> {
+fn run_remove(store: &TomlSyncConfigStore, ledger: &LedgerId) -> CliResult<()> {
     let removed = store.remove_tracked(ledger)?;
     if removed {
         println!("Removed tracking for '{ledger}'");
@@ -187,13 +200,18 @@ fn run_list(store: &TomlSyncConfigStore) -> CliResult<()> {
     }
 
     let mut table = Table::new();
-    table.set_header(vec!["Local Alias", "Remote", "Remote Alias"]);
+    table.set_header(vec!["Local Alias", "Remote", "Remote Alias", "Mode"]);
 
     for t in tracked {
+        let mode = match t.mode {
+            TrackMode::Proxy => "proxy",
+            TrackMode::Peer => "peer",
+        };
         table.add_row(vec![
             Cell::new(&t.local_alias),
             Cell::new(&t.remote),
             Cell::new(&t.remote_alias),
+            Cell::new(mode),
         ]);
     }
 
@@ -201,7 +219,7 @@ fn run_list(store: &TomlSyncConfigStore) -> CliResult<()> {
     Ok(())
 }
 
-async fn run_status(store: &TomlSyncConfigStore, ledger: Option<&str>) -> CliResult<()> {
+async fn run_status(store: &TomlSyncConfigStore, ledger: Option<&LedgerId>) -> CliResult<()> {
     let tracked = match ledger {
         Some(alias) => {
             let t = store

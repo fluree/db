@@ -21,7 +21,7 @@ use parquet::column::reader::ColumnReader;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::reader::RowGroupReader;
 use parquet::file::serialized_reader::SerializedFileReader;
-use parquet::schema::types::Type as SchemaType;
+use parquet::schema::types::{SchemaDescriptor, Type as SchemaType};
 use tokio::sync::Mutex;
 
 use std::collections::HashMap;
@@ -33,7 +33,7 @@ use crate::metadata::Schema;
 use crate::scan::FileScanTask;
 
 /// Parquet magic bytes (footer ends with "PAR1").
-const PARQUET_MAGIC: [u8; 4] = [b'P', b'A', b'R', b'1'];
+const PARQUET_MAGIC: [u8; 4] = *b"PAR1";
 
 /// Maximum file size for sparse buffer allocation (64MB).
 ///
@@ -305,7 +305,7 @@ impl<'a, S: IcebergStorage> ParquetReader<'a, S> {
             }
 
             // Convert to Column format and create batch for this row group
-            let columns = build_columns_from_values(column_data, &batch_schema)?;
+            let columns = build_columns_from_values(column_data, &batch_schema);
             let batch = ColumnBatch::new(Arc::clone(&batch_schema), columns)?;
 
             if !batch.is_empty() {
@@ -389,12 +389,14 @@ impl<'a, S: IcebergStorage> ParquetReader<'a, S> {
             "Range-reading Parquet file"
         );
 
-        // Fetch all ranges (could be parallelized with bounded concurrency)
-        let mut range_data: Vec<(u64, Bytes)> = Vec::with_capacity(coalesced.len());
-        for (start, end) in &coalesced {
-            let data = self.storage.read_range(path, *start..*end).await?;
-            range_data.push((*start, data));
-        }
+        // Item 12 (B1-AppD): fetch the coalesced ranges via `read_ranges` — bounded
+        // concurrent GETs on S3 (order-preserving), sequential on other backends.
+        // The bytes come back in the SAME order as the input ranges, so pair each
+        // back to its start offset for the sparse-buffer assembler.
+        let range_reqs: Vec<std::ops::Range<u64>> = coalesced.iter().map(|(s, e)| *s..*e).collect();
+        let range_bytes = self.storage.read_ranges(path, range_reqs).await?;
+        let range_data: Vec<(u64, Bytes)> =
+            coalesced.iter().map(|(s, _)| *s).zip(range_bytes).collect();
 
         // Assemble into sparse buffer
         let sparse_buffer = assemble_sparse_buffer(file_size as usize, range_data);
@@ -553,6 +555,10 @@ pub fn convert_field_to_column_value(
         Field::Str(v) => Some(ColumnValue::String(v.clone())),
         Field::Bytes(v) => Some(ColumnValue::Bytes(v.data().to_vec())),
         Field::Date(v) => Some(ColumnValue::Date(*v)),
+        // Iceberg time values use microseconds since midnight, represented by
+        // Int64 in our tabular schema. Parquet 58 exposes explicit time fields.
+        Field::TimeMillis(v) => Some(ColumnValue::Int64(i64::from(*v) * 1000)),
+        Field::TimeMicros(v) => Some(ColumnValue::Int64(*v)),
         Field::TimestampMillis(v) => {
             // Convert milliseconds to microseconds for consistent storage
             let micros = *v * 1000;
@@ -621,178 +627,188 @@ fn decimal_bytes_to_i128(bytes: &[u8]) -> i128 {
     i128::from_be_bytes(arr)
 }
 
-/// Build Column vectors from row-collected values.
+/// Build Column vectors from row-collected values. Infallible (id=3717339925: the
+/// per-column mapping was extracted into the infallible [`column_from_values`], so this
+/// no longer returns a `Result`).
 pub fn build_columns_from_values(
     column_data: Vec<Vec<Option<ColumnValue>>>,
     schema: &BatchSchema,
-) -> Result<Vec<Column>> {
+) -> Vec<Column> {
     let mut columns = Vec::with_capacity(schema.fields.len());
 
     for (col_idx, field) in schema.fields.iter().enumerate() {
         let values = &column_data[col_idx];
-        let column = match field.field_type {
-            FieldType::Boolean => {
-                let data: Vec<Option<bool>> = values
-                    .iter()
-                    .map(|v| {
-                        v.as_ref().and_then(|cv| match cv {
-                            ColumnValue::Boolean(b) => Some(*b),
-                            _ => None,
-                        })
-                    })
-                    .collect();
-                Column::Boolean(data)
-            }
-            FieldType::Int32 => {
-                let data: Vec<Option<i32>> = values
-                    .iter()
-                    .map(|v| {
-                        v.as_ref().and_then(|cv| match cv {
-                            ColumnValue::Int32(i) => Some(*i),
-                            ColumnValue::Int64(i) => Some(*i as i32),
-                            _ => None,
-                        })
-                    })
-                    .collect();
-                Column::Int32(data)
-            }
-            FieldType::Int64 => {
-                let data: Vec<Option<i64>> = values
-                    .iter()
-                    .map(|v| {
-                        v.as_ref().and_then(|cv| match cv {
-                            ColumnValue::Int64(i) => Some(*i),
-                            ColumnValue::Int32(i) => Some(*i as i64),
-                            _ => None,
-                        })
-                    })
-                    .collect();
-                Column::Int64(data)
-            }
-            FieldType::Float32 => {
-                let data: Vec<Option<f32>> = values
-                    .iter()
-                    .map(|v| {
-                        v.as_ref().and_then(|cv| match cv {
-                            ColumnValue::Float32(f) => Some(*f),
-                            ColumnValue::Float64(f) => Some(*f as f32),
-                            _ => None,
-                        })
-                    })
-                    .collect();
-                Column::Float32(data)
-            }
-            FieldType::Float64 => {
-                let data: Vec<Option<f64>> = values
-                    .iter()
-                    .map(|v| {
-                        v.as_ref().and_then(|cv| match cv {
-                            ColumnValue::Float64(f) => Some(*f),
-                            ColumnValue::Float32(f) => Some(*f as f64),
-                            _ => None,
-                        })
-                    })
-                    .collect();
-                Column::Float64(data)
-            }
-            FieldType::String => {
-                let data: Vec<Option<String>> = values
-                    .iter()
-                    .map(|v| {
-                        v.as_ref().and_then(|cv| match cv {
-                            ColumnValue::String(s) => Some(s.clone()),
-                            ColumnValue::Bytes(b) => Some(String::from_utf8_lossy(b).into_owned()),
-                            _ => None,
-                        })
-                    })
-                    .collect();
-                Column::String(data)
-            }
-            FieldType::Bytes => {
-                let data: Vec<Option<Vec<u8>>> = values
-                    .iter()
-                    .map(|v| {
-                        v.as_ref().and_then(|cv| match cv {
-                            ColumnValue::Bytes(b) => Some(b.clone()),
-                            ColumnValue::String(s) => Some(s.as_bytes().to_vec()),
-                            _ => None,
-                        })
-                    })
-                    .collect();
-                Column::Bytes(data)
-            }
-            FieldType::Date => {
-                let data: Vec<Option<i32>> = values
-                    .iter()
-                    .map(|v| {
-                        v.as_ref().and_then(|cv| match cv {
-                            ColumnValue::Date(i) => Some(*i),
-                            // Fallback for Int32 if source didn't properly tag as Date
-                            ColumnValue::Int32(i) => Some(*i),
-                            _ => None,
-                        })
-                    })
-                    .collect();
-                Column::Date(data)
-            }
-            FieldType::Timestamp => {
-                let data: Vec<Option<i64>> = values
-                    .iter()
-                    .map(|v| {
-                        v.as_ref().and_then(|cv| match cv {
-                            ColumnValue::Timestamp(i) => Some(*i),
-                            ColumnValue::TimestampTz(i) => Some(*i),
-                            // Fallback for Int64 if source didn't properly tag
-                            ColumnValue::Int64(i) => Some(*i),
-                            ColumnValue::Int32(i) => Some(*i as i64),
-                            _ => None,
-                        })
-                    })
-                    .collect();
-                Column::Timestamp(data)
-            }
-            FieldType::TimestampTz => {
-                let data: Vec<Option<i64>> = values
-                    .iter()
-                    .map(|v| {
-                        v.as_ref().and_then(|cv| match cv {
-                            ColumnValue::TimestampTz(i) => Some(*i),
-                            ColumnValue::Timestamp(i) => Some(*i),
-                            // Fallback for Int64 if source didn't properly tag
-                            ColumnValue::Int64(i) => Some(*i),
-                            ColumnValue::Int32(i) => Some(*i as i64),
-                            _ => None,
-                        })
-                    })
-                    .collect();
-                Column::TimestampTz(data)
-            }
-            FieldType::Decimal { precision, scale } => {
-                let data: Vec<Option<i128>> = values
-                    .iter()
-                    .map(|v| {
-                        v.as_ref().and_then(|cv| match cv {
-                            ColumnValue::Decimal(i) => Some(*i),
-                            // Fallback for Int32/Int64: Parquet can encode small-precision
-                            // decimals as INT32/INT64 physical types. These are already
-                            // unscaled values (e.g., decimal(5,2) value 123.45 stored as 12345).
-                            ColumnValue::Int64(i) => Some(*i as i128),
-                            ColumnValue::Int32(i) => Some(*i as i128),
-                            _ => None,
-                        })
-                    })
-                    .collect();
-                Column::Decimal {
-                    values: data,
-                    precision,
-                    scale,
-                }
-            }
-        };
-        columns.push(column);
+        columns.push(column_from_values(values, &field.field_type));
     }
 
-    Ok(columns)
+    columns
+}
+
+/// Map one column's row-collected `ColumnValue`s to the typed [`Column`] for
+/// `field_type`. Extracted verbatim from [`build_columns_from_values`] so the
+/// Arrow direct decoder ([`crate::io::arrow_reader::arrow_column_to_column`]) can
+/// reuse the EXACT same `ColumnValue` -> `Column` mapping for its cross-type
+/// fallback — this keeps the direct decode path byte-identical to the two-hop path.
+pub fn column_from_values(values: &[Option<ColumnValue>], field_type: &FieldType) -> Column {
+    match *field_type {
+        FieldType::Boolean => {
+            let data: Vec<Option<bool>> = values
+                .iter()
+                .map(|v| {
+                    v.as_ref().and_then(|cv| match cv {
+                        ColumnValue::Boolean(b) => Some(*b),
+                        _ => None,
+                    })
+                })
+                .collect();
+            Column::Boolean(data)
+        }
+        FieldType::Int32 => {
+            let data: Vec<Option<i32>> = values
+                .iter()
+                .map(|v| {
+                    v.as_ref().and_then(|cv| match cv {
+                        ColumnValue::Int32(i) => Some(*i),
+                        ColumnValue::Int64(i) => Some(*i as i32),
+                        _ => None,
+                    })
+                })
+                .collect();
+            Column::Int32(data)
+        }
+        FieldType::Int64 => {
+            let data: Vec<Option<i64>> = values
+                .iter()
+                .map(|v| {
+                    v.as_ref().and_then(|cv| match cv {
+                        ColumnValue::Int64(i) => Some(*i),
+                        ColumnValue::Int32(i) => Some(*i as i64),
+                        _ => None,
+                    })
+                })
+                .collect();
+            Column::Int64(data)
+        }
+        FieldType::Float32 => {
+            let data: Vec<Option<f32>> = values
+                .iter()
+                .map(|v| {
+                    v.as_ref().and_then(|cv| match cv {
+                        ColumnValue::Float32(f) => Some(*f),
+                        ColumnValue::Float64(f) => Some(*f as f32),
+                        _ => None,
+                    })
+                })
+                .collect();
+            Column::Float32(data)
+        }
+        FieldType::Float64 => {
+            let data: Vec<Option<f64>> = values
+                .iter()
+                .map(|v| {
+                    v.as_ref().and_then(|cv| match cv {
+                        ColumnValue::Float64(f) => Some(*f),
+                        ColumnValue::Float32(f) => Some(*f as f64),
+                        _ => None,
+                    })
+                })
+                .collect();
+            Column::Float64(data)
+        }
+        FieldType::String => {
+            let data: Vec<Option<String>> = values
+                .iter()
+                .map(|v| {
+                    v.as_ref().and_then(|cv| match cv {
+                        ColumnValue::String(s) => Some(s.clone()),
+                        ColumnValue::Bytes(b) => Some(String::from_utf8_lossy(b).into_owned()),
+                        _ => None,
+                    })
+                })
+                .collect();
+            Column::String(data)
+        }
+        FieldType::Bytes => {
+            let data: Vec<Option<Vec<u8>>> = values
+                .iter()
+                .map(|v| {
+                    v.as_ref().and_then(|cv| match cv {
+                        ColumnValue::Bytes(b) => Some(b.clone()),
+                        ColumnValue::String(s) => Some(s.as_bytes().to_vec()),
+                        _ => None,
+                    })
+                })
+                .collect();
+            Column::Bytes(data)
+        }
+        FieldType::Date => {
+            let data: Vec<Option<i32>> = values
+                .iter()
+                .map(|v| {
+                    v.as_ref().and_then(|cv| match cv {
+                        ColumnValue::Date(i) => Some(*i),
+                        // Fallback for Int32 if source didn't properly tag as Date
+                        ColumnValue::Int32(i) => Some(*i),
+                        _ => None,
+                    })
+                })
+                .collect();
+            Column::Date(data)
+        }
+        FieldType::Timestamp => {
+            let data: Vec<Option<i64>> = values
+                .iter()
+                .map(|v| {
+                    v.as_ref().and_then(|cv| match cv {
+                        ColumnValue::Timestamp(i) => Some(*i),
+                        ColumnValue::TimestampTz(i) => Some(*i),
+                        // Fallback for Int64 if source didn't properly tag
+                        ColumnValue::Int64(i) => Some(*i),
+                        ColumnValue::Int32(i) => Some(*i as i64),
+                        _ => None,
+                    })
+                })
+                .collect();
+            Column::Timestamp(data)
+        }
+        FieldType::TimestampTz => {
+            let data: Vec<Option<i64>> = values
+                .iter()
+                .map(|v| {
+                    v.as_ref().and_then(|cv| match cv {
+                        ColumnValue::TimestampTz(i) => Some(*i),
+                        ColumnValue::Timestamp(i) => Some(*i),
+                        // Fallback for Int64 if source didn't properly tag
+                        ColumnValue::Int64(i) => Some(*i),
+                        ColumnValue::Int32(i) => Some(*i as i64),
+                        _ => None,
+                    })
+                })
+                .collect();
+            Column::TimestampTz(data)
+        }
+        FieldType::Decimal { precision, scale } => {
+            let data: Vec<Option<i128>> = values
+                .iter()
+                .map(|v| {
+                    v.as_ref().and_then(|cv| match cv {
+                        ColumnValue::Decimal(i) => Some(*i),
+                        // Fallback for Int32/Int64: Parquet can encode small-precision
+                        // decimals as INT32/INT64 physical types. These are already
+                        // unscaled values (e.g., decimal(5,2) value 123.45 stored as 12345).
+                        ColumnValue::Int64(i) => Some(*i as i128),
+                        ColumnValue::Int32(i) => Some(*i as i128),
+                        _ => None,
+                    })
+                })
+                .collect();
+            Column::Decimal {
+                values: data,
+                precision,
+                scale,
+            }
+        }
+    }
 }
 
 /// Decode columns from a row group reader.
@@ -1311,6 +1327,42 @@ pub fn build_field_id_to_column_mapping(
     mapping
 }
 
+/// Map each top-level (root) field index to its first Parquet **leaf** column
+/// index.
+///
+/// [`build_field_id_to_column_mapping`] and [`build_batch_schema`] index
+/// `Type::get_fields()`, i.e. root fields. But leaf-column consumers —
+/// `RowGroupMetaData::column` (statistics) and `ProjectionMask::leaves`
+/// (projection) — index the flat leaf-column space. The two coincide only for a
+/// fully flat schema; a nested column (struct/list/map/VARIANT) before a
+/// projected primitive shifts later leaf indices. Translate a root index through
+/// this map before handing it to a leaf-column API. The primitives this crate
+/// projects each own exactly one leaf, so the first leaf under a root is it.
+pub fn build_root_to_leaf_map(schema_descr: &SchemaDescriptor) -> HashMap<usize, usize> {
+    let mut map = HashMap::new();
+    for leaf in 0..schema_descr.num_columns() {
+        map.entry(schema_descr.get_column_root_idx(leaf))
+            .or_insert(leaf);
+    }
+    map
+}
+
+/// Iceberg field ID → Parquet **leaf** column index, composing
+/// [`build_field_id_to_column_mapping`] (field ID → root) with
+/// [`build_root_to_leaf_map`] (root → leaf). This is the mapping leaf-indexed
+/// consumers (row-group statistics, projection) must use; see
+/// [`build_root_to_leaf_map`] for why root ≠ leaf under nested schemas.
+pub fn build_field_id_to_leaf_mapping(
+    metadata: &ParquetMetaData,
+    iceberg_schema: Option<&Schema>,
+) -> HashMap<i32, usize> {
+    let root_to_leaf = build_root_to_leaf_map(metadata.file_metadata().schema_descr());
+    build_field_id_to_column_mapping(metadata.file_metadata().schema(), iceberg_schema)
+        .into_iter()
+        .filter_map(|(field_id, root)| root_to_leaf.get(&root).map(|&leaf| (field_id, leaf)))
+        .collect()
+}
+
 /// Build batch schema from Parquet metadata, Iceberg schema, and projected field IDs.
 ///
 /// This function uses the Iceberg schema as the source of truth for field metadata
@@ -1554,6 +1606,13 @@ fn parquet_type_to_field_type(parquet_type: &Arc<SchemaType>) -> FieldType {
             return FieldType::Date;
         }
 
+        if matches!(
+            converted_type,
+            parquet::basic::ConvertedType::TIME_MILLIS | parquet::basic::ConvertedType::TIME_MICROS
+        ) {
+            return FieldType::Int64;
+        }
+
         // Check for timestamp annotations
         // Parquet 2.0+ uses LogicalType for timezone info, converted_type doesn't distinguish
         if converted_type == parquet::basic::ConvertedType::TIMESTAMP_MILLIS
@@ -1563,7 +1622,7 @@ fn parquet_type_to_field_type(parquet_type: &Arc<SchemaType>) -> FieldType {
             if let Some(parquet::basic::LogicalType::Timestamp {
                 is_adjusted_to_u_t_c: true,
                 ..
-            }) = basic_info.logical_type()
+            }) = basic_info.logical_type_ref()
             {
                 return FieldType::TimestampTz;
             }
@@ -1574,11 +1633,11 @@ fn parquet_type_to_field_type(parquet_type: &Arc<SchemaType>) -> FieldType {
         if converted_type == parquet::basic::ConvertedType::DECIMAL {
             // Try to get precision/scale from logical type
             if let Some(parquet::basic::LogicalType::Decimal { precision, scale }) =
-                basic_info.logical_type()
+                basic_info.logical_type_ref()
             {
                 return FieldType::Decimal {
-                    precision: precision as u8,
-                    scale: scale as i8,
+                    precision: *precision as u8,
+                    scale: *scale as i8,
                 };
             }
             // Fallback: use default precision/scale if not available
@@ -1811,6 +1870,73 @@ mod tests {
             mapping.is_empty(),
             "Mapping should be empty without field IDs or schema"
         );
+    }
+
+    #[test]
+    fn test_root_to_leaf_diverges_under_nested_column() {
+        use parquet::basic::Repetition;
+        use parquet::schema::types::SchemaDescriptor;
+
+        // A struct (2 leaves) precedes two top-level primitives. Root indices are
+        // {addr:0, year:1, name:2}; leaf indices are {street:0, zip:1, year:2,
+        // name:3}. A flat schema hides the bug because root == leaf; here they
+        // diverge, so treating a root index as a leaf index would select the
+        // wrong column (`year`'s root 1 is leaf 2, not leaf 1 = `zip`).
+        let addr = Arc::new(
+            SchemaType::group_type_builder("addr")
+                .with_id(Some(1))
+                .with_repetition(Repetition::REQUIRED)
+                .with_fields(vec![
+                    Arc::new(
+                        SchemaType::primitive_type_builder("street", PhysicalType::BYTE_ARRAY)
+                            .with_id(Some(10))
+                            .with_repetition(Repetition::REQUIRED)
+                            .build()
+                            .unwrap(),
+                    ),
+                    Arc::new(
+                        SchemaType::primitive_type_builder("zip", PhysicalType::INT32)
+                            .with_id(Some(11))
+                            .with_repetition(Repetition::REQUIRED)
+                            .build()
+                            .unwrap(),
+                    ),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let year = Arc::new(
+            SchemaType::primitive_type_builder("year", PhysicalType::INT32)
+                .with_id(Some(2))
+                .with_repetition(Repetition::REQUIRED)
+                .build()
+                .unwrap(),
+        );
+        let name = Arc::new(
+            SchemaType::primitive_type_builder("name", PhysicalType::BYTE_ARRAY)
+                .with_id(Some(3))
+                .with_repetition(Repetition::REQUIRED)
+                .build()
+                .unwrap(),
+        );
+        let schema = SchemaType::group_type_builder("schema")
+            .with_fields(vec![addr, year, name])
+            .build()
+            .unwrap();
+        let descr = SchemaDescriptor::new(Arc::new(schema.clone()));
+
+        // Root → first leaf: the struct owns leaves 0,1 so the primitives shift.
+        let root_to_leaf = build_root_to_leaf_map(&descr);
+        assert_eq!(root_to_leaf.get(&0), Some(&0)); // addr → leaf 0
+        assert_eq!(root_to_leaf.get(&1), Some(&2)); // year → leaf 2 (not 1!)
+        assert_eq!(root_to_leaf.get(&2), Some(&3)); // name → leaf 3
+
+        // field_id → root (embedded ids), composed to field_id → leaf.
+        let field_to_root = build_field_id_to_column_mapping(&schema, None);
+        assert_eq!(field_to_root.get(&2), Some(&1)); // year is root field 1
+        let year_leaf = root_to_leaf[&field_to_root[&2]];
+        assert_eq!(year_leaf, 2, "year must resolve to leaf 2, not its root 1");
+        assert_eq!(root_to_leaf[&field_to_root[&3]], 3); // name → leaf 3
     }
 
     #[test]

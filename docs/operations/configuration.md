@@ -2,6 +2,18 @@
 
 Fluree server is configured via a configuration file, command-line flags, and environment variables.
 
+Run the server with `fluree server run` (foreground) or `fluree server start` (background).
+Both need a Fluree project directory: a `.fluree/` found by walking up from the working
+directory (create one with `fluree init`), or the directory holding the file given to `--config`.
+The exception is `run --memory` ([Memory Storage](#memory-storage)), which needs none.
+`run` takes `--listen-addr`, `--storage-path`, `--connection-config`, `--memory`, `--log-level`,
+`--bolt-listen-addr`, `--bolt-default-db`, `--profile`, and the CLI's `--config <file>`
+directly. Every other server flag in this document is passed through after `--`:
+
+```bash
+fluree server run --storage-path /var/lib/fluree -- --cache-max-mb 4096 --indexing-enabled
+```
+
 ## Configuration Methods
 
 ### Configuration File (TOML, JSON, or JSON-LD)
@@ -21,13 +33,13 @@ On Linux, config and data directories are separated per the XDG Base Directory s
 
 ```bash
 # Use default config file discovery
-fluree-server
+fluree server run
 
 # Override config file path
-fluree-server --config /etc/fluree/config.toml
+fluree server run --config /etc/fluree/config.toml
 
 # Activate a profile
-fluree-server --profile prod
+fluree server run --profile prod
 ```
 
 Example `config.toml`:
@@ -39,8 +51,11 @@ storage_path = "/var/lib/fluree"
 log_level = "info"
 query_timeout_ms = 900000  # 15 minutes; set to 0 to disable
 query_min_t_timeout_ms = 5000
+graphql_max_depth = 15         # GraphQL nesting depth; 0 disables
+graphql_max_complexity = 1000  # GraphQL fields per document; 0 disables
 # cache_max_mb = 4096  # global in-memory cache budget (MB); default: tiered by RAM (<4GB: 30%, 4-8GB: 40%, >=8GB: 35%)
 # disk_cache_max_mb = 20480  # global on-disk cache budget (MB), shared across object storage + Iceberg; default: auto-detect; 0 disables
+# iceberg_local_roots = "/data/warehouse:/srv/lake"  # allow catalog-less Iceberg tables under these dirs; default: unset (local-filesystem tables disabled)
 
 [server.query_refresh]
 enabled = false
@@ -130,7 +145,7 @@ Profile values are deep-merged onto `[server]` — only the fields present in th
 ### Command-Line Flags
 
 ```bash
-fluree-server \
+fluree server run \
   --listen-addr 0.0.0.0:8090 \
   --storage-path /var/lib/fluree \
   --log-level info
@@ -145,7 +160,7 @@ export FLUREE_LISTEN_ADDR=0.0.0.0:8090
 export FLUREE_STORAGE_PATH=/var/lib/fluree
 export FLUREE_LOG_LEVEL=info
 
-fluree-server
+fluree server run
 ```
 
 A few operational knobs are environment-only (no CLI flag):
@@ -154,6 +169,12 @@ A few operational knobs are environment-only (no CLI flag):
 |----------|---------|---------|
 | `FLUREE_REASONING_MAX_FACTS` | 1,000,000 | Server-wide default OWL2-RL materialization budget (max derived facts). Overridden per ledger by `f:reasoningMaxFacts` and per query by `"reasoningBudget"`; see [Reasoning](../query/reasoning.md#materialization-budget). |
 | `FLUREE_REASONING_MAX_SECONDS` | 30 | Server-wide default OWL2-RL materialization budget (wall-clock seconds). Same override chain as above. |
+| `FLUREE_REASONING_MAX_MEMORY_MB` | derived from the fact budget | Server-wide default materialization budget (max megabytes of derived facts). Unset, it is derived from the effective fact budget so the fact cap binds first; set it to bound memory directly. Overridden per ledger by `f:reasoningMaxMemoryMb` and per query by `"reasoningBudget"`. |
+| `FLUREE_CYPHER_ALLOW_FULL_SCAN` | off | Allow bare Cypher `MATCH (n)` (no label/property/relationship constraint) to run as a whole-graph distinct-subject scan. Off by default — intended for benchmarks and ad-hoc exploration, not production queries. |
+| `FLUREE_MAX_GRAPH_SCAN_FLAKES` | 10,000,000 | Memory backstop for whole-graph transactions (graph sync, `CLEAR`, `DROP`, `COPY`, `MOVE`). Staging materializes the target graph's currently-asserted flakes, so peak memory scales with the graph, not the delta; the scan stops and the transaction fails with a clear resource-limit error once it passes this many flakes. `0` disables. Read per operation, not cached. The streaming-diff follow-up that removes the materialization is [#1691](https://github.com/fluree/db/issues/1691). |
+| `FLUREE_PATH_MAX_VISITED` | 1,000,000 | Visited-node cap for path traversals (variable-length paths, `shortestPath`) — a runaway-closure backstop. Traversals that exceed it fail with a clear resource-limit error; raise for graphs whose legitimate closures are larger (the cap also bounds per-query traversal memory). Read once at startup. |
+| `FLUREE_CYPHER_AST_CACHE` | 512 | Capacity (entries) of the process-wide Cypher parsed-AST cache, keyed on statement text. Repeated statements (parameterized workloads, benchmark loops) skip re-parsing; parameters are substituted into a per-request clone. `0` disables the cache. Read once at startup. |
+| `FLUREE_STORAGE_FSYNC` | on | Filesystem syncing is enabled by default so acknowledged commits survive power loss. Set to `0` (also `false`, `off`, or `no`) before starting Fluree to turn it off; a power loss or kernel panic can then lose acknowledged commits. Set to `1` to turn it back on. Overrides the storage node's `durability` setting. Applies only to local file storage; Raft log flushing is independent. See [Storage durability](storage.md#durability). |
 
 ### Precedence
 
@@ -167,7 +188,7 @@ Configuration precedence (highest to lowest):
 
 ### Error Handling
 
-If `--config` or `--profile` is specified and the configuration cannot be loaded (file not found, parse error, missing profile), the server **exits with an error**. This prevents silent misconfiguration in production.
+If `--config` (or the `FLUREE_CONFIG` env var) or `--profile` is specified and the configuration cannot be loaded (file not found, parse error, missing profile), the server **exits with an error**. This prevents silent misconfiguration in production.
 
 If the config file is auto-discovered (no explicit `--config`) and cannot be parsed, the server logs a warning and continues with CLI/env/default values only.
 
@@ -182,7 +203,37 @@ Address and port to bind to:
 | `--listen-addr` | `FLUREE_LISTEN_ADDR` | `0.0.0.0:8090` |
 
 ```bash
-fluree-server --listen-addr 0.0.0.0:9090
+fluree server run --listen-addr 0.0.0.0:9090
+```
+
+### Bolt Protocol Listener
+
+The server can additionally speak the Bolt protocol (Neo4j drivers)
+against the openCypher surface. The listener binds only when an address
+is configured — unset = disabled. (The `bolt` build feature is on by
+default; minimal builds may exclude it.)
+See the [Bolt guide](../guides/bolt.md) for driver examples and the
+[Bolt reference](../api/bolt.md) for protocol and value-mapping notes.
+
+| Flag                | Env Var                   | Default    |
+| ------------------- | ------------------------- | ---------- |
+| `--bolt-listen-addr`| `FLUREE_BOLT_LISTEN_ADDR` | (disabled) |
+| `--bolt-default-db` | `FLUREE_BOLT_DEFAULT_DB`  | (none)     |
+
+`--bolt-default-db` names the ledger served to sessions that select no
+database; drivers can select one per session (`database=` / `db`).
+Authentication follows `data_auth_mode` per session, exactly like the
+HTTP data plane (bearer tokens through the same verification pipeline);
+see the [Bolt reference](../api/bolt.md#authentication).
+
+```bash
+fluree server run --bolt-listen-addr 0.0.0.0:7687 --bolt-default-db mydb:main
+```
+
+```toml
+[server.bolt]
+listen_addr = "0.0.0.0:7687"
+default_db = "mydb:main"
 ```
 
 ### Storage Path
@@ -195,11 +246,39 @@ Path for file-based storage. If not specified, defaults to `.fluree/storage` rel
 
 ```bash
 # Explicit storage path (e.g. production)
-fluree-server --storage-path /var/lib/fluree
+fluree server run --storage-path /var/lib/fluree
 
 # Default: uses .fluree/storage in the working directory
-fluree-server
+fluree server run
 ```
+
+### Memory Storage
+
+Keep all ledgers in memory; every ledger is lost when the server stops, which suits tests and
+CI:
+
+| Flag       | Env Var                 | Default |
+| ---------- | ----------------------- | ------- |
+| `--memory` | `FLUREE_MEMORY_STORAGE` | `false` |
+
+```bash
+fluree server run --memory
+```
+
+`fluree server run --memory` needs no `.fluree/` directory and writes nothing to the directory it
+runs in, including `server.meta.json`, so CLI auto-routing does not see it. As in every storage
+mode, index builds use the system temp directory for scratch and cache
+files. `fluree server start` does not run in memory mode. There is no config file setting for it.
+
+`--memory` cannot be combined with `--storage-path` or `--connection-config`. It replaces a
+storage path or connection config set in the environment, a profile, or the config file.
+`FLUREE_MEMORY_STORAGE=true` does the same, except that a `--storage-path` or
+`--connection-config` flag beats it. When memory storage replaces a configured storage path or
+connection config, the server logs a warning at startup naming what it replaced, since that
+data is not being read and nothing written is kept.
+
+A query peer (`--server-role peer`) and a Raft node refuse `--memory`: a peer reads the
+transaction server's storage, and a Raft log outlives the process that holds the data it refers to.
 
 ### Connection Configuration (S3, DynamoDB, etc.)
 
@@ -260,7 +339,7 @@ Example connection config (`connection.jsonld`):
 
 - `--connection-config` and `--storage-path` are mutually exclusive. If both are set, `--connection-config` takes precedence (a warning is logged).
 - Server-level settings (`--cache-max-mb`, `--indexing-enabled`, `--reindex-min-bytes`, `--reindex-max-bytes`) override any equivalent values from the connection config.
-- `--indexing-enabled` defaults to `true`. Pass `--indexing-enabled=false` only when a separate peer/indexer process owns index maintenance for the same storage.
+- `--indexing-enabled` defaults to `true`. Set `--indexing-enabled=false` (or `FLUREE_INDEXING_ENABLED=false`, or `[server.indexing] enabled = false`) only when a separate peer/indexer process owns index maintenance for the same storage.
 - AWS credentials and region are resolved via the standard AWS SDK chain (env vars, instance profile, `~/.aws/config`, etc.) — they are not part of the connection config.
 - The connection config can use `envVar` indirection for sensitive fields like S3 bucket names or encryption keys (see [ConfigurationValue](../reference/connection-config-jsonld.md#configurationvalue-env-var-indirection)).
 
@@ -292,7 +371,20 @@ Enable Cross-Origin Resource Sharing:
 | ---------------- | --------------------- | ------- |
 | `--cors-enabled` | `FLUREE_CORS_ENABLED` | `true`  |
 
-When enabled, allows requests from any origin.
+When enabled, allows requests from any origin, with any method and any request headers. There are no per-origin allow lists; restrict CORS at a reverse proxy if needed. Disable it with `--cors-enabled=false` (or `FLUREE_CORS_ENABLED=false`, or `cors_enabled = false` in the config file).
+
+### Outbound HTTPS Certificate Trust
+
+The CLI and server's reqwest-based HTTP clients use Rustls with platform
+certificate verification (reqwest 0.13). This includes catalog and OAuth requests,
+remote HTTP connections, and OTLP HTTP exports. Internal certificate authorities
+must be trusted by the operating system or container running Fluree. Ensure
+minimal Linux images include CA certificates, and verify enterprise CA settings
+when upgrading from the previous bundled-root configuration.
+
+AWS SDK storage connections configure their TLS transport separately. See the
+[reqwest migration notes](https://github.com/seanmonstar/reqwest/blob/master/CHANGELOG.md#v0130)
+for the underlying certificate-verification change.
 
 ### Body Limit
 
@@ -323,6 +415,36 @@ operators can stop at the next checkpoint.
 `query_min_t_timeout_ms` caps HTTP read-after-write waits from `Fluree-Min-T`, `opts.min-t`, and numeric `@t` snapshot pins. It remains enforced even when `query_timeout_ms = 0`.
 
 `stream_heartbeat_ms` is the keep-alive cadence for the [streaming query endpoint](../api/streaming-query.md) (`/stream/query`). Records flush at this interval during stalls so a long-running query survives a fronting proxy's idle timeout; set it below that timeout (e.g. under CloudFront/ALB's ~60s). `0` disables heartbeats.
+
+The [GraphQL endpoint](../query/graphql.md) runs inside the same timeout and
+cancellation scope, and one document's root fields share a single handle — so a
+timeout or a client disconnect stops all of them, not whichever field checks
+next.
+
+### GraphQL Document Limits
+
+A GraphQL schema derived from a ledger is cyclic wherever one class references
+another, so nesting depth is chosen by the caller rather than by the schema.
+Root fields also resolve concurrently, which means aliases multiply whatever one
+field costs. Two limits bound a document; both apply only to the GraphQL
+surface.
+
+| Flag                        | Env Var                          | Default |
+| --------------------------- | -------------------------------- | ------- |
+| `--graphql-max-depth`       | `FLUREE_GRAPHQL_MAX_DEPTH`       | `15`    |
+| `--graphql-max-complexity`  | `FLUREE_GRAPHQL_MAX_COMPLEXITY`  | `1000`  |
+
+`graphql_max_depth` counts field levels the way GraphQL tooling does: the root
+field is level 1 and a leaf is a level of its own, so
+`{ persons { knows { name } } }` is depth 3. Fragments and inline fragments are
+flattened into the level that holds them and do not count. `graphql_max_complexity`
+is a budget of fields per document, across every alias and fragment, which is
+what bounds alias fan-out.
+
+Both are checked before execution: a document past either limit comes back as a
+`200` with an `errors` array — the GraphQL spec's shape for a refusal — having
+run nothing. Set either to `0` to disable that limit, the same way
+`query_timeout_ms = 0` disables the timeout.
 
 ### Query-Time Refresh
 
@@ -374,7 +496,15 @@ Enable background indexing and configure novelty backpressure thresholds:
 | --------------------- | -------------------------- | --------- | ----------------------------------------------- |
 | `--indexing-enabled`  | `FLUREE_INDEXING_ENABLED`  | `true`    | Enable background indexing (set `false` only when an external indexer process owns this storage) |
 | `--reindex-min-bytes` | `FLUREE_REINDEX_MIN_BYTES` | `100`     | Soft threshold (triggers background indexing; default ≈ reindex every commit) |
-| `--reindex-max-bytes` | `FLUREE_REINDEX_MAX_BYTES` | 20% of system RAM (256 MB fallback) | Hard threshold (blocks commits until reindexed) |
+| `--reindex-max-bytes` | `FLUREE_REINDEX_MAX_BYTES` | 20% of system RAM (256 MB fallback) | Hard threshold: transactions are rejected with HTTP 503 `err:db/NoveltyAtMax` (+ `Retry-After`) until the indexer catches up — nothing waits or queues; clients should retry |
+
+Index garbage-collection retention (see [Index Retention](../indexing-and-search/background-indexing.md#index-retention)):
+
+| Flag                         | Env Var                           | Default | Description                                     |
+| ---------------------------- | --------------------------------- | ------- | ----------------------------------------------- |
+| `--gc-max-old-indexes`       | `FLUREE_GC_MAX_OLD_INDEXES`       | `5`     | Old index versions to retain before GC |
+| `--gc-min-time-mins`         | `FLUREE_GC_MIN_TIME_MINS`         | `30`    | Minimum age (minutes) before an index version can be collected. Protects queries that started against an older version. ANDed with the count, so the slower of the two wins |
+| `--gc-hard-max-old-indexes`  | `FLUREE_GC_HARD_MAX_OLD_INDEXES`  | unset   | Version ceiling past which the age guard is overridden and versions are collected regardless of age. Bounds retained versions, not bytes; past it GC can release artifacts a still-running query needs, so set it well above the versions published during your longest query |
 
 Config file equivalent:
 
@@ -383,6 +513,9 @@ Config file equivalent:
 enabled = true
 reindex_min_bytes = 100            # ≈ every commit — soft trigger
 # reindex_max_bytes = 536870912    # 512 MB — defaults to 20% of system RAM if omitted
+# gc_max_old_indexes = 5
+# gc_min_time_mins = 30
+# gc_hard_max_old_indexes = 40     # unset by default: the age guard is never overridden
 ```
 
 ## Server Role Configuration
@@ -409,7 +542,7 @@ Base URL of the transaction server (required in peer mode):
 | `--tx-server-url` | `FLUREE_TX_SERVER_URL` |
 
 ```bash
-fluree-server \
+fluree server run -- \
   --server-role peer \
   --tx-server-url http://tx.internal:8090
 ```
@@ -441,16 +574,19 @@ Modes:
 - `optional`: Accept tokens but don't require them
 - `required`: Require valid Bearer token
 
+Events auth is independent of [data auth](#data-api-authentication): requiring tokens on
+the data API does not require them here.
+
 Supports both Ed25519 (embedded JWK) and OIDC/JWKS (RS256) tokens when the `oidc` feature is enabled and `--jwks-issuer` is configured. For OIDC tokens, issuer trust is implicit — only tokens signed by keys from configured JWKS endpoints will verify. For Ed25519 tokens, the issuer must appear in `--events-auth-trusted-issuer`.
 
 ```bash
 # Ed25519 tokens only
-fluree-server \
+fluree server run -- \
   --events-auth-mode required \
   --events-auth-trusted-issuer did:key:z6Mk...
 
 # OIDC + Ed25519 (both work simultaneously)
-fluree-server \
+fluree server run -- \
   --events-auth-mode required \
   --jwks-issuer "https://auth.example.com=https://auth.example.com/.well-known/jwks.json" \
   --events-auth-trusted-issuer did:key:z6Mk...
@@ -468,6 +604,7 @@ Protect query/transaction endpoints (including `/v1/fluree/query/{ledger...}`,
 | `--data-auth-mode`                 | `FLUREE_DATA_AUTH_MODE`                 | `none`  |
 | `--data-auth-audience`             | `FLUREE_DATA_AUTH_AUDIENCE`             | None    |
 | `--data-auth-trusted-issuer`       | `FLUREE_DATA_AUTH_TRUSTED_ISSUERS`      | None    |
+| `--data-auth-policy-authority`     | `FLUREE_DATA_AUTH_POLICY_AUTHORITIES`  | None    |
 | `--data-auth-default-policy-class` | `FLUREE_DATA_AUTH_DEFAULT_POLICY_CLASS` | None    |
 
 Modes:
@@ -483,8 +620,21 @@ Bearer token scopes:
 
 Back-compat: `fluree.storage.*` claims imply **read** scope for data endpoints.
 
+Data auth does not cover `/v1/fluree/events`, which has its own
+[`--events-auth-mode`](#events-endpoint-authentication). With data auth `required` and
+events auth `none`, `/v1/fluree/events?all=true` lists every ledger and its nameservice
+record to anyone, and the server logs a warning at startup. Set both; query peers then
+need an events token (`--peer-events-token`).
+
+Applications may select request policies using a credential with
+`"fluree.policy": "request"`, or issue a fixed signed `fluree.policy`
+selection for downstream clients. Both require the verified issuer to be a
+configured policy authority.
+This repeatable setting requires a nonempty data-auth audience; policy authorities also establish ordinary issuer trust. See [Trusted policy authorization](../security/policy-authorization.md)
+for the TOML configuration, claim format, and embedded SDK equivalent.
+
 ```bash
-fluree-server \
+fluree server run -- \
   --data-auth-mode required \
   --data-auth-trusted-issuer did:key:z6Mk...
 ```
@@ -494,6 +644,10 @@ fluree-server \
 When the `oidc` feature is enabled, the server can verify JWT tokens signed by external identity
 providers (e.g., Fluree Cloud Service) using JWKS (JSON Web Key Set) endpoints. This is in addition to the
 existing embedded-JWK (Ed25519 `did:key`) verification path.
+
+The `oidc` feature is not in the default build, so `--jwks-issuer` and `--jwks-cache-ttl` are
+rejected by a stock `fluree` binary. Build the CLI with it enabled on the server crate:
+`cargo build --release -p fluree-db-cli --features fluree-db-server/oidc`.
 
 **Dual-path dispatch**: The server inspects each Bearer token's header:
 
@@ -510,7 +664,7 @@ Both paths coexist; no configuration change is needed for existing Ed25519 token
 The `--jwks-issuer` flag takes the format `<issuer_url>=<jwks_url>`:
 
 ```bash
-fluree-server \
+fluree server run -- \
   --data-auth-mode required \
   --jwks-issuer "https://solo.example.com=https://solo.example.com/.well-known/jwks.json"
 ```
@@ -519,7 +673,7 @@ For multiple issuers, repeat the flag or use comma separation in the env var:
 
 ```bash
 # CLI flags (repeatable)
-fluree-server \
+fluree server run -- \
   --jwks-issuer "https://issuer1.example.com=https://issuer1.example.com/.well-known/jwks.json" \
   --jwks-issuer "https://issuer2.example.com=https://issuer2.example.com/.well-known/jwks.json"
 
@@ -563,12 +717,12 @@ Supports both Ed25519 (embedded JWK) and OIDC/JWKS (RS256) tokens when the `oidc
 
 ```bash
 # Ed25519 tokens only
-fluree-server \
+fluree server run -- \
   --admin-auth-mode required \
   --admin-auth-trusted-issuer did:key:z6Mk...
 
 # OIDC (trust comes from --jwks-issuer, no did:key issuers needed)
-fluree-server \
+fluree server run -- \
   --admin-auth-mode required \
   --jwks-issuer "https://auth.example.com=https://auth.example.com/.well-known/jwks.json"
 ```
@@ -599,10 +753,29 @@ This setting does not apply to `get_data_model`, which may perform schema/stat
 collection without this query timeout.
 
 ```bash
-fluree-server \
+fluree server run -- \
   --mcp-enabled \
   --mcp-auth-trusted-issuer did:key:z6Mk...
 ```
+
+Whether `/mcp` requires a token follows the data API. With `--data-auth-mode none` (the
+default) and no MCP issuer configured (`--mcp-auth-trusted-issuer`, or the
+`--events-auth-trusted-issuer` fallback), `/mcp` is as open as the query API: no token is
+needed, any token sent is ignored, and every ledger is readable, governed by each ledger's
+policy defaults. Configuring an MCP issuer requires tokens regardless of data auth. With
+data auth `optional` or `required`, tokens are always required and the server will not
+start without an MCP issuer. Under `optional` that makes `/mcp` stricter than the query
+API: an anonymous `/query` is served, an anonymous `/mcp` call is a `401`.
+
+Issuer trust admits a token; its ledger claims decide what it can reach. Both MCP tools
+authorize the requested ledger against `fluree.ledger.read.all` /
+`fluree.ledger.read.ledgers` (falling back to `fluree.storage.*`), the same claims the data
+API uses — see [Authentication](../security/authentication.md). A token with neither claim
+reaches no ledger; issue `"fluree.ledger.read.all": true` for an agent that should read
+everything.
+
+For a walkthrough from a local tryout to a scoped production setup, see
+[Connect an agent over MCP](../ai/mcp-server.md).
 
 ## Peer Mode Configuration
 
@@ -617,7 +790,7 @@ Configure what the peer subscribes to:
 | `--peer-graph-source <ledger-id>` | Subscribe to specific graph source (repeatable) |
 
 ```bash
-fluree-server \
+fluree server run -- \
   --server-role peer \
   --tx-server-url http://tx:8090 \
   --peer-subscribe-all
@@ -626,7 +799,7 @@ fluree-server \
 Or subscribe to specific resources:
 
 ```bash
-fluree-server \
+fluree server run -- \
   --server-role peer \
   --tx-server-url http://tx:8090 \
   --peer-ledger books:main \
@@ -682,52 +855,58 @@ Enable storage proxy endpoints for peers without direct storage access:
 
 ```bash
 # Ed25519 trust (did:key):
-fluree-server \
+fluree server run -- \
   --storage-proxy-enabled \
   --storage-proxy-trusted-issuer did:key:z6Mk...
 
 # OIDC/JWKS trust (same --jwks-issuer flag used by other endpoints):
-fluree-server \
+fluree server run -- \
   --storage-proxy-enabled \
   --jwks-issuer "https://solo.example.com=https://solo.example.com/.well-known/jwks.json"
 ```
 
 > **JWKS support**: When `--jwks-issuer` is configured, storage proxy endpoints accept RS256 OIDC tokens in addition to Ed25519 JWS tokens. The `--jwks-issuer` flag is shared with data, admin, and events endpoints — a single flag enables OIDC across all endpoint groups.
 
+Storage proxy rejects fixed `fluree.policy` delegation and `"fluree.policy": "request"` credentials. Delegated policy selection is supported by the data API, not storage-proxy endpoints. Use separate replication credentials for storage access; see [Trusted policy authorization](../security/policy-authorization.md).
+
 ## Complete Configuration Examples
 
 ### Development (Memory Storage)
 
 ```bash
-fluree-server \
+fluree server run \
+  --memory \
   --log-level debug
 ```
 
 ### Single Server (File Storage)
 
 ```bash
-fluree-server \
+fluree server run \
   --storage-path /var/lib/fluree \
-  --indexing-enabled \
-  --log-level info
+  --log-level info \
+  -- \
+  --indexing-enabled
 ```
 
 ### Production with Admin Auth
 
 ```bash
-fluree-server \
+fluree server run \
   --storage-path /var/lib/fluree \
+  --log-level info \
+  -- \
   --indexing-enabled \
   --admin-auth-mode required \
-  --admin-auth-trusted-issuer did:key:z6Mk... \
-  --log-level info
+  --admin-auth-trusted-issuer did:key:z6Mk...
 ```
 
 ### Transaction Server with Events Auth
 
 ```bash
-fluree-server \
+fluree server run \
   --storage-path /var/lib/fluree \
+  -- \
   --events-auth-mode required \
   --events-auth-trusted-issuer did:key:z6Mk... \
   --storage-proxy-enabled \
@@ -737,8 +916,10 @@ fluree-server \
 ### Production with OIDC (All Endpoints)
 
 ```bash
-fluree-server \
+# Requires a build with the oidc feature (see OIDC / JWKS Token Verification)
+fluree server run \
   --storage-path /var/lib/fluree \
+  -- \
   --indexing-enabled \
   --jwks-issuer "https://auth.example.com=https://auth.example.com/.well-known/jwks.json" \
   --data-auth-mode required \
@@ -750,10 +931,11 @@ fluree-server \
 ### Query Peer (Shared Storage)
 
 ```bash
-fluree-server \
+fluree server run \
+  --storage-path /var/lib/fluree \
+  -- \
   --server-role peer \
   --tx-server-url http://tx.internal:8090 \
-  --storage-path /var/lib/fluree \
   --peer-subscribe-all \
   --peer-events-token @/etc/fluree/peer-token.jwt
 ```
@@ -761,7 +943,7 @@ fluree-server \
 ### Query Peer (Proxy Storage)
 
 ```bash
-fluree-server \
+fluree server run -- \
   --server-role peer \
   --tx-server-url http://tx.internal:8090 \
   --storage-access-mode proxy \
@@ -775,6 +957,7 @@ fluree-server \
 ```bash
 fluree server run \
   --connection-config /etc/fluree/connection.jsonld \
+  -- \
   --indexing-enabled \
   --reindex-min-bytes 100000 \
   --reindex-max-bytes 5000000 \
@@ -803,9 +986,10 @@ trusted_issuers = ["did:key:z6Mk..."]
 
 ```bash
 fluree server run \
+  --connection-config /etc/fluree/connection.jsonld \
+  -- \
   --server-role peer \
   --tx-server-url http://tx.internal:8090 \
-  --connection-config /etc/fluree/connection.jsonld \
   --peer-subscribe-all \
   --peer-events-token @/etc/fluree/peer-token.jwt
 ```
@@ -820,13 +1004,19 @@ fluree server run \
 | `FLUREE_LISTEN_ADDR`                    | Server address:port                             | `0.0.0.0:8090`                                                          |
 | `FLUREE_STORAGE_PATH`                   | File storage path                               | `.fluree/storage`                                                       |
 | `FLUREE_CONNECTION_CONFIG`              | JSON-LD connection config file path             | None                                                                    |
+| `FLUREE_MEMORY_STORAGE`                 | Keep all ledgers in memory (lost on exit)       | `false`                                                                 |
 | `FLUREE_CORS_ENABLED`                   | Enable CORS                                     | `true`                                                                  |
 | `FLUREE_INDEXING_ENABLED`               | Enable background indexing                      | `true`                                                                  |
-| `FLUREE_REINDEX_MIN_BYTES`              | Soft reindex threshold (bytes)                  | `100000`                                                                |
+| `FLUREE_REINDEX_MIN_BYTES`              | Soft reindex threshold (bytes)                  | `100`                                                                   |
 | `FLUREE_REINDEX_MAX_BYTES`              | Hard reindex threshold (bytes)                  | 20% of system RAM (256 MB fallback)                                      |
+| `FLUREE_GC_MAX_OLD_INDEXES`             | Old index versions to retain before GC          | `5`                                                                     |
+| `FLUREE_GC_MIN_TIME_MINS`               | Minimum age (minutes) before an index version can be collected; protects queries that started against an older version | `30`                              |
+| `FLUREE_GC_HARD_MAX_OLD_INDEXES`        | Version ceiling past which the age guard is overridden. Bounds versions, not bytes; past it GC can release artifacts a still-running query needs — see [Index Retention](../indexing-and-search/background-indexing.md#index-retention) | Unset (no ceiling) |
+| `FLUREE_DICT_COMPACTION`                | Merge forward dictionary packs during incremental index builds. Off (`0`/`false`/`off`/`no`) appends packs without ever merging them, so a dictionary's object and mapping count grows once per build forever — see [Forward pack compaction](../design/index-format.md#forward-pack-compaction). Read once per process. | `true` |
 | `FLUREE_CACHE_MAX_MB`                   | Global in-memory cache budget (MB)              | Tiered by RAM: `<4GB: 30%, 4-8GB: 40%, >=8GB: 35%`                                                     |
 | `FLUREE_DISK_CACHE_MAX_MB`              | Global on-disk cache budget (MB), shared across object storage + Iceberg | Auto-detect from free disk; `0` disables |
 | `FLUREE_DISK_CACHE_BUDGET_BYTES`        | On-disk cache budget (bytes); overrides `FLUREE_DISK_CACHE_MAX_MB`        | Auto-detect from free disk; `0` disables |
+| `FLUREE_ICEBERG_LOCAL_ROOTS`            | Colon-separated absolute directories under which catalog-less Iceberg tables may be read from the local filesystem. Unset disables local-filesystem tables entirely | Unset (local tables disabled) |
 | `FLUREE_BODY_LIMIT`                     | Max request body bytes                          | `52428800`                                                              |
 | `FLUREE_QUERY_TIMEOUT_MS`               | Max query execution time in milliseconds (`0` disables) | `900000`                                                     |
 | `FLUREE_QUERY_MIN_T_TIMEOUT_MS`         | Max read-after-write min-t wait in milliseconds | `5000`                                                                  |
@@ -851,10 +1041,16 @@ fluree server run \
 | `FLUREE_STORAGE_ACCESS_MODE`            | Peer storage mode                               | `shared`                                                                |
 | `FLUREE_STORAGE_PROXY_ENABLED`          | Enable storage proxy                            | `false`                                                                 |
 
+`FLUREE_CORS_ENABLED` and `FLUREE_INDEXING_ENABLED` accept `true`/`false`, `1`/`0`, `yes`/`no` and `on`/`off`, in any case. The `--cors-enabled` and `--indexing-enabled` flags take the same values after `=` (`--indexing-enabled=off`); the bare flag means `true`.
+
 ## Command-Line Reference
 
 ```bash
-fluree-server --help
+# Flags `run` takes directly
+fluree server run --help
+
+# The complete server flag list (everything that can follow `--`)
+fluree server run -- --help
 ```
 
 ## Best Practices
@@ -896,7 +1092,7 @@ The following config file fields support `@filepath` resolution:
 Always protect admin endpoints in production:
 
 ```bash
-fluree-server \
+fluree server run -- \
   --admin-auth-mode required \
   --admin-auth-trusted-issuer did:key:z6Mk...
 ```
@@ -907,10 +1103,10 @@ Memory storage is lost on restart:
 
 ```bash
 # Development only
-fluree-server
+fluree server run --memory
 
 # Production
-fluree-server --storage-path /var/lib/fluree
+fluree server run --storage-path /var/lib/fluree
 ```
 
 ### 4. Monitor Logs
@@ -918,7 +1114,7 @@ fluree-server --storage-path /var/lib/fluree
 Use structured logging for production:
 
 ```bash
-fluree-server --log-level info 2>&1 | jq .
+fluree server run --log-level info 2>&1 | jq .
 ```
 
 ## Remote Connections
@@ -970,7 +1166,7 @@ that swaps the global allocator to [mimalloc](https://github.com/microsoft/mimal
 It is **off by default** — enable it in your release build:
 
 ```bash
-cargo build --release -p fluree-db-server --features mimalloc
+cargo build --release -p fluree-db-cli --features mimalloc
 ```
 
 **When it helps:** allocation-heavy, multicore query paths — most notably
@@ -992,6 +1188,63 @@ Iceberg table: ~62s with the system allocator vs ~31s with mimalloc).
 
 Pair it with bounded query parallelism so a single large scan cannot monopolize
 cores and allocator pressure under concurrent load.
+
+## Iceberg / R2RML Graph-Source Tuning
+
+Queries against an Iceberg-backed R2RML graph source are tuned by a set of
+environment knobs. All are optional; the defaults are chosen for correct,
+reasonable behavior out of the box. `FLUREE_ICEBERG_LOCAL_ROOTS` is also
+settable from the config file (`[server] iceberg_local_roots`); the rest are
+environment-only.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `FLUREE_ICEBERG_LOCAL_ROOTS` | unset (local tables **disabled**) | Colon-separated absolute directories under which catalog-less Iceberg tables may be read from the local filesystem, in the style of `PATH`. Unset, a Direct `table_location` that is a `file://` URI or an absolute path is **refused when the graph source is created**, with an error naming this switch. When set, such locations are permitted *and* every path read — table location, metadata, manifests, data files — is confined to these directories, so a manifest reference that climbs out of the table root (`.../table/../../../etc/passwd`) is refused rather than followed. Containment is checked textually and against the canonical path, so a symlink out of a root does not escape it. `/` allows the whole filesystem — reasonable on a single-tenant workstation, risky on a shared deployment. See [Iceberg graph sources](../graph-sources/iceberg.md#enabling-local-tables). |
+| `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS` | unset (none) | Comma-separated names of environment variables that an `iceberg/map`, browse or preview request may name as its catalog secret (`auth_bearer_env`, `oauth2_client_secret_env`). A request naming any other variable is refused. The request also chooses where the secret is sent, so list only variables that hold catalog credentials. Does not apply to a local CLI, which reads its own environment. See [Iceberg graph sources](../graph-sources/iceberg.md#stored-configuration-format-nameservice). |
+| `FLUREE_ICEBERG_LOADTABLE_CACHE` | on | Master switch for all REST catalog caching. Set to `0`/`false`/`off` to build a fresh catalog client and reload the table on **every** scan (restores a per-scan OAuth exchange + `loadTable` round-trip). Disables the client/OAuth reuse, the cross-query `loadTable` cache, and the per-query snapshot pin. **Materialize refusal:** because disabling the cache also disables the per-query snapshot pin, `fluree materialize` **refuses to build** a twin while this is off (the twin's stamped watermark could not be guaranteed to describe its contents) — re-enable the cache to materialize. |
+| `FLUREE_ICEBERG_LOADTABLE_TTL_SECS` | `60` | TTL (seconds) for the **cross-query** `loadTable`-response cache. A REST `loadTable` GET against a catalog such as Snowflake Horizon costs ~1.3–3 s, so caching it lets a burst of queries against the same table skip the round-trip. The TTL bounds how stale a snapshot a *new* query may observe; `0` disables the cross-query layer (leaving only the per-query pin). Every cache read is additionally gated on vended-credential expiry (30 s buffer), so a long TTL never hands out about-to-expire credentials. |
+| `FLUREE_ICEBERG_REST_CLIENT_TTL_SECS` | `900` | TTL (seconds) for the process-wide REST **catalog-client** cache (the reused OAuth token + HTTPS pool). The cache is keyed by a fingerprint of the raw config JSON, which does **not** change when a secret referenced by env var / secret store is rotated; this TTL bounds how long a rotated secret stays stale before the client is rebuilt and re-authenticated. `0` rebuilds the client every query (restoring a per-query OAuth exchange). The same TTL bounds the shared handle of a [Delta table](../graph-sources/delta.md#performance): its remembered log state, and, for a table named in Unity Catalog, where the name points. |
+| `FLUREE_R2RML_SCAN_CACHE` | on | Toggles the correlated-join inner-scan cache, which reuses a materialized inner (dimension) table across a join's child batches instead of re-scanning it per batch. Set to `0`/`false`/`off` to restore per-child-batch re-scans. |
+| `FLUREE_R2RML_LIMIT_PUSHDOWN` | on | Toggles pushing a query's `LIMIT` into the R2RML scan as a row budget, so a scan stops after enough output rows instead of draining the table. Set to `0`/`false`/`off` to always scan fully. |
+| `FLUREE_ICEBERG_PREDICATE_PUSHDOWN` | on | Toggles pushing simple date/int/bool/string FILTER comparisons into the Iceberg reader for **row-group pruning** (skip groups whose min/max rule out the predicate) and **exact row filtering** (drop non-matching rows during decode — e.g. `= "Acme"` on a name/code column). The in-engine FILTER remains the authority, so this only ever affects performance. Set to `0`/`false`/`off` to disable both. |
+| `FLUREE_R2RML_FILTER_CONSUMPTION` | on | Toggles folding a fully scan-local FILTER into the single R2RML scan that produces its variables, dropping the standalone filter operator so a `LIMIT` budget can reach the scan (a `FILTER + LIMIT` fact query then stops early). The scan re-applies the filter with the same evaluator, so results are unchanged. Set to `0`/`false`/`off` to keep the filter downstream (no early termination). |
+| `FLUREE_FUSED_VECTOR_FOLD` | on | Toggles the vectorized GROUP BY fold (a borrowed-key dense-id dict) for fused R2RML aggregates. Set to `0`/`false`/`off` to restore the byte-identical owned-key `HashMap` fold that clones a fresh key every row. Read at fused-operator construction (per query). |
+| `FLUREE_FUSED_R2RML_OUTPUT_BOUND` | on | Toggles emitting a fused GROUP BY rollup in bounded chunks (≤8192 groups per batch) so a high-cardinality result never fully materializes at once. Set to `0`/`false`/`off` to emit a single batch. Same rows either way, but a bare `LIMIT` with no `ORDER BY` can return a different prefix on vs off (group order is unspecified). Read at fused-operator construction (per query). |
+| `FLUREE_FUSED_R2RML_MULTIFACT` | on | Toggles the fused multi-fact branching-star join (one GROUP-KEY branch + one SEMI-JOIN branch). Set to `0`/`false`/`off` to decline the branching star to the generic pipeline (byte-identical). Read at fused-operator construction (per query). |
+| `FLUREE_FUSED_R2RML_MULTIFACT_GEN` | on | Toggles the S1/S2 generality WIDENING over the one-of-each cut: K≥2 SEMI-JOIN branches (S1) and ≥2 ref-IRI GROUP-BY keys (S2). Set to `0`/`false`/`off` to decline ONLY that increment — a K=1 branching star and a single ref-IRI key still fuse (byte-identical to before the widening). Rides on top of `FLUREE_FUSED_R2RML_MULTIFACT` / `FLUREE_FUSED_R2RML_AGG_JOIN` (either of those off declines the whole family). Read at fused-operator construction (per query). |
+| `FLUREE_ARROW_DIRECT_DECODE` | on | Toggles building a column directly from an Arrow array, skipping the two-hop per-cell intermediate. Set to `0`/`false`/`off` to restore the byte-identical two-hop decode. |
+| `FLUREE_R2RML_MATERIALIZE_WINDOW_ROWS` | `524288` | Target table rows materialized into RDF-term bindings per parallel window. Bounds resident memory during a scan (materialization explodes the compact columnar form into fat binding rows). Also caps the size of an inner scan eligible for the inner-scan cache above. |
+| `FLUREE_ICEBERG_SCAN_CONCURRENCY` | `min(cores, files, 8)` | Number of data files read concurrently within one scan. Raise it for high-latency remote object stores (it is not capped, but is bounded by the number of files in the scan). |
+| `FLUREE_DELTA_SCAN_CONCURRENCY` | `min(cores, files, 32)` | Number of data files of a Delta table read concurrently within one scan. Raise it for high-latency remote object stores. |
+| `FLUREE_DELTA_LOG_CACHE_MB` | `256` | Memory (MB), across all Delta tables, for the data-file lists remembered between queries so a query reads only the commits added since the last one instead of replaying the table's log. A table whose list does not fit is planned from its log on every query. `0` remembers nothing. |
+| `FLUREE_DELTA_FOOTER_CACHE_MB` | `128` | Memory (MB), across all Delta tables, for the Parquet footers and page indexes of data files kept between queries. Data files are immutable, so a kept footer is never stale. `0` keeps none: every query re-reads the footer of every file it opens. |
+| `FLUREE_MATERIALIZE_MEMORY_BUDGET_MB` | `1024` | Memory budget (MB) for one materialize pass's subject accumulator — the pass's dominant memory term (one retained node per distinct subject in the window). A window whose **estimated** accumulator exceeds the budget fails with a typed error *before any commit* (nothing partially applied, watermark un-advanced) instead of the process being OOM-killed. The failure is deterministic and recurs every poll until the budget or the window changes: shorten the poll interval so incremental windows stay small, or raise the budget for a large full read. `0` disables the gate. |
+| `FLUREE_MATERIALIZE_WATERMARK_REFRESH_MINS` | `30` | How old a materialize window may grow before an *empty* poll still persists its watermark. Skipping watermark writes on no-data polls keeps the state ledger from taking ~1,200 empty commits/hour, but never refreshing lets the stored snapshot age out of the source's snapshot retention — after which every poll degrades to a full table read. This bound is the compromise: quiet tables refresh their watermark at most once per interval. |
+| `FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS` | derived | Rows one materialize pass may take before checkpointing, on both the full-read and the incremental path. Unset, it is derived from the configured novelty ceiling (`reindex_max_bytes`, however it was set): a quarter of the ceiling divided by `FLUREE_MATERIALIZE_FLAKE_BYTES_PER_ROW`, floored at 1,000 rows, so that a bounded pass can actually commit. A **full read** stops at a commit boundary and records where it got to — as a snapshot checkpoint when a retained snapshot names it, otherwise as a commit-sequence cursor, which survives snapshot expiry. An **incremental window** whose snapshots (sized from their `added-records` summaries) exceed the budget stops at the last snapshot the budget covers and advances the watermark to it, so a backlog drains in bounded steps instead of re-reading a growing window on every poll until the watermark expires. Either way the next poll resumes from where this one stopped. `0` disables the bound and reads the whole window in one pass. |
+| `FLUREE_MATERIALIZE_FLAKE_BYTES_PER_ROW` | `108` | Estimated bytes of novelty one materialized row costs; used only to convert the novelty ceiling into the row budget above. Set this, rather than the row budget, when rows are much wider or narrower, so the budget keeps tracking the ceiling. |
+
+**Caching model.** Catalog access is cached at two scopes. Within a single query,
+the first scan of a table pins its `metadata_location`, so every scan in that
+query reads one consistent Iceberg snapshot even if the table commits mid-query.
+Across queries, a process-wide cache reuses the REST client (so its OAuth token —
+valid ~1 h — and HTTPS connection pool survive) and the `loadTable` response
+(bounded by `FLUREE_ICEBERG_LOADTABLE_TTL_SECS`). On a warm server this means the
+second and later queries against a table typically skip both the OAuth exchange
+and the `loadTable` GET entirely. The cross-query cache always records the
+catalog's current state, never a query's pinned snapshot, so pin preservation
+cannot leak a stale location to other queries. The client cache is keyed by a
+fingerprint of the raw config JSON: editing the config (including an inline
+secret) rebuilds the client immediately, but a secret referenced by env var or
+secret store is invisible to the fingerprint, so a rotation of that secret is
+picked up only when the client cache entry expires
+(`FLUREE_ICEBERG_REST_CLIENT_TTL_SECS`, default 15 min) — until then the reused
+client keeps presenting the old credential.
+
+**Freshness vs. latency.** The only knob with a data-freshness tradeoff is
+`FLUREE_ICEBERG_LOADTABLE_TTL_SECS`: a new query may read a snapshot up to that
+many seconds old. This is well within typical warehouse ETL latency; lower it (or
+set `0`) if you need each query to always resolve the newest snapshot, at the cost
+of paying the `loadTable` GET per query.
 
 ## Related Documentation
 

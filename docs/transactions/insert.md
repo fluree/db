@@ -280,7 +280,10 @@ Create entities without explicit IRIs:
 }
 ```
 
-Fluree generates a unique IRI for the blank node address.
+Fluree generates a unique IRI for the blank node address, in the reserved
+`_:fdb-...` label space. Queries return that id, and it can be used later to
+address the node directly — see
+[Editing blank-node structures](update-where-delete-insert.md#editing-blank-node-structures-stable-_fdb--ids).
 
 ## Adding to Existing Entities
 
@@ -381,6 +384,25 @@ Inline `@annotation` queries return one row per occurrence.
 - Hand-authored mention of the [reserved system predicates](../reference/vocabulary.md#edge-annotation-predicates-reserved) that back annotations (compact or full IRI form).
 
 For the full surface — including SPARQL 1.2 / RDF 1.2 annotation tails (`{| |}`), the named reifier (`~`), the cardinality / multiplicity contract, anonymous vs explicit-IRI lifecycle, and named-graph behavior — see the [Edge annotations concept doc](../concepts/edge-annotations.md). For cascade semantics when a base edge or annotation metadata is removed, see [Retractions](retractions.md).
+
+## Turtle and TriG
+
+`/insert` also takes RDF text. Turtle (`text/turtle`) is parsed straight to flakes. TriG (`application/trig`) adds graph blocks, which land in their named graphs; a `GRAPH <#txn-meta> { ... }` block becomes commit metadata instead:
+
+```bash
+curl -X POST "http://localhost:8090/v1/fluree/insert?ledger=mydb:main" \
+  -H "Content-Type: application/trig" \
+  --data-binary '
+@prefix ex: <http://example.org/ns/> .
+
+ex:alice ex:name "Alice" .
+
+GRAPH <http://example.org/graphs/hr> {
+  ex:alice ex:salary 95000 .
+}'
+```
+
+A body with graph blocks is read as TriG even when sent as `text/turtle`. From the CLI, `fluree insert -f data.trig` does the same. See [Turtle and TriG](turtle.md) for the syntax, the TriG rules, and querying named graphs.
 
 ## Insert Semantics
 
@@ -661,6 +683,7 @@ Use compact contexts:
 
 - [Overview](overview.md) - Transaction overview
 - [Upsert](upsert.md) - Replace mode inserts
+- [Turtle and TriG](turtle.md) - RDF text formats and named graphs
 - [Update](update-where-delete-insert.md) - Updating existing data
 - [Data Types](../concepts/datatypes.md) - Supported datatypes
 - [API Endpoints](../api/endpoints.md) - HTTP API details

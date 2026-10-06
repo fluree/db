@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "query_id": "q025",
+  "result_hash": "f8e0c9f633ba11fb937e021e37193122d67db61e75a795379595aa3874f13495",
+  "rows": 5,
+  "head_rows": [
+    "2.976956839795172\u001fGarden\u001f2734",
+    "2.9881201956673653\u001fSports\u001f2862",
+    "2.9934164934164933\u001fElectronics\u001f2886",
+    "2.994192377495463\u001fHome\u001f2755",
+    "2.9965858654831\u001fBeauty\u001f2929"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

@@ -15,18 +15,19 @@
 
 use super::types::{ShapesArtifactWire, WireObject, WireOrigin, WireTriple};
 use super::CrossLedgerError;
-use crate::Fluree;
+use super::ResolveCtx;
 use fluree_db_core::{
     FlakeValue, IndexType, LedgerSnapshot, RangeMatch, RangeOptions, RangeTest, Sid,
 };
 
 const SHACL: &str = "http://www.w3.org/ns/shacl#";
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+const OWL: &str = "http://www.w3.org/2002/07/owl#";
 
 #[tracing::instrument(
     name = "cross_ledger.shapes.materialize",
     level = "debug",
-    skip(fluree),
+    skip(ctx),
     fields(
         model_ledger = canonical_model_ledger_id,
         graph_iri = graph_iri,
@@ -37,10 +38,10 @@ pub(super) async fn materialize_shapes(
     canonical_model_ledger_id: &str,
     graph_iri: &str,
     resolved_t: i64,
-    fluree: &Fluree,
+    ctx: &ResolveCtx<'_>,
 ) -> Result<ShapesArtifactWire, CrossLedgerError> {
-    let m_db = fluree
-        .load_graph_db_at_t(canonical_model_ledger_id, resolved_t)
+    let m_db = ctx
+        .open_model_db(canonical_model_ledger_id, resolved_t)
         .await
         .map_err(|e| CrossLedgerError::TranslationFailed {
             ledger_id: canonical_model_ledger_id.to_string(),
@@ -91,9 +92,26 @@ pub(super) async fn materialize_shapes(
         "and",
         "or",
         "xone",
+        "node",
+        "qualifiedValueShape",
+        "qualifiedMinCount",
+        "qualifiedMaxCount",
+        "qualifiedValueShapesDisjoint",
+        "deactivated",
         "severity",
         "message",
         "name",
+        // SPARQL-based constraints (sh:sparql). `sh:select` carries the
+        // query text as a literal; `sh:prefixes`/`sh:declare`/`sh:prefix`/
+        // `sh:namespace` carry the prefix declarations the query header is
+        // built from, and `owl:imports` (projected below) links prefix
+        // ontologies transitively.
+        "sparql",
+        "select",
+        "prefixes",
+        "declare",
+        "prefix",
+        "namespace",
     ];
 
     let mut shacl_predicate_sids: Vec<Sid> = Vec::new();
@@ -104,6 +122,10 @@ pub(super) async fn materialize_shapes(
     }
     let rdf_first_sid = m_db.snapshot.encode_iri_strict(&format!("{RDF}first"));
     let rdf_rest_sid = m_db.snapshot.encode_iri_strict(&format!("{RDF}rest"));
+    // owl:imports edges are followed when resolving `sh:prefixes` into a
+    // PREFIX header for sh:sparql constraints — project them so the closure
+    // survives the wire.
+    let owl_imports_sid = m_db.snapshot.encode_iri_strict(&format!("{OWL}imports"));
 
     let opts = RangeOptions::default().with_to_t(m_db.t);
     let mut triples: Vec<WireTriple> = Vec::new();
@@ -135,7 +157,7 @@ pub(super) async fn materialize_shapes(
         }
     }
 
-    for opt_sid in [rdf_first_sid, rdf_rest_sid]
+    for opt_sid in [rdf_first_sid, rdf_rest_sid, owl_imports_sid]
         .iter()
         .filter_map(|s| s.as_ref())
     {

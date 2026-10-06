@@ -1,0 +1,10 @@
+# q015 shipment_sla
+# Intent: Fact-to-fact join (Shipment->Order); H3 stress (fact parent).
+# BI lineage (BI-10): "What is the shipment status and cost for each order?"
+# Predicates verified against enterprise.ttl — FactShipment: shipStatus, shipCost, order(->FactOrder); FactOrder: orderId, orderStatus.
+# Determinism: unordered LIMIT truncates a larger set (any k rows are valid) -> hash_gate=rows_only; gated on row count + invariants, not an exact hash.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?oid ?st ?sc ?ost
+WHERE { ?sh a edw:Shipment ; edw:shipStatus ?st ; edw:shipCost ?sc ; edw:order ?o .
+        ?o edw:orderId ?oid ; edw:orderStatus ?ost . }
+LIMIT 5000

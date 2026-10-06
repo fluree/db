@@ -40,13 +40,14 @@ use crate::raft::state_machine::{BodyKind, PoisonReason, QueueEntry, RefKey};
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::{NodeId, TypeConfig};
 use crate::{
-    QueuedMerge, QueuedPush, QueuedRebase, QueuedRequest, QueuedRevert, QueuedTransact,
-    SubmissionError, TransactionBody,
+    QueuedMerge, QueuedPush, QueuedPushWithMerges, QueuedRebase, QueuedRequest, QueuedRevert,
+    QueuedTransact, SubmissionError, TransactionBody,
 };
 use fluree_db_api::{
     ApiError, Base64Bytes, Fluree, PushCommitsRequest, RefreshOpts, StagedMerge, StagedPush,
     StagedRebase, StagedRevert,
 };
+use fluree_db_core::task::panic_message;
 use fluree_db_core::ContentId;
 use fluree_db_ledger::IndexConfig;
 use fluree_db_nameservice::{CommitPublisher, NameServiceError};
@@ -226,8 +227,12 @@ impl Worker {
     /// nameservice head so a conflict rooted in stale state (e.g.
     /// a namespace allocation this node missed because it took
     /// leadership mid-write) heals instead of producing the same
-    /// failure forever. Returns once the entry has reached a
-    /// terminal state in the queue (advanced or poisoned).
+    /// failure forever. A `Lagged` rejection (staged on a view
+    /// behind the replicated head) re-stages indefinitely with a
+    /// refresh between attempts — the entry is still at the queue
+    /// front and becomes stageable as soon as the local view
+    /// catches up. Returns once the entry has reached a terminal
+    /// state in the queue (advanced or poisoned).
     async fn process_entry(&self, entry: QueueEntry) -> Result<(), WorkerError> {
         let mut attempt: u32 = 0;
         loop {
@@ -284,6 +289,41 @@ impl Worker {
                         )
                         .await;
                 }
+                Err(WorkerError::Lagged(msg)) => {
+                    // The entry is still at the queue front: either
+                    // this worker staged on a local view lagging
+                    // the replicated head, or another ferry for the
+                    // same entry was in flight on the leader.
+                    // Refresh the local cache against the
+                    // replicated head and re-stage the same entry.
+                    // Unbounded — progress resumes as soon as the
+                    // newer head arrives or the competing ferry
+                    // resolves, and poisoning would fail a valid
+                    // entry over a node-local condition. The
+                    // staging-attempt budget resets: each lag retry
+                    // starts a fresh stage against a newer view.
+                    attempt = 0;
+                    warn!(
+                        queue_id = entry.queue_id,
+                        %msg,
+                        "staged on a lagging view; refreshing and re-staging"
+                    );
+                    tokio::time::sleep(RAFT_BACKOFF).await;
+                    let ledger_id = self.ref_key.ledger_id();
+                    if let Err(refresh_err) = self
+                        .staging
+                        .fluree
+                        .refresh(&ledger_id, RefreshOpts::default())
+                        .await
+                    {
+                        warn!(
+                            queue_id = entry.queue_id,
+                            error = %refresh_err,
+                            "refresh after lagged apply failed; retrying anyway"
+                        );
+                    }
+                    continue;
+                }
                 Err(WorkerError::Stage(reason)) => {
                     return self.propose_poison(entry.queue_id, *reason).await;
                 }
@@ -303,6 +343,7 @@ impl Worker {
         let StagedOutcome { receipt, install } = match envelope {
             QueuedRequest::Transact(transact) => self.stage_and_persist(*transact).await?,
             QueuedRequest::Push(push) => self.process_push(*push).await?,
+            QueuedRequest::PushWithMerges(push) => self.process_push_with_merges(*push).await?,
             QueuedRequest::Revert(revert) => self.process_revert(revert).await?,
             QueuedRequest::Merge(merge) => self.process_merge(merge).await?,
             QueuedRequest::Rebase(rebase) => self.process_rebase(rebase).await?,
@@ -361,16 +402,37 @@ impl Worker {
                     self.release_orphaned_commit_blob(&commit_id).await;
                     Ok(())
                 } else {
-                    // Apply didn't land. Release the staged commit
-                    // blob — the next retry rebuilds the commit with
-                    // a fresh timestamp, producing a different
-                    // `commit_id`, so this one is orphaned. Drop
-                    // `install` (write_guard releases without
-                    // calling `replace`, so this node's Fluree
-                    // handle stays at its pre-stage head — same as
-                    // every other node) and propagate the error for
-                    // the outer retry/poison logic.
-                    self.release_orphaned_commit_blob(&commit_id).await;
+                    // Apply didn't land locally. Whether the blob
+                    // can be released depends on what the failure
+                    // proves. An authoritative state-machine
+                    // rejection (`Stage`, `Lagged`) proves this
+                    // commit will never land — any retry rebuilds
+                    // with a fresh timestamp and a different
+                    // `commit_id` — so the blob is orphaned. An
+                    // ambiguous propose failure (`Raft`: ferry
+                    // timeout, leader step-down mid-propose, lost
+                    // response) may have committed the head advance
+                    // anyway, with only the local applied state
+                    // lagging behind it — releasing then would hard-
+                    // delete the blob every node's replicated head
+                    // points at in shared storage, so it is kept
+                    // (one orphan accumulates in CAS if the propose
+                    // truly failed). Either way drop `install`
+                    // (write_guard releases without calling
+                    // `replace`, so this node's Fluree handle stays
+                    // at its pre-stage head) and propagate the error
+                    // for the outer retry/poison logic.
+                    if err.is_rejection() {
+                        self.release_orphaned_commit_blob(&commit_id).await;
+                    } else {
+                        warn!(
+                            queue_id = entry.queue_id,
+                            commit_id = %commit_id,
+                            error = %err,
+                            "publish outcome unknown; keeping staged commit blob \
+                             (it may be the replicated head)"
+                        );
+                    }
                     Err(err)
                 }
             }
@@ -429,16 +491,15 @@ impl Worker {
             .is_some_and(|entry| &entry.head == commit_id)
     }
 
-    /// Release the staged commit blob from the local content store.
-    /// Called on the orphan paths in [`Self::try_advance_head`] —
-    /// the entry's `commit_t` won't land (either the queue front
-    /// moved past us, or the publish failed and the next retry
-    /// will rebuild the commit with a fresh timestamp, producing a
-    /// different `commit_id`). Without this release, every
-    /// transport blip or sibling-worker race leaks one blob per
-    /// failed attempt with no GC path: `release_envelopes` covers
-    /// the request body, not the staged commit; the state machine
-    /// doesn't track unreferenced commit blobs.
+    /// Release the staged commit blob from the content store.
+    /// Called on the orphan paths in [`Self::try_advance_head`],
+    /// and only when the publish outcome proves the commit can
+    /// never become the replicated head (see
+    /// [`WorkerError::is_rejection`]). Without this release,
+    /// every sibling-worker race leaks one blob per failed attempt
+    /// with no GC path: `release_envelopes` covers the request
+    /// body, not the staged commit; the state machine doesn't
+    /// track unreferenced commit blobs.
     ///
     /// Best effort — a failed release is logged but doesn't abort
     /// the worker's retry loop. `ContentStore::release` is
@@ -453,6 +514,32 @@ impl Worker {
                 "failed to release orphaned commit blob; CAS will accumulate one entry"
             );
         }
+    }
+
+    /// Persist a staged commit's blobs to `ledger_id`'s content
+    /// store: referenced payloads first, then the commit blob, so a
+    /// resolvable commit CID always implies its referenced payloads
+    /// are durable. (`referenced_bytes` is empty today; the
+    /// ordering matters the day it isn't.) `op` labels errors with
+    /// the operation being staged.
+    async fn persist_staged_blobs(
+        &self,
+        ledger_id: &str,
+        commit_cid: &ContentId,
+        staged: &fluree_db_transact::StagedCommit,
+        op: &str,
+    ) -> Result<(), WorkerError> {
+        let content_store = self.staging.fluree.content_store(ledger_id);
+        for (cid, bytes) in &staged.referenced_bytes {
+            content_store
+                .put_with_id(cid, bytes)
+                .await
+                .map_err(|e| stage_failure(&format!("{op} referenced blob write failed: {e}")))?;
+        }
+        content_store
+            .put_with_id(commit_cid, &staged.commit_bytes)
+            .await
+            .map_err(|e| stage_failure(&format!("{op} commit blob write failed: {e}")))
     }
 
     /// Install staged ledger state through the held write guard
@@ -512,12 +599,16 @@ impl Worker {
             .fluree
             .ledger_manager()
             .ok_or_else(|| stage_failure("LedgerManager is not configured on Fluree"))?;
+        let typed_id = self
+            .ref_key
+            .id()
+            .map_err(|e| stage_failure(&format!("invalid ledger id: {e}")))?;
         let ledger_handle = ledger_manager
-            .get_or_load(&ledger_id)
+            .get_or_load(&typed_id)
             .await
             .map_err(|e| stage_failure(&format!("ledger load failed: {e}")))?;
 
-        let policy_ctx = build_policy_context(&ledger_handle, &governance)
+        let policy_ctx = build_policy_context(&self.staging.fluree, &ledger_handle, &governance)
             .await
             .map_err(submission_to_stage)?;
 
@@ -536,6 +627,7 @@ impl Worker {
                     query,
                     params.as_ref(),
                     &governance,
+                    txn_opts.skolem_txn_id.clone(),
                 )
                 .await
                 .map_err(|e| stage_failure(&format!("cypher lowering failed: {e}")))?,
@@ -548,13 +640,51 @@ impl Worker {
             TransactionBody::JsonLdInsert(json) => staged.insert(json),
             TransactionBody::JsonLdUpsert(json) => staged.upsert(json),
             TransactionBody::JsonLdUpdate(json) => staged.update(json),
+            TransactionBody::JsonLdGraphSync { graph_iri, body } => staged.sync_graph_payload(
+                crate::graph_sel(graph_iri),
+                fluree_db_api::GraphPayload::JsonLd(body),
+                false,
+            ),
+            TransactionBody::RdfGraphSync {
+                graph_iri,
+                text,
+                allow_empty,
+            } => staged.sync_graph_payload(
+                crate::graph_sel(graph_iri),
+                fluree_db_api::GraphPayload::Rdf(text),
+                *allow_empty,
+            ),
+            TransactionBody::GraphInsert { graph_iri, payload } => {
+                let payload = match payload {
+                    crate::GraphBody::JsonLd(json) => fluree_db_api::GraphPayload::JsonLd(json),
+                    crate::GraphBody::Rdf(text) => fluree_db_api::GraphPayload::Rdf(text),
+                };
+                staged.insert_graph_payload(crate::graph_sel(graph_iri), payload)
+            }
             TransactionBody::TurtleInsert(text) => staged.insert_turtle(text.as_str()),
             TransactionBody::TurtleUpsert(text) | TransactionBody::TrigUpsert(text) => {
                 staged.upsert_turtle(text.as_str())
             }
             TransactionBody::Sparql(query) => staged.sparql_update(query.as_str()),
             TransactionBody::Cypher { .. } => {
-                staged.txn(cypher_txn.expect("cypher_txn is Some for a Cypher body"))
+                match cypher_txn.expect("cypher_txn is Some for a Cypher body") {
+                    crate::local::CypherWriteUnderLock::Resolved(resolved) => {
+                        let staged = staged.txn(resolved.primary);
+                        match resolved.followup {
+                            Some(followup) => staged.txn_followup(followup),
+                            None => staged,
+                        }
+                    }
+                    // Multi-clause plan: the sequential driver stages it
+                    // clause-by-clause inside the builder against the locked
+                    // state (the worker is the single serialized writer, so
+                    // the under-lock contract holds). A trailing RETURN was
+                    // rejected at submission — the Raft receipt path has no
+                    // channel for it.
+                    crate::local::CypherWriteUnderLock::Sequential(input) => {
+                        staged.cypher_sequential(*input)
+                    }
+                }
             }
         };
 
@@ -568,11 +698,35 @@ impl Worker {
         if let Some(policy) = policy_ctx {
             builder = builder.policy(policy);
         }
+        // The verified identity rides governance from the accepting node; the
+        // SHACL override gate reads it from here, not from the policy.
+        builder = builder.server_identity(governance.server_identity.clone());
 
-        let (write_guard, staged_commit) = builder
-            .build_commit()
-            .await
-            .map_err(|e| stage_failure(&format!("build_commit failed: {e}")))?;
+        let Some((write_guard, staged_commit)) =
+            builder.build_commit().await.map_err(build_commit_failure)?
+        else {
+            // No-change transaction (e.g. a graph sync whose payload already
+            // matches the graph): mirror the revert NoOp short-circuit —
+            // republish the current head with `install: None` so the queue
+            // entry completes without advancing and the local state is
+            // untouched. A no-op requires an already-registered graph, hence
+            // an existing head.
+            let snap = ledger_handle.snapshot().await;
+            let head_id = snap.head_commit_id.clone().ok_or_else(|| {
+                stage(PoisonReason::WorkerPanic {
+                    message: "no-op transaction on a ledger without a head commit".into(),
+                })
+            })?;
+            return Ok(StagedOutcome {
+                receipt: AppliedReceipt::Transact(TransactApplied {
+                    commit_id: head_id,
+                    commit_t: snap.t,
+                    flake_count: 0,
+                    tally: None,
+                }),
+                install: None,
+            });
+        };
 
         let commit_cid = staged_commit.commit.id.clone().ok_or_else(|| {
             stage(PoisonReason::WorkerPanic {
@@ -587,17 +741,8 @@ impl Worker {
         // produced.
         let tally = staged_commit.tally.clone();
 
-        let content_store = self.staging.fluree.content_store(&ledger_id);
-        content_store
-            .put_with_id(&commit_cid, &staged_commit.commit_bytes)
-            .await
-            .map_err(|e| stage_failure(&format!("commit blob write failed: {e}")))?;
-        for (cid, bytes) in &staged_commit.referenced_bytes {
-            content_store
-                .put_with_id(cid, bytes)
-                .await
-                .map_err(|e| stage_failure(&format!("referenced blob write failed: {e}")))?;
-        }
+        self.persist_staged_blobs(&ledger_id, &commit_cid, &staged_commit, "transact")
+            .await?;
 
         // Derive post-commit state but do NOT call finalize_commit
         // here — local install runs after the publish confirms the
@@ -627,11 +772,12 @@ impl Worker {
     /// blob to CAS, finalize local state, and return the new head
     /// identity. NoOp short-circuits (the conflict strategy dropped
     /// every reverted flake) republish the existing head so the
-    /// queue entry completes cleanly without advancing — `ApplyHead`
-    /// against the same head is a stale-write that the state machine
-    /// surfaces via `QueueDesync::WrongFront` only if another
-    /// transactor jumped ahead, which is exactly the race the queue
-    /// already serializes against.
+    /// queue entry completes cleanly without advancing. `ApplyHead`
+    /// recognizes that republish — equal `t` AND equal commit id —
+    /// as the designed no-op completion: it consumes the queue entry
+    /// and leaves the ref untouched. Equal `t` with a DIFFERENT
+    /// commit id is still a stale writer and is still refused with
+    /// `HeadNotMonotonic`.
     async fn process_revert(&self, revert: QueuedRevert) -> Result<StagedOutcome, WorkerError> {
         use fluree_db_api::GuardedStagedCommit;
 
@@ -686,17 +832,8 @@ impl Worker {
         let commit_t = staged_commit.commit.t;
 
         let ledger_id = self.ref_key.ledger_id();
-        let content_store = self.staging.fluree.content_store(&ledger_id);
-        content_store
-            .put_with_id(&commit_cid, &staged_commit.commit_bytes)
-            .await
-            .map_err(|e| stage_failure(&format!("revert commit blob write failed: {e}")))?;
-        for (cid, bytes) in &staged_commit.referenced_bytes {
-            content_store
-                .put_with_id(cid, bytes)
-                .await
-                .map_err(|e| stage_failure(&format!("revert referenced blob write failed: {e}")))?;
-        }
+        self.persist_staged_blobs(&ledger_id, &commit_cid, &staged_commit, "revert")
+            .await?;
 
         let (_receipt, new_state) = staged_commit
             .finalize_state()
@@ -723,10 +860,27 @@ impl Worker {
     /// finalize through the held write guard so this node's cache
     /// catches up with the head we're about to publish.
     async fn process_push(&self, push: QueuedPush) -> Result<StagedOutcome, WorkerError> {
-        let QueuedPush {
-            commit_cids,
-            blobs,
-            governance,
+        self.process_push_with_merges(QueuedPushWithMerges {
+            push,
+            merged_commit_cids: Vec::new(),
+        })
+        .await
+    }
+
+    /// [`Self::process_push`] for a push that also carries the commits its
+    /// merges brought in.
+    async fn process_push_with_merges(
+        &self,
+        push: QueuedPushWithMerges,
+    ) -> Result<StagedOutcome, WorkerError> {
+        let QueuedPushWithMerges {
+            push:
+                QueuedPush {
+                    commit_cids,
+                    blobs,
+                    governance,
+                },
+            merged_commit_cids,
         } = push;
         let ledger_id = self.ref_key.ledger_id();
         let content_store = self.staging.fluree.content_store(&ledger_id);
@@ -737,25 +891,39 @@ impl Worker {
         // malformed body. Any other error is a transport / backend
         // hiccup; raise as `Transient` so the retry/backoff loop in
         // `process_entry` heals it.
-        let mut commits = Vec::with_capacity(commit_cids.len());
-        for cid in &commit_cids {
-            let bytes = content_store.get(cid).await.map_err(|e| {
-                if matches!(e, fluree_db_core::Error::NotFound(_)) {
-                    stage(PoisonReason::BodyMalformed {
-                        error: format!("push commit {cid} missing from CAS: {e}"),
-                    })
-                } else {
-                    WorkerError::Transient(format!("push commit {cid} CAS read failed: {e}"))
+        let read_commits = |cids: Vec<fluree_db_core::CommitId>| {
+            let content_store = content_store.clone();
+            async move {
+                let mut out = Vec::with_capacity(cids.len());
+                for cid in &cids {
+                    let bytes = content_store.get(cid).await.map_err(|e| {
+                        if matches!(e, fluree_db_core::Error::NotFound(_)) {
+                            stage(PoisonReason::BodyMalformed {
+                                error: format!("push commit {cid} missing from CAS: {e}"),
+                            })
+                        } else {
+                            WorkerError::Transient(format!(
+                                "push commit {cid} CAS read failed: {e}"
+                            ))
+                        }
+                    })?;
+                    out.push(Base64Bytes(bytes));
                 }
-            })?;
-            commits.push(Base64Bytes(bytes));
-        }
+                Ok::<_, WorkerError>(out)
+            }
+        };
+        let commits = read_commits(commit_cids).await?;
+        let merged_commits = read_commits(merged_commit_cids).await?;
         let payload = PushCommitsRequest {
             commits,
             blobs: blobs
                 .into_iter()
                 .map(|(k, v)| (k, Base64Bytes(v)))
                 .collect(),
+            // The staged bundle carries every blob it resolved; a gap it
+            // could not resolve is not distinguished here yet.
+            missing_blobs: Vec::new(),
+            merged_commits,
         };
         let StagedPush {
             accepted,
@@ -853,16 +1021,8 @@ impl Worker {
                     message: "build_merge_general produced staged commit without commit.id".into(),
                 })
             })?;
-            let content_store = self.staging.fluree.content_store(&target_id);
-            content_store
-                .put_with_id(&commit_cid, &staged.commit_bytes)
-                .await
-                .map_err(|e| stage_failure(&format!("merge commit blob write failed: {e}")))?;
-            for (cid, bytes) in &staged.referenced_bytes {
-                content_store.put_with_id(cid, bytes).await.map_err(|e| {
-                    stage_failure(&format!("merge referenced blob write failed: {e}"))
-                })?;
-            }
+            self.persist_staged_blobs(&target_id, &commit_cid, &staged, "merge")
+                .await?;
             let (_receipt, new_state) = staged
                 .finalize_state()
                 .map_err(|e| stage_failure(&format!("merge finalize_state failed: {e}")))?;
@@ -1005,6 +1165,18 @@ impl Worker {
             // up the new queue front once local raft applies the
             // pop.
             Err(NameServiceError::ApplyStale(msg)) => Err(WorkerError::Stale(msg)),
+            // The entry is still at the queue front, but this
+            // worker staged on a local view lagging the replicated
+            // head. The retry loop refreshes the local view and
+            // re-stages the same entry.
+            Err(NameServiceError::ApplyLagged(msg)) => Err(WorkerError::Lagged(msg)),
+            // Ambiguous outcome — the ApplyHead may have committed
+            // with only the response lost. `Raft` is not a
+            // rejection (see [`WorkerError::is_rejection`]), so the
+            // caller keeps the staged blob while it backs off.
+            Err(NameServiceError::ProposeUnresolved(msg)) => Err(WorkerError::Raft(format!(
+                "publish_commit unresolved: {msg}"
+            ))),
             Err(e) => Err(WorkerError::Raft(format!("publish_commit failed: {e}"))),
         }
     }
@@ -1078,6 +1250,9 @@ impl Worker {
                 }
                 Ok(Err(WorkerError::Stale(_))) => {
                     unreachable!("try_advance_head consumes Stale internally and returns Ok")
+                }
+                Ok(Err(WorkerError::Lagged(_))) => {
+                    unreachable!("process_entry consumes Lagged internally and re-stages")
                 }
                 Ok(Err(WorkerError::Raft(propose_error))) => {
                     // Raft propose failed (leader stepped down, quorum
@@ -1402,7 +1577,7 @@ fn drain_dead_workers(
 fn check_envelope_kind(body_kind: BodyKind, envelope: &QueuedRequest) -> Result<(), WorkerError> {
     let expected = match envelope {
         QueuedRequest::Transact(t) => BodyKind::from(&t.body),
-        QueuedRequest::Push(_) => BodyKind::Pushed,
+        QueuedRequest::Push(_) | QueuedRequest::PushWithMerges(_) => BodyKind::Pushed,
         QueuedRequest::Revert(_) => BodyKind::Revert,
         QueuedRequest::Merge(_) => BodyKind::Merge,
         QueuedRequest::Rebase(_) => BodyKind::Rebase,
@@ -1422,17 +1597,18 @@ fn stage_failure(message: &str) -> WorkerError {
     WorkerError::Transient(message.into())
 }
 
-/// Best-effort string extraction from a `catch_unwind` payload —
-/// covers the `panic!("literal")` and `panic!("{fmt}")` cases that
-/// produce `&'static str` and `String` payloads respectively.
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<&'static str>() {
-        return (*s).to_string();
+/// A `build_commit` failure the request itself caused — malformed input
+/// (400) or a delta too large to ever commit (413) — fails the same way on
+/// every attempt, so it poisons now instead of spending the retry budget.
+/// Anything else can be rooted in this node's view (a commit or namespace
+/// conflict, policy or SHACL over lagging state) and stays transient.
+fn build_commit_failure(err: ApiError) -> WorkerError {
+    match err.status_code() {
+        400 | 413 => stage(PoisonReason::BodyMalformed {
+            error: err.to_string(),
+        }),
+        _ => stage_failure(&format!("build_commit failed: {err}")),
     }
-    if let Some(s) = payload.downcast_ref::<String>() {
-        return s.clone();
-    }
-    "non-string panic payload".to_string()
 }
 
 fn submission_to_stage(err: SubmissionError) -> WorkerError {
@@ -1491,6 +1667,36 @@ pub enum WorkerError {
     /// `snapshot_front` again.
     #[error("apply stale: {0}")]
     Stale(String),
+    /// The publish arrived behind the current state of affairs:
+    /// the staged `commit_t` doesn't advance the replicated head
+    /// (this worker staged against a lagging local view), or
+    /// another ferry for the same entry was already in flight on
+    /// the leader. Either way the entry is still at the queue
+    /// front: refresh the local view and re-stage the same entry,
+    /// rather than dropping the work ([`Self::Stale`]) or
+    /// re-proposing the same staged commit ([`Self::Raft`]).
+    #[error("publish lagged behind current state: {0}")]
+    Lagged(String),
+}
+
+impl WorkerError {
+    /// Whether this error is an authoritative rejection: an applied
+    /// state-machine response to this worker's own propose
+    /// (`Stale`, `Stage`, `Lagged`), as opposed to an ambiguous
+    /// outcome (`Raft`: ferry timeout, leader step-down
+    /// mid-propose, lost response) where the propose may have
+    /// committed anyway.
+    ///
+    /// A rejection proves the staged commit can never become the
+    /// replicated head — the state machine decided against it, and
+    /// no other proposer carries its `commit_id` — so its blob is
+    /// safe to release. On an ambiguous outcome the blob may be
+    /// the new head with only the local applied state lagging, and
+    /// `ContentStore::release` is a hard delete on storage shared
+    /// by every node, so the blob must be kept.
+    fn is_rejection(&self) -> bool {
+        matches!(self, Self::Stale(_) | Self::Stage(_) | Self::Lagged(_))
+    }
 }
 
 /// Output of a per-op staging path before consensus has confirmed
@@ -1528,6 +1734,28 @@ mod tests {
 
     fn cid(seed: u8) -> ContentId {
         ContentId::new(ContentKind::Commit, &[seed])
+    }
+
+    #[test]
+    fn request_errors_from_build_commit_poison_without_retry() {
+        for status in [400, 413] {
+            assert!(
+                matches!(
+                    build_commit_failure(ApiError::http(status, "bad")),
+                    WorkerError::Stage(reason) if matches!(*reason, PoisonReason::BodyMalformed { .. })
+                ),
+                "{status}"
+            );
+        }
+        for status in [403, 409, 422, 500, 503] {
+            assert!(
+                matches!(
+                    build_commit_failure(ApiError::http(status, "maybe stale")),
+                    WorkerError::Transient(_)
+                ),
+                "{status}"
+            );
+        }
     }
 
     fn sample_transact_envelope() -> QueuedRequest {
@@ -1581,6 +1809,26 @@ mod tests {
     fn check_envelope_kind_accepts_matching_pair() {
         assert!(check_envelope_kind(BodyKind::JsonLdInsert, &sample_transact_envelope()).is_ok());
         assert!(check_envelope_kind(BodyKind::Pushed, &sample_push_envelope()).is_ok());
+    }
+
+    /// Authoritative state-machine rejections orphan the staged
+    /// commit blob; ambiguous propose failures must keep it, since
+    /// the head advance may have committed with the local applied
+    /// state lagging and `release` hard-deletes from shared storage.
+    #[test]
+    fn only_authoritative_rejections_classify_as_rejection() {
+        assert!(WorkerError::Stale("queue front moved".into()).is_rejection());
+        assert!(WorkerError::Stage(Box::new(PoisonReason::LedgerNotFound {
+            ledger_id: "test/db:main".into(),
+        }))
+        .is_rejection());
+        assert!(WorkerError::Lagged("commit_t 3 <= head t 5".into()).is_rejection());
+
+        assert!(!WorkerError::Raft(
+            "apply_staged_commit POST to leader: operation timed out".into()
+        )
+        .is_rejection());
+        assert!(!WorkerError::Transient("backend blip".into()).is_rejection());
     }
 
     #[test]
@@ -1661,7 +1909,7 @@ mod tests {
             "feature",
             vec![enqueued_entry(9, cid(3), BodyKind::Sparql)],
         );
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
 
         let main_front = snapshot_front_for_test(&shared, &RefKey::new("test/db", "main"))
             .await
@@ -1680,7 +1928,7 @@ mod tests {
     async fn snapshot_front_is_none_when_empty_or_missing() {
         let mut state = NameServiceState::default();
         install_queue(&mut state, "test/db", "empty", vec![]);
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
 
         assert!(
             snapshot_front_for_test(&shared, &RefKey::new("test/db", "empty"))
@@ -1708,7 +1956,7 @@ mod tests {
             vec![enqueued_entry(7, cid(1), BodyKind::JsonLdInsert)],
         );
         install_queue(&mut state, "test/db", "feature", vec![]);
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
 
         let desired = desired_owners_under_lock(&shared, 1, &[1]).await;
         assert_eq!(desired.len(), 2);
@@ -1726,7 +1974,7 @@ mod tests {
         for i in 0..50 {
             install_queue(&mut state, "test/db", &format!("branch-{i}"), vec![]);
         }
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
         let voters = vec![1u64, 2, 3, 4];
 
         let mut union = HashSet::new();
@@ -1759,7 +2007,7 @@ mod tests {
             "main",
             vec![enqueued_entry(7, cid(1), BodyKind::JsonLdInsert)],
         );
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
 
         let desired = desired_owners_under_lock(&shared, 1, &[]).await;
         assert!(desired.is_empty());
@@ -1779,7 +2027,7 @@ mod tests {
         // only {1, 2} should host workers, and 3 must own nothing.
         state.configured_voters = [1, 2, 3].into_iter().collect();
         state.worker_eligible_voters = [1, 2].into_iter().collect();
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
         let fallback = vec![1u64, 2, 3];
 
         // The demoted voter claims nothing despite still being in
@@ -1818,7 +2066,7 @@ mod tests {
             install_queue(&mut state, "test/db", &format!("branch-{i}"), vec![]);
         }
         // `worker_eligible_voters` deliberately left empty.
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
         let fallback = vec![1u64, 2, 3];
 
         // Each of the three fallback voters covers a share of the
@@ -1850,28 +2098,10 @@ mod tests {
             vec![enqueued_entry(7, cid(1), BodyKind::JsonLdInsert)],
         );
         state.worker_eligible_voters = [1, 2].into_iter().collect();
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
         // Voter 3 is in the fallback, but not in the eligible set.
         let desired = desired_owners_under_lock(&shared, 3, &[1, 2, 3]).await;
         assert!(desired.is_empty());
-    }
-
-    #[test]
-    fn panic_message_extracts_static_str() {
-        let payload: Box<dyn std::any::Any + Send> = Box::new("kaboom");
-        assert_eq!(panic_message(payload), "kaboom");
-    }
-
-    #[test]
-    fn panic_message_extracts_string() {
-        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("formatted: 42"));
-        assert_eq!(panic_message(payload), "formatted: 42");
-    }
-
-    #[test]
-    fn panic_message_falls_back_for_unknown_payload() {
-        let payload: Box<dyn std::any::Any + Send> = Box::new(42u32);
-        assert_eq!(panic_message(payload), "non-string panic payload");
     }
 
     /// `abort_and_await` must return only after every aborted task

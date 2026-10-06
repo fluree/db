@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "query_id": "q001",
+  "result_hash": "b63934693917fee07064f79b06bbbedc0267544322f5afad9d85bae204c088ab",
+  "rows": 500,
+  "head_rows": [
+    "Online\u001fStore 104\u001fOutlet",
+    "Online\u001fStore 106\u001fOutlet",
+    "Online\u001fStore 114\u001fOutlet",
+    "Online\u001fStore 116\u001fWarehouse",
+    "Online\u001fStore 119\u001fOutlet",
+    "Online\u001fStore 12\u001fOutlet",
+    "Online\u001fStore 120\u001fStandard",
+    "Online\u001fStore 128\u001fOutlet",
+    "Online\u001fStore 129\u001fPopup",
+    "Online\u001fStore 132\u001fWarehouse",
+    "Online\u001fStore 135\u001fFlagship",
+    "Online\u001fStore 14\u001fFlagship",
+    "Online\u001fStore 141\u001fOutlet",
+    "Online\u001fStore 142\u001fPopup",
+    "Online\u001fStore 143\u001fWarehouse",
+    "Online\u001fStore 146\u001fWarehouse",
+    "Online\u001fStore 149\u001fOutlet",
+    "Online\u001fStore 15\u001fStandard",
+    "Online\u001fStore 154\u001fWarehouse",
+    "Online\u001fStore 157\u001fFlagship"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

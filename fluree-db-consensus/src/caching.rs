@@ -82,7 +82,7 @@ struct CachedSubmission {
 enum ClaimOutcome {
     /// A previous submission with the same key and body already completed.
     /// The caller returns this receipt without running the executor.
-    AlreadyDone(OperationReceipt),
+    AlreadyDone(Box<OperationReceipt>),
     /// This caller won the claim. The guard owns the `InFlight` slot in
     /// the moka cache; dropping it before [`ClaimGuard::commit`] runs
     /// schedules an asynchronous eviction so a cancelled transact future
@@ -248,7 +248,11 @@ fn weigh_policy_map(map: &HashMap<String, PolicyStats>) -> usize {
 
 fn weigh_submission_error(err: &SubmissionError) -> usize {
     match err {
-        SubmissionError::Execution { message, .. } => message.capacity(),
+        SubmissionError::Execution { message, .. }
+        | SubmissionError::NoveltyBackpressure { message }
+        | SubmissionError::NoveltyDeltaTooLarge { message }
+        | SubmissionError::DatatypeLimitExceeded { message }
+        | SubmissionError::CommitNotFound { message } => message.capacity(),
         SubmissionError::KeyCollision
         | SubmissionError::AlreadyInFlight
         | SubmissionError::Overloaded => 0,
@@ -264,17 +268,63 @@ pub struct CachingCommitter<C: Committer = LocalCommitter> {
     executor: C,
     cache: Cache<IdempotencyCacheKey, CachedSubmission>,
     admission: Arc<Semaphore>,
-    per_ledger_admission: DashMap<String, Arc<Semaphore>>,
+    // `Arc` so an [`AdmissionPermits`] guard can hold a handle and
+    // evict its ledger's semaphore once idle — otherwise this map
+    // grows one never-removed entry per distinct ledger string ever
+    // submitted, which a flood of client-chosen names could exploit
+    // (admission runs before any ledger-existence check).
+    per_ledger_admission: Arc<DashMap<String, Arc<Semaphore>>>,
     per_ledger_limit: usize,
 }
 
-/// RAII guard holding both an admission permits — the per-ledger slot
-/// (acquired first) and the global slot. Dropping it releases both.
-/// Fields are private with `_` prefixes because callers only care about
-/// the lifetime effect, not direct permit access.
+/// RAII guard for a submission's per-ledger admission slot. Dropping
+/// it releases the permit and, when the ledger's semaphore goes idle,
+/// evicts that semaphore from
+/// [`CachingCommitter::per_ledger_admission`] so the map stays bounded
+/// by the count of ledgers with in-flight submissions (itself bounded
+/// by the global permit pool).
+///
+/// The eviction is bound to *this* guard rather than the composite
+/// [`AdmissionPermits`] because the map entry is created the moment
+/// the per-ledger permit is acquired — before the global permit. If
+/// the global acquire then fails, this guard still drops (and evicts
+/// the now-idle entry); tying eviction to the composite guard, which
+/// is only built once *both* permits succeed, would leak one entry
+/// per distinct ledger name whenever the global pool is saturated —
+/// exactly the flood the bound defends against.
+struct PerLedgerPermit {
+    /// `Option` so [`Drop`] can release this permit *before* testing
+    /// whether the semaphore is idle.
+    permit: Option<OwnedSemaphorePermit>,
+    admission_map: Arc<DashMap<String, Arc<Semaphore>>>,
+    ledger_id: String,
+    per_ledger_limit: usize,
+}
+
+impl Drop for PerLedgerPermit {
+    fn drop(&mut self) {
+        // Release this submission's per-ledger permit, then drop the
+        // semaphore entry iff no other submission for the same ledger
+        // still holds one. The idle test runs under DashMap's bucket
+        // lock, so a concurrent acquirer is either observed (a permit
+        // is out → entry kept) or races ahead onto its own clone of
+        // the `Arc`, which stays valid regardless — a bounded,
+        // transient relaxation of the soft per-ledger cap, never a
+        // leaked map entry.
+        drop(self.permit.take());
+        self.admission_map
+            .remove_if(&self.ledger_id, |_, semaphore| {
+                semaphore.available_permits() == self.per_ledger_limit
+            });
+    }
+}
+
+/// RAII guard holding a submission's two admission permits — the
+/// per-ledger slot (acquired first) and the global slot. Dropping it
+/// releases both; the per-ledger slot's [`Drop`] handles map eviction.
 struct AdmissionPermits {
     _global: OwnedSemaphorePermit,
-    _per_ledger: OwnedSemaphorePermit,
+    _per_ledger: PerLedgerPermit,
 }
 
 impl CachingCommitter<LocalCommitter> {
@@ -312,7 +362,7 @@ impl<C: Committer> CachingCommitter<C> {
             executor,
             cache,
             admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
-            per_ledger_admission: DashMap::new(),
+            per_ledger_admission: Arc::new(DashMap::new()),
             per_ledger_limit: DEFAULT_PER_LEDGER_PENDING_LIMIT,
         }
     }
@@ -395,10 +445,20 @@ impl<C: Committer> CachingCommitter<C> {
     /// so retries that elide the default branch resolve to the same
     /// semaphore.
     fn try_admit(&self, ledger_id: &str) -> Result<AdmissionPermits, SubmissionError> {
-        let per_ledger = self
-            .ledger_semaphore(ledger_id)
-            .try_acquire_owned()
-            .map_err(|_| SubmissionError::Overloaded)?;
+        // Acquiring the per-ledger permit creates the map entry;
+        // wrapping it in its evicting guard *before* the global
+        // acquire ensures a global-tier rejection still tears the
+        // entry back down (see [`PerLedgerPermit`]).
+        let per_ledger = PerLedgerPermit {
+            permit: Some(
+                self.ledger_semaphore(ledger_id)
+                    .try_acquire_owned()
+                    .map_err(|_| SubmissionError::Overloaded)?,
+            ),
+            admission_map: Arc::clone(&self.per_ledger_admission),
+            ledger_id: ledger_id.to_string(),
+            per_ledger_limit: self.per_ledger_limit,
+        };
         let global = Arc::clone(&self.admission)
             .try_acquire_owned()
             .map_err(|_| SubmissionError::Overloaded)?;
@@ -476,7 +536,7 @@ impl<C: Committer> CachingCommitter<C> {
             // `SubmissionLookup` (post-leader-transition reads), which
             // doesn't flow through this map.
             SubmissionState::Committed(committed) => match committed.receipt {
-                Some(r) => Ok(ClaimOutcome::AlreadyDone(*r)),
+                Some(r) => Ok(ClaimOutcome::AlreadyDone(r)),
                 None => Err(SubmissionError::AlreadyInFlight),
             },
             _ => Err(SubmissionError::AlreadyInFlight),
@@ -489,8 +549,13 @@ impl<C: Committer> CachingCommitter<C> {
     /// fully-populated [`SubmissionState::Committed`] — the caller
     /// supplies the canonical kit (op kind + commit identity) and
     /// the typed [`OperationReceipt`] together because both come
-    /// from the same per-op response shape. Failures bypass the
-    /// projection and store directly as [`SubmissionState::Failed`].
+    /// from the same per-op response shape. Settled failures bypass
+    /// the projection and store directly as
+    /// [`SubmissionState::Failed`]; unsettled ones
+    /// ([`SubmissionError::is_settled`]) are not recorded at all —
+    /// the submission may still commit, so the slot is left to
+    /// `ClaimGuard::drop`'s `InFlight` cleanup and `status` falls
+    /// through to the replicated map for the truth.
     async fn record_outcome<R, F>(
         &self,
         cache_key: IdempotencyCacheKey,
@@ -502,6 +567,12 @@ impl<C: Committer> CachingCommitter<C> {
     {
         let final_state = match outcome {
             Ok(receipt) => project_committed(receipt),
+            // Not an outcome: the submission may still commit
+            // through the replicated log (stranded waiter, leader
+            // transition). Caching it as terminal would serve an
+            // authoritative-looking `Failed` for the cache TTL
+            // while the replicated map says `Committed`.
+            Err(err) if !err.is_settled() => return,
             Err(err) => SubmissionState::Failed(err.clone()),
         };
         let value = CachedSubmission {
@@ -592,6 +663,11 @@ impl<C: Committer> CachingCommitter<C> {
             hasher.update((value.len() as u64).to_le_bytes());
             hasher.update(value);
         }
+        hasher.update((request.merged_commits.len() as u64).to_le_bytes());
+        for commit in &request.merged_commits {
+            hasher.update((commit.len() as u64).to_le_bytes());
+            hasher.update(commit);
+        }
         hash_governance(&mut hasher, &request.governance);
         hasher.finalize().into()
     }
@@ -608,9 +684,12 @@ impl<C: Committer> CachingCommitter<C> {
 /// moka cache.
 ///
 /// Determinism notes:
-/// - Scalar fields (`identity`, `default_allow`) and the
-///   length-prefixed string list (`policy_class`) hash to stable
-///   bytes for a given input.
+/// - Scalar fields (`identity`, `server_identity`, `default_allow`)
+///   and the length-prefixed string list (`policy_class`) hash to
+///   stable bytes for a given input. `server_identity` is included
+///   because two gateway credentials selecting the same policy
+///   identity share an `identity` yet may resolve
+///   `f:overrideControl` differently.
 /// - `policy_values` keys are sorted before iteration so HashMap
 ///   iteration order doesn't perturb the digest.
 /// - `policy` and individual `policy_values` entries are
@@ -623,6 +702,14 @@ impl<C: Committer> CachingCommitter<C> {
 fn hash_governance(hasher: &mut Sha256, governance: &GovernanceOptions) {
     hasher.update(b"gov");
     match governance.identity.as_deref() {
+        Some(identity) => {
+            hasher.update([1u8]);
+            hasher.update((identity.len() as u64).to_le_bytes());
+            hasher.update(identity.as_bytes());
+        }
+        None => hasher.update([0u8]),
+    }
+    match governance.server_identity.as_deref() {
         Some(identity) => {
             hasher.update([1u8]);
             hasher.update((identity.len() as u64).to_le_bytes());
@@ -672,7 +759,13 @@ fn hash_governance(hasher: &mut Sha256, governance: &GovernanceOptions) {
         }
         None => hasher.update([0u8]),
     }
-    hasher.update([u8::from(governance.default_allow)]);
+    // Tri-state: unset and explicit-false must digest differently, since only
+    // the former lets the ledger's `f:defaultAllow` widen access.
+    hasher.update([match governance.default_allow {
+        None => 0u8,
+        Some(false) => 1u8,
+        Some(true) => 2u8,
+    }]);
 }
 
 fn hash_commit_ref(hasher: &mut Sha256, commit: &CommitRef) {
@@ -724,8 +817,10 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         let body_hash = Self::hash_request_body(&request);
 
         let guard = match self.try_claim_slot(cache_key.clone(), body_hash).await? {
-            ClaimOutcome::AlreadyDone(OperationReceipt::Transaction(r)) => return Ok(r),
-            ClaimOutcome::AlreadyDone(_) => return Err(SubmissionError::KeyCollision),
+            ClaimOutcome::AlreadyDone(receipt) => match *receipt {
+                OperationReceipt::Transaction(r) => return Ok(*r),
+                _ => return Err(SubmissionError::KeyCollision),
+            },
             ClaimOutcome::Claimed(g) => g,
         };
 
@@ -742,7 +837,7 @@ impl<C: Committer> Committer for CachingCommitter<C> {
                 commit_id: r.commit.commit_id.clone(),
                 t: r.commit.t,
                 tally: r.tally.clone(),
-                receipt: Some(Box::new(OperationReceipt::Transaction(r.clone()))),
+                receipt: Some(Box::new(OperationReceipt::Transaction(Box::new(r.clone())))),
             }))
         })
         .await;
@@ -764,8 +859,10 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         let body_hash = Self::hash_revert_body(&request);
 
         let guard = match self.try_claim_slot(cache_key.clone(), body_hash).await? {
-            ClaimOutcome::AlreadyDone(OperationReceipt::Revert(r)) => return Ok(r),
-            ClaimOutcome::AlreadyDone(_) => return Err(SubmissionError::KeyCollision),
+            ClaimOutcome::AlreadyDone(receipt) => match *receipt {
+                OperationReceipt::Revert(r) => return Ok(r),
+                _ => return Err(SubmissionError::KeyCollision),
+            },
             ClaimOutcome::Claimed(g) => g,
         };
 
@@ -801,8 +898,10 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         let body_hash = Self::hash_merge_body(&request);
 
         let guard = match self.try_claim_slot(cache_key.clone(), body_hash).await? {
-            ClaimOutcome::AlreadyDone(OperationReceipt::Merge(r)) => return Ok(r),
-            ClaimOutcome::AlreadyDone(_) => return Err(SubmissionError::KeyCollision),
+            ClaimOutcome::AlreadyDone(receipt) => match *receipt {
+                OperationReceipt::Merge(r) => return Ok(r),
+                _ => return Err(SubmissionError::KeyCollision),
+            },
             ClaimOutcome::Claimed(g) => g,
         };
 
@@ -837,8 +936,10 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         let body_hash = Self::hash_rebase_body(&request);
 
         let guard = match self.try_claim_slot(cache_key.clone(), body_hash).await? {
-            ClaimOutcome::AlreadyDone(OperationReceipt::Rebase(r)) => return Ok(r),
-            ClaimOutcome::AlreadyDone(_) => return Err(SubmissionError::KeyCollision),
+            ClaimOutcome::AlreadyDone(receipt) => match *receipt {
+                OperationReceipt::Rebase(r) => return Ok(r),
+                _ => return Err(SubmissionError::KeyCollision),
+            },
             ClaimOutcome::Claimed(g) => g,
         };
 
@@ -886,8 +987,10 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         let body_hash = Self::hash_push_body(&request);
 
         let guard = match self.try_claim_slot(cache_key.clone(), body_hash).await? {
-            ClaimOutcome::AlreadyDone(OperationReceipt::Push(r)) => return Ok(r),
-            ClaimOutcome::AlreadyDone(_) => return Err(SubmissionError::KeyCollision),
+            ClaimOutcome::AlreadyDone(receipt) => match *receipt {
+                OperationReceipt::Push(r) => return Ok(r),
+                _ => return Err(SubmissionError::KeyCollision),
+            },
             ClaimOutcome::Claimed(g) => g,
         };
 
@@ -979,6 +1082,7 @@ mod tests {
     use fluree_db_api::{
         CommitId, CommitRef, ConflictStrategy, FlureeBuilder, GovernanceOptions, TrackingOptions,
     };
+    use fluree_db_core::VerifiedIdentity;
     use fluree_db_transact::{CommitOpts, TxnOpts};
     use serde_json::{json, Value as JsonValue};
 
@@ -1065,7 +1169,10 @@ mod tests {
                     time: Some("12.34ms".into()),
                     fuel: Some(0.0),
                     policy: Some(policy),
+                    policy_enforcement: None,
                     reasoning: None,
+                    sql: None,
+                    sql_elided: None,
                 }),
                 receipt: None,
             })),
@@ -1184,7 +1291,7 @@ mod tests {
             executor: stub.clone(),
             cache,
             admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
-            per_ledger_admission: DashMap::new(),
+            per_ledger_admission: Arc::new(DashMap::new()),
             per_ledger_limit: DEFAULT_PER_LEDGER_PENDING_LIMIT,
         };
 
@@ -1242,7 +1349,7 @@ mod tests {
             executor: stub.clone(),
             cache,
             admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
-            per_ledger_admission: DashMap::new(),
+            per_ledger_admission: Arc::new(DashMap::new()),
             per_ledger_limit: DEFAULT_PER_LEDGER_PENDING_LIMIT,
         };
 
@@ -1278,7 +1385,7 @@ mod tests {
             executor: stub.clone(),
             cache,
             admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
-            per_ledger_admission: DashMap::new(),
+            per_ledger_admission: Arc::new(DashMap::new()),
             per_ledger_limit: DEFAULT_PER_LEDGER_PENDING_LIMIT,
         };
 
@@ -1429,6 +1536,278 @@ mod tests {
         assert!(matches!(entry.state, SubmissionState::Committed(_)));
     }
 
+    #[test]
+    fn settlement_classification() {
+        let execution = |status: u16| SubmissionError::Execution {
+            status,
+            message: "test".into(),
+        };
+        // Determined outcomes: bad requests, policy denials,
+        // poisons, and local internal failures that never submitted.
+        assert!(execution(400).is_settled());
+        assert!(execution(422).is_settled());
+        assert!(execution(500).is_settled());
+
+        // Gateway-class: the submission may still commit through
+        // the replicated log (not-leader, raft fatal, stranded).
+        assert!(!execution(502).is_settled());
+        assert!(!execution(503).is_settled());
+        assert!(!execution(504).is_settled());
+
+        // Never executed at all.
+        assert!(!SubmissionError::KeyCollision.is_settled());
+        assert!(!SubmissionError::AlreadyInFlight.is_settled());
+        assert!(!SubmissionError::Overloaded.is_settled());
+
+        // Novelty refusals are SETTLED even though the client is told to
+        // retry: they are decided before commit construction, and only a
+        // recorded `Failed` entry is re-attemptable (try_claim_slot's
+        // body-hash-matching replace). Unsettled would pin the InFlight
+        // slot — record_outcome skips it while guard.commit() disarms the
+        // cleanup — turning every keyed retry into a 409 for the TTL.
+        assert!(SubmissionError::NoveltyBackpressure {
+            message: "n".into()
+        }
+        .is_settled());
+        assert!(SubmissionError::NoveltyDeltaTooLarge {
+            message: "n".into()
+        }
+        .is_settled());
+        // Decided before commit construction, and permanent.
+        assert!(SubmissionError::DatatypeLimitExceeded {
+            message: "d".into()
+        }
+        .is_settled());
+    }
+
+    /// The `execution_failure` flattening must route novelty refusals by
+    /// drainability: at-max and a delta that fits after drain are retryable
+    /// backpressure (503 at the HTTP layer); a delta at or above the ceiling
+    /// can never fit and is a permanent 413 shape. Everything else keeps the
+    /// status-passthrough form.
+    #[test]
+    fn execution_failure_routes_novelty_by_drainability() {
+        use fluree_db_api::{ApiError, TransactError};
+        let f = crate::local::execution_failure;
+
+        assert!(matches!(
+            f(ApiError::Transact(TransactError::NoveltyAtMax)),
+            SubmissionError::NoveltyBackpressure { .. }
+        ));
+        assert!(matches!(
+            f(ApiError::Transact(TransactError::NoveltyWouldExceed {
+                current_bytes: 90,
+                delta_bytes: 20,
+                max_bytes: 100
+            })),
+            SubmissionError::NoveltyBackpressure { .. }
+        ));
+        assert!(matches!(
+            f(ApiError::Transact(TransactError::NoveltyWouldExceed {
+                current_bytes: 0,
+                delta_bytes: 100,
+                max_bytes: 100
+            })),
+            SubmissionError::NoveltyDeltaTooLarge { .. }
+        ));
+        assert!(matches!(
+            f(ApiError::Transact(TransactError::DatatypeLimitExceeded {
+                used: 16_369,
+                adding: 1,
+                max: 16_369
+            })),
+            SubmissionError::DatatypeLimitExceeded { .. }
+        ));
+        assert!(matches!(
+            f(ApiError::Transact(TransactError::EmptyTransaction)),
+            SubmissionError::Execution { status: 400, .. }
+        ));
+    }
+
+    /// Executor scripted for the keyed-retry pin: refuses the first
+    /// transact with novelty backpressure, commits the second — the
+    /// "indexer drained between attempts" shape.
+    #[derive(Clone)]
+    struct ScriptedNoveltyExecutor(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl ScriptedNoveltyExecutor {
+        fn new() -> Self {
+            Self(Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+        }
+
+        fn calls(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Committer for ScriptedNoveltyExecutor {
+        async fn transact(
+            &self,
+            request: TransactionRequest,
+        ) -> Result<TransactionReceipt, SubmissionError> {
+            let attempt = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 0 {
+                return Err(SubmissionError::NoveltyBackpressure {
+                    message: "Novelty at maximum size, reindexing required".into(),
+                });
+            }
+            Ok(TransactionReceipt {
+                idempotency_key: request.idempotency_key,
+                commit: fluree_db_transact::CommitReceipt {
+                    commit_id: CommitId::new(fluree_db_api::ContentKind::Commit, &[1u8]),
+                    t: 1,
+                    flake_count: 1,
+                    assert_count: 1,
+                    retract_count: 0,
+                },
+                tally: None,
+                cypher_return: None,
+            })
+        }
+        async fn revert(&self, _request: RevertRequest) -> Result<RevertReceipt, SubmissionError> {
+            unreachable!("keyed-retry test never exercises revert")
+        }
+        async fn merge(&self, _request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
+            unreachable!("keyed-retry test never exercises merge")
+        }
+        async fn rebase(&self, _request: RebaseRequest) -> Result<RebaseReceipt, SubmissionError> {
+            unreachable!("keyed-retry test never exercises rebase")
+        }
+        async fn push(&self, _request: PushRequest) -> Result<PushReceipt, SubmissionError> {
+            unreachable!("keyed-retry test never exercises push")
+        }
+    }
+
+    /// A keyed retry after a novelty refusal must RE-EXECUTE, not bounce
+    /// off a pinned `InFlight` slot (#1719 review CRITICAL-1).
+    ///
+    /// `record_outcome` skips unsettled errors while `guard.commit()`
+    /// unconditionally disarms the drop-time `InFlight` cleanup, so an
+    /// unsettled classification pins the slot for the full cache TTL and
+    /// every keyed retry returns `AlreadyInFlight` — the dropped-write
+    /// footgun (#1708), now behind one extra round-trip. Settled `Failed`
+    /// entries are re-attemptable by design (`try_claim_slot` replaces
+    /// them on a matching body hash). Mutation check: flipping the
+    /// novelty arm of `is_settled` back to `false` fails this test with
+    /// `AlreadyInFlight` on the retry.
+    #[tokio::test]
+    async fn keyed_retry_after_novelty_refusal_reexecutes() {
+        let scripted = ScriptedNoveltyExecutor::new();
+        let committer: CachingCommitter<ScriptedNoveltyExecutor> = CachingCommitter {
+            executor: scripted.clone(),
+            cache: Cache::builder()
+                .time_to_live(DEFAULT_IDEMPOTENCY_TTL)
+                .max_capacity(DEFAULT_IDEMPOTENCY_CACHE_MAX_BYTES)
+                .weigher(weigh_cached_submission)
+                .build(),
+            admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
+            per_ledger_admission: Arc::new(DashMap::new()),
+            per_ledger_limit: DEFAULT_PER_LEDGER_PENDING_LIMIT,
+        };
+
+        let req = || request("test/db:main", Some("ingest-1"), sample_insert("a"));
+
+        // First keyed attempt: refused by backpressure (503 at the HTTP layer).
+        let first = committer.transact(req()).await;
+        assert!(
+            matches!(first, Err(SubmissionError::NoveltyBackpressure { .. })),
+            "first attempt must surface the refusal, got {first:?}"
+        );
+
+        // Same key, same body, after the condition clears: must re-execute
+        // and commit — not 409 AlreadyInFlight, not a replayed refusal.
+        let second = committer.transact(req()).await;
+        let receipt = second.expect("keyed retry must re-execute and succeed");
+        assert_eq!(receipt.commit.t, 1);
+        assert_eq!(scripted.calls(), 2, "executor must run once per attempt");
+    }
+
+    #[tokio::test]
+    async fn unsettled_error_is_not_recorded_as_terminal_failure() {
+        // A stranded submission (504: outcome unknown) may commit on
+        // the new leader seconds later. Recording it as `Failed`
+        // would make `status()` serve that answer authoritatively
+        // for the cache TTL while the replicated map says
+        // `Committed` — inviting a resubmit under a fresh key.
+        let (_fluree, committer, _ledger_id) = setup().await;
+        let cache_key = IdempotencyCacheKey::new(
+            "tenant-a:main",
+            IdempotencyKey::new("k-unsettled").expect("fits cap"),
+        );
+        let body_hash = [7u8; 32];
+
+        let outcome = committer
+            .try_claim_slot(cache_key.clone(), body_hash)
+            .await
+            .expect("claim");
+        let _guard = match outcome {
+            ClaimOutcome::Claimed(g) => g,
+            _ => panic!("expected fresh claim"),
+        };
+
+        let stranded: Result<(), SubmissionError> = Err(SubmissionError::Execution {
+            status: 504,
+            message: "submission stranded by leader transition".into(),
+        });
+        committer
+            .record_outcome(cache_key.clone(), body_hash, &stranded, |&()| {
+                unreachable!("no receipt to project")
+            })
+            .await;
+
+        let cached = committer
+            .cache
+            .get(&cache_key)
+            .await
+            .expect("claim marker still present");
+        assert!(
+            matches!(cached.state, SubmissionState::InFlight),
+            "unsettled outcome must not overwrite the InFlight claim, got {:?}",
+            cached.state
+        );
+    }
+
+    #[tokio::test]
+    async fn settled_error_is_recorded_as_terminal_failure() {
+        let (_fluree, committer, _ledger_id) = setup().await;
+        let cache_key = IdempotencyCacheKey::new(
+            "tenant-a:main",
+            IdempotencyKey::new("k-settled").expect("fits cap"),
+        );
+        let body_hash = [8u8; 32];
+
+        let outcome = committer
+            .try_claim_slot(cache_key.clone(), body_hash)
+            .await
+            .expect("claim");
+        let _guard = match outcome {
+            ClaimOutcome::Claimed(g) => g,
+            _ => panic!("expected fresh claim"),
+        };
+
+        let poisoned: Result<(), SubmissionError> = Err(SubmissionError::Execution {
+            status: 422,
+            message: "submission poisoned".into(),
+        });
+        committer
+            .record_outcome(cache_key.clone(), body_hash, &poisoned, |&()| {
+                unreachable!("no receipt to project")
+            })
+            .await;
+
+        let cached = committer
+            .cache
+            .get(&cache_key)
+            .await
+            .expect("terminal state present");
+        assert!(
+            matches!(cached.state, SubmissionState::Failed(_)),
+            "settled failure must be cached as terminal, got {:?}",
+            cached.state
+        );
+    }
+
     #[tokio::test]
     async fn drop_cleanup_preserves_existing_terminal_state() {
         // Regression for the `get` + `invalidate` TOCTOU in
@@ -1520,6 +1899,84 @@ mod tests {
             committer.try_admit("tenant-d:main"),
             Err(SubmissionError::Overloaded)
         ));
+    }
+
+    #[tokio::test]
+    async fn idle_per_ledger_semaphores_are_evicted_not_accumulated() {
+        let (_fluree, committer, _ledger_id) = setup().await;
+        let committer = committer
+            .with_pending_limit(100)
+            .with_per_ledger_pending_limit(2);
+
+        // A flood of distinct client-chosen ledger strings, each
+        // admitted and released in turn, must leave no residue — this
+        // is the unbounded-growth DoS the eviction closes (admission
+        // runs before any ledger-existence check).
+        for i in 0..1000 {
+            let permit = committer
+                .try_admit(&format!("flood-{i}:main"))
+                .expect("admit");
+            drop(permit);
+        }
+        assert_eq!(
+            committer.per_ledger_admission.len(),
+            0,
+            "idle per-ledger semaphores must be evicted, not accumulated"
+        );
+
+        // An in-flight submission keeps its entry; dropping it removes it.
+        let held = committer.try_admit("held:main").expect("admit held");
+        assert_eq!(committer.per_ledger_admission.len(), 1);
+        drop(held);
+        assert_eq!(committer.per_ledger_admission.len(), 0);
+
+        // Two concurrent submissions on one ledger: the entry survives
+        // the first drop (the second still holds a permit) and is
+        // removed only once the last permit is released.
+        let s1 = committer.try_admit("shared:main").expect("s1");
+        let s2 = committer.try_admit("shared:main").expect("s2");
+        assert_eq!(committer.per_ledger_admission.len(), 1);
+        drop(s1);
+        assert_eq!(
+            committer.per_ledger_admission.len(),
+            1,
+            "entry must survive while another submission holds a permit"
+        );
+        drop(s2);
+        assert_eq!(committer.per_ledger_admission.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn global_tier_rejections_do_not_leak_per_ledger_entries() {
+        // The dangerous path: the per-ledger permit (which creates the
+        // map entry) succeeds but the GLOBAL permit is exhausted, so
+        // `try_admit` returns `Overloaded`. A flood of distinct ledger
+        // names under global saturation hits this every request — the
+        // rejection must still evict the entry it created, or the DoS
+        // reopens.
+        let (_fluree, committer, _ledger_id) = setup().await;
+        let committer = committer
+            .with_pending_limit(2) // global cap = 2
+            .with_per_ledger_pending_limit(5); // per-ledger never the limiter here
+
+        // Saturate the global pool with two submissions on one ledger.
+        let _g1 = committer.try_admit("busy:main").expect("g1");
+        let _g2 = committer.try_admit("busy:main").expect("g2");
+        assert_eq!(committer.per_ledger_admission.len(), 1);
+
+        // Each distinct name now fails at the global tier (per-ledger
+        // acquire succeeds on a fresh semaphore, global is full).
+        for i in 0..1000 {
+            assert!(matches!(
+                committer.try_admit(&format!("flood-{i}:main")),
+                Err(SubmissionError::Overloaded)
+            ));
+        }
+        assert_eq!(
+            committer.per_ledger_admission.len(),
+            1,
+            "global-tier rejections must evict the entry they created; only the busy ledger remains"
+        );
     }
 
     #[test]
@@ -1718,6 +2175,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn key_collision_with_different_server_identity_errors() {
+        // `server_identity` is the auth-layer-verified DID that
+        // `f:overrideControl` gates on. Two submissions with the same
+        // body and the same policy `identity` can still resolve
+        // override control differently when the credential behind them
+        // differs (two gateways selecting the same policy identity), so
+        // it must be part of the digest — including the None / Some edge.
+        let (_fluree, committer, ledger_id) = setup().await;
+        let body = sample_insert("alice");
+
+        // None vs Some.
+        let key = IdempotencyKey::new("01J5COLLIDE003").expect("test key fits cap");
+        committer
+            .transact(request(&ledger_id, Some(key.as_str()), body.clone()))
+            .await
+            .expect("first submission to succeed");
+        let mut req = request(&ledger_id, Some(key.as_str()), body.clone());
+        req.governance.server_identity = Some(VerifiedIdentity::new("did:example:admin"));
+        let err = committer
+            .transact(req)
+            .await
+            .expect_err("retry with same body but a verified identity must collide");
+        assert!(
+            matches!(err, SubmissionError::KeyCollision),
+            "expected KeyCollision, got {err:?}"
+        );
+
+        // Some(a) vs Some(b) with every other governance field equal. A
+        // verified identity alone is not a policy input, so the first
+        // submission commits without a policy context.
+        let key = IdempotencyKey::new("01J5COLLIDE004").expect("test key fits cap");
+        let mut first = request(&ledger_id, Some(key.as_str()), body.clone());
+        first.governance.server_identity = Some(VerifiedIdentity::new("did:example:root-a"));
+        committer
+            .transact(first)
+            .await
+            .expect("first submission to succeed");
+        let mut second = request(&ledger_id, Some(key.as_str()), body);
+        second.governance.server_identity = Some(VerifiedIdentity::new("did:example:root-b"));
+        let err = committer
+            .transact(second)
+            .await
+            .expect_err("retry with same body but different verified identity must collide");
+        assert!(
+            matches!(err, SubmissionError::KeyCollision),
+            "expected KeyCollision, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn anonymous_submissions_do_not_populate_cache() {
         let (_fluree, committer, ledger_id) = setup().await;
 
@@ -1780,7 +2287,7 @@ mod tests {
         // construction inside the consensus layer — and it permits the write.
         let mut req = request(&ledger_id, None, sample_insert("alice"));
         req.governance = GovernanceOptions {
-            default_allow: true,
+            default_allow: Some(true),
             ..Default::default()
         };
 
@@ -1810,7 +2317,7 @@ mod tests {
                 "f:action": [{"@id": "f:view"}],
                 "f:allow": true
             }])),
-            default_allow: false,
+            default_allow: Some(false),
             ..Default::default()
         };
 
@@ -2290,8 +2797,25 @@ ex:alice ex:name "Alice" ."#;
             ledger_id: "test/committer:main".to_string(),
             commits,
             blobs: std::collections::HashMap::new(),
+            merged_commits: Vec::new(),
             governance: GovernanceOptions::default(),
         }
+    }
+
+    /// Two pushes that differ only in their merged commits must not share a
+    /// body hash. The cache would otherwise return the first push's receipt
+    /// for the second.
+    #[test]
+    fn push_body_hash_covers_merged_commits() {
+        let plain = push_request(Some("k"), vec![b"line".to_vec()]);
+        let with_merges = PushRequest {
+            merged_commits: vec![b"merged".to_vec()],
+            ..push_request(Some("k"), vec![b"line".to_vec()])
+        };
+        assert_ne!(
+            CachingCommitter::<LocalCommitter>::hash_push_body(&plain),
+            CachingCommitter::<LocalCommitter>::hash_push_body(&with_merges),
+        );
     }
 
     #[tokio::test]

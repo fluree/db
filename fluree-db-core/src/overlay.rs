@@ -38,6 +38,7 @@ use crate::comparator::IndexType;
 use crate::flake::Flake;
 use crate::ids::GraphId;
 use std::any::Any;
+use std::collections::HashMap;
 
 /// Identity + transaction-time span of one overlay segment.
 ///
@@ -54,6 +55,52 @@ pub struct OverlaySegmentMeta {
     pub min_t: i64,
     /// Highest transaction time in the segment.
     pub max_t: i64,
+}
+
+/// Process-wide counter behind [`next_overlay_content_version`]. Starts at 1
+/// so `0` can mean "empty since construction" for overlays that want it.
+static NEXT_CONTENT_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Allocate a process-unique [`OverlayProvider::content_version`] stamp.
+///
+/// Every overlay type that reports a content version draws from this one
+/// counter, which is what makes the version unique across overlay *types* —
+/// a staged view and the committed novelty it will become must never share
+/// one, or a cache keyed on it would serve the staged product for the
+/// committed state.
+pub fn next_overlay_content_version() -> u64 {
+    NEXT_CONTENT_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Remembered compositions, at most this many. Past the cap the table is
+/// dropped wholesale: a composition seen again afterwards draws a fresh stamp,
+/// which can only miss a cache, never alias one.
+const COMPOSED_VERSIONS_CAP: usize = 4096;
+
+static COMPOSED_VERSIONS: once_cell::sync::Lazy<parking_lot::Mutex<HashMap<Box<[u64]>, u64>>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// The [`OverlayProvider::content_version`] of an overlay whose output is a
+/// function of its parts' versions — a reasoning overlay over a novelty, a
+/// schema bundle over a novelty, a dataset composite over several.
+///
+/// Two u64 stamps cannot be packed into one injectively, so compositions are
+/// interned: the same ordered `parts` always map to the same stamp, and every
+/// stamp comes from [`next_overlay_content_version`], so a composition can
+/// never collide with a leaf overlay's version or with a different
+/// composition. Ordered, because the same parts in another order describe a
+/// different overlay type's output.
+pub fn compose_content_version(parts: &[u64]) -> u64 {
+    let mut table = COMPOSED_VERSIONS.lock();
+    if let Some(&version) = table.get(parts) {
+        return version;
+    }
+    if table.len() >= COMPOSED_VERSIONS_CAP {
+        table.clear();
+    }
+    let version = next_overlay_content_version();
+    table.insert(parts.into(), version);
+    version
 }
 
 /// Overlay provider trait for external flake sources
@@ -79,6 +126,20 @@ pub trait OverlayProvider: Send + Sync {
     /// default keeps unknown overlays on merge-correct paths.
     fn is_effectively_empty(&self) -> bool {
         false
+    }
+
+    /// Globally-unique version stamp of this overlay's current content, for
+    /// keying caches of data derived from a full overlay walk (e.g. V3
+    /// overlay-op translations shared across `range_with_overlay` calls).
+    ///
+    /// Unlike [`Self::epoch`] — which is only unique within one overlay
+    /// instance's lineage — implementations must guarantee that **no two
+    /// overlays whose `for_each_overlay_flake` output differs ever report
+    /// the same version**, across instances, clones, and overlay types.
+    /// Return `None` (the default) when no such guarantee exists; callers
+    /// must then skip caching and derive from a fresh walk.
+    fn content_version(&self) -> Option<u64> {
+        None
     }
 
     /// Push overlay flakes for a leaf's range to the callback
@@ -118,6 +179,20 @@ pub trait OverlayProvider: Send + Sync {
         to_t: i64,
         callback: &mut dyn FnMut(&Flake),
     );
+
+    /// Number of overlay flakes for `g_id`, unfiltered by `to_t`, when the
+    /// implementation can answer in O(segments) or better.
+    ///
+    /// Used as the denominator of selectivity heuristics (e.g. the bounded
+    /// overlay walk's fallback guard in `fluree-db-query`), so `None` (the
+    /// default) means "unknown — skip the heuristic": callers must never walk
+    /// the overlay to count. Because the count is `to_t`-unfiltered while a
+    /// bounded walk's matches are filtered, a time-travel query under-states
+    /// its match share — which only ever biases the guard toward staying
+    /// bounded, never toward a spurious fallback.
+    fn overlay_flake_count(&self, _g_id: GraphId) -> Option<usize> {
+        None
+    }
 
     /// Segment metadata for `g_id`, in segment (commit) order.
     ///
@@ -174,6 +249,12 @@ impl OverlayProvider for NoOverlay {
 
     fn is_effectively_empty(&self) -> bool {
         true
+    }
+
+    /// `0` is the stamp every never-mutated novelty reports; sharing it is
+    /// allowed because both outputs are empty.
+    fn content_version(&self) -> Option<u64> {
+        Some(0)
     }
 
     fn for_each_overlay_flake(
@@ -247,9 +328,30 @@ mod tests {
     }
 
     #[test]
+    fn composed_content_version_is_stable_ordered_and_never_a_leaf_stamp() {
+        let a = next_overlay_content_version();
+        let b = next_overlay_content_version();
+
+        let ab = compose_content_version(&[a, b]);
+        assert_eq!(
+            ab,
+            compose_content_version(&[a, b]),
+            "same parts, same stamp"
+        );
+        assert_ne!(ab, compose_content_version(&[b, a]), "order is identity");
+        assert_ne!(ab, compose_content_version(&[a, b, b]), "arity is identity");
+        assert!(ab != a && ab != b, "a composition is not one of its parts");
+
+        // Leaf stamps drawn before and after can never equal the composition.
+        let c = next_overlay_content_version();
+        assert!(ab != c && ab < c);
+    }
+
+    #[test]
     fn test_no_overlay() {
         let overlay = NoOverlay;
         assert_eq!(overlay.epoch(), 0);
+        assert_eq!(overlay.content_version(), Some(0));
 
         let mut count = 0;
         overlay.for_each_overlay_flake(0, IndexType::Spot, None, None, true, 100, &mut |_| {

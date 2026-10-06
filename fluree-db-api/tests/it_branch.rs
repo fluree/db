@@ -4,7 +4,8 @@
 //! independently, and verifying data isolation between branches.
 
 use crate::support;
-use fluree_db_api::{CommitRef, FlureeBuilder};
+use fluree_db_api::{FlureeBuilder, IndexConfig, TimeSpec};
+use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
 
 /// Extract sorted name strings from query result rows.
@@ -139,6 +140,23 @@ async fn create_branch_missing_source() {
     );
 }
 
+/// Branching from a source with no commits is a client error, and creates nothing.
+#[tokio::test]
+async fn create_branch_from_empty_source_fails() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await.unwrap();
+
+    let err = fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .expect_err("branching from an empty source should fail");
+    assert_eq!(err.status_code(), 400, "got: {err}");
+
+    let branches = fluree.list_branches("mydb").await.unwrap();
+    let names: Vec<&str> = branches.iter().map(|r| r.branch.as_str()).collect();
+    assert_eq!(names, vec!["main"]);
+}
+
 /// Transact divergent data on two branches and verify isolation.
 ///
 /// This is the core branching test: after branching, transactions on one
@@ -253,7 +271,7 @@ async fn branch_t_advances_independently() {
     assert_eq!(dev.t(), 3);
 }
 
-/// Branch at a historical commit via `CommitRef::Exact`.
+/// Branch at a historical commit named by its full CID.
 ///
 /// Main advances to t=3. We branch at the t=2 commit and verify the new
 /// branch starts at t=2 with no index (replay-from-genesis path).
@@ -294,7 +312,7 @@ async fn create_branch_at_historical_commit() {
             "mydb",
             "historical",
             None,
-            Some(CommitRef::Exact(t2_commit_id.clone())),
+            Some(TimeSpec::at_commit(t2_commit_id.to_string())),
         )
         .await
         .unwrap();
@@ -312,7 +330,7 @@ async fn create_branch_at_historical_commit() {
     assert_eq!(branch.t(), 2);
 }
 
-/// Branch at a historical commit via `CommitRef::T`.
+/// Branch at a historical commit via `TimeSpec::AtT`.
 ///
 /// Resolution scans the txn-meta graph for a commit with matching `t`.
 /// The scan includes the novelty overlay, so freshly committed transactions
@@ -348,7 +366,7 @@ async fn create_branch_at_t() {
         .unwrap();
 
     let record = fluree
-        .create_branch("mydb", "historical", None, Some(CommitRef::T(2)))
+        .create_branch("mydb", "historical", None, Some(TimeSpec::AtT(2)))
         .await
         .unwrap();
 
@@ -356,7 +374,7 @@ async fn create_branch_at_t() {
     assert_eq!(record.commit_t, 2);
 }
 
-/// Branch at a historical commit via `CommitRef::Prefix` using a hex digest.
+/// Branch at a historical commit via `TimeSpec::AtCommit` using a hex digest.
 ///
 /// Like `T`, the prefix resolver scans novelty and tolerates unindexed sources.
 #[tokio::test]
@@ -393,7 +411,7 @@ async fn create_branch_at_prefix() {
     // tiny test ledger; the resolver requires >= 6 chars.
     let prefix = t2_commit_id.digest_hex()[..8].to_string();
     let record = fluree
-        .create_branch("mydb", "historical", None, Some(CommitRef::Prefix(prefix)))
+        .create_branch("mydb", "historical", None, Some(TimeSpec::AtCommit(prefix)))
         .await
         .unwrap();
 
@@ -425,7 +443,12 @@ async fn create_branch_at_non_ancestor_commit_fails() {
     let bogus = ContentId::new(ContentKind::Commit, b"not-a-real-commit");
 
     let err = fluree
-        .create_branch("mydb", "dev", None, Some(CommitRef::Exact(bogus)))
+        .create_branch(
+            "mydb",
+            "dev",
+            None,
+            Some(TimeSpec::at_commit(bogus.to_string())),
+        )
         .await
         .expect_err("non-ancestor commit should be rejected");
     let msg = err.to_string();
@@ -433,6 +456,228 @@ async fn create_branch_at_non_ancestor_commit_fails() {
         msg.contains("not found") || msg.contains("not an ancestor"),
         "expected not-found/not-ancestor error, got: {msg}"
     );
+}
+
+// =============================================================================
+// Branching at a point in time
+// =============================================================================
+
+/// Three commits on `mydb:main` whose event times (2020, 2021, 2022) and
+/// recorded times (2026-01-01, -02, -03) are pinned, so an instant can name a
+/// different commit on each axis. Returns main's state and the commit ids by
+/// `t - 1`.
+async fn seed_dated_history(
+    fluree: &support::MemoryFluree,
+) -> (support::MemoryLedger, Vec<fluree_db_api::CommitId>) {
+    let mut ledger = fluree.create_ledger("mydb").await.unwrap();
+    let mut commits = Vec::new();
+    for (i, (event, recorded)) in [
+        ("2020-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+        ("2021-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
+        ("2022-01-01T00:00:00Z", "2026-01-03T00:00:00Z"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let tx = json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "@graph": [{"@id": format!("ex:p{i}"), "ex:name": format!("n{i}")}]
+        });
+        let result = fluree
+            .insert_with_opts(
+                ledger,
+                &tx,
+                TxnOpts::default(),
+                CommitOpts::default()
+                    .with_timestamp(event)
+                    .with_received_at(recorded),
+                &IndexConfig {
+                    reindex_min_bytes: 100_000,
+                    reindex_max_bytes: 1_000_000_000,
+                },
+            )
+            .await
+            .unwrap();
+        commits.push(result.receipt.commit_id.clone());
+        ledger = result.ledger;
+    }
+    (ledger, commits)
+}
+
+/// Sorted `ex:name` values read through a `from` entry (`mydb:dev`,
+/// `mydb:main@time:…`).
+async fn names_from(
+    fluree: &support::MemoryFluree,
+    fmt: &support::MemoryLedger,
+    from: &str,
+) -> Vec<String> {
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "from": [from],
+        "select": ["?name"],
+        "where": {"@id": "?s", "ex:name": "?name"}
+    });
+    let result = fluree.query_connection(&query).await.unwrap();
+    extract_names(
+        &result
+            .to_jsonld_async(fmt.as_graph_db_ref(0))
+            .await
+            .unwrap(),
+    )
+}
+
+/// A branch at `time:X` is the source as a query at `@time:X` reads it: the
+/// same `t` and the same rows, at every position relative to the commits.
+#[tokio::test]
+async fn create_branch_at_time_matches_query_at_time() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (main, commits) = seed_dated_history(&fluree).await;
+
+    for (i, (time, expected_t)) in [
+        ("2020-06-01T00:00:00Z", 1),
+        // Exactly commit 2's event time: that commit is included.
+        ("2021-01-01T00:00:00Z", 2),
+        ("2021-06-01T00:00:00Z", 2),
+        // After the head: the head, as a query resolves it.
+        ("2030-01-01T00:00:00Z", 3),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let branch = format!("asof{i}");
+        let spec = TimeSpec::parse_at(&format!("time:{time}")).unwrap();
+        let record = fluree
+            .create_branch("mydb", &branch, None, Some(spec.clone()))
+            .await
+            .unwrap_or_else(|e| panic!("branch at time:{time}: {e}"));
+
+        assert_eq!(record.commit_t, expected_t, "time:{time}");
+        assert_eq!(
+            record.commit_head_id.as_ref(),
+            Some(&commits[expected_t as usize - 1]),
+            "time:{time}"
+        );
+
+        let queried = fluree.db_at("mydb:main", spec).await.unwrap();
+        assert_eq!(record.commit_t, queried.t, "time:{time}");
+        assert_eq!(
+            names_from(&fluree, &main, &format!("mydb:{branch}")).await,
+            names_from(&fluree, &main, &format!("mydb:main@time:{time}")).await,
+            "time:{time}"
+        );
+    }
+}
+
+/// `iso:` is `time:`'s alias here as on every other surface, and `latest` is
+/// the source head.
+#[tokio::test]
+async fn create_branch_at_iso_and_latest() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (_main, commits) = seed_dated_history(&fluree).await;
+
+    let record = fluree
+        .create_branch(
+            "mydb",
+            "iso",
+            None,
+            Some(TimeSpec::parse_at("iso:2020-06-01T00:00:00Z").unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(record.commit_head_id.as_ref(), Some(&commits[0]));
+
+    let record = fluree
+        .create_branch(
+            "mydb",
+            "latest",
+            None,
+            Some(TimeSpec::parse_at("latest").unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(record.commit_head_id.as_ref(), Some(&commits[2]));
+}
+
+/// `recorded:` reads the recorded axis. On 2026-01-02 every event time is
+/// already past, so the event axis says t=3 while the recorded axis says t=2.
+#[tokio::test]
+async fn create_branch_at_recorded_uses_the_recorded_axis() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (main, commits) = seed_dated_history(&fluree).await;
+    let instant = "2026-01-02T12:00:00Z";
+
+    let record = fluree
+        .create_branch(
+            "mydb",
+            "recorded",
+            None,
+            Some(TimeSpec::parse_at(&format!("recorded:{instant}")).unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(record.commit_head_id.as_ref(), Some(&commits[1]));
+    assert_eq!(
+        names_from(&fluree, &main, "mydb:recorded").await,
+        names_from(&fluree, &main, &format!("mydb:main@recorded:{instant}")).await
+    );
+
+    let record = fluree
+        .create_branch(
+            "mydb",
+            "event",
+            None,
+            Some(TimeSpec::parse_at(&format!("time:{instant}")).unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(record.commit_t, 3, "the event axis disagrees here");
+}
+
+/// Every point that names no commit on the source is a 400, and creates
+/// nothing: a time before the first commit on either axis, a malformed
+/// timestamp, a transaction number below 1, and a table snapshot id.
+#[tokio::test]
+async fn create_branch_at_a_point_with_no_commit_is_a_bad_request() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed_dated_history(&fluree).await;
+
+    for (at, expect) in [
+        (
+            TimeSpec::parse_at("time:2019-01-01T00:00:00Z").unwrap(),
+            "no data as of",
+        ),
+        (
+            TimeSpec::parse_at("recorded:2025-06-01T00:00:00Z").unwrap(),
+            "no data recorded as of",
+        ),
+        (
+            TimeSpec::at_time("2021-13-45T00:00:00Z"),
+            "Invalid ISO-8601 timestamp",
+        ),
+        (TimeSpec::parse_at("t:0").unwrap(), "must be >= 1"),
+        (TimeSpec::parse_at("0").unwrap(), "must be >= 1"),
+        (TimeSpec::parse_at("-3").unwrap(), "must be >= 1"),
+        (TimeSpec::AtSnapshot(7), "@snapshot:"),
+    ] {
+        let label = format!("{at:?}");
+        let err = fluree
+            .create_branch("mydb", "nowhere", None, Some(at))
+            .await
+            .expect_err(&label);
+        assert_eq!(err.status_code(), 400, "{label}: {err}");
+        assert!(
+            matches!(err, fluree_db_api::ApiError::InvalidBranch(_)),
+            "{label}: {err:?}"
+        );
+        assert!(err.to_string().contains(expect), "{label}: {err}");
+    }
+
+    let branches = fluree.list_branches("mydb").await.unwrap();
+    let names: Vec<&str> = branches.iter().map(|r| r.branch.as_str()).collect();
+    assert_eq!(names, vec!["main"]);
+
+    // A tagged spec with no timestamp never reaches the resolver at all.
+    assert!(TimeSpec::parse_at("time:").is_err());
 }
 
 /// Dropping a leaf branch (no children) fully deletes it.
@@ -982,4 +1227,136 @@ async fn branch_incremental_index_resolves_pre_fork_parent() {
             );
         })
         .await;
+}
+
+/// Branching at a commit that only arrived through a merge is refused.
+///
+/// The branch never replays such a commit: what the merge contributed is
+/// folded into the merge commit. Branching there would replay the merged
+/// branch's own history as this branch's state.
+#[tokio::test]
+async fn create_branch_at_merged_in_commit_fails() {
+    use fluree_db_api::ConflictStrategy;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let insert = |ledger_id: &'static str, id: &'static str| {
+        let fluree = &fluree;
+        async move {
+            let state = fluree.ledger(ledger_id).await.unwrap();
+            fluree
+                .insert(
+                    state,
+                    &json!({
+                        "@context": {"ex": "http://example.org/ns/"},
+                        "@graph": [{"@id": format!("ex:{id}"), "ex:name": id}]
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+    };
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:a", "ex:name": "a"}]
+            }),
+        )
+        .await
+        .unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    insert("mydb:dev", "d2").await;
+    let dev_head = fluree
+        .ledger("mydb:dev")
+        .await
+        .unwrap()
+        .head_commit_id
+        .clone()
+        .unwrap();
+    // main advances too, so the merge is not a fast-forward.
+    insert("mydb:main", "m2").await;
+    fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .unwrap();
+
+    let err = fluree
+        .create_branch(
+            "mydb",
+            "x",
+            Some("main"),
+            Some(TimeSpec::at_commit(dev_head.to_string())),
+        )
+        .await
+        .expect_err("dev's commit is not on main's line");
+    assert!(
+        err.to_string().contains("arrived through a merge"),
+        "unexpected error: {err}"
+    );
+
+    // The merge commit itself is on the line, so branching there works.
+    let merge_commit = fluree
+        .ledger("mydb:main")
+        .await
+        .unwrap()
+        .head_commit_id
+        .clone()
+        .unwrap();
+    fluree
+        .create_branch(
+            "mydb",
+            "y",
+            Some("main"),
+            Some(TimeSpec::at_commit(merge_commit.to_string())),
+        )
+        .await
+        .unwrap();
+}
+
+/// A branch's line runs through its fork point into its source's history,
+/// so a pre-fork commit is a valid branch point.
+#[tokio::test]
+async fn create_branch_at_pre_fork_commit_succeeds() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let first = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:a", "ex:name": "a"}]
+            }),
+        )
+        .await
+        .unwrap();
+    let pre_fork = first.receipt.commit_id.clone();
+    fluree
+        .insert(
+            first.ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:b", "ex:name": "b"}]
+            }),
+        )
+        .await
+        .unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+
+    fluree
+        .create_branch(
+            "mydb",
+            "x",
+            Some("dev"),
+            Some(TimeSpec::at_commit(pre_fork.to_string())),
+        )
+        .await
+        .expect("a commit before the fork is still on dev's line");
 }

@@ -40,6 +40,9 @@ Configuration is organized into independent **setting groups**, each governing a
 | [`f:reasoningDefaults`](setting-groups.md#reasoning-defaults) | OWL/RDFS reasoning | `f:reasoningModes`, `f:schemaSource` |
 | [`f:datalogDefaults`](setting-groups.md#datalog-defaults) | Datalog rules | `f:datalogEnabled`, `f:rulesSource` |
 | [`f:transactDefaults`](setting-groups.md#transact-defaults) | Transaction constraints | `f:uniqueEnabled`, `f:constraintsSource` |
+| [`f:fullTextDefaults`](setting-groups.md#full-text-defaults) | Full-text indexing | `f:property`, `f:defaultLanguage` |
+| [`f:queryDefaults`](setting-groups.md#fquerydefaults--query-defaults) | Query defaults (ledger-scoped) | `f:unionDefaultGraph` |
+| [`f:servingDefaults`](setting-groups.md#fservingdefaults--serving-posture) | Serving posture (ledger-scoped) | `f:serveQuery`, `f:serveBlocks`, `f:publicVisibility` |
 
 Each group is resolved independently — locking down policy does not affect whether reasoning can be overridden.
 
@@ -204,18 +207,41 @@ User queries against the config graph go through **policy enforcement**. If `f:d
 The config graph is written and queried through normal CLI transaction and query commands:
 
 ```bash
-# Write config via TriG
-fluree insert --ledger mydb:main --format trig config.trig
+# Write config via SPARQL UPDATE. TriG through `fluree insert` works too, but
+# not with the anonymous blank nodes (`[ … ]`) config settings are usually
+# written as (#1930); see "Writing from the CLI" in writing-config.md.
+fluree update --ledger mydb:main --format sparql -e '
+PREFIX f: <https://ns.flur.ee/db#>
+INSERT DATA {
+  GRAPH <urn:fluree:mydb:main#config> {
+    <urn:fluree:mydb:main:config:ledger> a f:LedgerConfig ;
+      f:shaclDefaults [ f:shaclEnabled true ] .
+  }
+}'
 
-# Query the config graph via SPARQL
-fluree query --ledger mydb:main --format sparql \
+# Query the config graph by naming it in FROM. The query language is
+# auto-detected; `fluree query --format` selects the OUTPUT format.
+fluree query --ledger mydb:main \
   'PREFIX f: <https://ns.flur.ee/db#>
    SELECT ?s ?p ?o
    FROM <urn:fluree:mydb:main#config>
    WHERE { ?s ?p ?o }'
+
+# Or address the config graph directly as a ledger fragment.
+fluree query --ledger mydb:main#config 'SELECT ?s ?p ?o WHERE { ?s ?p ?o }'
 ```
 
 No special CLI commands are needed — config is data, written and queried like any other named graph.
+
+A reserved graph has to be named in full. `FROM <config>` and `FROM <#config>`
+are not the config graph's IRI and are rejected, and `GRAPH ?g` never
+enumerates the reserved graphs — naming one is always something the query
+author did on purpose.
+
+Reachability is not access. Adding `f:policyDefaults [ f:defaultAllow false ]`
+to the config above makes the `FROM` query return zero rows instead of three,
+without changing what the query is allowed to name — see "Config graph query
+returns empty results" above.
 
 ## In this section
 

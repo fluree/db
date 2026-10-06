@@ -16,31 +16,80 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use fluree_db_core::disk_cache::DiskArtifactCache;
 use tokio::runtime::Handle;
+// PR-2 phase-1 (measurement-only): `.instrument()` for the per-file cost
+// decomposition sub-spans in `read_task_small_file`. Additive/debug-level;
+// no behavior change.
+use tracing::Instrument as _;
 
 use crate::error::{IcebergError, Result};
 use crate::io::batch::ColumnBatch;
 use crate::io::chunk_reader::RangeBackedChunkReader;
 use crate::io::parquet::{
-    build_batch_schema, build_batch_schema_with_iceberg, build_columns_from_values,
-    build_projected_schema, calculate_column_chunk_ranges, convert_field_to_column_value,
-    parse_parquet_metadata_from_bytes, ColumnValue, ParquetFooterCache, NULL_COLUMN_SENTINEL,
+    build_batch_schema, build_batch_schema_with_iceberg, calculate_column_chunk_ranges,
+    parse_parquet_metadata_from_bytes, ParquetFooterCache, NULL_COLUMN_SENTINEL,
 };
 use crate::io::SendIcebergStorage;
 use crate::metadata::Schema;
+use crate::scan::predicate::Expression;
+use crate::scan::pruning::row_group_can_contain;
 use crate::scan::FileScanTask;
 
 use parquet::file::metadata::ParquetMetaData;
-use parquet::file::reader::FileReader;
-use parquet::file::serialized_reader::SerializedFileReader;
+use std::collections::HashMap;
 
 /// Parquet magic bytes (footer ends with "PAR1").
-const PARQUET_MAGIC: [u8; 4] = [b'P', b'A', b'R', b'1'];
+const PARQUET_MAGIC: [u8; 4] = *b"PAR1";
+
+/// Whether row-group / row-level predicate pushdown is enabled. Read once from
+/// `FLUREE_ICEBERG_PREDICATE_PUSHDOWN` (only `0`/`false`/`off` disable it).
+pub(crate) fn predicate_pushdown_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(
+        || match std::env::var("FLUREE_ICEBERG_PREDICATE_PUSHDOWN") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off"
+            ),
+            Err(_) => true,
+        },
+    )
+}
+
+/// The row groups to decode: those whose column statistics do not rule out
+/// `residual`. Returns every row group (no pruning) when pushdown is disabled or
+/// there is no residual filter. Pruning is conservative — a row group is dropped
+/// only when its min/max bounds prove no row can match, so results are unchanged.
+pub(crate) fn surviving_row_groups(
+    metadata: &ParquetMetaData,
+    residual: Option<&Expression>,
+    field_id_to_leaf: &HashMap<i32, usize>,
+) -> Vec<usize> {
+    let n = metadata.num_row_groups();
+    let Some(expr) = residual.filter(|_| predicate_pushdown_enabled()) else {
+        return (0..n).collect();
+    };
+    let mut keep = Vec::with_capacity(n);
+    for rg in 0..n {
+        if row_group_can_contain(expr, metadata.row_group(rg), field_id_to_leaf) {
+            keep.push(rg);
+        }
+    }
+    let pruned = n - keep.len();
+    if pruned > 0 {
+        tracing::debug!(
+            row_groups_total = n,
+            row_groups_pruned = pruned,
+            "Row-group pruning skipped non-matching row groups"
+        );
+    }
+    keep
+}
 
 /// Maximum file size for sparse buffer allocation (64MB).
 ///
@@ -58,7 +107,7 @@ const WHOLE_FILE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const WHOLE_FILE_MIN_SHARE_PCT: u64 = 50;
 
 /// Correctness floor: files below this size are always read whole (a sparse
-/// buffer can omit chunks the row iterator dereferences). Applies even without a
+/// buffer can omit chunks the reader dereferences). Applies even without a
 /// disk cache.
 const MIN_SPARSE_FILE_BYTES: u64 = 1024 * 1024;
 
@@ -114,6 +163,96 @@ async fn read_whole_local(path: &Path, expected_size: u64) -> Option<Bytes> {
         Ok(Ok(bytes)) if bytes.len() as u64 == expected_size => Some(Bytes::from(bytes)),
         _ => None,
     }
+}
+
+/// Lever A kill switch (`FLUREE_ICEBERG_FOOTER_FROM_CACHE`, default **on**). When
+/// on, a file that is read whole anyway — a disk-cache hit, or a cheap/small file
+/// the policy fetches whole — parses its Parquet footer from those in-memory
+/// bytes instead of issuing a separate footer round-trip (measured ~190ms of two
+/// serial S3 range GETs per file, see `docs/audit/2026-07-virtual-dataset-perf/06-per-file-cost.md`).
+/// Off (`0`/`false`/`off`/`no`, trimmed + case-insensitive per the R2RML switch
+/// family) restores the byte-identical footer-first path. Read once per process
+/// (`OnceLock`, the family idiom — e.g. `catalog_session::cache_enabled` in
+/// `fluree-db-api`): set it at startup, not per query.
+fn footer_from_cache_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FLUREE_ICEBERG_FOOTER_FROM_CACHE") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    })
+}
+
+/// T2.3 kill switch (`FLUREE_ICEBERG_ROWGROUP_PARALLELISM`, default **on**). When
+/// on, a large file whose scan granted it a row-group concurrency > 1 decodes its
+/// surviving row groups across that many blocking tasks instead of one, so a
+/// single-file table (which the file-level fan-out pins at concurrency 1) uses the
+/// idle cores. Off (`0`/`false`/`off`/`no`) restores the byte-identical sequential
+/// single-thread decode. Read once per process (`OnceLock`, the family idiom).
+fn rowgroup_parallelism_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(
+        || match std::env::var("FLUREE_ICEBERG_ROWGROUP_PARALLELISM") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        },
+    )
+}
+
+/// Split `n` row-group indices `0..n` into `parts` contiguous chunks as evenly as
+/// possible (earlier chunks get the remainder). Each chunk is decoded by one
+/// blocking task; row groups are independently decodable, so the union of the
+/// chunks' rows equals a sequential decode's rows (order-independent for a scan).
+fn split_row_groups(n: usize, parts: usize) -> Vec<Vec<usize>> {
+    let parts = parts.clamp(1, n.max(1));
+    let base = n / parts;
+    let rem = n % parts;
+    let mut chunks = Vec::with_capacity(parts);
+    let mut start = 0usize;
+    for p in 0..parts {
+        let len = base + usize::from(p < rem);
+        if len == 0 {
+            break;
+        }
+        chunks.push((start..start + len).collect());
+        start += len;
+    }
+    chunks
+}
+
+/// Parse Parquet metadata from a whole-file byte buffer already resident in
+/// memory — the footer is sliced out of `bytes`, so this does **no I/O**. Mirrors
+/// the validation and parse in [`SendParquetReader::read_metadata`] exactly (same
+/// footer slice `file_size - 8 - footer_len .. file_size`, same parser), differing
+/// only in that the bytes are already local.
+fn metadata_from_whole_bytes(bytes: &Bytes) -> Result<Arc<ParquetMetaData>> {
+    let file_size = bytes.len() as u64;
+    if file_size < 12 {
+        return Err(IcebergError::Storage(format!(
+            "File too small to be Parquet: {file_size} bytes"
+        )));
+    }
+    let len = bytes.len();
+    if bytes[len - 4..len] != PARQUET_MAGIC {
+        return Err(IcebergError::Storage(
+            "Invalid Parquet file: missing magic bytes".to_string(),
+        ));
+    }
+    let footer_len = u32::from_le_bytes([
+        bytes[len - 8],
+        bytes[len - 7],
+        bytes[len - 6],
+        bytes[len - 5],
+    ]) as u64;
+    let footer_start = file_size.saturating_sub(8 + footer_len) as usize;
+    let footer_bytes = bytes.slice(footer_start..len);
+    let metadata = parse_parquet_metadata_from_bytes(&footer_bytes, file_size)?;
+    Ok(Arc::new(metadata))
 }
 
 /// A [`SendIcebergStorage`] backed by a single local cache file, serving a large
@@ -201,6 +340,13 @@ pub struct SendParquetReader<'a, S: SendIcebergStorage> {
     storage: &'a S,
     footer_cache: Option<&'a ParquetFooterCache>,
     disk_cache: Option<DiskCacheRef<'a>>,
+    /// T2.3: how many of this file's row groups to decode CONCURRENTLY. `1`
+    /// (the default) is the sequential single-thread decode. The scan sets this
+    /// to `max(1, available_parallelism / file_concurrency)` so a single-file
+    /// table (file concurrency 1) reclaims the idle cores while a many-file scan
+    /// (already saturating cores via the file fan-out) stays at 1 — no
+    /// oversubscription.
+    rowgroup_concurrency: usize,
 }
 
 impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
@@ -210,6 +356,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             storage,
             footer_cache: None,
             disk_cache: None,
+            rowgroup_concurrency: 1,
         }
     }
 
@@ -219,6 +366,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             storage,
             footer_cache: Some(cache),
             disk_cache: None,
+            rowgroup_concurrency: 1,
         }
     }
 
@@ -241,7 +389,17 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                 cache: disk_cache,
                 dir: cache_dir,
             }),
+            rowgroup_concurrency: 1,
         }
+    }
+
+    /// T2.3: set how many of a large file's row groups to decode concurrently.
+    /// The scan passes `max(1, available_parallelism / file_concurrency)`; `1`
+    /// (or the `FLUREE_ICEBERG_ROWGROUP_PARALLELISM` switch off) keeps the
+    /// sequential single-thread decode.
+    pub fn with_rowgroup_concurrency(mut self, n: usize) -> Self {
+        self.rowgroup_concurrency = n.max(1);
+        self
     }
 
     /// Read the Parquet file metadata (footer) using range reads.
@@ -302,11 +460,9 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
 
     /// Read a file scan task into column batches.
     ///
-    /// Uses parquet-rs's row iterator API for reliable decoding.
-    /// Optimizations:
-    /// - Projection pushdown: Only decodes projected columns
-    /// - O(1) field lookup: Uses iterator position instead of name lookup
-    /// - Per-row-group batches: Emits one batch per row group for streaming
+    /// Decodes via the Arrow reader ([`crate::io::arrow_reader`]) with:
+    /// - projection pushdown (only the requested columns are read),
+    /// - row-group pruning + exact row filtering from `task.residual_filter`.
     ///
     /// For files larger than 64MB, uses `RangeBackedChunkReader` for on-demand
     /// range reads instead of loading the entire file into memory.
@@ -325,21 +481,130 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         self.read_task_small_file(task).await
     }
 
-    /// Read a small file using sparse buffer approach.
+    /// Lever A: obtain the whole-file bytes for the cases where the disk-cache /
+    /// small-file policy reads the file whole regardless of projection, WITHOUT a
+    /// separate footer read. Returns `None` for files that take the sparse-range
+    /// path (they keep the footer-first policy in [`Self::read_task_small_file`]).
+    ///
+    /// - **A2** (disk-cache hit, any size in the small-file range): the whole file
+    ///   — and thus its footer — is served from the cached local bytes.
+    /// - **A1** (a miss on the cheap tier `<= WHOLE_FILE_MAX_BYTES`, admitted whole
+    ///   unconditionally by `admit_whole_file`'s `cheap` branch; or a
+    ///   sub-[`MIN_SPARSE_FILE_BYTES`] file with no disk cache): the file is
+    ///   fetched whole in one GET (single-flight, cached when a disk cache is
+    ///   present), then its footer is parsed from those bytes.
+    ///
+    /// A larger file with a narrow projection returns `None` — that is the
+    /// range-read tier, whose footer path is intentionally unchanged.
+    async fn try_whole_bytes_no_footer(&self, path: &str, file_size: u64) -> Result<Option<Bytes>> {
+        if let Some(dc) = self.disk_cache.filter(|dc| dc.cache.budget_bytes() > 0) {
+            let local = dc.local_path(path, file_size);
+            // A2: whole file already local — serve footer + data from disk.
+            if let Some(bytes) = read_whole_local(&local, file_size).await {
+                tracing::debug!(
+                    path,
+                    file_size,
+                    "Lever A: footer+data from disk cache (whole file)"
+                );
+                return Ok(Some(bytes));
+            }
+            // A1 (cheap tier): admitted whole unconditionally, so fetch whole
+            // without the footer. Single-flight fill mirrors `read_file_for_task`.
+            if file_size <= WHOLE_FILE_MAX_BYTES {
+                let data = dc
+                    .cache
+                    .coalesced_fetch(local, || async {
+                        self.storage
+                            .read(path)
+                            .await
+                            .map(|b| b.to_vec())
+                            .map_err(|e| std::io::Error::other(e.to_string()))
+                    })
+                    .await
+                    .map_err(|e| IcebergError::Storage(format!("disk-cache fill: {e}")))?;
+                tracing::debug!(
+                    path,
+                    file_size,
+                    "Lever A: footer+data from whole-file fetch (cheap, cached)"
+                );
+                return Ok(Some(Bytes::from(data)));
+            }
+            // Larger file, narrow projection: range-read tier (unchanged).
+            return Ok(None);
+        }
+        // No disk cache: only the sub-`MIN_SPARSE_FILE_BYTES` correctness-floor
+        // files are read whole (matches `read_file_for_task`).
+        if file_size < MIN_SPARSE_FILE_BYTES {
+            tracing::debug!(
+                path,
+                file_size,
+                "Lever A: footer+data from whole small file (no disk cache)"
+            );
+            return Ok(Some(self.storage.read(path).await?));
+        }
+        Ok(None)
+    }
+
+    /// Read a small file (`<= MAX_SPARSE_BUFFER_SIZE`).
+    //
+    // PR-2: Lever A (footer-from-cache) fast path first — when the file is read
+    // whole anyway, parse the footer from the fetched/cached bytes instead of a
+    // separate 2-round-trip footer read. Sparse-range files (larger, narrow
+    // projection) and the kill-switch-off case fall through to the unchanged
+    // footer-first path. The four `iceberg.*` sub-spans (PR-2 phase-1 counters)
+    // decompose the per-file wall; in the fast path `iceberg.read_footer` times
+    // the in-memory footer parse — the ~190ms round-trip collapsed to a parse.
     async fn read_task_small_file(&self, task: &FileScanTask) -> Result<Vec<ColumnBatch>> {
-        use parquet::record::reader::RowIter;
-
         let path = &task.data_file.file_path;
-        let metadata = self.read_metadata(path).await?;
+        let file_size = task.data_file.file_size_in_bytes as u64;
 
-        // Resolve the exact Parquet column indices first so sparse-range reads
-        // and row-iterator projection stay in lock-step.
-        let (batch_schema, column_indices) = if let Some(ref iceberg_schema) = task.iceberg_schema {
-            build_batch_schema_with_iceberg(&metadata, iceberg_schema, &task.projected_field_ids)?
-        } else {
-            build_batch_schema(&metadata, &task.projected_field_ids)?
+        // Lever A fast path (default on; FLUREE_ICEBERG_FOOTER_FROM_CACHE=0 skips).
+        if footer_from_cache_enabled() {
+            let maybe_whole = self
+                .try_whole_bytes_no_footer(path, file_size)
+                .instrument(tracing::debug_span!("iceberg.fetch_bytes"))
+                .await?;
+            if let Some(file_bytes) = maybe_whole {
+                // Parse+validate the footer from the in-memory bytes (no I/O).
+                // `decode_batches_arrow` re-derives it from the same bytes; this
+                // parse is the early validation and the footer-cost counter.
+                {
+                    let _footer_guard = tracing::debug_span!("iceberg.read_footer").entered();
+                    metadata_from_whole_bytes(&file_bytes)?;
+                }
+                let _decode_guard = tracing::debug_span!("iceberg.decode").entered();
+                return crate::io::arrow_reader::decode_batches_arrow(
+                    file_bytes,
+                    &task.projected_field_ids,
+                    task.residual_filter.as_ref(),
+                    task.iceberg_schema.as_deref(),
+                    None,
+                    None,
+                );
+            }
+        }
+
+        // Unchanged path: footer first (range reads), then the policy-driven fetch
+        // of the projected column chunks (sparse) or the whole file.
+        let metadata = self
+            .read_metadata(path)
+            .instrument(tracing::debug_span!("iceberg.read_footer"))
+            .await?;
+
+        // Resolve the projected Parquet column indices so the sparse-range read
+        // fetches exactly the column chunks the Arrow reader will decode.
+        let (_, column_indices) = {
+            let _plan_guard = tracing::debug_span!("iceberg.plan_columns").entered();
+            if let Some(ref iceberg_schema) = task.iceberg_schema {
+                build_batch_schema_with_iceberg(
+                    &metadata,
+                    iceberg_schema,
+                    &task.projected_field_ids,
+                )?
+            } else {
+                build_batch_schema(&metadata, &task.projected_field_ids)?
+            }
         };
-        let batch_schema = Arc::new(batch_schema);
 
         let real_column_indices: Vec<usize> = column_indices
             .iter()
@@ -347,94 +612,24 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             .filter(|&idx| idx != NULL_COLUMN_SENTINEL)
             .collect();
 
-        // Read the file bytes via range reads for the needed column chunks
+        // Read the file bytes via range reads for the needed column chunks.
         let file_bytes = self
             .read_file_for_task(path, task, &real_column_indices, &metadata)
+            .instrument(tracing::debug_span!("iceberg.fetch_bytes"))
             .await?;
 
-        // Parse using parquet-rs
-        let reader = SerializedFileReader::new(file_bytes)
-            .map_err(|e| IcebergError::Storage(format!("Failed to read Parquet file: {e}")))?;
-
-        let metadata = reader.metadata();
-
-        // Build mapping from batch position to row position (or None for NULL columns)
-        let batch_to_row_mapping: Vec<Option<usize>> = column_indices
-            .iter()
-            .scan(0usize, |row_idx, &col_idx| {
-                if col_idx == NULL_COLUMN_SENTINEL {
-                    Some(None) // NULL column - no row data
-                } else {
-                    let current = *row_idx;
-                    *row_idx += 1;
-                    Some(Some(current)) // Real column - maps to this row position
-                }
-            })
-            .collect();
-
-        // Build a projected schema for parquet-rs to only decode needed columns
-        let projected_schema =
-            build_projected_schema(metadata.file_metadata().schema(), &real_column_indices)?;
-
-        let mut batches = Vec::new();
-
-        // Process each row group separately to emit streaming batches
-        for rg_idx in 0..metadata.num_row_groups() {
-            let row_group_reader = reader.get_row_group(rg_idx).map_err(|e| {
-                IcebergError::Storage(format!("Failed to get row group {rg_idx}: {e}"))
-            })?;
-
-            // Create row iterator for this row group with projection
-            let row_iter =
-                RowIter::from_row_group(Some(projected_schema.clone()), row_group_reader.as_ref())
-                    .map_err(|e| {
-                        IcebergError::Storage(format!(
-                            "Failed to create row iterator for row group {rg_idx}: {e}"
-                        ))
-                    })?;
-
-            // Collect rows into columnar format
-            let num_fields = batch_schema.fields.len();
-            let estimated_rows = metadata.row_group(rg_idx).num_rows() as usize;
-            let mut column_data: Vec<Vec<Option<ColumnValue>>> = (0..num_fields)
-                .map(|_| Vec::with_capacity(estimated_rows))
-                .collect();
-
-            for row_result in row_iter {
-                let row = row_result
-                    .map_err(|e| IcebergError::Storage(format!("Failed to read row: {e}")))?;
-
-                // With projection, row columns come in the same order as projected schema.
-                let row_fields: Vec<_> = row.get_column_iter().map(|(_, f)| f).collect();
-
-                // Map row columns to batch positions, inserting NULLs for missing columns
-                for (batch_idx, field_info) in batch_schema.fields.iter().enumerate() {
-                    let value = match batch_to_row_mapping[batch_idx] {
-                        Some(row_idx) => {
-                            // Real column - get value from row
-                            row_fields.get(row_idx).and_then(|field| {
-                                convert_field_to_column_value(field, &field_info.field_type)
-                            })
-                        }
-                        None => {
-                            // NULL column (schema evolution) - always NULL
-                            None
-                        }
-                    };
-                    column_data[batch_idx].push(value);
-                }
-            }
-
-            // Convert to Column format and create batch for this row group
-            let columns = build_columns_from_values(column_data, &batch_schema)?;
-            let batch = ColumnBatch::new(Arc::clone(&batch_schema), columns)?;
-
-            if !batch.is_empty() {
-                batches.push(batch);
-            }
-        }
-
-        Ok(batches)
+        // Decode the range-read bytes with native projection + row-group pruning
+        // + exact row filtering. `Bytes` is a `ChunkReader`, so the Arrow reader
+        // reuses the exact bytes fetched above.
+        let _decode_guard = tracing::debug_span!("iceberg.decode").entered();
+        crate::io::arrow_reader::decode_batches_arrow(
+            file_bytes,
+            &task.projected_field_ids,
+            task.residual_filter.as_ref(),
+            task.iceberg_schema.as_deref(),
+            None,
+            None,
+        )
     }
 
     /// Read a large file, applying the disk-cache policy before falling back to
@@ -450,6 +645,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         let path = task.data_file.file_path.clone();
         let file_size = task.data_file.file_size_in_bytes as u64;
         let projected_field_ids = task.projected_field_ids.clone();
+        let residual_filter = task.residual_filter.clone();
         let iceberg_schema = task.iceberg_schema.clone();
         let runtime = Handle::current();
 
@@ -467,8 +663,11 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                     path,
                     file_size,
                     projected_field_ids,
+                    residual_filter,
                     iceberg_schema,
                     runtime,
+                    None,
+                    self.rowgroup_concurrency,
                 )
                 .await;
             }
@@ -501,8 +700,11 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                         path,
                         file_size,
                         projected_field_ids,
+                        residual_filter,
                         iceberg_schema,
                         runtime,
+                        None,
+                        self.rowgroup_concurrency,
                     )
                     .await;
                 }
@@ -516,8 +718,11 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             path,
             file_size,
             projected_field_ids,
+            residual_filter,
             iceberg_schema,
             runtime,
+            None,
+            self.rowgroup_concurrency,
         )
         .await
     }
@@ -526,113 +731,134 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
     /// source store or a local cache file) via `RangeBackedChunkReader`,
     /// projecting only the requested columns. Runs the sync decode on a blocking
     /// thread.
+    ///
+    /// `max_rows` bounds the decode to a cheap first-row-group "peek" (see
+    /// [`crate::io::arrow_reader::decode_batches_arrow`]); `None` decodes the
+    /// whole projected file.
+    // Params mirror the `FileScanTask` fields already destructured for the
+    // `spawn_blocking` move plus the storage/runtime/budget; bundling them would
+    // not clarify this internal helper.
+    #[expect(clippy::too_many_arguments)]
     async fn decode_large_file<St: SendIcebergStorage + 'static>(
         storage: Arc<St>,
         path: String,
         file_size: u64,
         projected_field_ids: Vec<i32>,
+        residual_filter: Option<Expression>,
         iceberg_schema: Option<Arc<Schema>>,
         runtime: Handle,
+        max_rows: Option<usize>,
+        rowgroup_concurrency: usize,
     ) -> Result<Vec<ColumnBatch>> {
-        use parquet::record::reader::RowIter;
-
-        // Run the sync parquet decoding in a blocking context
-        let result = tokio::task::spawn_blocking(move || {
-            // Create range-backed chunk reader
-            let chunk_reader = RangeBackedChunkReader::new(storage, path, file_size, runtime);
-
-            // Parse using parquet-rs with our chunk reader
-            let reader = SerializedFileReader::new(chunk_reader)
-                .map_err(|e| IcebergError::Storage(format!("Failed to read Parquet file: {e}")))?;
-
-            let metadata = reader.metadata();
-
-            // Build schema for batch and get column indices for projected columns
-            let (batch_schema, column_indices) = if let Some(ref iceberg_schema) = iceberg_schema {
-                build_batch_schema_with_iceberg(metadata, iceberg_schema, &projected_field_ids)?
-            } else {
-                build_batch_schema(metadata, &projected_field_ids)?
-            };
-            let batch_schema = Arc::new(batch_schema);
-
-            // Separate real columns from NULL columns (schema evolution)
-            let real_column_indices: Vec<usize> = column_indices
-                .iter()
-                .copied()
-                .filter(|&idx| idx != NULL_COLUMN_SENTINEL)
-                .collect();
-
-            // Build mapping from batch position to row position
-            let batch_to_row_mapping: Vec<Option<usize>> = column_indices
-                .iter()
-                .scan(0usize, |row_idx, &col_idx| {
-                    if col_idx == NULL_COLUMN_SENTINEL {
-                        Some(None)
-                    } else {
-                        let current = *row_idx;
-                        *row_idx += 1;
-                        Some(Some(current))
-                    }
+        // T2.3: decode this file's row groups across up to `rowgroup_concurrency`
+        // blocking tasks (each a contiguous slice of the row groups) when the scan
+        // granted concurrency > 1 — a single-file table otherwise decodes on ONE
+        // core while the other vCPUs sit idle. Row groups are independently
+        // decodable, so the union of the tasks' rows equals a sequential decode's
+        // (order-independent for a scan). Declines to the sequential single-thread
+        // decode for: the switch off; a bounded `max_rows` peek (decline (v) — a
+        // small budget wants only the first row group, so parallelizing would
+        // decode groups a sequential read would skip); and a single row group.
+        if rowgroup_concurrency > 1 && max_rows.is_none() && rowgroup_parallelism_enabled() {
+            // One footer read to size the fan and honor the single-group decline.
+            let num_row_groups = {
+                let storage = Arc::clone(&storage);
+                let path = path.clone();
+                let runtime = runtime.clone();
+                tokio::task::spawn_blocking(move || {
+                    let cr = RangeBackedChunkReader::new(storage, path, file_size, runtime);
+                    crate::io::arrow_reader::read_num_row_groups(cr)
                 })
-                .collect();
-
-            // Build a projected schema for parquet-rs
-            let projected_schema =
-                build_projected_schema(metadata.file_metadata().schema(), &real_column_indices)?;
-
-            let mut batches = Vec::new();
-
-            // Process each row group
-            for rg_idx in 0..metadata.num_row_groups() {
-                let row_group_reader = reader.get_row_group(rg_idx).map_err(|e| {
-                    IcebergError::Storage(format!("Failed to get row group {rg_idx}: {e}"))
-                })?;
-
-                let row_iter = RowIter::from_row_group(
-                    Some(projected_schema.clone()),
-                    row_group_reader.as_ref(),
-                )
-                .map_err(|e| {
-                    IcebergError::Storage(format!("Failed to create row iterator: {e}"))
-                })?;
-
-                let num_fields = batch_schema.fields.len();
-                let estimated_rows = metadata.row_group(rg_idx).num_rows() as usize;
-                let mut column_data: Vec<Vec<Option<ColumnValue>>> = (0..num_fields)
-                    .map(|_| Vec::with_capacity(estimated_rows))
-                    .collect();
-
-                for row_result in row_iter {
-                    let row = row_result
-                        .map_err(|e| IcebergError::Storage(format!("Failed to read row: {e}")))?;
-
-                    let row_fields: Vec<_> = row.get_column_iter().map(|(_, f)| f).collect();
-
-                    for (batch_idx, field_info) in batch_schema.fields.iter().enumerate() {
-                        let value = match batch_to_row_mapping[batch_idx] {
-                            Some(row_idx) => row_fields.get(row_idx).and_then(|field| {
-                                convert_field_to_column_value(field, &field_info.field_type)
-                            }),
-                            None => None,
-                        };
-                        column_data[batch_idx].push(value);
-                    }
+                .await
+                .map_err(|e| IcebergError::Storage(format!("Blocking task failed: {e}")))??
+            };
+            let n_tasks = rowgroup_concurrency.min(num_row_groups);
+            if n_tasks > 1 {
+                let mut handles = Vec::with_capacity(n_tasks);
+                for chunk in split_row_groups(num_row_groups, n_tasks) {
+                    let storage = Arc::clone(&storage);
+                    let path = path.clone();
+                    let projected = projected_field_ids.clone();
+                    let residual = residual_filter.clone();
+                    let schema = iceberg_schema.clone();
+                    let runtime = runtime.clone();
+                    handles.push(tokio::task::spawn_blocking(move || {
+                        let cr = RangeBackedChunkReader::new(storage, path, file_size, runtime);
+                        crate::io::arrow_reader::decode_batches_arrow(
+                            cr,
+                            &projected,
+                            residual.as_ref(),
+                            schema.as_deref(),
+                            None,
+                            Some(&chunk),
+                        )
+                    }));
                 }
-
-                let columns = build_columns_from_values(column_data, &batch_schema)?;
-                let batch = ColumnBatch::new(Arc::clone(&batch_schema), columns)?;
-
-                if !batch.is_empty() {
-                    batches.push(batch);
+                let mut out = Vec::new();
+                for h in handles {
+                    out.extend(h.await.map_err(|e| {
+                        IcebergError::Storage(format!("Blocking task failed: {e}"))
+                    })??);
                 }
+                return Ok(out);
             }
+        }
 
-            Ok::<Vec<ColumnBatch>, IcebergError>(batches)
+        // Sequential decode (default / declined): native projection + row-group
+        // pruning + row filtering over the range-backed reader (skipped row
+        // groups' column chunks are never fetched).
+        tokio::task::spawn_blocking(move || {
+            let chunk_reader = RangeBackedChunkReader::new(storage, path, file_size, runtime);
+            crate::io::arrow_reader::decode_batches_arrow(
+                chunk_reader,
+                &projected_field_ids,
+                residual_filter.as_ref(),
+                iceberg_schema.as_deref(),
+                max_rows,
+                None,
+            )
         })
         .await
-        .map_err(|e| IcebergError::Storage(format!("Blocking task failed: {e}")))?;
+        .map_err(|e| IcebergError::Storage(format!("Blocking task failed: {e}")))?
+    }
 
-        result
+    /// Read at most `max_rows` rows from the **first row group** of the task's
+    /// file — a bounded, cheap "peek" for row previews and the LLM data sampler.
+    ///
+    /// Unlike [`Self::read_task`], this never reads the whole file: it drives the
+    /// range-backed chunk reader against the source store, and the row-group-0
+    /// restriction + row budget in
+    /// [`decode_batches_arrow`](crate::io::arrow_reader::decode_batches_arrow)
+    /// mean only the footer plus the first row group's projected column chunks are
+    /// fetched, whatever the file size. It therefore returns at most
+    /// `min(max_rows, rows-in-first-row-group)` rows and does **not** fill the
+    /// disk cache (a peek should not pull a whole file into it).
+    pub async fn read_task_sample(
+        &self,
+        task: &FileScanTask,
+        max_rows: usize,
+    ) -> Result<Vec<ColumnBatch>>
+    where
+        S: Clone + 'static,
+    {
+        if max_rows == 0 {
+            return Ok(Vec::new());
+        }
+        let path = task.data_file.file_path.clone();
+        let file_size = task.data_file.file_size_in_bytes as u64;
+        let storage = Arc::new(self.storage.clone());
+        Self::decode_large_file(
+            storage,
+            path,
+            file_size,
+            task.projected_field_ids.clone(),
+            task.residual_filter.clone(),
+            task.iceberg_schema.clone(),
+            Handle::current(),
+            Some(max_rows),
+            1,
+        )
+        .await
     }
 
     /// Read file bytes needed for the task using range reads (small files only).
@@ -687,7 +913,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             }
         } else if file_size < MIN_SPARSE_FILE_BYTES {
             // No disk cache: keep the small-file correctness behavior (read whole
-            // to avoid a sparse buffer missing chunks the row iterator needs).
+            // to avoid a sparse buffer missing chunks the reader needs).
             tracing::debug!(path, file_size, "Reading entire small Parquet file");
             return self.storage.read(path).await;
         }
@@ -724,12 +950,14 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             "Range-reading Parquet file"
         );
 
-        // Fetch all ranges
-        let mut range_data: Vec<(u64, Bytes)> = Vec::with_capacity(coalesced.len());
-        for (start, end) in &coalesced {
-            let data = self.storage.read_range(path, *start..*end).await?;
-            range_data.push((*start, data));
-        }
+        // Item 12 (B1-AppD): fetch the coalesced ranges via `read_ranges` — bounded
+        // concurrent GETs on S3 (order-preserving), sequential on other backends
+        // (incl. the local-file wrapper, where the default sequential impl already
+        // does the right thing). Bytes return in input order → zip to their starts.
+        let range_reqs: Vec<std::ops::Range<u64>> = coalesced.iter().map(|(s, e)| *s..*e).collect();
+        let range_bytes = self.storage.read_ranges(path, range_reqs).await?;
+        let range_data: Vec<(u64, Bytes)> =
+            coalesced.iter().map(|(s, _)| *s).zip(range_bytes).collect();
 
         // Assemble into sparse buffer
         let sparse_buffer = assemble_sparse_buffer(file_size as usize, range_data);
@@ -787,7 +1015,7 @@ mod tests {
 
     /// In-memory source store standing in for S3, used to prove the local-cache
     /// fallback reads from source when the cache file is gone.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     struct InMemorySource {
         bytes: Bytes,
     }
@@ -935,5 +1163,498 @@ mod tests {
             b"URC"
         );
         assert_eq!(&storage.read("ignored").await.unwrap()[..], b"SOURCEDATA");
+    }
+
+    /// A multi-type, multi-row-group Parquet file with nulls. Non-Iceberg (no
+    /// field-id metadata), so `build_batch_schema` assigns field_id = column
+    /// index: id=0, name=1, age=2, active=3, bday=4.
+    fn multitype_parquet() -> Bytes {
+        use parquet::data_type::{BoolType, ByteArray, ByteArrayType, Int32Type, Int64Type};
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::parser::parse_message_type;
+
+        let message = "
+            message schema {
+              OPTIONAL INT64 id;
+              OPTIONAL BYTE_ARRAY name (UTF8);
+              OPTIONAL INT32 age;
+              OPTIONAL BOOLEAN active;
+              OPTIONAL INT32 bday (DATE);
+            }";
+        let schema = Arc::new(parse_message_type(message).unwrap());
+        let props = Arc::new(WriterProperties::builder().build());
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = SerializedFileWriter::new(&mut buf, schema, props).unwrap();
+
+            // Row group 1: two rows; name is null in row 2.
+            {
+                let mut rg = writer.next_row_group().unwrap();
+                let mut c = rg.next_column().unwrap().unwrap();
+                c.typed::<Int64Type>()
+                    .write_batch(&[1, 2], Some(&[1, 1]), None)
+                    .unwrap();
+                c.close().unwrap();
+                let mut c = rg.next_column().unwrap().unwrap();
+                c.typed::<ByteArrayType>()
+                    .write_batch(&[ByteArray::from("alice")], Some(&[1, 0]), None)
+                    .unwrap();
+                c.close().unwrap();
+                let mut c = rg.next_column().unwrap().unwrap();
+                c.typed::<Int32Type>()
+                    .write_batch(&[10, 20], Some(&[1, 1]), None)
+                    .unwrap();
+                c.close().unwrap();
+                let mut c = rg.next_column().unwrap().unwrap();
+                c.typed::<BoolType>()
+                    .write_batch(&[true, false], Some(&[1, 1]), None)
+                    .unwrap();
+                c.close().unwrap();
+                let mut c = rg.next_column().unwrap().unwrap();
+                c.typed::<Int32Type>()
+                    .write_batch(&[100, 200], Some(&[1, 1]), None)
+                    .unwrap();
+                c.close().unwrap();
+                rg.close().unwrap();
+            }
+
+            // Row group 2: one row; age is null.
+            {
+                let mut rg = writer.next_row_group().unwrap();
+                let mut c = rg.next_column().unwrap().unwrap();
+                c.typed::<Int64Type>()
+                    .write_batch(&[3], Some(&[1]), None)
+                    .unwrap();
+                c.close().unwrap();
+                let mut c = rg.next_column().unwrap().unwrap();
+                c.typed::<ByteArrayType>()
+                    .write_batch(&[ByteArray::from("carol")], Some(&[1]), None)
+                    .unwrap();
+                c.close().unwrap();
+                let mut c = rg.next_column().unwrap().unwrap();
+                c.typed::<Int32Type>()
+                    .write_batch(&[], Some(&[0]), None)
+                    .unwrap();
+                c.close().unwrap();
+                let mut c = rg.next_column().unwrap().unwrap();
+                c.typed::<BoolType>()
+                    .write_batch(&[true], Some(&[1]), None)
+                    .unwrap();
+                c.close().unwrap();
+                let mut c = rg.next_column().unwrap().unwrap();
+                c.typed::<Int32Type>()
+                    .write_batch(&[300], Some(&[1]), None)
+                    .unwrap();
+                c.close().unwrap();
+                rg.close().unwrap();
+            }
+
+            writer.close().unwrap();
+        }
+        Bytes::from(buf)
+    }
+
+    /// Flatten a decoded column across all emitted batches into a single
+    /// row-ordered vector (batch boundaries are not asserted).
+    fn flatten<'a, T: Clone + 'a>(
+        batches: &'a [ColumnBatch],
+        field_id: i32,
+        extract: impl Fn(&'a crate::io::batch::Column) -> &'a [Option<T>],
+    ) -> Vec<Option<T>> {
+        let mut out = Vec::new();
+        for b in batches {
+            let col = b
+                .column_by_id(field_id)
+                .unwrap_or_else(|| panic!("missing field {field_id}"));
+            out.extend(extract(col).iter().cloned());
+        }
+        out
+    }
+
+    /// T2.3 parity: the parallel decode partitions a file's row groups across
+    /// tasks by index, so decoding subset `[0]` then subset `[1]` and concatenating
+    /// yields EXACTLY the full sequential decode's rows (row groups are
+    /// independently decodable). An empty subset decodes nothing (a task whose
+    /// slice contains no surviving groups).
+    #[test]
+    fn rowgroup_subset_decode_partitions_the_file() {
+        use crate::io::arrow_reader::decode_batches_arrow;
+        use crate::io::batch::Column;
+        let id_of = |batches: &[ColumnBatch]| {
+            flatten(batches, 0, |c| match c {
+                Column::Int64(v) => v.as_slice(),
+                _ => panic!("id not Int64"),
+            })
+        };
+        let bytes = multitype_parquet(); // row group 0 = ids [1, 2], row group 1 = id [3]
+
+        let full = decode_batches_arrow(bytes.clone(), &[], None, None, None, None).unwrap();
+        assert_eq!(id_of(&full), vec![Some(1), Some(2), Some(3)]);
+
+        let rg0 = decode_batches_arrow(bytes.clone(), &[], None, None, None, Some(&[0])).unwrap();
+        let rg1 = decode_batches_arrow(bytes.clone(), &[], None, None, None, Some(&[1])).unwrap();
+        let mut combined = id_of(&rg0);
+        combined.extend(id_of(&rg1));
+        assert_eq!(
+            combined,
+            id_of(&full),
+            "subset [0] ++ subset [1] must equal the full sequential decode"
+        );
+
+        let empty = decode_batches_arrow(bytes.clone(), &[], None, None, None, Some(&[])).unwrap();
+        assert_eq!(empty.iter().map(|b| b.num_rows).sum::<usize>(), 0);
+    }
+
+    #[test]
+    fn split_row_groups_partitions_indices_evenly() {
+        assert_eq!(split_row_groups(5, 2), vec![vec![0, 1, 2], vec![3, 4]]);
+        assert_eq!(
+            split_row_groups(6, 3),
+            vec![vec![0, 1], vec![2, 3], vec![4, 5]]
+        );
+        // Parts are capped to the group count; a single group never fans.
+        assert_eq!(split_row_groups(2, 4), vec![vec![0], vec![1]]);
+        assert_eq!(split_row_groups(1, 3), vec![vec![0]]);
+        // Union == 0..n with no overlap.
+        let mut all: Vec<usize> = split_row_groups(7, 3).into_iter().flatten().collect();
+        all.sort_unstable();
+        assert_eq!(all, (0..7).collect::<Vec<_>>());
+    }
+
+    /// End-to-end decode round-trip: asserts the exact decoded values across all
+    /// supported types, nulls, and multiple row groups.
+    #[tokio::test]
+    async fn read_task_decodes_all_types_with_nulls_across_row_groups() {
+        use crate::io::batch::Column;
+        use crate::scan::planner::FileScanTask;
+
+        let bytes = multitype_parquet();
+        let source = InMemorySource {
+            bytes: bytes.clone(),
+        };
+        let mut data_file = crate::manifest::DataFile {
+            file_path: "mem://multitype.parquet".to_string(),
+            file_format: crate::manifest::FileFormat::Parquet,
+            record_count: 3,
+            file_size_in_bytes: bytes.len() as i64,
+            partition: crate::manifest::PartitionData::default(),
+            column_sizes: None,
+            value_counts: None,
+            null_value_counts: None,
+            nan_value_counts: None,
+            lower_bounds: None,
+            upper_bounds: None,
+            split_offsets: None,
+            sort_order_id: None,
+        };
+        data_file.file_size_in_bytes = bytes.len() as i64;
+
+        // Empty projection => all columns.
+        let task = FileScanTask::for_whole_file(data_file, vec![], None);
+
+        let reader = SendParquetReader::new(&source);
+        let batches = reader.read_task(&task).await.expect("decode");
+
+        let total: usize = batches.iter().map(|b| b.num_rows).sum();
+        assert_eq!(total, 3, "expected 3 rows across all batches");
+
+        let ids = flatten(&batches, 0, |c| match c {
+            Column::Int64(v) => v.as_slice(),
+            _ => panic!("id not Int64"),
+        });
+        assert_eq!(ids, vec![Some(1), Some(2), Some(3)]);
+
+        let names = flatten(&batches, 1, |c| match c {
+            Column::String(v) => v.as_slice(),
+            _ => panic!("name not String"),
+        });
+        assert_eq!(
+            names,
+            vec![Some("alice".to_string()), None, Some("carol".to_string())]
+        );
+
+        let ages = flatten(&batches, 2, |c| match c {
+            Column::Int32(v) => v.as_slice(),
+            _ => panic!("age not Int32"),
+        });
+        assert_eq!(ages, vec![Some(10), Some(20), None]);
+
+        let active = flatten(&batches, 3, |c| match c {
+            Column::Boolean(v) => v.as_slice(),
+            _ => panic!("active not Boolean"),
+        });
+        assert_eq!(active, vec![Some(true), Some(false), Some(true)]);
+
+        // INT32 + (DATE) logical annotation decodes as Date (days since epoch).
+        let bday = flatten(&batches, 4, |c| match c {
+            Column::Date(v) => v.as_slice(),
+            _ => panic!("bday not Date"),
+        });
+        assert_eq!(bday, vec![Some(100), Some(200), Some(300)]);
+    }
+
+    /// A whole-file scan task for an in-memory Parquet blob (empty projection =>
+    /// all columns), with an optional residual pushdown predicate and optional
+    /// Iceberg schema (needed for field_id → column resolution when the fixture
+    /// carries no embedded Parquet field IDs).
+    fn whole_file_task(
+        bytes: &Bytes,
+        residual: Option<Expression>,
+        schema: Option<Arc<Schema>>,
+    ) -> FileScanTask {
+        let data_file = crate::manifest::DataFile {
+            file_path: "mem://fixture.parquet".to_string(),
+            file_format: crate::manifest::FileFormat::Parquet,
+            record_count: 0,
+            file_size_in_bytes: bytes.len() as i64,
+            partition: crate::manifest::PartitionData::default(),
+            column_sizes: None,
+            value_counts: None,
+            null_value_counts: None,
+            nan_value_counts: None,
+            lower_bounds: None,
+            upper_bounds: None,
+            split_offsets: None,
+            sort_order_id: None,
+        };
+        match schema {
+            Some(s) => FileScanTask::for_whole_file_with_schema(data_file, vec![], residual, s),
+            None => FileScanTask::for_whole_file(data_file, vec![], residual),
+        }
+    }
+
+    /// Build a minimal Iceberg schema from `(name, type)` fields, ids assigned by
+    /// position (matching the fixtures' column order).
+    fn schema_of(fields: &[(&str, &str)]) -> Arc<Schema> {
+        use crate::metadata::SchemaField;
+        Arc::new(Schema {
+            schema_id: 0,
+            identifier_field_ids: vec![],
+            fields: fields
+                .iter()
+                .enumerate()
+                .map(|(i, (name, ty))| SchemaField {
+                    id: i as i32,
+                    name: name.to_string(),
+                    required: false,
+                    field_type: serde_json::json!(ty),
+                    doc: None,
+                })
+                .collect(),
+        })
+    }
+
+    /// A single-row-group Parquet with an `xsd:integer`-style column physically
+    /// stored as `DECIMAL(9,0)` (INT32-backed) — how Iceberg materializes small
+    /// integers. Columns: id=0, year=1. Rows: (1,2020) (2,2024) (3,null).
+    fn decimal_backed_int_parquet() -> Bytes {
+        use parquet::data_type::{Int32Type, Int64Type};
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::parser::parse_message_type;
+
+        let message = "
+            message schema {
+              OPTIONAL INT64 id;
+              OPTIONAL INT32 year (DECIMAL(9,0));
+            }";
+        let schema = Arc::new(parse_message_type(message).unwrap());
+        let props = Arc::new(WriterProperties::builder().build());
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = SerializedFileWriter::new(&mut buf, schema, props).unwrap();
+            let mut rg = writer.next_row_group().unwrap();
+            let mut c = rg.next_column().unwrap().unwrap();
+            c.typed::<Int64Type>()
+                .write_batch(&[1, 2, 3], Some(&[1, 1, 1]), None)
+                .unwrap();
+            c.close().unwrap();
+            let mut c = rg.next_column().unwrap().unwrap();
+            c.typed::<Int32Type>()
+                .write_batch(&[2020, 2024], Some(&[1, 1, 0]), None)
+                .unwrap();
+            c.close().unwrap();
+            rg.close().unwrap();
+            writer.close().unwrap();
+        }
+        Bytes::from(buf)
+    }
+
+    /// Arrow row filter drops rows that fail the predicate and rows whose filter
+    /// column is null (an R2RML null column produces no triple). Arrow-only: the
+    /// (Row-group pruning alone would not drop individual rows within a group.)
+    #[tokio::test]
+    async fn read_task_row_filter_drops_nonmatching_and_null_rows() {
+        use crate::io::batch::Column;
+
+        let bytes = multitype_parquet();
+        let source = InMemorySource {
+            bytes: bytes.clone(),
+        };
+        // age (field_id 2) >= 20
+        let residual = Expression::Comparison {
+            field_id: 2,
+            column: "age".to_string(),
+            op: crate::scan::predicate::ComparisonOp::GtEq,
+            value: crate::scan::predicate::LiteralValue::Int64(20),
+        };
+        let schema = schema_of(&[
+            ("id", "long"),
+            ("name", "string"),
+            ("age", "int"),
+            ("active", "boolean"),
+            ("bday", "date"),
+        ]);
+        let task = whole_file_task(&bytes, Some(residual), Some(schema));
+        let batches = SendParquetReader::new(&source)
+            .read_task(&task)
+            .await
+            .expect("decode");
+
+        let ids = flatten(&batches, 0, |c| match c {
+            Column::Int64(v) => v.as_slice(),
+            _ => panic!("id not Int64"),
+        });
+        // age 10 dropped, age 20 kept, age null dropped.
+        assert_eq!(ids, vec![Some(2)]);
+    }
+
+    /// String-equality row filter: `name = "alice"` keeps only the matching row
+    /// (and drops the null-name row). Exercises the Arrow string comparison path.
+    #[tokio::test]
+    async fn read_task_row_filter_string_equality() {
+        use crate::io::batch::Column;
+
+        let bytes = multitype_parquet();
+        let source = InMemorySource {
+            bytes: bytes.clone(),
+        };
+        // name (field_id 1) = "alice"
+        let residual = Expression::Comparison {
+            field_id: 1,
+            column: "name".to_string(),
+            op: crate::scan::predicate::ComparisonOp::Eq,
+            value: crate::scan::predicate::LiteralValue::String("alice".to_string()),
+        };
+        let schema = schema_of(&[
+            ("id", "long"),
+            ("name", "string"),
+            ("age", "int"),
+            ("active", "boolean"),
+            ("bday", "date"),
+        ]);
+        let task = whole_file_task(&bytes, Some(residual), Some(schema));
+        let batches = SendParquetReader::new(&source)
+            .read_task(&task)
+            .await
+            .expect("decode");
+
+        let ids = flatten(&batches, 0, |c| match c {
+            Column::Int64(v) => v.as_slice(),
+            _ => panic!("id not Int64"),
+        });
+        let names = flatten(&batches, 1, |c| match c {
+            Column::String(v) => v.as_slice(),
+            _ => panic!("name not String"),
+        });
+        assert_eq!(ids, vec![Some(1)], "only alice's row survives");
+        assert_eq!(names, vec![Some("alice".to_string())]);
+    }
+
+    /// The Decimal landmine: an `xsd:integer` column is physically `DECIMAL`, so
+    /// an `Int64` literal must be cast to the column's decimal type before
+    /// comparison. A naive raw compare dropped every row; this asserts the one
+    /// matching row survives. Arrow-only.
+    #[tokio::test]
+    async fn read_task_row_filter_handles_decimal_backed_integer() {
+        use crate::io::batch::Column;
+
+        let bytes = decimal_backed_int_parquet();
+        let source = InMemorySource {
+            bytes: bytes.clone(),
+        };
+        // year (field_id 1) >= 2024, literal is a plain integer.
+        let residual = Expression::Comparison {
+            field_id: 1,
+            column: "year".to_string(),
+            op: crate::scan::predicate::ComparisonOp::GtEq,
+            value: crate::scan::predicate::LiteralValue::Int64(2024),
+        };
+        let schema = schema_of(&[("id", "long"), ("year", "decimal(9, 0)")]);
+        let task = whole_file_task(&bytes, Some(residual), Some(schema));
+        let batches = SendParquetReader::new(&source)
+            .read_task(&task)
+            .await
+            .expect("decode");
+
+        let ids = flatten(&batches, 0, |c| match c {
+            Column::Int64(v) => v.as_slice(),
+            _ => panic!("id not Int64"),
+        });
+        // year 2020 dropped, year 2024 kept, year null dropped.
+        assert_eq!(ids, vec![Some(2)], "decimal-backed integer filter mismatch");
+    }
+
+    /// Bounded first-row-group "peek": `read_task_sample` returns at most `n`
+    /// rows, reads only the FIRST row group, and honors projection — exercising
+    /// the range-backed reader path end to end over the 2-row-group fixture
+    /// (row group 0 = 2 rows, row group 1 = 1 row).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_task_sample_bounds_rows_to_first_row_group() {
+        use crate::io::batch::Column;
+
+        let bytes = multitype_parquet();
+        let source = InMemorySource {
+            bytes: bytes.clone(),
+        };
+        let reader = SendParquetReader::new(&source);
+
+        // Whole-file task (empty projection => all columns).
+        let task = whole_file_task(&bytes, None, None);
+
+        // n = 0 => no rows, no read.
+        let none = reader.read_task_sample(&task, 0).await.expect("sample 0");
+        assert_eq!(none.iter().map(|b| b.num_rows).sum::<usize>(), 0);
+
+        // n = 1 => exactly the first row of row group 0.
+        let one = reader.read_task_sample(&task, 1).await.expect("sample 1");
+        let ids = flatten(&one, 0, |c| match c {
+            Column::Int64(v) => v.as_slice(),
+            _ => panic!("id not Int64"),
+        });
+        assert_eq!(ids, vec![Some(1)]);
+
+        // n = 2 => all of row group 0.
+        let two = reader.read_task_sample(&task, 2).await.expect("sample 2");
+        assert_eq!(two.iter().map(|b| b.num_rows).sum::<usize>(), 2);
+
+        // n = 10 => still only row group 0's 2 rows (row group 1 is never read),
+        // proving the peek does not scan the whole file.
+        let ten = reader.read_task_sample(&task, 10).await.expect("sample 10");
+        let ids = flatten(&ten, 0, |c| match c {
+            Column::Int64(v) => v.as_slice(),
+            _ => panic!("id not Int64"),
+        });
+        assert_eq!(
+            ids,
+            vec![Some(1), Some(2)],
+            "only the first row group is read"
+        );
+
+        // Projection: sampling a single column yields only that column.
+        let projected = FileScanTask::for_whole_file(task.data_file.clone(), vec![0], None);
+        let sampled = reader
+            .read_task_sample(&projected, 1)
+            .await
+            .expect("sample projected");
+        assert!(
+            sampled[0].column_by_id(0).is_some(),
+            "projected id column present"
+        );
+        assert!(
+            sampled[0].column_by_id(1).is_none(),
+            "name column not projected"
+        );
     }
 }

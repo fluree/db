@@ -92,6 +92,16 @@ pub struct ReasoningModes {
     /// (query key `maxSeconds`, pragma `reasoning-max-seconds:`, config
     /// `f:reasoningMaxSeconds`, env `FLUREE_REASONING_MAX_SECONDS`).
     pub max_seconds: Option<u64>,
+
+    /// Materialization budget: max megabytes of derived facts before the
+    /// closure is capped. Same sourcing/precedence as [`Self::max_facts`]
+    /// (query key `maxMemoryMb`, pragma `reasoning-max-memory-mb:`, config
+    /// `f:reasoningMaxMemoryMb`, env `FLUREE_REASONING_MAX_MEMORY_MB`).
+    ///
+    /// `None` derives the ceiling from the effective fact cap, so the fact cap
+    /// binds first on ordinary data and this one only catches facts that are
+    /// abnormally large.
+    pub max_memory_mb: Option<u64>,
 }
 
 impl ReasoningModes {
@@ -274,9 +284,10 @@ impl ReasoningModes {
         // Parse the per-query materialization budget. Doesn't flip any mode
         // flag — it only takes effect when a reasoning mode is requested.
         if let Some(budget) = query.get("reasoningBudget") {
-            let (max_facts, max_seconds) = Self::parse_budget_json(budget)?;
+            let (max_facts, max_seconds, max_memory_mb) = Self::parse_budget_json(budget)?;
             modes.max_facts = max_facts;
             modes.max_seconds = max_seconds;
+            modes.max_memory_mb = max_memory_mb;
         }
 
         Ok(modes)
@@ -284,12 +295,15 @@ impl ReasoningModes {
 
     /// Parse a `"reasoningBudget"` JSON object.
     ///
-    /// Shape: `{"maxFacts": 20000000, "maxSeconds": 300}` (both optional;
-    /// `max-facts`/`max_facts` variants accepted).
-    fn parse_budget_json(value: &serde_json::Value) -> Result<(Option<u64>, Option<u64>), String> {
+    /// Shape: `{"maxFacts": 20000000, "maxSeconds": 300, "maxMemoryMb": 512}`
+    /// (all optional; `max-facts`/`max_facts` variants accepted).
+    #[allow(clippy::type_complexity)]
+    fn parse_budget_json(
+        value: &serde_json::Value,
+    ) -> Result<(Option<u64>, Option<u64>, Option<u64>), String> {
         let serde_json::Value::Object(obj) = value else {
             if value.is_null() {
-                return Ok((None, None));
+                return Ok((None, None, None));
             }
             return Err("reasoningBudget must be an object".to_string());
         };
@@ -308,10 +322,15 @@ impl ReasoningModes {
 
         let max_facts = field(&["maxFacts", "max-facts", "max_facts"])?;
         let max_seconds = field(&["maxSeconds", "max-seconds", "max_seconds"])?;
-        Ok((max_facts, max_seconds))
+        let max_memory_mb = field(&["maxMemoryMb", "max-memory-mb", "max_memory_mb"])?;
+        Ok((max_facts, max_seconds, max_memory_mb))
     }
 
-    /// Parse a single mode string
+    /// Parse a single mode string.
+    ///
+    /// One canonical string per mode (case-insensitive); no synonyms. Reasoning
+    /// is a new feature with no backward-compat surface, so the accepted set is
+    /// kept deliberately small.
     fn parse_single(s: &str) -> Result<Self, String> {
         match s.to_lowercase().as_str() {
             "none" => Ok(Self::none()),
@@ -319,7 +338,7 @@ impl ReasoningModes {
                 rdfs: true,
                 ..Default::default()
             }),
-            "owl2ql" | "owl-ql" | "owlql" => Ok(Self {
+            "owl2ql" => Ok(Self {
                 rdfs: true, // OWL2-QL implies RDFS for subclass expansion
                 owl2ql: true,
                 ..Default::default()
@@ -328,11 +347,11 @@ impl ReasoningModes {
                 datalog: true,
                 ..Default::default()
             }),
-            "owl2rl" | "owl-rl" | "owlrl" => Ok(Self {
+            "owl2rl" => Ok(Self {
                 owl2rl: true,
                 ..Default::default()
             }),
-            "owl-datalog" | "owldatalog" | "owl_datalog" => Ok(Self {
+            "owl-datalog" => Ok(Self {
                 owl_datalog: true,
                 // owl-datalog is a superset of owl2rl - enable both
                 owl2rl: true,
@@ -355,9 +374,27 @@ impl ReasoningModes {
         // rules are combined
         self.rules.extend(other.rules.iter().cloned());
         // budgets: first explicit value wins
+        self.max_memory_mb = self.max_memory_mb.or(other.max_memory_mb);
         self.max_facts = self.max_facts.or(other.max_facts);
         self.max_seconds = self.max_seconds.or(other.max_seconds);
         self
+    }
+
+    /// Strictly validate config-declared reasoning mode strings.
+    ///
+    /// Mirrors [`Self::from_mode_strings`]'s per-item handling (strip the
+    /// `fluree:` namespace prefix, then parse) but returns the first
+    /// unrecognized mode as an error instead of warning and skipping. Used at
+    /// transaction time to reject a bad `f:reasoningModes` before it commits,
+    /// so a config typo fails loudly rather than silently disabling reasoning
+    /// at query time. The `Err` string names the offending mode and the
+    /// accepted set.
+    pub fn validate_mode_names(names: &[String]) -> Result<(), String> {
+        for name in names {
+            let short = name.strip_prefix(fluree_vocab::fluree::DB).unwrap_or(name);
+            Self::parse_single(short)?;
+        }
+        Ok(())
     }
 
     /// Build from a list of mode name strings (e.g., from config graph).
@@ -602,8 +639,8 @@ mod tests {
 
     #[test]
     fn test_reasoning_modes_from_json_string_owl2ql() {
-        // Test various spellings
-        for spelling in &["owl2ql", "owl-ql", "owlql", "OWL2QL", "Owl-Ql"] {
+        // Canonical spelling, case-insensitive.
+        for spelling in &["owl2ql", "OWL2QL", "Owl2Ql"] {
             let value = serde_json::json!(spelling);
             let modes = ReasoningModes::from_json(&value).unwrap();
             assert!(modes.owl2ql, "Failed for spelling: {spelling}");
@@ -613,10 +650,30 @@ mod tests {
 
     #[test]
     fn test_reasoning_modes_from_json_string_owl2rl() {
-        for spelling in &["owl2rl", "owl-rl", "owlrl"] {
+        for spelling in &["owl2rl", "OWL2RL"] {
             let value = serde_json::json!(spelling);
             let modes = ReasoningModes::from_json(&value).unwrap();
             assert!(modes.owl2rl, "Failed for spelling: {spelling}");
+        }
+    }
+
+    #[test]
+    fn test_reasoning_modes_reject_noncanonical_spellings() {
+        // One canonical string per mode — former synonyms are now errors.
+        for bad in &[
+            "owl-ql",
+            "owlql",
+            "owl2-ql",
+            "owl-rl",
+            "owlrl",
+            "owl2-rl",
+            "owldatalog",
+        ] {
+            let value = serde_json::json!(bad);
+            assert!(
+                ReasoningModes::from_json(&value).is_err(),
+                "non-canonical spelling {bad} must be rejected"
+            );
         }
     }
 

@@ -51,8 +51,8 @@ use crate::raft::commit_worker::{QueuePoisonError, QueuePoisonPublisher};
 use crate::raft::staged_receipt::{AppliedReceipt, StagedReceiptMap, StashGuard};
 use crate::raft::state_machine::{
     Command as SmCommand, ConfigUpdate, DesyncReason, EntryPoisoning, NameServiceState, NewBranch,
-    NewIndexHead, NewLedger, PoisonReason, RecordedTally, RefKey, ResetHeadSnapshot,
-    Response as SmResponse, StagedHead,
+    NewIndexHead, NewLedger, PoisonReason, RecordedTally, RefCas, RefKey, ResetHeadSnapshot,
+    Response as SmResponse, StagedHead, StoredConfig, StoredStatus,
 };
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::{ClusterNode, NodeId, TypeConfig};
@@ -62,14 +62,14 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
-use fluree_db_core::ledger_id::split_ledger_id;
-use fluree_db_core::ContentId;
+use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
+use fluree_db_core::{ContentId, LedgerId};
 use fluree_db_nameservice::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
     ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
-    GraphSourceType, IndexPublisher, LedgerLifecycle, NameServiceError, NameServiceLookup,
-    NsLookupResult, NsRecord, NsRecordSnapshot, RefKind, RefLookup, RefPublisher, RefValue, Result,
-    StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
+    GraphSourceType, IndexPublisher, LedgerHeads, LedgerLifecycle, NameServiceError,
+    NameServiceLookup, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind, RefLookup,
+    RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
 };
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::Raft;
@@ -152,15 +152,20 @@ impl RaftNameService {
     /// `request_timeout` is the per-request cap on those POSTs —
     /// typically threaded through from
     /// [`NetworkConfig::cross_node_propose_timeout`](crate::raft::network::NetworkConfig::cross_node_propose_timeout).
+    /// Takes a
+    /// [`RaftHttpClient`](crate::raft::network::RaftHttpClient) rather
+    /// than a bare `reqwest::Client`: these POSTs go to a
+    /// membership-supplied URL, so the no-redirects guarantee is what
+    /// keeps the SSRF check on that URL meaningful.
     pub fn with_forwarding(
         mut self,
         id: NodeId,
-        http_client: reqwest::Client,
+        http_client: crate::raft::network::RaftHttpClient,
         request_timeout: std::time::Duration,
     ) -> Self {
         self.forwarding = Some(ForwardingConfig {
             id,
-            http_client,
+            http_client: http_client.inner().clone(),
             request_timeout,
         });
         self
@@ -225,6 +230,9 @@ fn build_index_head_args(
 ///   indexer should re-stage against the current commit head.
 /// - [`SmResponse::LedgerNotFound`] → `Err(not_found)`. Ledger gone
 ///   mid-build (drop / membership change).
+/// - [`SmResponse::LedgerRetracted`] → `Err(Retracted)`. Branch
+///   tombstoned mid-build; its refs are frozen, so the built index
+///   has nowhere to land.
 /// - Anything else → `Err(Storage)` "unexpected variant". None of the
 ///   other variants are reachable for this command; if one appears
 ///   it's a state-machine bug worth surfacing rather than swallowing.
@@ -243,6 +251,7 @@ fn map_advance_index_response(resp: SmResponse) -> Result<()> {
              (proposer ran ahead of applied state; re-stage from current commit head)"
         ))),
         SmResponse::LedgerNotFound { ledger_id } => Err(NameServiceError::not_found(ledger_id)),
+        SmResponse::LedgerRetracted { ledger_id } => Err(NameServiceError::Retracted(ledger_id)),
         other => Err(NameServiceError::storage(format!(
             "unexpected Response variant for AdvanceIndexHead: {other:?}"
         ))),
@@ -266,7 +275,17 @@ fn record_from_state(
     if !ledger.branches.iter().any(|b| b == branch) {
         return None;
     }
-    let mut record = NsRecord::new(ledger_name, branch);
+    let id = LedgerId::from_persisted_parts(ledger_name, branch)
+        .inspect_err(|e| {
+            tracing::warn!(
+                ledger_name,
+                branch,
+                error = %e,
+                "Skipping nameservice record whose id is invalid; rename or remove it"
+            );
+        })
+        .ok()?;
+    let mut record = NsRecord::new(id);
     let ref_key = RefKey::new(ledger_name, branch);
     if let Some(entry) = state.refs.get(&ref_key) {
         record.commit_head_id = Some(entry.head.clone());
@@ -288,6 +307,32 @@ impl NameServiceLookup for RaftNameService {
         let (name, branch) = split_ledger_id(ledger_id)?;
         let state = self.state.read().await;
         Ok(record_from_state(&state, &name, &branch))
+    }
+
+    /// One lock, two field reads. Mirrors `get_ref`: retracted branches are
+    /// tombstoned here (`None`) even though `lookup` still returns them.
+    async fn heads(&self, ledger_id: &str) -> Result<Option<LedgerHeads>> {
+        let (name, branch) = split_ledger_id(ledger_id)?;
+        let state = self.state.read().await;
+        if !state.ledgers.contains_key(&name) {
+            return Ok(None);
+        }
+        let ref_key = RefKey::new(&name, &branch);
+        if state.retracted.contains(&ref_key) {
+            return Ok(None);
+        }
+        let entry = state.refs.get(&ref_key);
+        let index = entry.and_then(|e| e.index.as_ref());
+        Ok(Some(LedgerHeads {
+            commit: RefValue {
+                id: entry.map(|e| e.head.clone()),
+                t: entry.map(|e| e.t).unwrap_or(0),
+            },
+            index: RefValue {
+                id: index.map(|i| i.head.clone()),
+                t: index.map(|i| i.t).unwrap_or(0),
+            },
+        }))
     }
 
     async fn all_records(&self) -> Result<Vec<NsRecord>> {
@@ -317,7 +362,10 @@ impl IndexPublisher for RaftNameService {
             Ok(resp) => map_advance_index_response(resp.data),
             // A stepped-down leader's straggling publish call. The
             // new leader will run its own build; nothing for us to
-            // do except not propagate the error.
+            // do except not propagate the error. This swallow is
+            // specific to the background indexer's re-run story —
+            // the one-shot `publish_index_allow_equal` below
+            // surfaces the same condition as an error instead.
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => Ok(()),
             // ChangeMembershipError can't surface here — this
             // command isn't a membership change. Treat as
@@ -345,13 +393,29 @@ impl AdminPublisher for RaftNameService {
         let cmd = build_rewrite_index_command(ledger_id, index_t, index_id)?;
         match self.raft.client_write(cmd).await {
             Ok(resp) => map_advance_index_response(resp.data),
-            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => Ok(()),
+            // Unlike `publish_index`, no swallow here: this trait's
+            // callers are one-shot admin operations (import's final
+            // publish, the CLI index command) with no re-run story —
+            // returning Ok would report success with no index head
+            // published. Not-leader at submission and step-down
+            // mid-propose arrive as the same error, so the outcome
+            // is unresolved: the caller retries against the current
+            // leader.
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => {
+                Err(NameServiceError::propose_unresolved(
+                    "RewriteIndexHead forwarded to leader (this node is not the leader, or \
+                     stepped down mid-propose); retry against the current leader"
+                        .to_string(),
+                ))
+            }
             Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(e))) => {
                 Err(NameServiceError::storage(format!(
                     "unexpected ChangeMembershipError on RewriteIndexHead: {e}"
                 )))
             }
-            Err(RaftError::Fatal(f)) => Err(NameServiceError::storage(format!(
+            // A fatal raft error can strike after the entry was
+            // appended; it may still replicate and commit.
+            Err(RaftError::Fatal(f)) => Err(NameServiceError::propose_unresolved(format!(
                 "raft fatal during RewriteIndexHead: {f}"
             ))),
         }
@@ -426,12 +490,17 @@ fn build_apply_head_command(
 /// result.
 ///
 /// - [`SmResponse::HeadApplied`] → `Ok(())`.
-/// - [`SmResponse::QueueDesync`] → `Err(ApplyStale)` with the reason
-///   inlined. Common causes are admin preemption (`QueueCleared`),
-///   former-leader straggler proposals (`WrongFront`), a stale-base
-///   commit_t (`HeadNotMonotonic`), or a state-machine invariant
-///   break. The worker maps `ApplyStale` to `WorkerError::Stale`
-///   and drops its local install — same recovery shape as the
+/// - [`SmResponse::QueueDesync`] with a `HeadNotMonotonic` reason →
+///   `Err(ApplyLagged)`. The state machine left the entry at the
+///   queue front expecting a retry: the worker staged on a local
+///   view lagging the replicated head, so it refreshes and
+///   re-stages the same entry rather than dropping it.
+/// - [`SmResponse::QueueDesync`] with any other reason →
+///   `Err(ApplyStale)` with the reason inlined. Common causes are
+///   admin preemption (`QueueCleared`), former-leader straggler
+///   proposals (`WrongFront`), or a state-machine invariant break.
+///   The worker maps `ApplyStale` to `WorkerError::Stale` and drops
+///   its local install — same recovery shape as the
 ///   follower-forward path, so the leader-owned worker doesn't
 ///   loop on a condition that can't recover by retrying the same
 ///   propose.
@@ -447,6 +516,14 @@ fn build_apply_head_command(
 fn map_apply_head_response(resp: SmResponse) -> Result<()> {
     match resp {
         SmResponse::HeadApplied { .. } => Ok(()),
+        SmResponse::QueueDesync {
+            ledger_id,
+            requested_queue_id,
+            reason: reason @ DesyncReason::HeadNotMonotonic { .. },
+        } => Err(NameServiceError::apply_lagged(format!(
+            "raft ApplyHead on {ledger_id} (queue_id={requested_queue_id}): {}",
+            describe_desync_reason(&reason)
+        ))),
         SmResponse::QueueDesync {
             ledger_id,
             requested_queue_id,
@@ -528,6 +605,24 @@ pub enum ApplyStagedCommitResponse {
         /// queue is empty (likely admin-cleared between stage and propose).
         current_front_queue_id: Option<u64>,
     },
+    /// The entry is still at the queue front, but the staged
+    /// `commit_t` doesn't advance the replicated head — the caller
+    /// staged against a local view lagging the replicated state
+    /// (`DesyncReason::HeadNotMonotonic`). The state machine left
+    /// the entry in place; the caller should refresh its local view
+    /// and re-stage the same entry.
+    ///
+    /// Appended after `Stale` so postcard's positional variant
+    /// indices keep old-follower decoding of the earlier variants
+    /// intact during a rolling upgrade; an old follower receiving
+    /// this variant fails decode and falls back to its
+    /// backoff-and-retry transport-error path.
+    Lagged {
+        /// `t` of the replicated head the propose failed to advance.
+        current_t: i64,
+        /// `t` the staged commit carried.
+        proposed_t: i64,
+    },
 }
 
 /// Errors returned by [`RaftNameService::apply_staged_commit`]. Sent
@@ -565,9 +660,12 @@ pub enum ApplyStagedCommitError {
     InvariantViolated(String),
     /// A receipt is already stashed under this `queue_id` on the
     /// leader — typically a second follower racing the first under
-    /// an ownership flap. The caller drops its install and lets
-    /// the in-flight ferry land; the entry is the same one either
-    /// way, so the outcome is correct.
+    /// an ownership flap. The in-flight ferry usually decides the
+    /// entry, but its handler can also be dropped between stash and
+    /// propose (TCP reset — the stash guard cleans up and no
+    /// propose happens), so the caller must retry rather than treat
+    /// the entry as decided: if the first ferry landed, the retry
+    /// resolves as a queue-front race and advances.
     #[error("a receipt is already stashed for queue_id {queue_id}")]
     AlreadyStashed { queue_id: u64 },
 }
@@ -666,6 +764,17 @@ impl RaftNameService {
             SmResponse::HeadApplied { commit_t, .. } => {
                 Ok(ApplyStagedCommitResponse::Applied { commit_t })
             }
+            SmResponse::QueueDesync {
+                reason:
+                    DesyncReason::HeadNotMonotonic {
+                        current_t,
+                        proposed_t,
+                    },
+                ..
+            } => Ok(ApplyStagedCommitResponse::Lagged {
+                current_t,
+                proposed_t,
+            }),
             SmResponse::QueueDesync { .. } => Ok(ApplyStagedCommitResponse::Stale {
                 current_front_queue_id: self.current_front_queue_id(&ref_key).await,
             }),
@@ -937,6 +1046,10 @@ fn map_propose_error<E: FromRaftWriteError>(
 /// - [`LedgerNotFound`](ApplyStagedCommitError::LedgerNotFound) →
 ///   [`NotFound`](NameServiceError::NotFound). Terminal; worker
 ///   poisons with `PoisonReason::LedgerNotFound`.
+/// - [`Lagged`](ApplyStagedCommitResponse::Lagged) →
+///   [`ApplyLagged`](NameServiceError::ApplyLagged). The entry is
+///   still at the queue front; the worker refreshes its local view
+///   and re-stages the same entry.
 /// - [`LedgerRetracted`](ApplyStagedCommitError::LedgerRetracted) →
 ///   [`Retracted`](NameServiceError::Retracted). Terminal; worker
 ///   drops the install and moves on (the retract command already
@@ -947,14 +1060,20 @@ fn map_propose_error<E: FromRaftWriteError>(
 ///   [`ApplyRejected`](NameServiceError::ApplyRejected). Terminal;
 ///   worker poisons with `PoisonReason::WorkerPanic`.
 /// - [`AlreadyStashed`](ApplyStagedCommitError::AlreadyStashed) →
-///   [`ApplyStale`](NameServiceError::ApplyStale). Another ferry
-///   for this `queue_id` is already in flight on the leader; the
-///   in-flight one will land. Worker drops its install and moves
-///   on — same drop-and-advance recovery as the queue-front race.
+///   [`ApplyLagged`](NameServiceError::ApplyLagged). Another ferry
+///   for this `queue_id` is in flight on the leader, but it isn't
+///   guaranteed to land — its handler can die between stash and
+///   propose, leaving the entry undecided. The worker retries
+///   after a backoff: a landed first ferry surfaces as a
+///   queue-front race on the retry (drop-and-advance), a dead one
+///   gets the entry decided by the retry itself. Drop-and-advance
+///   here instead would mark the possibly-undecided entry as
+///   committed and skip it forever.
 /// - [`NotLeader`](ApplyStagedCommitError::NotLeader),
 ///   [`RaftPropose`](ApplyStagedCommitError::RaftPropose) →
-///   [`Storage`](NameServiceError::Storage). Transient; worker
-///   retries.
+///   [`ProposeUnresolved`](NameServiceError::ProposeUnresolved).
+///   The propose may have committed on the leader; the worker
+///   keeps its staged blob and retries.
 fn classify_apply_staged_commit_outcome(
     outcome: std::result::Result<ApplyStagedCommitResponse, ApplyStagedCommitError>,
     queue_id: u64,
@@ -966,6 +1085,13 @@ fn classify_apply_staged_commit_outcome(
         }) => Err(NameServiceError::apply_stale(format!(
             "queue_id {queue_id} no longer at front (current front: {current_front_queue_id:?})"
         ))),
+        Ok(ApplyStagedCommitResponse::Lagged {
+            current_t,
+            proposed_t,
+        }) => Err(NameServiceError::apply_lagged(format!(
+            "queue_id {queue_id} still at front, but proposed commit_t {proposed_t} would not \
+             advance current head (t={current_t}); local view lags the replicated head"
+        ))),
         Err(ApplyStagedCommitError::LedgerNotFound(id)) => Err(NameServiceError::not_found(id)),
         Err(ApplyStagedCommitError::LedgerRetracted(id)) => Err(NameServiceError::Retracted(id)),
         Err(ApplyStagedCommitError::InvariantViolated(msg)) => {
@@ -973,13 +1099,20 @@ fn classify_apply_staged_commit_outcome(
                 "apply_staged_commit invariant violated: {msg}"
             )))
         }
-        Err(ApplyStagedCommitError::AlreadyStashed { queue_id }) => Err(
-            NameServiceError::apply_stale(format!("queue_id {queue_id} already in flight")),
-        ),
+        Err(ApplyStagedCommitError::AlreadyStashed { queue_id }) => {
+            Err(NameServiceError::apply_lagged(format!(
+                "queue_id {queue_id} already has a ferry in flight on the leader; \
+                 retry after it resolves"
+            )))
+        }
+        // NotLeader can't distinguish "stale leader lookup, nothing
+        // submitted" from "stepped down mid-propose, entry may still
+        // commit"; RaftPropose fatals can likewise strike after the
+        // entry was appended. Both leave the outcome unresolved.
         Err(
             e @ (ApplyStagedCommitError::NotLeader { .. } | ApplyStagedCommitError::RaftPropose(_)),
-        ) => Err(NameServiceError::storage(format!(
-            "leader rejected apply_staged_commit: {e}"
+        ) => Err(NameServiceError::propose_unresolved(format!(
+            "leader could not resolve apply_staged_commit: {e}"
         ))),
     }
 }
@@ -1055,8 +1188,11 @@ impl RaftNameService {
             // Ok would tell the worker the head landed, leaving the
             // staged receipt in place to later override the
             // genuinely-committed receipt from the new leader.
+            // Step-down window: if leadership was lost after the
+            // entry was accepted, it can still commit under the new
+            // leader — the outcome is unresolved, not failed.
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => {
-                Err(NameServiceError::storage(
+                Err(NameServiceError::propose_unresolved(
                     "ApplyHead forwarded to leader (stepped down between stage and propose); \
                      caller should drop the stash and let the new leader's worker re-stage"
                         .to_string(),
@@ -1067,7 +1203,9 @@ impl RaftNameService {
                     "unexpected ChangeMembershipError on ApplyHead: {e}"
                 )))
             }
-            Err(RaftError::Fatal(f)) => Err(NameServiceError::storage(format!(
+            // A fatal raft error can strike after the entry was
+            // appended; it may still replicate and commit.
+            Err(RaftError::Fatal(f)) => Err(NameServiceError::propose_unresolved(format!(
                 "raft fatal during ApplyHead: {f}"
             ))),
         }
@@ -1160,22 +1298,35 @@ impl RaftNameService {
             .send()
             .await
             .map_err(|e| {
-                NameServiceError::storage(format!("apply_staged_commit POST to leader: {e}"))
+                // The request may have reached the leader before the
+                // failure (timeout covers send + response read), so
+                // the propose may have committed.
+                NameServiceError::propose_unresolved(format!(
+                    "apply_staged_commit POST to leader: {e}"
+                ))
             })?;
 
         if !resp.status().is_success() {
-            return Err(NameServiceError::storage(format!(
+            // A non-2xx can arise before the propose (request decode
+            // rejected) or after it (post-propose handler failure);
+            // the status alone can't distinguish them.
+            return Err(NameServiceError::propose_unresolved(format!(
                 "apply_staged_commit returned HTTP {}",
                 resp.status()
             )));
         }
 
         let body_bytes = resp.bytes().await.map_err(|e| {
-            NameServiceError::storage(format!("read apply_staged_commit body: {e}"))
+            // 2xx headers arrived, so the leader computed an outcome;
+            // it was lost with the body.
+            NameServiceError::propose_unresolved(format!("read apply_staged_commit body: {e}"))
         })?;
         let outcome: std::result::Result<ApplyStagedCommitResponse, ApplyStagedCommitError> =
             postcard::from_bytes(&body_bytes).map_err(|e| {
-                NameServiceError::storage(format!(
+                // Outcome delivered but unreadable — includes a newer
+                // leader sending a response variant this node doesn't
+                // know yet (rolling upgrade).
+                NameServiceError::propose_unresolved(format!(
                     "postcard decode of apply_staged_commit response: {e}"
                 ))
             })?;
@@ -1336,7 +1487,7 @@ fn build_retract_command(ledger_id: &str) -> std::result::Result<SmCommand, Name
 
 fn build_purge_command(ledger_id: &str) -> std::result::Result<SmCommand, NameServiceError> {
     let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-    Ok(SmCommand::PurgeLedger {
+    Ok(SmCommand::PurgeBranch {
         ledger_id: ledger_name,
         branch,
         applied_at_millis: crate::raft::current_millis(),
@@ -1367,8 +1518,19 @@ fn map_retract_response(resp: SmResponse) -> Result<()> {
 fn map_purge_response(resp: SmResponse) -> Result<()> {
     match resp {
         SmResponse::Purged { .. } | SmResponse::AlreadyPurged { .. } => Ok(()),
+        // Purge, like drop_branch, refuses a branch that still has
+        // children. The whole-ledger drop composes purges leaf-first
+        // (children already gone → the parent's count is 0), so this
+        // only fires on an out-of-order direct purge of a parent —
+        // failing loud instead of stranding the child.
+        SmResponse::BranchHasChildren {
+            ledger_id,
+            children,
+        } => Err(NameServiceError::storage(format!(
+            "purge refused: {ledger_id} still has {children} child branch(es)"
+        ))),
         other => Err(NameServiceError::storage(format!(
-            "unexpected Response variant for PurgeLedger: {other:?}"
+            "unexpected Response variant for PurgeBranch: {other:?}"
         ))),
     }
 }
@@ -1575,18 +1737,21 @@ impl RefPublisher for RaftNameService {
         new: &RefValue,
     ) -> Result<CasResult> {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-        let cmd = SmCommand::CompareAndSetRef {
+        let cmd = SmCommand::CompareAndSetRef(RefCas {
             ledger_id: ledger_name,
             branch,
             kind,
             expected: expected.cloned(),
             new: new.clone(),
             applied_at_millis: crate::raft::current_millis(),
-        };
+        });
         match self.submit_lifecycle(cmd).await? {
             SmResponse::RefCasUpdated => Ok(CasResult::Updated),
             SmResponse::RefCasConflict { actual } => Ok(CasResult::Conflict { actual }),
             SmResponse::LedgerNotFound { ledger_id } => Err(NameServiceError::not_found(ledger_id)),
+            SmResponse::LedgerRetracted { ledger_id } => {
+                Err(NameServiceError::Retracted(ledger_id))
+            }
             // `IndexAhead` from an `IndexHead` CAS proposing past
             // the branch's commit watermark maps to a `Conflict`
             // with no actual value.
@@ -1604,8 +1769,10 @@ impl GraphSourceLookup for RaftNameService {
         &self,
         graph_source_id: &str,
     ) -> Result<Option<GraphSourceRecord>> {
+        // Keyed by canonical `name:branch`, as every other backend resolves.
+        let key = LedgerId::parse(graph_source_id)?.to_string();
         let state = self.state.read().await;
-        Ok(state.graph_sources.get(graph_source_id).cloned())
+        Ok(state.graph_sources.get(&key).cloned())
     }
 
     /// Resolve `resource_id` against the ledger map first, then the
@@ -1615,8 +1782,9 @@ impl GraphSourceLookup for RaftNameService {
         if let Some(record) = self.lookup(resource_id).await? {
             return Ok(NsLookupResult::Ledger(record));
         }
+        let key = LedgerId::parse(resource_id)?.to_string();
         let state = self.state.read().await;
-        if let Some(record) = state.graph_sources.get(resource_id).cloned() {
+        if let Some(record) = state.graph_sources.get(&key).cloned() {
             return Ok(NsLookupResult::GraphSource(record));
         }
         Ok(NsLookupResult::NotFound)
@@ -1695,6 +1863,10 @@ impl GraphSourcePublisher for RaftNameService {
 impl StatusLookup for RaftNameService {
     async fn get_status(&self, ledger_id: &str) -> Result<Option<StatusValue>> {
         let (name, branch) = split_ledger_id(ledger_id)?;
+        // `state.status` is keyed by the canonical `name:branch`
+        // form (`push_status` canonicalizes before proposing), so a
+        // bare-name read finds what a full-form push wrote.
+        let canonical = format_ledger_id(&name, &branch);
         let state = self.state.read().await;
         let branch_registered = state
             .ledgers
@@ -1703,13 +1875,12 @@ impl StatusLookup for RaftNameService {
         if !branch_registered {
             return Ok(None);
         }
-        Ok(Some(
-            state
-                .status
-                .get(ledger_id)
-                .cloned()
-                .unwrap_or_else(StatusValue::initial),
-        ))
+        let stored = state
+            .status
+            .get(&canonical)
+            .cloned()
+            .unwrap_or_else(StoredStatus::initial);
+        Ok(Some(StatusValue::from(&stored)))
     }
 }
 
@@ -1721,14 +1892,25 @@ impl StatusPublisher for RaftNameService {
         expected: Option<&StatusValue>,
         new: &StatusValue,
     ) -> Result<StatusCasResult> {
+        // Canonicalize before proposing so `"db"` and `"db:main"`
+        // address the same replicated entry. The state machine keys
+        // on the command's string verbatim — canonicalizing inside
+        // apply would make mixed-version nodes replay the same log
+        // entry to different keys. Values convert to the
+        // postcard-safe `StoredStatus` form here for the same
+        // reason: the apply compares and stores the command's bytes
+        // verbatim.
+        let (name, branch) = split_ledger_id(ledger_id)?;
         let cmd = SmCommand::PushStatus {
-            ledger_id: ledger_id.to_string(),
-            expected: expected.cloned(),
-            new: new.clone(),
+            ledger_id: format_ledger_id(&name, &branch),
+            expected: expected.map(StoredStatus::from),
+            new: StoredStatus::from(new),
         };
         match self.submit_lifecycle(cmd).await? {
             SmResponse::StatusUpdated => Ok(StatusCasResult::Updated),
-            SmResponse::StatusConflict { actual } => Ok(StatusCasResult::Conflict { actual }),
+            SmResponse::StatusConflict { actual } => Ok(StatusCasResult::Conflict {
+                actual: actual.as_ref().map(StatusValue::from),
+            }),
             other => Err(NameServiceError::storage(format!(
                 "unexpected Response variant for PushStatus: {other:?}"
             ))),
@@ -1740,6 +1922,8 @@ impl StatusPublisher for RaftNameService {
 impl ConfigLookup for RaftNameService {
     async fn get_config(&self, ledger_id: &str) -> Result<Option<ConfigValue>> {
         let (name, branch) = split_ledger_id(ledger_id)?;
+        // Same canonical keying as `get_status` above.
+        let canonical = format_ledger_id(&name, &branch);
         let state = self.state.read().await;
         let branch_registered = state
             .ledgers
@@ -1748,13 +1932,12 @@ impl ConfigLookup for RaftNameService {
         if !branch_registered {
             return Ok(None);
         }
-        Ok(Some(
-            state
-                .config
-                .get(ledger_id)
-                .cloned()
-                .unwrap_or_else(ConfigValue::unborn),
-        ))
+        let stored = state
+            .config
+            .get(&canonical)
+            .cloned()
+            .unwrap_or_else(StoredConfig::unborn);
+        Ok(Some(ConfigValue::from(&stored)))
     }
 }
 
@@ -1766,14 +1949,18 @@ impl ConfigPublisher for RaftNameService {
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> Result<ConfigCasResult> {
+        // Same canonicalize-before-propose contract as `push_status`.
+        let (name, branch) = split_ledger_id(ledger_id)?;
         let cmd = SmCommand::PushConfig(Box::new(ConfigUpdate {
-            ledger_id: ledger_id.to_string(),
-            expected: expected.cloned(),
-            new: new.clone(),
+            ledger_id: format_ledger_id(&name, &branch),
+            expected: expected.map(StoredConfig::from),
+            new: StoredConfig::from(new),
         }));
         match self.submit_lifecycle(cmd).await? {
             SmResponse::ConfigUpdated => Ok(ConfigCasResult::Updated),
-            SmResponse::ConfigConflict { actual } => Ok(ConfigCasResult::Conflict { actual }),
+            SmResponse::ConfigConflict { actual } => Ok(ConfigCasResult::Conflict {
+                actual: actual.as_ref().map(ConfigValue::from),
+            }),
             other => Err(NameServiceError::storage(format!(
                 "unexpected Response variant for PushConfig: {other:?}"
             ))),
@@ -1818,11 +2005,26 @@ mod tests {
         ContentId::new(ContentKind::Commit, &[seed])
     }
 
-    fn fresh_state() -> SharedState {
+    /// State a test owns and drives directly.
+    ///
+    /// Production state is written only by `apply`, so the code under
+    /// test receives the read-only [`view`] of this rather than the
+    /// handle itself — a scenario is set up by owning the other half,
+    /// not by widening what consumers can do.
+    fn fresh_state() -> Arc<RwLock<NameServiceState>> {
         Arc::new(RwLock::new(NameServiceState::default()))
     }
 
-    async fn apply_cmd(state: &SharedState, cmd: Command, index: u64) -> Response {
+    /// The read-only view of a test's state, as a consumer sees it.
+    fn view(state: &Arc<RwLock<NameServiceState>>) -> SharedState {
+        SharedState::view_of(Arc::clone(state))
+    }
+
+    async fn apply_cmd(
+        state: &Arc<RwLock<NameServiceState>>,
+        cmd: Command,
+        index: u64,
+    ) -> Response {
         let mut guard = state.write().await;
         crate::raft::state_machine::apply(&mut guard, cmd, index)
     }
@@ -1896,12 +2098,12 @@ mod tests {
     /// not the openraft consensus loop.
     async fn stub_raft() -> Arc<Raft<crate::raft::TypeConfig>> {
         use crate::raft::log_adapter::LogAdapter;
-        use crate::raft::state_machine_adapter::StateMachineAdapter;
+        use crate::raft::state_machine_adapter::{NameServiceObserver, StateMachineAdapter};
         use crate::raft::storage::memory::MemoryRaftStorage;
 
         let storage = Arc::new(MemoryRaftStorage::new());
         let log = LogAdapter::new(Arc::clone(&storage));
-        let sm = StateMachineAdapter::new(Arc::clone(&storage));
+        let sm = StateMachineAdapter::new(Arc::clone(&storage), NameServiceObserver::new());
         let config = Arc::new(Config::default().validate().expect("config validates"));
         Arc::new(
             Raft::new(1, config, StubFactory, log, sm)
@@ -2108,6 +2310,7 @@ mod tests {
             ledger_id: "test/db:main".into(),
             commit_id: cid(1),
             commit_t: 1,
+            released_envelope: None,
         });
         assert!(r.is_ok());
     }
@@ -2147,6 +2350,28 @@ mod tests {
         assert!(
             matches!(err, NameServiceError::ApplyStale(_)),
             "expected ApplyStale (drop-and-advance), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn map_apply_head_response_head_not_monotonic_is_apply_lagged() {
+        // HeadNotMonotonic leaves the entry at the queue front —
+        // the worker must refresh and re-stage, not drop the work.
+        // Flattening it into ApplyStale (drop-and-advance) made the
+        // worker mark the entry committed and skip it forever,
+        // permanently stalling the branch queue.
+        let r = map_apply_head_response(SmResponse::QueueDesync {
+            ledger_id: "test/db:main".into(),
+            requested_queue_id: 7,
+            reason: DesyncReason::HeadNotMonotonic {
+                current_t: 5,
+                proposed_t: 3,
+            },
+        });
+        let err = r.expect_err("desync is error");
+        assert!(
+            matches!(err, NameServiceError::ApplyLagged(_)),
+            "expected ApplyLagged (refresh-and-re-stage), got {err:?}"
         );
     }
 
@@ -2234,6 +2459,9 @@ mod tests {
             time: Some("12.34ms".to_string()),
             fuel: Some(1.5),
             policy: Some(policy),
+            // Read-path-only: never set on a transaction tally and deliberately
+            // absent from the recorded wire mirror (see `RecordedTally`).
+            policy_enforcement: None,
             reasoning: Some(ReasoningTally {
                 capped: true,
                 capped_reason: Some("budget".to_string()),
@@ -2241,6 +2469,8 @@ mod tests {
                 iterations: 3,
                 duration_ms: 17,
             }),
+            sql: None,
+            sql_elided: None,
         }
     }
 
@@ -2311,6 +2541,7 @@ mod tests {
             time: None,
             fuel: Some(1.0),
             policy: None,
+            policy_enforcement: None,
             reasoning: Some(ReasoningTally {
                 capped: false,
                 capped_reason: None,
@@ -2318,6 +2549,8 @@ mod tests {
                 iterations: 1,
                 duration_ms: 5,
             }),
+            sql: None,
+            sql_elided: None,
         };
         let receipt = AppliedReceipt::Transact(TransactApplied {
             commit_id: cid(2),
@@ -2386,6 +2619,31 @@ mod tests {
     }
 
     #[test]
+    fn classify_outcome_lagged_is_apply_lagged() {
+        // The `Lagged` shape means our queue_id is STILL at the
+        // front — the leader's state machine pushed the entry back
+        // because our staged commit_t didn't advance the replicated
+        // head. Map to `ApplyLagged` so the worker refreshes its
+        // local view and re-stages the same entry, instead of the
+        // drop-and-advance recovery `ApplyStale` triggers (which
+        // would skip the still-queued entry forever).
+        let r = classify_apply_staged_commit_outcome(
+            Ok(ApplyStagedCommitResponse::Lagged {
+                current_t: 5,
+                proposed_t: 3,
+            }),
+            7,
+        );
+        let err = r.expect_err("lagged must be Err");
+        assert!(
+            matches!(err, NameServiceError::ApplyLagged(_)),
+            "expected ApplyLagged, got {err:?}"
+        );
+        assert!(err.to_string().contains("queue_id 7"));
+        assert!(err.to_string().contains("commit_t 3"));
+    }
+
+    #[test]
     fn classify_outcome_stale_with_empty_queue_is_apply_stale() {
         // Admin-clear case: the queue was wiped between our stage
         // and propose; `current_front_queue_id` is `None`. Same
@@ -2446,19 +2704,23 @@ mod tests {
     }
 
     #[test]
-    fn classify_outcome_already_stashed_is_apply_stale() {
-        // Duplicate ferry under an ownership flap: the in-flight
-        // first ferry will land, so the second's worker should drop
-        // its install and advance — same recovery shape as the
-        // queue-front race.
+    fn classify_outcome_already_stashed_is_apply_lagged() {
+        // Duplicate ferry under an ownership flap. The in-flight
+        // first ferry is NOT guaranteed to land — its leader-side
+        // handler can die between stash and propose (TCP reset),
+        // leaving the entry undecided. Mapping to ApplyStale
+        // (drop-and-advance) made the surviving owner mark the
+        // still-queued entry committed and skip it forever;
+        // ApplyLagged retries instead, and a landed first ferry
+        // simply surfaces as a queue-front race on the retry.
         let r = classify_apply_staged_commit_outcome(
             Err(ApplyStagedCommitError::AlreadyStashed { queue_id: 7 }),
             7,
         );
         let err = r.expect_err("already_stashed must be Err");
         assert!(
-            matches!(err, NameServiceError::ApplyStale(_)),
-            "expected ApplyStale, got {err:?}"
+            matches!(err, NameServiceError::ApplyLagged(_)),
+            "expected ApplyLagged, got {err:?}"
         );
         assert!(err.to_string().contains("queue_id 7"));
     }
@@ -2485,25 +2747,29 @@ mod tests {
     }
 
     #[test]
-    fn classify_outcome_not_leader_is_transient_storage() {
-        // Mid-flight leader change. Transient: the next round
-        // discovers the new leader and retries against it.
+    fn classify_outcome_not_leader_is_propose_unresolved() {
+        // Mid-flight leader change. The propose may have been
+        // accepted before the step-down and can still commit under
+        // the new leader — the worker keeps its staged blob and
+        // retries once the next round discovers the new leader.
         let r = classify_apply_staged_commit_outcome(
             Err(ApplyStagedCommitError::NotLeader { leader: Some(2) }),
             7,
         );
         let err = r.expect_err("not_leader must be Err");
         assert!(
-            matches!(err, NameServiceError::Storage(_)),
-            "expected Storage, got {err:?}"
+            matches!(err, NameServiceError::ProposeUnresolved(_)),
+            "expected ProposeUnresolved, got {err:?}"
         );
     }
 
     #[test]
-    fn classify_outcome_raft_propose_is_transient_storage() {
+    fn classify_outcome_raft_propose_is_propose_unresolved() {
         // Raft fatal (membership-change error, log fsync stuck,
-        // etc.). Transient at this layer — openraft's own retry
-        // machinery and the worker's backoff handle recovery.
+        // etc.) can strike after the entry was appended, so the
+        // outcome is unresolved rather than failed; the worker
+        // keeps its staged blob while openraft's retry machinery
+        // and the worker's backoff handle recovery.
         let r = classify_apply_staged_commit_outcome(
             Err(ApplyStagedCommitError::RaftPropose(
                 "log fsync failed".into(),
@@ -2512,8 +2778,8 @@ mod tests {
         );
         let err = r.expect_err("raft_propose must be Err");
         assert!(
-            matches!(err, NameServiceError::Storage(_)),
-            "expected Storage, got {err:?}"
+            matches!(err, NameServiceError::ProposeUnresolved(_)),
+            "expected ProposeUnresolved, got {err:?}"
         );
     }
 
@@ -2560,7 +2826,10 @@ mod tests {
                 );
                 m
             }),
+            policy_enforcement: None,
             reasoning: Some(original_reasoning),
+            sql: None,
+            sql_elided: None,
         };
         let original_transact = TransactApplied {
             commit_id: cid(2),
@@ -2605,11 +2874,19 @@ mod tests {
             time: rt_time,
             fuel: rt_fuel,
             policy: rt_policy,
+            policy_enforcement: rt_policy_enforcement,
             reasoning: rt_reasoning,
+            sql: rt_sql,
+            sql_elided: rt_sql_elided,
         } = rt_tally.expect("tally Some on round-trip");
+        assert_eq!(rt_sql, None);
+        assert_eq!(rt_sql_elided, None);
         assert_eq!(rt_time, original_tally.time);
         assert_eq!(rt_fuel, original_tally.fuel);
         assert_eq!(rt_policy, original_tally.policy);
+        // Not carried by the recorded mirror: a replicated transaction never
+        // has a read-path enforcement record to carry.
+        assert_eq!(rt_policy_enforcement, None);
 
         let ReasoningTally {
             capped: rt_capped,
@@ -2706,7 +2983,7 @@ mod tests {
 
     #[tokio::test]
     async fn publishing_ledger_id_echoes_input() {
-        let ns = RaftNameService::new(fresh_state(), stub_raft().await);
+        let ns = RaftNameService::new(view(&fresh_state()), stub_raft().await);
         assert_eq!(
             ns.publishing_ledger_id("test/db:main"),
             Some("test/db:main".to_string())
@@ -2721,7 +2998,7 @@ mod tests {
     /// through the queue. Used by lookup-side tests that need a
     /// populated head but aren't exercising the apply pipeline.
     async fn seed_head(
-        state: &SharedState,
+        state: &Arc<RwLock<NameServiceState>>,
         ledger_id: &str,
         branch: &str,
         head: ContentId,
@@ -2753,9 +3030,35 @@ mod tests {
         );
     }
 
+    /// The stub raft is never initialized, so it has no leader and
+    /// `client_write` returns `ForwardToLeader` — exactly the
+    /// condition whose handling deliberately differs between the
+    /// two index publishers. The background indexer's `publish_index`
+    /// swallows it (the new leader runs its own build); the one-shot
+    /// admin `publish_index_allow_equal` must surface it, or import
+    /// and the CLI report success with no index head published.
+    #[tokio::test]
+    async fn publish_index_swallows_not_leader() {
+        let ns = RaftNameService::new(view(&fresh_state()), stub_raft().await);
+        assert!(ns.publish_index("test/db:main", 1, &cid(1)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn publish_index_allow_equal_surfaces_not_leader() {
+        let ns = RaftNameService::new(view(&fresh_state()), stub_raft().await);
+        let err = ns
+            .publish_index_allow_equal("test/db:main", 1, &cid(1))
+            .await
+            .expect_err("not-leader admin publish must not report success");
+        assert!(
+            matches!(err, NameServiceError::ProposeUnresolved(_)),
+            "expected ProposeUnresolved, got {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn lookup_returns_none_when_ledger_missing() {
-        let ns = RaftNameService::new(fresh_state(), stub_raft().await);
+        let ns = RaftNameService::new(view(&fresh_state()), stub_raft().await);
         assert!(ns.lookup("test/db:main").await.unwrap().is_none());
     }
 
@@ -2765,12 +3068,94 @@ mod tests {
         let _ = apply_cmd(&state, init_cmd("test/db", "main"), 1).await;
         seed_head(&state, "test/db", "main", cid(5), 7).await;
 
-        let ns = RaftNameService::new(state, stub_raft().await);
+        let ns = RaftNameService::new(view(&state), stub_raft().await);
         let record = ns.lookup("test/db:main").await.unwrap().expect("record");
         assert_eq!(record.ledger_id, "test/db:main");
         assert_eq!(record.commit_head_id, Some(cid(5)));
         assert_eq!(record.commit_t, 7);
         assert_eq!(record.index_head_id, None);
+    }
+
+    /// Graph sources are stored under canonical `name:branch`; a branchless
+    /// lookup must resolve like every other backend's, not miss on raft only.
+    #[tokio::test]
+    async fn graph_source_lookups_accept_the_branchless_spelling() {
+        let state = fresh_state();
+        apply_cmd(
+            &state,
+            Command::PublishGraphSource {
+                name: "search".into(),
+                branch: "main".into(),
+                source_type: GraphSourceType::Bm25,
+                config: "{}".into(),
+                dependencies: vec![],
+            },
+            1,
+        )
+        .await;
+        let ns = RaftNameService::new(view(&state), stub_raft().await);
+        let record = ns.lookup_graph_source("search").await.unwrap();
+        assert_eq!(record.expect("found").graph_source_id, "search:main");
+        assert!(matches!(
+            ns.lookup_any("search").await.unwrap(),
+            NsLookupResult::GraphSource(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn status_and_config_reads_normalize_ledger_id() {
+        // Entries land under the canonical `name:branch` form (what
+        // `push_status` / `push_config` propose after
+        // canonicalizing); reads with either form must find them.
+        // The full push round trip is pinned (currently ignored) in
+        // `tests/single_node_round_trip.rs` — the commands aren't
+        // postcard-serializable yet.
+        let state = fresh_state();
+        apply_cmd(&state, init_cmd("test/db", "main"), 1).await;
+
+        let pushed_status = StatusValue::new(2, Default::default());
+        let resp = apply_cmd(
+            &state,
+            Command::PushStatus {
+                ledger_id: "test/db:main".into(),
+                expected: Some(StoredStatus::initial()),
+                new: StoredStatus::from(&pushed_status),
+            },
+            2,
+        )
+        .await;
+        assert_eq!(resp, Response::StatusUpdated);
+
+        let pushed_config = ConfigValue::new(1, None);
+        let resp = apply_cmd(
+            &state,
+            Command::PushConfig(Box::new(ConfigUpdate {
+                ledger_id: "test/db:main".into(),
+                expected: Some(StoredConfig::unborn()),
+                new: StoredConfig::from(&pushed_config),
+            })),
+            3,
+        )
+        .await;
+        assert_eq!(resp, Response::ConfigUpdated);
+
+        let ns = RaftNameService::new(view(&state), stub_raft().await);
+        assert_eq!(
+            ns.get_status("test/db").await.unwrap(),
+            Some(pushed_status.clone())
+        );
+        assert_eq!(
+            ns.get_status("test/db:main").await.unwrap(),
+            Some(pushed_status)
+        );
+        assert_eq!(
+            ns.get_config("test/db").await.unwrap(),
+            Some(pushed_config.clone())
+        );
+        assert_eq!(
+            ns.get_config("test/db:main").await.unwrap(),
+            Some(pushed_config)
+        );
     }
 
     #[tokio::test]
@@ -2779,7 +3164,7 @@ mod tests {
         apply_cmd(&state, init_cmd("test/db", "main"), 1).await;
         seed_head(&state, "test/db", "main", cid(9), 3).await;
 
-        let ns = RaftNameService::new(state, stub_raft().await);
+        let ns = RaftNameService::new(view(&state), stub_raft().await);
         let ref_value = ns
             .get_ref("test/db:main", RefKind::CommitHead)
             .await
@@ -2797,9 +3182,28 @@ mod tests {
         assert_eq!(index_ref.t, 0);
     }
 
+    #[tokio::test]
+    async fn heads_matches_get_ref_and_tombstones_unknown() {
+        let state = fresh_state();
+        apply_cmd(&state, init_cmd("test/db", "main"), 1).await;
+        seed_head(&state, "test/db", "main", cid(9), 3).await;
+
+        let ns = RaftNameService::new(view(&state), stub_raft().await);
+        let heads = ns.heads("test/db:main").await.unwrap().expect("heads");
+        assert_eq!(
+            heads.commit,
+            RefValue {
+                id: Some(cid(9)),
+                t: 3
+            }
+        );
+        assert_eq!(heads.index, RefValue { id: None, t: 0 });
+        assert!(ns.heads("test/other:main").await.unwrap().is_none());
+    }
+
     /// Convenience for the index-head tests: create a ledger and
     /// seed its commit head + t. Returns the shared state.
-    async fn ledger_at_commit(commit_head: u8, commit_t: i64) -> SharedState {
+    async fn ledger_at_commit(commit_head: u8, commit_t: i64) -> Arc<RwLock<NameServiceState>> {
         let state = fresh_state();
         let _ = apply_cmd(&state, init_cmd("test/db", "main"), 1).await;
         seed_head(&state, "test/db", "main", cid(commit_head), commit_t).await;
@@ -2822,7 +3226,7 @@ mod tests {
         )
         .await;
 
-        let ns = RaftNameService::new(state, stub_raft().await);
+        let ns = RaftNameService::new(view(&state), stub_raft().await);
         let record = ns.lookup("test/db:main").await.unwrap().expect("record");
         assert_eq!(record.commit_head_id, Some(cid(7)));
         assert_eq!(record.commit_t, 10);
@@ -2846,7 +3250,7 @@ mod tests {
         )
         .await;
 
-        let ns = RaftNameService::new(state, stub_raft().await);
+        let ns = RaftNameService::new(view(&state), stub_raft().await);
         let ref_value = ns
             .get_ref("test/db:main", RefKind::IndexHead)
             .await
@@ -2877,7 +3281,7 @@ mod tests {
         .await;
         seed_head(&state, "test/db", "main", cid(8), 20).await;
 
-        let ns = RaftNameService::new(state, stub_raft().await);
+        let ns = RaftNameService::new(view(&state), stub_raft().await);
         let record = ns.lookup("test/db:main").await.unwrap().expect("record");
         assert_eq!(record.commit_head_id, Some(cid(8)));
         assert_eq!(record.commit_t, 20);
@@ -2892,7 +3296,7 @@ mod tests {
         apply_cmd(&state, init_cmd("a/db", "main"), 1).await;
         seed_head(&state, "a/db", "feat", cid(1), 1).await;
 
-        let ns = RaftNameService::new(state, stub_raft().await);
+        let ns = RaftNameService::new(view(&state), stub_raft().await);
         let mut ids: Vec<_> = ns
             .all_records()
             .await

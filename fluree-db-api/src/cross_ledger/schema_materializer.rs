@@ -16,7 +16,7 @@
 
 use super::types::{SchemaArtifactWire, WireObject, WireOrigin, WireTriple};
 use super::CrossLedgerError;
-use crate::Fluree;
+use super::ResolveCtx;
 use fluree_db_core::{
     is_rdf_type, is_schema_class, is_schema_predicate, FlakeValue, IndexType, LedgerSnapshot,
     RangeMatch, RangeOptions, RangeTest, Sid,
@@ -27,7 +27,7 @@ use fluree_db_core::{
 #[tracing::instrument(
     name = "cross_ledger.schema.materialize",
     level = "debug",
-    skip(fluree),
+    skip(ctx),
     fields(
         model_ledger = canonical_model_ledger_id,
         graph_iri = graph_iri,
@@ -38,13 +38,13 @@ pub(super) async fn materialize_schema(
     canonical_model_ledger_id: &str,
     graph_iri: &str,
     resolved_t: i64,
-    fluree: &Fluree,
+    ctx: &ResolveCtx<'_>,
 ) -> Result<SchemaArtifactWire, CrossLedgerError> {
     use fluree_vocab::{owl, rdf, rdfs};
 
     // 1. Open M at resolved_t.
-    let m_db = fluree
-        .load_graph_db_at_t(canonical_model_ledger_id, resolved_t)
+    let m_db = ctx
+        .open_model_db(canonical_model_ledger_id, resolved_t)
         .await
         .map_err(|e| CrossLedgerError::TranslationFailed {
             ledger_id: canonical_model_ledger_id.to_string(),

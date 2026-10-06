@@ -576,7 +576,7 @@ fn sparql_is_history_query(sparql: &str) -> bool {
 /// used in the collision error message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExtractedFrom {
-    /// Bare ledger identifier with any `@t:`/`@iso:`/`@commit:` suffix and
+    /// Bare ledger identifier with any `@t:`/`@time:`/`@commit:` suffix and
     /// `#named-graph` fragment stripped.
     ledger: String,
     /// `Some(location)` if the source entry expressed a temporal pin
@@ -591,7 +591,7 @@ struct ExtractedFrom {
 /// Mirrors the dataset parser surface (`parse_single_graph_source` /
 /// `parse_graph_sources` in `crate::dataset`):
 /// - String → single graph source. The identifier may carry a
-///   `@t:`/`@iso:`/`@commit:` suffix (temporal pin) and an optional
+///   `@t:`/`@time:`/`@commit:` suffix (temporal pin) and an optional
 ///   `#named-graph` fragment.
 /// - Object → single graph source with `@id`/`id` for the identifier and
 ///   optional `t` (integer) or `at` (string: `commit:HASH` or ISO timestamp)
@@ -627,15 +627,12 @@ fn extract_jsonld_from_value(val: &JsonValue, out: &mut Vec<ExtractedFrom>) {
 }
 
 fn extract_jsonld_from_string(s: &str) -> ExtractedFrom {
-    let pin_location = TEMPORAL_MARKERS.iter().find_map(|m| {
-        if s.contains(m) {
-            Some(format!("'from' contains temporal pin: {s}"))
-        } else {
-            None
-        }
-    });
+    // The same tag-driven detection the snapshot rewriter uses, so a pin the
+    // rewriter leaves alone is one the collision check saw.
+    let pin_location =
+        snapshot::string_has_explicit_pin(s).then(|| format!("'from' contains temporal pin: {s}"));
     ExtractedFrom {
-        ledger: strip_temporal_suffix(s).to_string(),
+        ledger: snapshot::bare_ledger_id(s),
         pin_location,
     }
 }
@@ -667,22 +664,6 @@ fn extract_jsonld_from_object(obj: &JsonMap<String, JsonValue>) -> Option<Extrac
 
     Some(entry)
 }
-
-/// Strip a `@t:`/`@iso:`/`@commit:` suffix from a ledger identifier so distinct
-/// ledger counting is independent of temporal pins.
-fn strip_temporal_suffix(ledger: &str) -> &str {
-    // Fragment (`#named-graph`) may follow the temporal marker; we strip it
-    // alongside the marker to keep counting on the bare ledger name.
-    let bare = ledger.split('#').next().unwrap_or(ledger);
-    for marker in TEMPORAL_MARKERS {
-        if let Some(idx) = bare.find(marker) {
-            return &bare[..idx];
-        }
-    }
-    bare
-}
-
-const TEMPORAL_MARKERS: &[&str] = &["@t:", "@iso:", "@commit:"];
 
 /// Extract per-IRI ledger identifiers and temporal-pin status from a SPARQL
 /// query's `FROM` / `FROM NAMED` dataset clauses.
@@ -772,6 +753,87 @@ pub fn merged_opts(envelope: Option<&JsonValue>, inner: Option<&JsonValue>) -> O
         (None, None) => None,
         (Some(v), None) | (None, Some(v)) => Some(v.clone()),
         (Some(env), Some(inner)) => Some(shallow_merge_objects(env, inner)),
+    }
+}
+
+/// A SPARQL sub-query's `# PRAGMA` options as the `opts` object a JSON-LD body
+/// would carry: the body layer of the alias's opts merge, so they win over the
+/// alias's and the envelope's `opts` as a JSON-LD body's do. `Err` names a
+/// pragma that does not parse.
+pub fn sparql_pragma_opts(sparql: &str) -> std::result::Result<Option<JsonValue>, String> {
+    let pragmas = fluree_db_sparql::request_pragmas(sparql)?;
+    let mut opts = serde_json::Map::new();
+    if let Some(meta) = pragmas.meta {
+        opts.insert(
+            "meta".into(),
+            serde_json::json!({"time": meta.time, "fuel": meta.fuel, "policy": meta.policy}),
+        );
+    }
+    if let Some(max_fuel) = pragmas.max_fuel {
+        opts.insert("max-fuel".into(), serde_json::json!(max_fuel));
+    }
+    if let Some(min_t) = pragmas.min_t {
+        opts.insert("min-t".into(), serde_json::json!(min_t));
+    }
+    if let Some(identity) = pragmas.identity {
+        opts.insert("identity".into(), JsonValue::String(identity));
+    }
+    if let Some(classes) = pragmas.policy_class {
+        opts.insert("policy-class".into(), serde_json::json!(classes));
+    }
+    if let Some(values) = pragmas.policy_values {
+        opts.insert("policy-values".into(), JsonValue::Object(values));
+    }
+    if let Some(default_allow) = pragmas.default_allow {
+        opts.insert("default-allow".into(), JsonValue::Bool(default_allow));
+    }
+    Ok((!opts.is_empty()).then_some(JsonValue::Object(opts)))
+}
+
+/// Hold the tracking options a SPARQL alias's pragmas put into `merged` to
+/// those its `outer` (envelope ⊕ alias) opts already set. Unlike the alias's
+/// other pragmas, which win as body `opts` do, a pragma's `max-fuel` can
+/// tighten the outer cap but never lift it, and its `meta` adds to the outer
+/// tracking but never removes it — as they combine with `fluree-max-fuel` and
+/// `fluree-track-*` on a single query.
+pub fn hold_pragma_tracking(merged: &mut Option<JsonValue>, outer: Option<&JsonValue>) {
+    let (Some(outer), Some(JsonValue::Object(opts))) = (outer, merged.as_mut()) else {
+        return;
+    };
+    let cap = ["max-fuel", "max_fuel", "maxFuel"]
+        .iter()
+        .find_map(|key| outer.get(*key))
+        .and_then(JsonValue::as_f64);
+    if let Some(cap) = cap {
+        if opts
+            .get("max-fuel")
+            .and_then(JsonValue::as_f64)
+            .is_some_and(|max_fuel| max_fuel > cap)
+        {
+            opts.insert("max-fuel".into(), serde_json::json!(cap));
+        }
+    }
+    let flags = |meta: Option<&JsonValue>| {
+        let flag = |key: &str| {
+            matches!(meta, Some(JsonValue::Bool(true)))
+                || meta
+                    .and_then(|m| m.get(key))
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false)
+        };
+        [flag("time"), flag("fuel"), flag("policy")]
+    };
+    let outer_flags = flags(outer.get("meta"));
+    if opts.contains_key("meta") && outer_flags.contains(&true) {
+        let [time, fuel, policy] = flags(opts.get("meta"));
+        opts.insert(
+            "meta".into(),
+            serde_json::json!({
+                "time": time || outer_flags[0],
+                "fuel": fuel || outer_flags[1],
+                "policy": policy || outer_flags[2],
+            }),
+        );
     }
 }
 
@@ -1149,7 +1211,7 @@ mod tests {
         let req = envelope_with(&[("a", jsonld("ledgerA"))], Some(AsOf::T(42)));
         let distinct = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap();
         assert_eq!(distinct.len(), 1);
-        assert!(distinct.contains("ledgerA"));
+        assert!(distinct.contains("ledgerA:main"));
     }
 
     #[test]
@@ -1346,7 +1408,49 @@ mod tests {
         );
         let distinct = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap();
         assert_eq!(distinct.len(), 1);
-        assert!(distinct.contains("ledgerA"));
+        assert!(distinct.contains("ledgerA:main"));
+    }
+
+    /// `mydb` and `mydb:main` are one ledger: counting them twice trips the
+    /// distinct-ledger limit and the single-ledger `asOf` rule.
+    #[test]
+    fn distinct_ledger_set_counts_spellings_of_one_ledger_once() {
+        let req = envelope_with(
+            &[("a", jsonld("mydb")), ("b", jsonld("mydb:main@t:3"))],
+            None,
+        );
+        let distinct = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap();
+        assert_eq!(distinct.len(), 1, "{distinct:?}");
+        assert!(distinct.contains("mydb:main"));
+    }
+
+    /// Every tag of the shared grammar is a pin to the validator — the same
+    /// set the snapshot rewriter honours, so a pin it leaves alone is one the
+    /// collision check saw and the distinct-ledger count stripped.
+    #[test]
+    fn validator_recognises_every_grammar_tag_as_a_pin() {
+        for pinned in [
+            "ledgerA@time:2024-01-01T00:00:00Z",
+            "ledgerA@iso:2024-01-01T00:00:00Z",
+            "ledgerA@recorded:2024-01-01T00:00:00Z",
+            "ledgerA@snapshot:42",
+            "ledgerA@commit:abcdef",
+            "ledgerA@time:2024-01-01T00:00:00Z#txn-meta",
+        ] {
+            let req = envelope_with(
+                &[("a", jsonld(pinned)), ("b", jsonld("ledgerA"))],
+                Some(AsOf::Iso("2024-01-01T00:00:00Z".into())),
+            );
+            let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
+            assert!(
+                matches!(err, MultiQueryValidationError::AsOfCollision { .. }),
+                "{pinned}: {err:?}"
+            );
+            let req = envelope_with(&[("a", jsonld(pinned)), ("b", jsonld("ledgerA"))], None);
+            let distinct = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap();
+            assert_eq!(distinct.len(), 1, "{pinned}: {distinct:?}");
+            assert!(distinct.contains("ledgerA:main"), "{pinned}: {distinct:?}");
+        }
     }
 
     #[test]
@@ -1363,9 +1467,9 @@ mod tests {
         );
         let distinct = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap();
         assert_eq!(distinct.len(), 3);
-        assert!(distinct.contains("ledgerA"));
-        assert!(distinct.contains("ledgerB"));
-        assert!(distinct.contains("ledgerC"));
+        assert!(distinct.contains("ledgerA:main"));
+        assert!(distinct.contains("ledgerB:main"));
+        assert!(distinct.contains("ledgerC:main"));
     }
 
     // -------------------------------------------------------------------------
@@ -1619,7 +1723,7 @@ mod tests {
         };
         let req = envelope_with(&[("a", sq)], Some(AsOf::Iso("2024-01-01T00:00:00Z".into())));
         let distinct = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap();
-        assert!(distinct.contains("ledgerA"));
+        assert!(distinct.contains("ledgerA:main"));
     }
 
     #[test]

@@ -1,0 +1,8 @@
+# q043 langtag_object_error
+# Intent: Probe an LLM-style query with a language-tagged bound object.
+# EMPIRICAL CORRECTION (2026-07-11 SF01 parity run): the design's "virtual fails the whole GRAPH scope" expectation was WRONG — virtual-sf01 returned ok with 0 rows in ~2.1s (no error). expected_status removed accordingly; the lang-tag object matches nothing on both native and virtual. Flagged for the findings register.
+# BI lineage (BI-20): "Find a customer by a language-tagged name (a query an LLM might emit)."
+# Predicates verified against enterprise.ttl — DimCustomer: name (lang-tagged object).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?c
+WHERE { ?c a edw:Customer ; edw:name "Aziz"@fr . }

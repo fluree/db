@@ -37,6 +37,12 @@ pub struct LedgerConfig {
     pub transact: Option<TransactDefaults>,
     /// Full-text indexing defaults (`f:fullTextDefaults`).
     pub full_text: Option<FullTextDefaults>,
+    /// Serving-posture defaults (`f:servingDefaults`). Ledger-scoped:
+    /// never merged per-graph and not subject to override control.
+    pub serving: Option<ServingDefaults>,
+    /// Query defaults (`f:queryDefaults`). Ledger-scoped: never merged
+    /// per-graph and not subject to override control.
+    pub query: Option<QueryDefaults>,
     /// Per-graph config overrides (`f:graphOverrides`).
     pub graph_overrides: Vec<GraphConfig>,
 }
@@ -70,7 +76,15 @@ pub struct ResolvedConfig {
 /// Policy defaults from the config graph (`f:policyDefaults`).
 #[derive(Debug, Clone, Default)]
 pub struct PolicyDefaults {
-    /// `f:defaultAllow` — `None` means use system default (true).
+    /// `f:defaultAllow` — whether to permit access when no policy rule
+    /// matches. `None` means unconfigured, in which case the request's own
+    /// (also tri-state) `default-allow` governs; unset on both sides resolves
+    /// fail-closed to **false**.
+    ///
+    /// Note this is only ever consulted for a request that carries policy
+    /// inputs (an identity, a policy class, or an inline policy). A request
+    /// with none of those builds no policy context at all and reads
+    /// everything, whatever this is set to.
     pub default_allow: Option<bool>,
     /// `f:policySource` — reference to graph containing policy rules.
     pub policy_source: Option<GraphSourceRef>,
@@ -96,7 +110,7 @@ pub struct ShaclDefaults {
 /// Reasoning defaults from the config graph (`f:reasoningDefaults`).
 #[derive(Debug, Clone, Default)]
 pub struct ReasoningDefaults {
-    /// `f:reasoningModes` — e.g., `["rdfs"]`, `["owl2-rl"]`.
+    /// `f:reasoningModes` — e.g., `["rdfs"]`, `["owl2rl"]`.
     pub modes: Option<Vec<String>>,
     /// `f:schemaSource` — reference to graph containing schema hierarchy.
     pub schema_source: Option<GraphSourceRef>,
@@ -119,6 +133,11 @@ pub struct ReasoningDefaults {
     /// seconds before the OWL2-RL closure is capped. `None` means use the
     /// system default.
     pub max_seconds: Option<u64>,
+    /// `f:reasoningMaxMemoryMb` — materialization budget: max megabytes of
+    /// derived facts before the closure is capped. Like the other two this is
+    /// a correctness control, not a tuning knob: a capped closure is
+    /// incomplete. `None` means derive it from the effective fact cap.
+    pub max_memory_mb: Option<u64>,
     /// Override control for this setting group.
     pub override_control: OverrideControl,
 }
@@ -146,6 +165,42 @@ pub struct DatalogDefaults {
     pub allow_query_time_rules: Option<bool>,
     /// Override control for this setting group.
     pub override_control: OverrideControl,
+}
+
+/// Serving-posture defaults from the config graph (`f:servingDefaults`).
+///
+/// Declares which serving tiers the ledger's origin server offers to callers.
+/// Gates apply only on the origin (transaction-role) serving surface: a
+/// read-only peer or mount that holds the ledger's blocks always queries its
+/// own copy freely. `None` fields mean "allowed" (an unconfigured ledger is
+/// fully served); `public_visibility` defaults to false (token required).
+///
+/// Ledger-scoped: lives only on `f:LedgerConfig`, ignored on `f:GraphConfig`,
+/// and not subject to override control — it changes only by transacting the
+/// config graph.
+#[derive(Debug, Clone, Default)]
+pub struct ServingDefaults {
+    /// `f:serveQuery` — origin executes queries for this ledger.
+    pub serve_query: Option<bool>,
+    /// `f:serveBlocks` — origin serves raw CAS blocks (storage proxy).
+    pub serve_blocks: Option<bool>,
+    /// `f:publicVisibility` — ledger is discoverable/readable without a token.
+    pub public_visibility: Option<bool>,
+}
+
+/// Query defaults from the config graph (`f:queryDefaults`).
+///
+/// Ledger-scoped: lives only on `f:LedgerConfig`, ignored on `f:GraphConfig`,
+/// and not subject to override control. A request may still choose for
+/// itself, since these shape what a query reads rather than what it may
+/// read.
+#[derive(Debug, Clone, Default)]
+pub struct QueryDefaults {
+    /// `f:unionDefaultGraph` — a query that does not choose its own default
+    /// graph reads the union of the ledger's default graph and its named
+    /// graphs (never the reserved `#txn-meta` / `#config` graphs). `None`
+    /// means off.
+    pub union_default_graph: Option<bool>,
 }
 
 /// Full-text indexing defaults from the config graph (`f:fullTextDefaults`).
@@ -295,14 +350,14 @@ impl OverrideControl {
 
     /// Check if a given request identity is permitted to override.
     ///
-    /// `request_identity` is the server-verified canonical DID string.
+    /// `request_identity` is the auth-layer-verified identity.
     /// `None` means anonymous (no verified identity).
-    pub fn permits_override(&self, request_identity: Option<&str>) -> bool {
+    pub fn permits_override(&self, request_identity: Option<&crate::VerifiedIdentity>) -> bool {
         match self {
             OverrideControl::None => false,
             OverrideControl::AllowAll => true,
             OverrideControl::IdentityRestricted { allowed_identities } => request_identity
-                .map(|id| allowed_identities.contains(id))
+                .map(|id| allowed_identities.contains(id.as_str()))
                 .unwrap_or(false),
         }
     }
@@ -364,13 +419,28 @@ pub enum TrustMode {
 
 /// SHACL validation mode.
 ///
-/// Values are IRIs in the `f:` namespace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Values are IRIs in the `f:` namespace. Serialized lowercase
+/// (`"reject"` / `"warn"`) — the form `opts.validationMode` uses on
+/// transaction requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ValidationMode {
     /// `f:ValidationReject` — reject transactions that fail SHACL validation.
     Reject,
     /// `f:ValidationWarn` — warn but allow transactions that fail SHACL validation.
     Warn,
+}
+
+impl ValidationMode {
+    /// Parse the request-surface string form (case-insensitive
+    /// `"reject"` / `"warn"`). `None` for anything else.
+    pub fn parse_opt(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "reject" => Some(ValidationMode::Reject),
+            "warn" => Some(ValidationMode::Warn),
+            _ => None,
+        }
+    }
 }
 
 // ============================================================================
@@ -500,13 +570,15 @@ mod tests {
 
     #[test]
     fn permits_override_none_always_false() {
-        assert!(!OverrideControl::None.permits_override(Some("did:key:alice")));
+        assert!(!OverrideControl::None
+            .permits_override(Some(&crate::VerifiedIdentity::new("did:key:alice"))));
         assert!(!OverrideControl::None.permits_override(None));
     }
 
     #[test]
     fn permits_override_allow_all_always_true() {
-        assert!(OverrideControl::AllowAll.permits_override(Some("did:key:alice")));
+        assert!(OverrideControl::AllowAll
+            .permits_override(Some(&crate::VerifiedIdentity::new("did:key:alice"))));
         assert!(OverrideControl::AllowAll.permits_override(None));
     }
 
@@ -515,8 +587,8 @@ mod tests {
         let ctrl = OverrideControl::IdentityRestricted {
             allowed_identities: identity_set(&["did:key:alice", "did:key:bob"]),
         };
-        assert!(ctrl.permits_override(Some("did:key:alice")));
-        assert!(ctrl.permits_override(Some("did:key:bob")));
+        assert!(ctrl.permits_override(Some(&crate::VerifiedIdentity::new("did:key:alice"))));
+        assert!(ctrl.permits_override(Some(&crate::VerifiedIdentity::new("did:key:bob"))));
     }
 
     #[test]
@@ -524,7 +596,7 @@ mod tests {
         let ctrl = OverrideControl::IdentityRestricted {
             allowed_identities: identity_set(&["did:key:alice"]),
         };
-        assert!(!ctrl.permits_override(Some("did:key:bob")));
+        assert!(!ctrl.permits_override(Some(&crate::VerifiedIdentity::new("did:key:bob"))));
     }
 
     #[test]
@@ -540,7 +612,7 @@ mod tests {
         let ctrl = OverrideControl::IdentityRestricted {
             allowed_identities: HashSet::new(),
         };
-        assert!(!ctrl.permits_override(Some("did:key:alice")));
+        assert!(!ctrl.permits_override(Some(&crate::VerifiedIdentity::new("did:key:alice"))));
         assert!(!ctrl.permits_override(None));
     }
 

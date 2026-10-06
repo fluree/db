@@ -231,7 +231,7 @@ index_rate < transaction_rate
 ### Optimize for Write-Heavy Loads
 
 ```bash
-fluree-server \
+fluree server run -- \
   --indexing-enabled \
   --reindex-min-bytes 200000 \
   --reindex-max-bytes 2000000
@@ -242,7 +242,7 @@ Larger thresholds reduce indexing frequency (more novelty accumulation), trading
 ### Optimize for Read-Heavy Loads
 
 ```bash
-fluree-server \
+fluree server run -- \
   --indexing-enabled \
   --reindex-min-bytes 50000
 ```
@@ -267,11 +267,38 @@ The nameservice stores the current index root CID (`index_head_id`) and its wate
 
 Old index snapshots are retained for time-travel safety and concurrent query safety. Cleanup is performed by the binary index garbage collector, governed by:
 
-- `IndexerConfig.gc_max_old_indexes`
-- `IndexerConfig.gc_min_time_mins`
+- `IndexerConfig.gc_max_old_indexes` (`--gc-max-old-indexes` / `FLUREE_GC_MAX_OLD_INDEXES`, default 5): old versions to retain.
+- `IndexerConfig.gc_min_time_mins` (`--gc-min-time-mins` / `FLUREE_GC_MIN_TIME_MINS`, default 30): minimum age before a version can be collected.
 
-No standalone HTTP compaction endpoint is currently exposed. Use `POST
-/v1/fluree/reindex` when you need to force a full index refresh.
+Both must be satisfied, so the slower of the two wins. Under a sustained publish rate that is the age guard: a ledger publishing every few seconds holds far more than `gc_max_old_indexes` versions inside the 30-minute window, and the count bounds nothing. Retention becomes "however many versions fit in the window", which grows with publish rate and per-version size. Every one of those versions is still reachable and still on disk.
+
+- `IndexerConfig.gc_hard_max_old_indexes` (`--gc-hard-max-old-indexes` / `FLUREE_GC_HARD_MAX_OLD_INDEXES`, unset by default): a ceiling past which versions are collected regardless of age.
+
+The ceiling is opt-in because the age guard is what protects a query that started against an older version: until the guard expires, that version's leaves are still in storage. Past the ceiling they are released regardless, and a query still reading them fails or reads a torn version. Set it well above the number of versions the ledger publishes during your longest query. Each GC pass reports how many versions it collected past the ceiling (`age_guard_overridden` in the completion log line), so an override that is firing is visible at the default log level.
+
+It is a bound on versions, not bytes. What a retained version costs varies by orders of magnitude between ledgers — one deployment measured ~7.7 GiB per version on one ledger and ~3.3 GiB on another — so size the ceiling from the per-version disk use you observe, and expect `objects/history` to hold roughly `versions × per-version bytes` at the ceiling.
+
+The collector runs after every index publish, and also on the worker's periodic tick (`IndexerConfig.catchup_interval`, default 300 s), including once at start-up. The periodic pass is what reaches a ledger that stops publishing: a load-once dataset whose final burst left hundreds of versions inside the age guard would otherwise keep them until its next write, which may never come. Passes are serialised per ledger name, the tick runs them one at a time, and releases go out in batches — one `DeleteObjects` request per thousand artifacts on S3, a few in flight — so a large pass does not take the storage request cap away from readers.
+
+The collector reclaims artifacts by *name*. Each index root carries a garbage manifest listing what the previous version replaced, and the collector walks the prev-index chain releasing exactly those. It therefore reaches only artifacts that some manifest records.
+
+Dictionary blobs live in the ledger-wide `@shared/dicts/` namespace, shared by every branch: a branch created from another starts out reading the source's dictionaries rather than a copy, so the source's manifest can name a blob the fork still reads. The collector releases a dictionary blob only when no other branch of the ledger — retracted branches included — still reaches it through its own index chain. A blob a sibling still reaches is deferred; when that sibling replaces it, its own manifest names it and the sibling's pass releases it. Whichever branch drops a blob last deletes it, and dropping a branch releases the blobs only that branch referenced. A ledger with a single branch releases every blob its manifests name.
+
+A manifest's word is not final. Content addressing gives byte-identical output the same name, so a later build can recreate a blob an earlier manifest recorded as replaced — reverse-dictionary leaves do this routinely under monotonically increasing keys (ULIDs, UUIDv7, sequential ids). The collector therefore never releases anything a retained root still references, whatever a manifest says. And because a build can recreate such a blob at any moment, a pass plans against a snapshot and then releases inside a short window during which no branch of the ledger builds: it waits for a build in flight, defers new ones, re-reads the current index head of the branch and of each of its siblings, and only then releases. Builds resume when the window closes. A pass that has nothing to release never opens one, and a pass that finds a branch held by a reindex or sweep releases nothing and leaves the work to a later pass. Which branches are siblings comes from the worker's branch listing, refreshed every `catchup_interval`, plus any branch the worker has built since; with `gc_hard_max_old_indexes` set, or an age guard under ten minutes, the listing is taken fresh for every pass. All of this behaves the same on every storage and nameservice backend: it needs only a consistent single-record lookup, which the file, S3 and DynamoDB nameservices all provide. It covers the indexer in one process; two processes indexing the same storage are not coordinated.
+
+### Reclaiming orphaned artifacts
+
+Artifacts orphaned outside that chain are invisible to the collector. The main source is a reindex published by Fluree **4.1.4 or earlier**: it severed the prev-index chain, leaving every earlier root — and the blobs only those roots referenced — unreachable from any walk. Retention could never truncate past it, so a ledger that had been reindexed accumulated index artifacts without bound.
+
+`POST /v1/fluree/sweep` reclaims them, and `fluree sweep <ledger>` does the same from the CLI. A sweep enumerates what storage holds, subtracts everything reachable from a live index chain, and releases the remainder. Use `--dry-run` (or `POST /v1/fluree/sweep/plan`) to see what would be released first.
+
+A sweep is also what reclaims what the collector cannot reach any more: dictionary blobs whose manifests were consumed on Fluree **4.2.0 or earlier**, which left every dictionary blob to the sweep, blobs a branch drop could not attribute, and anything orphaned off a chain. A ledger that accumulated dictionaries under one of those versions can hold many times its live index in `@shared/dicts/`; one sweep clears the backlog, and afterwards the collector keeps up. Running one when nothing is reclaimable is a safe no-op.
+
+A sweep is ledger-wide rather than per-branch, because dictionary blobs are shared across a ledger's branches. It touches only index artifacts — commits, transactions, and config blobs are reachable through the commit chain rather than the index chain, so a sweep cannot establish that they are unreferenced and never considers them.
+
+> **Single-process deployments only.** The hold that keeps index builds from writing during a sweep excludes the server's own indexer. An external or second-process indexer writing to the same storage is not excluded, and its in-flight artifacts would be indistinguishable from orphans.
+
+`POST /v1/fluree/reindex` rebuilds the index but does not reclaim anything by itself. A reindex now participates in the GC chain like any incremental build, so ordinary retention applies to the roots it supersedes; a sweep is only needed for artifacts orphaned by an earlier version.
 
 ## Troubleshooting
 

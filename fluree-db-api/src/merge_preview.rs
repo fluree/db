@@ -5,23 +5,25 @@
 //! [`crate::Fluree::merge_branch`] but without mutating any nameservice or
 //! content-store state.
 //!
-//! The heavy lifting (per-commit summaries, DAG walking, common-ancestor
-//! discovery, delta-key computation) lives in `fluree-db-core` and
-//! `fluree-db-novelty`. This module orchestrates them: nameservice lookups,
-//! branched-store construction for source/target, and parallel walks.
+//! The heavy lifting (the branch diff, per-commit summaries, delta-key
+//! computation) lives in `fluree-db-core` and `fluree-db-novelty`. This
+//! module orchestrates them: nameservice lookups, branched-store
+//! construction for source/target, and parallel walks.
 
 use crate::error::{ApiError, Result};
 use crate::format::iri::IriCompactor;
 use crate::graph_commit_builder::resolve_flake;
 use crate::rebase::{current_asserted_for_key, ConflictStrategy};
-use fluree_db_core::ledger_id::format_ledger_id;
+use fluree_db_core::LedgerId;
 use fluree_db_core::{
-    find_common_ancestor, walk_commit_summaries, BranchedContentStore, CommitSummary, ConflictKey,
-    ContentId, ContentStore, Flake,
+    commit_to_summary, diff_branches, load_commit_by_id, load_commit_envelope_by_id,
+    walk_commit_summaries, BranchedContentStore, CommitSummary, ConflictKey, ContentId,
+    ContentStore, Flake,
 };
 use fluree_db_ledger::LedgerState;
-use fluree_db_novelty::compute_delta_keys;
+use fluree_db_novelty::{compute_delta_keys_and_changes, delta_keys_of};
 use futures::{stream, StreamExt, TryStreamExt};
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 use std::sync::Arc;
 use tracing::Instrument;
@@ -31,6 +33,10 @@ pub const DEFAULT_MAX_COMMITS: usize = 500;
 
 /// Default cap on conflict keys returned in [`ConflictSummary::keys`].
 pub const DEFAULT_MAX_CONFLICT_KEYS: usize = 200;
+
+/// Default cap on change entries returned in [`ChangeSummary::entries`],
+/// counted in flakes.
+pub const DEFAULT_MAX_CHANGES: usize = 500;
 
 /// Knobs for [`crate::Fluree::merge_preview`].
 ///
@@ -47,26 +53,26 @@ pub const DEFAULT_MAX_CONFLICT_KEYS: usize = 200;
 /// lists**, not the cost of computing them:
 ///
 /// - The `BranchDelta::count` on each side is the full unbounded divergence,
-///   computed by walking every commit envelope between HEAD and the common
-///   ancestor. A 1M-commit divergence costs 1M envelope reads regardless of
-///   the cap.
+///   computed by walking every commit envelope down to the commit the other
+///   side holds. A 1M-commit divergence costs 1M envelope reads regardless
+///   of the cap.
 /// - The `ConflictSummary::count` is the full intersection size; both
-///   `compute_delta_keys` walks scan every flake on each side since the
-///   ancestor. Pass [`include_conflicts: false`](Self::include_conflicts) to
-///   skip them entirely when only counts are needed.
+///   delta-key walks scan every flake on each side since the divergence.
+///   Pass [`include_conflicts: false`](Self::include_conflicts) to skip them
+///   entirely when only counts are needed.
 ///
 /// To bound the *I/O cost* of the walk itself, callers must pre-check the
-/// divergence (e.g., refuse before invoking when `target.t - ancestor.t`
-/// exceeds some threshold) or use `include_conflicts: false`.
+/// divergence (for example, refuse before invoking when either side is more
+/// than some number of commits ahead) or use `include_conflicts: false`.
 #[derive(Clone, Debug)]
 pub struct MergePreviewOpts {
     /// Per side. `Some(n)` caps the returned list at `n`; `None` is
     /// unbounded. **Does not bound the divergence walk** — see type docs.
     pub max_commits: Option<usize>,
     /// Cap on `conflicts.keys`. `None` is unbounded. **Does not bound the
-    /// `compute_delta_keys` walks** — see type docs.
+    /// delta-key walks** — see type docs.
     pub max_conflict_keys: Option<usize>,
-    /// When `false`, skips the two `compute_delta_keys` walks — the response
+    /// When `false`, skips the two delta-key walks — the response
     /// still contains commit counts but `conflicts` will be empty. The
     /// fastest way to bound preview cost on diverged branches.
     pub include_conflicts: bool,
@@ -76,6 +82,33 @@ pub struct MergePreviewOpts {
     pub include_conflict_details: bool,
     /// Strategy used for human-readable conflict resolution labels.
     pub conflict_strategy: ConflictStrategy,
+    /// When `true`, include the aggregate netted change set the merge would
+    /// apply (source side, `ancestor..source_head`) as
+    /// [`MergePreview::changes`]. Costs one full commit load per commit in
+    /// the source divergence; the walk is shared with the conflict
+    /// computation when both are requested.
+    pub include_changes: bool,
+    /// Cap on change entries returned in [`ChangeSummary::entries`], counted
+    /// in **flakes** (not subjects) and cut at subject boundaries — a
+    /// subject's diff is never split across the cap, so a single subject
+    /// larger than the cap is returned whole (bounded overshoot). `Some(0)`
+    /// is a valid "diff stats" mode: exact counts, no payload, and no
+    /// source-state load for IRI resolution. `None` is unbounded. Caps the
+    /// response size only — counts stay exact and the replay walk is
+    /// unaffected.
+    pub max_changes: Option<usize>,
+    /// Resume cursor for paging [`ChangeSummary::entries`]: return only
+    /// subjects whose full IRI sorts strictly after this value. Pass the
+    /// previous response's [`ChangeSummary::next_cursor`]. Each page re-pays
+    /// the full replay + netting cost. Requires `include_changes`.
+    pub changes_after_subject: Option<String>,
+    /// When `true` (the default), stage the strategy-resolved change set on
+    /// the target and validate it against the target's SHACL configuration
+    /// and shapes, exactly as the merge would. The outcome is reported in
+    /// [`MergePreview::validation`] and folded into
+    /// [`MergePreview::mergeable`]. Costs a target-state load plus the
+    /// validation pass; set `false` for count-only previews.
+    pub include_validation: bool,
 }
 
 impl Default for MergePreviewOpts {
@@ -86,8 +119,25 @@ impl Default for MergePreviewOpts {
             include_conflicts: true,
             include_conflict_details: false,
             conflict_strategy: ConflictStrategy::default(),
+            include_changes: false,
+            max_changes: Some(DEFAULT_MAX_CHANGES),
+            changes_after_subject: None,
+            include_validation: true,
         }
     }
+}
+
+/// SHACL outcome of staging the merge's resolved change set on the target.
+#[derive(Clone, Debug, Serialize)]
+pub struct ValidationSummary {
+    /// `true` when the merged state conforms to the target's shapes under
+    /// its configured posture (warn-mode violations are logged, not
+    /// reported, matching the transaction path).
+    pub conforms: bool,
+    /// The violation report the merge would fail with. Present iff
+    /// `conforms` is `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report: Option<String>,
 }
 
 /// Common ancestor of source and target HEADs.
@@ -155,6 +205,70 @@ impl ConflictSummary {
     }
 }
 
+/// Aggregate netted change set a merge would apply — the source side's
+/// `ancestor..source_head` flakes folded per fact, with
+/// internally-cancelling assert/retract pairs removed.
+///
+/// ### Netting contract
+///
+/// Per fact (full identity: subject, predicate, object, datatype, graph,
+/// language tag, list index), the net op is the newest in-range op; a fact
+/// survives only when its oldest and newest in-range ops agree. Intermediate
+/// churn (create-then-delete, delete-then-restore) never appears. This is
+/// the **net commit effect** — what replaying the range applies, minus
+/// pairs that cancel — so a re-assert of a value that already existed
+/// before the range still nets as an assert (the merge does apply it).
+///
+/// The change set is strategy-independent: it is the raw source-vs-ancestor
+/// delta, *before* conflict resolution. Under a non-default strategy,
+/// conflicting keys resolve per the separately-returned
+/// [`ConflictSummary::details`].
+#[derive(Clone, Debug, Serialize)]
+pub struct ChangeSummary {
+    /// Exact net assert count across the full divergence. Never truncated.
+    pub assert_count: usize,
+    /// Exact net retract count across the full divergence. Never truncated.
+    pub retract_count: usize,
+    /// Exact number of distinct subjects touched by net changes.
+    pub subject_count: usize,
+    /// Net changes grouped by subject, subjects ordered by full IRI.
+    /// Bounded by [`MergePreviewOpts::max_changes`] (counting flakes, cut at
+    /// subject boundaries) and offset by
+    /// [`MergePreviewOpts::changes_after_subject`].
+    pub entries: Vec<SubjectChange>,
+    /// `true` when subjects after this page were withheld — either by the
+    /// flake cap or because `max_changes = 0` suppressed the payload.
+    pub truncated: bool,
+    /// Cursor for the next page when `truncated` by the flake cap: the last
+    /// returned subject IRI, to be passed as `changes_after_subject`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+impl ChangeSummary {
+    fn empty() -> Self {
+        Self {
+            assert_count: 0,
+            retract_count: 0,
+            subject_count: 0,
+            entries: Vec::new(),
+            truncated: false,
+            next_cursor: None,
+        }
+    }
+}
+
+/// Net changes for one subject.
+#[derive(Clone, Debug, Serialize)]
+pub struct SubjectChange {
+    /// Full (expanded) subject IRI — also the pagination sort key.
+    pub subject: String,
+    /// Net additions on this subject.
+    pub asserts: Vec<crate::ResolvedFlake>,
+    /// Net removals on this subject.
+    pub retracts: Vec<crate::ResolvedFlake>,
+}
+
 /// Read-only diff between two branches.
 #[derive(Clone, Debug, Serialize)]
 pub struct MergePreview {
@@ -177,8 +291,22 @@ pub struct MergePreview {
     /// or when the caller opted out via [`MergePreviewOpts::include_conflicts`].
     pub conflicts: ConflictSummary,
 
-    /// Whether the selected strategy can be applied without aborting.
+    /// Whether the merge would go through: the selected strategy can be
+    /// applied without aborting, and the resulting state conforms to the
+    /// target's shapes when validation ran.
     pub mergeable: bool,
+
+    /// SHACL outcome for the resolved change set. Present iff
+    /// [`MergePreviewOpts::include_validation`] was set and the merge is
+    /// not a fast-forward (a fast-forward adopts commits already validated
+    /// when they were authored).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation: Option<ValidationSummary>,
+
+    /// Aggregate netted change set. Present iff
+    /// [`MergePreviewOpts::include_changes`] was set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changes: Option<ChangeSummary>,
 }
 
 impl crate::Fluree {
@@ -245,108 +373,112 @@ impl crate::Fluree {
                 "Skip strategy is not supported for merge preview".to_string(),
             ));
         }
+        if opts.changes_after_subject.is_some() && !opts.include_changes {
+            return Err(ApiError::InvalidBranch(
+                "changes_after_subject requires include_changes=true".to_string(),
+            ));
+        }
 
         // ---- Resolve records (mirrors merge_branch_inner). ----------------
-        let source_id = format_ledger_id(ledger_name, source_branch);
+        let source_id = LedgerId::from_parts(ledger_name, source_branch)?;
         let source_record = self
             .nameservice()
             .lookup(&source_id)
             .await?
-            .ok_or_else(|| ApiError::NotFound(source_id.clone()))?;
+            .ok_or_else(|| ApiError::NotFound(source_id.clone().to_string()))?;
 
-        let source_parent = source_record.source_branch.as_deref().ok_or_else(|| {
-            ApiError::InvalidBranch(format!(
-                "Branch {source_branch} has no source branch; \
-                 only branches created from another branch can be previewed"
-            ))
-        })?;
-
-        let resolved_target = target_branch.unwrap_or(source_parent);
+        // Resolve target: explicit, or the branch the source was created
+        // from. Only the second needs the source to have a parent. Mirrors
+        // `prepare_merge`.
+        let resolved_target = match target_branch {
+            Some(target) => target.to_string(),
+            None => source_record.source_branch.clone().ok_or_else(|| {
+                ApiError::InvalidBranch(format!(
+                    "Branch {source_branch} has no source branch; \
+                         name the branch to preview a merge into with an explicit target"
+                ))
+            })?,
+        };
+        let resolved_target = resolved_target.as_str();
         if source_branch == resolved_target {
             return Err(ApiError::InvalidBranch(
                 "Cannot merge a branch into itself".to_string(),
             ));
         }
 
-        let target_id = format_ledger_id(ledger_name, resolved_target);
+        let target_id = LedgerId::from_parts(ledger_name, resolved_target)?;
         let target_record = self
             .nameservice()
             .lookup(&target_id)
             .await?
-            .ok_or_else(|| ApiError::NotFound(target_id.clone()))?;
+            .ok_or_else(|| ApiError::NotFound(target_id.clone().to_string()))?;
 
         // ---- Build branched stores. ---------------------------------------
-        // Source is always a branch by definition (we required source_branch above).
-        let source_store = LedgerState::build_branched_store(
-            &self.nameservice_mode,
-            &source_record,
-            self.backend(),
-        )
-        .await?;
-
-        // Target may or may not be a branch — same logic as merge.rs:296-308.
-        // We always wrap as a `BranchedContentStore` (using `leaf` for the
-        // non-branch case) so the union store below can chain it as a parent.
-        let target_branched: BranchedContentStore = if target_record.source_branch.is_some() {
-            LedgerState::build_branched_store(
-                &self.nameservice_mode,
-                &target_record,
-                self.backend(),
-            )
-            .await?
-        } else {
-            BranchedContentStore::leaf(self.content_store(&target_id))
-        };
+        // Either side may be a root branch, which has only its own
+        // namespace. The union store below chains both.
+        let source_store = self.branch_store(&source_record, &source_id).await?;
+        let target_branched = self.branch_store(&target_record, &target_id).await?;
 
         let source_head = source_record.commit_head_id.clone();
         let target_head = target_record.commit_head_id.clone();
 
-        // ---- Find common ancestor. ----------------------------------------
-        // The ancestor walk needs to load both `source_head` and `target_head`,
-        // which may live in disjoint branch namespaces (e.g., two sibling
-        // branches off `main`). We construct a union view that fans out to
-        // both branched stores' ancestry so either head's envelope resolves.
-        let ancestor = match (&source_head, &target_head) {
-            (Some(s), Some(t)) => {
-                let union_store = BranchedContentStore::with_parents(
-                    Arc::new(source_store.clone()) as Arc<dyn ContentStore>,
-                    vec![target_branched.clone()],
-                );
-                Some(find_common_ancestor(&union_store, s, t).await?)
-            }
+        // ---- Diff the branches. -------------------------------------------
+        // What each side changed since they last shared a commit, by commit
+        // identity. The walk reads both heads, which live in disjoint branch
+        // namespaces, so it runs over a union of the two stores. This is the
+        // same call `prepare_merge` makes, so a preview and the merge it
+        // previews see the same divergence.
+        let union_store = BranchedContentStore::with_parents(
+            Arc::new(source_store.clone()) as Arc<dyn ContentStore>,
+            vec![target_branched.clone()],
+        );
+        let diff = match (&source_head, &target_head) {
+            (Some(s), Some(t)) => Some(diff_branches(&union_store, s, t).await?),
             _ => None,
         };
 
-        // ---- Fast-forward predicate (mirrors merge.rs:135-139). -----------
-        let fast_forward = match (&ancestor, &target_head) {
-            (Some(a), Some(tid)) => a.commit_id == *tid,
+        // The commit both branches last shared, for the response. It can sit
+        // on either branch's line, so it is read through the union.
+        let ancestor = match &diff {
+            Some(diff) => Some(AncestorRef {
+                t: load_commit_envelope_by_id(&union_store, &diff.base)
+                    .await?
+                    .t,
+                commit_id: diff.base.clone(),
+            }),
+            None => None,
+        };
+
+        // ---- Fast-forward predicate (mirrors `prepare_merge`). ------------
+        let fast_forward = match (&diff, &target_head) {
+            (Some(diff), Some(_)) => diff.fast_forward,
             (None, None) => true,
             _ => false,
         };
-
-        let stop_at_t = ancestor.as_ref().map_or(0, |a| a.t);
 
         // ---- Walk both sides in parallel. ---------------------------------
         // `opts.max_commits == None` is a deliberate "unbounded" signal — we
         // pass it through verbatim. The HTTP layer always supplies a bound to
         // protect against unbounded responses; direct Rust callers can opt in.
         let ahead_fut = async {
-            match &source_head {
-                Some(head) => {
-                    walk_commit_summaries(&source_store, head, stop_at_t, opts.max_commits)
+            match (&diff, &source_head) {
+                (Some(diff), _) => {
+                    summarize(&source_store, &diff.source.commits, opts.max_commits).await
+                }
+                // No target head: every source commit is ahead.
+                (None, Some(head)) => {
+                    walk_commit_summaries(&source_store, head, 0, opts.max_commits)
                         .await
                         .map_err(ApiError::from)
                 }
-                None => Ok((Vec::new(), 0)),
+                (None, None) => Ok((Vec::new(), 0)),
             }
         };
 
         let behind_fut = async {
-            match &target_head {
-                Some(head) => {
-                    walk_commit_summaries(&target_branched, head, stop_at_t, opts.max_commits)
-                        .await
-                        .map_err(ApiError::from)
+            match &diff {
+                Some(diff) => {
+                    summarize(&target_branched, &diff.target.commits, opts.max_commits).await
                 }
                 None => Ok((Vec::new(), 0)),
             }
@@ -366,73 +498,233 @@ impl crate::Fluree {
             commits: behind_summaries,
         };
 
-        // ---- Conflicts (only if relevant). --------------------------------
-        let conflicts = if !opts.include_conflicts || fast_forward {
-            ConflictSummary::empty()
-        } else {
-            match (&source_head, &target_head, &ancestor) {
-                (Some(s_head), Some(t_head), Some(anc)) => {
-                    let s_delta_fut =
-                        compute_delta_keys(source_store.clone(), s_head.clone(), anc.t);
-                    let t_delta_fut =
-                        compute_delta_keys(target_branched.clone(), t_head.clone(), anc.t);
-                    let (s_delta, t_delta) = tokio::try_join!(s_delta_fut, t_delta_fut)?;
+        // ---- Source-side replay (conflicts and/or changes). ---------------
+        // Conflicts and the netted change set both fold the source commit
+        // chain since the ancestor; when both are requested one walk serves
+        // both. Conflicts are only possible on non-fast-forward merges;
+        // changes are meaningful regardless (fast-forward is the common
+        // merge-request review case).
+        let need_conflicts = opts.include_conflicts && !fast_forward && diff.is_some();
+        let need_changes = opts.include_changes;
+        // Validation stages the resolved change set on the target, so it
+        // needs the netted source delta too. A fast-forward adopts commits
+        // already validated when they were authored, so it is skipped.
+        let need_validation = opts.include_validation && !fast_forward && diff.is_some();
 
-                    // Sort lexicographically by (s, p, g) so capped responses
-                    // are stable across builds and across requests — `HashSet`
-                    // intersection order is otherwise unspecified.
-                    let mut keys: Vec<ConflictKey> =
-                        s_delta.intersection(&t_delta).cloned().collect();
-                    keys.sort();
-                    let count = keys.len();
-                    let truncated = match opts.max_conflict_keys {
-                        Some(cap) if count > cap => {
-                            keys.truncate(cap);
-                            true
-                        }
-                        _ => false,
-                    };
-
-                    let details = if opts.include_conflict_details && !keys.is_empty() {
-                        let source_state_fut = self.load_queryable_state_with_store(
-                            source_store.clone(),
-                            source_record.clone(),
-                        );
-                        let target_state_fut = self.load_queryable_state_with_store(
-                            target_branched.clone(),
-                            target_record.clone(),
-                        );
-                        let (source_state, target_state) =
-                            tokio::try_join!(source_state_fut, target_state_fut)?;
-
-                        build_conflict_details(
-                            &keys,
-                            &source_state,
-                            &target_state,
-                            &opts.conflict_strategy,
+        // The change set folds every commit on the source's line, because a
+        // merge the source made carries how it resolved that merge. A merge
+        // that brought the target in keeps only its resolution, as in the
+        // merge this previews. Conflict keys come from the source's own
+        // changes only.
+        let source_fut = async {
+            match (&diff, &source_head) {
+                (Some(diff), _) => {
+                    let want_keys = need_conflicts || need_validation;
+                    if need_changes || need_validation {
+                        // One walk serves both: folding the line yields the
+                        // change set, and the commits carrying the source's
+                        // own changes yield the conflict keys.
+                        let (data, keys) = crate::merge::collect_commit_data(
+                            &source_store,
+                            &diff.source.commits,
+                            &diff.source.own,
                         )
-                        .await?
+                        .await?;
+                        Ok::<_, ApiError>((
+                            want_keys.then_some(keys),
+                            Some(data.flakes),
+                            Some((data.namespace_delta, data.graph_iris)),
+                        ))
                     } else {
-                        Vec::new()
-                    };
-
-                    ConflictSummary {
-                        count,
-                        keys,
-                        truncated,
-                        strategy: if count > 0 {
-                            Some(opts.conflict_strategy.as_str().to_string())
+                        // Keys alone. Only the source's own commits are
+                        // read, and nothing is folded.
+                        let keys = if want_keys {
+                            Some(delta_keys_of(&source_store, &diff.source.own).await?)
                         } else {
                             None
-                        },
-                        details,
+                        };
+                        Ok((keys, None, None))
                     }
                 }
-                _ => ConflictSummary::empty(),
+                // No target head: the change set is the source's whole
+                // history.
+                (None, Some(s_head)) if need_changes => {
+                    let (keys, net, ns_delta, graph_iris) =
+                        compute_delta_keys_and_changes(source_store.clone(), s_head.clone(), 0)
+                            .await?;
+                    Ok((Some(keys), Some(net), Some((ns_delta, graph_iris))))
+                }
+                _ => Ok((None, None, None)),
+            }
+        };
+        // Validation resolves conflicts the way the merge does, so it needs
+        // the target delta even when the caller asked for no conflict
+        // reporting (`include_conflicts=false`).
+        let target_fut = async {
+            match &diff {
+                Some(diff) if need_conflicts || need_validation => {
+                    let keys = delta_keys_of(&target_branched, &diff.target.own).await?;
+                    Ok::<_, ApiError>(Some(keys))
+                }
+                _ => Ok(None),
+            }
+        };
+        let ((source_delta, net_flakes, source_deltas), target_delta) =
+            tokio::try_join!(source_fut, target_fut)?;
+
+        // ---- Conflicts. ----------------------------------------------------
+        // `all_conflict_keys` is the full, uncapped intersection whenever both
+        // deltas were walked: what validation resolves the merge against.
+        // The reported `conflicts` are gated on `include_conflicts` and
+        // capped: the cap bounds the response, not what the strategy
+        // resolves.
+        let all_conflict_keys: Vec<ConflictKey> = match (&source_delta, &target_delta) {
+            (Some(s_delta), Some(t_delta)) => {
+                // Sort lexicographically by (s, p, g) so capped responses
+                // are stable across builds and across requests — `HashSet`
+                // intersection order is otherwise unspecified.
+                let mut keys: Vec<ConflictKey> = s_delta.intersection(t_delta).cloned().collect();
+                keys.sort();
+                keys
+            }
+            _ => Vec::new(),
+        };
+        let (conflict_keys, conflict_count, conflicts_truncated) = if need_conflicts {
+            let mut keys = all_conflict_keys.clone();
+            let count = keys.len();
+            let truncated = match opts.max_conflict_keys {
+                Some(cap) if count > cap => {
+                    keys.truncate(cap);
+                    true
+                }
+                _ => false,
+            };
+            (keys, count, truncated)
+        } else {
+            (Vec::new(), 0, false)
+        };
+
+        // ---- Load states needed for IRI resolution. -----------------------
+        // Conflict details need both sides; the change payload needs only the
+        // source side (its head state carries every namespace code the
+        // divergence introduced). Stats-only mode (`max_changes = 0`) skips
+        // the load entirely.
+        let want_details = opts.include_conflict_details && !conflict_keys.is_empty();
+        let want_change_payload = need_changes
+            && net_flakes.as_ref().is_some_and(|n| !n.is_empty())
+            && opts.max_changes != Some(0);
+
+        // Validation stages onto the target, so it needs the target side.
+        let want_source = want_details || want_change_payload;
+        let want_target = want_details || need_validation;
+        let source_state_fut = async {
+            if want_source {
+                self.load_queryable_state_with_store(source_store.clone(), source_record.clone())
+                    .await
+                    .map(Some)
+            } else {
+                Ok::<_, ApiError>(None)
+            }
+        };
+        let target_state_fut = async {
+            if want_target {
+                self.load_queryable_state_with_store(target_branched.clone(), target_record.clone())
+                    .await
+                    .map(Some)
+            } else {
+                Ok::<_, ApiError>(None)
+            }
+        };
+        let (source_state, target_state) = tokio::try_join!(source_state_fut, target_state_fut)?;
+
+        let conflicts = if !need_conflicts {
+            ConflictSummary::empty()
+        } else {
+            let details = if want_details {
+                build_conflict_details(
+                    &conflict_keys,
+                    source_state.as_ref().expect("loaded for details"),
+                    target_state.as_ref().expect("loaded for details"),
+                    &opts.conflict_strategy,
+                )
+                .await?
+            } else {
+                Vec::new()
+            };
+
+            ConflictSummary {
+                count: conflict_count,
+                keys: conflict_keys,
+                truncated: conflicts_truncated,
+                strategy: if conflict_count > 0 {
+                    Some(opts.conflict_strategy.as_str().to_string())
+                } else {
+                    None
+                },
+                details,
             }
         };
 
-        let mergeable = opts.conflict_strategy != ConflictStrategy::Abort || conflicts.count == 0;
+        let mut net_flakes = net_flakes;
+
+        // ---- Changes (only if requested). ----------------------------------
+        let changes = if need_changes {
+            // No compactor in stats-only mode even when conflict details
+            // loaded the source state — `max_changes = 0` means no payload.
+            let compactor = if want_change_payload {
+                source_state
+                    .as_ref()
+                    .map(|s| IriCompactor::from_namespaces(s.snapshot.shared_namespaces()))
+            } else {
+                None
+            };
+            let summary = match net_flakes.as_deref() {
+                Some(net) if !net.is_empty() => build_change_summary(
+                    net,
+                    compactor,
+                    opts.max_changes,
+                    opts.changes_after_subject.as_deref(),
+                )?,
+                _ => ChangeSummary::empty(),
+            };
+            Some(summary)
+        } else {
+            None
+        };
+
+        // ---- Validation (default on; skipped on fast-forward). -------------
+        // The same staging and validation the merge performs, minus the
+        // commit: resolve the netted source delta under the strategy, stage
+        // it on a clone of the target state, and run the branch-operation
+        // validator. Under `Abort` with conflicts the merge never reaches
+        // validation, so neither does the preview.
+        let validation =
+            if need_validation && !opts.conflict_strategy.aborts_on(all_conflict_keys.len()) {
+                let target_state = target_state.as_ref().expect("loaded for validation");
+                // The change summary above borrowed it; nothing needs it
+                // after this, so hand it over.
+                let net = net_flakes.take();
+                let (ns_delta, graph_iris) = source_deltas.unwrap_or_default();
+                let (_view, outcome) = self
+                    .stage_merge(
+                        target_state.clone(),
+                        net.unwrap_or_default(),
+                        &all_conflict_keys,
+                        &opts.conflict_strategy,
+                        &ns_delta,
+                        &graph_iris,
+                    )
+                    .await?;
+                Some(ValidationSummary {
+                    conforms: outcome.conforms(),
+                    report: outcome.report,
+                })
+            } else {
+                None
+            };
+
+        let mergeable = !opts.conflict_strategy.aborts_on(conflicts.count)
+            && validation.as_ref().is_none_or(|v| v.conforms);
 
         // ---- Invariants (debug-only). -------------------------------------
         debug_assert!(ahead.commits.len() <= ahead.count);
@@ -442,23 +734,140 @@ impl crate::Fluree {
             debug_assert_eq!(conflicts.count, 0);
         }
         if source_head.is_some() && target_head.is_some() {
-            debug_assert!(ancestor.is_some());
+            debug_assert!(diff.is_some());
         }
 
         Ok(MergePreview {
             source: source_branch.to_string(),
             target: resolved_target.to_string(),
-            ancestor: ancestor.map(|a| AncestorRef {
-                commit_id: a.commit_id,
-                t: a.t,
-            }),
+            ancestor,
             ahead,
             behind,
             fast_forward,
             conflicts,
             mergeable,
+            validation,
+            changes,
         })
     }
+}
+
+/// Commit summaries for `cids`, newest first, capped at `max`. The count is
+/// the whole set, whatever the cap.
+async fn summarize(
+    store: &impl ContentStore,
+    cids: &[ContentId],
+    max: Option<usize>,
+) -> Result<(Vec<CommitSummary>, usize)> {
+    let wanted = max.unwrap_or(cids.len()).min(cids.len());
+    let mut summaries = Vec::with_capacity(wanted);
+    for cid in cids.iter().rev().take(wanted) {
+        summaries.push(commit_to_summary(&load_commit_by_id(store, cid).await?));
+    }
+    Ok((summaries, cids.len()))
+}
+
+/// Group netted flakes by subject, order deterministically, and apply the
+/// cursor + flake cap. Counts are computed over the full net set before any
+/// truncation. `compactor: None` is stats-only mode — exact counts, no
+/// entries.
+fn build_change_summary(
+    net_flakes: &[Flake],
+    compactor: Option<IriCompactor>,
+    max_changes: Option<usize>,
+    after_subject: Option<&str>,
+) -> Result<ChangeSummary> {
+    let assert_count = net_flakes.iter().filter(|f| f.op).count();
+    let retract_count = net_flakes.len() - assert_count;
+
+    let Some(compactor) = compactor else {
+        // Stats-only: distinct subjects countable without IRI resolution
+        // (Sid ↔ IRI is bijective under one namespace table).
+        let subjects: FxHashSet<&fluree_db_core::Sid> = net_flakes.iter().map(|f| &f.s).collect();
+        return Ok(ChangeSummary {
+            assert_count,
+            retract_count,
+            subject_count: subjects.len(),
+            entries: Vec::new(),
+            truncated: !net_flakes.is_empty(),
+            next_cursor: None,
+        });
+    };
+
+    // Group by Sid first — a cheap Arc-clone key with no IRI resolution — so
+    // each distinct subject is decoded exactly once rather than once per flake.
+    // Sorting by the decoded IRI then gives the deterministic subject order
+    // that pagination cursors rely on.
+    let mut by_sid: FxHashMap<fluree_db_core::Sid, Vec<&Flake>> = FxHashMap::default();
+    for f in net_flakes {
+        by_sid.entry(f.s.clone()).or_default().push(f);
+    }
+    let subject_count = by_sid.len();
+
+    let mut by_subject: Vec<(String, Vec<&Flake>)> = by_sid
+        .into_iter()
+        .map(|(sid, flakes)| Ok((compactor.decode_sid(&sid)?, flakes)))
+        .collect::<Result<_>>()?;
+    by_subject.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    let mut entries = Vec::new();
+    let mut emitted_flakes = 0usize;
+    let mut truncated = false;
+
+    for (subject, mut flakes) in by_subject
+        .into_iter()
+        .skip_while(|(s, _)| after_subject.is_some_and(|a| s.as_str() <= a))
+    {
+        // Cut at subject boundaries: stop before a subject that would cross
+        // the cap — unless it's the first subject of the page, which is
+        // returned whole (bounded overshoot) so progress is always possible.
+        if let Some(cap) = max_changes {
+            if !entries.is_empty() && emitted_flakes + flakes.len() > cap {
+                truncated = true;
+                break;
+            }
+        }
+        emitted_flakes += flakes.len();
+
+        // Deterministic order within a subject.
+        flakes.sort_by(|a, b| {
+            a.p.cmp(&b.p)
+                .then_with(|| a.o.cmp(&b.o))
+                .then_with(|| a.dt.cmp(&b.dt))
+                .then_with(|| a.m.cmp(&b.m))
+        });
+
+        let mut asserts = Vec::new();
+        let mut retracts = Vec::new();
+        for &f in &flakes {
+            let resolved = resolve_flake(&compactor, f)?;
+            if f.op {
+                asserts.push(resolved);
+            } else {
+                retracts.push(resolved);
+            }
+        }
+        entries.push(SubjectChange {
+            subject,
+            asserts,
+            retracts,
+        });
+    }
+
+    let next_cursor = if truncated {
+        entries.last().map(|e| e.subject.clone())
+    } else {
+        None
+    };
+
+    Ok(ChangeSummary {
+        assert_count,
+        retract_count,
+        subject_count,
+        entries,
+        truncated,
+        next_cursor,
+    })
 }
 
 async fn build_conflict_details(

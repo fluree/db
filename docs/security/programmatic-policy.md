@@ -125,10 +125,10 @@ When you call `wrap_identity_policy_view`:
 
 For cases where policies should not be stored in the database, use inline policies with explicit `?$identity` binding.
 
-### QueryConnectionOptions Pattern
+### GovernanceOptions Pattern
 
 ```rust
-use fluree_db_api::{QueryConnectionOptions, wrap_policy_view};
+use fluree_db_api::{GovernanceOptions, wrap_policy_view};
 use std::collections::HashMap;
 
 let policy = json!([{
@@ -144,13 +144,13 @@ let policy = json!([{
     })).unwrap()
 }]);
 
-let opts = QueryConnectionOptions {
+let opts = GovernanceOptions {
     policy: Some(policy),
     policy_values: Some(HashMap::from([(
         "?$identity".to_string(),
         json!({"@id": "http://example.org/identity/alice"}),
     )])),
-    default_allow: true,
+    default_allow: Some(true),
     ..Default::default()
 };
 
@@ -199,6 +199,20 @@ let result = fluree.query_from()
     .execute()
     .await?;
 ```
+
+### Body Options Through the Graph-Scoped Builder
+
+`fluree.graph(<ledger>).query()` honors the same body `opts` as `query_from()`,
+and a ledger's configured `f:policyDefaults` govern a bare read through either.
+Use it when the target may be a mapped graph source as well as a native ledger.
+
+A SPARQL request carries the same selection in its
+[`# PRAGMA` comments](../query/sparql.md#request-options--pragma) (`identity`,
+`policy-class`, `policy-values`, `default-allow`; the inline policy document has
+no pragma), and both builders honor them. One limit is worth knowing: a snapshot
+materialized with `graph(<ledger>).load()` carries configured defaults but not a
+query's own `opts` or pragmas, because it is loaded before any query is attached
+and then serves many of them.
 
 ## Policy Options Precedence
 
@@ -263,8 +277,8 @@ When multiple policy options are provided, they follow this precedence:
 When multiple policies match a flake, they are combined using **Deny Overrides**:
 
 1. If **any** matching policy explicitly denies (`f:allow: false`), access is **denied**
-2. If a targeted policy's `f:query` returns false, access is **denied** (doesn't fall through to Default policies)
-3. If any policy allows (`f:allow: true` or `f:query` returns true), access is **granted**
+2. If any targeted policy allows (`f:allow: true` or `f:query` returns true), access is **granted** — every targeted policy is evaluated, regardless of order
+3. If a targeted policy's `f:query` returns false and no other targeted policy allows, access is **denied** (doesn't fall through to Default policies)
 4. If no policies match and `default_allow` is `true` → access is **granted**
 5. Otherwise, access is **denied**
 
@@ -274,7 +288,29 @@ When multiple policies match a flake, they are combined using **Deny Overrides**
 
 ## Transactions with Policy
 
-Policies can also be applied to transactions using the builder API:
+Policies can also be applied to transactions using the builder API. The
+recommended entry point is `build_transact_policy_context`, which honors
+the ledger's `#config` graph the same way the server transact path does:
+it merges config policy defaults (`f:policyClass`, `f:defaultAllow`) into
+the supplied options and resolves `f:policySource` — same-ledger named
+graphs and cross-ledger model references — before building the context.
+It returns `None` when neither the request nor the config supplies any
+policy input (run as root):
+
+```rust
+let policy_ctx = fluree_db_api::build_transact_policy_context(
+    &fluree,
+    &ledger.snapshot,
+    ledger.novelty.as_ref(),
+    Some(ledger.novelty.as_ref()),
+    ledger.t(),
+    &qc_opts,
+).await?; // -> Option<PolicyContext>
+```
+
+The lower-level `build_policy_context_from_opts` remains available when
+you want to control the policy graphs yourself (it does no config
+resolution and no defaults merge):
 
 ```rust
 use fluree_db_api::policy_builder;
@@ -314,7 +350,7 @@ match result {
 For time-travel queries with policy, load a historical graph and apply policy as a view overlay:
 
 ```rust
-use fluree_db_api::{GraphDb, QueryConnectionOptions};
+use fluree_db_api::{GovernanceOptions, GraphDb};
 
 // Load a historical view
 let graph = fluree.view_at_t("mydb:main", 100).await?;
@@ -362,18 +398,19 @@ Creates a policy-wrapped view using identity-based `f:policyClass` lookup.
 ```rust
 pub async fn wrap_policy_view<'a>(
     ledger: &'a LedgerState,
-    opts: &QueryConnectionOptions,
+    opts: &GovernanceOptions,
 ) -> Result<PolicyWrappedView<'a>>
 ```
 
-Creates a policy-wrapped view from query connection options.
+Creates a policy-wrapped view from governance options.
 
-**QueryConnectionOptions fields:**
+**GovernanceOptions fields:**
 - `identity`: Identity IRI for `f:policyClass` lookup
 - `policy`: Inline policy JSON
 - `policy_class`: Policy class IRIs to query
 - `policy_values`: Variable bindings for policy queries
-- `default_allow`: Default access when no policies match
+- `default_allow`: Default access when no policies match. Tri-state: `None` lets the ledger's configured `f:defaultAllow` fill it in, `Some(v)` is an explicit request value. Unset on both sides is fail-closed.
+- `server_identity`: The auth-layer-verified caller identity, and the only thing `f:overrideControl` gates on. Never parsed from a request body or header. An application embedding this API is the auth layer for its deployment and sets it from the identity it verified; left unset, `f:IdentityRestricted` denies the override. See [Override control](../ledger-config/override-control.md#identity-verification).
 
 ### PolicyWrappedView
 

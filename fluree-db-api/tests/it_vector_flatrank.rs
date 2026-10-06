@@ -540,7 +540,7 @@ async fn vector_search_post_indexing() {
                 .expect("insert_with_opts");
 
             // Trigger indexing and wait for completion
-            let completion = handle.trigger(ledger_id, result.receipt.t).await;
+            let completion = handle.trigger(&fluree_db_api::LedgerId::parse(ledger_id).unwrap(), result.receipt.t).await;
             match completion.wait().await {
                 fluree_db_api::IndexOutcome::Completed { index_t, .. } => {
                     assert!(index_t >= result.receipt.t);
@@ -658,7 +658,7 @@ async fn vector_search_novelty_plus_indexed() {
                 .expect("batch1");
 
             // Index batch 1
-            let completion = handle.trigger(ledger_id, r1.receipt.t).await;
+            let completion = handle.trigger(&fluree_db_api::LedgerId::parse(ledger_id).unwrap(), r1.receipt.t).await;
             match completion.wait().await {
                 fluree_db_api::IndexOutcome::Completed { .. } => {}
                 fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
@@ -854,7 +854,7 @@ async fn vector_cosine_normalized_optimization() {
                 .expect("insert");
 
             // Index
-            let completion = handle.trigger(ledger_id, r.receipt.t).await;
+            let completion = handle.trigger(&fluree_db_api::LedgerId::parse(ledger_id).unwrap(), r.receipt.t).await;
             match completion.wait().await {
                 fluree_db_api::IndexOutcome::Completed { .. } => {}
                 fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
@@ -1193,4 +1193,592 @@ async fn sparql_vector_with_score_filter() {
     // Only Homer (0.72) passes the threshold; Bart (0.61) does not
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0][0], "Homer");
+}
+
+// =============================================================================
+// Perf smoke harness
+// =============================================================================
+
+/// Deterministic pseudo-random f64 in [-1, 1) (LCG; no process randomness so
+/// the test can regenerate the exact vectors for scalar verification).
+struct Lcg(u64);
+
+impl Lcg {
+    fn next_f64(&mut self) -> f64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        ((self.0 >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+    }
+}
+
+/// Perf smoke harness for per-row flat vector scoring at scale (run manually):
+///
+/// ```sh
+/// cargo test -p fluree-db-api --features vector --test it_vector_flatrank \
+///     --release vector_flatrank_perf_50k -- --ignored --nocapture
+/// ```
+///
+/// Seeds 50k entities with 256-dim vectors (novelty-only, so every scanned
+/// row arrives as a materialized `Binding::Lit` — the production shape once
+/// any unindexed commit exists), then times `bind ?score (dotProduct ...)`
+/// + threshold filter. Results are verified against scalar recomputation of
+/// the same LCG-generated vectors: exact hit count, and top-5 ids/scores
+/// within 1e-9 — so before/after runs must agree on output, not just speed.
+#[tokio::test]
+#[ignore = "perf smoke — run manually with --ignored --nocapture"]
+async fn vector_flatrank_perf_50k() {
+    const N: usize = 50_000;
+    const DIMS: usize = 256;
+    const CHUNK: usize = 10_000;
+    const THRESHOLD: f64 = 11.0;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "test/vector-perf:main";
+    let mut ledger = fluree.create_ledger(ledger_id).await.unwrap();
+
+    // Generate all vectors once (kept for scalar verification below).
+    let mut rng = Lcg(42);
+    let vectors: Vec<Vec<f64>> = (0..N)
+        .map(|_| (0..DIMS).map(|_| rng.next_f64()).collect())
+        .collect();
+    let target: Vec<f64> = (0..DIMS).map(|_| rng.next_f64()).collect();
+
+    let seed_start = std::time::Instant::now();
+    for chunk_start in (0..N).step_by(CHUNK) {
+        let entities: Vec<serde_json::Value> = (chunk_start..(chunk_start + CHUNK).min(N))
+            .map(|i| {
+                json!({
+                    "@id": format!("ex:v{i}"),
+                    "ex:vec": {
+                        "@value": vectors[i],
+                        "@type": "https://ns.flur.ee/db#embeddingVector"
+                    }
+                })
+            })
+            .collect();
+        let txn = json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "@graph": entities
+        });
+        ledger = fluree
+            .insert(ledger, &txn)
+            .await
+            .expect("seed chunk")
+            .ledger;
+    }
+    println!(
+        "vector_perf_50k: seeded {N} x {DIMS}-dim in {:?}",
+        seed_start.elapsed()
+    );
+
+    // Scalar ground truth: expected hits and top-5 (id index, score).
+    let scalar_dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+    let mut expected: Vec<(usize, f64)> = vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (i, scalar_dot(v, &target)))
+        .filter(|(_, s)| *s > THRESHOLD)
+        .collect();
+    expected.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    assert!(
+        expected.len() > 100,
+        "threshold should pass a meaningful subset, got {}",
+        expected.len()
+    );
+
+    let query_dot = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "select": ["?x", "?score"],
+        "values": [["?targetVec"],
+            [{"@value": target, "@type": "https://ns.flur.ee/db#embeddingVector"}]],
+        "where": [
+            {"@id": "?x", "ex:vec": "?vec"},
+            ["bind", "?score", ["dotProduct", "?vec", "?targetVec"]],
+            ["filter", format!("(> ?score {THRESHOLD})")]
+        ],
+        "orderBy": [["desc", "?score"]]
+    });
+
+    for run in ["cold", "warm"] {
+        let start = std::time::Instant::now();
+        let result = support::query_jsonld(&fluree, &ledger, &query_dot)
+            .await
+            .expect("dotProduct query");
+        let rows = result.to_jsonld(&ledger.snapshot).unwrap();
+        let arr = rows.as_array().unwrap().clone();
+        println!(
+            "vector_perf_50k: dotProduct {run} run: {} hits in {:?}",
+            arr.len(),
+            start.elapsed()
+        );
+
+        assert_eq!(
+            arr.len(),
+            expected.len(),
+            "{run}: hit count must match scalar recomputation"
+        );
+        for (rank, (exp_idx, exp_score)) in expected.iter().take(5).enumerate() {
+            let row = arr[rank].as_array().unwrap();
+            let id = row[0].as_str().unwrap();
+            let score = row[1].as_f64().unwrap();
+            assert_eq!(id, format!("ex:v{exp_idx}"), "{run}: rank {rank} id");
+            assert!(
+                (score - exp_score).abs() <= 1e-6 * exp_score.abs().max(1.0),
+                "{run}: rank {rank} score {score} != scalar {exp_score}"
+            );
+        }
+    }
+
+    // Cosine + euclidean: one timed pass each, count-verified against scalar.
+    for (func, name) in [
+        ("cosineSimilarity", "cosine"),
+        ("euclideanDistance", "euclidean"),
+    ] {
+        let (filter, expected_count) = match name {
+            "cosine" => {
+                let cnt = vectors
+                    .iter()
+                    .filter(|v| {
+                        let dot = scalar_dot(v, &target);
+                        let ma = scalar_dot(v, v).sqrt();
+                        let mb = scalar_dot(&target, &target).sqrt();
+                        dot / (ma * mb) > 0.2
+                    })
+                    .count();
+                ("(> ?score 0.2)".to_string(), cnt)
+            }
+            _ => {
+                let cnt = vectors
+                    .iter()
+                    .filter(|v| {
+                        v.iter()
+                            .zip(&target)
+                            .map(|(x, y)| (x - y) * (x - y))
+                            .sum::<f64>()
+                            .sqrt()
+                            < 12.0
+                    })
+                    .count();
+                ("(< ?score 12.0)".to_string(), cnt)
+            }
+        };
+        let query = json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "select": ["?x", "?score"],
+            "values": [["?targetVec"],
+                [{"@value": target, "@type": "https://ns.flur.ee/db#embeddingVector"}]],
+            "where": [
+                {"@id": "?x", "ex:vec": "?vec"},
+                ["bind", "?score", [func, "?vec", "?targetVec"]],
+                ["filter", filter]
+            ]
+        });
+        let start = std::time::Instant::now();
+        let result = support::query_jsonld(&fluree, &ledger, &query)
+            .await
+            .expect("scored query");
+        let rows = result.to_jsonld(&ledger.snapshot).unwrap();
+        let got = rows.as_array().unwrap().len();
+        println!(
+            "vector_perf_50k: {name} run: {got} hits in {:?}",
+            start.elapsed()
+        );
+        assert_eq!(
+            got, expected_count,
+            "{name}: hit count must match scalar recomputation"
+        );
+    }
+
+    // ── Indexed phase ──────────────────────────────────────────────────────
+    // Full reindex, then reload: novelty is empty (overlay epoch 0), so the
+    // scan late-materializes and `?vec` reaches eval as EncodedLit VECTOR_ID
+    // — the packed-f32-shard path, exercised with the same verification.
+    let reindex_start = std::time::Instant::now();
+    fluree
+        .reindex(ledger_id, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload indexed");
+    println!(
+        "vector_perf_50k: reindexed in {:?} (t={})",
+        reindex_start.elapsed(),
+        ledger.t()
+    );
+
+    let query_dot_pipeline = {
+        let mut q = query_dot.clone();
+        // Duplicate threshold filter: same semantics, but defeats the top-k
+        // fast-path detection (≤1 filter) so the generic pipeline runs.
+        q["where"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(["filter", format!("(> ?score {THRESHOLD})")]));
+        q
+    };
+    for run in ["indexed pipeline cold", "indexed pipeline warm"] {
+        let start = std::time::Instant::now();
+        let result = support::query_jsonld(&fluree, &ledger, &query_dot_pipeline)
+            .await
+            .expect("indexed pipeline query");
+        let rows = result.to_jsonld(&ledger.snapshot).unwrap();
+        println!(
+            "vector_perf_50k: dotProduct {run} run: {} hits in {:?}",
+            rows.as_array().unwrap().len(),
+            start.elapsed()
+        );
+    }
+    for run in ["indexed cold", "indexed warm"] {
+        let start = std::time::Instant::now();
+        let result = support::query_jsonld(&fluree, &ledger, &query_dot)
+            .await
+            .expect("indexed dotProduct query");
+        let rows = result.to_jsonld(&ledger.snapshot).unwrap();
+        let arr = rows.as_array().unwrap().clone();
+        println!(
+            "vector_perf_50k: dotProduct {run} run: {} hits in {:?}",
+            arr.len(),
+            start.elapsed()
+        );
+
+        assert_eq!(
+            arr.len(),
+            expected.len(),
+            "{run}: hit count must match scalar recomputation"
+        );
+        for (rank, (exp_idx, exp_score)) in expected.iter().take(5).enumerate() {
+            let row = arr[rank].as_array().unwrap();
+            let id = row[0].as_str().unwrap();
+            let score = row[1].as_f64().unwrap();
+            assert_eq!(id, format!("ex:v{exp_idx}"), "{run}: rank {rank} id");
+            assert!(
+                (score - exp_score).abs() <= 1e-6 * exp_score.abs().max(1.0),
+                "{run}: rank {rank} score {score} != scalar {exp_score}"
+            );
+        }
+    }
+}
+
+// =============================================================================
+// Flat-rank top-k fast-path parity
+// =============================================================================
+
+/// End-to-end parity for the flat-rank vector fast path against scalar
+/// ground truth, across its lanes:
+///
+/// - indexed base (epoch 0): threshold + ORDER BY DESC + LIMIT top-k
+/// - overlay lane: novelty assert (new top vector) + retraction of an
+///   indexed vector via upsert — both must be reflected without reindexing
+/// - multi-cardinality: a subject with two vectors yields two scored rows
+/// - fallback shapes: an extra hydration triple and a projected `?vec`
+///   must not detect (results still correct via the pipeline)
+#[tokio::test]
+async fn vector_topk_fast_path_parity() {
+    use fluree_db_api::ReindexOptions;
+
+    const DIMS: usize = 8;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "test/vector-topk-parity:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.unwrap();
+
+    // Deterministic vectors; values chosen to be exactly f32-representable
+    // is NOT required — ground truth below quantizes the same way ingest does.
+    let mut rng = Lcg(7);
+    let vectors: Vec<Vec<f64>> = (0..40)
+        .map(|_| (0..DIMS).map(|_| rng.next_f64()).collect())
+        .collect();
+    let target: Vec<f64> = (0..DIMS).map(|_| rng.next_f64()).collect();
+    // Give one subject (v39) a second vector (multi-cardinality).
+    let second_vec: Vec<f64> = (0..DIMS).map(|_| rng.next_f64()).collect();
+
+    let mut entities: Vec<serde_json::Value> = (0..40)
+        .map(|i| {
+            json!({
+                "@id": format!("ex:v{i}"),
+                "ex:vec": {"@value": vectors[i], "@type": "https://ns.flur.ee/db#embeddingVector"}
+            })
+        })
+        .collect();
+    entities.push(json!({
+        "@id": "ex:v39",
+        "ex:vec": {"@value": second_vec, "@type": "https://ns.flur.ee/db#embeddingVector"}
+    }));
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({"@context": {"ex": "http://example.org/ns/"}, "@graph": entities}),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let _ = ledger;
+
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload indexed");
+
+    // Ground truth: stored vectors are f32-quantized at ingest; the query
+    // VALUES vector is used at full precision (only *storage* quantizes).
+    let q = |v: &[f64]| -> Vec<f64> { v.iter().map(|&x| (x as f32) as f64).collect() };
+    let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+    let qt = target.clone();
+    // (subject index, score); index 40 = v39's second vector.
+    let mut facts: Vec<(usize, f64)> = vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (i, dot(&q(v), &qt)))
+        .collect();
+    facts.push((39, dot(&q(&second_vec), &qt)));
+
+    let run_topk = |ledger: support::MemoryLedger, k: usize| {
+        let fluree = &fluree;
+        let target = target.clone();
+        async move {
+            let query = json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "select": ["?x", "?score"],
+                "values": [["?t"], [{"@value": target, "@type": "https://ns.flur.ee/db#embeddingVector"}]],
+                "where": [
+                    {"@id": "?x", "ex:vec": "?vec"},
+                    ["bind", "?score", ["dotProduct", "?vec", "?t"]],
+                    ["filter", "(> ?score 0)"]
+                ],
+                "orderBy": [["desc", "?score"]],
+                "limit": k
+            });
+            let result = support::query_jsonld(fluree, &ledger, &query)
+                .await
+                .expect("topk query");
+            let rows = result.to_jsonld(&ledger.snapshot).unwrap();
+            let out: Vec<(String, f64)> = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| {
+                    let r = r.as_array().unwrap();
+                    (r[0].as_str().unwrap().to_string(), r[1].as_f64().unwrap())
+                })
+                .collect();
+            (ledger, out)
+        }
+    };
+
+    let expect_topk = |facts: &[(usize, f64)], k: usize| -> Vec<(String, f64)> {
+        let mut passing: Vec<(usize, f64)> =
+            facts.iter().copied().filter(|(_, s)| *s > 0.0).collect();
+        passing.sort_by(|a, b| b.1.total_cmp(&a.1));
+        passing
+            .into_iter()
+            .take(k)
+            .map(|(i, s)| (format!("ex:v{i}"), s))
+            .collect()
+    };
+
+    let assert_rows = |got: &[(String, f64)], want: &[(String, f64)], label: &str| {
+        assert_eq!(got.len(), want.len(), "{label}: row count");
+        for (idx, ((gid, gs), (wid, ws))) in got.iter().zip(want).enumerate() {
+            assert_eq!(
+                gid, wid,
+                "{label}: rank {idx} id (got {got:?} want {want:?})"
+            );
+            assert!(
+                (gs - ws).abs() <= 1e-9 * ws.abs().max(1.0),
+                "{label}: rank {idx} score {gs} != {ws}"
+            );
+        }
+    };
+
+    // ── Phase A: indexed base, top-5 ───────────────────────────────────────
+    let (ledger, got) = run_topk(ledger, 5).await;
+    assert_rows(&got, &expect_topk(&facts, 5), "indexed base");
+
+    // ── Phase B: novelty — new top vector + retraction via upsert ─────────
+    // New subject whose vector is target*2 → dominant top score.
+    let big: Vec<f64> = target.iter().map(|x| x * 2.0).collect();
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:vNEW",
+                "ex:vec": {"@value": big, "@type": "https://ns.flur.ee/db#embeddingVector"}
+            }),
+        )
+        .await
+        .expect("novelty insert")
+        .ledger;
+    // Retract the current best base vector by replacing it (upsert) with a
+    // strongly negative one.
+    let best_idx = facts
+        .iter()
+        .filter(|(i, _)| *i != 39) // v39 is multi-cardinality; upsert replaces BOTH its vectors
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .unwrap()
+        .0;
+    let neg: Vec<f64> = target.iter().map(|x| -x).collect();
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": format!("ex:v{best_idx}"),
+                "ex:vec": {"@value": neg, "@type": "https://ns.flur.ee/db#embeddingVector"}
+            }),
+        )
+        .await
+        .expect("retract via upsert")
+        .ledger;
+
+    // Update ground truth: drop best_idx's old fact, add its replacement and vNEW.
+    facts.retain(|(i, _)| *i != best_idx);
+    facts.push((best_idx, dot(&q(&neg), &qt)));
+    let mut facts_with_new: Vec<(String, f64)> = facts
+        .iter()
+        .map(|(i, s)| (format!("ex:v{i}"), *s))
+        .collect();
+    facts_with_new.push(("ex:vNEW".to_string(), dot(&q(&big), &qt)));
+    let mut want: Vec<(String, f64)> = facts_with_new
+        .into_iter()
+        .filter(|(_, s)| *s > 0.0)
+        .collect();
+    want.sort_by(|a, b| b.1.total_cmp(&a.1));
+    want.truncate(5);
+    assert_eq!(want[0].0, "ex:vNEW", "sanity: novelty vector must lead");
+
+    let (ledger, got) = run_topk(ledger, 5).await;
+    assert_rows(&got, &want, "overlay lane");
+
+    // ── Phase C: fallback shapes stay correct ──────────────────────────────
+    // Projecting ?vec must not detect (vector materialization is pipeline
+    // work); the result set must be the same subjects/scores.
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "select": ["?x", "?score", "?vec"],
+        "values": [["?t"], [{"@value": target, "@type": "https://ns.flur.ee/db#embeddingVector"}]],
+        "where": [
+            {"@id": "?x", "ex:vec": "?vec"},
+            ["bind", "?score", ["dotProduct", "?vec", "?t"]],
+            ["filter", "(> ?score 0)"]
+        ],
+        "orderBy": [["desc", "?score"]],
+        "limit": 5
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("fallback query");
+    let rows = result.to_jsonld(&ledger.snapshot).unwrap();
+    let got_fb: Vec<(String, f64)> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let r = r.as_array().unwrap();
+            (r[0].as_str().unwrap().to_string(), r[1].as_f64().unwrap())
+        })
+        .collect();
+    assert_rows(&got_fb, &want, "fallback (?vec projected)");
+}
+
+/// A non-vector literal physically stored on the vector predicate passes
+/// fast-path *detection* (the canonical `{?x, ?score}` shape), then trips the
+/// runtime `Scorer::score → Err(Bail)` mid-scan. The whole fast path must defer
+/// to the generic pipeline and return the pipeline's exact rows — never a
+/// partial/garbage result.
+#[tokio::test]
+async fn vector_topk_fast_path_runtime_bail_defers_to_pipeline() {
+    use fluree_db_api::ReindexOptions;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "test/vector-topk-runtime-bail:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.unwrap();
+
+    let ctx = json!({"ex": "http://example.org/ns/"});
+    // Real vectors plus one non-vector string on the SAME predicate.
+    let real: [(&str, [f64; 2]); 4] = [
+        ("ex:a", [0.9, 0.1]),
+        ("ex:b", [0.5, 0.5]),
+        ("ex:c", [0.1, 0.9]),
+        ("ex:d", [0.8, 0.2]),
+    ];
+    let mut graph: Vec<serde_json::Value> = real
+        .iter()
+        .map(|(id, v)| {
+            json!({
+                "@id": id,
+                "ex:vec": {"@value": [v[0], v[1]], "@type": "https://ns.flur.ee/db#embeddingVector"}
+            })
+        })
+        .collect();
+    graph.push(json!({"@id": "ex:bad", "ex:vec": "Not a Vector"}));
+
+    let ledger = fluree
+        .insert(ledger0, &json!({"@context": ctx, "@graph": graph}))
+        .await
+        .expect("seed")
+        .ledger;
+    let _ = ledger;
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload indexed");
+
+    let target = [0.7_f64, 0.3_f64];
+    let query = json!({
+        "@context": ctx,
+        "select": ["?x", "?score"],
+        "values": [["?t"], [{"@value": [target[0], target[1]], "@type": "https://ns.flur.ee/db#embeddingVector"}]],
+        "where": [
+            {"@id": "?x", "ex:vec": "?vec"},
+            ["bind", "?score", ["dotProduct", "?vec", "?t"]],
+            ["filter", "(> ?score 0)"]
+        ],
+        "orderBy": [["desc", "?score"]],
+        "limit": 3
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("runtime-bail query");
+    let rows = result.to_jsonld(&ledger.snapshot).unwrap();
+    let got: Vec<(String, f64)> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let r = r.as_array().unwrap();
+            (r[0].as_str().unwrap().to_string(), r[1].as_f64().unwrap())
+        })
+        .collect();
+
+    // Scalar ground truth over the real vectors only (f32-quantized at ingest;
+    // the target stays full precision). The non-vector subject contributes
+    // nothing, so it must be absent from the deferred pipeline's output.
+    let q = |x: f64| (x as f32) as f64;
+    let mut want: Vec<(String, f64)> = real
+        .iter()
+        .map(|(id, v)| (id.to_string(), q(v[0]) * target[0] + q(v[1]) * target[1]))
+        .filter(|(_, s)| *s > 0.0)
+        .collect();
+    want.sort_by(|a, b| b.1.total_cmp(&a.1));
+    want.truncate(3);
+
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "runtime bail must defer, not emit partial: got {got:?}"
+    );
+    for (i, ((gid, gs), (wid, ws))) in got.iter().zip(&want).enumerate() {
+        assert_eq!(gid, wid, "rank {i} id: got {got:?} want {want:?}");
+        assert!(
+            (gs - ws).abs() <= 1e-9 * ws.abs().max(1.0),
+            "rank {i} score {gs} != {ws}"
+        );
+    }
+    assert!(
+        !got.iter().any(|(id, _)| id == "ex:bad"),
+        "non-vector subject must not appear: {got:?}"
+    );
 }

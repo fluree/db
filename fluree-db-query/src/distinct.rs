@@ -6,12 +6,13 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
-use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm};
+use crate::object_binding::{equality_norm, normalize_for_key_cow, EqualityNorm};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use hashbrown::HashMap;
 use rustc_hash::{FxBuildHasher, FxHasher};
+use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -58,6 +59,11 @@ impl DistinctOperator {
         }
     }
 
+    /// Recover the child when a runtime-only dedup wrapper is closed.
+    pub(crate) fn into_child(self) -> BoxedOperator {
+        self.child
+    }
+
     /// Get the number of unique rows seen so far
     pub fn unique_count(&self) -> usize {
         self.seen.len()
@@ -87,6 +93,30 @@ impl DistinctOperator {
 
 #[async_trait]
 impl Operator for DistinctOperator {
+    // The trait object has no Default; replace it with a closed wrapper's stub.
+    #[allow(clippy::box_default)]
+    fn take_distinct_input(&mut self) -> Option<BoxedOperator> {
+        if self.state != OperatorState::Created {
+            return None;
+        }
+        self.state = OperatorState::Closed;
+        Some(std::mem::replace(
+            &mut self.child,
+            Box::new(crate::seed::EmptyOperator::new()),
+        ))
+    }
+
+    /// Item 11 (F-AUD-7): DECLINE forwarding — DISTINCT may collapse arbitrarily
+    /// many input rows into one, so producing `k` distinct rows can require
+    /// unboundedly many input rows. Explicit (was a silent trait-default no-op) so
+    /// the swallow is observable.
+    fn set_row_budget(&mut self, budget: usize) {
+        tracing::debug!(
+            budget,
+            "DISTINCT row-budget swallowed (unsound to forward: dedup collapses rows)"
+        );
+    }
+
     fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
         vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
     }
@@ -136,25 +166,59 @@ impl Operator for DistinctOperator {
             // equality check, and only allocate the full signature for rows that
             // are genuinely new.
             let num_cols = self.schema.len();
+
+            // Zero-column input: every WHERE variable was projected away, so every
+            // row is the empty tuple and they are all duplicates of one another —
+            // DISTINCT over N of them is exactly one row, or none if the child was
+            // empty. This needs its own arm because a column-less `Batch` carries no
+            // row count (`Batch::new` reads it off `columns.first()`), so the
+            // general path below would build a zero-row batch and its
+            // `columns.first() … unwrap_or(true)` guard would read "all duplicates"
+            // forever, swallowing the whole stream. `Batch::empty_schema_with_len`
+            // is the constructor that preserves a row count without columns.
+            //
+            // Reachable from a CONSTRUCT whose template is entirely constant
+            // (`CONSTRUCT { <s> <p> "x" } WHERE { ?s ?p ?o }`): the graph result
+            // licenses WHERE-level dedup while the template needs no variable, so
+            // the block prunes to an empty schema.
+            if num_cols == 0 {
+                if batch.is_empty() {
+                    continue;
+                }
+                if self.seen.is_empty() {
+                    self.seen.insert(RowSignature::new(), ());
+                    return Ok(Some(Batch::empty_schema_with_len(1)));
+                }
+                continue;
+            }
+
             let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
+            // Reused across rows: a duplicate row costs a hash and a probe, no
+            // allocation; only rows that survive are copied into an owned key.
+            let mut scratch: Vec<Cow<'_, Binding>> = Vec::with_capacity(num_cols);
 
             for row_idx in 0..batch.len() {
                 if self.norm.is_some() {
                     let (store, gv) = EqualityNorm::parts(&self.norm);
                     // Normalize decoded bindings to encoded form so mixed
                     // representations of the same value dedup (encoded
-                    // bindings pass through untouched).
-                    let signature: RowSignature = (0..num_cols)
-                        .map(|col| normalize_for_key(batch.get_by_col(row_idx, col), store, gv))
-                        .collect();
+                    // bindings pass through untouched, borrowed).
+                    scratch.clear();
+                    scratch.extend((0..num_cols).map(|col| {
+                        normalize_for_key_cow(batch.get_by_col(row_idx, col), store, gv)
+                    }));
+                    // `Cow` hashes as the binding it wraps, so this equals the
+                    // stored `Vec<Binding>` hash the map recomputes on rehash.
                     let mut h = FxHasher::default();
-                    signature.hash(&mut h);
+                    scratch.hash(&mut h);
                     let hash = h.finish();
-                    let entry = self
-                        .seen
-                        .raw_entry_mut()
-                        .from_hash(hash, |sig| *sig == signature);
+                    let entry = self.seen.raw_entry_mut().from_hash(hash, |sig| {
+                        sig.len() == scratch.len()
+                            && sig.iter().zip(&scratch).all(|(a, b)| a == b.as_ref())
+                    });
                     if let hashbrown::hash_map::RawEntryMut::Vacant(v) = entry {
+                        let signature: RowSignature =
+                            scratch.iter().map(|b| b.as_ref().clone()).collect();
                         v.insert_hashed_nocheck(hash, signature, ());
                         for (col_idx, col) in columns.iter_mut().enumerate() {
                             col.push(batch.get_by_col(row_idx, col_idx).clone());
@@ -305,7 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_all_unique() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -326,9 +390,65 @@ mod tests {
         assert!(result2.is_none());
     }
 
+    /// Zero-column input: every row is the empty tuple, so DISTINCT over any
+    /// number of them is exactly one row — and one row *total*, across every
+    /// batch in the stream.
+    ///
+    /// A column-less `Batch` carries no row count through `Batch::new` (it reads
+    /// the count off `columns.first()`), so the general dedup path built a
+    /// zero-row batch and then its `columns.first() … unwrap_or(true)` guard
+    /// read "all rows were duplicates" on every batch and swallowed the whole
+    /// stream. `CONSTRUCT { <s> <p> "x" } WHERE { ?s ?p ?o }` reaches this: the
+    /// graph result licenses WHERE-level dedup while the constant template needs
+    /// no variable, so the block prunes to an empty schema and the query
+    /// returned an empty graph instead of its one triple.
+    #[tokio::test]
+    async fn test_distinct_zero_column_batches_yield_exactly_one_row() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        // Three batches of empty tuples: 4 rows, then 0, then 2.
+        let mock = MockOperator::new(vec![
+            Batch::empty_schema_with_len(4),
+            Batch::empty_schema_with_len(0),
+            Batch::empty_schema_with_len(2),
+        ]);
+
+        let mut distinct_op = DistinctOperator::new(Box::new(mock));
+        distinct_op.open(&ctx).await.unwrap();
+
+        let first = distinct_op.next_batch(&ctx).await.unwrap();
+        assert!(
+            first.is_some(),
+            "zero-column DISTINCT must emit the single empty-tuple row"
+        );
+        assert_eq!(first.unwrap().len(), 1);
+
+        assert!(
+            distinct_op.next_batch(&ctx).await.unwrap().is_none(),
+            "the remaining empty tuples are duplicates of the first"
+        );
+    }
+
+    /// The other half: a child that produced no rows at all must stay empty —
+    /// the fix must not manufacture a row out of an empty solution sequence.
+    #[tokio::test]
+    async fn test_distinct_zero_column_empty_child_stays_empty() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let mock = MockOperator::new(vec![Batch::empty_schema_with_len(0)]);
+        let mut distinct_op = DistinctOperator::new(Box::new(mock));
+        distinct_op.open(&ctx).await.unwrap();
+
+        assert!(distinct_op.next_batch(&ctx).await.unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn test_distinct_all_duplicates() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -347,7 +467,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_mixed() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -384,7 +504,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_across_batches() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -417,7 +537,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_batch_all_dupes_skipped() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -445,7 +565,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_multi_column() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -465,7 +585,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_with_unbound() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -490,7 +610,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_with_poisoned() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -515,7 +635,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_preserves_schema() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -546,7 +666,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_state_transitions() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 

@@ -31,6 +31,7 @@
 //! even though chunk parsing is parallel.
 
 use crate::error::ApiError;
+use fluree_db_core::task::TaskFailure;
 use fluree_db_core::{
     ContentId, ContentKind, ContentStore, FuelExceededError, RemoteObject, Storage, StorageRead,
     Tracker, TrackingTally,
@@ -43,8 +44,82 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::Instrument;
 
+/// Publish the import's commit head by fast-forwarding the ref directly.
+///
+/// Bulk import is a one-shot admin flow: nothing is staged on the
+/// per-branch transaction queue, so `publish_commit` — whose contract on
+/// queue-backed nameservices (the raft data plane) is "apply the staged
+/// queue front" — fails there with "per-branch queue is empty". A
+/// ref-level fast-forward carries the exact strictly-newer semantics the
+/// file/S3 nameservices give `publish_commit`, and every nameservice
+/// implements it via `RefPublisher`, so the bulk importer works under
+/// all data planes without touching the transactor's queue contract.
+///
+/// Import runs against a fresh ledger and publishes serially, so the one
+/// benign conflict is the final publish restating the last checkpoint's
+/// exact `(t, commit_id)`. Any other conflict is surfaced as an error:
+/// a head at a different `t`/id means a foreign writer got ahead of the
+/// import, and a head still behind `t` means the CAS retry budget ran
+/// out under contention.
+async fn publish_import_commit_head(
+    nameservice: &dyn crate::NameServicePublisher,
+    alias: &str,
+    t: i64,
+    commit_id: &ContentId,
+) -> std::result::Result<(), ImportError> {
+    use fluree_db_nameservice::{CasResult, RefValue};
+
+    let new_ref = RefValue {
+        id: Some(commit_id.clone()),
+        t,
+    };
+    match nameservice
+        .fast_forward_commit(alias, &new_ref, 5)
+        .await
+        .map_err(|e| ImportError::Storage(e.to_string()))?
+    {
+        CasResult::Updated => Ok(()),
+        CasResult::Conflict { actual }
+            if actual
+                .as_ref()
+                .is_some_and(|a| a.t == t && a.id.as_ref() == Some(commit_id)) =>
+        {
+            Ok(())
+        }
+        CasResult::Conflict { actual } => Err(ImportError::Storage(match actual.as_ref() {
+            // `fast_forward_commit` returns the same `Conflict` shape when
+            // its retry budget runs out while the fast-forward is still
+            // valid — the head never reached `t`, so this is contention,
+            // not divergence.
+            None => format!(
+                "import commit-head publish for {alias} gave up after contended CAS \
+                 attempts: head is still unborn, wanted t={t}"
+            ),
+            Some(a) if a.t < t => format!(
+                "import commit-head publish for {alias} gave up after contended CAS \
+                 attempts: head is at t={}, wanted t={t}",
+                a.t
+            ),
+            Some(a) => format!(
+                "import commit-head publish for {alias} found a diverged head: \
+                 head is t={} id={:?}, wanted t={t} id={commit_id}",
+                a.t, a.id
+            ),
+        })),
+    }
+}
+
 const IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS: u128 = 50;
 const LOCAL_RECHUNK_EVENT_CHANNEL_CAPACITY: usize = 2;
+
+fn log_ttl_chunk(idx: usize, ttl: &str) {
+    tracing::debug!(
+        chunk_idx = idx,
+        chunk_text_len = ttl.len(),
+        starts_with = ttl.chars().take(200).collect::<String>(),
+        "about to parse chunk"
+    );
+}
 
 // ============================================================================
 // Configuration
@@ -99,7 +174,15 @@ pub enum ImportPhase {
 pub type ProgressFn = Arc<dyn Fn(ImportPhase) + Send + Sync>;
 
 /// Configuration for the bulk import pipeline.
+///
+/// `#[non_exhaustive]` (#1529 review, minor): this struct gained a `pub(crate)`
+/// field (`virtual_source`), so external crates can no longer build it with a
+/// struct literal. Marking it non-exhaustive makes that contract explicit — a
+/// clearer compile error than a bare E0451 — and reserves the right to add fields
+/// without a breaking change. Construct it via [`ImportConfig::default`] + the
+/// builder setters; in-crate literals are unaffected.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct ImportConfig {
     /// Number of parallel TTL parse threads. `0` = auto: the machine's logical
     /// cores, capped so peak parse memory fits the budget (see
@@ -179,6 +262,37 @@ pub struct ImportConfig {
     /// shared `@context` map or already the first node. No effect on other
     /// formats. Default: [`FirstLineContextPolicy::Auto`].
     pub ndjson_first_line_context: FirstLineContextPolicy,
+    /// When set, the import materializes a virtual R2RML graph source into a
+    /// native ledger instead of parsing files (DEC-003 Deliverable 1). Carries
+    /// the provider + graph-source id; `None` for every file/remote import, so
+    /// those paths are unaffected.
+    pub(crate) virtual_source: Option<VirtualSource>,
+    /// Namespace that salts blank-node ids minted by this import.
+    ///
+    /// `None` (the default) salts with the normalized ledger id, so importing
+    /// one source tree into two ledgers mints two disjoint sets of ids —
+    /// blank nodes are local to the graph that holds them, and nothing should
+    /// make them look shared across ledgers by accident.
+    ///
+    /// Set it to make that sharing deliberate: two ledgers imported from the
+    /// same tree under the same namespace mint *identical* ids, so a blank
+    /// node can be matched across them (a rebuild-and-diff, a sharded load of
+    /// one logical dataset, a staging/production pair). It is a plain string
+    /// with no interpretation — any two imports that agree on it, agree on
+    /// their ids.
+    pub skolem_namespace: Option<String>,
+}
+
+/// A virtual (R2RML-over-Iceberg) graph source to materialize into a native
+/// twin: the combined provider handle plus the graph-source id to scan.
+#[derive(Clone)]
+pub(crate) struct VirtualSource {
+    pub provider: Arc<dyn crate::materialize::R2rmlBuildProvider>,
+    pub graph_source_id: String,
+    /// Build a twin even when a parent join key maps to multiple parents (the
+    /// twin then bakes one deterministically-chosen parent per key and records the
+    /// anomaly in its stamp). Default `false` = decline such a source.
+    pub allow_duplicate_parent_keys: bool,
 }
 
 impl std::fmt::Debug for ImportConfig {
@@ -217,6 +331,8 @@ impl Default for ImportConfig {
             progress: None,
             tracker: Tracker::disabled(),
             ndjson_first_line_context: FirstLineContextPolicy::Auto,
+            virtual_source: None,
+            skolem_namespace: None,
         }
     }
 }
@@ -307,6 +423,14 @@ impl ImportConfig {
         }
     }
 
+    /// Effective file-descriptor budget for this import: the live soft
+    /// `RLIMIT_NOFILE` (read fresh, so it reflects the pipeline's best-effort
+    /// raise) minus a reserve, overridable via `FLUREE_FD_BUDGET`. The index
+    /// build plans every fan-in/fan-out stage within it.
+    pub fn effective_fd_budget(&self) -> fluree_db_core::fd_limit::FdBudget {
+        fluree_db_core::fd_limit::FdBudget::detect()
+    }
+
     /// Effective coalesce threshold (number of small files above which the local
     /// directory rechunk producer merges sub-`chunk_size` files into larger work
     /// items). Overridable via `FLUREE_IMPORT_COALESCE_THRESHOLD`; `0` disables.
@@ -347,12 +471,34 @@ impl ImportConfig {
         }
         let budget_mb = self.effective_memory_budget_mb();
         let max_inflight = self.effective_max_inflight();
-        // Budget ≈ max_inflight * chunk_size * 2.5 + run_budget + 2GB (fixed overhead)
-        // Solve for chunk_size: (budget - 2048) / (max_inflight * 2.5 + 1)
-        let numerator = budget_mb.saturating_sub(2048) as f64;
         let denominator = max_inflight as f64 * 2.5 + 1.0;
-        let raw = (numerator / denominator).floor() as usize;
-        raw.clamp(128, 768)
+        if budget_mb >= 2048 {
+            // Large budget: subtract the ~2GB fixed overhead (index build, dict
+            // merge, OS cache) and divide the rest across the in-flight working
+            // set, clamped to [128, 768] MB. Unchanged behavior.
+            let numerator = (budget_mb - 2048) as f64;
+            (numerator / denominator).floor().clamp(128.0, 768.0) as usize
+        } else {
+            // Sub-2GB budgets (O6): the flat 2GB overhead term underflowed to 0 and
+            // the 128MB clamp floor then applied REGARDLESS of budget — so a
+            // 512MB-budget import used the same 128MB chunk as a 2GB one, and a
+            // 128MB chunk under a 512MB budget blows the budget once the ~2.5x
+            // parse/inflight expansion is counted. Instead reserve ~40% for run
+            // buffers + index build and divide the rest across the working set;
+            // floor at 16MB (still worth a commit), cap at 128MB (continuous with
+            // the large-budget floor at the 2GB boundary).
+            //
+            // SHARED-PATH BLAST RADIUS: this branch resizes chunks for EVERY text
+            // import (Turtle/TriG/JSON-LD), not just materialize — a 512MB budget
+            // goes 128MB → ~51MB chunks (≈2.5× the commit count, a different ledger
+            // shape for the same input). The default budget is ~80% of RAM, so most
+            // hosts land ≥2048MB (the branch above) and are unaffected; what changes
+            // is containers under ~2.5GB and any explicit `--memory-budget-mb` below
+            // 2GB (which every finalizer-touching test in this repo passes, e.g.
+            // 256MB). Sizing only — never correctness.
+            let working = budget_mb as f64 * 0.6 / denominator;
+            (working.floor() as usize).clamp(16, 128)
+        }
     }
 
     /// Effective parse/worker thread count.
@@ -524,6 +670,12 @@ pub struct ImportResult {
     /// Tracking tally (fuel, time) when a tracker was supplied via
     /// `ImportBuilder::tracker(...)`. `None` when tracking was disabled.
     pub tally: Option<TrackingTally>,
+    /// Duplicate input statements collapsed out of the index. `flake_count`
+    /// reports the raw commit operations (the commit blobs keep every op),
+    /// so when this is non-zero the indexed triple count is
+    /// `flake_count - duplicates_removed`. 0 when `build_index == false`
+    /// (no index, nothing collapsed).
+    pub duplicates_removed: u64,
 }
 
 /// Lightweight summary of the imported dataset for CLI display.
@@ -568,6 +720,30 @@ pub enum ImportError {
     MixedFormats(String),
     /// Tracker max-fuel limit exceeded mid-import.
     FuelExceeded(FuelExceededError),
+    /// A virtual (R2RML materialize) import was attempted on a single-threaded
+    /// tokio runtime. Its producer drives an async scan via `Handle::block_on`
+    /// off a dedicated thread, which deadlocks on a current-thread runtime.
+    UnsupportedRuntime(String),
+    /// The process open-file limit was exhausted (or is demonstrably too low)
+    /// during an import phase with a per-chunk descriptor cost, such as the
+    /// dictionary merge. Carries the observed limit and the remedy.
+    FdLimit(String),
+}
+
+/// Wrap an index-build I/O failure, upgrading descriptor exhaustion
+/// (`EMFILE`/`ENFILE`) into an actionable message carrying the observed limit.
+fn index_build_error(e: &std::io::Error) -> ImportError {
+    if fluree_db_core::fd_limit::is_fd_exhaustion(e) {
+        let soft = fluree_db_core::fd_limit::nofile_limits()
+            .map_or_else(|| "unknown".to_string(), |l| l.soft.to_string());
+        ImportError::IndexBuild(format!(
+            "{e}. The process open-file limit (currently {soft}) was exhausted \
+             despite descriptor budgeting; raise it (`ulimit -n <n>`, or \
+             launchd/systemd LimitNOFILE) or lower import parallelism"
+        ))
+    } else {
+        ImportError::IndexBuild(e.to_string())
+    }
 }
 
 impl std::fmt::Display for ImportError {
@@ -589,6 +765,8 @@ impl std::fmt::Display for ImportError {
                 e.used_fuel(),
                 e.limit_fuel()
             ),
+            Self::UnsupportedRuntime(msg) => write!(f, "unsupported runtime: {msg}"),
+            Self::FdLimit(msg) => write!(f, "open-file limit: {msg}"),
         }
     }
 }
@@ -643,6 +821,11 @@ pub(crate) enum ImportSource {
         storage: Arc<dyn StorageRead>,
         source: RemoteSource,
     },
+    /// Materialize a virtual R2RML graph source into a native ledger. The
+    /// provider + graph-source id ride on [`ImportConfig::virtual_source`]; this
+    /// marker only routes `run_import_pipeline` past file resolution to the
+    /// virtual producer arm.
+    Virtual,
 }
 
 /// Format of an individual remote object, derived from its extension.
@@ -657,8 +840,246 @@ pub(crate) enum RemoteFormat {
     Ndjson,
 }
 
-/// `(chunk_index, raw_bytes)` payload sent from the remote producer to parser workers.
-type RemoteChunk = (usize, Vec<u8>);
+/// Which document a chunk came from, and where inside it.
+///
+/// RDF scopes blank-node labels to a document, and only the producer knows how
+/// chunks map onto input files — a large file is sub-split into many chunks,
+/// several small files can share one chunk. This travels with every chunk so
+/// the parse worker can scope labels to their source document.
+///
+/// `Copy` and two scalars wide on purpose: it rides the chunk channel, which
+/// stays allocation-free (the skolem base is rendered once per chunk in the
+/// worker, not once per document in the producer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DocChunk {
+    /// Hashed identity of the source document — see [`fluree_db_core::skolem`].
+    /// Every chunk cut from one document carries the same value, and no two
+    /// documents in an import share one (enforced by [`DocIds::new`]).
+    doc: u64,
+    /// Index of this chunk within its source document, from 0.
+    ///
+    /// Labeled blank nodes ignore it (they unify across the whole document);
+    /// *anonymous* nodes need it, because their mint counter restarts in every
+    /// sink. See `ImportSink::term_blank`.
+    sub_chunk: u32,
+}
+
+impl DocChunk {
+    /// A chunk that is a whole document by itself.
+    fn whole(doc: u64) -> Self {
+        Self { doc, sub_chunk: 0 }
+    }
+
+    /// The `{base}` in the parser's `fdb-{base}-{label}` skolem key.
+    fn skolem_base(self) -> String {
+        fluree_db_core::skolem::doc_scope(self.doc)
+    }
+}
+
+/// Assigns each payload its sub-chunk index within its source document.
+///
+/// Producers emit a document's chunks contiguously and in document order, so a
+/// counter that resets whenever the document changes is enough to make
+/// `(doc, sub_chunk)` unique across the import. `next_for` debug-asserts that
+/// contiguity rather than trusting it silently — a producer that interleaved
+/// documents would otherwise re-issue sub-chunk 0 and merge two documents'
+/// anonymous nodes.
+///
+/// Debug-only, unlike the analogous guard in [`DocIds::new`], because the two
+/// watch different things. `DocIds::new` validates *caller-supplied input* — a
+/// `Remote` `OrderedObjects` list names the addresses, and a caller can repeat
+/// one — so no amount of testing this crate rules it out and the check has to
+/// hold in release. This one guards an invariant of an internal producer loop,
+/// which no external input can perturb: whether a producer walks its documents
+/// contiguously is fixed by the code, so a violation is a bug in this file that
+/// a debug build catches before it ships, not a condition to re-check per chunk
+/// on the hot path.
+#[derive(Default)]
+struct SubChunkCounter {
+    current: Option<u64>,
+    next: u32,
+    #[cfg(debug_assertions)]
+    seen: std::collections::HashSet<u64>,
+}
+
+impl SubChunkCounter {
+    fn next_for(&mut self, doc: u64) -> DocChunk {
+        if self.current != Some(doc) {
+            #[cfg(debug_assertions)]
+            debug_assert!(
+                self.seen.insert(doc),
+                "producer emitted document {doc:x} in two separate runs; \
+                 sub-chunk indexes would repeat"
+            );
+            self.current = Some(doc);
+            self.next = 0;
+        }
+        let sub_chunk = self.next;
+        self.next += 1;
+        DocChunk { doc, sub_chunk }
+    }
+}
+
+/// `(chunk_index, doc_chunk, raw_bytes)` payload sent from a chunk producer to
+/// the parser workers.
+type RemoteChunk = (usize, DocChunk, Vec<u8>);
+
+/// Every document in one import, in source order: its key and its hashed id.
+///
+/// Built at the two places where the document set and the import root are both
+/// in scope — [`discover_chunks`] for local sources, [`resolve_remote_objects`]
+/// for remote ones — so every arm agrees on what a document key is. Indexed the
+/// same way `per_chunk_format` and the rechunk `sizes` are.
+///
+/// Doubles as the import manifest: [`DocIds::manifest`] hands the
+/// `scope → key` mapping to the `txn-meta` graph builder, which is what makes a
+/// minted `_:fdb-d…` id traceable back to the document it came from.
+///
+#[derive(Debug)]
+pub(crate) struct DocIds {
+    /// Salt for every id in this import — the normalized ledger id unless the
+    /// caller overrode it. Retained because the ndjson arm discovers extra
+    /// documents (context segments) mid-read, after this table is built.
+    namespace: String,
+    /// Document keys in source order — paths relative to the import root, or
+    /// remote addresses relative to the listing prefix.
+    keys: Vec<String>,
+    /// `skolem::doc_id` of each key at segment 0, same order.
+    ids: Vec<u64>,
+}
+
+impl DocIds {
+    /// Hash every key under `namespace`, refusing an import whose documents do
+    /// not have distinct ids.
+    ///
+    /// A duplicate is nearly always a duplicate *key* — the `Remote`
+    /// `OrderedObjects` arm takes a caller-supplied list, which can name one
+    /// address twice — and much more rarely an `xxh64` collision between two
+    /// genuinely different keys. Both are fatal for the same reason: two
+    /// documents sharing a scope silently merge their `_:x` nodes into one
+    /// subject. Aborting up front costs nothing; discovering it after a
+    /// multi-hour import costs the whole import.
+    fn new(namespace: &str, keys: Vec<String>) -> std::result::Result<Self, ImportError> {
+        let mut ids = Vec::with_capacity(keys.len());
+        let mut seen: HashMap<u64, usize> = HashMap::with_capacity(keys.len());
+        for (idx, key) in keys.iter().enumerate() {
+            let id = fluree_db_core::skolem::doc_id(namespace, key, 0);
+            if let Some(&first) = seen.get(&id) {
+                return Err(ImportError::Source(format!(
+                    "two import documents share the blank-node scope \
+                     '{}': {:?} and {:?}. Blank-node labels in the two would \
+                     merge into one subject. Remove the duplicate, or import \
+                     them separately.",
+                    fluree_db_core::skolem::doc_scope(id),
+                    keys[first],
+                    key,
+                )));
+            }
+            seen.insert(id, idx);
+            ids.push(id);
+        }
+        Ok(Self {
+            namespace: namespace.to_string(),
+            keys,
+            ids,
+        })
+    }
+
+    /// Hashed id of document `idx`.
+    ///
+    /// Out-of-range indexes fall back to `0`: the caller has already sized its
+    /// document list, so this is unreachable, and a wrong-but-stable scope is a
+    /// better failure than a panic mid-import.
+    ///
+    /// The fallback is nonetheless the one silent way this table can go wrong:
+    /// *several* out-of-range documents would all land on scope `0` and merge
+    /// their `_:x` nodes — the failure `DocIds::new` refuses up front, arriving
+    /// through the back door. The assertion turns that into a test failure and
+    /// costs nothing in release.
+    fn id(&self, idx: usize) -> u64 {
+        debug_assert!(
+            idx < self.ids.len(),
+            "document index {idx} is out of range ({} documents); every \
+             out-of-range index shares scope 0",
+            self.ids.len()
+        );
+        self.ids.get(idx).copied().unwrap_or(0)
+    }
+
+    /// Hashed ids in source order, for handing to a producer thread.
+    fn ids(&self) -> Vec<u64> {
+        self.ids.clone()
+    }
+
+    /// Document keys in source order, for the ndjson producers, which hash
+    /// their own per-segment ids.
+    fn keys(&self) -> Vec<String> {
+        self.keys.clone()
+    }
+
+    /// The import manifest: `(blank-node local name of the scope, document
+    /// key)` for every document.
+    ///
+    /// The subject is the scope's own blank node — `fdb-d<scope>`, the prefix
+    /// every id minted from that document shares — so a reader holding an
+    /// opaque `_:fdb-d…-label` recovers the source with
+    /// `fluree_db_core::skolem::split_doc_scope` and one lookup.
+    ///
+    /// `extra_segments` names `(document index, segment ordinal)` pairs beyond
+    /// segment 0 — the ndjson arm cuts one file into several documents at its
+    /// `@context` switches, and which ones exist is only known once the file
+    /// has been read. Each gets its own row against the same document key, so
+    /// every minted scope resolves even though the manifest does not say which
+    /// segment of the file it was.
+    fn manifest(&self, extra_segments: &[(usize, u32)]) -> Vec<(String, String)> {
+        let scope_row = |id: u64, key: &str| {
+            (
+                format!(
+                    "{}{}",
+                    fluree_db_core::ns_encoding::STABLE_BLANK_NODE_LABEL_PREFIX,
+                    fluree_db_core::skolem::doc_scope(id)
+                ),
+                key.to_string(),
+            )
+        };
+        let mut rows: Vec<(String, String)> = self
+            .ids
+            .iter()
+            .zip(&self.keys)
+            .map(|(&id, key)| scope_row(id, key))
+            .collect();
+        for &(idx, segment) in extra_segments {
+            if segment == 0 {
+                continue; // already covered above
+            }
+            let Some(key) = self.keys.get(idx) else {
+                continue;
+            };
+            let id = fluree_db_core::skolem::doc_id(&self.namespace, key, segment);
+            rows.push(scope_row(id, key));
+        }
+        rows
+    }
+}
+
+/// Derive a document key for a local path: its location relative to the import
+/// root, or its file name when the root *is* the file.
+///
+/// Relative rather than absolute so that ids depend on the shape of the import,
+/// not on where the tree happens to be mounted — the same directory imported
+/// from `/tmp/x` and `/data/x` mints the same ids.
+///
+/// [`discover_chunks`] does not recurse, so a local key is a bare file name in
+/// practice; the relative form is what remote `Prefix` listings need, and what
+/// keeps the two arms describing documents the same way.
+fn local_doc_key(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .ok()
+        .or_else(|| path.file_name().map(Path::new))
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
 
 type RemoteChunkRx = Arc<std::sync::Mutex<std::sync::mpsc::Receiver<RemoteChunk>>>;
 
@@ -671,6 +1092,13 @@ type RemoteChunkRx = Arc<std::sync::Mutex<std::sync::mpsc::Receiver<RemoteChunk>
 /// exit to distinguish clean completion from producer failure.
 pub struct RemoteChunkProducer {
     pub(crate) rx: RemoteChunkRx,
+    /// `(document index, segment ordinal)` for every context segment an ndjson
+    /// source actually opened, filled by the producer as it reads. Empty for
+    /// whole-object sources, which are one document each.
+    ///
+    /// Read after the producer thread is joined; that is the only point at
+    /// which it is known to be complete.
+    pub(crate) segments: Arc<std::sync::Mutex<Vec<(usize, u32)>>>,
     /// Take-once handles, accessible through `&self` via Mutex<Option<_>>.
     /// `error_rx` carries `Some(err)` on producer failure, `None` on success.
     pub(crate) error_rx:
@@ -895,12 +1323,12 @@ impl ChunkSource {
         }
     }
 
-    /// Whether chunk at `index` is a JSON-LD file (`.jsonld`, also compressed).
+    /// Whether chunk at `index` is a JSON-LD file (`.json`/`.jsonld`, also compressed).
     pub fn is_jsonld(&self, index: usize) -> bool {
         match self {
             Self::Files(files) => files
                 .get(index)
-                .is_some_and(|p| effective_extension(p).0.as_deref() == Some("jsonld")),
+                .is_some_and(|p| is_jsonld_ext(effective_extension(p).0.as_deref())),
             Self::Streaming(_) | Self::LocalRechunk(_) => false,
             Self::Remote(producer) => {
                 matches!(producer.format_at(index), Some(RemoteFormat::JsonLd))
@@ -916,7 +1344,7 @@ impl ChunkSource {
         match self {
             Self::Files(files) => files
                 .iter()
-                .any(|p| effective_extension(p).0.as_deref() == Some("jsonld")),
+                .any(|p| is_jsonld_ext(effective_extension(p).0.as_deref())),
             Self::Streaming(_) | Self::LocalRechunk(_) => false,
             Self::Remote(producer) => producer.has_jsonld(),
             Self::JsonLdStream(_) => true,
@@ -973,8 +1401,14 @@ pub(crate) fn is_ndjson_ext(ext: Option<&str>) -> bool {
     matches!(ext, Some("jsonl" | "ndjson"))
 }
 
+/// Whether an effective extension names a whole-document JSON-LD file.
+/// `.json` is accepted because it is a common JSON-LD filename convention.
+pub(crate) fn is_jsonld_ext(ext: Option<&str>) -> bool {
+    matches!(ext, Some("json" | "jsonld"))
+}
+
 /// Whether `path` names a file the bulk-import pipeline accepts: any supported
-/// RDF/JSON-LD extension (`.ttl`/`.nt`/`.nq`/`.trig`/`.jsonld`/`.jsonl`/
+/// RDF/JSON-LD extension (`.ttl`/`.nt`/`.nq`/`.trig`/`.json`/`.jsonld`/`.jsonl`/
 /// `.ndjson`, case-insensitive), optionally compressed with `.gz`/`.zst`.
 ///
 /// Single source of truth shared with the CLI's import-vs-transact routing —
@@ -982,10 +1416,8 @@ pub(crate) fn is_ndjson_ext(ext: Option<&str>) -> bool {
 pub fn is_bulk_import_file(path: &Path) -> bool {
     let inner = effective_extension(path).0;
     is_ndjson_ext(inner.as_deref())
-        || matches!(
-            inner.as_deref(),
-            Some("ttl" | "nt" | "trig" | "nq" | "jsonld")
-        )
+        || is_jsonld_ext(inner.as_deref())
+        || matches!(inner.as_deref(), Some("ttl" | "nt" | "trig" | "nq"))
 }
 
 /// Buffer size for decoded input streams, sized to match the splitter's scan
@@ -1050,12 +1482,33 @@ fn read_decoded_to_string(path: &Path) -> std::io::Result<String> {
 /// - If `path` is a single large `.ttl` file: auto-split using `StreamingTurtleReader`.
 /// - If `path` is a single small `.ttl`/`.nt`/`.nq`/`.trig`/`.jsonld` file: treat as a single-element `Files` source.
 /// - All extensions above also accept `.gz` and `.zst` suffixes (e.g. `data.ttl.gz`).
+///
+/// Returns the source alongside its document identity table.
+/// `skolem_namespace` salts the document ids (see [`DocIds`]); it is the
+/// normalized ledger id unless the caller overrode it.
 fn resolve_chunk_source(
     path: &Path,
     config: &ImportConfig,
-) -> std::result::Result<ChunkSource, ImportError> {
+    skolem_namespace: &str,
+) -> std::result::Result<(ChunkSource, DocIds), ImportError> {
+    // Single-file sources key on the file name: a lone file is the import root
+    // *and* its only document, so a path relative to the root would be empty.
+    let single_file_docs = |p: &Path| -> std::result::Result<DocIds, ImportError> {
+        DocIds::new(
+            skolem_namespace,
+            vec![p.file_name().map_or_else(
+                || p.to_string_lossy().into_owned(),
+                |n| n.to_string_lossy().into_owned(),
+            )],
+        )
+    };
+
     if path.is_dir() {
         let files = discover_chunks(path)?;
+        let doc_ids = DocIds::new(
+            skolem_namespace,
+            files.iter().map(|f| local_doc_key(path, f)).collect(),
+        )?;
 
         // A directory of newline-delimited JSON-LD streams via chained
         // NdjsonReaders (one file → many JSON-LD chunks). `.jsonl`/`.ndjson`
@@ -1071,11 +1524,13 @@ fn resolve_chunk_source(
             let channel_capacity = config.effective_max_inflight();
             let producer = spawn_local_ndjson_producer(
                 files,
+                doc_ids.keys(),
+                skolem_namespace.to_string(),
                 config.ndjson_first_line_context,
                 chunk_size_bytes,
                 channel_capacity,
             );
-            return Ok(ChunkSource::JsonLdStream(producer));
+            return Ok((ChunkSource::JsonLdStream(producer), doc_ids));
         }
 
         // A directory of purely Turtle/N-Triples files can be rechunked through
@@ -1093,15 +1548,16 @@ fn resolve_chunk_source(
             let rechunk_threads = config.effective_rechunk_threads();
             let producer = spawn_local_producer(
                 files,
+                doc_ids.ids(),
                 chunk_size_bytes,
                 channel_capacity,
                 coalesce_threshold,
                 rechunk_threads,
             );
-            return Ok(ChunkSource::LocalRechunk(producer));
+            return Ok((ChunkSource::LocalRechunk(producer), doc_ids));
         }
 
-        return Ok(ChunkSource::Files(files));
+        return Ok((ChunkSource::Files(files), doc_ids));
     }
 
     if !path.exists() {
@@ -1135,13 +1591,16 @@ fn resolve_chunk_source(
     if is_ndjson_ext(inner_ext.as_deref()) {
         let chunk_size_bytes = config.effective_chunk_size_mb() as u64 * 1024 * 1024;
         let channel_capacity = config.effective_max_inflight();
+        let doc_ids = single_file_docs(path)?;
         let producer = spawn_local_ndjson_producer(
             vec![path.to_path_buf()],
+            doc_ids.keys(),
+            skolem_namespace.to_string(),
             config.ndjson_first_line_context,
             chunk_size_bytes,
             channel_capacity,
         );
-        return Ok(ChunkSource::JsonLdStream(producer));
+        return Ok((ChunkSource::JsonLdStream(producer), doc_ids));
     }
 
     let is_ttl = matches!(inner_ext.as_deref(), Some("ttl" | "nt"));
@@ -1201,24 +1660,37 @@ fn resolve_chunk_source(
             compression = ?compression,
             "streaming large Turtle file (no pre-scan)"
         );
-        Ok(ChunkSource::Streaming(reader))
+        Ok((ChunkSource::Streaming(reader), single_file_docs(path)?))
     } else {
         // Small file or non-TTL: treat as a single-element source. The Files
         // variant's `read_chunk` transparently decodes `.gz` / `.zst`.
-        Ok(ChunkSource::Files(vec![path.to_path_buf()]))
+        Ok((
+            ChunkSource::Files(vec![path.to_path_buf()]),
+            single_file_docs(path)?,
+        ))
     }
 }
 
 /// Resolve a remote source (`OrderedObjects` or `Prefix`) into a list of
 /// `RemoteObject`s, sorted lex by address for `Prefix` mode.
 ///
-/// Returns the accepted objects and their per-chunk formats (parallel to
-/// the objects vec). Rejects mixing Turtle (`.ttl`/`.trig`) with JSON-LD
-/// (`.jsonld`), mirroring the local `scan_directory_format` rule.
+/// Returns the accepted objects, their per-chunk formats (parallel to the
+/// objects vec), and their document identity table. Rejects mixing Turtle
+/// (`.ttl`/`.trig`) with JSON-LD (`.jsonld`), mirroring the local
+/// `scan_directory_format` rule.
+///
+/// Document keys are addresses relative to the listing prefix, so a prefix
+/// import mints the same ids wherever the bucket layout puts it — the local
+/// arms' relative-path rule, transposed. `OrderedObjects` supplies no prefix,
+/// so its keys are the full addresses. Note that `RemoteObject::address` is
+/// backend-opaque by contract (see `fluree_db_core::storage`), so hashing it
+/// pins the minted ids to whatever address encoding that backend uses: the
+/// same objects re-imported through a different backend mint different ids.
 async fn resolve_remote_objects(
     storage: &Arc<dyn StorageRead>,
     source: &RemoteSource,
-) -> std::result::Result<(Vec<RemoteObject>, Vec<RemoteFormat>), ImportError> {
+    skolem_namespace: &str,
+) -> std::result::Result<(Vec<RemoteObject>, Vec<RemoteFormat>, DocIds), ImportError> {
     let all_objects = match source {
         RemoteSource::OrderedObjects(objs) => objs.clone(),
         RemoteSource::Prefix { prefix } => {
@@ -1283,7 +1755,7 @@ async fn resolve_remote_objects(
                     accepted.push(obj);
                     extensions.push(RemoteFormat::Nquads);
                 }
-                Some("jsonld") => {
+                Some("json" | "jsonld") => {
                     has_jsonld = true;
                     accepted.push(obj);
                     extensions.push(RemoteFormat::JsonLd);
@@ -1308,7 +1780,8 @@ async fn resolve_remote_objects(
 
     if accepted.is_empty() {
         return Err(ImportError::NoChunks(
-            "remote source contains no .ttl/.nt/.nq/.trig/.jsonld/.jsonl/.ndjson objects".into(),
+            "remote source contains no .ttl/.nt/.nq/.trig/.json/.jsonld/.jsonl/.ndjson objects"
+                .into(),
         ));
     }
 
@@ -1318,7 +1791,20 @@ async fn resolve_remote_objects(
     // and named graphs are queryable via the `#<graph-iri>` fragment. See the
     // named-graph spool wiring in `import_trig_commit` (fluree-db-transact).
 
-    Ok((accepted, extensions))
+    let doc_keys = accepted
+        .iter()
+        .map(|o| match source {
+            RemoteSource::Prefix { prefix } => o
+                .address
+                .strip_prefix(prefix.as_str())
+                .unwrap_or(&o.address)
+                .to_string(),
+            RemoteSource::OrderedObjects(_) => o.address.clone(),
+        })
+        .collect();
+    let doc_ids = DocIds::new(skolem_namespace, doc_keys)?;
+
+    Ok((accepted, extensions, doc_ids))
 }
 
 /// Spawn the async producer task + bridge thread for a remote source.
@@ -1335,17 +1821,19 @@ fn spawn_remote_producer(
     storage: Arc<dyn StorageRead>,
     objects: Vec<RemoteObject>,
     per_chunk_format: Vec<RemoteFormat>,
+    doc_ids: Vec<u64>,
     in_flight: usize,
 ) -> RemoteChunkProducer {
     let estimated_count = objects.len();
     debug_assert_eq!(estimated_count, per_chunk_format.len());
+    debug_assert_eq!(estimated_count, doc_ids.len());
     let in_flight = in_flight.max(1);
 
     // tokio mpsc — async producer side.
-    let (tokio_tx, mut tokio_rx) = tokio::sync::mpsc::channel::<(usize, Vec<u8>)>(in_flight);
+    let (tokio_tx, mut tokio_rx) = tokio::sync::mpsc::channel::<RemoteChunk>(in_flight);
     // std mpsc — sync worker side. Capacity 2 (small handoff buffer; tokio
     // channel is the real backpressure knob).
-    let (std_tx, std_rx) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>)>(2);
+    let (std_tx, std_rx) = std::sync::mpsc::sync_channel::<RemoteChunk>(2);
     let (error_tx, error_rx) = tokio::sync::oneshot::channel::<Option<ImportError>>();
 
     // Producer task — async on tokio.
@@ -1370,7 +1858,9 @@ fn spawn_remote_producer(
                     "remote object size differs from listing metadata"
                 );
             }
-            if tokio_tx.send((idx, bytes)).await.is_err() {
+            // One remote object == one whole document.
+            let doc = DocChunk::whole(doc_ids.get(idx).copied().unwrap_or(0));
+            if tokio_tx.send((idx, doc, bytes)).await.is_err() {
                 // Bridge dropped — pipeline aborted upstream. Exit cleanly.
                 let _ = error_tx.send(None);
                 return;
@@ -1394,6 +1884,8 @@ fn spawn_remote_producer(
 
     RemoteChunkProducer {
         rx: Arc::new(std::sync::Mutex::new(std_rx)),
+        // One whole object is one document; nothing segments it.
+        segments: Arc::default(),
         error_rx: std::sync::Mutex::new(Some(error_rx)),
         bridge_handle: std::sync::Mutex::new(Some(bridge_handle)),
         estimated_count,
@@ -1506,22 +1998,38 @@ fn estimate_ndjson_chunks(total_bytes: u64, chunk_size_bytes: u64) -> usize {
     total_bytes.div_ceil(chunk_size_bytes.max(1)).max(1) as usize
 }
 
-/// Spawn a producer that streams ndjson from a sequence of `(label, factory)`
-/// byte sources, chaining one [`NdjsonReader`] per source and forwarding their
-/// JSON-LD chunks into a shared channel with a global chunk index. The readers
-/// are independent, so each source's own leading `@context` is honored.
+/// One ndjson byte source for [`spawn_chained_ndjson_producer`].
+struct NdjsonSource {
+    /// Human-readable name — a path or remote address — for error text.
+    label: String,
+    /// Position of this source in the import's document list.
+    doc_idx: usize,
+    /// The key this source's documents hash under (see [`DocIds`]). Each of
+    /// its context segments is a document in its own right, so the id is
+    /// derived per chunk rather than precomputed.
+    doc_key: String,
+    factory: NdjsonSourceFactory,
+}
+
+/// Spawn a producer that streams ndjson from a sequence of byte sources,
+/// chaining one [`NdjsonReader`] per source and forwarding their JSON-LD chunks
+/// into a shared channel with a global chunk index. The readers are
+/// independent, so each source's own leading `@context` is honored.
 /// Reuses [`RemoteChunkProducer`]'s channel + `error_rx` machinery;
 /// `per_chunk_format` is empty because the chunks ride the
 /// [`ChunkSource::JsonLdStream`] path, which always parses them as JSON-LD.
 fn spawn_chained_ndjson_producer(
-    sources: Vec<(String, NdjsonSourceFactory)>,
+    sources: Vec<NdjsonSource>,
+    skolem_namespace: String,
     policy: FirstLineContextPolicy,
     chunk_size_bytes: u64,
     in_flight: usize,
     estimated_count: usize,
 ) -> RemoteChunkProducer {
     let in_flight = in_flight.max(1);
-    let (std_tx, std_rx) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>)>(in_flight);
+    let segments: Arc<std::sync::Mutex<Vec<(usize, u32)>>> = Arc::default();
+    let segment_log = Arc::clone(&segments);
+    let (std_tx, std_rx) = std::sync::mpsc::sync_channel::<RemoteChunk>(in_flight);
     let (error_tx, error_rx) = tokio::sync::oneshot::channel::<Option<ImportError>>();
 
     // A dedicated std thread: each NdjsonReader spawns its own reader thread,
@@ -1531,7 +2039,14 @@ fn spawn_chained_ndjson_producer(
         .name("ndjson-producer".into())
         .spawn(move || {
             let mut global_idx = 0usize;
-            for (label, factory) in sources {
+            for source in sources {
+                let NdjsonSource {
+                    label,
+                    doc_idx,
+                    doc_key,
+                    factory,
+                } = source;
+                let mut last_segment: Option<u32> = None;
                 let byte_source = match factory() {
                     Ok(r) => r,
                     Err(e) => {
@@ -1557,8 +2072,35 @@ fn spawn_chained_ndjson_producer(
                     };
                 loop {
                     match reader.recv_chunk() {
-                        Ok(Some((_local_idx, bytes))) => {
-                            if std_tx.send((global_idx, bytes)).is_err() {
+                        Ok(Some((local_idx, segment, bytes))) => {
+                            // One CONTEXT SEGMENT is one document. Within a
+                            // segment the nodes share an `@context` and are
+                            // emitted as members of one `@graph`, which is
+                            // what makes them co-document; a `@context` switch
+                            // seals that document and opens the next, so
+                            // `cat a.jsonl b.jsonl` keeps the two files' `_:x`
+                            // labels apart. Neither the chunk nor the line is
+                            // the unit: a chunk is a cut of a segment, and a
+                            // line is a node.
+                            //
+                            // `local_idx` is the reader's own chunk counter,
+                            // monotonic across the whole file and never reset
+                            // at a switch, so it is distinct within every
+                            // segment — which is all the sub-chunk index has
+                            // to be.
+                            if last_segment != Some(segment) {
+                                last_segment = Some(segment);
+                                segment_log.lock().unwrap().push((doc_idx, segment));
+                            }
+                            let doc = DocChunk {
+                                doc: fluree_db_core::skolem::doc_id(
+                                    &skolem_namespace,
+                                    &doc_key,
+                                    segment,
+                                ),
+                                sub_chunk: u32::try_from(local_idx).unwrap_or(u32::MAX),
+                            };
+                            if std_tx.send((global_idx, doc, bytes)).is_err() {
                                 // Consumer aborted upstream — exit cleanly.
                                 let _ = error_tx.send(None);
                                 return;
@@ -1589,6 +2131,7 @@ fn spawn_chained_ndjson_producer(
 
     RemoteChunkProducer {
         rx: Arc::new(std::sync::Mutex::new(std_rx)),
+        segments,
         error_rx: std::sync::Mutex::new(Some(error_rx)),
         bridge_handle: std::sync::Mutex::new(Some(producer_handle)),
         estimated_count,
@@ -1607,6 +2150,8 @@ fn spawn_chained_ndjson_producer(
 fn spawn_remote_ndjson_producer(
     storage: Arc<dyn StorageRead>,
     objects: Vec<RemoteObject>,
+    doc_keys: Vec<String>,
+    skolem_namespace: String,
     policy: FirstLineContextPolicy,
     chunk_size_bytes: u64,
     in_flight: usize,
@@ -1615,9 +2160,11 @@ fn spawn_remote_ndjson_producer(
     let ranged = storage.supports_ranged_reads();
     let total_bytes: u64 = objects.iter().map(|o| o.size_bytes).sum();
     let estimated_count = estimate_ndjson_chunks(total_bytes, chunk_size_bytes);
-    let sources: Vec<(String, NdjsonSourceFactory)> = objects
+    let sources: Vec<NdjsonSource> = objects
         .into_iter()
-        .map(|obj| {
+        .enumerate()
+        .map(|(idx, obj)| {
+            let doc_key = doc_keys.get(idx).cloned().unwrap_or_default();
             let storage = Arc::clone(&storage);
             let handle = handle.clone();
             let label = obj.address.clone();
@@ -1648,11 +2195,17 @@ fn spawn_remote_ndjson_producer(
                     decode_buffered(comp, Box::new(std::io::Cursor::new(bytes)))
                 })
             };
-            (label, factory)
+            NdjsonSource {
+                label,
+                doc_idx: idx,
+                doc_key,
+                factory,
+            }
         })
         .collect();
     spawn_chained_ndjson_producer(
         sources,
+        skolem_namespace,
         policy,
         chunk_size_bytes,
         in_flight,
@@ -1664,6 +2217,8 @@ fn spawn_remote_ndjson_producer(
 /// `open_decoded` handles `.gz`/`.zst` transparently.
 fn spawn_local_ndjson_producer(
     files: Vec<PathBuf>,
+    doc_keys: Vec<String>,
+    skolem_namespace: String,
     policy: FirstLineContextPolicy,
     chunk_size_bytes: u64,
     in_flight: usize,
@@ -1676,16 +2231,24 @@ fn spawn_local_ndjson_producer(
         .map(|m| m.len())
         .sum();
     let estimated_count = estimate_ndjson_chunks(total_bytes, chunk_size_bytes);
-    let sources: Vec<(String, NdjsonSourceFactory)> = files
+    let sources: Vec<NdjsonSource> = files
         .into_iter()
-        .map(|f| {
+        .enumerate()
+        .map(|(idx, f)| {
+            let doc_key = doc_keys.get(idx).cloned().unwrap_or_default();
             let label = f.display().to_string();
             let factory: NdjsonSourceFactory = Box::new(move || open_decoded(&f));
-            (label, factory)
+            NdjsonSource {
+                label,
+                doc_idx: idx,
+                doc_key,
+                factory,
+            }
         })
         .collect();
     spawn_chained_ndjson_producer(
         sources,
+        skolem_namespace,
         policy,
         chunk_size_bytes,
         in_flight,
@@ -1783,9 +2346,15 @@ fn should_stream_split(path: &Path, on_disk: u64, chunk_size_bytes: u64) -> bool
 }
 
 /// Background rechunk loop for a local directory of plain Turtle/N-Triples
-/// files. Walks `files` in order, emitting contiguous `(idx, bytes)` chunks:
-/// large files are sub-split at statement boundaries; small files are read
-/// whole and (when `coalesce_enabled`) concatenated up to ~`chunk_size`.
+/// files. Walks `files` in order, emitting contiguous `(idx, doc, bytes)`
+/// chunks: large files are sub-split at statement boundaries; small files are
+/// read whole and (when `coalesce_enabled`) concatenated up to ~`chunk_size`.
+///
+/// Every chunk carries the identity of the file it came from, so the parse
+/// workers can scope blank-node labels to their source document (see
+/// [`DocChunk`]). A coalesced payload reports its *first* file — sound because
+/// [`coalesce_unsafe`] refuses to coalesce any file containing a `_:` label, so
+/// a coalesced payload has no labeled blank nodes to scope.
 ///
 /// Returns `Ok(())` on completion **or** on a closed receiver (consumer aborted
 /// upstream — not this producer's error). Returns `Err` only for an actual
@@ -1793,20 +2362,25 @@ fn should_stream_split(path: &Path, on_disk: u64, chunk_size_bytes: u64) -> bool
 fn local_rechunk_loop(
     files: &[PathBuf],
     sizes: &[u64],
+    doc_ids: &[u64],
     chunk_size_bytes: u64,
     coalesce_enabled: bool,
-    tx: &std::sync::mpsc::SyncSender<(usize, Vec<u8>)>,
+    tx: &std::sync::mpsc::SyncSender<RemoteChunk>,
 ) -> std::result::Result<(), ImportError> {
     let mut next_idx = 0usize;
-    // Accumulated self-contained TTL text for coalesced small files.
+    // Accumulated self-contained TTL text for coalesced small files, and the
+    // index of the first file that contributed to it.
     let mut buf: Vec<u8> = Vec::new();
+    let mut buf_doc = 0usize;
+    let mut sub_chunks = SubChunkCounter::default();
 
     macro_rules! emit {
-        ($payload:expr) => {{
+        ($doc:expr, $payload:expr) => {{
             let payload = $payload;
             let payload_len = payload.len();
             let send_start = Instant::now();
-            if tx.send((next_idx, payload)).is_err() {
+            let doc = sub_chunks.next_for(doc_ids.get($doc).copied().unwrap_or(0));
+            if tx.send((next_idx, doc, payload)).is_err() {
                 // Consumer dropped the receiver — pipeline aborted upstream.
                 return Ok(());
             }
@@ -1838,7 +2412,7 @@ fn local_rechunk_loop(
             // at statement boundaries. ----
             // Flush any pending coalesce buffer first to preserve ordering.
             if !buf.is_empty() {
-                emit!(std::mem::take(&mut buf));
+                emit!(buf_doc, std::mem::take(&mut buf));
             }
 
             let mut reader = if matches!(comp, Compression::None) {
@@ -1894,7 +2468,9 @@ fn local_rechunk_loop(
                                 "local rechunk built split-file payload"
                             );
                         }
-                        emit!(payload);
+                        // Every sub-chunk of this file shares its document
+                        // scope — that is the whole point of `doc`.
+                        emit!(fi, payload);
                     }
                     Ok(None) => break,
                     Err(e) => {
@@ -1934,20 +2510,22 @@ fn local_rechunk_loop(
             if !coalesce_enabled || coalesce_unsafe(&bytes) {
                 // Emit standalone (flush any pending buffer first).
                 if !buf.is_empty() {
-                    emit!(std::mem::take(&mut buf));
+                    emit!(buf_doc, std::mem::take(&mut buf));
                 }
-                emit!(bytes);
+                emit!(fi, bytes);
             } else {
                 // Coalesce: flush first if adding would overflow the target.
                 if !buf.is_empty() && (buf.len() + 1 + bytes.len()) as u64 > chunk_size_bytes {
-                    emit!(std::mem::take(&mut buf));
+                    emit!(buf_doc, std::mem::take(&mut buf));
                 }
-                if !buf.is_empty() {
+                if buf.is_empty() {
+                    buf_doc = fi;
+                } else {
                     buf.push(b'\n');
                 }
                 buf.extend_from_slice(&bytes);
                 if buf.len() as u64 >= chunk_size_bytes {
-                    emit!(std::mem::take(&mut buf));
+                    emit!(buf_doc, std::mem::take(&mut buf));
                 }
             }
         }
@@ -1958,7 +2536,8 @@ fn local_rechunk_loop(
         let payload = std::mem::take(&mut buf);
         let payload_len = payload.len();
         let send_start = Instant::now();
-        if tx.send((next_idx, payload)).is_err() {
+        let doc = sub_chunks.next_for(doc_ids.get(buf_doc).copied().unwrap_or(0));
+        if tx.send((next_idx, doc, payload)).is_err() {
             // Consumer dropped the receiver — pipeline aborted upstream.
             return Ok(());
         }
@@ -2119,14 +2698,15 @@ fn process_local_rechunk_job(
 }
 
 fn emit_local_rechunk_payload(
-    tx: &std::sync::mpsc::SyncSender<(usize, Vec<u8>)>,
+    tx: &std::sync::mpsc::SyncSender<RemoteChunk>,
     next_idx: &mut usize,
+    doc: DocChunk,
     payload: Vec<u8>,
 ) -> bool {
     let payload_len = payload.len();
     let chunk_idx = *next_idx;
     let send_start = Instant::now();
-    if tx.send((chunk_idx, payload)).is_err() {
+    if tx.send((chunk_idx, doc, payload)).is_err() {
         // Consumer dropped the receiver — pipeline aborted upstream.
         return false;
     }
@@ -2152,14 +2732,22 @@ fn emit_local_rechunk_payload(
 fn local_rechunk_loop_parallel(
     files: Vec<PathBuf>,
     sizes: Vec<u64>,
+    doc_ids: Vec<u64>,
     chunk_size_bytes: u64,
     coalesce_enabled: bool,
-    tx: &std::sync::mpsc::SyncSender<(usize, Vec<u8>)>,
+    tx: &std::sync::mpsc::SyncSender<RemoteChunk>,
     rechunk_threads: usize,
 ) -> std::result::Result<(), ImportError> {
     let worker_count = rechunk_threads.min(files.len()).max(1);
     if worker_count <= 1 {
-        return local_rechunk_loop(&files, &sizes, chunk_size_bytes, coalesce_enabled, tx);
+        return local_rechunk_loop(
+            &files,
+            &sizes,
+            &doc_ids,
+            chunk_size_bytes,
+            coalesce_enabled,
+            tx,
+        );
     }
 
     let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<LocalRechunkJob>(worker_count);
@@ -2221,7 +2809,15 @@ fn local_rechunk_loop_parallel(
     let mut result: std::result::Result<(), ImportError> = Ok(());
     let mut output_open = true;
     let mut next_idx = 0usize;
+    // Coalesce buffer plus the index of the first file that contributed to it,
+    // so a flushed payload reports the document it started in (see
+    // `local_rechunk_loop` for why that is sound for coalesced payloads).
     let mut buf: Vec<u8> = Vec::new();
+    let mut buf_doc = 0usize;
+    let mut sub_chunks = SubChunkCounter::default();
+    let doc_chunk = |sub_chunks: &mut SubChunkCounter, file_idx: usize| {
+        sub_chunks.next_for(doc_ids.get(file_idx).copied().unwrap_or(0))
+    };
 
     while let Some((file_idx, event_rx)) = event_rxs.pop_front() {
         loop {
@@ -2243,12 +2839,24 @@ fn local_rechunk_loop_parallel(
                     if output_open && result.is_ok() {
                         if !buf.is_empty() {
                             let pending = std::mem::take(&mut buf);
-                            if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+                            if !emit_local_rechunk_payload(
+                                tx,
+                                &mut next_idx,
+                                doc_chunk(&mut sub_chunks, buf_doc),
+                                pending,
+                            ) {
                                 output_open = false;
                                 buf.clear();
                             }
                         }
-                        if output_open && !emit_local_rechunk_payload(tx, &mut next_idx, payload) {
+                        if output_open
+                            && !emit_local_rechunk_payload(
+                                tx,
+                                &mut next_idx,
+                                doc_chunk(&mut sub_chunks, file_idx),
+                                payload,
+                            )
+                        {
                             output_open = false;
                             buf.clear();
                         }
@@ -2262,12 +2870,23 @@ fn local_rechunk_loop_parallel(
                         if !coalesce_enabled || unsafe_to_coalesce {
                             if !buf.is_empty() {
                                 let pending = std::mem::take(&mut buf);
-                                if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+                                if !emit_local_rechunk_payload(
+                                    tx,
+                                    &mut next_idx,
+                                    doc_chunk(&mut sub_chunks, buf_doc),
+                                    pending,
+                                ) {
                                     output_open = false;
                                     buf.clear();
                                 }
                             }
-                            if output_open && !emit_local_rechunk_payload(tx, &mut next_idx, bytes)
+                            if output_open
+                                && !emit_local_rechunk_payload(
+                                    tx,
+                                    &mut next_idx,
+                                    doc_chunk(&mut sub_chunks, file_idx),
+                                    bytes,
+                                )
                             {
                                 output_open = false;
                                 buf.clear();
@@ -2277,19 +2896,31 @@ fn local_rechunk_loop_parallel(
                                 && (buf.len() + 1 + bytes.len()) as u64 > chunk_size_bytes
                             {
                                 let pending = std::mem::take(&mut buf);
-                                if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+                                if !emit_local_rechunk_payload(
+                                    tx,
+                                    &mut next_idx,
+                                    doc_chunk(&mut sub_chunks, buf_doc),
+                                    pending,
+                                ) {
                                     output_open = false;
                                     buf.clear();
                                 }
                             }
                             if output_open {
-                                if !buf.is_empty() {
+                                if buf.is_empty() {
+                                    buf_doc = file_idx;
+                                } else {
                                     buf.push(b'\n');
                                 }
                                 buf.extend_from_slice(&bytes);
                                 if buf.len() as u64 >= chunk_size_bytes {
                                     let pending = std::mem::take(&mut buf);
-                                    if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+                                    if !emit_local_rechunk_payload(
+                                        tx,
+                                        &mut next_idx,
+                                        doc_chunk(&mut sub_chunks, buf_doc),
+                                        pending,
+                                    ) {
                                         output_open = false;
                                         buf.clear();
                                     }
@@ -2327,7 +2958,12 @@ fn local_rechunk_loop_parallel(
 
     if output_open && result.is_ok() && !buf.is_empty() {
         let pending = std::mem::take(&mut buf);
-        if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+        if !emit_local_rechunk_payload(
+            tx,
+            &mut next_idx,
+            doc_chunk(&mut sub_chunks, buf_doc),
+            pending,
+        ) {
             return Ok(());
         }
     }
@@ -2344,6 +2980,7 @@ fn local_rechunk_loop_parallel(
 /// files (`0` disables it).
 fn spawn_local_producer(
     files: Vec<PathBuf>,
+    doc_ids: Vec<u64>,
     chunk_size_bytes: u64,
     channel_capacity: usize,
     coalesce_threshold: usize,
@@ -2380,7 +3017,7 @@ fn spawn_local_producer(
         "local directory rechunk producer"
     );
 
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>)>(channel_capacity);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<RemoteChunk>(channel_capacity);
     let (error_tx, error_rx) = tokio::sync::oneshot::channel::<Option<ImportError>>();
 
     let producer_handle = std::thread::Builder::new()
@@ -2389,6 +3026,7 @@ fn spawn_local_producer(
             let result = local_rechunk_loop_parallel(
                 files,
                 sizes,
+                doc_ids,
                 chunk_size_bytes,
                 coalesce_enabled,
                 &tx,
@@ -2456,6 +3094,28 @@ impl<'a> ImportBuilder<'a> {
         }
     }
 
+    pub(crate) fn new_virtual(
+        fluree: &'a super::Fluree,
+        ledger_id: String,
+        provider: Arc<dyn crate::materialize::R2rmlBuildProvider>,
+        graph_source_id: String,
+    ) -> Self {
+        let config = ImportConfig {
+            virtual_source: Some(VirtualSource {
+                provider,
+                graph_source_id,
+                allow_duplicate_parent_keys: false,
+            }),
+            ..ImportConfig::default()
+        };
+        Self {
+            fluree,
+            ledger_id,
+            source: ImportSource::Virtual,
+            config,
+        }
+    }
+
     /// Set the number of parallel TTL parse threads. `0` = auto (use the
     /// machine's logical cores, memory-capped). Explicit values are honored
     /// as-is (not capped to core count) with a hard floor of 1.
@@ -2506,6 +3166,19 @@ impl<'a> ImportBuilder<'a> {
         self
     }
 
+    /// Allow a virtual (materialize) import to proceed when a parent join key maps
+    /// to more than one parent. Default (`false`) DECLINES such a source: the twin
+    /// would bake one deterministically-chosen parent per key and silently drop the
+    /// rest (an R2RML RefObjectMap fan-out the builder does not yet emit). When
+    /// enabled, the twin builds and records the anomaly in its completion stamp.
+    /// No-op for non-virtual imports.
+    pub fn allow_duplicate_parent_keys(mut self, v: bool) -> Self {
+        if let Some(vs) = self.config.virtual_source.as_mut() {
+            vs.allow_duplicate_parent_keys = v;
+        }
+        self
+    }
+
     /// Whether to build indexes after import. Default: true.
     pub fn build_index(mut self, v: bool) -> Self {
         self.config.build_index = v;
@@ -2539,6 +3212,17 @@ impl<'a> ImportBuilder<'a> {
     /// First-line interpretation for ndjson/jsonl sources: whether line 1 is a
     /// shared `@context` map or the first node. No effect on other formats.
     /// Default: [`FirstLineContextPolicy::Auto`].
+    /// Salt this import's blank-node ids with `namespace` instead of the
+    /// ledger id.
+    ///
+    /// Two imports of the same source tree mint identical blank-node ids iff
+    /// they agree on this value. See [`ImportConfig::skolem_namespace`].
+    #[must_use]
+    pub fn skolem_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.config.skolem_namespace = Some(namespace.into());
+        self
+    }
+
     pub fn ndjson_first_line_context(mut self, policy: FirstLineContextPolicy) -> Self {
         self.config.ndjson_first_line_context = policy;
         self
@@ -2635,6 +3319,27 @@ impl<'a> CreateBuilder<'a> {
     /// (sorted lexicographically), or a single `.ttl`/`.jsonld` file.
     pub fn import(self, path: impl AsRef<Path>) -> ImportBuilder<'a> {
         ImportBuilder::new(self.fluree, self.ledger_id, path.as_ref().to_path_buf())
+    }
+
+    /// Materialize a virtual R2RML graph source into this native ledger
+    /// (DEC-003 Deliverable 1). `provider` scans the source and compiles its
+    /// mapping; `graph_source_id` selects which registered source to read. The
+    /// returned [`ImportBuilder`] accepts the usual tuning.
+    ///
+    /// MACHINE-SAFETY: set explicit `.parallelism(...)` and
+    /// `.memory_budget_mb(...)` — the auto (own-the-box) defaults can OOM a
+    /// co-resident machine, and the memory budget also drives the chunk size.
+    pub fn import_r2rml<P: crate::materialize::R2rmlBuildProvider + 'static>(
+        self,
+        provider: Arc<P>,
+        graph_source_id: impl Into<String>,
+    ) -> ImportBuilder<'a> {
+        ImportBuilder::new_virtual(
+            self.fluree,
+            self.ledger_id,
+            provider,
+            graph_source_id.into(),
+        )
     }
 
     /// Attach a bulk import that streams source bytes from a remote
@@ -2734,7 +3439,7 @@ pub fn scan_directory_format(dir: &Path) -> std::result::Result<DirectoryFormat,
         } else {
             match inner.as_deref() {
                 Some("ttl" | "trig" | "nt" | "nq") => has_turtle = true,
-                Some("jsonld") => has_jsonld = true,
+                Some("json" | "jsonld") => has_jsonld = true,
                 _ => {}
             }
         }
@@ -2754,7 +3459,7 @@ pub fn scan_directory_format(dir: &Path) -> std::result::Result<DirectoryFormat,
         (true, _) => Ok(DirectoryFormat::Turtle),
         (false, true) => Ok(DirectoryFormat::JsonLd),
         (false, false) => Err(ImportError::NoChunks(format!(
-            "no supported data files (.ttl, .nt, .nq, .trig, .jsonld, .jsonl, .ndjson) found in {}",
+            "no supported data files (.ttl, .nt, .nq, .trig, .json, .jsonld, .jsonl, .ndjson) found in {}",
             dir.display()
         ))),
     }
@@ -2815,21 +3520,71 @@ where
     let span = tracing::debug_span!("bulk_import", alias = %alias);
 
     async {
+        // ---- FD preflight ----
+        // Best-effort raise (idempotent — covers library embedders that never
+        // ran a CLI/server entry point), then warn early on low limits. The
+        // warnings read the OBSERVED kernel limit, deliberately not
+        // `effective_fd_budget()`: the FLUREE_FD_BUDGET override shapes how
+        // the build *plans*, but only the real limit describes the
+        // environment. No hard refusal here — a small single-chunk import
+        // can succeed at limits the worst multi-chunk phase could not, so
+        // refusing on a fixed floor would regress imports that used to work;
+        // if exhaustion does happen, the EMFILE errors now carry the
+        // observed limit and the remedy.
+        let fd_raise = fluree_db_core::fd_limit::raise_nofile_soft_to_hard();
+        fluree_db_core::fd_limit::log_raise_outcome(&fd_raise);
+        if let Some(limits) = fluree_db_core::fd_limit::nofile_limits() {
+            if limits.soft < 96 {
+                tracing::warn!(
+                    soft = limits.soft,
+                    "open-file limit is very low; small imports may succeed but \
+                     multi-chunk imports are likely to exhaust it — raise it with \
+                     `ulimit -n <n>` or launchd/systemd LimitNOFILE"
+                );
+            } else if limits.soft < 256 {
+                tracing::warn!(
+                    soft = limits.soft,
+                    "open-file limit is low; import will conserve descriptors \
+                     (bounded scatter pool, cascaded merges)"
+                );
+            }
+        }
+
         // ---- Log effective settings and resolve chunk source ----
         config.log_effective_settings();
-        let chunk_source = match &import_source {
+
+        // Normalize before anything derives an identity from the alias.
+        // `create my/ledger --import` and `create my/ledger:main --import` name
+        // the SAME ledger, so they must salt blank-node ids identically —
+        // otherwise re-importing under the other spelling would mint a
+        // different id for every blank node in the source.
+        let normalized_alias = fluree_db_core::LedgerId::parse(alias)
+            .and_then(|id| {
+                fluree_db_core::validate_ledger_name(id.name())?;
+                fluree_db_core::validate_branch_name(id.branch())?;
+                Ok(id)
+            })
+            .map_err(|e| ImportError::Api(ApiError::from(e)))?
+            .to_string();
+        let skolem_namespace = config
+            .skolem_namespace
+            .clone()
+            .unwrap_or_else(|| normalized_alias.clone());
+
+        let (chunk_source, doc_ids) = match &import_source {
             ImportSource::Local(path) => {
-                let cs = resolve_chunk_source(path, config)?;
+                let (cs, doc_ids) = resolve_chunk_source(path, config, &skolem_namespace)?;
                 tracing::info!(
                     estimated_chunks = cs.estimated_len(),
                     streaming = cs.is_streaming(),
                     path = %path.display(),
                     "resolved import chunks"
                 );
-                cs
+                (cs, doc_ids)
             }
             ImportSource::Remote { storage, source } => {
-                let (objects, per_chunk_format) = resolve_remote_objects(storage, source).await?;
+                let (objects, per_chunk_format, doc_ids) =
+                    resolve_remote_objects(storage, source, &skolem_namespace).await?;
                 let count = objects.len();
                 let total_bytes: u64 = objects.iter().map(|o| o.size_bytes).sum();
                 let in_flight = config.effective_max_inflight();
@@ -2847,6 +3602,8 @@ where
                     let producer = spawn_remote_ndjson_producer(
                         Arc::clone(storage),
                         objects,
+                        doc_ids.keys(),
+                        skolem_namespace.clone(),
                         config.ndjson_first_line_context,
                         chunk_size_bytes,
                         in_flight,
@@ -2857,7 +3614,7 @@ where
                         in_flight,
                         "resolved remote ndjson import (streamed)"
                     );
-                    ChunkSource::JsonLdStream(producer)
+                    (ChunkSource::JsonLdStream(producer), doc_ids)
                 } else {
                     // Each remote object is fetched whole into memory by the
                     // producer. Warn if any object exceeds the configured chunk
@@ -2881,6 +3638,7 @@ where
                         Arc::clone(storage),
                         objects,
                         per_chunk_format,
+                        doc_ids.ids(),
                         in_flight,
                     );
                     tracing::info!(
@@ -2889,15 +3647,27 @@ where
                         in_flight,
                         "resolved remote import chunks"
                     );
-                    ChunkSource::Remote(producer)
+                    (ChunkSource::Remote(producer), doc_ids)
                 }
             }
+            // Virtual (R2RML) source: the provider rides on
+            // `config.virtual_source`; the chunk source is an empty placeholder
+            // and `run_import_chunks` routes to the virtual producer arm when
+            // `config.virtual_source` is set.
+            //
+            // A virtual source has no source *documents* — it scans a mapped
+            // table, not a tree of files — so its document table is empty. That
+            // is the honest value, not a placeholder: the manifest it feeds
+            // gains no `importSource` rows (there is no file to name), and any
+            // `DocIds::id` call on this path would be indexing a document list
+            // that was never populated, which the `debug_assert` there reports.
+            ImportSource::Virtual => (
+                ChunkSource::Files(Vec::new()),
+                DocIds::new(&skolem_namespace, Vec::new())?,
+            ),
         };
 
         // ---- Phase 1: Create ledger (init nameservice) ----
-        let normalized_alias = fluree_db_core::ledger_id::normalize_ledger_id(alias)
-            .unwrap_or_else(|_| alias.to_string());
-
         // Check if ledger already exists
         let ns_record = nameservice
             .lookup(&normalized_alias)
@@ -2933,8 +3703,7 @@ where
             fluree_db_core::address_path::ledger_id_to_path_prefix(&normalized_alias)
                 .unwrap_or_else(|_| normalized_alias.replace(':', "/"));
 
-        // Derive session dir from storage's data directory.
-        // For file storage: {data_dir}/{alias_path}/tmp_import/{session_id}/
+        // Session dir under the import scratch base (see `derive_session_dir`).
         let sid = session_id();
         let session_dir = derive_session_dir(storage, &alias_prefix, &sid);
         let run_dir = session_dir.join("runs");
@@ -2961,6 +3730,7 @@ where
             nameservice,
             &normalized_alias,
             &chunk_source,
+            &doc_ids,
             paths,
             config,
             pipeline_start,
@@ -3063,17 +3833,23 @@ struct IndexBuildInput<'a> {
     named_g_ids: Vec<u16>,
     /// Actual split mode the import used; written into the root and predicate sids.
     ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode,
+    /// Whether any imported record carried an RDF-list position (OR'd across
+    /// every parse chunk via `SpoolConfig::saw_list_meta`). Written into
+    /// `IndexRoot.has_list_meta`.
+    saw_list_meta: bool,
 }
 
 /// Run phases 2-6: import chunks, build indexes, upload to CAS, write V4 root, publish.
 ///
 /// Separated from `run_import_pipeline` to enable clean error-path handling:
 /// on failure, the caller keeps the session dir for debugging.
+#[allow(clippy::too_many_arguments)]
 async fn run_pipeline_phases<S>(
     storage: &S,
     nameservice: &dyn crate::NameServicePublisher,
     alias: &str,
     chunk_source: &std::sync::Arc<ChunkSource>,
+    doc_ids: &DocIds,
     paths: PipelinePaths<'_>,
     config: &ImportConfig,
     pipeline_start: Instant,
@@ -3087,6 +3863,7 @@ where
         nameservice,
         alias,
         chunk_source,
+        doc_ids,
         paths.run_dir,
         config,
     )
@@ -3105,6 +3882,7 @@ where
     let index_t;
     let summary;
     let mut has_annotations = false;
+    let mut duplicates_removed = 0u64;
 
     if config.build_index {
         let build_input = IndexBuildInput {
@@ -3123,6 +3901,7 @@ where
             prefix_map: &import_result.prefix_map,
             named_g_ids: import_result.named_g_ids,
             ns_split_mode: import_result.ns_split_mode,
+            saw_list_meta: import_result.saw_list_meta,
         };
         let index_result = build_and_upload(
             storage,
@@ -3137,7 +3916,13 @@ where
         .await?;
 
         // Publish index CID to nameservice so the server can find the root.
+        // The artifacts go to the device first: the pointer is durable and
+        // must never name files that did not make it.
         if config.publish {
+            storage
+                .sync()
+                .await
+                .map_err(|e| ImportError::Storage(format!("flush index artifacts: {e}")))?;
             nameservice
                 .publish_index(alias, index_result.index_t, &index_result.root_id)
                 .await
@@ -3153,6 +3938,7 @@ where
         index_t = index_result.index_t;
         summary = index_result.summary;
         has_annotations = index_result.has_annotations;
+        duplicates_removed = index_result.duplicates_removed;
     } else {
         root_id = None;
         index_t = 0;
@@ -3178,6 +3964,7 @@ where
         summary,
         has_annotations,
         tally: config.tracker.tally(),
+        duplicates_removed,
     })
 }
 
@@ -3236,14 +4023,19 @@ struct ChunkImportResult {
     /// `HostPlusN`). Recorded into the root, predicate sids, and genesis commit so
     /// reads split IRIs the same way the dictionary was keyed.
     ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode,
+    /// Whether any imported record carried an RDF-list position, OR'd across
+    /// every parse chunk. Recorded into `IndexRoot.has_list_meta`.
+    saw_list_meta: bool,
 }
 
 /// Import all TTL chunks: parallel parse + serial commit + streaming runs.
+#[allow(clippy::too_many_arguments)]
 async fn run_import_chunks<S>(
     storage: &S,
     nameservice: &dyn crate::NameServicePublisher,
     alias: &str,
     chunk_source: &std::sync::Arc<ChunkSource>,
+    doc_ids: &DocIds,
     run_dir: &Path,
     config: &ImportConfig,
 ) -> std::result::Result<ChunkImportResult, ImportError>
@@ -3258,14 +4050,30 @@ where
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    /// The custom datatype IRIs allocated so far, or an error once there
+    /// are more than the index can store.
+    ///
+    /// Import assigns datatype IDs directly rather than through a commit, so
+    /// the limit is enforced here, before any of them reaches an `OType`.
     fn current_custom_datatype_iris(
         datatype_alloc: &fluree_db_indexer::run_index::global_dict::SharedDictAllocator,
-    ) -> Vec<String> {
+    ) -> std::io::Result<Vec<String>> {
+        use fluree_db_transact::datatype_limit::MAX_NON_RESERVED_DATATYPES;
         let dict = datatype_alloc.to_predicate_dict();
         let reserved = fluree_db_core::DatatypeDictId::RESERVED_COUNT as u32;
-        (reserved..dict.len())
+        let custom = dict.len().saturating_sub(reserved) as usize;
+        if custom > MAX_NON_RESERVED_DATATYPES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "datatype limit exceeded: the import uses {custom} non-reserved datatypes \
+                     and a ledger can hold at most {MAX_NON_RESERVED_DATATYPES}"
+                ),
+            ));
+        }
+        Ok((reserved..dict.len())
             .filter_map(|id| dict.resolve(id).map(String::from))
-            .collect()
+            .collect())
     }
 
     async fn spawn_sorted_commit_write(
@@ -3303,7 +4111,7 @@ where
             let _guard = parent_span.enter();
             let task_start = std::time::Instant::now();
             tracing::info!(chunk = ci, record_count, "starting sorted-commit write");
-            let custom_datatype_iris = current_custom_datatype_iris(&datatype_alloc);
+            let custom_datatype_iris = current_custom_datatype_iris(&datatype_alloc)?;
             let otype_registry = fluree_db_core::OTypeRegistry::new(&custom_datatype_iris);
             let r = fluree_db_indexer::run_index::spool::sort_remap_and_write_sorted_commit(
                 sr.records,
@@ -3395,7 +4203,9 @@ where
                 tokio::task::spawn_blocking(move || rx.lock().unwrap().recv())
                     .await
                     .map_err(|e| {
-                        ImportError::Transact(format!("parsed-chunk receive task panicked: {e}"))
+                        ImportError::Transact(
+                            TaskFailure::from(e).describe("parsed-chunk receive task"),
+                        )
                     })?
             };
             let (idx, parsed) = match recv_result {
@@ -3483,10 +4293,13 @@ where
                 if env.config.publish_every > 0
                     && (next_expected + 1).is_multiple_of(env.config.publish_every)
                 {
-                    env.nameservice
-                        .publish_commit(env.alias, result.t, &result.commit_id)
-                        .await
-                        .map_err(|e| ImportError::Storage(e.to_string()))?;
+                    publish_import_commit_head(
+                        env.nameservice,
+                        env.alias,
+                        result.t,
+                        &result.commit_id,
+                    )
+                    .await?;
                     tracing::info!(
                         t = result.t,
                         chunk = next_expected + 1,
@@ -3514,7 +4327,11 @@ where
     let is_remote_serial = is_remote && !remote_all_ttl;
     let is_local_rechunk = chunk_source.is_local_rechunk();
     let is_jsonld_stream = chunk_source.is_jsonld_stream();
-    let is_channel_fed = is_streaming || is_remote_parallel || is_local_rechunk;
+    // Virtual (R2RML) materialization is signaled on the config, not the chunk
+    // source (an empty placeholder). Its own bounded chunk channel provides
+    // backpressure, so it counts as channel-fed (skips the permit channel).
+    let is_virtual = config.virtual_source.is_some();
+    let is_channel_fed = is_streaming || is_remote_parallel || is_local_rechunk || is_virtual;
     let estimated_total = chunk_source.estimated_len();
     let compress = config.compress_commits;
     let num_threads = config.effective_parse_threads();
@@ -3630,6 +4447,10 @@ where
         vector_pool: Arc::new(SharedVectorArenaPool::new()),
         ns_alloc: Arc::clone(&shared_alloc),
         decimal_encoding: IMPORT_DECIMAL_ENCODING,
+        // Parse workers OR their per-chunk observation in here at finish;
+        // read once at root assembly (after every worker has joined) to
+        // record `IndexRoot.has_list_meta` exactly.
+        saw_list_meta: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
     // Pre-insert rdf:type so we know the predicate ID before Phase A begins.
@@ -3652,6 +4473,7 @@ where
             (fluree::DB, db::ASSERTS),
             (fluree::DB, db::RETRACTS),
             (fluree::DB, db::PREVIOUS),
+            (fluree::DB, db::IMPORT_SOURCE),
         ] {
             spool_config
                 .predicate_alloc
@@ -3681,25 +4503,30 @@ where
     struct ParseChunkContext<'a> {
         shared_alloc: &'a Arc<SharedNamespaceAllocator>,
         prelude: Option<&'a fluree_graph_turtle::splitter::TurtlePrelude>,
-        ledger: &'a str,
         compress: bool,
         spool_dir: &'a Path,
         spool_config: &'a Arc<SpoolConfig>,
     }
 
+    /// `doc` says which source document this chunk was cut from and where
+    /// inside it (see [`DocChunk`]). It is deliberately a separate argument
+    /// from `idx`/`t`: the two coincide only when a chunk is a whole document.
     fn parse_ttl_chunk(
         ttl: &str,
         ctx: &ParseChunkContext<'_>,
         t: i64,
         idx: usize,
+        doc: DocChunk,
     ) -> std::result::Result<ParsedChunk, String> {
+        let base = doc.skolem_base();
         let parsed = if let Some(prelude) = ctx.prelude {
             parse_chunk_with_prelude(
                 ttl,
                 ctx.shared_alloc,
                 prelude,
                 t,
-                ctx.ledger,
+                &base,
+                doc.sub_chunk,
                 ctx.compress,
                 Some(ctx.spool_dir),
                 Some(ctx.spool_config),
@@ -3710,7 +4537,8 @@ where
                 ttl,
                 ctx.shared_alloc,
                 t,
-                ctx.ledger,
+                &base,
+                doc.sub_chunk,
                 ctx.compress,
                 Some(ctx.spool_dir),
                 Some(ctx.spool_config),
@@ -3746,8 +4574,6 @@ where
         // Streaming path: workers receive chunk data from the reader thread's
         // channel. No worker I/O — the reader is the only entity reading from disk.
         // This avoids double I/O that would kill throughput on external drives.
-        let ledger = alias.to_string();
-
         let (reader_rx, prelude, ns_preflight_cell) = match &**chunk_source {
             ChunkSource::Streaming(reader) => (
                 reader.shared_receiver(),
@@ -3777,12 +4603,14 @@ where
             std::result::Result<(usize, ParsedChunk), String>,
         >(num_threads);
 
+        // One streamed file is one document; every chunk shares its scope.
+        let streaming_doc = doc_ids.id(0);
+
         let mut parse_handles = Vec::with_capacity(num_threads);
         for thread_idx in 0..num_threads {
             let work_rx = Arc::clone(&work_rx);
             let result_tx = result_tx.clone();
             let shared_alloc = Arc::clone(&shared_alloc);
-            let ledger = ledger.clone();
             let prelude = prelude.clone();
             let spool_dir = spool_dir.clone();
             let spool_config = Arc::clone(&spool_config);
@@ -3793,7 +4621,6 @@ where
                     let ctx = ParseChunkContext {
                         shared_alloc: &shared_alloc,
                         prelude: Some(&prelude),
-                        ledger: &ledger,
                         compress,
                         spool_dir: &spool_dir,
                         spool_config: &spool_config,
@@ -3816,13 +4643,15 @@ where
                         };
 
                         let t = (idx + 1) as i64;
-                        tracing::debug!(
-                            chunk_idx = idx,
-                            chunk_text_len = ttl.len(),
-                            starts_with = &ttl[..ttl.len().min(200)],
-                            "about to parse chunk"
-                        );
-                        match parse_ttl_chunk(&ttl, &ctx, t, idx) {
+                        log_ttl_chunk(idx, &ttl);
+                        // This arm streams a SINGLE local file, so every chunk
+                        // belongs to the same document; `idx` is its sub-chunk
+                        // index inside that document.
+                        let doc = DocChunk {
+                            doc: streaming_doc,
+                            sub_chunk: u32::try_from(idx).unwrap_or(u32::MAX),
+                        };
+                        match parse_ttl_chunk(&ttl, &ctx, t, idx, doc) {
                             Ok(parsed) => {
                                 if result_tx.send(Ok((idx, parsed))).is_err() {
                                     break;
@@ -3907,6 +4736,101 @@ where
             committed_chunks = next_expected,
             "streaming import phase complete"
         );
+    } else if is_virtual {
+        // Virtual (R2RML) source: one materializer thread scans the graph source,
+        // enumerates triples, and encodes byte-budgeted ParsedChunks that feed the
+        // SAME commit_parsed_chunks_in_order consumer + index/publish downstream as
+        // the text paths. Chunk byte-size derives from the memory budget
+        // (machine-safety); the sync-channel capacity bounds in-flight chunks. The
+        // scan is async, so the producer thread drives it via the ambient runtime
+        // handle — Handle::block_on off a DEDICATED thread (never a runtime worker),
+        // so the blocking channel sends inside it are safe.
+        let vs = config
+            .virtual_source
+            .clone()
+            .expect("is_virtual implies virtual_source is set");
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<
+            std::result::Result<(usize, ParsedChunk), String>,
+        >(num_threads);
+        let chunk_size_bytes = config.effective_chunk_size_mb() * 1024 * 1024;
+        // The parallelism knob bounds the produce side's concurrent scans (O5:
+        // pin-all + Pass-1 pre-index) inside the materializer.
+        let producer_parallelism = num_threads.max(1);
+        // Import memory budget in bytes, so the materializer can charge the resident
+        // FK parent index against it and fail loud on overflow (O6).
+        let memory_budget_bytes = config.effective_memory_budget_mb() * 1024 * 1024;
+        let shared_alloc = Arc::clone(&shared_alloc);
+        let spool_config = Arc::clone(&spool_config);
+        let spool_dir = spool_dir.clone();
+        let ledger = alias.to_string();
+        let runtime = tokio::runtime::Handle::current();
+        // Fail loud, not deadlock: the producer drives its async scan via
+        // `runtime.block_on` off a dedicated thread, which hangs on a
+        // single-threaded runtime. Production servers and the CLI both run
+        // multi-thread. FUTURE: a remote-style two-stage producer (async tokio
+        // task → bridge thread → sync ParsedChunk channel) would be
+        // runtime-flavor-agnostic; deferred until a customer needs it.
+        if matches!(
+            runtime.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::CurrentThread
+        ) {
+            return Err(ImportError::UnsupportedRuntime(
+                "materialize (virtual R2RML import) requires a multi-thread tokio runtime; \
+                 the current runtime is single-threaded"
+                    .to_string(),
+            ));
+        }
+
+        let producer = std::thread::Builder::new()
+            .name("virtual-materializer".into())
+            .spawn(move || {
+                let ctx = crate::materialize::VirtualChunkContext {
+                    shared_alloc: &shared_alloc,
+                    ledger_id: &ledger,
+                    compress,
+                    spool_dir: &spool_dir,
+                    spool_config: Some(&spool_config),
+                };
+                // The driver + its worker pool send chunks on this cloned sender;
+                // keep the outer `result_tx` in this closure so a build error can
+                // still be surfaced to the consumer AFTER the driver drops its copy.
+                let drive_tx = result_tx.clone();
+                let outcome = runtime.block_on(crate::materialize::drive_virtual_import(
+                    &*vs.provider,
+                    &vs.graph_source_id,
+                    chunk_size_bytes,
+                    producer_parallelism,
+                    memory_budget_bytes,
+                    vs.allow_duplicate_parent_keys,
+                    &ctx,
+                    drive_tx,
+                ));
+                if let Err(e) = outcome {
+                    let _ = result_tx.send(Err(e.to_string()));
+                }
+                // result_tx dropped here → the consumer sees EOF.
+            })
+            .map_err(|e| ImportError::Transact(format!("spawn virtual materializer: {e}")))?;
+
+        let next_expected = commit_parsed_chunks_in_order(
+            result_rx,
+            &commit_env,
+            &mut state,
+            &mut published_codes,
+            compute_ns_delta,
+            &mut sort_write_handles,
+            &mut total_commit_size,
+            &mut commit_metas,
+        )
+        .await?;
+
+        producer
+            .join()
+            .map_err(|_| ImportError::Transact("virtual materializer thread panicked".into()))?;
+        tracing::info!(
+            committed_chunks = next_expected,
+            "virtual import phase complete"
+        );
     } else if is_remote_parallel || is_local_rechunk {
         // Channel-fed parallel path. Two sources share this arm:
         //
@@ -3923,7 +4847,6 @@ where
         // throttle). At least one worker is always used — zero would deadlock the
         // producer sending into an unread channel.
         let num_threads = num_threads.max(1);
-        let ledger = alias.to_string();
 
         // Both producers expose `(rx, error_rx, join_handle)` with identical EOF
         // semantics: the channel closing is not "success" on its own — we must
@@ -3961,7 +4884,6 @@ where
             let work_rx = Arc::clone(&remote_rx);
             let result_tx = result_tx.clone();
             let shared_alloc = Arc::clone(&shared_alloc);
-            let ledger = ledger.clone();
             let spool_dir = spool_dir.clone();
             let spool_config = Arc::clone(&spool_config);
 
@@ -3973,14 +4895,13 @@ where
                         // Remote objects are whole files with embedded preludes —
                         // parse_chunk extracts prelude per-chunk.
                         prelude: None,
-                        ledger: &ledger,
                         compress,
                         spool_dir: &spool_dir,
                         spool_config: &spool_config,
                     };
                     loop {
                         let recv_start = Instant::now();
-                        let (idx, raw_bytes) = match work_rx.lock().unwrap().recv() {
+                        let (idx, doc, raw_bytes) = match work_rx.lock().unwrap().recv() {
                             Ok(payload) => payload,
                             Err(_) => break, // Bridge dropped — channel closed.
                         };
@@ -4006,7 +4927,7 @@ where
 
                         let t = (idx + 1) as i64;
                         let parse_start = Instant::now();
-                        match parse_ttl_chunk(&ttl, &ctx, t, idx) {
+                        match parse_ttl_chunk(&ttl, &ctx, t, idx, doc) {
                             Ok(parsed) => {
                                 let parse_ms = parse_start.elapsed().as_millis();
                                 let send_start = Instant::now();
@@ -4128,10 +5049,10 @@ where
                 tokio::task::spawn_blocking(move || rx.lock().unwrap().recv())
                     .await
                     .map_err(|e| {
-                        ImportError::Transact(format!("chunk receive task panicked: {e}"))
+                        ImportError::Transact(TaskFailure::from(e).describe("chunk receive task"))
                     })?
             };
-            let (idx, raw_bytes) = match payload {
+            let (idx, doc, raw_bytes) = match payload {
                 Ok(payload) => payload,
                 Err(_) => break, // Channel closed — producer thread exited.
             };
@@ -4155,6 +5076,7 @@ where
                     trig_content,
                     storage,
                     alias,
+                    &doc.skolem_base(),
                     compress,
                     Some(&spool_dir),
                     Some(&spool_config),
@@ -4168,12 +5090,14 @@ where
                 published_codes.extend(state.ns_registry.all_codes());
                 r
             } else {
+                let skolem_base = doc.skolem_base();
                 let parsed = if chunk_source.is_jsonld(idx) {
                     parse_jsonld_chunk(
                         &content,
                         &shared_alloc,
                         t,
-                        alias,
+                        &skolem_base,
+                        doc.sub_chunk,
                         compress,
                         Some(&spool_dir),
                         Some(&spool_config),
@@ -4184,7 +5108,8 @@ where
                         &content,
                         &shared_alloc,
                         t,
-                        alias,
+                        &skolem_base,
+                        doc.sub_chunk,
                         compress,
                         Some(&spool_dir),
                         Some(&spool_config),
@@ -4237,10 +5162,7 @@ where
                 elapsed_secs: run_start.elapsed().as_secs_f64(),
             });
             if config.publish_every > 0 && (idx + 1).is_multiple_of(config.publish_every) {
-                nameservice
-                    .publish_commit(alias, result.t, &result.commit_id)
-                    .await
-                    .map_err(|e| ImportError::Storage(e.to_string()))?;
+                publish_import_commit_head(nameservice, alias, result.t, &result.commit_id).await?;
             }
         }
 
@@ -4280,9 +5202,9 @@ where
         let has_nquads = chunk_source.has_nquads();
         let has_jsonld = chunk_source.has_jsonld();
         if estimated_total > 0 && num_threads > 0 && !has_trig && !has_nquads && !has_jsonld {
-            let ledger = alias.to_string();
-
             let next_chunk = Arc::new(AtomicUsize::new(0));
+            // One whole file per chunk, so chunk index == document index.
+            let file_doc_ids: Arc<Vec<u64>> = Arc::new(doc_ids.ids());
             let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<
                 std::result::Result<(usize, ParsedChunk), String>,
             >(num_threads);
@@ -4296,7 +5218,7 @@ where
                 let next_chunk = Arc::clone(&next_chunk);
                 let result_tx = result_tx.clone();
                 let shared_alloc = Arc::clone(&shared_alloc);
-                let ledger = ledger.clone();
+                let file_doc_ids = Arc::clone(&file_doc_ids);
                 let chunk_source = Arc::clone(chunk_source);
                 let permit_rx_ref = Arc::clone(&permit_rx);
                 let permit_tx_ref = permit_tx.clone();
@@ -4310,7 +5232,6 @@ where
                         let ctx = ParseChunkContext {
                             shared_alloc: &shared_alloc,
                             prelude: None,
-                            ledger: &ledger,
                             compress,
                             spool_dir: &spool_dir,
                             spool_config: &spool_config,
@@ -4337,8 +5258,10 @@ where
                                 }
                             };
 
+                            // `Files` reads one whole file per chunk.
                             let t = (idx + 1) as i64;
-                            match parse_ttl_chunk(&ttl, &ctx, t, idx) {
+                            let doc = DocChunk::whole(file_doc_ids[idx]);
+                            match parse_ttl_chunk(&ttl, &ctx, t, idx, doc) {
                                 Ok(parsed) => {
                                     let _ = permit_tx_ref.send(());
                                     if result_tx.send(Ok((idx, parsed))).is_err() {
@@ -4390,8 +5313,9 @@ where
                 let result = if chunk_source.is_trig(i) || chunk_source.is_nquads(i) {
                     // TriG (and N-Quads, converted to TriG) use the dedicated
                     // commit function for named-graph handling. It allocates
-                    // codes in state.ns_registry; sync them to shared_alloc
-                    // afterward for subsequent chunks' spool writes.
+                    // codes through spool_config.ns_alloc (spool prefix
+                    // lookups happen mid-parse); the sync below is a
+                    // belt-and-braces consistency check.
                     let nq_converted;
                     let trig_content: &str = if chunk_source.is_nquads(i) {
                         nq_converted = fluree_db_transact::parse::nquads_to_trig(&content)
@@ -4405,6 +5329,7 @@ where
                         trig_content,
                         storage,
                         alias,
+                        &DocChunk::whole(doc_ids.id(i)).skolem_base(),
                         compress,
                         Some(&spool_dir),
                         Some(&spool_config),
@@ -4420,13 +5345,16 @@ where
                     published_codes.extend(state.ns_registry.all_codes());
                     r
                 } else {
-                    // TTL and JSON-LD: parse via shared allocator, then finalize.
+                    // TTL and JSON-LD: parse via shared allocator, then
+                    // finalize. `Files` reads one whole file per chunk.
+                    let skolem_base = DocChunk::whole(doc_ids.id(i)).skolem_base();
                     let parsed = if chunk_source.is_jsonld(i) {
                         parse_jsonld_chunk(
                             &content,
                             &shared_alloc,
                             t,
-                            alias,
+                            &skolem_base,
+                            0,
                             compress,
                             Some(&spool_dir),
                             Some(&spool_config),
@@ -4437,7 +5365,8 @@ where
                             &content,
                             &shared_alloc,
                             t,
-                            alias,
+                            &skolem_base,
+                            0,
                             compress,
                             Some(&spool_dir),
                             Some(&spool_config),
@@ -4492,10 +5421,8 @@ where
                     elapsed_secs: run_start.elapsed().as_secs_f64(),
                 });
                 if config.publish_every > 0 && (i + 1).is_multiple_of(config.publish_every) {
-                    nameservice
-                        .publish_commit(alias, result.t, &result.commit_id)
-                        .await
-                        .map_err(|e| ImportError::Storage(e.to_string()))?;
+                    publish_import_commit_head(nameservice, alias, result.t, &result.commit_id)
+                        .await?;
                 }
             }
         }
@@ -4507,10 +5434,7 @@ where
         .clone()
         .ok_or_else(|| ImportError::Storage("no commit head after import".to_string()))?;
 
-    nameservice
-        .publish_commit(alias, state.t, &commit_head_id)
-        .await
-        .map_err(|e| ImportError::Storage(e.to_string()))?;
+    publish_import_commit_head(nameservice, alias, state.t, &commit_head_id).await?;
     tracing::info!(t = state.t, "published final commit head");
 
     // ---- Spawn txn-meta "meta chunk" build in background ----
@@ -4544,6 +5468,19 @@ where
         let p_previous = spool_config
             .predicate_alloc
             .get_or_insert_parts(fluree::DB, db::PREVIOUS);
+        let p_import_source = spool_config
+            .predicate_alloc
+            .get_or_insert_parts(fluree::DB, db::IMPORT_SOURCE);
+        // The ndjson producer discovers documents as it reads (a `@context`
+        // switch opens a new one), and it has been joined by now, so its log
+        // is complete.
+        let observed_segments = match &**chunk_source {
+            ChunkSource::Remote(producer) | ChunkSource::JsonLdStream(producer) => {
+                producer.segments.lock().unwrap().clone()
+            }
+            _ => Vec::new(),
+        };
+        let manifest = doc_ids.manifest(&observed_segments);
 
         // txn-meta is always pre-seeded as dict_id=0 in the graph allocator
         // (via SharedDictAllocator::new_graph), so g_id = dict_id + 1 = 1.
@@ -4571,6 +5508,24 @@ where
             let mut meta_strings = ChunkStringDict::new();
             let mut records: Vec<RunRecord> = Vec::with_capacity(commit_metas.len() * 8);
 
+            let record = |s_id: u64,
+                          p_id: u32,
+                          o_kind: ObjKind,
+                          o_key: ObjKey,
+                          dt: DatatypeDictId,
+                          t: u32| RunRecord {
+                g_id,
+                s_id: SubjectId::from_u64(s_id),
+                p_id,
+                dt: dt.as_u16(),
+                o_kind: o_kind.as_u8(),
+                op: 1, // assert
+                o_key: o_key.as_u64(),
+                t,
+                lang_id: 0,
+                i: LIST_INDEX_NONE,
+            };
+
             for cm in &commit_metas {
                 let commit_s = meta_subjects
                     .get_or_insert(namespaces::FLUREE_COMMIT, cm.commit_hash_hex.as_bytes());
@@ -4578,18 +5533,7 @@ where
 
                 let mut push =
                     |s_id: u64, p_id: u32, o_kind: ObjKind, o_key: ObjKey, dt: DatatypeDictId| {
-                        records.push(RunRecord {
-                            g_id,
-                            s_id: SubjectId::from_u64(s_id),
-                            p_id,
-                            dt: dt.as_u16(),
-                            o_kind: o_kind.as_u8(),
-                            op: 1, // assert
-                            o_key: o_key.as_u64(),
-                            t,
-                            lang_id: 0,
-                            i: LIST_INDEX_NONE,
-                        });
+                        records.push(record(s_id, p_id, o_kind, o_key, dt, t));
                     };
 
                 // db:address — commit hash hex as LEX_ID string
@@ -4663,6 +5607,29 @@ where
                 }
             }
 
+            // Import manifest: one triple per source document, mapping the
+            // blank-node scope every id from that document shares back to the
+            // document itself. Without it a minted `_:fdb-d…` is unresolvable
+            // — the scope is a hash, and nothing else in the ledger records
+            // what was hashed.
+            //
+            // Stamped at t=1: the manifest describes the import as a whole,
+            // and t=1 is the first commit any reader of the ledger can see.
+            let manifest_count = manifest.len();
+            for (scope_label, doc_key) in &manifest {
+                let scope_s =
+                    meta_subjects.get_or_insert(namespaces::BLANK_NODE, scope_label.as_bytes());
+                let key_str_id = meta_strings.get_or_insert(doc_key.as_bytes());
+                records.push(record(
+                    scope_s,
+                    p_import_source,
+                    ObjKind::LEX_ID,
+                    ObjKey::encode_u32_id(key_str_id),
+                    DatatypeDictId::STRING,
+                    1,
+                ));
+            }
+
             let meta_records_count = records.len();
             let commit_count = commit_metas.len();
 
@@ -4678,7 +5645,7 @@ where
             std::fs::write(&lang_voc_path, &lang_bytes)?;
 
             let meta_custom_datatype_iris =
-                current_custom_datatype_iris(&meta_spool_config.datatype_alloc);
+                current_custom_datatype_iris(&meta_spool_config.datatype_alloc)?;
             let meta_otype_registry =
                 fluree_db_core::OTypeRegistry::new(&meta_custom_datatype_iris);
             let meta_sorted_info = sort_remap_and_write_sorted_commit(
@@ -4697,6 +5664,7 @@ where
             tracing::info!(
                 meta_chunk_idx,
                 commit_count,
+                manifest_count,
                 meta_records_count,
                 "txn-meta meta chunk built"
             );
@@ -4718,7 +5686,9 @@ where
         let await_start = Instant::now();
         let info = handle
             .await
-            .map_err(|e| ImportError::RunGeneration(format!("sort/write task panicked: {e}")))?
+            .map_err(|e| {
+                ImportError::RunGeneration(TaskFailure::from(e).describe("sort/write task"))
+            })?
             .map_err(ImportError::Io)?;
         tracing::info!(
             chunk = info.chunk_idx,
@@ -4738,7 +5708,9 @@ where
     if let Some(handle) = meta_chunk_handle {
         let meta_sorted_info = handle
             .await
-            .map_err(|e| ImportError::RunGeneration(format!("meta chunk task panicked: {e}")))?
+            .map_err(|e| {
+                ImportError::RunGeneration(TaskFailure::from(e).describe("meta chunk task"))
+            })?
             .map_err(ImportError::Io)?;
         sorted_commit_infos.push(meta_sorted_info);
     }
@@ -4841,9 +5813,60 @@ where
     use fluree_db_indexer::run_index::vocab_merge;
 
     // Phase B can use more CPU: subject, string, and language merges are independent.
-    // Run them concurrently to better utilize cores while this phase is otherwise I/O-bound.
+    // Run them concurrently to better utilize cores while this phase is otherwise I/O-bound —
+    // unless the FD budget can't cover the concurrent peak. Each merge holds
+    // one reader per chunk, the subject/string merges additionally hold one
+    // remap writer per chunk, plus a handful of output streams: ~5 descriptors
+    // per chunk when all three run at once, ~2 per chunk serialized. This was
+    // the import's first unbudgeted EMFILE site on multi-chunk imports at low
+    // limits — before the index build even starts.
     let run_dir_path = run_dir.to_path_buf();
     let remap_dir_path = remap_dir.to_path_buf();
+
+    let vocab_chunks = sorted_commit_infos.len();
+    let vocab_concurrent_peak = 5 * vocab_chunks + 16;
+    let vocab_serial_peak = 2 * vocab_chunks + 8;
+    let fd_available = config.effective_fd_budget().available();
+    let vocab_merge_serial = fd_available < vocab_concurrent_peak;
+    if vocab_merge_serial {
+        tracing::info!(
+            chunks = vocab_chunks,
+            fd_available,
+            vocab_concurrent_peak,
+            "serializing dictionary merges to fit fd budget"
+        );
+        // Warn against the KERNEL limit, not the plan: a deliberately
+        // shrunken FLUREE_FD_BUDGET plan can serialize the merges while the
+        // real limit still fits them comfortably.
+        let kernel_headroom = fluree_db_core::fd_limit::nofile_limits().map_or(fd_available, |l| {
+            fluree_db_core::fd_limit::FdBudget::from_soft(l.soft).available()
+        });
+        if kernel_headroom < vocab_serial_peak {
+            tracing::warn!(
+                chunks = vocab_chunks,
+                kernel_headroom,
+                vocab_serial_peak,
+                "dictionary merge may exceed the open-file limit even serialized; \
+                 raise the limit or import fewer/larger chunks"
+            );
+        }
+    }
+
+    /// Map a vocab-merge failure, upgrading descriptor exhaustion into the
+    /// actionable open-file-limit error.
+    fn vocab_merge_error(e: std::io::Error) -> ImportError {
+        if fluree_db_core::fd_limit::is_fd_exhaustion(&e) {
+            let soft = fluree_db_core::fd_limit::nofile_limits()
+                .map_or_else(|| "unknown".to_string(), |l| l.soft.to_string());
+            ImportError::FdLimit(format!(
+                "{e} during dictionary merge; the process open-file limit (currently \
+                 {soft}) is too low for this many import chunks — raise it \
+                 (`ulimit -n <n>`, LimitNOFILE) or use fewer/larger chunks"
+            ))
+        } else {
+            ImportError::Io(e)
+        }
+    }
 
     let subj_vocab_paths_for_task = subject_vocab_paths.clone();
     let chunk_ids_for_subj = chunk_ids.clone();
@@ -4862,6 +5885,19 @@ where
             namespace_codes_for_subj.as_ref(),
         )
     });
+    // Serial mode: drain each merge before spawning the next, so only one
+    // merge's per-chunk descriptors are live at a time.
+    let (subj_stats_serial, subj_handle) = if vocab_merge_serial {
+        let stats = subj_handle
+            .await
+            .map_err(|e| {
+                ImportError::RunGeneration(TaskFailure::from(e).describe("subject vocab merge"))
+            })?
+            .map_err(vocab_merge_error)?;
+        (Some(stats), None)
+    } else {
+        (None, Some(subj_handle))
+    };
 
     let str_vocab_paths_for_task = string_vocab_paths.clone();
     let chunk_ids_for_str = chunk_ids.clone();
@@ -4877,6 +5913,17 @@ where
             &run_dir_for_str,
         )
     });
+    let (str_stats_serial, str_handle) = if vocab_merge_serial {
+        let stats = str_handle
+            .await
+            .map_err(|e| {
+                ImportError::RunGeneration(TaskFailure::from(e).describe("string vocab merge"))
+            })?
+            .map_err(vocab_merge_error)?;
+        (Some(stats), None)
+    } else {
+        (None, Some(str_handle))
+    };
 
     let lang_vocab_paths_for_task = lang_vocab_paths.clone();
     let lang_span = merge_parent_span;
@@ -4885,17 +5932,31 @@ where
         fluree_db_indexer::run_index::build_lang_remap_from_vocabs(&lang_vocab_paths_for_task)
     });
 
-    let subj_stats = subj_handle
-        .await
-        .map_err(|e| ImportError::RunGeneration(format!("subject vocab merge panicked: {e}")))?
-        .map_err(ImportError::Io)?;
-    let str_stats = str_handle
-        .await
-        .map_err(|e| ImportError::RunGeneration(format!("string vocab merge panicked: {e}")))?
-        .map_err(ImportError::Io)?;
+    let subj_stats = match (subj_stats_serial, subj_handle) {
+        (Some(stats), _) => stats,
+        (None, Some(handle)) => handle
+            .await
+            .map_err(|e| {
+                ImportError::RunGeneration(TaskFailure::from(e).describe("subject vocab merge"))
+            })?
+            .map_err(vocab_merge_error)?,
+        (None, None) => unreachable!("serial mode stores stats, concurrent mode stores handle"),
+    };
+    let str_stats = match (str_stats_serial, str_handle) {
+        (Some(stats), _) => stats,
+        (None, Some(handle)) => handle
+            .await
+            .map_err(|e| {
+                ImportError::RunGeneration(TaskFailure::from(e).describe("string vocab merge"))
+            })?
+            .map_err(vocab_merge_error)?,
+        (None, None) => unreachable!("serial mode stores stats, concurrent mode stores handle"),
+    };
     let (unified_lang_dict, lang_remaps) = lang_handle
         .await
-        .map_err(|e| ImportError::RunGeneration(format!("language vocab merge panicked: {e}")))?
+        .map_err(|e| {
+            ImportError::RunGeneration(TaskFailure::from(e).describe("language vocab merge"))
+        })?
         .map_err(|e| ImportError::RunGeneration(format!("lang remap: {e}")))?;
 
     let total_unique_subjects = subj_stats.total_unique;
@@ -5094,6 +6155,11 @@ where
         named_g_ids: v3_named_g_ids,
         // Forwarder thread joined above, so this reflects any preflight coarsening.
         ns_split_mode: shared_alloc.split_mode(),
+        // Every parse worker has finished its `SpoolContext` by now, so this
+        // read sees every chunk's contribution.
+        saw_list_meta: spool_config
+            .saw_list_meta
+            .load(std::sync::atomic::Ordering::Relaxed),
     })
 }
 
@@ -5111,6 +6177,9 @@ struct IndexUploadResult {
     /// `reindex` pass (the bulk-import root currently writes
     /// `annotation_index: None` even when annotations are present).
     has_annotations: bool,
+    /// Duplicate input statements collapsed out of the index (chunk-level
+    /// dedup + cross-chunk merge dedup). The commit blobs keep the raw ops.
+    duplicates_removed: u64,
 }
 
 /// Decimal-encoding policy for a fresh bulk import. Like a full reindex, a new
@@ -5210,6 +6279,10 @@ where
         let v3_run_budget = config.effective_run_budget_mb() * 1024 * 1024;
         let v3_worker_count = config.effective_heavy_workers();
         let v3_sorted_commit_infos = input.sorted_commit_infos;
+        let chunk_duplicates_removed: u64 = v3_sorted_commit_infos
+            .iter()
+            .map(|info| info.duplicates_removed)
+            .sum();
         let v3_lang_remaps: Vec<Vec<u16>> = lang_remaps.clone();
         let v3_remap_counter = remap_counter.clone();
         let v3_build_counter = build_counter.clone();
@@ -5292,6 +6365,11 @@ where
                 let v3_runs_g0 = v3_run_dir.join("v3_runs_g0");
                 let v3_runs_g1 = v3_run_dir.join("v3_runs_g1");
 
+                // One FD budget for every graph's build in this import: the
+                // builds are sequential and plan against the same process
+                // limit (post best-effort raise at startup/preflight).
+                let fd_budget = fluree_db_core::fd_limit::FdBudget::detect();
+
                 let cfg_g0 = fluree_db_indexer::BuildConfig {
                     run_dir: v3_runs_g0,
                     index_dir: v3_index_dir.clone(),
@@ -5301,12 +6379,12 @@ where
                     zstd_level: 1,
                     run_budget_bytes: v3_run_budget,
                     worker_count: v3_worker_count,
+                    fd_budget,
                     remap_progress: Some(v3_remap_counter),
                     build_progress: Some(v3_build_counter),
                     stage_marker: Some(v3_stage_marker),
                 };
-                std::fs::create_dir_all(&cfg_g0.run_dir)
-                    .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                std::fs::create_dir_all(&cfg_g0.run_dir).map_err(|e| index_build_error(&e))?;
 
                 let (g0_result, mut spot_class_stats) =
                     fluree_db_indexer::build_indexes_from_commits(
@@ -5314,7 +6392,7 @@ where
                         &cfg_g0,
                         stats_hook.as_mut(),
                     )
-                    .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                    .map_err(|e| index_build_error(&e))?;
 
                 // Meta chunk is always the last chunk when present. We build
                 // it BEFORE stats finalize and share the IdStatsHook so the
@@ -5330,12 +6408,12 @@ where
                         zstd_level: 1,
                         run_budget_bytes: v3_run_budget,
                         worker_count: 1,
+                        fd_budget,
                         remap_progress: None,
                         build_progress: None,
                         stage_marker: None,
                     };
-                    std::fs::create_dir_all(&cfg_g1.run_dir)
-                        .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                    std::fs::create_dir_all(&cfg_g1.run_dir).map_err(|e| index_build_error(&e))?;
 
                     Some(
                         fluree_db_indexer::build_indexes_from_commits(
@@ -5343,7 +6421,7 @@ where
                             &cfg_g1,
                             stats_hook.as_mut(),
                         )
-                        .map_err(|e| ImportError::IndexBuild(e.to_string()))?,
+                        .map_err(|e| index_build_error(&e))?,
                     )
                 } else {
                     None
@@ -5367,12 +6445,12 @@ where
                         zstd_level: 1,
                         run_budget_bytes: v3_run_budget,
                         worker_count: 1,
+                        fd_budget,
                         remap_progress: None,
                         build_progress: None,
                         stage_marker: None,
                     };
-                    std::fs::create_dir_all(&cfg_ng.run_dir)
-                        .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                    std::fs::create_dir_all(&cfg_ng.run_dir).map_err(|e| index_build_error(&e))?;
 
                     // Fold this named graph's per-class SPOT stats into the
                     // default-graph accumulator. All `SpotClassStats` maps are
@@ -5387,7 +6465,7 @@ where
                         &cfg_ng,
                         stats_hook.as_mut(),
                     )
-                    .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                    .map_err(|e| index_build_error(&e))?;
                     if let Some(ng) = ng_spot {
                         match &mut spot_class_stats {
                             Some(acc) => acc.merge(ng),
@@ -5414,6 +6492,7 @@ where
                 let mut total_remapped = g0_result.total_remapped;
                 let mut remap_elapsed = g0_result.remap_elapsed;
                 let mut build_elapsed = g0_result.build_elapsed;
+                let mut duplicates_removed = g0_result.duplicates_removed;
 
                 // g1 (txn-meta) is a system graph; its per-class SPOT stats are
                 // intentionally not merged into the user-facing class stats.
@@ -5422,6 +6501,7 @@ where
                     total_remapped += g1.total_remapped;
                     remap_elapsed += g1.remap_elapsed;
                     build_elapsed += g1.build_elapsed;
+                    duplicates_removed += g1.duplicates_removed;
 
                     for (order, g1_order) in g1.order_results {
                         if let Some((_, existing)) =
@@ -5441,6 +6521,7 @@ where
                     total_remapped += ng.total_remapped;
                     remap_elapsed += ng.remap_elapsed;
                     build_elapsed += ng.build_elapsed;
+                    duplicates_removed += ng.duplicates_removed;
 
                     for (order, ng_order) in ng.order_results {
                         if let Some((_, existing)) =
@@ -5460,6 +6541,7 @@ where
                     total_remapped,
                     remap_elapsed,
                     build_elapsed,
+                    duplicates_removed,
                 };
 
                 tracing::info!(
@@ -5475,8 +6557,12 @@ where
             },
         );
 
-        let remap_total_flakes = input.cumulative_flakes;
-        let build_total_flakes = input.cumulative_flakes * 4;
+        // Chunk-level dedup already shrank the sorted commits the remap and
+        // build phases consume; cross-chunk merge dedup self-corrects because
+        // the pumps advance progress by consumed (pre-collapse) records.
+        let deduped_flakes = input.cumulative_flakes - chunk_duplicates_removed;
+        let remap_total_flakes = deduped_flakes;
+        let build_total_flakes = deduped_flakes * 4;
 
         let emit_index_progress =
             |stage: u8, current_stage: &mut u8, stage_start: &mut std::time::Instant| {
@@ -5528,8 +6614,7 @@ where
                     let stage = stage_marker.load(std::sync::atomic::Ordering::Relaxed);
                     emit_index_progress(stage, &mut current_stage, &mut stage_start);
                     break result
-                        .map_err(|e| ImportError::IndexBuild(format!("build task panicked: {e}")))?
-                        .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                        .map_err(|e| ImportError::IndexBuild(TaskFailure::from(e).describe("build task")))??;
                 }
                 () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
                     let stage = stage_marker.load(std::sync::atomic::Ordering::Relaxed);
@@ -5728,54 +6813,19 @@ where
             use fluree_db_core::index_stats as is;
 
             // Aggregate across graphs by p_id (deprecated SID-keyed view).
-            struct PropAgg {
-                count: u64,
-                ndv_values: u64,
-                ndv_subjects: u64,
-                last_modified_t: i64,
-                datatypes: Vec<(u8, u64)>,
-            }
-            let mut agg: std::collections::HashMap<u32, PropAgg> = std::collections::HashMap::new();
-            for g in &id_stats.graphs {
-                for p in &g.properties {
-                    let e = agg.entry(p.p_id).or_insert(PropAgg {
-                        count: 0,
-                        ndv_values: 0,
-                        ndv_subjects: 0,
-                        last_modified_t: 0,
-                        datatypes: Vec::new(),
-                    });
-                    e.count += p.count;
-                    e.ndv_values = e.ndv_values.max(p.ndv_values);
-                    e.ndv_subjects = e.ndv_subjects.max(p.ndv_subjects);
-                    e.last_modified_t = e.last_modified_t.max(p.last_modified_t);
-                    for &(dt, cnt) in &p.datatypes {
-                        if let Some(existing) = e.datatypes.iter_mut().find(|(d, _)| *d == dt) {
-                            existing.1 += cnt;
-                        } else {
-                            e.datatypes.push((dt, cnt));
-                        }
-                    }
-                }
-            }
-
-            let properties: Vec<is::PropertyStatEntry> = agg
-                .into_iter()
-                .map(|(p_id, pa)| {
-                    let (ns, name) = predicate_sids_v6
-                        .get(p_id as usize)
-                        .cloned()
-                        .unwrap_or((0u16, String::new()));
-                    is::PropertyStatEntry {
-                        sid: (ns, name),
-                        count: pa.count,
-                        ndv_values: pa.ndv_values,
-                        ndv_subjects: pa.ndv_subjects,
-                        last_modified_t: pa.last_modified_t,
-                        datatypes: pa.datatypes,
-                    }
-                })
-                .collect();
+            // Shared with the incremental and rebuild pipelines so
+            // `observed_datatypes` — which is fail-closed, and so goes wrong
+            // quietly — has one producer rather than one per pipeline.
+            let properties: Vec<is::PropertyStatEntry> =
+                fluree_db_indexer::stats::aggregate_property_entries_by_sid(
+                    &id_stats.graphs,
+                    |p_id| {
+                        predicate_sids_v6
+                            .get(p_id as usize)
+                            .cloned()
+                            .unwrap_or((0u16, String::new()))
+                    },
+                );
 
             let mut graphs = id_stats.graphs;
             if let Some(ref cs) = spot_class_stats {
@@ -5805,6 +6855,11 @@ where
                 properties: Some(properties),
                 classes: None,
                 graphs: Some(graphs),
+                // An import replays its entire input as the ledger's full
+                // history, so the stats hook has observed the tag of every
+                // record at every `t` — historical coverage is complete from
+                // genesis.
+                historical_since_t: Some(0),
             };
             // Wire `total_commit_size` into `stats.size` and per-graph sizes,
             // mirroring `root_assembly::compose_root_v6` for the normal indexing
@@ -5903,6 +6958,18 @@ where
             // later defensive drop carries the sticky bit forward
             // and stays out of the bootstrap path.
             had_annotation_arena: false,
+            // Every record written through the spool pipeline reports
+            // whether it carried an RDF-list position, OR'd into one sticky
+            // bit on the shared `SpoolConfig` and read after the parse
+            // workers joined — so this is an exact observation, the same
+            // grade the full-rebuild resolver produces. `Some(false)` is
+            // what lets filtered-DELETE staging skip list-meta hydration on
+            // bulk-imported ledgers, which are the large ones.
+            //
+            // The txn-meta records assembled outside the spool (they hard-code
+            // `i: LIST_INDEX_NONE`) are the only other rows in the root, and
+            // they are never list rows.
+            has_list_meta: Some(input.saw_list_meta),
             ns_split_mode: input.ns_split_mode,
             // Same source as the spool object resolution (SpoolConfig): the root
             // version must match how the import encoded decimals.
@@ -5943,6 +7010,7 @@ where
             index_t: input.final_t,
             summary,
             has_annotations: import_has_annotations,
+            duplicates_removed: chunk_duplicates_removed + v3_result.duplicates_removed,
         })
     }
 }
@@ -6148,9 +7216,10 @@ fn session_id() -> String {
 
 /// Derive the session directory path.
 ///
-/// Uses `{temp_dir}/fluree-import/{alias_prefix}/tmp_import/{session_id}/`.
-/// The cleanup phase removes this directory on success; on failure it is
-/// kept for debugging (logged with full path).
+/// Uses `{temp_dir}/fluree-import/{alias_prefix}/tmp_import/{session_id}/`,
+/// or `FLUREE_IMPORT_DIR` in place of `{temp_dir}/fluree-import`. Storage is
+/// not consulted. The import removes this directory when it finishes, on
+/// success or failure, unless `cleanup_local_files` is off.
 fn derive_session_dir<S: Storage>(_storage: &S, alias_prefix: &str, sid: &str) -> PathBuf {
     // Allow overriding import scratch space for large imports.
     //
@@ -6269,6 +7338,34 @@ where
 }
 
 #[cfg(test)]
+mod logging_tests {
+    use super::log_ttl_chunk;
+
+    #[test]
+    fn unicode_chunk_logging_at_byte_200() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::enabled!(tracing::Level::DEBUG));
+            for character in ['±', '界', '🦀'] {
+                let start = "<http://example.org/s> <http://example.org/p> \"";
+                let ttl = format!(
+                    "{start}{}{character} trailing text\" .\n",
+                    "a".repeat(199 - start.len())
+                );
+                assert!(!ttl.is_char_boundary(200));
+                log_ttl_chunk(0, &ttl);
+            }
+            for ttl in ["", "short ±界🦀", &"a".repeat(201), &"界".repeat(100)] {
+                log_ttl_chunk(0, ttl);
+            }
+        });
+    }
+}
+
+#[cfg(test)]
 mod resource_model_tests {
     use super::*;
 
@@ -6330,6 +7427,88 @@ mod resource_model_tests {
         }
     }
 
+    // A duplicate document key is unreachable through `discover_chunks`
+    // (`read_dir` yields each entry once), so exercise the guard directly. The
+    // one arm that CAN produce it — caller-supplied `OrderedObjects` — is
+    // covered end-to-end by `duplicate_remote_addresses_abort_the_import`.
+    #[test]
+    fn duplicate_document_keys_are_refused_by_name() {
+        let err = DocIds::new(
+            "l:main",
+            vec!["a.ttl".into(), "sub/b.ttl".into(), "a.ttl".into()],
+        )
+        .expect_err("two documents with one key must not build a DocIds");
+        let msg = err.to_string();
+        assert!(msg.contains("a.ttl"), "must name the colliding key: {msg}");
+        assert!(
+            !msg.contains("sub/b.ttl"),
+            "must not implicate the innocent document: {msg}"
+        );
+    }
+
+    #[test]
+    fn distinct_document_keys_build_distinct_ids() {
+        let docs =
+            DocIds::new("l:main", vec!["a.ttl".into(), "sub/a.ttl".into()]).expect("distinct keys");
+        assert_ne!(
+            docs.id(0),
+            docs.id(1),
+            "the same file name under a different directory is a different document"
+        );
+    }
+
+    // Anonymous-node ids are `(doc, sub_chunk, counter)`; the producer supplies
+    // the first two. A counter that reset outside its document's run would
+    // re-issue sub-chunk 0 and merge two documents' anonymous nodes.
+    #[test]
+    fn sub_chunk_indexes_restart_per_document() {
+        let mut counter = SubChunkCounter::default();
+        assert_eq!(
+            counter.next_for(7),
+            DocChunk {
+                doc: 7,
+                sub_chunk: 0
+            }
+        );
+        assert_eq!(
+            counter.next_for(7),
+            DocChunk {
+                doc: 7,
+                sub_chunk: 1
+            }
+        );
+        assert_eq!(
+            counter.next_for(9),
+            DocChunk {
+                doc: 9,
+                sub_chunk: 0
+            }
+        );
+        assert_eq!(
+            counter.next_for(9),
+            DocChunk {
+                doc: 9,
+                sub_chunk: 1
+            }
+        );
+    }
+
+    #[test]
+    fn local_doc_key_is_relative_to_the_import_root() {
+        let root = Path::new("/data/corpus");
+        assert_eq!(
+            local_doc_key(root, Path::new("/data/corpus/a.ttl")),
+            "a.ttl"
+        );
+        assert_eq!(
+            local_doc_key(root, Path::new("/data/corpus/sub/a.ttl")),
+            format!("sub{}a.ttl", std::path::MAIN_SEPARATOR)
+        );
+        // Outside the root (never produced by discovery) falls back to the
+        // file name rather than leaking an absolute path into the id.
+        assert_eq!(local_doc_key(root, Path::new("/elsewhere/a.ttl")), "a.ttl");
+    }
+
     #[test]
     fn explicit_thread_count_is_honored_uncapped() {
         let _env = EnvGuard::clear_overrides();
@@ -6339,6 +7518,41 @@ mod resource_model_tests {
         assert_eq!(c.effective_parse_threads(), 64);
         // ...and heavy workers follow it.
         assert_eq!(c.effective_heavy_workers(), 64);
+    }
+
+    #[test]
+    fn chunk_size_scales_below_2gb_budget_not_floored_at_128() {
+        // O6: any sub-2GB budget used to underflow the fixed 2GB overhead term to 0
+        // and floor at 128MB REGARDLESS of budget. A 512MB budget must now yield a
+        // chunk WELL below 128MB so peak RAM tracks the budget.
+        let _env = EnvGuard::clear_overrides();
+        let small = cfg(512, 0, 0).effective_chunk_size_mb();
+        assert!(
+            (16..128).contains(&small),
+            "512MB budget must scale the chunk into [16,128), got {small}"
+        );
+        // Monotone-ish: a smaller budget must not produce a LARGER chunk.
+        let tiny = cfg(256, 0, 0).effective_chunk_size_mb();
+        assert!(
+            tiny <= small,
+            "256MB chunk {tiny} must not exceed 512MB chunk {small}"
+        );
+        // Hard floor at 16MB keeps a chunk worth committing.
+        let floor = cfg(64, 0, 0).effective_chunk_size_mb();
+        assert!(floor >= 16, "chunk floors at 16MB, got {floor}");
+    }
+
+    #[test]
+    fn chunk_size_large_budget_behavior_unchanged() {
+        // The >=2GB path is untouched: still [128,768], derived from budget-2048.
+        let _env = EnvGuard::clear_overrides();
+        let big = cfg(8192, 0, 0).effective_chunk_size_mb();
+        assert!(
+            (128..=768).contains(&big),
+            "8GB budget chunk in [128,768], got {big}"
+        );
+        // An explicit chunk size still wins over the derivation.
+        assert_eq!(cfg(512, 200, 0).effective_chunk_size_mb(), 200);
     }
 
     #[test]
@@ -6407,6 +7621,98 @@ mod resource_model_tests {
         assert_eq!(c.effective_rechunk_threads(), 1);
     }
 
+    // The sub-chunk index a chunk carries only separates anonymous nodes if a
+    // document's chunks are emitted as one contiguous run — otherwise the
+    // counter resets mid-document and re-issues 0. The mixed shape is where
+    // that could break: a split file's sub-chunks interleaving with coalesce
+    // buffer flushes. Runs in debug, so `SubChunkCounter`'s contiguity
+    // assertion is live, and compares the two producers payload-for-payload
+    // (the comparison includes the `DocChunk`).
+    #[test]
+    fn rechunk_scopes_survive_split_and_coalesced_files_interleaved() {
+        let _env = EnvGuard::clear_overrides();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let chunk_size_bytes = 64 * 1024;
+
+        // 000/001 coalesce, 002 splits into several sub-chunks, 003/004
+        // coalesce again behind it.
+        let big: String = (0..5_000)
+            .map(|i| format!("<http://example/big{i}> <http://example/p> <http://example/o> .\n"))
+            .collect();
+        let small =
+            |i: usize| format!("<http://example/s{i}> <http://example/p> <http://example/o> .\n");
+        let inputs: Vec<(String, String)> = vec![
+            ("000.nt".into(), small(0)),
+            ("001.nt".into(), small(1)),
+            ("002.nt".into(), big),
+            ("003.nt".into(), small(3)),
+            ("004.nt".into(), small(4)),
+        ];
+
+        let files: Vec<PathBuf> = inputs
+            .iter()
+            .map(|(name, contents)| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, contents).expect("write fixture");
+                path
+            })
+            .collect();
+        let sizes: Vec<u64> = files
+            .iter()
+            .map(|p| std::fs::metadata(p).expect("metadata").len())
+            .collect();
+        assert!(
+            sizes[2] > chunk_size_bytes,
+            "fixture must force the split arm"
+        );
+        let doc_ids: Vec<u64> = (0..files.len() as u64).map(|i| i + 1).collect();
+
+        let (serial_tx, serial_rx) = std::sync::mpsc::sync_channel(64);
+        local_rechunk_loop(&files, &sizes, &doc_ids, chunk_size_bytes, true, &serial_tx)
+            .expect("serial rechunk");
+        drop(serial_tx);
+        let serial: Vec<RemoteChunk> = serial_rx.into_iter().collect();
+
+        let (parallel_tx, parallel_rx) = std::sync::mpsc::sync_channel(256);
+        local_rechunk_loop_parallel(
+            files,
+            sizes,
+            doc_ids,
+            chunk_size_bytes,
+            true,
+            &parallel_tx,
+            4,
+        )
+        .expect("parallel rechunk");
+        drop(parallel_tx);
+        let parallel: Vec<RemoteChunk> = parallel_rx.into_iter().collect();
+
+        assert_eq!(parallel, serial);
+
+        // Both loops buffer their whole output here (nothing drains
+        // concurrently), so the channel must outrun the chunk count.
+        //
+        // Note the 64 KB chunk size: `StreamingTurtleReader` does not
+        // terminate on a sub-KB chunk size, so the split arm cannot be
+        // exercised at the 1 KB the coalescing-only test above uses. That is
+        // pre-existing and unreachable in production — `chunk_size_mb` is
+        // megabytes — but it is why this fixture is sized the way it is.
+
+        // Every (document, sub-chunk) pair is used once — the invariant the
+        // anonymous-node mint rests on.
+        let mut seen: Vec<DocChunk> = serial.iter().map(|(_, doc, _)| *doc).collect();
+        let total = seen.len();
+        seen.sort_by_key(|d| (d.doc, d.sub_chunk));
+        seen.dedup();
+        assert_eq!(seen.len(), total, "a (doc, sub_chunk) pair was reused");
+
+        let split_chunks = serial.iter().filter(|(_, d, _)| d.doc == 3).count();
+        assert!(
+            split_chunks > 1,
+            "test is vacuous unless 002.nt was sub-split: {split_chunks} chunk(s)"
+        );
+    }
+
     #[test]
     fn parallel_local_rechunk_matches_serial_order_and_coalescing() {
         let _env = EnvGuard::clear_overrides();
@@ -6439,6 +7745,7 @@ mod resource_model_tests {
             .iter()
             .map(|p| std::fs::metadata(p).expect("metadata").len())
             .collect();
+        let doc_ids: Vec<u64> = (0..files.len() as u64).map(|i| i + 1).collect();
         let chunk_size_bytes = 1024;
         let coalesce_enabled = true;
 
@@ -6446,6 +7753,7 @@ mod resource_model_tests {
         local_rechunk_loop(
             &files,
             &sizes,
+            &doc_ids,
             chunk_size_bytes,
             coalesce_enabled,
             &serial_tx,
@@ -6458,6 +7766,7 @@ mod resource_model_tests {
         local_rechunk_loop_parallel(
             files,
             sizes,
+            doc_ids,
             chunk_size_bytes,
             coalesce_enabled,
             &parallel_tx,
@@ -6472,5 +7781,74 @@ mod resource_model_tests {
         assert_eq!(parallel[0].0, 0);
         assert_eq!(parallel[1].0, 1);
         assert_eq!(parallel[2].0, 2);
+    }
+}
+
+#[cfg(test)]
+mod publish_import_commit_head_tests {
+    use super::*;
+    use fluree_db_nameservice::memory::MemoryNameService;
+    use fluree_db_nameservice::{LedgerLifecycle, RefKind, RefLookup};
+
+    fn cid(label: &str) -> ContentId {
+        ContentId::new(ContentKind::Commit, label.as_bytes())
+    }
+
+    /// The publish shapes the import pipeline produces — creation on a
+    /// freshly-initialized ledger, a checkpoint fast-forwarding past the
+    /// importer's own head, and the final publish restating the last
+    /// checkpoint's exact `(t, commit_id)` — plus the two conflicts it
+    /// never produces (equal `t` under a different id, lower `t`), which
+    /// must fail loudly instead of reporting success over a foreign head.
+    #[tokio::test]
+    async fn creates_advances_tolerates_exact_republish_rejects_divergence() {
+        let ns = MemoryNameService::new();
+        let alias = "importdb:main";
+
+        // The importer initializes the ledger before its first publish.
+        ns.init(alias).await.expect("init");
+
+        publish_import_commit_head(&ns, alias, 1, &cid("t1"))
+            .await
+            .expect("initial publish creates the head");
+        let head = ns
+            .get_ref(alias, RefKind::CommitHead)
+            .await
+            .expect("get_ref")
+            .expect("head exists");
+        assert_eq!(head.t, 1);
+        assert_eq!(head.id, Some(cid("t1")));
+
+        publish_import_commit_head(&ns, alias, 5, &cid("t5"))
+            .await
+            .expect("checkpoint fast-forwards");
+
+        publish_import_commit_head(&ns, alias, 5, &cid("t5"))
+            .await
+            .expect("republish of the exact head is a no-op success");
+
+        let err = publish_import_commit_head(&ns, alias, 5, &cid("other"))
+            .await
+            .expect_err("equal t under a different id is a divergence");
+        assert!(
+            err.to_string().contains("diverged"),
+            "unexpected error: {err}"
+        );
+
+        let err = publish_import_commit_head(&ns, alias, 3, &cid("t3"))
+            .await
+            .expect_err("a head past the published t is a divergence");
+        assert!(
+            err.to_string().contains("diverged"),
+            "unexpected error: {err}"
+        );
+
+        let head = ns
+            .get_ref(alias, RefKind::CommitHead)
+            .await
+            .expect("get_ref")
+            .expect("head exists");
+        assert_eq!(head.t, 5, "failed publishes leave the head alone");
+        assert_eq!(head.id, Some(cid("t5")));
     }
 }

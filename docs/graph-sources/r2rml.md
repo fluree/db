@@ -306,6 +306,21 @@ R2RML graph sources execute by scanning the underlying Iceberg table and materia
 
 4. **Partition by Common Filters:** Partition your Iceberg tables by columns frequently used in filters (e.g., date).
 
+### Bound-subject key pushdown
+
+A query that names a specific subject IRI — e.g. `<http://example.org/store/5> ex:name ?n` — can be answered without scanning the whole table. Fluree reverses the subject template (`rr:subjectMap rr:template "http://example.org/store/{store_key}"`) to recover the key value (`store_key = 5`) and pushes it to the Iceberg scan as an equality predicate, so the reader can prune to the matching rows. The mapping's subject equality is always re-checked in-engine, so this only ever affects *which rows the scan returns*, never the result.
+
+This is **on by default**. It shares the Iceberg predicate-pushdown kill-switch, `FLUREE_ICEBERG_PREDICATE_PUSHDOWN=0` (see [Configuration](../operations/configuration.md)); with pushdown off, bound-subject queries are still answered correctly — just by scanning and filtering in-engine instead of pruning.
+
+**The percent-encoding contract.** R2RML builds subject IRIs by substituting column values into the template and percent-encoding each value per RFC 3987 (letters, digits, and `- . _ ~ ! $ & ' ( ) * + , ; = : @` are left literal; everything else — including `/`, `#`, `?`, space, and non-ASCII — becomes `%XX`). Reversal is the exact inverse. **For the pushdown to engage, a query's subject IRI must use this same encoding.** For example, a `store_key` of `west/5` is stored in the IRI as `http://example.org/store/west%2F5` — query it with the `%2F`, not a literal `/`.
+
+If a query IRI is encoded differently, it simply matches no generated subject — and it does so *identically* whether pushdown is on or off (both return no rows). A mis-encoded IRI is therefore a query-authoring issue, never a case where pushdown and a full scan disagree.
+
+**What is pushed.** Pushdown engages only for templates that reverse unambiguously and key columns whose physical type is supported:
+
+- **Template shape:** a single trailing placeholder (`.../{key}`) always qualifies; multi-placeholder templates (`.../{a}/{b}`) qualify only when the separators between placeholders are characters that are always percent-encoded (like `/`). Ambiguous shapes such as `.../{a};{b}` (`;` is left literal) are skipped and fall back to a full scan.
+- **Key column type:** `string` keys, and integer-valued keys on `int`, `long`, or `decimal` columns. A `decimal` column of *any* scale qualifies — the recovered key is pushed as an integer literal (the Arrow reader casts it to the column's decimal type), and a key that is not integer-valued fails the parse and falls back to a full scan. Other physical types (dates, floats) are not pushed yet. The pushdown never affects correctness regardless: the operator always re-enforces the subject equality.
+
 ## Use Cases
 
 ### Data Lake Analytics
@@ -329,11 +344,49 @@ Query Iceberg tables containing large-scale analytical data alongside Fluree led
 
 A single R2RML mapping file can define multiple `TriplesMap` entries, each targeting a different Iceberg table or logical view. This enables querying across related tables through a single graph source.
 
+## Materializing a Native Twin
+
+An R2RML graph source is *virtual* — every query re-reads the underlying tables. To snapshot it into a native, fully-indexed Fluree ledger (a *twin*), use [`fluree materialize`](../cli/materialize.md). The twin bulk-materializes every triple the mapping produces (foreign keys resolved into RDF references), stamps the mapping hash and per-table Iceberg watermark into its final commit, and verifies itself against the source before it is announced. See [Iceberg → Materializing a native twin](iceberg.md#materializing-a-native-twin) for the stamp/watermark contract and verification modes.
+
 ## Limitations
 
 1. **Read-Only:** R2RML graph sources are read-only (no writes via Fluree)
 2. **Performance:** Complex joins across Fluree + Iceberg may be slow
 3. **Schema Changes:** Requires mapping updates when referenced columns change
+4. **No index-walking query patterns (fail-closed):** Property-path quantifiers
+   (`p+`, `p*`, `p?`, and quantified combinations like `^p+` or `(a|b)+`),
+   `shortestPath`, and subqueries cannot be evaluated over a mapped source — it
+   has no native index for them to walk. A query using one is **refused** with
+   HTTP 400 `err:db/InvalidQuery` naming the pattern, rather than returning the
+   empty result it would otherwise produce as a success. Fixed-length patterns
+   (`p`, `p/p`, …) and unquantified `a|b` / `^p` lower to table scans and run
+   normally. Over a SQL source, a sub-`SELECT` the
+   [pushdown lane](sql.md#the-pushdown-lane-one-statement-per-block) admits
+   runs as a derived table of the block's statement; one it does not take is
+   refused the same way. See [Graph Sources Overview → Query Patterns a Graph
+   Source Cannot Evaluate](overview.md#query-patterns-a-graph-source-cannot-evaluate)
+   for the bounded workaround, or materialize a native twin (below) for
+   unbounded traversal.
+5. **One object map per predicate on a projected scan:** when a query names a
+   predicate, the scan reads the first `rr:predicateObjectMap` of the triples
+   map that carries it. A second predicate-object map for the same predicate
+   on the same map is not materialized there; give it its own triples map
+   (same table and subject template) if both values must come back.
+6. **Named-graph routing is a subset of R2RML, refused outside it:** a subject
+   map may carry one `rr:graph <iri>`, or one `rr:graphMap` with exactly one of
+   `rr:template`, `rr:column` or `rr:constant`; `rr:defaultGraph` names the
+   default graph, as in the spec. A mapping outside that subset fails to load
+   with an error naming the construct, rather than placing rows in the default
+   graph unannounced: several graph maps on one term map (cumulative in R2RML),
+   a graph map on a predicate-object map, a graph that is not an IRI, a graph
+   map with no value source or more than one, or an `rr:termType` other than
+   `rr:IRI`. Only
+   [materialization into a native ledger](iceberg.md#materialization-into-a-native-ledger)
+   honors the graph map today. The
+   [native twin](iceberg.md#materializing-a-native-twin) builder refuses a
+   mapping that carries one, since it would place every triple in the default
+   graph and its parity gate would not notice; the virtual query path still
+   reads everything from the default graph (tracked in #1607).
 
 ## Troubleshooting
 
@@ -382,4 +435,5 @@ A single R2RML mapping file can define multiple `TriplesMap` entries, each targe
 
 - [Graph Sources Overview](overview.md) - Graph source concepts
 - [Iceberg](iceberg.md) - Data lake integration
+- [materialize](../cli/materialize.md) - Build a native twin ledger from a mapping
 - [Query Datasets](../query/datasets.md) - Multi-graph queries

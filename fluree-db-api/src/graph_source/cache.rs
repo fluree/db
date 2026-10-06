@@ -10,8 +10,21 @@
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use std::sync::Arc;
 
+// moka's eviction clock reads std::time::Instant at cache construction, which
+// aborts on wasm32-unknown-unknown; use core's clock-free LRU stand-in there.
+#[cfg(target_arch = "wasm32")]
+use fluree_db_core::wasm_cache::Cache as SyncCache;
+#[cfg(not(target_arch = "wasm32"))]
+use moka::sync::Cache as SyncCache;
+
+#[cfg(feature = "iceberg")]
+use super::catalog_session::CachedLoadTable;
+#[cfg(feature = "iceberg")]
+use fluree_db_iceberg::catalog::RestCatalogClient;
 #[cfg(feature = "iceberg")]
 use fluree_db_iceberg::{io::parquet::ParquetFooterCache, metadata::TableMetadata, DataFile};
+#[cfg(feature = "sql")]
+use fluree_db_sql::TrinoClient;
 #[cfg(feature = "iceberg")]
 use std::time::Duration;
 
@@ -22,10 +35,54 @@ pub(crate) struct CachedScanFiles {
     pub estimated_row_count: i64,
     pub files_selected: usize,
     pub files_pruned: usize,
+    /// Whether the source snapshot carried merge-on-read delete files. Only ever
+    /// `true` when the fail-closed guard was overridden at plan time; carried on
+    /// the cache entry so a scan-files cache HIT (in-memory or disk) can re-refuse
+    /// if the override is later turned off, instead of silently serving a
+    /// delete-bearing file list (audit F-AUD-1, cache-arm follow-up).
+    pub has_delete_manifests: bool,
 }
 
 #[cfg(feature = "iceberg")]
 const DIRECT_METADATA_LOCATION_TTL: Duration = Duration::from_secs(2);
+
+/// Default cross-query `loadTable`-response cache TTL. A REST `loadTable` GET
+/// costs ~1.3–3s against Snowflake Horizon, so caching it across queries lets a
+/// burst of queries against the same tables skip the round-trip. The TTL bounds
+/// how stale a snapshot a *new* query can observe (an in-flight query pins its
+/// own snapshot regardless). Every read is also gated on vended-credential
+/// expiry. Override with `FLUREE_ICEBERG_LOADTABLE_TTL_SECS` (`0` disables the
+/// cross-query layer, leaving only the per-query pin).
+#[cfg(feature = "iceberg")]
+const DEFAULT_REST_LOADTABLE_TTL_SECS: u64 = 60;
+
+#[cfg(feature = "iceberg")]
+fn rest_loadtable_ttl_secs() -> u64 {
+    std::env::var("FLUREE_ICEBERG_LOADTABLE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_REST_LOADTABLE_TTL_SECS)
+}
+
+/// Default TTL for the process-wide REST catalog client cache. Reusing a client
+/// preserves its OAuth `CachedToken` and HTTPS connection pool, but the cache is
+/// keyed by a fingerprint of the *raw* config JSON. When a Bearer/OAuth secret is
+/// sourced from an env var or secret store, that JSON stores the reference, not
+/// the secret, so rotating the secret does not change the fingerprint — without a
+/// TTL the stale client (and its cached token) would serve 401s until LRU
+/// eviction or a process restart. A bounded TTL lets a rotated secret self-heal:
+/// the client rebuilds and re-authenticates within the window. Override with
+/// `FLUREE_ICEBERG_REST_CLIENT_TTL_SECS` (`0` rebuilds the client every query).
+#[cfg(feature = "iceberg")]
+const DEFAULT_REST_CLIENT_TTL_SECS: u64 = 900;
+
+#[cfg(feature = "iceberg")]
+fn rest_client_ttl_secs() -> u64 {
+    std::env::var("FLUREE_ICEBERG_REST_CLIENT_TTL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_REST_CLIENT_TTL_SECS)
+}
 
 /// Cache for R2RML compiled mappings and Iceberg table metadata.
 ///
@@ -46,15 +103,15 @@ const DIRECT_METADATA_LOCATION_TTL: Duration = Duration::from_secs(2);
 /// Uses `moka::sync::Cache` for lock-free concurrent reads.
 pub struct R2rmlCache {
     /// Cache for compiled R2RML mappings.
-    compiled_mappings: moka::sync::Cache<String, Arc<CompiledR2rmlMapping>>,
+    compiled_mappings: SyncCache<String, Arc<CompiledR2rmlMapping>>,
 
     /// Cache for parsed Iceberg table metadata.
     #[cfg(feature = "iceberg")]
-    table_metadata: moka::sync::Cache<String, Arc<TableMetadata>>,
+    table_metadata: SyncCache<String, Arc<TableMetadata>>,
 
     /// Cache for manifest-derived file selections keyed by metadata location.
     #[cfg(feature = "iceberg")]
-    scan_files: moka::sync::Cache<String, Arc<CachedScanFiles>>,
+    scan_files: SyncCache<String, Arc<CachedScanFiles>>,
 
     /// Shared Parquet footer cache for repeated scans of the same files.
     /// `Arc` so it can be shared into per-file read workers.
@@ -65,7 +122,38 @@ pub struct R2rmlCache {
     ///
     /// Uses moka's native TTL (`time_to_live`) so entries auto-expire.
     #[cfg(feature = "iceberg")]
-    direct_metadata_locations: moka::sync::Cache<String, String>,
+    direct_metadata_locations: SyncCache<String, String>,
+
+    /// Process-wide REST catalog clients keyed by source config fingerprint.
+    /// Reused across queries so the OAuth `CachedToken` and the HTTPS connection
+    /// pool survive — one token exchange per ~hour instead of one per query.
+    /// The fingerprint is over the raw config JSON, so a secret changed *inline*
+    /// in the config invalidates the client, but a secret referenced by env var
+    /// / secret store does not (the JSON is unchanged). A TTL
+    /// (`DEFAULT_REST_CLIENT_TTL_SECS`) bounds how long such a rotation stays
+    /// stale before the client is rebuilt and re-authenticated.
+    #[cfg(feature = "iceberg")]
+    rest_clients: SyncCache<String, Arc<RestCatalogClient>>,
+
+    /// Process-wide `loadTable` responses keyed by `(graph_source_id, ns.table)`,
+    /// with a short TTL (see [`DEFAULT_REST_LOADTABLE_TTL_SECS`]) and a
+    /// credential-expiry gate. Lets a burst of queries against the same table
+    /// skip the ~1.3–3s catalog GET.
+    #[cfg(feature = "iceberg")]
+    rest_load_tables: SyncCache<String, Arc<CachedLoadTable>>,
+
+    /// Process-wide SQL endpoint clients keyed like `rest_clients` (id + raw
+    /// config fingerprint), sharing its TTL rationale. Each client also holds
+    /// the per-table schema probes, so reuse across queries skips the
+    /// `LIMIT 0` round trip.
+    #[cfg(feature = "sql")]
+    sql_clients: SyncCache<String, Arc<TrinoClient>>,
+    /// Process-wide Delta table handles keyed by location + io options. A
+    /// handle owns the table's store and remembers the last version it read,
+    /// which the next query extends rather than replays; the TTL bounds a
+    /// stale store configuration.
+    #[cfg(feature = "delta")]
+    delta_tables: SyncCache<String, fluree_db_delta::DeltaTable>,
 }
 
 // moka::sync::Cache is Send+Sync but doesn't implement Debug
@@ -94,15 +182,38 @@ impl R2rmlCache {
         #[cfg(feature = "iceberg")]
         {
             Self {
-                compiled_mappings: moka::sync::Cache::new(mapping_cap),
-                table_metadata: moka::sync::Cache::new(metadata_cap),
-                scan_files: moka::sync::Cache::new(metadata_cap),
+                compiled_mappings: SyncCache::new(mapping_cap),
+                table_metadata: SyncCache::new(metadata_cap),
+                scan_files: SyncCache::new(metadata_cap),
                 parquet_footers: Arc::new(ParquetFooterCache::new(
                     (metadata_capacity.max(1) / 2).max(32),
                 )),
-                direct_metadata_locations: moka::sync::Cache::builder()
+                direct_metadata_locations: SyncCache::builder()
                     .max_capacity(metadata_cap)
                     .time_to_live(DIRECT_METADATA_LOCATION_TTL)
+                    .build(),
+                // A process serves few distinct graph sources; a small cap is
+                // plenty and bounds retained clients/connection pools. A TTL lets
+                // an env-var/secret-store secret rotation self-heal (see
+                // `DEFAULT_REST_CLIENT_TTL_SECS`) since the config fingerprint
+                // does not change when the referenced secret does.
+                rest_clients: SyncCache::builder()
+                    .max_capacity(64)
+                    .time_to_live(Duration::from_secs(rest_client_ttl_secs()))
+                    .build(),
+                rest_load_tables: SyncCache::builder()
+                    .max_capacity(metadata_cap)
+                    .time_to_live(Duration::from_secs(rest_loadtable_ttl_secs()))
+                    .build(),
+                #[cfg(feature = "sql")]
+                sql_clients: SyncCache::builder()
+                    .max_capacity(64)
+                    .time_to_live(Duration::from_secs(rest_client_ttl_secs()))
+                    .build(),
+                #[cfg(feature = "delta")]
+                delta_tables: SyncCache::builder()
+                    .max_capacity(256)
+                    .time_to_live(Duration::from_secs(rest_client_ttl_secs()))
                     .build(),
             }
         }
@@ -111,7 +222,7 @@ impl R2rmlCache {
         {
             let _ = metadata_cap;
             Self {
-                compiled_mappings: moka::sync::Cache::new(mapping_cap),
+                compiled_mappings: SyncCache::new(mapping_cap),
             }
         }
     }
@@ -191,6 +302,98 @@ impl R2rmlCache {
             .insert(table_location, metadata_location);
     }
 
+    /// Get a process-wide REST catalog client for a source config `fingerprint`,
+    /// or `None` on miss (or when catalog caching is disabled).
+    #[cfg(feature = "iceberg")]
+    pub(crate) fn rest_client(&self, fingerprint: &str) -> Option<Arc<RestCatalogClient>> {
+        if !super::catalog_session::cache_enabled() {
+            return None;
+        }
+        self.rest_clients.get(fingerprint)
+    }
+
+    /// Store a REST catalog client for cross-query reuse (no-op when disabled).
+    #[cfg(feature = "iceberg")]
+    pub(crate) fn put_rest_client(&self, fingerprint: String, client: Arc<RestCatalogClient>) {
+        if !super::catalog_session::cache_enabled() {
+            return;
+        }
+        self.rest_clients.insert(fingerprint, client);
+    }
+
+    #[cfg(feature = "sql")]
+    pub(crate) fn sql_client(&self, key: &str) -> Option<Arc<TrinoClient>> {
+        self.sql_clients.get(key)
+    }
+
+    #[cfg(feature = "sql")]
+    pub(crate) fn put_sql_client(&self, key: String, client: Arc<TrinoClient>) {
+        self.sql_clients.insert(key, client);
+    }
+
+    /// The shared handle for the Delta table at `placement`, opened on first
+    /// use. Keyed on the config as stored, before secrets are resolved, so a
+    /// rotated secret behind a reference does not re-key the cache; the TTL
+    /// bounds how long a handle keeps the old one — and, for a table found
+    /// through a catalog, how long one dropped and recreated elsewhere is
+    /// still read where it was.
+    #[cfg(feature = "delta")]
+    pub(crate) async fn delta_table(
+        &self,
+        table_name: &str,
+        placement: &fluree_db_delta::Placement,
+        config: &fluree_db_delta::DeltaGsConfig,
+        resolver: Option<&Arc<dyn fluree_db_iceberg::SecretResolver>>,
+    ) -> fluree_db_delta::Result<fluree_db_delta::DeltaTable> {
+        use fluree_db_delta::{DeltaTable, Placement};
+        let key = delta_table_key(placement, config);
+        if let Some(table) = self.delta_tables.get(&key) {
+            return Ok(table);
+        }
+        let io = config.io.hydrate(resolver).await?;
+        let table = match (placement, &config.unity) {
+            (Placement::Path(location), _) => DeltaTable::open(table_name, location, &io)?,
+            (Placement::Unity(full_name), Some(unity)) => {
+                let unity = unity.hydrate(resolver).await?;
+                DeltaTable::open_in_unity(table_name, &unity, full_name, &io).await?
+            }
+            (Placement::Unity(full_name), None) => {
+                return Err(fluree_db_delta::DeltaError::Config(format!(
+                    "table '{full_name}' is placed in a catalog the source does not have"
+                )))
+            }
+        };
+        self.delta_tables.insert(key, table.clone());
+        Ok(table)
+    }
+
+    /// Get a cross-query `loadTable` response if cached, within TTL, and its
+    /// vended credentials are not near expiry; otherwise `None` (an expired
+    /// entry is invalidated). Returns `None` when caching or the cross-query
+    /// layer (TTL=0) is disabled.
+    #[cfg(feature = "iceberg")]
+    pub(crate) fn get_rest_load_table(&self, key: &str) -> Option<Arc<CachedLoadTable>> {
+        if !super::catalog_session::cache_enabled() || rest_loadtable_ttl_secs() == 0 {
+            return None;
+        }
+        let hit = self.rest_load_tables.get(key)?;
+        if hit.creds_expired() {
+            self.rest_load_tables.invalidate(key);
+            return None;
+        }
+        Some(hit)
+    }
+
+    /// Store a `loadTable` response in the cross-query cache (no-op when disabled
+    /// or TTL=0).
+    #[cfg(feature = "iceberg")]
+    pub(crate) fn put_rest_load_table(&self, key: String, value: Arc<CachedLoadTable>) {
+        if !super::catalog_session::cache_enabled() || rest_loadtable_ttl_secs() == 0 {
+            return;
+        }
+        self.rest_load_tables.insert(key, value);
+    }
+
     /// Clear all caches.
     pub async fn clear(&self) {
         self.compiled_mappings.invalidate_all();
@@ -201,7 +404,11 @@ impl R2rmlCache {
             self.scan_files.invalidate_all();
             self.parquet_footers.clear().await;
             self.direct_metadata_locations.invalidate_all();
+            self.rest_clients.invalidate_all();
+            self.rest_load_tables.invalidate_all();
         }
+        #[cfg(feature = "sql")]
+        self.sql_clients.invalidate_all();
     }
 
     /// Get cache statistics.
@@ -278,4 +485,162 @@ pub struct R2rmlCacheStats {
     pub metadata_entries: usize,
     /// Maximum metadata cache capacity
     pub metadata_capacity: usize,
+}
+
+#[cfg(all(test, feature = "iceberg"))]
+mod iceberg_tests {
+    use super::*;
+    use crate::graph_source::catalog_session::CachedLoadTable;
+    use chrono::{Duration, Utc};
+    use fluree_db_iceberg::credential::VendedCredentials;
+
+    fn creds(expires_in_secs: i64) -> VendedCredentials {
+        VendedCredentials {
+            access_key_id: "AKIA".to_string(),
+            secret_access_key: "secret".to_string(),
+            session_token: Some("token".to_string()),
+            expires_at: Some(Utc::now() + Duration::seconds(expires_in_secs)),
+            endpoint: None,
+            region: Some("us-east-2".to_string()),
+            path_style: false,
+        }
+    }
+
+    fn entry(loc: &str, creds: Option<VendedCredentials>) -> Arc<CachedLoadTable> {
+        Arc::new(CachedLoadTable {
+            metadata_location: loc.to_string(),
+            credentials: creds,
+        })
+    }
+
+    #[test]
+    fn cross_query_loadtable_put_get() {
+        let cache = R2rmlCache::with_defaults();
+        assert!(
+            cache.get_rest_load_table("k1").is_none(),
+            "empty cache misses"
+        );
+        cache.put_rest_load_table("k1".to_string(), entry("s3://m.json", Some(creds(3600))));
+        assert_eq!(
+            cache.get_rest_load_table("k1").unwrap().metadata_location,
+            "s3://m.json"
+        );
+        assert!(
+            cache.get_rest_load_table("k2").is_none(),
+            "different key misses"
+        );
+    }
+
+    #[test]
+    fn cross_query_near_expiry_creds_is_a_miss() {
+        let cache = R2rmlCache::with_defaults();
+        // Inside the 30s refresh buffer → treated as expired.
+        cache.put_rest_load_table("k".to_string(), entry("s3://m.json", Some(creds(10))));
+        assert!(
+            cache.get_rest_load_table("k").is_none(),
+            "about-to-expire vended creds must not be served cross-query"
+        );
+    }
+
+    #[test]
+    fn cross_query_no_creds_never_expires() {
+        let cache = R2rmlCache::with_defaults();
+        cache.put_rest_load_table("k".to_string(), entry("s3://m.json", None));
+        assert!(cache.get_rest_load_table("k").is_some());
+    }
+
+    #[tokio::test]
+    async fn clear_empties_cross_query_loadtable() {
+        let cache = R2rmlCache::with_defaults();
+        cache.put_rest_load_table("k".to_string(), entry("s3://m.json", Some(creds(3600))));
+        assert!(cache.get_rest_load_table("k").is_some());
+        cache.clear().await;
+        assert!(
+            cache.get_rest_load_table("k").is_none(),
+            "clear() drops cross-query entries"
+        );
+    }
+}
+
+/// Keyed on the config as stored, never on resolved secrets. Two sources that
+/// name one catalog table with different catalog credentials get a handle
+/// each: the credentials are what reads it.
+#[cfg(feature = "delta")]
+fn delta_table_key(
+    placement: &fluree_db_delta::Placement,
+    config: &fluree_db_delta::DeltaGsConfig,
+) -> String {
+    use fluree_db_delta::Placement;
+    let io = serde_json::to_string(&config.io).unwrap_or_default();
+    match placement {
+        Placement::Path(location) => format!("{location}\u{1f}{io}"),
+        Placement::Unity(full_name) => format!(
+            "{full_name}\u{1f}{}\u{1f}{io}",
+            serde_json::to_string(&config.unity).unwrap_or_default(),
+        ),
+    }
+}
+
+#[cfg(all(test, feature = "delta"))]
+mod delta_key_tests {
+    use super::delta_table_key;
+    use fluree_db_delta::{DeltaGsConfig, Placement, UnityConfig};
+    use fluree_db_iceberg::auth::AuthConfig;
+    use fluree_db_iceberg::ConfigValue;
+
+    fn source(token: ConfigValue) -> DeltaGsConfig {
+        DeltaGsConfig {
+            unity: Some(UnityConfig {
+                uri: "https://workspace.example.com".to_string(),
+                auth: AuthConfig::Bearer { token },
+                catalog: None,
+                schema: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_catalog_tables_handle_belongs_to_the_credentials_that_read_it() {
+        let orders = Placement::Unity("main.sales.orders".to_string());
+        let items = Placement::Unity("main.sales.items".to_string());
+        let alice = source(ConfigValue::literal("alice"));
+        let bob = source(ConfigValue::literal("bob"));
+
+        assert_eq!(
+            delta_table_key(&orders, &alice),
+            delta_table_key(&orders, &alice)
+        );
+        assert_ne!(
+            delta_table_key(&orders, &alice),
+            delta_table_key(&orders, &bob)
+        );
+        assert_ne!(
+            delta_table_key(&orders, &alice),
+            delta_table_key(&items, &alice)
+        );
+
+        let mut elsewhere = alice.clone();
+        elsewhere.unity.as_mut().unwrap().uri = "https://other.example.com".to_string();
+        assert_ne!(
+            delta_table_key(&orders, &alice),
+            delta_table_key(&orders, &elsewhere)
+        );
+
+        // A path and a catalog name spelt alike are different tables.
+        assert_ne!(
+            delta_table_key(&Placement::Path("main.sales.orders".to_string()), &alice),
+            delta_table_key(&orders, &alice)
+        );
+    }
+
+    #[test]
+    fn a_secret_named_by_variable_keys_on_the_name() {
+        let orders = Placement::Unity("main.sales.orders".to_string());
+        let key = delta_table_key(
+            &orders,
+            &source(ConfigValue::from_env("UNITY_TOKEN_KEY_TEST")),
+        );
+        assert!(key.contains("UNITY_TOKEN_KEY_TEST"), "{key}");
+    }
 }

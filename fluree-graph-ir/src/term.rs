@@ -76,30 +76,23 @@ impl LiteralValue {
 
     /// Create a JSON literal value from a canonical string
     ///
-    /// The string should already be canonicalized (e.g., via `json_ld::normalize_data()`).
+    /// The string must already be canonical: see
+    /// [`canonicalize_json`](crate::canonicalize_json), which is what every
+    /// ingest path runs a JSON literal through.
     pub fn json_canonical(canonical: impl AsRef<str>) -> Self {
         LiteralValue::Json(Arc::from(canonical.as_ref()))
     }
 
     /// Get the lexical representation of this value
+    ///
+    /// Doubles use the W3C canonical `xsd:double` form (`1.0E6`, `NaN`,
+    /// `INF`, `-INF`) — see [`crate::xsd_double`].
     pub fn lexical(&self) -> String {
         match self {
             LiteralValue::String(s) => s.to_string(),
             LiteralValue::Boolean(b) => b.to_string(),
             LiteralValue::Integer(i) => i.to_string(),
-            LiteralValue::Double(d) => {
-                if d.is_nan() {
-                    "NaN".to_string()
-                } else if d.is_infinite() {
-                    if d.is_sign_positive() {
-                        "INF".to_string()
-                    } else {
-                        "-INF".to_string()
-                    }
-                } else {
-                    d.to_string()
-                }
-            }
+            LiteralValue::Double(d) => crate::xsd_double::canonical_xsd_double(*d),
             LiteralValue::Json(s) => s.to_string(),
         }
     }
@@ -469,21 +462,43 @@ impl Ord for Term {
     }
 }
 
+/// N-Triples syntax, escapes included.
 impl std::fmt::Display for Term {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Term::Iri(iri) => write!(f, "<{iri}>"),
+            Term::Iri(iri) => {
+                f.write_str("<")?;
+                crate::syntax::escape_iri(iri, |seg| f.write_str(seg))?;
+                f.write_str(">")
+            }
             Term::BlankNode(id) => write!(f, "{id}"),
             Term::Literal {
                 value,
                 datatype,
                 language,
             } => {
-                write!(f, "\"{}\"", value.lexical())?;
+                f.write_str("\"")?;
+                crate::syntax::escape_string(&value.lexical(), |seg| f.write_str(seg))?;
+                f.write_str("\"")?;
                 if let Some(lang) = language {
-                    write!(f, "@{lang}")
+                    f.write_str("@")?;
+                    if crate::syntax::is_lang_tag(lang) {
+                        f.write_str(lang)
+                    } else {
+                        // No escape form exists; %-encoding keeps a bad tag
+                        // from ending the literal and reading as more triples.
+                        lang.bytes().try_for_each(|b| {
+                            if b.is_ascii_alphanumeric() || b == b'-' {
+                                std::fmt::Write::write_char(f, b as char)
+                            } else {
+                                write!(f, "%{b:02X}")
+                            }
+                        })
+                    }
                 } else if !datatype.is_xsd_string() {
-                    write!(f, "^^<{}>", datatype.as_iri())
+                    f.write_str("^^<")?;
+                    crate::syntax::escape_iri(datatype.as_iri(), |seg| f.write_str(seg))?;
+                    f.write_str(">")
                 } else {
                     Ok(())
                 }
@@ -502,6 +517,23 @@ mod tests {
         assert_eq!(id.as_str(), "b0");
         assert_eq!(id.to_ntriples(), "_:b0");
         assert_eq!(format!("{id}"), "_:b0");
+    }
+
+    #[test]
+    fn display_is_escaped_ntriples() {
+        assert_eq!(
+            Term::iri("http://ex.org/a b").to_string(),
+            r"<http://ex.org/a\u0020b>"
+        );
+        assert_eq!(
+            Term::string("say \"hi\"\n").to_string(),
+            r#""say \"hi\"\n""#
+        );
+        assert_eq!(Term::lang_string("chat", "fr").to_string(), r#""chat"@fr"#);
+        assert_eq!(
+            Term::integer(5).to_string(),
+            r#""5"^^<http://www.w3.org/2001/XMLSchema#integer>"#
+        );
     }
 
     #[test]
@@ -534,8 +566,12 @@ mod tests {
         let i = LiteralValue::Integer(42);
         assert_eq!(i.lexical(), "42");
 
+        // Doubles use the canonical xsd:double lexical form.
         let d = LiteralValue::Double(3.13);
-        assert!(d.lexical().starts_with("3.13"));
+        assert_eq!(d.lexical(), "3.13E0");
+
+        let big = LiteralValue::Double(1_000_000.0);
+        assert_eq!(big.lexical(), "1.0E6");
 
         let nan = LiteralValue::Double(f64::NAN);
         assert_eq!(nan.lexical(), "NaN");

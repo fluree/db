@@ -30,7 +30,24 @@ A ledger ID serves as both a human-readable identifier and the canonical lookup 
 - The `:branch` suffix allows multiple isolated versions of the same logical ledger to coexist
 - The default branch name is `main` when not specified (e.g., `mydb` is equivalent to `mydb:main`)
 - Branches are independent—changes in one branch don't affect others
-- Branch names can include slashes for hierarchical organization
+- Ledger names can include slashes for hierarchical organization (`tenant/app`); branch names cannot
+
+### Naming Rules
+
+`:`, `@` and `#` delimit the parts of a ledger address (`name:branch@t:5#graph`), so neither a ledger name nor a branch name can contain them. An ID that breaks a rule is rejected with a 400 that names the ID and the rule.
+
+A ledger name:
+
+- is one or more `/`-separated segments, none empty (`/mydb`, `mydb/` and `a//b` are invalid) and none `.` or `..`
+- has no segment named `commit`, `txn`, `index`, `config` or `blob`, and no first segment `graph-sources`: these are storage-layout directories
+
+A new branch name:
+
+- contains no `/`: a ledger's files live under `name/branch/`, so `mydb:release/v1` and `mydb/release:v1` would share one directory
+- is not `commit`, `txn`, `index`, `config` or `blob`, and does not end in `.index` or `.snapshots`
+- is at most 128 characters
+
+Ledgers and branches created before these rules were enforced stay readable when they break only the layout rules. One whose name contains `@` or `#` is still listed and kept by cleanup, but no request can address it. One whose name has an empty or `.`/`..` segment is skipped, with a warning naming its record.
 
 ### Ledger Lifecycle
 
@@ -100,6 +117,8 @@ The index represents a queryable snapshot of the ledger state. Indexes are creat
 
 The divergence point (common ancestor) between a branch and its source is computed on demand by walking the commit chains rather than being stored. This avoids stale metadata and supports merge scenarios where the relationship between branches changes over time.
 
+Each branch numbers its commits from its own fork point, so a `t` from one branch means nothing on another. The walk compares commits by identity. It follows each branch's line of first parents, and it follows merge parents into the branches they brought in, so a commit a branch merged earlier counts as one the branch already holds.
+
 #### Additional Metadata
 
 - **`default_context_id`**: ContentId of the default JSON-LD @context for the ledger
@@ -150,6 +169,21 @@ Find ledger metadata by ledger ID:
 let record = nameservice.lookup("mydb:main").await?;
 // Returns: NsRecord with commit_id, index_id, timestamps, etc.
 ```
+
+Three read depths exist on every backend, all on `NameServiceLookup`. Pick the
+shallowest that answers the question — the deeper reads cost extra items on
+DynamoDB and extra files plus config/context parsing on file and S3:
+
+| Call | Returns | Use when |
+|------|---------|----------|
+| `get_ref(id, RefKind::CommitHead)` | `RefValue { id, t }` | "has this ledger moved?" — one head |
+| `heads(id)` | `LedgerHeads { commit, index }` | both heads; converts to `NsRecordSnapshot` for rollback |
+| `lookup(id)` | full `NsRecord` | branch metadata, config, retraction flag |
+
+`heads` is one round trip on DynamoDB (a projected query over the two ref
+items), the main + index file on file/S3, and a single lock on the in-memory
+and Raft backends. `None` means unknown (and, on Raft, retracted) — the same
+rule as `get_ref`; only `lookup` surfaces `retracted: true`.
 
 #### Publishing
 
@@ -476,7 +510,7 @@ Each branch is a fully independent `LedgerState` with its own snapshot, novelty 
 
 #### Nameservice Metadata
 
-When a branch is created, the nameservice records the **source branch name** on the new branch's `NsRecord` (e.g., `source_branch: Some("main")`). The divergence point between the branch and its source is computed on demand by walking the commit chains rather than being stored as a static snapshot.
+When a branch is created, the nameservice records the **source branch name** on the new branch's `NsRecord` (e.g., `source_branch: Some("main")`). The divergence point between the branch and its source is computed on demand by walking the commit chains rather than being stored as a static snapshot. That walk compares commits by identity, because two branches number their commits from their own fork points.
 
 This metadata enables the system to reconstruct the `BranchedContentStore` tree when loading a branch. For nested branches, the ancestry chain is walked recursively via `source_branch` lookups.
 
@@ -485,10 +519,14 @@ This metadata enables the system to reconstruct the `BranchedContentStore` tree 
 **Rust:**
 ```rust
 // Create a branch from main (default)
-let record = fluree.create_branch("mydb", "dev", None).await?;
+let record = fluree.create_branch("mydb", "dev", None, None).await?;
 
 // Create a branch from another branch
-let record = fluree.create_branch("mydb", "feature", Some("dev")).await?;
+let record = fluree.create_branch("mydb", "feature", Some("dev"), None).await?;
+
+// Create a branch from main's data as of a point in time
+let at = TimeSpec::parse_at("time:2026-06-30T23:59:59Z")?;
+let record = fluree.create_branch("mydb", "q2-close", None, Some(at)).await?;
 
 // List all branches
 let branches = fluree.list_branches("mydb").await?;
@@ -521,7 +559,7 @@ fluree branch list --ledger mydb
 
 Branches can be deleted with `drop_branch`. The **root** branch — any branch
 whose `source_branch.is_none()` on its `NsRecord` — cannot be dropped via
-`drop_branch`; use [`drop_ledger`](#dropping-a-whole-ledger) to remove the
+`drop_branch`; use [`drop_ledger`](../cli/drop.md) to remove the
 entire ledger including its root. `"main"` is the default branch name and so
 is the root on most ledgers, but the refusal is structural: a ledger created
 as `mydb:trunk` has `trunk` as its root, and `drop_branch("mydb", "trunk")`

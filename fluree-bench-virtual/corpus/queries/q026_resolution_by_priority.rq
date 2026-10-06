@@ -1,0 +1,9 @@
+# q026 resolution_by_priority
+# Intent: Single-table fact rollup + ORDER BY (fused-agg positive).
+# BI lineage (BI-14): "What is the average resolution time by ticket priority?"
+# Predicates verified against enterprise.ttl — FactSupportTicket: priority, resolutionHours.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?prio (AVG(?rh) AS ?avghrs)
+WHERE { ?t a edw:SupportTicket ; edw:priority ?prio ; edw:resolutionHours ?rh . }
+GROUP BY ?prio
+ORDER BY DESC(?avghrs)

@@ -8,9 +8,17 @@ use async_trait::async_trait;
 ///
 /// Simple auth that returns a fixed token. Token is resolved at construction
 /// time (env vars expanded), then used unchanged.
-#[derive(Debug)]
 pub struct BearerTokenAuth {
     token: String,
+}
+
+/// Redacting `Debug`: the resolved bearer token is a live credential.
+impl std::fmt::Debug for BearerTokenAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BearerTokenAuth")
+            .field("token", &"***")
+            .finish()
+    }
 }
 
 impl BearerTokenAuth {
@@ -63,5 +71,13 @@ mod tests {
         // Token should be unchanged
         let header = SendCatalogAuth::authorization_header(&auth).await.unwrap();
         assert_eq!(header, Some("Bearer test-token".to_string()));
+    }
+
+    #[test]
+    fn debug_redacts_token() {
+        let auth = BearerTokenAuth::new("super-secret-token".to_string());
+        let dbg = format!("{auth:?}");
+        assert!(!dbg.contains("super-secret-token"), "token leaked: {dbg}");
+        assert!(dbg.contains("***"));
     }
 }

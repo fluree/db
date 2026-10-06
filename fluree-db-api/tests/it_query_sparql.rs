@@ -7,7 +7,7 @@ use crate::support::{
     assert_index_defaults, genesis_ledger, normalize_rows, normalize_sparql_bindings, MemoryFluree,
     MemoryLedger,
 };
-use fluree_db_api::FlureeBuilder;
+use fluree_db_api::{FlureeBuilder, FormatterConfig};
 use serde_json::{json, Value as JsonValue};
 use std::sync::Arc;
 
@@ -366,7 +366,8 @@ async fn sparql_basic_query_outputs_jsonld_and_sparql_json() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(jsonld, json!([["ex:jdoe", "Jane Doe"]]));
 
-    // SPARQL JSON output uses compact IRIs.
+    // SPARQL Results JSON carries the ABSOLUTE IRI even though the query
+    // declared `ex:` — the format has no prefix map to expand it with (#45).
     let sparql_json = result
         .to_sparql_json(&ledger.snapshot)
         .expect("to_sparql_json");
@@ -376,11 +377,24 @@ async fn sparql_basic_query_outputs_jsonld_and_sparql_json() {
             "head": {"vars": ["fullName", "person"]},
             "results": {"bindings": [
                 {
-                    "person": {"type": "uri", "value": "ex:jdoe"},
+                    "person": {"type": "uri", "value": "http://example.org/ns/jdoe"},
                     "fullName": {"type": "literal", "value": "Jane Doe"}
                 }
             ]}
         })
+    );
+
+    // The Fluree display profile (#1466) still compacts the same result.
+    let display = fluree_db_api::format::format_results(
+        &result,
+        &result.context,
+        &ledger.snapshot,
+        &FormatterConfig::sparql_json().with_compact_iris(),
+    )
+    .expect("compacting sparql_json");
+    assert_eq!(
+        display["results"]["bindings"][0]["person"]["value"],
+        json!("ex:jdoe")
     );
 }
 
@@ -635,20 +649,26 @@ async fn sparql_order_by_expression_dedup_only_group_by() {
 
 #[tokio::test]
 async fn sparql_group_by_datatype_expression_collapses() {
-    // Issue #1362: `GROUP BY DATATYPE(?v)` directly on an expression must collapse
-    // to one row per distinct datatype (here all favNums are xsd:integer, so a
-    // single group), matching the behavior of `GROUP BY (LCASE(?x))` and of
-    // `BIND(DATATYPE(?v) AS ?dt) ... GROUP BY ?dt`. Previously it returned one row
-    // per binding (group key not collapsed) and LIMIT did not cap the output.
+    // Issue #1362: grouping by a DATATYPE(?v) expression must collapse to one
+    // row per distinct datatype (here all favNums are xsd:integer, so a
+    // single group), matching `BIND(DATATYPE(?v) AS ?dt) ... GROUP BY ?dt`.
+    // Previously it returned one row per binding (group key not collapsed)
+    // and LIMIT did not cap the output.
+    //
+    // PR-2 (V4) note: the original unaliased form — `GROUP BY DATATYPE(?v)`
+    // with `SELECT (DATATYPE(?v) AS ?dt)` re-projecting the key expression —
+    // is the W3C agg08 negative-syntax shape and is now rejected (see
+    // sparql_group_by_reprojected_key_expression_rejected below). The
+    // spec-valid spelling aliases the key: `GROUP BY (expr AS ?dt)`.
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_people(&fluree, "people:main").await;
 
     let query = r"
         PREFIX person: <http://example.org/Person#>
-        SELECT (DATATYPE(?favNum) AS ?dt) (COUNT(?favNum) AS ?n)
+        SELECT ?dt (COUNT(?favNum) AS ?n)
         WHERE { ?person person:favNums ?favNum }
-        GROUP BY DATATYPE(?favNum)
+        GROUP BY (DATATYPE(?favNum) AS ?dt)
         LIMIT 10
     ";
 
@@ -661,6 +681,35 @@ async fn sparql_group_by_datatype_expression_collapses() {
         rows.len(),
         1,
         "GROUP BY DATATYPE(?v) should collapse to one group, got: {jsonld}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_group_by_reprojected_key_expression_rejected() {
+    // PR-2 (V4) migration pin: re-projecting an UNALIASED GROUP BY key
+    // expression (`GROUP BY (expr)` + `SELECT (expr AS ?k)`) is the W3C
+    // agg08 negative-syntax shape — the expression is the key, not its
+    // variables — and is now a hard validation error. The migration is to
+    // alias the key in GROUP BY (see the two tests around this one).
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT (DATATYPE(?favNum) AS ?dt) (COUNT(?favNum) AS ?n)
+        WHERE { ?person person:favNums ?favNum }
+        GROUP BY DATATYPE(?favNum)
+        LIMIT 10
+    ";
+
+    let err = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect_err("re-projected unaliased group-key expression must be rejected");
+    assert!(
+        err.to_string()
+            .contains("neither a GROUP BY key nor aggregated"),
+        "unexpected error: {err}"
     );
 }
 
@@ -690,11 +739,13 @@ async fn sparql_group_by_datatype_expression_collapses_decimal() {
         .expect("insert+commit should succeed")
         .ledger;
 
+    // Spec-valid spelling (PR-2 / V4): the key expression is aliased in
+    // GROUP BY and the alias is projected.
     let query = r"
         PREFIX ex: <http://example.org/>
-        SELECT (DATATYPE(?v) AS ?dt) (COUNT(?v) AS ?n)
+        SELECT ?dt (COUNT(?v) AS ?n)
         WHERE { ?s ex:amount ?v }
-        GROUP BY DATATYPE(?v)
+        GROUP BY (DATATYPE(?v) AS ?dt)
         LIMIT 10
     ";
 
@@ -2137,7 +2188,16 @@ async fn sparql_optional_multi_pattern_requires_conjunctive_match() {
 }
 
 #[tokio::test]
-async fn sparql_group_by_with_optional_preserves_grouped_lists() {
+async fn sparql_group_by_with_optional_ungrouped_projection_rejected() {
+    // PR-2 (V4) migration pin: this test previously asserted Fluree's
+    // grouped-list extension on the SPARQL surface — `SELECT ?person
+    // ?favNums ... GROUP BY ?person` returning ?favNums as a per-group
+    // list. That is the W3C group06 negative-syntax shape (a projected
+    // variable that is neither a group key nor aggregated) and is now a
+    // hard validation error on the SPARQL surface. Grouped-list projection
+    // remains available on the JSON-LD analytical surface (pinned in
+    // it_query_grouping.rs / it_query_aggregates.rs); SPARQL callers
+    // aggregate explicitly (GROUP_CONCAT / SAMPLE / COUNT).
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "people:main";
@@ -2154,16 +2214,39 @@ async fn sparql_group_by_with_optional_preserves_grouped_lists() {
         GROUP BY ?person
     ";
 
+    let err = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect_err("ungrouped projected variable must be rejected");
+    assert!(
+        err.to_string()
+            .contains("neither a GROUP BY key nor aggregated"),
+        "unexpected error: {err}"
+    );
+
+    // Spec-valid equivalent of the original intent: OPTIONAL-produced
+    // unbound values flow through grouping — COUNT over the optional var is
+    // 0 for the group with no bindings, not a dropped row.
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?person (COUNT(?favNums) AS ?n)
+        WHERE {
+          ?person person:handle ?handle .
+          OPTIONAL { ?person person:favNums ?favNums . }
+        }
+        GROUP BY ?person
+    ";
+
     let result = support::query_sparql(&fluree, &ledger, query)
         .await
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
     let expected = json!([
-        ["ex:bbob", [23]],
-        ["ex:fbueller", [null]],
-        ["ex:jbob", [0, 3, 5, 6, 7, 8, 9]],
-        ["ex:jdoe", [3, 7, 42, 99]]
+        ["ex:bbob", 1],
+        ["ex:fbueller", 0],
+        ["ex:jbob", 7],
+        ["ex:jdoe", 4]
     ]);
 
     assert_eq!(normalize_rows(&jsonld), normalize_rows(&expected));
@@ -2450,15 +2533,43 @@ async fn sparql_concat_function_formats_strings() {
 
 #[tokio::test]
 async fn sparql_mix_of_grouped_values_and_aggregates() {
+    // PR-2 (V4) migration pin: this test previously ALSO projected the raw
+    // ?favNums alongside the aggregates (Fluree's grouped-list extension on
+    // the SPARQL surface) — the W3C group06/agg09 negative-syntax shape,
+    // now a hard validation error (asserted below). The multi-key grouping
+    // with multiple aggregates it pinned remains, spec-valid, here; the
+    // grouped-list projection remains available on the JSON-LD analytical
+    // surface (it_query_grouping.rs / it_query_aggregates.rs).
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "people:main";
     let ledger = seed_people(&fluree, ledger_id).await;
 
+    let err = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?favNums (AVG(?favNums) AS ?avg) ?person ?handle (MAX(?favNums) AS ?max)
+        WHERE {
+          ?person person:handle ?handle .
+          ?person person:favNums ?favNums .
+        }
+        GROUP BY ?person ?handle
+    ",
+    )
+    .await
+    .expect_err("ungrouped ?favNums projection must be rejected");
+    assert!(
+        err.to_string()
+            .contains("neither a GROUP BY key nor aggregated"),
+        "unexpected error: {err}"
+    );
+
     let query = r"
         PREFIX ex: <http://example.org/ns/>
         PREFIX person: <http://example.org/Person#>
-        SELECT ?favNums (AVG(?favNums) AS ?avg) ?person ?handle (MAX(?favNums) AS ?max)
+        SELECT (AVG(?favNums) AS ?avg) ?person ?handle (MAX(?favNums) AS ?max)
         WHERE {
           ?person person:handle ?handle .
           ?person person:favNums ?favNums .
@@ -2471,60 +2582,40 @@ async fn sparql_mix_of_grouped_values_and_aggregates() {
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
-    let mut rows: Vec<(String, String, Vec<i64>, f64, i64)> = normalize_rows(&jsonld)
+    let mut rows: Vec<(String, String, f64, i64)> = normalize_rows(&jsonld)
         .into_iter()
         .map(|row| {
-            let fav_nums = row[0]
-                .as_array()
-                .expect("favNums array")
-                .iter()
-                .map(|v| v.as_i64().expect("favNum"))
-                .collect::<Vec<_>>();
             // AVG of integers → xsd:decimal (JSON string).
-            let avg: f64 = row[1]
+            let avg: f64 = row[0]
                 .as_str()
                 .expect("avg as decimal string")
                 .parse()
                 .expect("parses");
-            let person = row[2].as_str().expect("person").to_string();
-            let handle = row[3].as_str().expect("handle").to_string();
-            let max = row[4].as_i64().expect("max");
-            (person, handle, fav_nums, avg, max)
+            let person = row[1].as_str().expect("person").to_string();
+            let handle = row[2].as_str().expect("handle").to_string();
+            let max = row[3].as_i64().expect("max");
+            (person, handle, avg, max)
         })
         .collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
 
     let expected = [
-        (
-            "ex:bbob".to_string(),
-            "bbob".to_string(),
-            vec![23],
-            23.0,
-            23,
-        ),
+        ("ex:bbob".to_string(), "bbob".to_string(), 23.0, 23),
         (
             "ex:jbob".to_string(),
             "jbob".to_string(),
-            vec![0, 3, 5, 6, 7, 8, 9],
             5.428_571_428_571_429,
             9,
         ),
-        (
-            "ex:jdoe".to_string(),
-            "jdoe".to_string(),
-            vec![3, 7, 42, 99],
-            37.75,
-            99,
-        ),
+        ("ex:jdoe".to_string(), "jdoe".to_string(), 37.75, 99),
     ];
 
     assert_eq!(rows.len(), expected.len());
     for (actual, target) in rows.iter().zip(expected.iter()) {
         assert_eq!(actual.0, target.0);
         assert_eq!(actual.1, target.1);
-        assert_eq!(actual.2, target.2);
-        assert!((actual.3 - target.3).abs() < 1e-12);
-        assert_eq!(actual.4, target.4);
+        assert!((actual.2 - target.2).abs() < 1e-12);
+        assert_eq!(actual.3, target.3);
     }
 }
 
@@ -4127,8 +4218,14 @@ async fn sparql_timezone_returns_day_time_duration() {
 }
 
 #[tokio::test]
-async fn sparql_timezone_positive_offset() {
-    // TIMEZONE for +05:30 → "PT5H30M"
+async fn sparql_timezone_normalizes_source_offset_to_utc() {
+    // ex:beer's value is written "2024-01-20T14:00:00+05:30", and this asserted
+    // "PT5H30M" until 2026-08-29. Fluree normalizes temporals to UTC and does
+    // not persist the source offset, so that answer was only reachable while
+    // the value sat in novelty — after a reindex the identical query returned
+    // "PT0S". TIMEZONE now reports UTC on both lanes rather than changing under
+    // a background reindex with no write behind it. See it_timezone_accessors
+    // and the register entry in testsuite-sparql/tests/registers/mod.rs.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_builtin_fn_data(&fluree, "fn:timezone-pos").await;
 
@@ -4148,7 +4245,7 @@ async fn sparql_timezone_positive_offset() {
     let bindings = normalize_sparql_bindings(&sparql_json);
     assert_eq!(bindings.len(), 1);
     let tz = &bindings[0]["tz"];
-    assert_eq!(tz["value"].as_str().unwrap(), "PT5H30M");
+    assert_eq!(tz["value"].as_str().unwrap(), "PT0S");
 }
 
 #[tokio::test]
@@ -4546,6 +4643,278 @@ async fn sparql_xsd_cast_double_from_integer() {
     assert_eq!(jsonld, json!([[42.0]]));
 }
 
+/// Issue #1445 (W3C csv03): a stored `xsd:double` serializes in the W3C
+/// canonical lexical form (`1.0E6`) across every RDF-lexical result format —
+/// SPARQL-JSON, SPARQL-XML, CSV, and TSV — while the JSON-LD surface keeps
+/// emitting a native JSON number (query-surface parity guard).
+#[tokio::test]
+async fn sparql_double_canonical_lexical_form_across_formats() {
+    use fluree_db_api::format::{format_results_string, FormatterConfig};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "canon:double-formats");
+
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@id": "ex:s6",
+        "ex:score": {"@value": "1.0E6", "@type": "xsd:double"}
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.expect("seed").ledger;
+
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT ?v WHERE { ex:s6 ex:score ?v }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("double query");
+
+    // SPARQL Results JSON: canonical lexical string + datatype.
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let binding = &sparql_json["results"]["bindings"][0]["v"];
+    assert_eq!(binding["value"], json!("1.0E6"), "{sparql_json}");
+    assert_eq!(
+        binding["datatype"],
+        json!("http://www.w3.org/2001/XMLSchema#double"),
+        "{sparql_json}"
+    );
+
+    // SPARQL Results XML: canonical lexical inside <literal>.
+    let xml = format_results_string(
+        &result,
+        &result.context,
+        &ledger.snapshot,
+        &FormatterConfig::sparql_xml(),
+    )
+    .expect("sparql xml");
+    assert!(xml.contains(">1.0E6</literal>"), "{xml}");
+
+    // CSV / TSV: canonical lexical cell.
+    let csv = result.to_csv(&ledger.snapshot).expect("to_csv");
+    assert_eq!(csv, "v\n1.0E6\n");
+    let tsv = result.to_tsv(&ledger.snapshot).expect("to_tsv");
+    assert_eq!(tsv, "v\n1.0E6\n");
+
+    // JSON-LD parity guard: same value stays a native JSON number.
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(jsonld, json!([[1_000_000.0]]));
+    assert!(
+        jsonld[0][0].is_number(),
+        "JSON-LD double must stay a JSON number: {jsonld}"
+    );
+}
+
+/// Issue #1695: `STR()` on an `xsd:double` must return the same W3C canonical
+/// lexical form the serializer emits for the very same term — the companion
+/// of `sparql_double_canonical_lexical_form_across_formats`, which pins the
+/// serializer side but never exercises expression evaluation. Each row
+/// asserts `STR(?d) == serialized ?d` (self-anchoring: the two paths cannot
+/// drift apart again) plus the expected canonical spelling.
+///
+/// The `xsd:string()` cast is pinned alongside precisely because it must NOT
+/// always follow: SPARQL §17.5 defers casting to XPath, whose double→string
+/// rule is plain decimal notation for absolute values in `[1e-6, 1e6)` — W3C
+/// `cast-string` requires `xsd:string("1E0"^^xsd:double)` to be `"1"` — and
+/// the canonical (scientific) lexical form outside that range, on BOTH sides
+/// (`1.0E-7` and `1.0E30` alike, never `0.0000001` or a 31-digit integer).
+/// This test states both answers so neither function drifts into the other.
+#[tokio::test]
+async fn sparql_str_double_matches_serializer_canonical_form() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "canon:str-double");
+
+    // Representative doubles: the issue's repro (1E0), an integral value,
+    // a large exponent, a small exponent, a negative, and the specials.
+    // Columns: id, stored lexical, canonical (STR + serializer), cast form.
+    let cases = [
+        ("ex:d1", "1E0", "1.0E0", "1"),
+        ("ex:d2", "5.0", "5.0E0", "5"),
+        // 1e6 sits just OUTSIDE the XPath decimal-notation range (the upper
+        // bound is exclusive), so cast and canonical agree here.
+        ("ex:d3", "1.0E6", "1.0E6", "1.0E6"),
+        ("ex:d4", "0.001", "1.0E-3", "0.001"),
+        ("ex:d5", "-12.5", "-1.25E1", "-12.5"),
+        // Outside the XPath range on either side the cast is the canonical
+        // scientific form too — the range rule is two-sided.
+        ("ex:d9", "1.0E-7", "1.0E-7", "1.0E-7"),
+        ("ex:d10", "1.0E30", "1.0E30", "1.0E30"),
+        // Specials share one spelling across both renderings — and neither is
+        // Rust's `Display` ("inf"), which is a lexical form of nothing.
+        ("ex:d6", "NaN", "NaN", "NaN"),
+        ("ex:d7", "INF", "INF", "INF"),
+        ("ex:d8", "-INF", "-INF", "-INF"),
+    ];
+    let graph: Vec<serde_json::Value> = cases
+        .iter()
+        .map(|(id, lex, _, _)| {
+            json!({"@id": id, "ex:score": {"@value": lex, "@type": "xsd:double"}})
+        })
+        .collect();
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@graph": graph
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.expect("seed").ledger;
+
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT ?s ?d (STR(?d) AS ?lex) (xsd:string(?d) AS ?cast)
+        WHERE { ?s ex:score ?d }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("STR(double) query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let bindings = sparql_json["results"]["bindings"]
+        .as_array()
+        .expect("bindings array");
+    assert_eq!(bindings.len(), cases.len(), "{sparql_json}");
+
+    for row in bindings {
+        let subject = row["s"]["value"].as_str().expect("subject IRI");
+        let serialized = row["d"]["value"].as_str().expect("serialized double");
+        let str_lex = row["lex"]["value"].as_str().expect("STR result");
+        let cast_lex = row["cast"]["value"].as_str().expect("xsd:string result");
+        // The core pin: expression evaluation agrees with the serializer on
+        // the SAME term in the SAME result set.
+        assert_eq!(
+            str_lex, serialized,
+            "STR(?d) diverges from the serializer for {subject}: {sparql_json}"
+        );
+        // And the shared form is the W3C canonical one.
+        let (_, _, canonical, cast) = cases
+            .iter()
+            .find(|(id, _, _, _)| subject.ends_with(&id[3..]))
+            .expect("known subject");
+        assert_eq!(serialized, *canonical, "{subject}: {sparql_json}");
+        // The cast keeps its own XPath-mandated rendering (W3C cast-string).
+        assert_eq!(
+            cast_lex, *cast,
+            "xsd:string(?d) must follow the XPath cast rule for {subject}: {sparql_json}"
+        );
+    }
+}
+
+/// Issue #1695 (float sibling): a stored `xsd:float` is carried as a
+/// full-precision f64 (ingest never narrows) and the serializer prints THAT
+/// value; expression evaluation narrows the same binding to an f32. `STR()`
+/// must side with the serializer — it reads the stored f64 off the binding
+/// (`stored_float_f64`) rather than spelling the f32 truncation. The
+/// f32-inexact rows are the ones that catch it: for `3.14159265358979` the
+/// truncated spelling would be `3.1415927E0`.
+#[tokio::test]
+async fn sparql_str_float_matches_serializer_canonical_form() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "canon:str-float");
+
+    let cases = [
+        ("ex:f1", "1E0", "1.0E0"),
+        ("ex:f2", "33.33", "3.333E1"),
+        ("ex:f3", "-0.5", "-5.0E-1"),
+        // f32-INEXACT: the stored f64 keeps more precision than an f32 can
+        // hold, so serializer-vs-STR() agreement is only possible if STR()
+        // reads the stored f64. (These rows go red if STR() ever routes
+        // through the f32 materialization again.)
+        ("ex:f4", "3.14159265358979", "3.14159265358979E0"),
+        ("ex:f5", "1.23456789012345E-5", "1.23456789012345E-5"),
+    ];
+    let graph: Vec<serde_json::Value> = cases
+        .iter()
+        .map(|(id, lex, _)| json!({"@id": id, "ex:reading": {"@value": lex, "@type": "xsd:float"}}))
+        .collect();
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@graph": graph
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.expect("seed").ledger;
+
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT ?s ?f (STR(?f) AS ?lex)
+        WHERE { ?s ex:reading ?f }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("STR(float) query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let bindings = sparql_json["results"]["bindings"]
+        .as_array()
+        .expect("bindings array");
+    assert_eq!(bindings.len(), cases.len(), "{sparql_json}");
+
+    for row in bindings {
+        let subject = row["s"]["value"].as_str().expect("subject IRI");
+        let serialized = row["f"]["value"].as_str().expect("serialized float");
+        let str_lex = row["lex"]["value"].as_str().expect("STR result");
+        assert_eq!(
+            str_lex, serialized,
+            "STR(?f) diverges from the serializer for {subject}: {sparql_json}"
+        );
+        let expected = cases
+            .iter()
+            .find(|(id, _, _)| subject.ends_with(&id[3..]))
+            .map(|(_, _, canonical)| *canonical)
+            .expect("known subject");
+        assert_eq!(serialized, expected, "{subject}: {sparql_json}");
+    }
+}
+
+/// Issue #1695 (aggregate sibling): GROUP_CONCAT's lenient numeric coercion
+/// stringifies a double through the same seam, and must use the same
+/// canonical form the serializer would give the value.
+#[tokio::test]
+async fn sparql_group_concat_double_canonical_form() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "canon:gc-double");
+
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@id": "ex:s",
+        "ex:score": [
+            {"@value": "1E0", "@type": "xsd:double"},
+            {"@value": "1.0E6", "@type": "xsd:double"}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.expect("seed").ledger;
+
+    let query = r#"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT (GROUP_CONCAT(?d; separator="|") AS ?all)
+        WHERE { ex:s ex:score ?d }
+    "#;
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("GROUP_CONCAT(double) query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let all = sparql_json["results"]["bindings"][0]["all"]["value"]
+        .as_str()
+        .expect("group_concat result");
+    let mut parts: Vec<&str> = all.split('|').collect();
+    parts.sort_unstable();
+    assert_eq!(parts, vec!["1.0E0", "1.0E6"], "{sparql_json}");
+}
+
 #[tokio::test]
 async fn sparql_integer_division_yields_decimal() {
     // Per XPath op:numeric-divide, xsd:integer / xsd:integer yields xsd:decimal:
@@ -4586,7 +4955,9 @@ async fn sparql_float_divided_by_integer_promotes() {
         .await
         .expect("float / integer query");
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
-    assert_eq!(jsonld, json!([[2.5]]));
+    // xsd:float(10) / 4 = 2.5; xsd:float has no bare-number JSON form (unlike
+    // xsd:double), so it round-trips as an explicit typed literal preserving the type.
+    assert_eq!(jsonld, json!([[{"@value": "2.5", "@type": "xsd:float"}]]));
 }
 
 #[tokio::test]
@@ -5272,6 +5643,63 @@ async fn sparql_service_remote_returns_mock_data() {
     );
 }
 
+/// End to end: the query the engine ships to a remote SERVICE endpoint carries
+/// the parent query's prologue, so a prefixed name in the SERVICE body means the
+/// same thing there as here. Without it the remote fails with
+/// `Undefined prefix 'ex'` (the local-only lowering tests in
+/// `fluree-db-sparql::lower` cover both failure modes in detail; this one pins
+/// the executor call site).
+#[tokio::test]
+async fn sparql_service_remote_query_carries_query_prologue() {
+    assert_index_defaults();
+    let mut fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let mock = Arc::new(fluree_db_api::remote_service::MockRemoteService::new());
+    mock.register_response(
+        "acme",
+        "customers:main",
+        json!({
+            "head": {"vars": ["name"]},
+            "results": {"bindings": [{"name": {"type": "literal", "value": "Alice"}}]}
+        }),
+    );
+    fluree.set_remote_service(mock.clone());
+
+    let query = r"
+        PREFIX ex: <http://example.org/>
+        BASE <http://base.example/>
+        SELECT ?name
+        WHERE {
+          SERVICE <fluree:remote:acme/customers:main> {
+            ?s ex:name ?name .
+          }
+        }
+    ";
+    support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("Remote SERVICE should succeed with mock");
+
+    let sent = mock.last_sparql().expect("mock should have been called");
+    assert!(
+        sent.contains("PREFIX ex: <http://example.org/>"),
+        "shipped sub-query must declare ex:, got: {sent}"
+    );
+    assert!(
+        sent.contains("BASE <http://base.example/>"),
+        "shipped sub-query must declare the base, got: {sent}"
+    );
+    assert!(
+        sent.contains("ex:name"),
+        "body must ship verbatim, got: {sent}"
+    );
+    // The prologue has to precede the query form to be legal SPARQL.
+    assert!(
+        sent.find("PREFIX ex:") < sent.find("SELECT"),
+        "prologue must precede SELECT, got: {sent}"
+    );
+}
+
 #[tokio::test]
 async fn sparql_service_remote_unknown_connection_errors() {
     assert_index_defaults();
@@ -5387,19 +5815,26 @@ async fn seed_currency_line_items(fluree: &MemoryFluree, ledger_id: &str) -> Mem
 
 #[tokio::test]
 async fn sparql_group_by_expression_collapses_and_honors_limit() {
-    // Field P0 repro: `GROUP BY (LCASE(?cur))` with the same expression aliased
-    // in the SELECT must collapse to one row per distinct expression value, and
-    // LIMIT must bound the result. The buggy behavior returned one row per input
-    // binding (10 rows) with LIMIT ignored.
+    // Field P0 repro: grouping by an `LCASE(?cur)` expression must collapse
+    // to one row per distinct expression value, and LIMIT must bound the
+    // result. The buggy behavior returned one row per input binding (10
+    // rows) with LIMIT ignored.
+    //
+    // PR-2 (V4) note: the field's original spelling — `GROUP BY (LCASE(?cur))`
+    // re-projected as `SELECT (LCASE(?cur) AS ?k)` — is the W3C agg08
+    // negative-syntax shape and is now a hard validation error (see
+    // sparql_group_by_reprojected_key_expression_rejected). The spec-valid
+    // migration aliases the key in GROUP BY, asserted here; the
+    // BIND-then-GROUP-BY control below is also still valid.
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_currency_line_items(&fluree, "currency:main").await;
 
     let query = r"
         PREFIX ex: <http://example.org/ns/>
-        SELECT (LCASE(?cur) AS ?k) (COUNT(?s) AS ?n)
+        SELECT ?k (COUNT(?s) AS ?n)
         WHERE { ?s a ex:LineItem ; ex:currency ?cur }
-        GROUP BY (LCASE(?cur))
+        GROUP BY (LCASE(?cur) AS ?k)
         ORDER BY DESC(?n)
         LIMIT 15
     ";
@@ -6166,4 +6601,523 @@ async fn sparql_zero_or_one_both_bound() {
             "{s} p? {o} expected reachable={expect}, got {rows} rows: {j}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// BASE-relative IRI resolution (roadmap PR-BASE; W3C base-prefix-2/5,
+// graph-exist, iri01 mechanisms).
+//
+// Constant IRIs anywhere in the query (patterns, GRAPH names, IRI()/URI()
+// constant arguments, relative PREFIX namespaces) resolve against the query's
+// `BASE` declaration at lowering time, per RFC 3986 §5. Without a BASE,
+// relative IRIs stay as written (ledger-local names keep working).
+// ---------------------------------------------------------------------------
+
+/// Seed absolute-IRI data shaped like the W3C `basic/` base-prefix fixtures:
+/// one fragment-style subject/predicate pair and one path-style pair, both
+/// under `http://example.org/x/`.
+async fn seed_base_resolution(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@graph": [
+            {"@id": "http://example.org/x/#x", "http://example.org/x/#p": "hit-fragment"},
+            {"@id": "http://example.org/x/x", "http://example.org/x/p": "hit-path"}
+        ]
+    });
+    fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert base-resolution fixture")
+        .ledger
+}
+
+/// Fragment references `<#x>` / `<#p>` resolve against BASE (the W3C
+/// `base-prefix-5` shape). Before PR-BASE, `#`-prefixed references were
+/// passed through unresolved and matched nothing.
+#[tokio::test]
+async fn sparql_base_resolves_fragment_references() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_base_resolution(&fluree, "it/sparql:base-frag").await;
+
+    let q = r"BASE <http://example.org/x/>
+        SELECT ?v WHERE { <#x> <#p> ?v }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("fragment refs resolve");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["hit-fragment"]])),
+        "fragment refs should resolve against BASE: {j}"
+    );
+}
+
+/// A relative PREFIX namespace (`PREFIX : <#>`) resolves against BASE before
+/// prefixed-name expansion (the W3C `base-prefix-2` shape).
+#[tokio::test]
+async fn sparql_base_resolves_relative_prefix_namespace() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_base_resolution(&fluree, "it/sparql:base-prefix").await;
+
+    let q = r"BASE <http://example.org/x/>
+        PREFIX : <#>
+        SELECT ?v WHERE { :x :p ?v }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("relative prefix namespace resolves");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["hit-fragment"]])),
+        "relative PREFIX namespace should resolve against BASE: {j}"
+    );
+}
+
+/// Path-style relative references resolve RFC 3986-correctly: against a
+/// directory-style BASE the last segment merges (`<x>` → `…/x/x`), not naive
+/// string concatenation.
+#[tokio::test]
+async fn sparql_base_resolves_path_references() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_base_resolution(&fluree, "it/sparql:base-path").await;
+
+    let q = r"BASE <http://example.org/x/>
+        SELECT ?v WHERE { <x> <p> ?v }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("path refs resolve");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["hit-path"]])),
+        "path refs should resolve against BASE: {j}"
+    );
+
+    // Sibling-document form: BASE names a document, the reference replaces
+    // its last segment (the `graph-exist` mechanism).
+    let q2 = r"BASE <http://example.org/x/query.rq>
+        SELECT ?v WHERE { <x> <p> ?v }";
+    let r2 = support::query_sparql(&fluree, &ledger, q2)
+        .await
+        .expect("sibling refs resolve");
+    let j2 = r2.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j2),
+        normalize_rows(&json!([["hit-path"]])),
+        "sibling refs should replace the base's last segment: {j2}"
+    );
+}
+
+/// A constant `GRAPH <relative>` name resolves against BASE to the absolute
+/// IRI the named graph is registered under (the W3C `graph-exist` failure:
+/// the query says `<data-g1.ttl>`, the registry key is the absolute URL).
+#[tokio::test]
+async fn sparql_base_resolves_constant_graph_iri() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:base-graph");
+    let trig = r#"
+        @prefix ex: <http://example.org/ns/> .
+        @prefix schema: <http://schema.org/> .
+
+        ex:alice schema:name "Alice" .
+
+        GRAPH <http://example.org/tests/data-g1.ttl> {
+            ex:bob schema:name "Bob" .
+        }
+    "#;
+    let ledger = fluree
+        .stage_owned(ledger0)
+        .upsert_turtle(trig)
+        .execute()
+        .await
+        .expect("trig upsert")
+        .ledger;
+
+    let q = r"BASE <http://example.org/tests/query.rq>
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name WHERE { GRAPH <data-g1.ttl> { ?s schema:name ?name } }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("relative graph name resolves");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["Bob"]])),
+        "GRAPH <relative> should resolve to the registered absolute IRI: {j}"
+    );
+}
+
+/// IRI()/URI() constant arguments resolve against BASE (expression-semantics
+/// D8; W3C `iri01`). The resolution is constant-folded at lowering time —
+/// the eval path never sees a base.
+#[tokio::test]
+async fn sparql_iri_function_resolves_constant_against_base() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_base_resolution(&fluree, "it/sparql:base-irifn").await;
+
+    let q = r#"BASE <http://example.org/x/>
+        SELECT ?v WHERE { ?s <p> ?v . FILTER(?s = IRI("x")) }"#;
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("IRI() constant resolves");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["hit-path"]])),
+        "IRI(\"x\") should resolve to <http://example.org/x/x>: {j}"
+    );
+
+    // URI() is the same function; absolute arguments stay verbatim.
+    let q2 = r#"BASE <http://example.org/x/>
+        SELECT ?v WHERE { ?s <p> ?v . FILTER(?s = URI("http://example.org/x/x")) }"#;
+    let r2 = support::query_sparql(&fluree, &ledger, q2)
+        .await
+        .expect("URI() absolute stays verbatim");
+    let j2 = r2.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j2),
+        normalize_rows(&json!([["hit-path"]])),
+        "absolute URI() argument should pass through: {j2}"
+    );
+}
+
+/// Without a BASE, relative IRIs keep their historical passthrough behavior.
+/// The JSON-LD surface stores raw relative `@id`s (no `@base`/`@vocab`
+/// required), and SPARQL must keep matching them verbatim — resolution is
+/// only ever performed against an explicit BASE.
+#[tokio::test]
+async fn sparql_no_base_keeps_relative_iris_verbatim() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:no-base");
+    let insert = json!({
+        "@graph": [
+            {"@id": "local-x", "http://schema.org/name": "Bob"}
+        ]
+    });
+    let ledger = fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert relative-id fixture")
+        .ledger;
+
+    let q = r"PREFIX schema: <http://schema.org/>
+        SELECT ?name WHERE { <local-x> schema:name ?name }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("verbatim relative IRI without BASE");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["Bob"]])),
+        "without BASE, relative IRIs match verbatim: {j}"
+    );
+}
+
+/// Fixture for WHERE-level early-dedup semantics: a 2-hop chain where the
+/// first hop fans in (two ?a rows reach the same ?b), so the intermediate
+/// relation carries duplicate ?b rows once ?a is projected away.
+///
+///   a1 --p1--> b1 --p2--> {10, 20}
+///   a2 --p1--> b1
+///
+/// Chain rows for `?a :p1 ?b . ?b :p2 ?x`: (a1,b1,10) (a1,b1,20) (a2,b1,10)
+/// (a2,b1,20) — COUNT(?x) = 4, COUNT(DISTINCT ?x) = 2.
+async fn seed_chain_fan_in(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [
+            {"@id": "ex:a1", "ex:p1": {"@id": "ex:b1"}},
+            {"@id": "ex:a2", "ex:p1": {"@id": "ex:b1"}},
+            {"@id": "ex:b1", "ex:p2": [10, 20]}
+        ]
+    });
+    fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert chain fixture")
+        .ledger
+}
+
+/// A duplicate-sensitive aggregate (`COUNT` without DISTINCT) must see full
+/// row multiplicity even when the query is `SELECT DISTINCT` and a WHERE var
+/// (?a) dies mid-chain. The WHERE-level early-dedup optimization must NOT
+/// fire here: outer DISTINCT dedups *result* rows after aggregation and says
+/// nothing about pre-aggregation multiplicity.
+#[tokio::test]
+async fn sparql_select_distinct_with_plain_count_keeps_multiplicity() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_chain_fan_in(&fluree, "it/sparql:dedup-count").await;
+
+    let q = r"PREFIX ex: <http://example.org/ns/>
+        SELECT DISTINCT (COUNT(?x) AS ?c)
+        WHERE { ?a ex:p1 ?b . ?b ex:p2 ?x }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("distinct + plain count");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        j,
+        json!([[4]]),
+        "COUNT(?x) must count all 4 chain rows — early dedup of the \
+         intermediate (?b) relation would wrongly halve it: {j}"
+    );
+}
+
+/// COUNT(DISTINCT ?x) over the same fan-in chain: 2 distinct values. This is
+/// the shape where WHERE-level early dedup IS sound (every aggregate is
+/// duplicate-insensitive) and collapses the duplicate ?b intermediate rows.
+#[tokio::test]
+async fn sparql_count_distinct_chain_fan_in() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_chain_fan_in(&fluree, "it/sparql:dedup-count-distinct").await;
+
+    let q = r"PREFIX ex: <http://example.org/ns/>
+        SELECT (COUNT(DISTINCT ?x) AS ?c)
+        WHERE { ?a ex:p1 ?b . ?b ex:p2 ?x }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("count distinct over chain");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(j, json!([[2]]), "2 distinct ?x values: {j}");
+}
+
+// =============================================================================
+// Range pushdown must be total-or-nothing
+// =============================================================================
+
+/// `ex:price` rows: a=497.26 b=0.005 c=12.5 d=0.01 (doubles), e=7 (integer),
+/// f=0.5 (decimal). `ex:shipped` rows: a=2019-12-31 b=2020-06-15 c=2021-06-01
+/// d=2022-01-01. A conjoined FILTER that mixed a pushable bound with an
+/// `xsd:decimal` bound used to push the representable half and drop the rest;
+/// two temporal bounds on the same side used to keep whichever came first.
+async fn seed_ranges(fluree: &MemoryFluree, ledger_id: &str) -> fluree_db_api::TransactResult {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@graph": [
+            {"@id": "ex:a", "ex:price": {"@value": "4.972607E2", "@type": "xsd:double"},
+             "ex:shipped": {"@value": "2019-12-31", "@type": "xsd:date"}},
+            {"@id": "ex:b", "ex:price": {"@value": "0.005", "@type": "xsd:double"},
+             "ex:shipped": {"@value": "2020-06-15", "@type": "xsd:date"}},
+            {"@id": "ex:c", "ex:price": {"@value": "12.5", "@type": "xsd:double"},
+             "ex:shipped": {"@value": "2021-06-01", "@type": "xsd:date"}},
+            {"@id": "ex:d", "ex:price": {"@value": "1.0E-2", "@type": "xsd:double"},
+             "ex:shipped": {"@value": "2022-01-01", "@type": "xsd:date"}},
+            {"@id": "ex:e", "ex:price": 7},
+            {"@id": "ex:f", "ex:price": {"@value": "0.5", "@type": "xsd:decimal"}}
+        ]
+    });
+    fluree.insert(ledger0, &insert).await.unwrap()
+}
+
+async fn filtered_subjects(
+    fluree: &MemoryFluree,
+    ledger: &MemoryLedger,
+    predicate: &str,
+    filter: &str,
+) -> Vec<String> {
+    let query = format!(
+        r"
+        PREFIX ex: <http://example.org/>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT ?s WHERE {{ ?s {predicate} ?v . FILTER({filter}) }}
+        "
+    );
+    let result = support::query_sparql(fluree, ledger, &query)
+        .await
+        .unwrap_or_else(|e| panic!("FILTER({filter}): {e}"));
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    let mut subjects: Vec<String> = jsonld
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| {
+            row.as_array().expect("row")[0]
+                .as_str()
+                .expect("subject")
+                .trim_start_matches("ex:")
+                .to_string()
+        })
+        .collect();
+    subjects.sort();
+    subjects
+}
+
+const RANGE_FILTER_CASES: &[(&str, &str, &[&str])] = &[
+    // Baselines: a lone bound and same-type pairs already worked.
+    ("ex:price", "?v < 0.01", &["b"]),
+    ("ex:price", "?v >= 0.0 && ?v < 0.01", &["b"]),
+    ("ex:price", "?v >= 0 && ?v < 1", &["b", "d", "f"]),
+    // Mixed pushable + decimal bound, either order and either side.
+    ("ex:price", "?v >= 0 && ?v < 0.01", &["b"]),
+    ("ex:price", "?v < 0.01 && ?v >= 0", &["b"]),
+    ("ex:price", "?v >= 0e0 && ?v < 0.01", &["b"]),
+    ("ex:price", "?v >= 1 && ?v <= 12.5", &["c", "e"]),
+    ("ex:price", "?v >= 0.5 && ?v < 20", &["c", "e", "f"]),
+    ("ex:price", "?v >= 0 && ?v < 1.0", &["b", "d", "f"]),
+    (
+        "ex:price",
+        "(?v >= 0) && (?v < 20.5)",
+        &["b", "c", "d", "e", "f"],
+    ),
+    (
+        "ex:price",
+        "?v >= 0 && ?v < 20.5 && ?v != 7",
+        &["b", "c", "d", "f"],
+    ),
+    // Two bounds on the same side: the tighter one must win, in either order.
+    ("ex:price", "?v < 5 && ?v < 0.01", &["b"]),
+    ("ex:price", "?v < 0.01 && ?v < 5", &["b"]),
+    ("ex:price", "?v > 0.5 && ?v > 0e0", &["a", "c", "e"]),
+    ("ex:price", "?v >= 0 && ?v > 100000000000000000000", &[]),
+    (
+        "ex:price",
+        "?v >= 0 && ?v < 100000000000000000000",
+        &["a", "b", "c", "d", "e", "f"],
+    ),
+    (
+        "ex:price",
+        "?v > -100000000000000000000",
+        &["a", "b", "c", "d", "e", "f"],
+    ),
+    // Contradictory across types: empty, not "everything".
+    ("ex:price", "?v > 1.5 && ?v < 1", &[]),
+    // A conjunct with no RangeValue at all (xsd:integer past i64) must keep the
+    // whole filter rather than push the representable half. Both directions, so
+    // a lane that drops every row cannot pass the `[]` case by accident.
+    (
+        "ex:price",
+        "?v >= 0 && ?v > \"100000000000000000000\"^^xsd:integer",
+        &[],
+    ),
+    (
+        "ex:price",
+        "?v >= 0 && ?v < \"100000000000000000000\"^^xsd:integer",
+        &["a", "b", "c", "d", "e", "f"],
+    ),
+    // Temporal: same-side pair keeps the tighter bound.
+    (
+        "ex:shipped",
+        "?v >= \"2020-01-01\"^^xsd:date && ?v >= \"2021-06-01\"^^xsd:date",
+        &["c", "d"],
+    ),
+    (
+        "ex:shipped",
+        "?v >= \"2021-06-01\"^^xsd:date && ?v >= \"2020-01-01\"^^xsd:date",
+        &["c", "d"],
+    ),
+    (
+        "ex:shipped",
+        "?v < \"2022-01-01\"^^xsd:date && ?v < \"2021-01-01\"^^xsd:date",
+        &["a", "b"],
+    ),
+    (
+        "ex:shipped",
+        "?v >= \"2020-01-01\"^^xsd:date && ?v < \"2021-06-01\"^^xsd:date",
+        &["b"],
+    ),
+];
+
+async fn assert_range_filter_cases(fluree: &MemoryFluree, ledger: &MemoryLedger, lane: &str) {
+    for (predicate, filter, expected) in RANGE_FILTER_CASES {
+        let expected: Vec<String> = expected.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            filtered_subjects(fluree, ledger, predicate, filter).await,
+            expected,
+            "[{lane}] FILTER({filter})"
+        );
+    }
+}
+
+/// An oversized `xsd:integer` reaches lowering from every expression surface
+/// the widened parser opened, not just FILTER: BIND, arithmetic, ORDER BY and
+/// aggregation each route through a different `LiteralValue` match.
+#[tokio::test]
+async fn sparql_big_integer_lowers_from_every_expression_surface() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_ranges(&fluree, "bigint:main").await.ledger;
+    let big = "100000000000000000000";
+
+    for (label, query) in [
+        ("bind", format!("SELECT ?x WHERE {{ BIND({big} AS ?x) }}")),
+        (
+            "arithmetic",
+            format!("SELECT ?x WHERE {{ BIND({big} + 1 AS ?x) }}"),
+        ),
+        (
+            "negated",
+            format!("SELECT ?x WHERE {{ BIND(-{big} AS ?x) }}"),
+        ),
+        (
+            "order-by",
+            format!(
+                "SELECT ?s WHERE {{ ?s <http://example.org/price> ?v }} ORDER BY (?v + {big}) LIMIT 1"
+            ),
+        ),
+        (
+            "having",
+            format!(
+                "SELECT (COUNT(?s) AS ?n) WHERE {{ ?s <http://example.org/price> ?v }} HAVING (COUNT(?s) < {big})"
+            ),
+        ),
+    ] {
+        let result = support::query_sparql(&fluree, &ledger, &query)
+            .await
+            .unwrap_or_else(|e| panic!("[{label}] {query}: {e}"));
+        let rows = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+        assert!(
+            !rows.as_array().expect("rows").is_empty(),
+            "[{label}] expected at least one row: {rows}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sparql_range_filter_keeps_every_conjunct_over_novelty() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_ranges(&fluree, "ranges:main").await.ledger;
+    assert_range_filter_cases(&fluree, &ledger, "novelty").await;
+}
+
+#[tokio::test]
+async fn sparql_range_filter_keeps_every_conjunct_over_index() {
+    use crate::support::{start_background_indexer_local, trigger_index_and_wait};
+
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "ranges/indexed:main";
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    local
+        .run_until(async move {
+            let commit_t = seed_ranges(&fluree, ledger_id).await.receipt.t;
+            trigger_index_and_wait(&handle, ledger_id, commit_t).await;
+            let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+            assert_eq!(
+                ledger.snapshot.t, commit_t,
+                "ledger must be indexed through the seed commit"
+            );
+            assert_range_filter_cases(&fluree, &ledger, "indexed").await;
+        })
+        .await;
 }

@@ -6,20 +6,20 @@
 //! operator tree for correctness.
 
 use crate::binary_scan::{compile_encoded_pre_filters_and_prune_inline_ops, EncodedPreFilter};
-use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     build_count_batch, count_predicate_overlay_delta, count_rows_for_predicate_psot, count_to_i64,
     cursor_fast_path_for_predicate, fast_path_store, fast_path_store_policy_cleared,
     leaf_entries_for_predicate, normalize_pred_sid, parallel_leaf_chunk_count,
     parallel_leaf_chunk_reduce, parallel_overlay_psot_filter_count, projection_okey_only,
-    projection_otype_only, projection_sid_only, projection_sid_otype_okey, FastPathOperator,
-    PredicateFastPath,
+    projection_otype_okey, projection_otype_only, projection_sid_only, projection_sid_otype_okey,
+    FastPathOperator, PredicateFastPath,
 };
 use crate::ir::triple::{Ref, TriplePattern};
 use crate::operator::inline::InlineOperator;
 use crate::operator::BoxedOperator;
 use crate::var_registry::VarId;
+use fluree_db_binary_index::arena::numbig::{NumBigArena, NumBigRepr, StoredBigValue};
 use fluree_db_binary_index::format::branch::LeafEntry;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::{
@@ -29,7 +29,7 @@ use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::o_type::OType;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::value_id::{ObjKey, ValueTypeTag};
-use fluree_db_core::{FlakeValue, GraphId, OverlayProvider};
+use fluree_db_core::{FlakeValue, GraphId};
 use fluree_vocab::namespaces;
 use std::sync::Arc;
 
@@ -63,14 +63,15 @@ pub fn count_rows_operator(
                 PredicateFastPath::Allow => {}
             }
 
-            let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-                return Ok(Some(build_count_batch(out_var, 0)?)); // predicate absent => 0
-            };
-
             // Lane 1 — metadata-only predicate row count (instant) when there is
-            // no novelty overlay and the target is the indexed head.
-            let overlay_free = ctx.overlay.map(OverlayProvider::epoch).unwrap_or(0) == 0;
+            // no novelty overlay and the target is the indexed head. Here, and
+            // only here, a predicate missing from the persisted dictionary really
+            // does mean zero rows: with no overlay, nothing else can contribute.
+            let overlay_free = !crate::fast_path_common::overlay_has_novelty(ctx);
             if overlay_free && ctx.to_t == store.max_t() {
+                let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+                    return Ok(Some(build_count_batch(out_var, 0)?)); // predicate absent => 0
+                };
                 let count = count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)?;
                 return Ok(Some(build_count_batch(
                     out_var,
@@ -81,7 +82,16 @@ pub fn count_rows_operator(
             // Lane 2 — base metadata count + a novelty delta that rescans only the
             // leaves novelty touches, when the target is at or above the indexed
             // head. Time-travel below the head needs base replay — defer.
+            //
+            // A predicate living only in the overlay (uncommitted novelty, or a
+            // datalog / OWL2-RL materialization) has no persisted `p_id` to
+            // range-bound the delta cursor, so the base count is not the answer —
+            // defer, exactly as the numeric-compare and encoded-filter twins below
+            // do. Reading the miss as 0 here was #1863.
             if ctx.to_t >= store.max_t() {
+                let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+                    return Ok(None);
+                };
                 if let Some(count) =
                     count_predicate_overlay_delta(ctx, store, ctx.binary_g_id, pred_sid, p_id)?
                 {
@@ -504,7 +514,7 @@ fn boundary_leaf_pid_extent(
 ) -> Result<Option<(u16, u64)>> {
     let handle = store
         .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
-        .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+        .map_err(|e| QueryError::from_io("leaf open", e))?;
     let entries = &handle.dir().entries;
     let mut indices = (0..entries.len()).collect::<Vec<_>>();
     if last {
@@ -548,7 +558,7 @@ fn count_numeric_compare_in_leaf_slice(
     for leaf_entry in leaves {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         let dir = handle.dir();
 
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
@@ -944,7 +954,7 @@ fn count_rows_matching_encoded_filters_in_leaf_slice(
     for leaf_entry in leaves {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         let dir = handle.dir();
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
@@ -1056,7 +1066,7 @@ fn count_rows_for_predicate_lang_psot(
     for leaf_entry in leaves {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         let dir = handle.dir();
 
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
@@ -1156,6 +1166,15 @@ pub fn count_distinct_position_operator(
             let Some(store) = fast_path_store(ctx) else {
                 return Ok(None);
             };
+            // The variable-predicate scan hides `f:reifies*` (and default-graph
+            // `f:`) facts, but the SPOT/PSOT/OPST directories these folds read
+            // include them — a graph with a reified edge would over-count in
+            // every position (its reifier subject, the reifies predicates, and
+            // the annotation objects are all pipeline-invisible). Decline to
+            // the general pipeline when any such predicate exists.
+            if crate::fast_whole_graph_agg::graph_has_scan_hidden_predicates(ctx, store)? {
+                return Ok(None);
+            }
             let (count, overflow_label) = match position {
                 // SPOT key layout: s_id(8) + p_id(4) + o_type(2) + o_key(8) + o_i(4).
                 // Distinct subjects = lead bytes [0..8].
@@ -1164,10 +1183,11 @@ pub fn count_distinct_position_operator(
                     "COUNT(DISTINCT) subjects",
                 ),
                 DistinctPosition::Predicates => (
-                    // Prefer the in-memory per-graph stats (number of predicates
-                    // with a positive current count) — O(#predicates), no leaf
-                    // opens. Falls back to the PSOT `p_const` scan when the graph
-                    // stats are unavailable.
+                    // Prefer the O(#predicates) in-memory stats count; fall back
+                    // to the PSOT `p_const` directory scan when stats are absent
+                    // (older index). Both are gated above to HEAD/no-overlay with
+                    // no scan-hidden predicates, so the stats count equals the
+                    // scan exactly.
                     match distinct_predicates_from_graph_stats(ctx) {
                         Some(c) => c,
                         None => count_distinct_predicates_psot(store, ctx.binary_g_id)?,
@@ -1175,11 +1195,17 @@ pub fn count_distinct_position_operator(
                     "COUNT(DISTINCT) predicates",
                 ),
                 // OPST key layout: o_type(2) + o_key(8) + o_i(4) + p_id(4) + s_id(8).
-                // Distinct objects = lead bytes [0..10].
-                DistinctPosition::Objects => (
-                    count_distinct_lead_groups(store, ctx.binary_g_id, RunSortOrder::Opst, 10)?,
-                    "COUNT(DISTINCT) objects",
-                ),
+                // Distinct objects = lead bytes [0..10] — which excludes p_id,
+                // and so is not an object identity for a NumBig arena handle.
+                // Those terms are counted exactly from the in-memory arenas
+                // (see `count_distinct_numbig_objects`); declining is reserved
+                // for an inconsistent index or the explicit kill switch.
+                DistinctPosition::Objects => {
+                    let Some(count) = count_distinct_objects(store, ctx.binary_g_id)? else {
+                        return Ok(None);
+                    };
+                    (count, "COUNT(DISTINCT) objects")
+                }
             };
             let count_i64 = count_to_i64(count, overflow_label)?;
             Ok(Some(build_count_batch(out_var, count_i64)?))
@@ -1189,16 +1215,19 @@ pub fn count_distinct_position_operator(
     )
 }
 
-/// Current-state distinct-predicate count from the per-graph index stats: the
-/// number of properties with a positive current flake count.
+/// Current-state distinct-predicate count from the per-graph index stats:
+/// properties with a positive current flake count. O(#predicates), no leaf
+/// opens — the in-memory equivalent of `count_distinct_predicates_psot`.
 ///
-/// `GraphPropertyStatEntry.count` is "after dedup; retractions decrement", so a
-/// predicate has a current PSOT leaflet iff its count is `> 0` — this matches
-/// `count_distinct_predicates_psot` exactly but reads the in-memory stats instead
-/// of opening every leaf. Returns `None` when the graph stats are unavailable
-/// (older index / not computed). Only correct at HEAD with no overlay; the caller
-/// gates that via `fast_path_store`.
-fn distinct_predicates_from_graph_stats(ctx: &ExecutionContext<'_>) -> Option<u64> {
+/// `GraphPropertyStatEntry.count` is post-dedup and retraction-decremented, so
+/// `count > 0` ⇔ the predicate has a live PSOT leaflet, matching the scan
+/// exactly. Safe only at HEAD with no overlay and no scan-hidden predicates —
+/// both are caller-gated (`fast_path_store`, `graph_has_scan_hidden_predicates`).
+/// Current-state-exact after an incremental index only because the build now
+/// carries base per-graph property stats forward (they were previously dropped,
+/// net-zero churn pinned at 0). Returns `None` when stats are absent (older
+/// index) so the caller falls back to the PSOT scan.
+fn distinct_predicates_from_graph_stats(ctx: &crate::context::ExecutionContext<'_>) -> Option<u64> {
     let graphs = ctx.active_snapshot.stats.as_ref()?.graphs.as_ref()?;
     let g = graphs.iter().find(|g| g.g_id == ctx.binary_g_id)?;
     Some(g.properties.iter().filter(|p| p.count > 0).count() as u64)
@@ -1213,6 +1242,10 @@ struct LeadGroupPartial {
     count: u64,
     first_lead: Vec<u8>,
     last_lead: Vec<u8>,
+    /// Rows in leaflets excluded from `count` because their key range can hold
+    /// an object key that is not a graph-wide identity. Only ever non-zero for
+    /// the OPST object walk.
+    skipped_rows: u64,
 }
 
 /// Count distinct lead groups across all leaflets in a given sort order.
@@ -1226,14 +1259,474 @@ struct LeadGroupPartial {
 /// `lead_len` is the number of leading key bytes that define the grouping:
 /// - SPOT distinct subjects: 8 bytes (s_id)
 /// - OPST distinct objects: 10 bytes (o_type + o_key)
-fn count_distinct_lead_groups(
+pub(crate) fn count_distinct_lead_groups(
     store: &BinaryIndexStore,
     g_id: GraphId,
     order: RunSortOrder,
     lead_len: usize,
 ) -> Result<u64> {
-    let Some(branch) = store.branch_for_order(g_id, order) else {
+    Ok(
+        count_distinct_lead_groups_inner(store, g_id, order, lead_len, false)?
+            .map_or(0, |w| w.count),
+    )
+}
+
+/// `fast-path outcome` site for the exact NumBig branch, distinct from the
+/// operator's own label so span capture can tell "counted from metadata alone"
+/// from "counted the arena slice exactly".
+const NUMBIG_EXACT_SITE: &str = "distinct object COUNT (numbig exact)";
+
+/// Kill switch for the exact NumBig branch: when set, a graph whose NumBig
+/// arenas hold more entries than this in total declines the whole count to
+/// the general pipeline. Unset means no cap.
+///
+/// There is deliberately no default. The branch reads resident arena entries
+/// and directory metadata, decoding mixed-type or legacy leaflets and scanning
+/// NumBig rows for predicates with stale handles. Declining instead scans and
+/// materializes every object in the graph. The predecessor of this
+/// branch capped on NumBig *rows* (25M) and declined above it, which on a
+/// Wikidata-scale ledger turned a 20 ms count into a full scan that timed out
+/// at 300 s.
+fn numbig_exact_max_entries() -> Option<u64> {
+    std::env::var("FLUREE_NUMBIG_EXACT_MAX_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+}
+
+/// Whole-graph distinct **objects** from OPST leaflet directories, or `None`
+/// when the count cannot be established without the general pipeline.
+///
+/// The 10-byte OPST lead is `o_type(2) + o_key(8)` and stops immediately before
+/// `p_id` (bytes `[14..18]`). For a `NUM_BIG_OVERFLOW` row that lead is a
+/// per-predicate arena handle, so the first big value under one predicate and
+/// the first under another share a lead and collapse into one group — see
+/// [`OType::o_key_is_globally_identifying`]. Because handles are allocated from
+/// 0 within each predicate, the result would be the *max* over predicates of
+/// their distinct big-value counts rather than the size of the union: a silent
+/// undercount, never an over-report.
+///
+/// The metadata walk therefore counts only the identifying part of the graph and
+/// reports the NumBig slice's row count separately. When that slice is non-empty
+/// its distinct terms come from [`count_distinct_numbig_objects`], which reads
+/// the arenas rather than the rows.
+///
+/// The per-predicate distinct-object count is unaffected and stays on its fast
+/// path: its 14-byte POST lead starts with `p_id`, which scopes the handle
+/// correctly. So is the distinct-subject count, whose SPOT lead is `s_id`.
+pub(crate) fn count_distinct_objects(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+) -> Result<Option<u64>> {
+    let Some(walk) = count_distinct_lead_groups_inner(store, g_id, RunSortOrder::Opst, 10, true)?
+    else {
+        return Ok(None);
+    };
+    if walk.skipped_non_identifying_rows == 0 {
+        return Ok(Some(walk.count));
+    }
+    let Some(exact) = count_distinct_numbig_objects(store, g_id)? else {
+        return Ok(None);
+    };
+    crate::fast_path_outcome::stamp_fast_path(
+        NUMBIG_EXACT_SITE,
+        crate::fast_path_outcome::FastPathOutcome::Proceed,
+    );
+    Ok(Some(walk.count.saturating_add(exact)))
+}
+
+/// Exact distinct-term count over the graph's `NUM_BIG_OVERFLOW` objects,
+/// answered from the arenas rather than the rows.
+///
+/// Every NumBig arena is resident in memory from store open and keyed on a
+/// normalized value repr, so the union of the arenas' entries *is* the set of
+/// distinct big-numeric terms the index has ever held — with one catch: an
+/// arena keeps a handle for a value whose rows have since been retracted (a
+/// full rebuild replays retractions through the same insert path), so arena
+/// membership alone over-counts. Liveness is proved per predicate from POST
+/// directory metadata: the number of distinct live handles under `p` is the
+/// predicate's lead-group count over its NumBig leaflets, and when that equals
+/// the arena's size every entry is live and nothing is read beyond directories.
+/// Only a predicate with stale handles pays for a column read, and only over
+/// its own NumBig rows, to learn *which* handles survive.
+///
+/// Dedup keys on the normalized repr, exactly as the general pipeline keys
+/// these rows (normalized decimal lexical, BigInt separate from BigDecimal), so
+/// the same value under two predicates — two handles in two arenas — and a
+/// legacy arena's scale-variant duplicates each count once. A BigInt entry that
+/// happens to fit `i64` is keyed as a big value here and as `Long` by the
+/// general pipeline; the resolver never routes such a value to the arena, so
+/// this cannot arise on a written index.
+///
+/// Returns `None` when the index is inconsistent (NumBig rows with no arena to
+/// decode them) or when [`numbig_exact_max_entries`] is set and exceeded.
+///
+/// Keys are built and sorted on every execution; the count is not cached.
+/// Before cross-predicate dedup, the vector holds one key per live arena
+/// entry, including repeated values across predicates. On typical 64-bit targets
+/// each key occupies 48 bytes, plus allocations for wide values and temporary
+/// buffers. Legacy arenas also pay for normalization during key construction.
+fn count_distinct_numbig_objects(store: &BinaryIndexStore, g_id: GraphId) -> Result<Option<u64>> {
+    use rayon::prelude::*;
+
+    let arenas: Vec<(u32, &NumBigArena)> = store
+        .numbig_arenas(g_id)
+        .filter(|(_, arena)| !arena.is_empty())
+        .collect();
+    if arenas.is_empty() {
+        return Ok(None);
+    }
+    let total_entries: u64 = arenas.iter().map(|(_, a)| a.len() as u64).sum();
+    if numbig_exact_max_entries().is_some_and(|cap| total_entries > cap) {
+        return Ok(None);
+    }
+
+    let mut keys: Vec<NumBigDistinctKey> = Vec::new();
+    for (p_id, arena) in arenas {
+        let normalized = arena.values_are_normalized();
+        let live = count_live_numbig_handles(store, g_id, p_id)?;
+        if live == 0 {
+            continue;
+        }
+        if live == arena.len() as u64 {
+            keys.par_extend(
+                arena
+                    .values()
+                    .par_iter()
+                    .map(|v| NumBigDistinctKey::from_stored(v, normalized)),
+            );
+            continue;
+        }
+        let handles = live_numbig_handles(store, g_id, p_id)?;
+        let mapped: Result<Vec<NumBigDistinctKey>> = handles
+            .par_iter()
+            .map(|&h| {
+                arena
+                    .get_by_handle(h)
+                    .map(|v| NumBigDistinctKey::from_stored(v, normalized))
+                    .ok_or_else(|| {
+                        QueryError::Internal(format!(
+                            "NumBig handle {h} beyond arena for g_id={g_id}, p_id={p_id}"
+                        ))
+                    })
+            })
+            .collect();
+        keys.extend(mapped?);
+    }
+    keys.par_sort_unstable();
+    keys.dedup();
+    Ok(Some(keys.len() as u64))
+}
+
+/// Compact, totally ordered form of [`NumBigRepr`] for sort-based dedup.
+///
+/// Canonical signed little-endian bytes of at most 16 bytes fold into an
+/// `i128`; anything wider keeps its bytes. The encoding is minimal, so a value
+/// that fits `i128` never appears in the wide arm and the mapping is injective.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum NumBigDistinctKey {
+    Int(i128),
+    IntWide(Vec<u8>),
+    Dec(i128, i64),
+    DecWide(Vec<u8>, i64),
+}
+
+impl NumBigDistinctKey {
+    /// Only bypass normalization when the arena proves all stored values are
+    /// normalized. Inline keys borrow bytes without allocating; wide keys own
+    /// a copy so they can be sorted together across arenas.
+    fn from_stored(value: &StoredBigValue, normalized: bool) -> Self {
+        if !normalized {
+            return Self::from_repr(value.normalized_repr());
+        }
+        match value {
+            StoredBigValue::BigInt(bytes) => match i128_from_signed_le(bytes) {
+                Some(v) => Self::Int(v),
+                None => Self::IntWide(bytes.clone()),
+            },
+            StoredBigValue::BigDec { unscaled, scale } => match i128_from_signed_le(unscaled) {
+                Some(v) => Self::Dec(v, *scale),
+                None => Self::DecWide(unscaled.clone(), *scale),
+            },
+        }
+    }
+
+    fn from_repr(repr: NumBigRepr) -> Self {
+        match repr {
+            NumBigRepr::BigIntBytes(bytes) => match i128_from_signed_le(&bytes) {
+                Some(v) => Self::Int(v),
+                None => Self::IntWide(bytes),
+            },
+            NumBigRepr::BigDecBytes { unscaled, scale } => match i128_from_signed_le(&unscaled) {
+                Some(v) => Self::Dec(v, scale),
+                None => Self::DecWide(unscaled, scale),
+            },
+        }
+    }
+}
+
+fn i128_from_signed_le(bytes: &[u8]) -> Option<i128> {
+    if bytes.len() > 16 {
+        return None;
+    }
+    let negative = bytes.last().is_some_and(|b| b & 0x80 != 0);
+    let mut buf = [if negative { 0xFF } else { 0x00 }; 16];
+    buf[..bytes.len()].copy_from_slice(bytes);
+    Some(i128::from_le_bytes(buf))
+}
+
+/// How one predicate's POST leaflet relates to the `NUM_BIG_OVERFLOW` range.
+enum NumBigLeaflet {
+    /// Holds no NumBig row, or belongs to another predicate.
+    Outside,
+    /// Every row is NumBig: `lead_group_count` is its distinct-handle count.
+    Pure,
+    /// Straddles the NumBig range (or predates `lead_group_count`): rows
+    /// must be decoded to find its NumBig handles.
+    Decode,
+}
+
+fn classify_numbig_leaflet(
+    entry: &fluree_db_binary_index::format::leaf::LeafletDirEntryV3,
+    p_id: u32,
+) -> NumBigLeaflet {
+    if entry.row_count == 0 || entry.p_const != Some(p_id) {
+        return NumBigLeaflet::Outside;
+    }
+    let numbig = OType::NUM_BIG_OVERFLOW.as_u16();
+    if entry.o_type_const == Some(numbig) {
+        return if entry.lead_group_count > 0 {
+            NumBigLeaflet::Pure
+        } else {
+            NumBigLeaflet::Decode
+        };
+    }
+    // POST keys sort by `(p_id, o_type, o_key, …)`, so the entry's own key
+    // interval bounds every o_type it holds.
+    let lo = read_ordered_key_v2(RunSortOrder::Post, &entry.first_key).o_type;
+    let hi = read_ordered_key_v2(RunSortOrder::Post, &entry.last_key).o_type;
+    if lo <= numbig && numbig <= hi {
+        NumBigLeaflet::Decode
+    } else {
+        NumBigLeaflet::Outside
+    }
+}
+
+/// Per-chunk partial for a run of NumBig handles under one predicate: distinct
+/// handles seen, plus the first and last handle for seam dedup.
+#[derive(Default)]
+struct NumBigHandlePartial {
+    count: u64,
+    first: Option<u64>,
+    last: Option<u64>,
+}
+
+impl NumBigHandlePartial {
+    fn push_run(&mut self, count: u64, first: u64, last: u64) {
+        self.count = self.count.saturating_add(count);
+        if self.last == Some(first) {
+            self.count = self.count.saturating_sub(1);
+        }
+        if self.first.is_none() {
+            self.first = Some(first);
+        }
+        self.last = Some(last);
+    }
+
+    fn combine(left: Self, right: Self) -> Self {
+        if right.first.is_none() {
+            return left;
+        }
+        if left.first.is_none() {
+            return right;
+        }
+        let seam_dedup = u64::from(left.last == right.first);
+        Self {
+            count: left
+                .count
+                .saturating_add(right.count)
+                .saturating_sub(seam_dedup),
+            first: left.first,
+            last: right.last,
+        }
+    }
+}
+
+/// Distinct NumBig handles in one decoded POST leaflet: `(count, first, last)`
+/// over its NumBig rows only, or `None` when it holds none. Rows are sorted by
+/// `(o_type, o_key, …)` within the predicate, so equal handles are adjacent.
+fn decode_numbig_handle_run(
+    handle: &dyn fluree_db_binary_index::read::leaf_access::LeafHandle,
+    leaflet_idx: usize,
+    o_type_const: Option<u16>,
+) -> Result<Option<(u64, u64, u64)>> {
+    let numbig = OType::NUM_BIG_OVERFLOW.as_u16();
+    let batch = handle
+        .load_columns(leaflet_idx, &projection_otype_okey(), RunSortOrder::Post)
+        .map_err(|e| QueryError::Internal(format!("leaflet columns: {e}")))?;
+    let o_type_default = o_type_const.unwrap_or(0);
+    let mut count = 0u64;
+    let mut first = None;
+    let mut prev = None;
+    for row in 0..batch.row_count {
+        if batch.o_type.get_or(row, o_type_default) != numbig {
+            continue;
+        }
+        let k = batch.o_key.get(row);
+        if prev != Some(k) {
+            count += 1;
+            prev = Some(k);
+            first.get_or_insert(k);
+        }
+    }
+    Ok(first.zip(prev).map(|(f, l)| (count, f, l)))
+}
+
+/// Number of distinct NumBig handles with a live row under `p_id`, from POST
+/// leaflet directories: `lead_group_count` over type-pure NumBig leaflets with
+/// seam dedup on the handle, decoding only a leaflet that straddles the NumBig
+/// range or predates `lead_group_count`. Compared against the arena's size, this
+/// says whether every arena entry is still live without reading a row.
+fn count_live_numbig_handles(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Result<u64> {
+    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
+    if leaves.is_empty() {
         return Ok(0);
+    }
+
+    let map = |chunk: &[LeafEntry]| -> Result<Option<NumBigHandlePartial>> {
+        let mut partial = NumBigHandlePartial::default();
+        for leaf_entry in chunk {
+            let dir = store
+                .open_leaf_dir(&leaf_entry.leaf_cid)
+                .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
+            let mut handle = None;
+            for (idx, entry) in dir.entries.iter().enumerate() {
+                match classify_numbig_leaflet(entry, p_id) {
+                    NumBigLeaflet::Outside => {}
+                    NumBigLeaflet::Pure => {
+                        let first = read_ordered_key_v2(RunSortOrder::Post, &entry.first_key).o_key;
+                        let last = read_ordered_key_v2(RunSortOrder::Post, &entry.last_key).o_key;
+                        partial.push_run(u64::from(entry.lead_group_count), first, last);
+                    }
+                    NumBigLeaflet::Decode => {
+                        let handle = match &handle {
+                            Some(h) => h,
+                            None => handle.insert(
+                                store
+                                    .open_leaf_handle(
+                                        &leaf_entry.leaf_cid,
+                                        leaf_entry.sidecar_cid.as_ref(),
+                                        false,
+                                    )
+                                    .map_err(|e| QueryError::from_io("leaf open", e))?,
+                            ),
+                        };
+                        if let Some((count, first, last)) =
+                            decode_numbig_handle_run(handle.as_ref(), idx, entry.o_type_const)?
+                        {
+                            partial.push_run(count, first, last);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Some(partial))
+    };
+
+    let parallel = leaves.len() >= crate::fast_path_common::parallel_dir_walk_min_leaves();
+    Ok(
+        parallel_leaf_chunk_reduce(leaves, parallel, map, NumBigHandlePartial::combine)?
+            .map_or(0, |p| p.count),
+    )
+}
+
+/// The set of NumBig handles with a live row under `p_id`, sorted and
+/// deduplicated. Reads the `o_key` column (plus `o_type` for a straddling
+/// leaflet) over the predicate's NumBig leaflets only — the fallback for a
+/// predicate whose arena holds retracted values.
+fn live_numbig_handles(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Result<Vec<u32>> {
+    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
+    if leaves.is_empty() {
+        return Ok(Vec::new());
+    }
+    let numbig = OType::NUM_BIG_OVERFLOW.as_u16();
+
+    let map = |chunk: &[LeafEntry]| -> Result<Option<Vec<u32>>> {
+        let mut handles: Vec<u32> = Vec::new();
+        for leaf_entry in chunk {
+            let dir = store
+                .open_leaf_dir(&leaf_entry.leaf_cid)
+                .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
+            let wanted: Vec<usize> = dir
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| {
+                    !matches!(classify_numbig_leaflet(e, p_id), NumBigLeaflet::Outside)
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if wanted.is_empty() {
+                continue;
+            }
+            let handle = store
+                .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
+                .map_err(|e| QueryError::from_io("leaf open", e))?;
+            for idx in wanted {
+                let entry = &dir.entries[idx];
+                let batch = handle
+                    .load_columns(idx, &projection_otype_okey(), RunSortOrder::Post)
+                    .map_err(|e| QueryError::Internal(format!("leaflet columns: {e}")))?;
+                let o_type_default = entry.o_type_const.unwrap_or(0);
+                for row in 0..batch.row_count {
+                    if batch.o_type.get_or(row, o_type_default) != numbig {
+                        continue;
+                    }
+                    let h = batch.o_key.get(row) as u32;
+                    if handles.last() != Some(&h) {
+                        handles.push(h);
+                    }
+                }
+            }
+        }
+        Ok(Some(handles))
+    };
+
+    let parallel = leaves.len() >= crate::fast_path_common::parallel_dir_walk_min_leaves();
+    let mut handles = parallel_leaf_chunk_reduce(leaves, parallel, map, |mut l, r| {
+        l.extend(r);
+        l
+    })?
+    .unwrap_or_default();
+    handles.sort_unstable();
+    handles.dedup();
+    Ok(handles)
+}
+
+/// Outcome of a lead-group walk: distinct groups over the leaflets that were
+/// counted, plus how many rows were skipped because their `(o_type, o_key)`
+/// lead is not a graph-wide identity.
+struct LeadGroupWalk {
+    count: u64,
+    skipped_non_identifying_rows: u64,
+}
+
+/// Walks leaflet directories only. With `require_identifying_o_key`, leaflets
+/// whose key range can hold a non-identifying `o_key` are excluded from the
+/// count and their rows tallied instead — they cannot participate in seam
+/// dedup either, which is sound because a NumBig lead can never equal a
+/// non-NumBig one (the o_type differs in the leading two bytes).
+fn count_distinct_lead_groups_inner(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    order: RunSortOrder,
+    lead_len: usize,
+    require_identifying_o_key: bool,
+) -> Result<Option<LeadGroupWalk>> {
+    let Some(branch) = store.branch_for_order(g_id, order) else {
+        return Ok(Some(LeadGroupWalk {
+            count: 0,
+            skipped_non_identifying_rows: 0,
+        }));
     };
 
     let map = |chunk: &[LeafEntry]| -> Result<Option<LeadGroupPartial>> {
@@ -1241,6 +1734,7 @@ fn count_distinct_lead_groups(
             count: 0,
             first_lead: Vec::new(),
             last_lead: Vec::new(),
+            skipped_rows: 0,
         };
         for leaf_entry in chunk {
             let dir = store
@@ -1259,6 +1753,14 @@ fn count_distinct_lead_groups(
                     QueryError::execution("leaflet key shorter than expected lead_len")
                 })?;
 
+                // `o_type` is the leading big-endian u16 of an OPST key, so the
+                // entry's own `[first, last]` interval says whether the leaflet
+                // can hold a non-identifying object key — no payload read.
+                if require_identifying_o_key && leaflet_may_hold_non_identifying_o_key(entry) {
+                    partial.skipped_rows += u64::from(entry.row_count);
+                    continue;
+                }
+
                 partial.count += u64::from(entry.lead_group_count);
                 if !partial.last_lead.is_empty() && partial.last_lead == lead_first {
                     partial.count = partial.count.saturating_sub(1);
@@ -1274,11 +1776,20 @@ fn count_distinct_lead_groups(
     };
 
     let combine = |left: LeadGroupPartial, right: LeadGroupPartial| -> LeadGroupPartial {
+        // Fold the tally before the empty-side short-circuits: a chunk with no
+        // counted leaflets may still have skipped some.
+        let skipped_rows = left.skipped_rows.saturating_add(right.skipped_rows);
         if right.first_lead.is_empty() {
-            return left;
+            return LeadGroupPartial {
+                skipped_rows,
+                ..left
+            };
         }
         if left.first_lead.is_empty() {
-            return right;
+            return LeadGroupPartial {
+                skipped_rows,
+                ..right
+            };
         }
         let seam_dedup = u64::from(left.last_lead == right.first_lead);
         LeadGroupPartial {
@@ -1288,12 +1799,51 @@ fn count_distinct_lead_groups(
                 .saturating_sub(seam_dedup),
             first_lead: left.first_lead,
             last_lead: right.last_lead,
+            skipped_rows,
         }
     };
 
     let parallel = branch.leaves.len() >= crate::fast_path_common::parallel_dir_walk_min_leaves();
     let result = parallel_leaf_chunk_reduce(&branch.leaves, parallel, map, combine)?;
-    Ok(result.map_or(0, |p| p.count))
+    Ok(Some(match result {
+        Some(p) => LeadGroupWalk {
+            count: p.count,
+            skipped_non_identifying_rows: p.skipped_rows,
+        },
+        None => LeadGroupWalk {
+            count: 0,
+            skipped_non_identifying_rows: 0,
+        },
+    }))
+}
+
+/// Whether an OPST leaflet's key range can cover an object key that is not a
+/// graph-wide identity.
+///
+/// OPST keys lead with a big-endian `o_type`, so the directory entry's
+/// `[first_key[0..2], last_key[0..2]]` interval bounds every `o_type` in the
+/// leaflet without opening a column. Which o_types are the exceptions is the
+/// `OType` vocabulary's business, not this walk's — both branches below defer
+/// to it, so a new non-identifying o_type needs no edit here.
+///
+/// Leaflets are segmented type-homogeneously today (`leaflet.rs` asserts it),
+/// so the point branch is the live one; the range branch costs nothing extra
+/// and stays correct if that ever changes.
+fn leaflet_may_hold_non_identifying_o_key(
+    entry: &fluree_db_binary_index::format::leaf::LeafletDirEntryV3,
+) -> bool {
+    let o_type_at = |k: &[u8]| -> OType {
+        OType::from_u16(u16::from_be_bytes([
+            k.first().copied().unwrap_or(0),
+            k.get(1).copied().unwrap_or(0),
+        ]))
+    };
+    let lo = o_type_at(&entry.first_key);
+    let hi = o_type_at(&entry.last_key);
+    if lo == hi {
+        return !lo.o_key_is_globally_identifying();
+    }
+    OType::range_holds_non_globally_identifying(lo, hi)
 }
 
 /// Per-chunk partial for the per-predicate distinct-object count: the same
@@ -1570,7 +2120,7 @@ fn count_literal_rows_psot(store: &BinaryIndexStore, g_id: GraphId) -> Result<u6
     for leaf_entry in &branch.leaves {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         let dir = handle.dir();
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
             if entry.row_count == 0 {
@@ -1660,7 +2210,7 @@ fn count_blank_subject_rows_spot(store: &BinaryIndexStore, g_id: GraphId) -> Res
     for leaf_entry in leaves {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         let dir = handle.dir();
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
             if entry.row_count == 0 {
@@ -1707,6 +2257,109 @@ mod tests {
     use fluree_db_core::index_stats::{GraphPropertyStatEntry, GraphStatsEntry};
     use fluree_db_core::IndexStats;
 
+    #[test]
+    fn numbig_signed_keys_preserve_boundaries() {
+        use num_bigint::BigInt;
+        for value in [
+            0,
+            127,
+            128,
+            -128,
+            -129,
+            i64::MIN as i128,
+            i64::MAX as i128,
+            i128::MIN,
+            i128::MAX,
+        ] {
+            let bytes = BigInt::from(value).to_signed_bytes_le();
+            assert_eq!(i128_from_signed_le(&bytes), Some(value));
+            assert_eq!(
+                NumBigDistinctKey::from_stored(&StoredBigValue::BigInt(bytes), true),
+                NumBigDistinctKey::Int(value)
+            );
+        }
+        for value in [BigInt::from(i128::MIN) - 1u8, BigInt::from(i128::MAX) + 1u8] {
+            let bytes = value.to_signed_bytes_le();
+            assert_eq!(i128_from_signed_le(&bytes), None);
+            let int = NumBigDistinctKey::from_stored(&StoredBigValue::BigInt(bytes.clone()), true);
+            let dec = NumBigDistinctKey::from_stored(
+                &StoredBigValue::BigDec {
+                    unscaled: bytes.clone(),
+                    scale: 0,
+                },
+                true,
+            );
+            assert_eq!(int, NumBigDistinctKey::IntWide(bytes.clone()));
+            assert_eq!(dec, NumBigDistinctKey::DecWide(bytes, 0));
+            assert_ne!(int, dec);
+        }
+    }
+
+    #[test]
+    fn numbig_stored_keys_match_normalized_keys() {
+        use fluree_db_binary_index::arena::numbig::{
+            read_numbig_arena_from_bytes, write_numbig_arena_to_bytes,
+        };
+        let mut arena = NumBigArena::new();
+        for lexical in [
+            "1.50",
+            "-1.500",
+            "0.000",
+            "1000.00",
+            "170141183460469231731687303715884105728.1",
+        ] {
+            arena.get_or_insert_bigdec(&lexical.parse().unwrap());
+        }
+        arena.get_or_insert_bigint(&"170141183460469231731687303715884105728".parse().unwrap());
+        let loaded =
+            read_numbig_arena_from_bytes(&write_numbig_arena_to_bytes(&arena).unwrap()).unwrap();
+        for arena in [&arena, &loaded] {
+            assert!(arena.values_are_normalized());
+            for value in arena.values() {
+                assert_eq!(
+                    NumBigDistinctKey::from_stored(value, arena.values_are_normalized()),
+                    NumBigDistinctKey::from_repr(value.normalized_repr())
+                );
+            }
+        }
+        for (unscaled, scale, expected) in [
+            (150i128, 2, NumBigDistinctKey::Dec(15, 1)),
+            (0, 3, NumBigDistinctKey::Dec(0, 0)),
+            (-1000, 2, NumBigDistinctKey::Dec(-1, -1)),
+        ] {
+            let value = StoredBigValue::BigDec {
+                unscaled: num_bigint::BigInt::from(unscaled).to_signed_bytes_le(),
+                scale,
+            };
+            assert_eq!(NumBigDistinctKey::from_stored(&value, false), expected);
+        }
+        assert_ne!(NumBigDistinctKey::Dec(15, 1), NumBigDistinctKey::Int(15));
+    }
+
+    #[test]
+    fn numbig_handle_partials_dedup_seams_and_preserve_empty_chunks() {
+        let mut left = NumBigHandlePartial::default();
+        left.push_run(2, 0, 1);
+        left.push_run(2, 1, 2);
+        assert_eq!((left.count, left.first, left.last), (3, Some(0), Some(2)));
+        let left = NumBigHandlePartial::combine(NumBigHandlePartial::default(), left);
+        let left = NumBigHandlePartial::combine(left, NumBigHandlePartial::default());
+        let mut right = NumBigHandlePartial::default();
+        right.push_run(2, 2, 3);
+        let merged = NumBigHandlePartial::combine(left, right);
+        assert_eq!(
+            (merged.count, merged.first, merged.last),
+            (4, Some(0), Some(3))
+        );
+        let mut disjoint = NumBigHandlePartial::default();
+        disjoint.push_run(2, 5, 6);
+        let merged = NumBigHandlePartial::combine(merged, disjoint);
+        assert_eq!(
+            (merged.count, merged.first, merged.last),
+            (6, Some(0), Some(6))
+        );
+    }
+
     fn prop(p_id: u32, datatypes: Vec<(u8, u64)>) -> GraphPropertyStatEntry {
         let count = datatypes.iter().map(|&(_, c)| c).sum();
         GraphPropertyStatEntry {
@@ -1715,6 +2368,8 @@ mod tests {
             ndv_values: 0,
             ndv_subjects: 0,
             last_modified_t: 1,
+            observed_datatypes: fluree_db_core::PropertyStatEntry::tags_of(&datatypes),
+            historical_datatypes: vec![],
             datatypes,
         }
     }
@@ -1733,6 +2388,7 @@ mod tests {
                 properties,
                 classes: None,
             }]),
+            historical_since_t: None,
         }
     }
 
@@ -1790,6 +2446,7 @@ mod tests {
             properties: None,
             classes: None,
             graphs: None,
+            historical_since_t: None,
         };
         assert_eq!(count_literal_rows_from_stats(&no_graphs, 0), None);
     }

@@ -26,6 +26,7 @@ mod inner {
     use fluree_db_core::CommitId;
     use fluree_db_core::{
         ContentAddressedWrite, ContentId, ContentKind, Flake, FlakeMeta, FlakeValue, Sid,
+        TxnMetaEntry,
     };
 
     /// Returns `Some(mode)` for the genesis commit (no parent), `None` otherwise.
@@ -124,6 +125,8 @@ mod inner {
     /// * `ttl` — Turtle input text
     /// * `storage` — storage backend for writing commit blobs
     /// * `ledger_id` — ledger name for storage path construction
+    /// * `skolem_base` — document-scoped blank-node key, built by the caller
+    ///   via `fluree_db_core::skolem::skolem_base`
     /// * `compress` — whether to zstd-compress the ops stream
     #[allow(clippy::too_many_arguments)]
     pub async fn import_commit<S>(
@@ -131,6 +134,7 @@ mod inner {
         ttl: &str,
         storage: &S,
         ledger_id: &str,
+        skolem_base: &str,
         compress: bool,
         spool_dir: Option<&std::path::Path>,
         spool_config: Option<&crate::import_sink::SpoolConfig>,
@@ -140,7 +144,6 @@ mod inner {
         S: ContentAddressedWrite,
     {
         let new_t = state.t + 1;
-        let txn_id = format!("{ledger_id}-{new_t}");
 
         // 1. Create ImportSink + parse TTL
         let ns_codes_before = state.ns_registry.code_count();
@@ -151,8 +154,24 @@ mod inner {
             ns_codes = ns_codes_before,
         )
         .entered();
-        let mut sink = ImportSink::new(&mut state.ns_registry, new_t, txn_id, compress)
-            .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
+        // Allocate namespace codes through the spool's shared allocator when
+        // spooling — SpoolContext resolves code→prefix at record-push time
+        // (mid-parse), so registry-only codes would fall back to an empty
+        // prefix and write suffix-only strings into the index dicts. See the
+        // matching comment in `import_trig_commit`.
+        let shared_ns: Arc<SharedNamespaceAllocator> = match spool_config {
+            Some(cfg) => Arc::clone(&cfg.ns_alloc),
+            None => Arc::new(SharedNamespaceAllocator::from_registry(&state.ns_registry)),
+        };
+        let mut worker_cache = WorkerCache::new(Arc::clone(&shared_ns));
+        let mut sink = ImportSink::new_cached(
+            &mut worker_cache,
+            new_t,
+            skolem_base.to_string(),
+            0,
+            compress,
+        )
+        .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
 
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
             let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
@@ -169,12 +188,23 @@ mod inner {
         let (writer, op_count, spool_result, envelope) = {
             let _span = tracing::debug_span!("import_build_envelope", t = new_t).entered();
             let (writer, chunk_prefix_map, spool_ctx) = sink
-                .finish()
+                .into_parts()
                 .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
             state.prefix_map.extend(chunk_prefix_map);
 
             let spool_result = spool_ctx.map(crate::import_sink::SpoolContext::finish_buffered);
             let op_count = writer.op_count();
+
+            // Adopt this commit's shared-allocator codes into the registry so
+            // take_delta() includes them in the commit's namespace_delta.
+            let new_codes = worker_cache.into_new_codes();
+            if !new_codes.is_empty() {
+                let adopted = shared_ns.lookup_codes(&new_codes);
+                state
+                    .ns_registry
+                    .adopt_delta_for_persistence(&adopted)
+                    .map_err(|e| TransactError::Parse(format!("namespace adopt conflict: {e}")))?;
+            }
             let ns_delta = state.ns_registry.take_delta();
             let ns_codes_after = state.ns_registry.code_count();
 
@@ -216,10 +246,13 @@ mod inner {
         let blob_bytes = result.bytes.len();
 
         // 5. Store
+        // `.instrument` (not a held `EnteredSpan`) across the await: an entered
+        // span guard is !Send and must never live across a suspension point.
         let write_res = {
-            let _span = tracing::debug_span!("import_store", t = new_t, blob_bytes).entered();
+            use tracing::Instrument as _;
             storage
                 .content_write_bytes(ContentKind::Commit, ledger_id, &result.bytes)
+                .instrument(tracing::debug_span!("import_store", t = new_t, blob_bytes))
                 .await?
         };
 
@@ -256,6 +289,7 @@ mod inner {
         prelude: &TurtlePrelude,
         storage: &S,
         ledger_id: &str,
+        skolem_base: &str,
         compress: bool,
         spool_dir: Option<&std::path::Path>,
         spool_config: Option<&crate::import_sink::SpoolConfig>,
@@ -275,7 +309,6 @@ mod inner {
         }
 
         let new_t = state.t + 1;
-        let txn_id = format!("{ledger_id}-{new_t}");
 
         let ns_codes_before = state.ns_registry.code_count();
         let _parse_span = tracing::debug_span!(
@@ -285,8 +318,21 @@ mod inner {
             ns_codes = ns_codes_before,
         )
         .entered();
-        let mut sink = ImportSink::new(&mut state.ns_registry, new_t, txn_id, compress)
-            .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
+        // Shared-allocator-backed allocation for spool prefix visibility;
+        // see the comment in `import_commit`.
+        let shared_ns: Arc<SharedNamespaceAllocator> = match spool_config {
+            Some(cfg) => Arc::clone(&cfg.ns_alloc),
+            None => Arc::new(SharedNamespaceAllocator::from_registry(&state.ns_registry)),
+        };
+        let mut worker_cache = WorkerCache::new(Arc::clone(&shared_ns));
+        let mut sink = ImportSink::new_cached(
+            &mut worker_cache,
+            new_t,
+            skolem_base.to_string(),
+            0,
+            compress,
+        )
+        .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
 
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
             let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
@@ -307,11 +353,20 @@ mod inner {
         let (writer, op_count, spool_result, envelope) = {
             let _span = tracing::debug_span!("import_build_envelope", t = new_t).entered();
             let (writer, _chunk_prefix_map, spool_ctx) = sink
-                .finish()
+                .into_parts()
                 .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
 
             let spool_result = spool_ctx.map(crate::import_sink::SpoolContext::finish_buffered);
             let op_count = writer.op_count();
+
+            let new_codes = worker_cache.into_new_codes();
+            if !new_codes.is_empty() {
+                let adopted = shared_ns.lookup_codes(&new_codes);
+                state
+                    .ns_registry
+                    .adopt_delta_for_persistence(&adopted)
+                    .map_err(|e| TransactError::Parse(format!("namespace adopt conflict: {e}")))?;
+            }
             let ns_delta = state.ns_registry.take_delta();
             let ns_codes_after = state.ns_registry.code_count();
 
@@ -350,10 +405,13 @@ mod inner {
         let commit_cid = ContentId::new(ContentKind::Commit, &result.bytes);
         let blob_bytes = result.bytes.len();
 
+        // `.instrument` (not a held `EnteredSpan`) across the await: an entered
+        // span guard is !Send and must never live across a suspension point.
         let write_res = {
-            let _span = tracing::debug_span!("import_store", t = new_t, blob_bytes).entered();
+            use tracing::Instrument as _;
             storage
                 .content_write_bytes(ContentKind::Commit, ledger_id, &result.bytes)
+                .instrument(tracing::debug_span!("import_store", t = new_t, blob_bytes))
                 .await?
         };
 
@@ -395,6 +453,8 @@ mod inner {
     /// * `trig` — TriG input text (Turtle-compatible if no GRAPH blocks)
     /// * `storage` — storage backend for writing commit blobs
     /// * `ledger_id` — ledger name for storage path construction
+    /// * `skolem_base` — document-scoped blank-node key, built by the caller
+    ///   via `fluree_db_core::skolem::skolem_base`
     /// * `compress` — whether to zstd-compress the ops stream
     #[allow(clippy::too_many_arguments)]
     pub async fn import_trig_commit<S>(
@@ -402,6 +462,7 @@ mod inner {
         trig: &str,
         storage: &S,
         ledger_id: &str,
+        skolem_base: &str,
         compress: bool,
         spool_dir: Option<&std::path::Path>,
         spool_config: Option<&crate::import_sink::SpoolConfig>,
@@ -411,7 +472,6 @@ mod inner {
         S: ContentAddressedWrite,
     {
         let new_t = state.t + 1;
-        let txn_id = format!("{ledger_id}-{new_t}");
 
         // 1. Parse TriG to extract GRAPH blocks
         let phase1 = parse_trig_phase1(trig)?;
@@ -423,6 +483,7 @@ mod inner {
                 trig,
                 storage,
                 ledger_id,
+                skolem_base,
                 compress,
                 spool_dir,
                 spool_config,
@@ -439,9 +500,30 @@ mod inner {
         )
         .entered();
 
-        // 2. Create ImportSink and parse default graph Turtle
-        let mut sink = ImportSink::new(&mut state.ns_registry, new_t, txn_id.clone(), compress)
-            .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
+        // 2. Create ImportSink and parse default graph Turtle.
+        //
+        // Namespace codes MUST be allocated through the spool's shared
+        // allocator (not `state.ns_registry` directly): SpoolContext resolves
+        // code→prefix via `ns_alloc` at record-push time — i.e. DURING the
+        // parse, right after an `@prefix` directive allocates the code. Codes
+        // that only live in the registry are invisible to it, and its
+        // empty-prefix fallback would permanently write suffix-only predicate
+        // strings into the index's predicate dict (breaking bound-predicate
+        // lookups after import). Without spooling, a throwaway allocator
+        // seeded from the registry preserves exact code assignment.
+        let shared_ns: Arc<SharedNamespaceAllocator> = match spool_config {
+            Some(cfg) => Arc::clone(&cfg.ns_alloc),
+            None => Arc::new(SharedNamespaceAllocator::from_registry(&state.ns_registry)),
+        };
+        let mut worker_cache = WorkerCache::new(Arc::clone(&shared_ns));
+        let mut sink = ImportSink::new_cached(
+            &mut worker_cache,
+            new_t,
+            skolem_base.to_string(),
+            0,
+            compress,
+        )
+        .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
 
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
             let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
@@ -461,7 +543,7 @@ mod inner {
         // root's `named_graphs` routing exactly like default-graph triples.
         // The spool is finished only after the named-graph loop completes.
         let (mut writer, chunk_prefix_map, mut spool_ctx) = sink
-            .finish()
+            .into_parts()
             .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
         state.prefix_map.extend(chunk_prefix_map);
         let mut op_count = writer.op_count();
@@ -471,7 +553,40 @@ mod inner {
         // Only new mappings (introduced by this commit) go into graph_delta.
         let mut graph_delta: HashMap<u16, String> = HashMap::new();
 
+        // Reserved system graphs are refused HERE because bulk import bypasses
+        // staging entirely: #1838's data-write guard lives in `stage()`
+        // (`stage.rs`, `ReservedGraphTarget`) and never sees these blocks. The
+        // parser assumes otherwise -- `parse/trig_meta.rs` notes "a write to the
+        // ledger's full txn-meta IRI is refused in `stage()`" -- which holds for
+        // every write surface except this one.
+        //
+        // Without the guard the flakes are encoded into the commit blob under
+        // the reserved g_id and then dropped by the graph-scoped index builder,
+        // which builds g_id 1 only from the synthetic commit-metadata chunk and
+        // has no pass for g_id 2 at all. The result is durable-but-unreadable
+        // data on an indexed ledger and, worse, *readable* forged commit
+        // provenance on a replica that has not indexed yet (issue #1846).
+        //
+        // The `<#txn-meta>` sentinel spelling is a different thing and stays
+        // supported: `parse_trig_phase1` routes it to `raw_meta`, so legitimate
+        // commit metadata never reaches this loop.
+        let txn_meta_iri = fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id);
+        let config_iri = fluree_db_core::graph_registry::config_graph_iri(ledger_id);
+
         for block in &phase1.named_graphs {
+            crate::stage::refuse_default_graph_name(&block.iri)?;
+            // Refuse by literal IRI, mirroring the staged-write guard's shape.
+            if block.iri == txn_meta_iri {
+                return Err(TransactError::ReservedGraphTarget {
+                    graph_iri: block.iri.clone(),
+                });
+            }
+            if block.iri == config_iri {
+                return Err(TransactError::ConfigGraphImportUnsupported {
+                    graph_iri: block.iri.clone(),
+                });
+            }
+
             // Allocate or reuse g_id for this graph IRI.
             //
             // When spooling (index build) is active, allocate from the shared
@@ -496,8 +611,25 @@ mod inner {
                 id
             };
 
+            // Second arm, mirroring `stage.rs`: refuse by what the IRI actually
+            // *routes to*, not only by how it is spelled. The shared graph
+            // allocator is pre-seeded with the two reserved IRIs, so this is
+            // belt-and-braces today; it is what keeps the guard correct if the
+            // seeding ever changes. One integer compare per graph block.
+            if g_id < fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID {
+                return Err(if g_id == fluree_db_core::graph_registry::CONFIG_GRAPH_ID {
+                    TransactError::ConfigGraphImportUnsupported {
+                        graph_iri: block.iri.clone(),
+                    }
+                } else {
+                    TransactError::ReservedGraphTarget {
+                        graph_iri: block.iri.clone(),
+                    }
+                });
+            }
+
             // Create a graph Sid (using the graph IRI's namespace + local name)
-            let graph_sid = state.ns_registry.sid_for_iri(&block.iri);
+            let graph_sid = worker_cache.sid_for_iri(&block.iri);
 
             // Process each triple in this named graph
             for triple in &block.triples {
@@ -505,12 +637,17 @@ mod inner {
                     TransactError::Parse("named graph triple missing subject".to_string())
                 })?;
 
-                let s = expand_term(subject, &block.prefixes, &mut state.ns_registry)?;
-                let p = expand_term(&triple.predicate, &block.prefixes, &mut state.ns_registry)?;
+                let s = expand_term(subject, &block.prefixes, &mut worker_cache, skolem_base)?;
+                let p = expand_term(
+                    &triple.predicate,
+                    &block.prefixes,
+                    &mut worker_cache,
+                    skolem_base,
+                )?;
 
                 for obj in &triple.objects {
                     let (o, dt, lang) =
-                        expand_object(obj, &block.prefixes, &mut state.ns_registry)?;
+                        expand_object(obj, &block.prefixes, &mut worker_cache, skolem_base)?;
 
                     // Spool the named-graph flake under its g_id (so it enters
                     // the index), then encode it into the commit blob.
@@ -526,7 +663,7 @@ mod inner {
                                 list_index: None,
                                 t: new_t,
                             },
-                        );
+                        )?;
                     }
 
                     let meta = lang.as_deref().map(FlakeMeta::with_lang);
@@ -547,11 +684,72 @@ mod inner {
                     op_count += 1;
                 }
             }
+
+            // TriG-star: `f:reifies*` bundles in the same graph as the edge
+            // they reify — the bundle the default-graph `ImportSink` emits,
+            // with `f:reifiesGraph` set.
+            for r in &block.reified {
+                let ann = expand_term(&r.reifier, &block.prefixes, &mut worker_cache, skolem_base)?;
+                let s = expand_term(&r.subject, &block.prefixes, &mut worker_cache, skolem_base)?;
+                let p = expand_term(
+                    &r.predicate,
+                    &block.prefixes,
+                    &mut worker_cache,
+                    skolem_base,
+                )?;
+                let (o, dt, lang) =
+                    expand_object(&r.object, &block.prefixes, &mut worker_cache, skolem_base)?;
+                let dtc = match lang {
+                    Some(lang) => fluree_db_core::DatatypeConstraint::LangTag(Arc::from(lang)),
+                    None => fluree_db_core::DatatypeConstraint::Explicit(dt),
+                };
+                let bundle = crate::generate::flakes::reified_triple_bundle(
+                    Some(graph_sid.clone()),
+                    s,
+                    p,
+                    o,
+                    &dtc,
+                    &ann,
+                    new_t,
+                )?;
+                for flake in bundle {
+                    if let Some(sc) = spool_ctx.as_mut() {
+                        sc.push_named_graph_record(
+                            g_id,
+                            crate::import_sink::FlakeRecord {
+                                s: &flake.s,
+                                p: &flake.p,
+                                o: &flake.o,
+                                dt: &flake.dt,
+                                lang: flake.m.as_ref().and_then(|m| m.lang.as_deref()),
+                                list_index: None,
+                                t: new_t,
+                            },
+                        )?;
+                    }
+                    writer.push_flake(&flake).map_err(|e| {
+                        TransactError::Parse(format!("failed to encode reifier bundle flake: {e}"))
+                    })?;
+                    op_count += 1;
+                }
+            }
         }
 
         // Named-graph flakes are now in the spool; finish it for the index.
         let spool_result = spool_ctx.map(crate::import_sink::SpoolContext::finish_buffered);
         drop(_parse_span);
+
+        // Adopt codes this commit allocated in the shared allocator into the
+        // registry, recording them for persistence so take_delta() below
+        // includes them in this commit's namespace_delta.
+        let new_codes = worker_cache.into_new_codes();
+        if !new_codes.is_empty() {
+            let adopted = shared_ns.lookup_codes(&new_codes);
+            state
+                .ns_registry
+                .adopt_delta_for_persistence(&adopted)
+                .map_err(|e| TransactError::Parse(format!("namespace adopt conflict: {e}")))?;
+        }
 
         // 5. Resolve txn-meta if present
         let txn_meta = if let Some(ref raw_meta) = phase1.raw_meta {
@@ -600,10 +798,17 @@ mod inner {
         let blob_bytes = result.bytes.len();
 
         // 8. Store
+        // `.instrument` (not a held `EnteredSpan`) across the await — see
+        // `import_commit`'s store step.
         let write_res = {
-            let _span = tracing::debug_span!("import_trig_store", t = new_t, blob_bytes).entered();
+            use tracing::Instrument as _;
             storage
                 .content_write_bytes(ContentKind::Commit, ledger_id, &result.bytes)
+                .instrument(tracing::debug_span!(
+                    "import_trig_store",
+                    t = new_t,
+                    blob_bytes
+                ))
                 .await?
         };
 
@@ -630,27 +835,37 @@ mod inner {
         })
     }
 
-    /// Expand a RawTerm to a Sid using the prefix map and namespace registry.
+    /// Expand a RawTerm to a Sid using the prefix map and worker cache.
+    ///
+    /// Allocation goes through the shared-allocator-backed [`WorkerCache`] so
+    /// the spool's prefix lookups see codes the moment they're allocated (see
+    /// the comment in `import_trig_commit`).
+    ///
+    /// Blank-node labels are skolemized with the same `{skolem_base}-{label}` key
+    /// as `ImportSink::skolemize`, so a label shared between the default graph
+    /// and a named-graph block of one TriG document resolves to one node
+    /// (TriG scopes labels to the whole document), while the same label in a
+    /// different document/commit stays distinct.
     fn expand_term(
         term: &RawTerm,
         prefixes: &rustc_hash::FxHashMap<String, String>,
-        ns_registry: &mut NamespaceRegistry,
+        ns: &mut WorkerCache,
+        skolem_base: &str,
     ) -> Result<Sid> {
         match term {
             RawTerm::Iri(iri) => {
                 if let Some(local) = iri.strip_prefix("_:") {
-                    // Blank node - skolemize
-                    Ok(ns_registry.blank_node_sid(local))
+                    Ok(ns.blank_node_sid(&format!("{skolem_base}-{local}")))
                 } else {
-                    Ok(ns_registry.sid_for_iri(iri))
+                    Ok(ns.sid_for_iri(iri))
                 }
             }
             RawTerm::PrefixedName { prefix, local } => {
-                let ns = prefixes
+                let namespace = prefixes
                     .get(prefix.as_str())
                     .ok_or_else(|| TransactError::Parse(format!("undefined prefix: {prefix}")))?;
-                let iri = format!("{ns}{local}");
-                Ok(ns_registry.sid_for_iri(&iri))
+                let iri = format!("{namespace}{local}");
+                Ok(ns.sid_for_iri(&iri))
             }
         }
     }
@@ -659,23 +874,25 @@ mod inner {
     fn expand_object(
         obj: &RawObject,
         prefixes: &rustc_hash::FxHashMap<String, String>,
-        ns_registry: &mut NamespaceRegistry,
+        ns: &mut WorkerCache,
+        skolem_base: &str,
     ) -> Result<(FlakeValue, Sid, Option<String>)> {
         match obj {
             RawObject::Iri(iri) => {
+                // Blank labels use the ImportSink skolem key; see expand_term.
                 let sid = if let Some(local) = iri.strip_prefix("_:") {
-                    ns_registry.blank_node_sid(local)
+                    ns.blank_node_sid(&format!("{skolem_base}-{local}"))
                 } else {
-                    ns_registry.sid_for_iri(iri)
+                    ns.sid_for_iri(iri)
                 };
                 Ok((FlakeValue::Ref(sid), DT_ID.clone(), None))
             }
             RawObject::PrefixedName { prefix, local } => {
-                let ns = prefixes
+                let namespace = prefixes
                     .get(prefix.as_str())
                     .ok_or_else(|| TransactError::Parse(format!("undefined prefix: {prefix}")))?;
-                let iri = format!("{ns}{local}");
-                let sid = ns_registry.sid_for_iri(&iri);
+                let iri = format!("{namespace}{local}");
+                let sid = ns.sid_for_iri(&iri);
                 Ok((FlakeValue::Ref(sid), DT_ID.clone(), None))
             }
             RawObject::String(s) => Ok((
@@ -704,11 +921,8 @@ mod inner {
                 Some(lang.clone()),
             )),
             RawObject::TypedLiteral { value, datatype } => {
-                let (fv, dt) = convert_string_literal(
-                    value,
-                    datatype,
-                    &mut NsAllocator::Exclusive(ns_registry),
-                );
+                let (fv, dt) =
+                    convert_string_literal(value, datatype, &mut NsAllocator::Cached(ns));
                 Ok((fv, dt, None))
             }
         }
@@ -740,6 +954,13 @@ mod inner {
         /// buffered RunRecords with chunk-local IDs and chunk-local
         /// dictionaries for the post-parse sort + sorted commit write pipeline.
         pub spool_result: Option<crate::import_sink::BufferedSpoolResult>,
+        /// Transaction metadata for this chunk's commit envelope. EMPTY for every
+        /// text-import chunk (Turtle/TriG/JSON-LD) — those set `Vec::new()`, so the
+        /// commit is byte-identical to before this field existed. The materialize
+        /// (twin) builder sets it on ONE chunk — the FINAL commit — to carry the
+        /// completion stamp (watermark + mapping hash + builder version), so a
+        /// twin is valid iff a head-walk finds the stamp (DEC-003 §17).
+        pub txn_meta: Vec<TxnMetaEntry>,
     }
 
     /// Parse a TTL chunk into a `StreamingCommitWriter`. Thread-safe.
@@ -748,7 +969,9 @@ mod inner {
     /// namespace lookups. New prefix allocations are tracked in the worker's
     /// `new_codes` set for commit-order publication by the serial finalizer.
     ///
-    /// The `t` value is pre-assigned by the caller (chunk_index + 1).
+    /// The `t` value is pre-assigned by the caller (chunk_index + 1);
+    /// `doc_scope` identifies the source document this chunk was cut from (see
+    /// [`skolem_base`]).
     ///
     /// If `spool_dir` is `Some`, a spool file is written alongside the commit
     /// blob for Phase A validation of the spool format.
@@ -757,19 +980,24 @@ mod inner {
         ttl: &str,
         alloc: &Arc<SharedNamespaceAllocator>,
         t: i64,
-        ledger_id: &str,
+        skolem_base: &str,
+        sub_chunk: u32,
         compress: bool,
         spool_dir: Option<&std::path::Path>,
         spool_config: Option<&crate::import_sink::SpoolConfig>,
         chunk_idx: usize,
     ) -> Result<ParsedChunk> {
-        let txn_id = format!("{ledger_id}-{t}");
-
         let _parse_span = tracing::debug_span!("parse_chunk", t, ttl_bytes = ttl.len(),).entered();
 
         let mut worker_cache = WorkerCache::new(Arc::clone(alloc));
-        let mut sink = ImportSink::new_cached(&mut worker_cache, t, txn_id, compress)
-            .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
+        let mut sink = ImportSink::new_cached(
+            &mut worker_cache,
+            t,
+            skolem_base.to_string(),
+            sub_chunk,
+            compress,
+        )
+        .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
 
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
             let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
@@ -783,7 +1011,7 @@ mod inner {
         drop(_parse_span);
 
         let (writer, prefix_map, spool_ctx) = sink
-            .finish()
+            .into_parts()
             .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
         let op_count = writer.op_count();
         let new_codes = worker_cache.into_new_codes();
@@ -796,6 +1024,7 @@ mod inner {
             new_codes,
             prefix_map,
             spool_result,
+            txn_meta: Vec::new(),
         })
     }
 
@@ -803,6 +1032,9 @@ mod inner {
     ///
     /// Like `parse_chunk`, but does not require the prefix block text to be
     /// prepended onto `ttl`. Uses a [`WorkerCache`] for lock-free lookups.
+    ///
+    /// `doc_scope` carries the same document-scoping contract as in
+    /// [`parse_chunk`] — see [`skolem_base`].
     ///
     /// If `spool_dir` is `Some`, a spool file is written alongside the commit
     /// blob for Phase A validation of the spool format.
@@ -812,13 +1044,13 @@ mod inner {
         alloc: &Arc<SharedNamespaceAllocator>,
         prelude: &TurtlePrelude,
         t: i64,
-        ledger_id: &str,
+        skolem_base: &str,
+        sub_chunk: u32,
         compress: bool,
         spool_dir: Option<&std::path::Path>,
         spool_config: Option<&crate::import_sink::SpoolConfig>,
         chunk_idx: usize,
     ) -> Result<ParsedChunk> {
-        let txn_id = format!("{ledger_id}-{t}");
         let _parse_span = tracing::debug_span!("parse_chunk", t, ttl_bytes = ttl.len(),).entered();
 
         let mut worker_cache = WorkerCache::new(Arc::clone(alloc));
@@ -828,8 +1060,14 @@ mod inner {
             worker_cache.get_or_allocate(ns_iri);
         }
 
-        let mut sink = ImportSink::new_cached(&mut worker_cache, t, txn_id, compress)
-            .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
+        let mut sink = ImportSink::new_cached(
+            &mut worker_cache,
+            t,
+            skolem_base.to_string(),
+            sub_chunk,
+            compress,
+        )
+        .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
 
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
             let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
@@ -848,7 +1086,7 @@ mod inner {
         drop(_parse_span);
 
         let (writer, _prefix_map, spool_ctx) = sink
-            .finish()
+            .into_parts()
             .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
         let op_count = writer.op_count();
         let new_codes = worker_cache.into_new_codes();
@@ -863,6 +1101,7 @@ mod inner {
             // need to contribute additional prefix mappings.
             prefix_map: HashMap::new(),
             spool_result,
+            txn_meta: Vec::new(),
         })
     }
 
@@ -927,20 +1166,34 @@ mod inner {
         jsonld: &str,
         alloc: &Arc<SharedNamespaceAllocator>,
         t: i64,
-        ledger_id: &str,
+        skolem_base: &str,
+        sub_chunk: u32,
         compress: bool,
         spool_dir: Option<&std::path::Path>,
         spool_config: Option<&crate::import_sink::SpoolConfig>,
         chunk_idx: usize,
     ) -> Result<ParsedChunk> {
-        let txn_id = format!("{ledger_id}-{t}");
+        // Chunk-scoped, matching the behavior before document scoping existed.
+        // For the `Files` and remote arms that is also document-scoped, because
+        // one chunk is one whole `.jsonld` file. It is NOT for the ndjson
+        // stream, where `NdjsonReader` packs many lines into one synthetic
+        // `@graph` document: labels there merge across lines within a chunk and
+        // split across chunks. That predates document scoping and is left alone
+        // deliberately — deciding whether an ndjson line is its own RDF
+        // document is a JSON-LD question, not a Turtle-chunking one.
 
         let _parse_span =
             tracing::debug_span!("parse_jsonld_chunk", t, jsonld_bytes = jsonld.len(),).entered();
 
         let mut worker_cache = WorkerCache::new(Arc::clone(alloc));
-        let mut sink = ImportSink::new_cached(&mut worker_cache, t, txn_id, compress)
-            .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
+        let mut sink = ImportSink::new_cached(
+            &mut worker_cache,
+            t,
+            skolem_base.to_string(),
+            sub_chunk,
+            compress,
+        )
+        .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
 
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
             let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
@@ -994,7 +1247,7 @@ mod inner {
         drop(_parse_span);
 
         let (writer, prefix_map, spool_ctx) = sink
-            .finish()
+            .into_parts()
             .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
         let op_count = writer.op_count();
         let new_codes = worker_cache.into_new_codes();
@@ -1007,6 +1260,7 @@ mod inner {
             new_codes,
             prefix_map,
             spool_result,
+            txn_meta: Vec::new(),
         })
     }
 
@@ -1030,63 +1284,73 @@ mod inner {
     {
         let new_t = state.t + 1;
 
-        let _span = tracing::debug_span!("finalize_parsed_chunk", t = new_t).entered();
+        // `.instrument` (not a held `EnteredSpan`): the body awaits the blob
+        // store, and an entered span guard is !Send across suspension points.
+        let span = tracing::debug_span!("finalize_parsed_chunk", t = new_t);
+        use tracing::Instrument as _;
+        async move {
+            // Merge published namespaces into serial registry to keep it in sync
+            // (needed for TriG serial paths and the final namespace snapshot).
+            for (code, prefix) in &ns_delta {
+                state.ns_registry.ensure_code(*code, prefix).map_err(|e| {
+                    TransactError::FlakeGeneration(format!("namespace code conflict: {e}"))
+                })?;
+            }
+            // Merge turtle prefix short names into session state
+            state.prefix_map.extend(parsed.prefix_map);
 
-        // Merge published namespaces into serial registry to keep it in sync
-        // (needed for TriG serial paths and the final namespace snapshot).
-        for (code, prefix) in &ns_delta {
-            state.ns_registry.ensure_code(*code, prefix).map_err(|e| {
-                TransactError::FlakeGeneration(format!("namespace code conflict: {e}"))
-            })?;
+            state.cumulative_flakes += parsed.op_count as u64;
+
+            // Persist split mode in genesis commit (first chunk, no previous ref).
+            let ns_split_mode = genesis_split_mode(state, state.ns_registry.split_mode());
+
+            let envelope = CodecEnvelope {
+                t: new_t,
+                parents: state.parent.clone().into_iter().collect(),
+                namespace_delta: ns_delta,
+                txn: None,
+                time: Some(state.import_time.clone()),
+
+                txn_signature: None,
+                // Empty for every text-import chunk (unchanged behavior); the
+                // materialize builder sets it on the final commit to carry the twin's
+                // completion stamp. The predicate namespace codes were interned through
+                // this chunk's sink, so they are already in `ns_delta` above.
+                txn_meta: parsed.txn_meta,
+                graph_delta: HashMap::new(),
+                ns_split_mode,
+            };
+
+            let result = parsed.writer.finish(&envelope)?;
+            let commit_cid = ContentId::new(ContentKind::Commit, &result.bytes);
+            let blob_bytes = result.bytes.len();
+
+            let write_res = storage
+                .content_write_bytes(ContentKind::Commit, ledger_id, &result.bytes)
+                .await?;
+
+            tracing::debug!(
+                t = new_t,
+                flakes = parsed.op_count,
+                blob_bytes,
+                address = %write_res.address,
+                "parsed chunk finalized and stored"
+            );
+
+            state.t = new_t;
+            state.parent = Some(commit_cid.clone());
+
+            Ok(ImportCommitResult {
+                commit_id: commit_cid,
+                t: new_t,
+                flake_count: parsed.op_count,
+                blob_bytes,
+                commit_blob: result.bytes,
+                spool_result: parsed.spool_result,
+            })
         }
-        // Merge turtle prefix short names into session state
-        state.prefix_map.extend(parsed.prefix_map);
-
-        state.cumulative_flakes += parsed.op_count as u64;
-
-        // Persist split mode in genesis commit (first chunk, no previous ref).
-        let ns_split_mode = genesis_split_mode(state, state.ns_registry.split_mode());
-
-        let envelope = CodecEnvelope {
-            t: new_t,
-            parents: state.parent.clone().into_iter().collect(),
-            namespace_delta: ns_delta,
-            txn: None,
-            time: Some(state.import_time.clone()),
-
-            txn_signature: None,
-            txn_meta: Vec::new(),
-            graph_delta: HashMap::new(),
-            ns_split_mode,
-        };
-
-        let result = parsed.writer.finish(&envelope)?;
-        let commit_cid = ContentId::new(ContentKind::Commit, &result.bytes);
-        let blob_bytes = result.bytes.len();
-
-        let write_res = storage
-            .content_write_bytes(ContentKind::Commit, ledger_id, &result.bytes)
-            .await?;
-
-        tracing::debug!(
-            t = new_t,
-            flakes = parsed.op_count,
-            blob_bytes,
-            address = %write_res.address,
-            "parsed chunk finalized and stored"
-        );
-
-        state.t = new_t;
-        state.parent = Some(commit_cid.clone());
-
-        Ok(ImportCommitResult {
-            commit_id: commit_cid,
-            t: new_t,
-            flake_count: parsed.op_count,
-            blob_bytes,
-            commit_blob: result.bytes,
-            spool_result: parsed.spool_result,
-        })
+        .instrument(span)
+        .await
     }
 }
 

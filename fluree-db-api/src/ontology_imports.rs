@@ -41,8 +41,15 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
+// moka's eviction clock reads std::time::Instant at cache construction, which
+// aborts on wasm32-unknown-unknown; use core's clock-free LRU stand-in there.
+#[cfg(not(target_arch = "wasm32"))]
+use moka::sync::Cache as SyncCache;
+
 use fluree_db_core::graph_registry::{CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID, TXN_META_GRAPH_ID};
 use fluree_db_core::ledger_config::{GraphSourceRef, ReasoningDefaults};
+#[cfg(target_arch = "wasm32")]
+use fluree_db_core::wasm_cache::Cache as SyncCache;
 use fluree_db_core::{GraphDbRef, GraphId, LedgerSnapshot, OverlayProvider};
 use fluree_db_query::{execute_pattern, Ref, Term, TriplePattern, VarRegistry};
 use fluree_vocab::config_iris;
@@ -161,9 +168,11 @@ fn resolve_local_graph_source(
     if let Some(ledger) = source.ledger.as_deref() {
         if ledger != snapshot.ledger_id {
             return Err(ApiError::OntologyImport(format!(
-                "schema/import sources must resolve within the current \
+                "this schema/import source must resolve within the current \
                  ledger (ref targets ledger '{ledger}', current ledger is \
-                 '{}'). Move the schema into the current ledger.",
+                 '{}'). Cross-ledger refs are supported only for the \
+                 top-level `f:schemaSource`, not for `f:ontologyImportMap` \
+                 entries.",
                 snapshot.ledger_id
             )));
         }
@@ -373,7 +382,7 @@ pub struct SchemaBundleCacheKey {
 /// by LRU capacity; stale entries age out naturally as new (ledger, t)
 /// combinations dominate.
 pub struct SchemaBundleCache {
-    inner: moka::sync::Cache<SchemaBundleCacheKey, Arc<ResolvedSchemaBundle>>,
+    inner: SyncCache<SchemaBundleCacheKey, Arc<ResolvedSchemaBundle>>,
 }
 
 impl SchemaBundleCache {
@@ -385,7 +394,7 @@ impl SchemaBundleCache {
     /// Create a new cache with the given entry capacity.
     pub fn with_capacity(capacity: u64) -> Self {
         Self {
-            inner: moka::sync::Cache::new(capacity),
+            inner: SyncCache::new(capacity),
         }
     }
 
@@ -445,7 +454,7 @@ pub struct SchemaBundleFlakesCacheKey {
 /// config change advances `t`, a plain LRU cache is sufficient — no
 /// invalidation.
 pub struct SchemaBundleFlakesCache {
-    inner: moka::sync::Cache<
+    inner: SyncCache<
         SchemaBundleFlakesCacheKey,
         Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>,
     >,
@@ -458,7 +467,7 @@ impl SchemaBundleFlakesCache {
 
     pub fn with_capacity(capacity: u64) -> Self {
         Self {
-            inner: moka::sync::Cache::new(capacity),
+            inner: SyncCache::new(capacity),
         }
     }
 
@@ -547,6 +556,7 @@ mod tests {
             ontology_import_map: map,
             max_facts: None,
             max_seconds: None,
+            max_memory_mb: None,
             override_control: OverrideControl::default(),
         }
     }

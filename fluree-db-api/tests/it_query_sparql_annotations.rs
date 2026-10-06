@@ -1258,3 +1258,178 @@ async fn sparql_version_1_2_declaration_is_accepted() {
         "VERSION \"1.2\" prologue must parse and the query must run"
     );
 }
+
+// =============================================================================
+// PR-W2A — SPARQL 1.2 reifier-form <-> JSON-LD @annotation parity
+//
+// The reified-triple forms (`<< s p o ~ r? >>` standalone / in object
+// position) desugar to the same `Pattern::AnnotationTarget` /
+// `Pattern::EdgeAnnotation` IR that the JSON-LD `@annotation` transact
+// surface writes and the established `?ann rdf:reifies <<( … )>>` form
+// reads. These regressions pin that reachability per the compliance
+// guideline (§ Query Surface Parity): insert via JSON-LD @annotation,
+// query via the NEW SPARQL reifier syntax, assert equivalence with the
+// established form.
+// =============================================================================
+
+/// Run a SELECT and return its SPARQL-JSON bindings array.
+async fn sparql_bindings(
+    fluree: &MemoryFluree,
+    ledger: &MemoryLedger,
+    sparql: &str,
+) -> Vec<JsonValue> {
+    let result = support::query_sparql(fluree, ledger, sparql)
+        .await
+        .expect("sparql query should execute");
+    result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json")["results"]["bindings"]
+        .as_array()
+        .expect("bindings array")
+        .clone()
+}
+
+#[tokio::test]
+async fn sparql_standalone_reified_triple_matches_jsonld_annotation() {
+    // Insert via JSON-LD @annotation; read back via the SPARQL 1.2
+    // standalone reified-triple statement (`<< s p o ~ ?r >> .`),
+    // which desugars to `?r rdf:reifies <<( s p o )>>`. Both the new
+    // form and the established rdf:reifies form must produce the
+    // SAME bindings against the same annotation storage.
+    let (fluree, ledger) = seed_alice_engineer("it/sparql-ann/standalone-reified").await;
+
+    let new_form = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?role WHERE {
+          << ex:alice ex:worksFor ex:acme ~ ?ann >> .
+          ?ann ex:role ?role .
+        }
+    ";
+    let established_form = r"
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+        PREFIX ex: <http://example.org/>
+        SELECT ?role WHERE {
+          ?ann rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> .
+          ?ann ex:role ?role .
+        }
+    ";
+    let new_bindings = sparql_bindings(&fluree, &ledger, new_form).await;
+    let established_bindings = sparql_bindings(&fluree, &ledger, established_form).await;
+
+    assert_eq!(new_bindings.len(), 1, "one annotation → one row");
+    assert_eq!(
+        new_bindings[0]["role"]["value"].as_str(),
+        Some("Engineer"),
+        "standalone reified triple must reach the @annotation-written reifier"
+    );
+    assert_eq!(
+        new_bindings, established_bindings,
+        "`<< s p o ~ ?r >> .` and `?r rdf:reifies <<( s p o )>>` are the same pattern"
+    );
+}
+
+#[tokio::test]
+async fn sparql_object_position_reified_triple_matches_jsonld_annotation() {
+    // A named reifier written through JSON-LD `@annotation { @id }` is
+    // an ordinary node: another JSON-LD triple can point at it. The
+    // SPARQL 1.2 object-position reified triple
+    // (`?doc ex:cites << s p o ~ ?r >>`) must join both facts —
+    // proving the object position desugars into the same
+    // AnnotationTarget machinery instead of erroring or matching a
+    // literal.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql-ann/object-position-reified");
+    let txn = json!({
+        "@context": ctx(),
+        "@graph": [
+            {
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "@id": "ex:employment1", "ex:role": "Engineer" }
+                }
+            },
+            {
+                "@id": "ex:doc",
+                "ex:cites": { "@id": "ex:employment1" }
+            }
+        ]
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed insert");
+    let ledger = committed.ledger;
+
+    let object_position = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?doc ?role WHERE {
+          ?doc ex:cites << ex:alice ex:worksFor ex:acme ~ ?r >> .
+          ?r ex:role ?role .
+        }
+    ";
+    let bindings = sparql_bindings(&fluree, &ledger, object_position).await;
+    assert_eq!(bindings.len(), 1, "one citing doc → one row: {bindings:#?}");
+    assert!(
+        bindings[0]["doc"]["value"]
+            .as_str()
+            .map(|s| s.ends_with("doc"))
+            .unwrap_or(false),
+        "doc should bind ex:doc; got {:?}",
+        bindings[0]["doc"]
+    );
+    assert_eq!(bindings[0]["role"]["value"].as_str(), Some("Engineer"));
+
+    // Equivalent desugared spelling through the established form.
+    let established = r"
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+        PREFIX ex: <http://example.org/>
+        SELECT ?doc ?role WHERE {
+          ?r rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> .
+          ?doc ex:cites ?r .
+          ?r ex:role ?role .
+        }
+    ";
+    let established_bindings = sparql_bindings(&fluree, &ledger, established).await;
+    assert_eq!(
+        bindings, established_bindings,
+        "object-position reified triple ≡ rdf:reifies + join on the reifier"
+    );
+}
+
+#[tokio::test]
+async fn sparql_multiple_annotation_units_join_same_jsonld_annotation() {
+    // One JSON-LD @annotation writes ONE reifier carrying two
+    // properties. A SPARQL 1.2 tail with two annotation units
+    // (`~ ?a {| … |} ~ ?b {| … |}`) constrains two reifiers of the
+    // same edge — both bind the single stored reifier, so the row
+    // count stays 1 and ?a = ?b.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql-ann/multi-unit");
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "ex:role": "Engineer", "ex:since": "2024" }
+        }
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed insert");
+    let ledger = committed.ledger;
+
+    let sparql = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?a ?b ?role ?since WHERE {
+          ex:alice ex:worksFor ex:acme ~ ?a {| ex:role ?role |} ~ ?b {| ex:since ?since |} .
+        }
+    ";
+    let bindings = sparql_bindings(&fluree, &ledger, sparql).await;
+    assert_eq!(
+        bindings.len(),
+        1,
+        "single reifier → single row: {bindings:#?}"
+    );
+    assert_eq!(bindings[0]["role"]["value"].as_str(), Some("Engineer"));
+    assert_eq!(bindings[0]["since"]["value"].as_str(), Some("2024"));
+    assert_eq!(
+        bindings[0]["a"]["value"], bindings[0]["b"]["value"],
+        "both annotation units bind the one stored reifier"
+    );
+}

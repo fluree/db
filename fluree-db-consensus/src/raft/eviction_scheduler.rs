@@ -19,16 +19,13 @@
 
 use crate::raft::state_machine::{Command as SmCommand, Response as SmResponse};
 use crate::raft::TypeConfig;
+// Sharing the in-process committer's TTL keeps client-facing retry
+// semantics identical between local and Raft deployments.
+use crate::DEFAULT_IDEMPOTENCY_TTL;
 use openraft::Raft;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
-
-/// Default TTL for idempotency cache entries before eviction. Matches
-/// the in-process [`CachingCommitter::DEFAULT_IDEMPOTENCY_TTL`] so
-/// client-facing retry semantics don't change between local and Raft
-/// deployments.
-pub const DEFAULT_IDEMPOTENCY_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// TTL applied to `recently_cleared` admin-clear markers. Bounded
 /// well above any realistic worker propose window — the only

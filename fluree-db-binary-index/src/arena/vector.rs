@@ -46,7 +46,8 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Write `bytes` to `path` atomically: stage in a uniquely-named temp file in
@@ -626,6 +627,25 @@ impl VectorSlice {
     }
 }
 
+/// All of a [`LazyVectorArena`]'s shards, pinned for direct zero-probe access.
+pub struct VectorArenaSnapshot {
+    shards: Vec<Arc<VectorShard>>,
+    shard_capacity: u32,
+    total_count: u32,
+}
+
+impl VectorArenaSnapshot {
+    /// Zero-copy vector read by handle. `None` for out-of-range handles.
+    #[inline]
+    pub fn get_f32(&self, handle: u32) -> Option<&[f32]> {
+        if handle >= self.total_count {
+            return None;
+        }
+        let shard = self.shards.get((handle / self.shard_capacity) as usize)?;
+        shard.get_f32(handle % self.shard_capacity)
+    }
+}
+
 impl LazyVectorArena {
     /// Create a new lazy arena from a parsed manifest, shard source metadata,
     /// a shared cache handle, and an optional content store for remote fetching.
@@ -677,14 +697,29 @@ impl LazyVectorArena {
     // ========================================================================
 
     /// Load shard through the global cache (point lookups, small batches).
+    ///
+    /// Residency-mode stores parse the shard from the resident tier — no
+    /// filesystem, no sync→async bridge; a miss surfaces as `NeedFetch`
+    /// (recorded in the miss register).
     fn load_shard_cached(&self, shard_idx: usize) -> io::Result<Arc<VectorShard>> {
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        if self.residency_mode() {
+            let source = self.get_source(shard_idx)?;
+            let bytes = self.resident_shard_bytes(source, shard_idx)?;
+            let shard = self
+                .cache
+                .try_get_or_load_vector_shard(source.cid_hash, || {
+                    let parsed = read_vector_shard_from_bytes(&bytes)?;
+                    Ok(Arc::new(parsed))
+                })?;
+            self.validate_shard_dims(&shard, shard_idx)?;
+            return Ok(shard);
+        }
         let source = self.get_source(shard_idx)?;
-        self.ensure_on_disk(source, shard_idx)?;
-        let path = source.path.clone();
         let shard = self
             .cache
             .try_get_or_load_vector_shard(source.cid_hash, || {
-                let bytes = std::fs::read(&path)?;
+                let bytes = self.shard_bytes(source, shard_idx)?;
                 let parsed = read_vector_shard_from_bytes(&bytes)?;
                 Ok(Arc::new(parsed))
             })?;
@@ -695,12 +730,50 @@ impl LazyVectorArena {
     /// Load shard WITHOUT inserting into the global cache.
     /// For streaming scans — avoids evicting BM25/dict/R1/R2 entries.
     fn load_shard_transient(&self, shard_idx: usize) -> io::Result<Arc<VectorShard>> {
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        if self.residency_mode() {
+            let source = self.get_source(shard_idx)?;
+            let bytes = self.resident_shard_bytes(source, shard_idx)?;
+            let shard = Arc::new(read_vector_shard_from_bytes(&bytes)?);
+            self.validate_shard_dims(&shard, shard_idx)?;
+            return Ok(shard);
+        }
         let source = self.get_source(shard_idx)?;
-        self.ensure_on_disk(source, shard_idx)?;
-        let bytes = std::fs::read(&source.path)?;
+        let bytes = self.shard_bytes(source, shard_idx)?;
         let shard = Arc::new(read_vector_shard_from_bytes(&bytes)?);
         self.validate_shard_dims(&shard, shard_idx)?;
         Ok(shard)
+    }
+
+    /// True when the content store carries a sync residency tier.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    fn residency_mode(&self) -> bool {
+        self.cas
+            .as_ref()
+            .is_some_and(|cs| cs.miss_register().is_some())
+    }
+
+    /// Resolve a shard's bytes from the residency tier or report the miss
+    /// (recording it in the store's miss register) with the shard's CID.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    fn resident_shard_bytes(&self, source: &ShardSource, idx: usize) -> io::Result<Arc<[u8]>> {
+        let cas = self.cas.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("vector shard {idx} not resident and no CAS configured"),
+            )
+        })?;
+        let cid = source.cid.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("vector shard {idx} not resident and no CID for remote fetch"),
+            )
+        })?;
+        crate::read::need_fetch::resident_or_need_fetch(
+            cas.as_ref(),
+            cid,
+            crate::read::need_fetch::FetchKind::VectorShard,
+        )
     }
 
     fn get_source(&self, shard_idx: usize) -> io::Result<&ShardSource> {
@@ -716,16 +789,18 @@ impl LazyVectorArena {
         })
     }
 
-    /// Ensure a shard file exists on local disk, fetching from remote if needed.
+    /// Bytes of shard `idx`: read from its local file when one exists, else
+    /// fetched from the CAS.
     ///
-    /// For FileStorage (all shards `on_disk: true` at construction), this is
-    /// a fast Acquire-load no-op. For remote backends, uses the same sync→async
-    /// bridge as `ensure_index_leaf_cached`: spawns an OS thread that calls
-    /// `tokio::Handle::block_on(cs.get(&cid))`, writes the result to disk,
-    /// then flips `on_disk`.
-    fn ensure_on_disk(&self, source: &ShardSource, idx: usize) -> io::Result<()> {
+    /// For FileStorage (all shards `on_disk: true` at construction) this is
+    /// a fast Acquire-load and a file read. For remote backends it uses the
+    /// same sync→async bridge as `ensure_index_leaf_cached`, then keeps the
+    /// fetched shard on disk for the next miss — unless the store forbids a
+    /// plaintext copy outside it (encrypted storage), in which case the
+    /// bytes stay in memory and the next miss fetches again.
+    fn shard_bytes(&self, source: &ShardSource, idx: usize) -> io::Result<Vec<u8>> {
         if source.on_disk.load(Ordering::Acquire) {
-            return Ok(());
+            return std::fs::read(&source.path);
         }
         // Shard not on disk — try lazy fetch from remote CAS.
         let cas = self.cas.as_ref().ok_or_else(|| {
@@ -751,7 +826,6 @@ impl LazyVectorArena {
         // search against remote (S3) stores.
         let cs = Arc::clone(cas);
         let cid = cid.clone();
-        let path = source.path.clone();
         // Bound the fetch with the same `cas_sync_timeout()` the index-leaf and
         // dict-pack bridges use, so a stalled remote (S3) GET fails fast instead
         // of blocking the waiting thread indefinitely.
@@ -773,19 +847,22 @@ impl LazyVectorArena {
                 fut.await.map_err(|e| io::Error::other(e.to_string()))
             }
         })?;
-        if let Some(parent) = path.parent() {
+        if !cas.permits_plaintext_cache() {
+            return Ok(bytes);
+        }
+        if let Some(parent) = source.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         // Publish atomically: write to a unique temp file in the same directory,
         // then rename onto the final path. Without this, two concurrent
-        // `ensure_on_disk` calls for the same shard (e.g. a cached `lookup_vector`
-        // racing a transient streaming scan) both `fs::write` the same path, and a
+        // fetches for the same shard (e.g. a cached `lookup_vector` racing a
+        // transient streaming scan) both `fs::write` the same path, and a
         // reader can observe a half-written file — surfacing as
         // "vector shard too small for header". A POSIX rename is atomic, so a
         // reader always sees a complete shard once this returns.
-        write_atomic(&path, &bytes)?;
+        write_atomic(&source.path, &bytes)?;
         source.on_disk.store(true, Ordering::Release);
-        Ok(())
+        Ok(bytes)
     }
 
     fn validate_shard_dims(&self, shard: &VectorShard, idx: usize) -> io::Result<()> {
@@ -823,6 +900,22 @@ impl LazyVectorArena {
             return Ok(None);
         }
         Ok(Some(VectorSlice { shard, offset }))
+    }
+
+    /// Pin every shard once and return a direct-access snapshot.
+    ///
+    /// [`Self::lookup_vector`] pays a shard-cache probe (and its `Arc` clone)
+    /// per call; scan loops that touch most handles should resolve the shards
+    /// once up front and index into them directly.
+    pub fn snapshot(&self) -> io::Result<VectorArenaSnapshot> {
+        let shards = (0..self.shard_count())
+            .map(|i| self.load_shard_cached(i))
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(VectorArenaSnapshot {
+            shards,
+            shard_capacity: self.manifest.shard_capacity,
+            total_count: self.manifest.total_count,
+        })
     }
 
     /// Batch point-lookup. Sorts handles for sequential shard access,

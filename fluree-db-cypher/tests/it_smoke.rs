@@ -105,3 +105,66 @@ fn moderate_nesting_is_accepted() {
     assert!(!out.has_errors(), "diagnostics: {:?}", out.diagnostics);
     assert!(out.ast.is_some());
 }
+
+/// Keyword tokens are accepted as binding names in `AS` position — a
+/// deliberate leniency over strict openCypher (which requires backticking
+/// reserved words). `RETURN … AS end` was previously rejected at parse.
+#[test]
+fn keyword_as_alias_parses() {
+    for query in [
+        "RETURN 1 AS end",
+        "RETURN 1 AS count",
+        "RETURN 1 AS order",
+        "MATCH (n) RETURN n.name AS limit, n.age AS skip",
+        "UNWIND [1, 2, 3] AS end RETURN end",
+    ] {
+        let out = parse_cypher(query);
+        assert!(
+            !out.has_errors(),
+            "{query} — diagnostics: {:?}",
+            out.diagnostics
+        );
+        assert!(out.ast.is_some(), "{query} produced no AST");
+    }
+}
+
+/// A keyword bound as an alias must remain referenceable downstream as a plain
+/// variable — the expression parser treats a stray keyword token in operand
+/// position as a variable name.
+#[test]
+fn keyword_alias_referenced_downstream_parses() {
+    for query in [
+        "WITH 1 AS end RETURN end",
+        "MATCH (n) WITH count(*) AS count WHERE count > 5 RETURN count",
+        "UNWIND [1, 2] AS end RETURN end + 1",
+    ] {
+        let out = parse_cypher(query);
+        assert!(
+            !out.has_errors(),
+            "{query} — diagnostics: {:?}",
+            out.diagnostics
+        );
+        assert!(out.ast.is_some(), "{query} produced no AST");
+    }
+}
+
+/// The keyword-as-variable fallback must not shadow the real primary meaning of
+/// `count(*)`, `exists { … }`, and `all(x IN … )` — those still parse as their
+/// dedicated constructs when followed by their delimiter.
+#[test]
+fn keyword_primaries_still_parse_as_constructs() {
+    for query in [
+        "MATCH (n) RETURN count(*)",
+        "MATCH (n) RETURN count(DISTINCT n)",
+        "MATCH (n) WHERE all(x IN [1, 2, 3] WHERE x > 0) RETURN n",
+        "MATCH (n) WHERE exists { (n)-[:KNOWS]->() } RETURN n",
+    ] {
+        let out = parse_cypher(query);
+        assert!(
+            !out.has_errors(),
+            "{query} — diagnostics: {:?}",
+            out.diagnostics
+        );
+        assert!(out.ast.is_some(), "{query} produced no AST");
+    }
+}

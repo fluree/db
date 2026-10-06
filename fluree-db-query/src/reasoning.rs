@@ -3,6 +3,7 @@
 //! This module provides helpers for integrating OWL2-RL materialization
 //! with query execution, including overlay composition for derived facts.
 
+use fluree_db_core::overlay::compose_content_version;
 use fluree_db_core::{Flake, GraphId, IndexType, OverlayProvider};
 use fluree_db_reasoner::{DerivedFactsOverlay, ReasoningCache};
 use std::sync::Arc;
@@ -18,11 +19,18 @@ pub struct ReasoningOverlay<'a> {
     derived: Arc<DerivedFactsOverlay>,
     /// Combined epoch for cache invalidation
     epoch: u64,
+    /// Composed content version (see [`compose_content_version`]); `None`
+    /// when the base cannot vouch for its own.
+    content_version: Option<u64>,
 }
 
 impl<'a> ReasoningOverlay<'a> {
     /// Create a new reasoning overlay combining base and derived facts.
     pub fn new(base: &'a dyn OverlayProvider, derived: Arc<DerivedFactsOverlay>) -> Self {
+        let content_version = match (base.content_version(), derived.content_version()) {
+            (Some(b), Some(d)) => Some(compose_content_version(&[b, d])),
+            _ => None,
+        };
         // Combine the base epoch with the materialization's process-unique
         // instance id, and tag the high bit so the combined value can never
         // collide with a plain novelty epoch (a small counter). The derived
@@ -40,6 +48,7 @@ impl<'a> ReasoningOverlay<'a> {
             base,
             derived,
             epoch,
+            content_version,
         }
     }
 
@@ -56,6 +65,10 @@ impl OverlayProvider for ReasoningOverlay<'_> {
 
     fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    fn content_version(&self) -> Option<u64> {
+        self.content_version
     }
 
     fn for_each_overlay_flake(
@@ -148,6 +161,68 @@ mod tests {
 
         // Epoch should be deterministic and non-zero
         assert_ne!(combined.epoch(), 0);
+    }
+
+    /// A base that vouches for a version, or one that cannot.
+    struct Stamped(Option<u64>);
+
+    impl OverlayProvider for Stamped {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn epoch(&self) -> u64 {
+            0
+        }
+        fn content_version(&self) -> Option<u64> {
+            self.0
+        }
+        fn for_each_overlay_flake(
+            &self,
+            _: GraphId,
+            _: IndexType,
+            _: Option<&Flake>,
+            _: Option<&Flake>,
+            _: bool,
+            _: i64,
+            _: &mut dyn FnMut(&Flake),
+        ) {
+        }
+    }
+
+    /// The cross-query translation cache is keyed on this: the same
+    /// (base, materialization) pair must report one stable version across
+    /// constructions, and any change to either part must move it.
+    #[test]
+    fn content_version_is_stable_per_pair_and_moves_with_either_part() {
+        let base = Stamped(Some(fluree_db_core::overlay::next_overlay_content_version()));
+        let derived = Arc::new(DerivedFactsOverlay::empty());
+
+        let first = ReasoningOverlay::new(&base, derived.clone())
+            .content_version()
+            .expect("vouching base + derived vouch");
+        let again = ReasoningOverlay::new(&base, derived.clone()).content_version();
+        assert_eq!(Some(first), again, "same pair, same version");
+
+        let other_derived = Arc::new(DerivedFactsOverlay::empty());
+        assert_ne!(
+            ReasoningOverlay::new(&base, other_derived).content_version(),
+            Some(first),
+            "a different materialization is a different version"
+        );
+
+        let other_base = Stamped(Some(fluree_db_core::overlay::next_overlay_content_version()));
+        assert_ne!(
+            ReasoningOverlay::new(&other_base, derived.clone()).content_version(),
+            Some(first),
+            "a different base is a different version"
+        );
+
+        let silent = Stamped(None);
+        assert_eq!(
+            ReasoningOverlay::new(&silent, derived).content_version(),
+            None,
+            "a base that cannot vouch leaves the composite unvouched"
+        );
     }
 
     #[test]

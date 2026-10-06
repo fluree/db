@@ -21,25 +21,63 @@ The primary production deployment. Exposes a full REST API over HTTP.
 
 ### Starting the Server
 
-```bash
-# Build from source
-cargo build --release -p fluree-db-server
+The server runs through the `fluree` CLI, which needs a project directory (`fluree init`)
+unless it keeps its data in memory (`--memory`):
 
-# Run with defaults (memory storage, port 8090)
-./target/release/fluree-server
+```bash
+# One-time: create .fluree/ in the current directory
+fluree init
+
+# Run with defaults (file storage in ./.fluree/storage, port 8090)
+fluree server run
 
 # Run with file-based persistence
-fluree-server --storage-path /var/lib/fluree
+fluree server run --storage-path /var/lib/fluree
 
 # Run with debug logging
-fluree-server --log-level debug
+fluree server run --log-level debug
+
+# Pass any other server flag after `--`
+fluree server run -- --cache-max-mb 4096
+
+# Throwaway server: no .fluree/ needed, data lost on exit
+fluree server run --memory
 ```
+
+`fluree server start` runs the same server in the background. (The `fluree-db-server` crate
+also builds a standalone `fluree-server` binary that takes every server flag directly; the
+Raft cluster mode in [Raft clusters](raft-clusters.md) requires it.)
+
+### Throwaway server for tests and CI
+
+`fluree server run --memory` starts a server with no setup: it needs no `.fluree/` directory,
+writes nothing to the directory it runs in, and loses every ledger when it exits. That makes it a
+fresh database for each CI job, for example one that runs SPARQL tests against it:
+
+```bash
+fluree server run --memory --listen-addr 127.0.0.1:8090 &
+FLUREE_PID=$!
+curl -fsS --retry 30 --retry-connrefused --retry-delay 1 http://127.0.0.1:8090/health
+
+curl -fsS -X POST http://127.0.0.1:8090/v1/fluree/create \
+  -H 'Content-Type: application/json' -d '{"ledger": "test:main"}'
+# SPARQL query endpoint:  http://127.0.0.1:8090/v1/fluree/query/test:main
+# SPARQL update endpoint: http://127.0.0.1:8090/v1/fluree/update/test:main
+
+# ... run the tests ...
+
+kill $FLUREE_PID
+```
+
+`FLUREE_MEMORY_STORAGE=true` works in place of the flag. Memory mode is foreground-only
+(`fluree server start` does not support it), and since it writes no `server.meta.json`, CLI
+auto-routing does not see it.
 
 ### Configuration
 
 Configuration is resolved in this precedence order (highest wins):
 
-1. **CLI flags** — `fluree-server --storage-path ./data --log-level debug`
+1. **CLI flags** — `fluree server run --storage-path ./data --log-level debug`
 2. **Environment variables** — All settings use a `FLUREE_` prefix (e.g., `FLUREE_LISTEN_ADDR`)
 3. **Profile overrides** — Environment-specific sections in the config file
 4. **Config file** — TOML, JSON, or JSON-LD (auto-discovered from `.fluree/config.toml` or `config.jsonld`)
@@ -49,9 +87,9 @@ Configuration is resolved in this precedence order (highest wins):
 
 | Backend | Flag / Config | Use Case |
 |---------|---------------|----------|
-| **Memory** | (default) | Dev/testing — data lost on restart |
-| **File** | `--storage-path /path` | Single-machine persistence |
-| **AWS S3 + DynamoDB** | `--aws` feature + config | Distributed / cloud-native deployments |
+| **Memory** | `--memory`, or `--connection-config` with a memory storage node ([details](storage.md#memory-storage)) | Dev/testing/CI — data lost on restart |
+| **File** | (default, `.fluree/storage`) or `--storage-path /path` | Single-machine persistence |
+| **AWS S3 + DynamoDB** | `aws` build feature + `--connection-config` | Distributed / cloud-native deployments |
 
 ### Server Roles
 
@@ -68,18 +106,20 @@ Configuration is resolved in this precedence order (highest wins):
 
 ```bash
 # Transaction server (primary)
-fluree-server \
+fluree server run \
   --storage-path /var/lib/fluree \
+  -- \
   --storage-proxy-enabled
 
 # Query peer (shared storage)
-fluree-server \
+fluree server run \
+  --storage-path /var/lib/fluree \
+  -- \
   --server-role peer \
-  --tx-server-url http://primary:8090 \
-  --storage-path /var/lib/fluree
+  --tx-server-url http://primary:8090
 
 # Query peer (proxy storage — no local data)
-fluree-server \
+fluree server run -- \
   --server-role peer \
   --tx-server-url http://primary:8090 \
   --storage-access-mode proxy \
@@ -92,8 +132,8 @@ All data-plane paths below are relative to the API base URL. For the standalone
 server this is `/v1/fluree`.
 
 **Data Operations:**
-- `POST /query` — JSON-LD and SPARQL queries
-- `POST /update` — Update transactions (WHERE/DELETE/INSERT JSON-LD or SPARQL UPDATE)
+- `POST /query` — JSON-LD, SPARQL, and Cypher queries
+- `POST /update` — Update transactions (WHERE/DELETE/INSERT JSON-LD, SPARQL UPDATE, or Cypher)
 - `POST /insert` / `POST /upsert` — Direct insert or upsert
 
 **Ledger Management:**

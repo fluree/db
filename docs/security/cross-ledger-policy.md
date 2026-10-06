@@ -11,7 +11,8 @@ All five `f:GraphRef`-shaped governance predicates support
 cross-ledger references today:
 
 - **Cross-ledger policy** (`f:policySource` with `f:ledger`) —
-  M's policy rule set is applied to queries against D.
+  M's policy rule set is applied to queries (`f:view`) and
+  transactions (`f:modify`) against D.
 - **Cross-ledger constraints** (`f:constraintsSource` with
   `f:ledger`) — M's `f:enforceUnique` annotations are applied
   to transactions against D.
@@ -154,30 +155,118 @@ rules are opt-in — operators name the class to enroll them.
 
 ## Engaging policy enforcement
 
-There's a subtlety in how the server's JSON-LD query route
-chooses whether to invoke policy enforcement at all. Requests
-without an `fluree-policy-class`, `fluree-identity`, or inline
-`opts.policy` go through a no-policy fast path that bypasses the
-cross-ledger dispatch. A configured `f:policySource` in `#config`
-is **not** enough on its own to force enforcement at the HTTP
-layer today.
+**Transactions engage cross-ledger policy automatically.** The
+transact path (JSON-LD / SPARQL UPDATE / Turtle / TriG through
+the server, push replication, credentialed transactions, and the
+CLI's local mode with policy flags) resolves D's config before
+staging: a cross-ledger `f:policySource` always builds a policy
+context, and M's `f:modify` rules are enforced on the staged
+flakes even when the request carries no policy inputs at all.
+Config `f:defaultAllow` / `f:policyClass` defaults merge in the
+same way they do for reads.
 
-To engage cross-ledger policy via HTTP, send a request with at
-least one of:
+For **queries**, there's a subtlety in how the server's JSON-LD
+query route chooses whether to invoke policy enforcement at all.
+Requests without an `fluree-policy-class`, `fluree-identity`, or
+inline `opts.policy` go through a no-policy fast path that
+bypasses the cross-ledger dispatch. A configured `f:policySource`
+in `#config` is **not** enough on its own to force enforcement at
+the HTTP query layer today.
+
+The graph-scoped read paths do not gate this way. A SPARQL query
+that resolves to a mapped graph source, and the MCP `sparql_query`
+tool, both read through `fluree.graph(<ledger>).query()`, which
+applies a ledger's or source's configured defaults whether or not
+the request carries policy inputs. A cross-ledger `f:policySource`
+reached through those defaults is resolved there.
+
+To engage cross-ledger policy on an HTTP query, send a request
+with at least one of:
 
 - `fluree-policy-class: <iri>` — the policy class header (the
   cleanest way to declare "use the configured policy"). Matching
   the class in D's config (e.g., `f:AccessPolicy`) is the
   natural choice.
-- `fluree-identity: <iri>` — an identity header. Identity-mode
-  has a different contract; see below.
+- `fluree-identity: <iri>` — an identity header. Under
+  cross-ledger the identity is bind-only; see
+  [Identity binding](#identity-binding-under-cross-ledger-policy).
 - `opts.policy` in the body — inline JSON-LD policy. This still
   merges with cross-ledger rules.
 
 When using the in-process Rust API, calling
 `fluree.db_with_policy(ledger_id, &opts)` always engages the
 policy path, even with empty opts. Programmatic users don't see
-this gating.
+this gating. The write-side equivalent is
+`build_transact_policy_context` — see
+[Programmatic policy API (Rust)](programmatic-policy.md).
+
+## Identity binding under cross-ledger policy
+
+An identity on the request (`fluree-identity` header,
+`opts.identity`, or a verified credential's DID) is **bind-only**
+under a cross-ledger `f:policySource`:
+
+- The identity resolves against **D** (identities are a
+  data-ledger concept — M never contributes identity records) and
+  populates `?$identity` for any `f:query` rules in M's policy
+  set. An owner-only rule authored in M therefore works across
+  every governed data ledger, with each D binding its own
+  identities.
+- The identity **never selects rules**. Same-ledger identity-mode
+  loads policies via the identity's `f:policyClass` triples;
+  under cross-ledger those D-local triples are intentionally not
+  consulted — declaring a cross-ledger `f:policySource` makes M
+  the policy authority, and rule selection is exclusively the
+  policy-class filter chain:
+
+  1. the request's `policy_class` (when present),
+  2. else the config's `f:policyClass`,
+  3. else — for anonymous requests only — `{f:AccessPolicy}`.
+
+- Because the identity can't select rules, an identity-carrying
+  request with **no policy class anywhere** (request or config)
+  fails closed: the operator must name which classes govern.
+  In practice, setting `f:policyClass` in D's config (as in the
+  configuration example above) makes authenticated requests work
+  with no per-request changes.
+- An identity IRI with no subject node in D yields an unbound
+  `?$identity`: `f:query` rules referencing it match nothing, so
+  `f:required` rules deny — the same contract as same-ledger
+  identity-mode's unknown-identity case.
+- **Identity records must live in D's default graph.** The
+  subject-existence probe that decides whether to bind `?$identity`
+  searches D's default graph only. An identity whose subject node
+  is written into a *named* graph is treated as absent (unbound
+  `?$identity`), so `f:required` rules deny even for a legitimate
+  owner. Keep identity/user records in the default graph, or bind
+  `?$identity` explicitly via `opts.policy_values`.
+
+### Virtual graph sources (Iceberg / SQL)
+
+A graph source registered with `--model <ledger>` is a data ledger D with no
+data of its own: the model ledger's default graph is both its
+`f:policySource` and its `f:schemaSource`, and the contract above applies
+with two adjustments, because D has nowhere to hold identity records:
+
+- An identity-carrying request with no policy class looks the identity's
+  `f:policyClass` up **in M** instead of failing closed. An identity M does
+  not know selects no rules, and `default-allow` governs.
+- Schema axioms from M are interned even for namespaces D has never
+  registered (a virtual D registers none), so `f:onClass` /
+  `f:onProperty` expand through M's hierarchy. On a native D the same
+  axioms are inert, since D holds no data under those namespaces.
+
+`?$identity` stays unbound (D has no subject node for it), which only
+matters for `f:query` rules — and those cannot run against a virtual source
+anyway. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy).
+
+One merge subtlety: an identity counts as a request policy input,
+so under the default `f:overrideControl` (`f:OverrideAll`) the
+request's options take precedence and the config's
+`f:defaultAllow` is **not** merged for identity-carrying requests
+(same long-standing contract as same-ledger reads). Send the
+`fluree-default-allow` header explicitly, or set a stricter
+override control if the config should always win.
 
 ## Cross-ledger uniqueness constraints
 
@@ -280,7 +369,7 @@ GRAPH <urn:fluree:mydb:main#config> {
         f:reasoningDefaults <urn:cfg:reasoning> .
 
     <urn:cfg:reasoning>
-        f:reasoningModes  ( "rdfs" "owl2-rl" ) ;
+        f:reasoningModes  ( "rdfs" "owl2rl" ) ;
         f:schemaSource    <urn:cfg:schema-ref> .
 
     <urn:cfg:schema-ref> rdf:type f:GraphRef ;
@@ -311,7 +400,7 @@ A few specifics that differ from cross-ledger policy:
 
 - Reasoning must be **enabled** for cross-ledger schema to take
   effect. The data ledger's config can set
-  `f:reasoningModes` (e.g., `["rdfs"]` or `["owl2-rl"]`), or
+  `f:reasoningModes` (e.g., `["rdfs"]` or `["owl2rl"]`), or
   the query can opt in via the `reasoning` option.
 - Failures during cross-ledger schema resolution surface as
   `ApiError::OntologyImport` (with the underlying
@@ -382,6 +471,81 @@ Specifics:
   cross-ledger source: both shape sets enforce. See
   [Cookbook: SHACL validation — Inline shapes per
   transaction](../guides/cookbook-shacl.md#inline-shapes-per-transaction).
+- **Enforced surfaces**: JSON-LD transactions (insert / upsert /
+  update, including TriG upserts), direct-flake Turtle inserts,
+  branch operations (merge, rebase, revert, and merge preview),
+  and validation reports (`fluree validate` in ledger mode, the
+  HTTP validate endpoint, `Fluree::validate_ledger`). Commit
+  replay (graph-sync push) intentionally skips SHACL
+  re-validation for cross-ledger sources: the origin already
+  validated against M when the commit was authored, and
+  re-resolving M at replay time could see a different head.
+  Branch operations are authoring, not replay: the state they
+  stage onto the target is a combination nobody has validated,
+  so they resolve M at operation time and enforce its shapes
+  like any transaction would.
+- **`sh:sparql` constraints travel over the wire** — the query
+  text, `sh:prefixes` declarations, and their `owl:imports`
+  closure are all projected. At write time the query lowers
+  against D's *staged* namespace registry, so a constraint
+  matches data from the very transaction that first introduces
+  its namespace; a constraint over vocabulary D has never seen
+  anywhere is silently inert (no rows, never an error).
+- **Steady-state cost is one nameservice lookup.** The wire is
+  cached per `(model, graph, resolved_t)` and the *compiled*
+  shapes (including parsed `sh:sparql` queries) are reused
+  across transactions while M's head and D's shape-affecting
+  epochs are unchanged. A commit on M invalidates both on the
+  next transaction — governance updates propagate immediately.
+
+### Installing a shape is equivalent to root read
+
+SHACL validation runs **unfiltered**: the constraint query's
+`ContextConfig` carries `policy_enforcer: None`. That is
+deliberate and pre-dates `sh:sparql` — validation has to see
+every flake bearing on a constraint, and a policy-filtered view
+would make it unsound, since data hidden from the validator
+would silently conform.
+
+`sh:sparql` makes that choice load-bearing in a new way. Every
+other SHACL constraint can only report values reachable from the
+focus node, so an unfiltered view leaks nothing the shape author
+had not already named. A `sh:sparql` body can read anywhere in
+the graph, and `sh:message` templates interpolate bound
+variables (`{?var}` / `{$var}`) into the result. Those messages
+reach a writer as the `ShaclViolation` error text and a
+`/validate` caller as `sh:resultMessage`, with the bound value
+also landing in `sh:value`.
+
+So on a ledger whose data is policy-restricted, **whoever can
+write to the shapes graph can read what the view policy hides**
+— by installing a constraint that binds the hidden value and
+echoes it through a message template. This holds for shapes
+attached locally exactly as it does for shapes projected from a
+model ledger.
+
+Treat shapes-graph write as a governance permission rather than
+a schema-authoring convenience, and size it to match unfiltered
+read. Where data readers are restricted but shape authorship is
+not, bring the two into line — either restrict writes to the
+shapes graph to the principals already trusted with unfiltered
+reads, or source shapes from a model ledger M whose write path
+is separately controlled, which is the pattern the rest of this
+page describes.
+
+Two related bounds, both off by default:
+
+- `sh:sparql` constraints run once per focus node with no
+  structural limit on what the body reads, so `/validate`
+  accepts `maxFuel` (micro-fuel ceiling for the pass) alongside
+  the server's configured query timeout and per-query memory
+  ceiling. Set `maxFuel` wherever untrusted parties can install
+  shapes.
+- A transaction-requested `opts.validationMode: "warn"` is
+  honored only where an operator has written an
+  `f:shaclDefaults` group whose `f:overrideControl` permits it.
+  A ledger with shapes but no `#config` graph enforces
+  unconditionally and ignores the request.
 
 ## Cross-ledger datalog rules
 
@@ -451,7 +615,7 @@ closed when configured:
 | `f:atT` (temporal pinning of M)            | Request fails with `UnsupportedFeature { feature: "f:atT", phase: "Phase 3" }`. |
 | `f:trustPolicy` (commit-signer allowlist)  | Request fails with `UnsupportedFeature`. |
 | `f:rollbackGuard` (freshness constraints)  | Request fails with `UnsupportedFeature`. |
-| `opts.identity` + cross-ledger `f:policySource` | Request fails with a config error. Identity-mode loads policies via the identity's `f:policyClass` triples, which would have to resolve in D (the identity isn't an M concept); combining the two modes ambiguously is rejected rather than silently choosing one. Use `opts.policy_class` with cross-ledger configs. |
+| `opts.identity` + cross-ledger `f:policySource` **with no policy class anywhere** | Request fails with a config error. The identity is bind-only under cross-ledger (see [Identity binding](#identity-binding-under-cross-ledger-policy)) and can't select rules, so a policy class must be named on the request or in D's config. With a class available, identity-carrying requests work normally. Exception: a [virtual graph source](#virtual-graph-sources-iceberg--sql) looks the identity's classes up in M. |
 | `f:policySource` with `f:graphSelector` naming M's `#config` or `#txn-meta` | Request fails with `ReservedGraphSelected` before any storage read on M. |
 | Transitive `owl:imports` across model ledgers (`f:schemaSource` recursion) | Not yet honored. Imports inside M's schema graph are projected but the resolver doesn't follow them across ledger boundaries. |
 

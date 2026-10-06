@@ -539,6 +539,8 @@ let sync_result = fluree.sync_vector_index("doc-embeddings:main").await?;
 println!("Upserted: {}, Removed: {}", sync_result.upserted, sync_result.removed);
 ```
 
+Sync is incremental only when the indexing query's dependencies can be tracked completely; the shape rules are the same as for [BM25 syncing](bm25.md#syncing). Outside that shape every sync re-embeds the whole corpus, and the decline is logged at `warn` with the reason. Within it, a window that touches none of the tracked properties (the embedding property is always one of them) advances the watermark without re-embedding anything.
+
 #### Full Resync
 
 Rebuild the entire index from scratch:
@@ -642,41 +644,95 @@ Key takeaways:
 - **Filtered queries** (where graph patterns reduce the candidate set before scoring) are ~25x faster -- the index enables efficient predicate-first access that avoids loading irrelevant vectors entirely
 - At 5,000 vectors, a filtered indexed query completes in **2.4 ms** -- well within interactive latency budgets
 
+### The flat-rank top-k fast path
+
+Queries matching the **canonical similarity signature** skip the generic
+operator pipeline entirely and execute as a direct parallel scan of the packed
+f32 vector shards, with a bounded top-k heap:
+
+```json
+{
+  "select": ["?s", "?score"],
+  "values": [["?target"], [{"@value": [/* query vector */], "@type": "https://ns.flur.ee/db#embeddingVector"}]],
+  "where": [
+    {"@id": "?s", "ex:embedding": "?vec"},
+    ["bind", "?score", ["dotProduct", "?vec", "?target"]],
+    ["filter", "(> ?score 0.5)"]
+  ],
+  "orderBy": [["desc", "?score"]],
+  "limit": 10
+}
+```
+
+The signature: a single triple pattern over one vector predicate, a `bind` of
+`dotProduct(?vec, <constant or single-row VALUES target>)`, an optional score
+threshold filter, optional `ORDER BY DESC(?score)`, optional `LIMIT`/`OFFSET`,
+projecting only `?s` and/or `?score`. Scores are bit-identical to the general
+pipeline, results are exact (every vector is scored — no approximation), and
+novelty is folded correctly (unindexed asserts appear, retractions cancel).
+Anything outside the signature — additional join patterns, `cosineSimilarity`
+/ `euclideanDistance`, projecting `?vec`, policy-enforced views, multi-ledger
+datasets, time travel — runs the general pipeline instead, correct but slower.
+
+Measured at 50,000 × 768-dim vectors (release, Apple M-series), threshold +
+`ORDER BY DESC` query:
+
+| Lane | Query time | Throughput |
+|------|-----------|------------|
+| Novelty-only (no binary index) | 324 ms | ~155K vec/s |
+| Binary index, general pipeline | 30 ms | ~1.6M vec/s |
+| Binary index, **top-k fast path** | **8.1 ms** | ~6.2M vec/s |
+
+The scan is memory-bandwidth-bound and partitions across cores, so it scales
+near-linearly with corpus bytes: roughly **6M vectors/sec at 768 dims** on
+laptop-class hardware.
+
 ### Inline similarity functions (flat scan)
 
 - **Best for**: Small to medium datasets, ad-hoc similarity queries, prototyping
 - **Complexity**: O(n) linear scan -- computes similarity against every matching vector
-- **Advantage**: No index setup required, works immediately after insert
-- **SIMD acceleration**: Fluree uses runtime-detected SIMD kernels (SSE2/AVX on x86_64, NEON on ARM) for vectorized dot/cosine/L2 computation
-- **Normalized embedding optimization**: For unit-normalized vectors (most transformer embeddings), cosine similarity reduces to a dot product, avoiding magnitude computation entirely
+- **Advantage**: No index setup required, works immediately after insert; results are exact and strongly consistent (novelty included)
+- **SIMD acceleration**: Fluree uses runtime-detected SIMD kernels (SSE2/AVX on x86_64, NEON on ARM) for vectorized dot/cosine/L2 computation, reading indexed vectors zero-copy from the packed f32 shards
+- **Prefer `dotProduct` for normalized embeddings**: for unit-normalized vectors (most transformer embeddings), dot product ranks identically to cosine similarity, computes fewer terms, and is the only scoring function served by the top-k fast path today
 
 ### When to consider HNSW
 
 Inline similarity functions perform a brute-force scan over all candidate vectors. This scales linearly and remains fast for moderate datasets, but at larger scales an HNSW index provides O(log n) approximate nearest-neighbor search.
 
-**Rule of thumb:**
+**Rule of thumb** (768-dim; scale thresholds down for higher dimensions).
+The two columns matter: queries matching the top-k fast-path signature scale
+much further than general-shape queries (extra joins, cosine/euclidean,
+projected vectors, policy-enforced views), which pay pipeline costs per row.
 
-| Vector count (per property) | Recommendation |
-|----------------------------|----------------|
-| < 100K | Flat scan works well, especially with binary indexing. Sub-100ms queries typical. |
-| 100K -- 1M | **Start evaluating HNSW.** Flat scan may still be acceptable depending on latency target and hardware, but HNSW will provide more consistent low-latency results. |
-| 1M -- 10M | HNSW strongly recommended for interactive latency. Flat scan can work if vectors are memory-resident and you can tolerate ~1-2 second queries. |
-| > 10M | HNSW (or other ANN index) is the default recommendation. Flat scan becomes I/O- and cache-bound for low-latency use cases. |
+| Vector count (per property) | Top-k signature (`dotProduct` + order/limit) | General-shape queries |
+|----------------------------|----------------------------------------------|----------------------|
+| < 100K | Flat scan is interactive (< ~20 ms indexed). | Flat scan works well (< ~60 ms indexed). |
+| 100K -- 1M | Flat scan stays interactive (~20-170 ms, memory-resident). HNSW optional. | **Start evaluating HNSW**; flat scan runs ~60-600 ms. |
+| 1M -- 10M | Flat scan viable for sub-second budgets if shards are memory-resident (~0.2-1.7 s). HNSW for strict latency. | HNSW strongly recommended for interactive latency. |
+| > 10M | HNSW (or other ANN index) is the default recommendation. | HNSW default; flat scan becomes I/O- and cache-bound. |
+
+Remember the trade: the HNSW graph source is **eventually consistent** (it
+lags the ledger until its index refreshes), while the flat scan is exact and
+strongly consistent, including uncommitted-to-index novelty. If your workload
+needs read-your-writes similarity search, that pushes the flat-scan ceiling up;
+if it needs guaranteed low latency at any corpus size, that pulls HNSW in
+earlier.
 
 Factors that shift the crossover:
 
-- **Hardware**: Fast NVMe / large RAM pushes the threshold higher; object storage (S3) pulls it lower
+- **Query shape**: only the canonical top-k signature gets the fast path — check both columns above
+- **Hardware**: Fast NVMe / large RAM pushes the threshold higher; object storage (S3) pulls it lower (first-touch shard loads dominate cold queries)
 - **Latency target**: A 50 ms budget favors HNSW earlier than a 2-second budget
 - **Filter selectivity**: If graph patterns reduce candidates to a small fraction before scoring, flat scan remains viable at higher counts
-- **Normalized embeddings**: Cosine-as-dot-product is faster, pushing the threshold higher
-- **Binary indexing**: An indexed dataset scans ~6x faster than novelty-only, effectively raising the flat-scan ceiling
+- **Dimensions**: the scan is memory-bandwidth-bound; 1536-dim costs ~2x the 768-dim numbers
+- **Binary indexing**: an indexed dataset scans ~10-40x faster than novelty-only — ensure background indexing runs for vector-heavy ledgers
 
 ### HNSW vector indexes
 
-- **Best for**: Large datasets (100K+ vectors), production similarity search with strict latency requirements
+- **Best for**: Multi-million-vector datasets, strict latency requirements at any size, and query shapes the flat-scan fast path doesn't serve; note HNSW results are eventually consistent (the index lags the ledger until it refreshes)
 - **Complexity**: O(log n) approximate nearest neighbor
 - **Space**: ~1.5x embedding size + IRI mapping overhead
-- **Updates**: Incremental via affected-subject tracking
+- **Updates**: Incremental via affected-subject tracking, for indexing queries whose dependencies can be tracked completely (see [Sync Updates](#sync-updates))
 
 #### Tuning parameters
 

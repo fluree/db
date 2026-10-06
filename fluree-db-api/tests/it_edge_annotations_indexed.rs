@@ -812,7 +812,12 @@ async fn non_annotation_ledger_skips_inject_annotations() {
     local
         .run_until(async {
             let _ = fluree.ledger_cached(ledger_id).await.unwrap();
-            let completion = handle.trigger(ledger_id, after.receipt.t).await;
+            let completion = handle
+                .trigger(
+                    &fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
+                    after.receipt.t,
+                )
+                .await;
             let _ = completion.wait().await;
             support::wait_for_index_application(&fluree, ledger_id, after.receipt.t).await;
 
@@ -1085,4 +1090,860 @@ async fn reindex_seals_arena_when_caching_enabled_no_provider_in_opts() {
         .stats;
     assert_eq!(stats.distinct_annotations, 1);
     assert_eq!(stats.live_attachment_pairs, 1);
+}
+
+#[tokio::test]
+async fn reindex_seals_arena_without_ledger_caching() {
+    // The CLI builds its client `without_ledger_caching()`, so
+    // `Fluree::reindex` has no `LedgerManager` and therefore no
+    // attachment-events provider to ask. That is the configuration behind
+    // `fluree create --from <turtle-star>`, whose one-shot seal pass ended
+    // with `annotation_index = None` while printing "Annotation arena
+    // sealed" — every quoted-triple query on the imported ledger then took
+    // the generic join chain. The reindex must derive coverage from the
+    // ledger state it loads anyway.
+    use fluree_db_api::ReindexOptions;
+
+    let fluree = FlureeBuilder::memory()
+        .without_ledger_caching()
+        .build_memory();
+    let ledger_id = "it/edge-annotations-indexed:reindex-seals-arena-no-cache";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    fluree
+        .insert(ledger0, &annotated_insert())
+        .await
+        .expect("annotated insert");
+
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex must succeed");
+
+    let post = fluree.ledger(ledger_id).await.expect("reload");
+    assert!(post.snapshot.has_annotations, "sticky bit set");
+    let stats = &post
+        .snapshot
+        .annotation_index
+        .as_ref()
+        .expect(
+            "reindex without a ledger manager must still seal the arena from the \
+             ledger state's attachment events",
+        )
+        .stats;
+    assert_eq!(stats.distinct_annotations, 1);
+    assert_eq!(stats.live_attachment_pairs, 1);
+}
+
+#[tokio::test]
+async fn wildcard_annotation_query_streams_from_the_arena() {
+    // StarBench P2 shape, `<< ?s ?p ?o >> :q ?x`, over a sealed arena: the
+    // annotation-first lane emits every live attachment straight from the
+    // forward arena — ref, plain-literal and language-tagged objects — with
+    // no base-edge scan. Rows must be exactly the annotated edges, with the
+    // object's datatype and language tag intact; the unannotated edge must
+    // not appear.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/edge-annotations-indexed:wildcard-enumeration";
+
+    let (local, handle) =
+        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+
+    local
+        .run_until(async move {
+            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let after_insert = fluree
+                .insert(
+                    ledger0,
+                    &json!({
+                        "@context": ctx(),
+                        "@graph": [
+                            {
+                                "@id": "ex:alice",
+                                "ex:worksFor": {
+                                    "@id": "ex:acme",
+                                    "@annotation": {"ex:source": "hr"}
+                                },
+                                "ex:score": {
+                                    "@value": 42,
+                                    "@annotation": {"ex:source": "exam"}
+                                },
+                                "ex:motto": {
+                                    "@value": "carpe diem",
+                                    "@language": "la",
+                                    "@annotation": {"ex:source": "wall"}
+                                }
+                            },
+                            {"@id": "ex:bob", "ex:worksFor": {"@id": "ex:acme"}}
+                        ]
+                    }),
+                )
+                .await
+                .expect("annotated insert");
+            let _ = fluree
+                .ledger_cached(ledger_id)
+                .await
+                .expect("cached load before reindex");
+
+            support::trigger_index_and_wait(&handle, ledger_id, after_insert.receipt.t).await;
+            support::wait_for_index_application(&fluree, ledger_id, after_insert.receipt.t).await;
+
+            let post = fluree
+                .ledger(ledger_id)
+                .await
+                .expect("reload after reindex");
+            assert!(
+                post.snapshot.annotation_index.is_some(),
+                "arena must be sealed for this test to exercise the enumeration lane"
+            );
+
+            let sparql = r"
+                PREFIX ex: <http://example.org/>
+                SELECT ?s ?p ?o ?src WHERE {
+                  << ?s ?p ?o >> ex:source ?src .
+                }
+                ORDER BY ?src
+            ";
+            let result = support::query_sparql(&fluree, &post, sparql)
+                .await
+                .expect("wildcard annotation query");
+            let rows = result.to_sparql_json(&post.snapshot).expect("sparql json");
+            let bindings = rows["results"]["bindings"]
+                .as_array()
+                .expect("bindings array")
+                .clone();
+            let cell = |b: &JsonValue, v: &str| b[v]["value"].as_str().unwrap_or("").to_string();
+            let got: Vec<(String, String, String, String)> = bindings
+                .iter()
+                .map(|b| (cell(b, "s"), cell(b, "p"), cell(b, "o"), cell(b, "src")))
+                .collect();
+            let ex = |l: &str| format!("http://example.org/{l}");
+            assert_eq!(
+                got,
+                vec![
+                    (
+                        ex("alice"),
+                        ex("score"),
+                        "42".to_string(),
+                        "exam".to_string()
+                    ),
+                    (ex("alice"), ex("worksFor"), ex("acme"), "hr".to_string()),
+                    (
+                        ex("alice"),
+                        ex("motto"),
+                        "carpe diem".to_string(),
+                        "wall".to_string()
+                    ),
+                ],
+                "exactly the annotated edges, in ?src order: {bindings:#?}"
+            );
+            let motto = bindings
+                .iter()
+                .find(|b| b["src"]["value"] == "wall")
+                .expect("language-tagged row");
+            assert_eq!(
+                motto["o"]["xml:lang"], "la",
+                "language tag must survive the arena round-trip: {motto:#?}"
+            );
+            let score = bindings
+                .iter()
+                .find(|b| b["src"]["value"] == "exam")
+                .expect("integer row");
+            assert_eq!(
+                score["o"]["datatype"], "http://www.w3.org/2001/XMLSchema#integer",
+                "datatype must survive the arena round-trip: {score:#?}"
+            );
+        })
+        .await;
+}
+
+/// #1467: a reification-aware COPY of a named-graph annotation must survive a
+/// reindex. The attachment indexer decodes each bundle via
+/// `EdgeKey::from_reifies_facts` at seal time
+/// (`indexer_attachment_provider.rs`), so an incorrect re-home would drop the
+/// annotation from the durable arena — not just from a live query. This drives
+/// the full seal path and then decodes the re-homed bundle out of the indexed
+/// snapshot (novelty-free), proving the anchor moved to the dest graph.
+#[tokio::test]
+async fn transfer_named_to_named_survives_reindex() {
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/edge-annotations-indexed:xfer-named-to-named";
+    let g1 = "http://example.org/g1";
+    let g2 = "http://example.org/g2";
+
+    let (local, handle) =
+        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+
+    local
+        .run_until(async move {
+            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let seeded = fluree
+                .insert(
+                    ledger0,
+                    &json!({
+                        "@context": ctx(),
+                        "@id": "ex:alice",
+                        "@graph": g1,
+                        "ex:worksFor": {
+                            "@id": "ex:acme",
+                            "@annotation": { "@id": "ex:emp/alice-acme", "ex:role": "Engineer" }
+                        }
+                    }),
+                )
+                .await
+                .expect("seed named-graph annotation");
+
+            // COPY <g1> TO <g2> — lower the SPARQL op and stage it.
+            let sparql = format!("COPY <{g1}> TO <{g2}>");
+            let parsed = fluree_db_sparql::parse_sparql(&sparql);
+            assert!(
+                !parsed.has_errors(),
+                "parse errors: {:?}",
+                parsed.diagnostics
+            );
+            let ast = parsed.ast.expect("AST");
+            let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&seeded.ledger.snapshot);
+            let txn = fluree_db_transact::lower_sparql_update_ast(
+                &ast,
+                &mut ns,
+                fluree_db_transact::TxnOpts::default(),
+            )
+            .expect("lower COPY");
+            let after_copy = fluree
+                .stage_owned(seeded.ledger)
+                .txn(txn)
+                .execute()
+                .await
+                .expect("stage COPY");
+
+            // Force the manager to cache the running ledger so the indexer's
+            // attachment-events provider finds it (mirrors the pattern in
+            // `incremental_arena_seal_then_arena_backed_query`).
+            let _ = fluree
+                .ledger_cached(ledger_id)
+                .await
+                .expect("cached load before reindex");
+
+            support::trigger_index_and_wait(&handle, ledger_id, after_copy.receipt.t).await;
+            support::wait_for_index_application(&fluree, ledger_id, after_copy.receipt.t).await;
+
+            let post = fluree
+                .ledger(ledger_id)
+                .await
+                .expect("reload after reindex");
+            let ann_root = post
+                .snapshot
+                .annotation_index
+                .as_ref()
+                .expect("reindex with the attachment provider must seal an arena");
+
+            // Index-time correctness gate. The attachment indexer decodes each
+            // bundle via `EdgeKey::from_reifies_facts` at seal time; a bad
+            // re-home of the g2 copy (anchor OBJECT still pointing at g1 while
+            // the flake-level `g` is g2) would be a `GraphMismatch` and get
+            // dropped from the arena. So the annotation now lives in BOTH the
+            // original g1 and the copied g2 — two distinct reified graphs, two
+            // f:reifiesGraph anchor rows in the durable index. Without the fix
+            // only g1 would survive the seal.
+            assert_eq!(
+                ann_root.stats.distinct_reified_graphs, 2,
+                "both the source (g1) and re-homed (g2) graph anchors must seal"
+            );
+            assert_eq!(
+                ann_root.stats.reifies_graph_rows, 2,
+                "two f:reifiesGraph anchor rows (one per graph) must survive the seal"
+            );
+        })
+        .await;
+}
+
+/// default→named at the DURABLE-INDEX layer (#1483 review: the synthesized
+/// anchor was only checked in-memory). `COPY DEFAULT TO <g2>` SYNTHESIZES an
+/// `f:reifiesGraph` anchor the source never had; the attachment indexer
+/// decodes every bundle via `EdgeKey::from_reifies_facts` at seal time, so a
+/// malformed synthesized anchor would be silently dropped from the arena.
+#[tokio::test]
+async fn transfer_default_to_named_synthesized_anchor_survives_reindex() {
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/edge-annotations-indexed:xfer-default-to-named";
+    let g2 = "http://example.org/g2";
+
+    let (local, handle) =
+        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+
+    local
+        .run_until(async move {
+            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            // Default-graph annotated edge — NO f:reifiesGraph anchor exists.
+            let seeded = fluree
+                .insert(
+                    ledger0,
+                    &json!({
+                        "@context": ctx(),
+                        "@id": "ex:alice",
+                        "ex:worksFor": {
+                            "@id": "ex:acme",
+                            "@annotation": { "@id": "ex:emp/alice-acme", "ex:role": "Engineer" }
+                        }
+                    }),
+                )
+                .await
+                .expect("seed default-graph annotation");
+
+            let sparql = format!("COPY DEFAULT TO <{g2}>");
+            let parsed = fluree_db_sparql::parse_sparql(&sparql);
+            assert!(
+                !parsed.has_errors(),
+                "parse errors: {:?}",
+                parsed.diagnostics
+            );
+            let ast = parsed.ast.expect("AST");
+            let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&seeded.ledger.snapshot);
+            let txn = fluree_db_transact::lower_sparql_update_ast(
+                &ast,
+                &mut ns,
+                fluree_db_transact::TxnOpts::default(),
+            )
+            .expect("lower COPY DEFAULT");
+            let after_copy = fluree
+                .stage_owned(seeded.ledger)
+                .txn(txn)
+                .execute()
+                .await
+                .expect("stage COPY DEFAULT");
+
+            let _ = fluree
+                .ledger_cached(ledger_id)
+                .await
+                .expect("cached load before reindex");
+
+            support::trigger_index_and_wait(&handle, ledger_id, after_copy.receipt.t).await;
+            support::wait_for_index_application(&fluree, ledger_id, after_copy.receipt.t).await;
+
+            let post = fluree
+                .ledger(ledger_id)
+                .await
+                .expect("reload after reindex");
+            let ann_root = post
+                .snapshot
+                .annotation_index
+                .as_ref()
+                .expect("reindex with the attachment provider must seal an arena");
+
+            // The default-graph bundle carries NO anchor; the g2 copy carries
+            // exactly the ONE synthesized anchor — and it must decode at seal
+            // time (a bad synthesis would be dropped as GraphMismatch).
+            assert_eq!(
+                ann_root.stats.distinct_reified_graphs, 1,
+                "exactly the synthesized g2 anchor's graph must seal"
+            );
+            assert_eq!(
+                ann_root.stats.reifies_graph_rows, 1,
+                "exactly one synthesized f:reifiesGraph anchor row must survive the seal"
+            );
+        })
+        .await;
+}
+
+// ============================================================================
+// Insert-flow seal matrix — regression pins for the write-only ingest trap:
+// a background index build racing an annotated insert used to run with
+// "delta unknown" (ledger not resident in the manager), defensively drop
+// the arena, and stamp the sticky bit; an explicit reindex then read a
+// stale NsRecord and rebuilt under Augment with no base arena — leaving
+// `annotation_index = None` permanently. Three fixes pinned here:
+// transient provider load, Augment merge with the previous root's arena,
+// and the post-quiesce record re-fetch in `Fluree::reindex`.
+// ============================================================================
+
+async fn assert_seals(fluree: &fluree_db_api::Fluree, ledger_id: &str, label: &str) {
+    fluree
+        .reindex(ledger_id, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let post = fluree.ledger(ledger_id).await.expect("reload");
+    assert!(
+        post.snapshot.has_annotations,
+        "{label}: sticky bit after annotated insert"
+    );
+    assert!(
+        post.snapshot.annotation_index.is_some(),
+        "{label}: first reindex must seal the arena"
+    );
+}
+
+#[tokio::test]
+async fn seal_file_backed_small_insert() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fluree: fluree_db_api::Fluree =
+        FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+            .build()
+            .expect("fluree");
+    let ledger_id = "bisect/file-small:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.expect("create");
+    fluree
+        .insert(ledger0, &annotated_insert())
+        .await
+        .expect("insert");
+    assert_seals(&fluree, ledger_id, "file+create_ledger+small").await;
+}
+
+#[tokio::test]
+async fn seal_memory_create_ledger_insert() {
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "bisect/mem-create:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.expect("create");
+    fluree
+        .insert(ledger0, &annotated_insert())
+        .await
+        .expect("insert");
+    assert_seals(&fluree, ledger_id, "memory+create_ledger+small").await;
+}
+
+#[tokio::test]
+async fn seal_memory_lpg_graph_insert() {
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "bisect/mem-lpg:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@graph": [
+                    {"@id": "n0", "@type": "INDEXED", "value": "v0",
+                     "order": {"@id": "n1", "@annotation": {"w": 1}}},
+                    {"@id": "n1", "@type": "INDEXED", "value": "v1",
+                     "related": {"@id": "n0", "@annotation": {"w": 2}}}
+                ],
+                "opts": {"lpgEdgeLifecycle": true}
+            }),
+        )
+        .await
+        .expect("insert");
+    assert_seals(&fluree, ledger_id, "memory+genesis+lpg-graph").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seal_survives_background_index_race() {
+    // Probe-scale: hundreds of annotated edges in one transaction, enough
+    // novelty for the background indexer to race the explicit reindex.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fluree: fluree_db_api::Fluree =
+        FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+            .build()
+            .expect("fluree");
+    let ledger_id = "bisect/file-large:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.expect("create");
+    let nodes = 500usize;
+    let graph: Vec<JsonValue> = (0..nodes)
+        .map(|i| {
+            json!({
+                "@id": format!("http://kb.example/node/{i}"),
+                "@type": "INDEXED",
+                "value": format!("http://kb.example/entity/{i}"),
+                "order": {
+                    "@id": format!("http://kb.example/node/{}", (i + 1) % nodes),
+                    "@annotation": {"w": 1}
+                }
+            })
+        })
+        .collect();
+    fluree
+        .insert(
+            ledger0,
+            &json!({"@graph": graph, "opts": {"lpgEdgeLifecycle": true}}),
+        )
+        .await
+        .expect("insert");
+    assert_seals(&fluree, ledger_id, "file+large-lpg-graph").await;
+}
+
+/// Arena-backed probe over a LITERAL reified triple with a VAR object.
+/// The recognized chain accepts a var object; the arena keys literal
+/// edges by (value, dt, lang) exactly as they were written, so the probe
+/// must match them — previously a runtime literal binding dropped the
+/// row (returned nothing) instead of probing.
+#[tokio::test]
+async fn arena_probe_matches_literal_object_annotation() {
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/edge-annotations-indexed:literal-object";
+
+    let (local, handle) =
+        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+
+    local
+        .run_until(async move {
+            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let after_insert = fluree
+                .insert(
+                    ledger0,
+                    &json!({
+                        "@context": ctx(),
+                        "@id": "ex:alice",
+                        "ex:score": {
+                            "@value": 42,
+                            "@annotation": {"ex:confidence": "high"}
+                        }
+                    }),
+                )
+                .await
+                .expect("literal annotated insert");
+            let _ = fluree
+                .ledger_cached(ledger_id)
+                .await
+                .expect("cached load before reindex");
+
+            support::trigger_index_and_wait(&handle, ledger_id, after_insert.receipt.t).await;
+            support::wait_for_index_application(&fluree, ledger_id, after_insert.receipt.t).await;
+
+            let post = fluree
+                .ledger(ledger_id)
+                .await
+                .expect("reload after reindex");
+            assert!(
+                post.snapshot.annotation_index.is_some(),
+                "arena must be sealed for this test to exercise the probe lane"
+            );
+
+            let sparql = r"
+                PREFIX ex: <http://example.org/>
+                SELECT ?score ?conf WHERE {
+                  ex:alice ex:score ?score {| ex:confidence ?conf |} .
+                }
+            ";
+            let result = support::query_sparql(&fluree, &post, sparql)
+                .await
+                .expect("var-object literal annotation query");
+            let rows = result.to_sparql_json(&post.snapshot).expect("sparql json");
+            let bindings = rows["results"]["bindings"]
+                .as_array()
+                .expect("bindings array")
+                .clone();
+            assert_eq!(
+                bindings.len(),
+                1,
+                "the literal reified triple must match via the arena probe: {bindings:#?}"
+            );
+            assert_eq!(bindings[0]["score"]["value"].as_str(), Some("42"));
+            assert_eq!(bindings[0]["conf"]["value"].as_str(), Some("high"));
+        })
+        .await;
+}
+
+// =============================================================================
+// Named-graph bundles after indexing: the flake-level `g` seam
+// =============================================================================
+
+/// A named-graph annotation must stay writable once its bundle has been
+/// indexed.
+///
+/// The stage-time single-target invariant compares a reifier's CURRENT bundle
+/// against the one this transaction produces, keyed by (graph, s, p, o, dt).
+/// Index-decoded flakes carry `g: None` — the graph is the index they came
+/// from, not a field on the flake — while a named-graph transaction's flakes
+/// carry `g: Some(sid)`. Without stamping the scanned side, the two never
+/// match: the net bundle mixes `None` and `Some` and decodes as
+/// `MixedFlakeGraphs`, so re-asserting an unchanged annotation, or adding a
+/// property to an existing claim, fails with an invariant violation on a
+/// perfectly legitimate write.
+///
+/// Default-graph annotations are unaffected (both sides are `None`), which is
+/// why this needs a named graph AND a published index to reproduce.
+#[tokio::test]
+async fn indexed_named_graph_annotation_stays_writable() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations-indexed:named-graph-rewrite";
+
+    let annotate = |props: JsonValue| {
+        json!({
+            "@context": ctx(),
+            "@id": "ex:alice",
+            "@graph": "ex:claims-graph",
+            "ex:knows": {
+                "@id": "ex:bob",
+                "@annotation": props
+            }
+        })
+    };
+
+    let committed = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &annotate(json!({"@id": "ex:claim1", "ex:confidence": 0.9})),
+        )
+        .await
+        .expect("annotated named-graph insert");
+    assert!(committed.ledger.t() > 0);
+
+    // Move the bundle out of novelty and into the index.
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+
+    // Re-assert the identical annotation against the indexed bundle.
+    let reloaded = fluree.ledger(ledger_id).await.expect("reload indexed");
+    fluree
+        .insert(
+            reloaded,
+            &annotate(json!({"@id": "ex:claim1", "ex:confidence": 0.9})),
+        )
+        .await
+        .expect("re-asserting an unchanged indexed named-graph annotation must be accepted");
+
+    // Add a property to the same claim — the ordinary "enrich a claim" edit.
+    let reloaded = fluree.ledger(ledger_id).await.expect("reload indexed");
+    fluree
+        .insert(
+            reloaded,
+            &annotate(json!({"@id": "ex:claim1", "ex:source": "hr"})),
+        )
+        .await
+        .expect("adding a property to an indexed named-graph claim must be accepted");
+
+    // The invariant itself still holds: re-pointing that reifier at a
+    // different edge is refused.
+    let reloaded = fluree.ledger(ledger_id).await.expect("reload indexed");
+    let err = fluree
+        .insert(
+            reloaded,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:claims-graph",
+                "ex:knows": {
+                    "@id": "ex:carol",
+                    "@annotation": {"@id": "ex:claim1", "ex:confidence": 0.5}
+                }
+            }),
+        )
+        .await
+        .expect_err("re-pointing an indexed reifier at a second edge must still be refused");
+    assert!(
+        err.to_string().contains("claim1"),
+        "the refusal must name the reifier: {err}"
+    );
+}
+
+/// Count the reifiers' own `f:reifies*` system facts across every graph.
+///
+/// The two cascade tests below need to tell an *orphaned* bundle from a
+/// *retracted* one, and the annotation query surface cannot: that lane joins
+/// the bundle against its base edge, so once the edge is gone it returns
+/// nothing either way. Reading the system facts directly is the only view
+/// that distinguishes them.
+async fn live_reifies_flakes(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> usize {
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let mut live = 0;
+    for g_id in 0..6u16 {
+        let flakes = fluree_db_core::range_with_overlay(
+            &ledger.snapshot,
+            g_id,
+            ledger.novelty.as_ref(),
+            fluree_db_core::comparator::IndexType::Spot,
+            fluree_db_core::range::RangeTest::Eq,
+            fluree_db_core::range::RangeMatch::new(),
+            fluree_db_core::range::RangeOptions::new().with_to_t(ledger.t()),
+        )
+        .await
+        .unwrap_or_default();
+        live += flakes
+            .iter()
+            .filter(|f| fluree_db_core::is_reserved_reifies_predicate(&f.p))
+            .count();
+    }
+    live
+}
+
+/// Deleting a base edge must retract the claim that reifies it, even once the
+/// bundle has been indexed.
+///
+/// `cascade_attachment_retracts` finds the annotation, scans its bundle back,
+/// and decodes it with `EdgeKey::from_reifies_facts` to confirm it really
+/// reifies the edge being deleted. That decode reconciles the bundle's
+/// `f:reifiesGraph` value against the flake-level `g` — and index-decoded
+/// flakes carry `g: None` while the value says `Some(graph)`, so an indexed
+/// named-graph bundle decoded as `GraphMismatch`. The cascade's
+/// `Err(_) => continue` then swallowed it and the claim outlived the edge it
+/// describes, which is a wrong answer rather than untidy storage.
+///
+/// Only this combination is affected. The default graph is fine (both sides
+/// `None`), and a novelty-resident named-graph bundle is fine (both `Some`),
+/// which is why every existing cascade test passed.
+#[tokio::test]
+async fn deleting_an_indexed_named_graph_edge_cascades_to_its_claim() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations-indexed:cascade-named-graph";
+
+    let committed = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:claims-graph",
+                "ex:knows": {
+                    "@id": "ex:bob",
+                    "@annotation": {"@id": "ex:claim1", "ex:confidence": 0.9}
+                }
+            }),
+        )
+        .await
+        .expect("annotated named-graph insert");
+    assert!(committed.ledger.t() > 0);
+
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+
+    // Guards the counter itself: if this read cannot see the bundle at all,
+    // the post-delete assertion below would pass for the wrong reason.
+    let before = live_reifies_flakes(&fluree, ledger_id).await;
+    assert!(
+        before > 0,
+        "the indexed bundle must be visible to this read before the delete"
+    );
+
+    let deleted = fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(
+            "PREFIX ex: <http://example.org/>\n\
+             DELETE DATA { GRAPH <http://example.org/claims-graph> \
+             { ex:alice ex:knows ex:bob } }",
+        )
+        .commit()
+        .await
+        .expect("delete the base edge");
+    assert!(deleted.receipt.t > committed.ledger.t());
+
+    assert_eq!(
+        live_reifies_flakes(&fluree, ledger_id).await,
+        0,
+        "the claim's f:reifies* bundle must not outlive the edge it reifies"
+    );
+}
+
+/// The same `g`-asymmetry defect, reached through the *other* cascade pass.
+///
+/// Pass 1 fires when the base edge is deleted. Pass 2 fires when the user
+/// deletes an annotation's last piece of metadata without touching the edge,
+/// which leaves the `f:reifies*` bundle behind with nothing to describe. Both
+/// passes scan the reifier's own facts and decode them, so both hit the
+/// `GraphMismatch` on an indexed named-graph bundle — a fix to one leaves the
+/// other silently broken, which is why this test exists alongside its twin.
+#[tokio::test]
+async fn deleting_an_indexed_named_graph_claim_body_cascades_its_bundle() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations-indexed:cascade-named-graph-orphan";
+
+    let committed = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:claims-graph",
+                "ex:knows": {
+                    "@id": "ex:bob",
+                    // A string, deliberately. A bare `0.9` in the SPARQL below
+                    // is an `xsd:decimal` while JSON-LD stores it as an
+                    // `xsd:double`, so `DELETE DATA` would match nothing, the
+                    // transaction would still commit, and this test would pass
+                    // without the cascade ever running.
+                    "@annotation": {"@id": "ex:claim1", "ex:role": "Engineer"}
+                }
+            }),
+        )
+        .await
+        .expect("annotated named-graph insert");
+
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+
+    assert!(
+        live_reifies_flakes(&fluree, ledger_id).await > 0,
+        "the indexed bundle must be visible to this read before the delete"
+    );
+
+    // Delete the claim's only metadata fact, leaving the edge itself alone.
+    let deleted = fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(
+            "PREFIX ex: <http://example.org/>\n\
+             DELETE DATA { GRAPH <http://example.org/claims-graph> \
+             { ex:claim1 ex:role \"Engineer\" } }",
+        )
+        .commit()
+        .await
+        .expect("delete the claim body");
+    assert!(deleted.receipt.t > committed.ledger.t());
+
+    assert_eq!(
+        live_reifies_flakes(&fluree, ledger_id).await,
+        0,
+        "a bundle whose claim has no body left must not survive as an orphan"
+    );
+}
+
+/// A reifier already in the base index is still checked against its stored
+/// bundle.
+///
+/// `enforce_single_target_reifiers` skips its scan for reifiers that resolve
+/// in neither the persisted dictionary nor novelty, because those provably
+/// have no prior bundle and the scan for them degrades into a walk of the
+/// graph's entire novelty. The skip must not extend to a reifier that *does*
+/// resolve: this one is in the base index after the rebuild, so the second
+/// write has to see its stored bundle to notice that it would then reify two
+/// edges at once.
+#[tokio::test]
+async fn an_indexed_reifier_pointed_at_a_second_edge_is_still_refused() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations-indexed:second-edge-refused";
+
+    let committed = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:knows": {
+                    "@id": "ex:bob",
+                    "@annotation": {"@id": "ex:claim1", "ex:confidence": 0.9}
+                }
+            }),
+        )
+        .await
+        .expect("annotated insert");
+
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let indexed = fluree.ledger(ledger_id).await.expect("reload indexed");
+    assert!(indexed.t() >= committed.ledger.t());
+
+    // Same reifier, a different edge, with the first attachment left in place.
+    let err = fluree
+        .insert(
+            indexed,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:carol",
+                "ex:knows": {
+                    "@id": "ex:dave",
+                    "@annotation": {"@id": "ex:claim1", "ex:confidence": 0.5}
+                }
+            }),
+        )
+        .await
+        .expect_err("a reifier on two edges must be refused");
+    assert!(
+        err.to_string().contains("claim1"),
+        "the error must name the reifier: {err}"
+    );
 }

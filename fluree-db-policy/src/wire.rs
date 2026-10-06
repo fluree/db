@@ -16,7 +16,8 @@
 use crate::error::Result;
 use crate::index::build_policy_set;
 use crate::types::{
-    PolicyAction, PolicyQuery, PolicyRestriction, PolicySet, PolicyValue, TargetMode,
+    ConditionState, PolicyAction, PolicyQuery, PolicyQueryLanguage, PolicyRestriction, PolicySet,
+    PolicyValue, TargetMode, WriteVerbs,
 };
 use fluree_db_core::{IndexStats, Sid};
 use std::collections::HashSet;
@@ -76,6 +77,9 @@ pub struct WireRestriction {
     pub targets: Vec<String>,
     /// `f:action`.
     pub action: PolicyAction,
+    /// Explicit write verbs (`f:create`/`f:update`/`f:delete`), if any.
+    /// `None` = bare `f:modify` legacy semantics.
+    pub verbs: Option<WriteVerbs>,
     /// `f:allow` / `f:query` effect.
     pub value: WirePolicyValue,
     /// `f:required` flag.
@@ -90,14 +94,18 @@ pub struct WireRestriction {
 
 /// IRI-form mirror of [`PolicyValue`].
 ///
-/// `Query` stores its JSON payload verbatim — it is already
-/// term-neutral; the policy query executor re-interns IRIs at
+/// `Query` stores its source text verbatim (plus the language tag) — it
+/// is already term-neutral; the policy query executor re-interns IRIs at
 /// execution time against the data ledger's term space.
 #[derive(Debug, Clone)]
 pub enum WirePolicyValue {
     Allow,
     Deny,
-    Query(String),
+    Query {
+        source: String,
+        language: PolicyQueryLanguage,
+        state: ConditionState,
+    },
 }
 
 /// Translate a wire artifact into a list of Sid-form
@@ -194,13 +202,22 @@ where
         let value = match &w.value {
             WirePolicyValue::Allow => PolicyValue::Allow,
             WirePolicyValue::Deny => PolicyValue::Deny,
-            WirePolicyValue::Query(json) => PolicyValue::Query(PolicyQuery { json: json.clone() }),
+            WirePolicyValue::Query {
+                source,
+                language,
+                state,
+            } => PolicyValue::Query(PolicyQuery {
+                source: source.clone(),
+                language: *language,
+                state: *state,
+            }),
         };
         out.push(PolicyRestriction {
             id: w.id.clone(),
             target_mode: w.target_mode,
             targets,
             action: w.action,
+            verbs: w.verbs,
             value,
             required: w.required,
             message: w.message.clone(),
@@ -231,7 +248,10 @@ where
     R: Fn(&str) -> Option<Sid>,
 {
     let restrictions = wire_to_restrictions(wire, resolve_iri, None)?;
-    Ok(build_policy_set(restrictions, stats, action_filter))
+    // Cross-ledger wire policies apply in the data ledger's term space, but
+    // this path has no hierarchy handle yet — no RDFS expansion (matches the
+    // pre-entailment behavior for wire policies).
+    Ok(build_policy_set(restrictions, stats, action_filter, None))
 }
 
 #[cfg(test)]
@@ -288,6 +308,7 @@ mod tests {
                 target_mode: TargetMode::OnProperty,
                 targets: vec![name_iri.into()],
                 action: PolicyAction::View,
+                verbs: None,
                 value: WirePolicyValue::Allow,
                 required: false,
                 message: None,
@@ -334,6 +355,7 @@ mod tests {
                 target_mode: TargetMode::OnProperty,
                 targets: vec![name_iri.into(), unknown_iri.into()],
                 action: PolicyAction::View,
+                verbs: None,
                 value: WirePolicyValue::Deny,
                 required: false,
                 message: None,
@@ -382,6 +404,7 @@ mod tests {
             target_mode: TargetMode::OnProperty,
             targets: [name_sid.clone()].into_iter().collect(),
             action: PolicyAction::View,
+            verbs: None,
             value: PolicyValue::Allow,
             required: false,
             message: None,
@@ -389,7 +412,7 @@ mod tests {
             for_classes: HashSet::new(),
             class_check_needed: false,
         };
-        let local_set = build_policy_set(vec![local_restriction], None, PolicyAction::View);
+        let local_set = build_policy_set(vec![local_restriction], None, PolicyAction::View, None);
 
         // (b) Wire form translated against the same Sid bindings.
         let wire = PolicyArtifactWire {
@@ -400,6 +423,7 @@ mod tests {
                 target_mode: TargetMode::OnProperty,
                 targets: vec![name_iri.into()],
                 action: PolicyAction::View,
+                verbs: None,
                 value: WirePolicyValue::Allow,
                 required: false,
                 message: None,
@@ -420,15 +444,15 @@ mod tests {
         // unrelated property.
         let unrelated = sid(100, "age");
 
-        let local_hits = local_set.restrictions_for_flake(&alice_sid, &name_sid);
-        let wire_hits = wire_set.restrictions_for_flake(&alice_sid, &name_sid);
+        let local_hits = local_set.restrictions_for_flake(&alice_sid, &name_sid, &[]);
+        let wire_hits = wire_set.restrictions_for_flake(&alice_sid, &name_sid, &[]);
         assert_eq!(local_hits.len(), wire_hits.len());
         assert_eq!(local_hits[0].id, wire_hits[0].id);
         assert!(matches!(local_hits[0].value, PolicyValue::Allow));
         assert!(matches!(wire_hits[0].value, PolicyValue::Allow));
 
-        let local_miss = local_set.restrictions_for_flake(&alice_sid, &unrelated);
-        let wire_miss = wire_set.restrictions_for_flake(&alice_sid, &unrelated);
+        let local_miss = local_set.restrictions_for_flake(&alice_sid, &unrelated, &[]);
+        let wire_miss = wire_set.restrictions_for_flake(&alice_sid, &unrelated, &[]);
         assert_eq!(local_miss.len(), 0);
         assert_eq!(wire_miss.len(), 0);
     }
@@ -453,6 +477,7 @@ mod tests {
                     target_mode: TargetMode::Default,
                     targets: vec![],
                     action: PolicyAction::View,
+                    verbs: None,
                     value: WirePolicyValue::Allow,
                     required: false,
                     message: None,
@@ -465,6 +490,7 @@ mod tests {
                     target_mode: TargetMode::Default,
                     targets: vec![],
                     action: PolicyAction::View,
+                    verbs: None,
                     value: WirePolicyValue::Allow,
                     required: false,
                     message: None,
@@ -514,6 +540,7 @@ mod tests {
                 target_mode: TargetMode::Default,
                 targets: vec![],
                 action: PolicyAction::View,
+                verbs: None,
                 value: WirePolicyValue::Allow,
                 required: false,
                 message: None,
@@ -544,7 +571,12 @@ mod tests {
                 target_mode: TargetMode::Default,
                 targets: vec![],
                 action: PolicyAction::View,
-                value: WirePolicyValue::Query(json_payload.into()),
+                verbs: None,
+                value: WirePolicyValue::Query {
+                    source: json_payload.into(),
+                    language: PolicyQueryLanguage::JsonLd,
+                    state: ConditionState::Pre,
+                },
                 required: false,
                 message: None,
                 class_policy: false,
@@ -556,7 +588,10 @@ mod tests {
 
         assert_eq!(set.restrictions.len(), 1);
         match &set.restrictions[0].value {
-            PolicyValue::Query(q) => assert_eq!(q.json, json_payload),
+            PolicyValue::Query(q) => {
+                assert_eq!(q.source, json_payload);
+                assert_eq!(q.language, PolicyQueryLanguage::JsonLd);
+            }
             other => panic!("expected Query, got {other:?}"),
         }
     }

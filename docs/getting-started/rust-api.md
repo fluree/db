@@ -36,12 +36,15 @@ Available feature flags:
 - `credential` (default in server/CLI) - DID/JWS/VerifiableCredential support for signed queries and transactions
 - `shacl` (default in server/CLI) - SHACL constraint validation
 - `iceberg` (default in server/CLI) - Apache Iceberg/R2RML graph source support
+- `sql` (default in server/CLI) - SQL graph sources (R2RML over a Trino-protocol endpoint); implies `iceberg`
+- `delta` (default in server/CLI) - Delta Lake graph sources (R2RML over Delta tables); implies `iceberg`
+- `graphql` (default in server/CLI) - GraphQL over the schema derived from a ledger's data; implies `shacl`
 - `aws` - AWS-backed storage support (S3, storage-backed nameservice). Enables `FlureeBuilder::s3()` and S3-based JSON-LD configs.
 - `ipfs` - IPFS-backed storage via Kubo HTTP RPC
 - `vector` - Embedded vector similarity search (HNSW indexes via usearch)
 - `search-remote-client` - Remote search service client (HTTP client for remote BM25 and vector search services)
 - `aws-testcontainers` - Opt-in LocalStack-backed S3/DynamoDB tests (auto-start via testcontainers)
-- `full` - Convenience bundle: `native`, `credential`, `iceberg`, `shacl`, `ipfs`
+- `full` - Convenience bundle: `native`, `credential`, `iceberg`, `sql`, `shacl`, `ipfs`, `graphql` (excludes `delta`, `aws`, `vector`, `search-remote-client`)
 
 ## Quick Start
 
@@ -139,8 +142,16 @@ use fluree_db_api::{FlureeBuilder, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // LocalStack/MinIO: endpoint is required
+    // LocalStack: an endpoint override is enough.
     let fluree = FlureeBuilder::s3("my-bucket", "http://localhost:4566")
+        .build_client()
+        .await?;
+
+    // MinIO also needs path-style addressing: without it the SDK emits
+    // `http://my-bucket.minio:9000/key`, which a plain MinIO (no wildcard
+    // bucket-subdomain DNS) rejects.
+    let _minio = FlureeBuilder::s3("my-bucket", "http://minio:9000")
+        .s3_force_path_style(true)
         .build_client()
         .await?;
 
@@ -201,7 +212,8 @@ Connection node:
 - `primaryPublisher` (publisher node)
 
 Storage node:
-- File: `filePath`, `AES256Key`
+- Any storage: `AES256Key`, or `AES256Keys` + `AES256CurrentKey` (mutually exclusive; put the key on `indexStorage`)
+- File: `filePath`, `durability`
 - S3: `s3Bucket`, `s3Prefix`, `s3Endpoint`, `s3ReadTimeoutMs`, `s3WriteTimeoutMs`, `s3ListTimeoutMs`, `s3MaxRetries`, `s3RetryBaseDelayMs`, `s3RetryMaxDelayMs`, `s3MaxConcurrentRequests`
 
 Publisher node:
@@ -687,7 +699,7 @@ All formats stream directly from the binary SPOT index. Memory usage is O(leafle
 - `.format(ExportFormat)` — output format (default: Turtle)
 - `.all_graphs()` — include all named graphs including system graphs (requires TriG or NQuads)
 - `.graph("iri")` — export a specific named graph by IRI
-- `.as_of(TimeSpec)` — time-travel export (transaction number, ISO-8601 datetime, or commit CID prefix)
+- `.as_of(TimeSpec)` — time-travel export (`AtT`, `AtTime`/`AtRecorded` for the event and recorded time axes, `AtCommit`, or `Latest`; parse a user-supplied string with `TimeSpec::parse_at`)
 - `.context(&json)` — override prefix map (default: ledger's context from nameservice)
 - `.write_to(&mut writer)` — stream to any `Write` sink
 - `.to_stdout()` — convenience for stdout output
@@ -1089,7 +1101,8 @@ integration test with immediate assertion) each wrap the same primitive differen
 ### Branch Diff (Merge Preview)
 
 `Fluree::merge_preview` returns the rich diff between two branches —
-ahead/behind commit summaries, the common ancestor, conflict keys, and
+ahead/behind commit summaries, the commit both branches last shared,
+conflict keys, and
 fast-forward eligibility — **without mutating any state**. It uses the
 same primitives as `merge_branch` but skips the publish/copy steps,
 making it cheap enough to call on every UI render.
@@ -1120,9 +1133,24 @@ async fn main() -> Result<()> {
             println!("  - s={} p={}", k.s, k.p);
         }
     }
+
+    // `mergeable` is the answer to "will `merge_branch` go through?": the
+    // strategy applies without aborting AND the merged state conforms to
+    // the target's SHACL shapes. The preview stages the resolved change
+    // set and runs the same validation the merge runs, so the two agree.
+    if let Some(v) = &preview.validation {
+        if !v.conforms {
+            println!("merge would be rejected:\n{}", v.report.as_deref().unwrap_or(""));
+        }
+    }
+    println!("mergeable: {}", preview.mergeable);
     Ok(())
 }
 ```
+
+`validation` is present for every non-fast-forward preview unless
+`MergePreviewOpts::include_validation` is `false`. A fast-forward adopts
+commits that were validated when they were authored, so it carries none.
 
 #### Tuning the preview
 
@@ -1146,6 +1174,8 @@ async fn main() -> Result<()> {
                 max_commits: Some(0),       // counts only — no commit summaries
                 max_conflict_keys: Some(0),
                 include_conflicts: false,
+                include_validation: false,  // skip the target-state load + SHACL pass
+                ..MergePreviewOpts::default()
             },
         )
         .await?;
@@ -1162,6 +1192,7 @@ async fn main() -> Result<()> {
                 max_commits: None,
                 max_conflict_keys: None,
                 include_conflicts: true,
+                ..MergePreviewOpts::default()
             },
         )
         .await?;
@@ -1170,16 +1201,85 @@ async fn main() -> Result<()> {
 }
 ```
 
+#### The aggregate change set (`include_changes`)
+
+For a merge-request "Changes" panel, `include_changes` returns the **net**
+set of facts the merge would apply: the source side's commits since the
+two branches diverged, folded per fact, each keeping its newest op. A branch with
+40 commits that ultimately touches 12 facts reviews as 12 facts, and a fact
+the branch created and then deleted shows as the deletion the merge
+applies:
+
+```rust
+use fluree_db_api::{FlureeBuilder, MergePreviewOpts, Result};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // ... create ledger, branch, transact on dev, etc.
+
+    let preview = fluree
+        .merge_preview_with(
+            "mydb",
+            "dev",
+            None,
+            MergePreviewOpts {
+                include_changes: true,
+                // Cap the payload at 100 flakes, cut at subject boundaries.
+                // Some(0) = stats-only; None = unbounded (Rust-only escape hatch).
+                max_changes: Some(100),
+                ..MergePreviewOpts::default()
+            },
+        )
+        .await?;
+
+    let changes = preview.changes.expect("include_changes was set");
+    println!(
+        "+{} -{} across {} subject(s)",
+        changes.assert_count, changes.retract_count, changes.subject_count,
+    );
+    for entry in &changes.entries {
+        println!("{}: +{} -{}", entry.subject, entry.asserts.len(), entry.retracts.len());
+    }
+    // Page through a large diff: subjects are ordered by full IRI and a
+    // truncated page carries a resume cursor.
+    if let Some(cursor) = changes.next_cursor {
+        let _next_page = fluree
+            .merge_preview_with(
+                "mydb",
+                "dev",
+                None,
+                MergePreviewOpts {
+                    include_changes: true,
+                    max_changes: Some(100),
+                    changes_after_subject: Some(cursor),
+                    ..MergePreviewOpts::default()
+                },
+            )
+            .await?;
+    }
+    Ok(())
+}
+```
+
+Exact counts (`assert_count` / `retract_count` / `subject_count`) are never
+truncated, so a UI can render "showing X of Y". The change set is
+strategy-independent — the raw source-vs-ancestor delta before conflict
+resolution; conflicting keys resolve per `conflicts.details`. Each page
+re-pays the source-side replay cost (there is no cache), matching what the
+merge itself would pay.
+
 #### What the caps do (and don't) control
 
 `max_commits` and `max_conflict_keys` cap the **size of the returned
 lists**, not the cost of computing them:
 
 - `BranchDelta::count` on each side reflects the full unbounded
-  divergence — computed by walking every commit envelope between HEAD and
-  the common ancestor — regardless of `max_commits`.
-- When `include_conflicts: true`, both `compute_delta_keys` walks scan
-  the full per-side delta regardless of `max_conflict_keys`.
+  divergence, computed by walking every commit envelope down to the commit
+  the other side holds, regardless of `max_commits`.
+- When `include_conflicts: true`, both delta-key walks scan the full
+  per-side delta regardless of `max_conflict_keys`.
 - When `include_conflict_details: true`, value details are collected only
   for the returned `conflicts.keys` after the `max_conflict_keys` cap is
   applied.
@@ -1196,12 +1296,16 @@ lists**, not the cost of computing them:
 | `ConflictSummary` | `count` (unbounded), `keys: Vec<ConflictKey>` (sorted, capped), `truncated`, `strategy`, `details` |
 | `ConflictDetail` | `key`, `source_values`, `target_values`, `resolution` (values are the current asserted values at each branch HEAD) |
 | `ConflictKey` | `s: Sid`, `p: Sid`, `g: Option<Sid>` |
+| `ValidationSummary` | `conforms`, `report: Option<String>` (present only when `conforms` is false; the message the merge would fail with) |
 
-`mergeable` only reflects whether the selected strategy would abort due to
-detected conflicts; it is not full validation of every constraint the eventual
-merge commit may encounter. `mergeable=true` does not guarantee a subsequent
-merge will succeed; it only reflects the conflict/strategy interaction at
-preview time.
+`mergeable` is `false` when the selected strategy would abort on detected
+conflicts or, when `validation` is present, when the merged state fails the
+target's SHACL shapes. The preview stages the resolved change set and runs
+the same validation `merge_branch` runs, so with `include_validation` on
+(the default) `mergeable=true` means neither the strategy nor the target's
+shapes will reject the merge. Other conditions still apply when the commit
+is built, novelty backpressure among them. With it off, `mergeable`
+reflects only the conflict/strategy interaction.
 
 All types derive `Serialize` so the response is wire-stable; the HTTP
 endpoint at `GET /v1/fluree/merge-preview/{ledger...}` returns the same struct.
@@ -1214,11 +1318,11 @@ The per-commit summary types and DAG walker are factored into core for
 reuse outside the merge-preview flow (e.g., git-log-style commit history
 viewers, indexer integration). Re-exported from `fluree-db-api`:
 
-- `walk_commit_summaries(store, head, stop_at_t, max) -> Result<(Vec<CommitSummary>, usize)>`
-  — newest-first walk that returns both the (capped) summary list and the
-  unbounded total count.
+- `diff_branches(store, source_head, target_head) -> Result<BranchDiff>`
+  — each side's commits since the two branches diverged, by commit
+  identity, plus the most recent commit both hold and whether the merge
+  fast-forwards.
 - `commit_to_summary(commit) -> CommitSummary` — pure function, no I/O.
-- `find_common_ancestor(store, head_a, head_b)` — dual-frontier BFS.
 
 ### Time Travel Queries
 
@@ -2010,8 +2114,8 @@ let result = fluree.stage(&handle)  // or stage_owned(ledger)
 | `.insert(&json)` | Insert JSON-LD data |
 | `.upsert(&json)` | Upsert JSON-LD data |
 | `.update(&json)` | Update with WHERE/DELETE/INSERT |
-| `.insert_turtle(&ttl)` | Insert Turtle data |
-| `.upsert_turtle(&ttl)` | Upsert Turtle data |
+| `.insert_turtle(&ttl)` | Insert Turtle or TriG data (graph blocks land in their named graphs) |
+| `.upsert_turtle(&ttl)` | Upsert Turtle or TriG data |
 | `.txn_opts(opts)` | Set transaction options (branch, context) |
 | `.commit_opts(opts)` | Set commit options (identity, raw_txn) |
 | `.policy(ctx)` | Set policy enforcement |

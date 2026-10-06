@@ -3,14 +3,25 @@
 //! Operators form a tree that produces batches of results through the
 //! `open/next_batch/close` lifecycle pattern.
 
+pub(crate) mod flush;
 pub mod inline;
 
-use crate::binding::Batch;
+use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
+use crate::sort::SortSpec;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use std::sync::Arc;
+
+/// One nonempty group returned by a grouped count drain.
+#[derive(Debug)]
+pub struct CountGroup {
+    /// Representative bindings in the requested group-variable order.
+    pub keys: Vec<Binding>,
+    /// Number of remaining output rows in this group.
+    pub count: u64,
+}
 
 /// Query execution operator
 ///
@@ -60,6 +71,30 @@ pub trait Operator: Send + Sync {
         None
     }
 
+    /// True only for a source guaranteed to emit exactly one empty solution.
+    /// This is an algebraic identity, not an estimated row count. Operators with
+    /// zero columns may still emit zero or many rows and must keep the default.
+    fn is_identity_seed(&self) -> bool {
+        false
+    }
+
+    /// Schema variables bound in every row this operator emits, when it can see
+    /// its rows. A plan seeded by this operator holds a BIND or FILTER reading
+    /// any other schema variable until the triples that could still bind it
+    /// have run. `None` plans every schema variable as bound.
+    fn bound_in_every_row(&self) -> Option<Vec<VarId>> {
+        None
+    }
+
+    /// Extract the input of a DISTINCT wrapper during planning, before `open()`.
+    /// The caller must prove that its consumer cannot observe input duplicates.
+    /// A successful extraction leaves the wrapper closed; discard it immediately.
+    /// Only DISTINCT implements this: do not forward through other operators,
+    /// since a LIMIT, projection or subquery can make deduplication significant.
+    fn take_distinct_input(&mut self) -> Option<BoxedOperator> {
+        None
+    }
+
     /// Consume all remaining output rows to exhaustion and return the total count.
     ///
     /// # Contract
@@ -78,6 +113,19 @@ pub trait Operator: Send + Sync {
         Ok(None)
     }
 
+    /// Count remaining rows by `group_vars`, using ordinary GROUP BY equality.
+    /// A successful drain exhausts this operator and returns each nonempty group
+    /// exactly once. Empty input returns an empty vector. Returning `None` must
+    /// leave the input untouched so the consumer can aggregate ordinary rows.
+    /// Do not forward through row-changing operators such as DISTINCT or LIMIT.
+    async fn drain_grouped_count(
+        &mut self,
+        _ctx: &ExecutionContext<'_>,
+        _group_vars: &[VarId],
+    ) -> Result<Option<Vec<CountGroup>>> {
+        Ok(None)
+    }
+
     /// Advisory row budget pushed down from a top-of-tree `LIMIT`.
     ///
     /// Tells this operator that its parent needs at most `budget` rows, so an
@@ -88,14 +136,37 @@ pub trait Operator: Send + Sync {
     ///
     /// **Default = ABSORB** (no-op). An operator forwards a budget to its
     /// children only by explicitly overriding this, and only when it is
-    /// row- and order-preserving — `Project`, `Offset` (+offset), `Limit`.
-    /// Row-dropping / reordering / materializing operators (`Bind`, `Filter`,
-    /// `Sort`, `Distinct`, `GroupAggregate`, hash-join build) absorb, so a
-    /// budget never leaks past a boundary where it would be unsound.
+    /// row- and order-preserving — `Project`, `Offset` (+offset), `Limit`,
+    /// and (switch-gated, F17) `Bind` (1:1, order-preserving) and `Union`
+    /// (to *each* branch — a single branch may supply all `budget` rows, so
+    /// the whole budget is forwarded, not split). Row-dropping / reordering /
+    /// materializing operators (`Filter`, `Sort`, `Distinct`, `GroupAggregate`,
+    /// hash-join build) absorb, so a budget never leaks past a boundary where
+    /// it would be unsound.
     ///
     /// Set **before** `open()`. Consult only at batch/leaflet boundaries —
     /// never inside fused per-row/per-group loops (hot-loop purity).
     fn set_row_budget(&mut self, _budget: usize) {}
+
+    /// Offer a source-side top-k directive: `ORDER BY <ordering> LIMIT k` (`k`
+    /// = LIMIT + OFFSET) sits directly above a row-preserving operator chain
+    /// down to a single source. `ordering` is the complete ORDER BY. Default
+    /// no-op. The R2RML scan reads the primary key alone and skips only the
+    /// files that cannot hold the top-k, which stays a superset under ties, so
+    /// the `Sort` above remains authoritative (for ASC it also requires a
+    /// non-nullable column, since SPARQL orders unbound first). A source that
+    /// answers *exactly* k rows (the SQL pushdown lane) must order on every
+    /// key or leave the LIMIT to the engine. Order-preserving pass-through
+    /// operators forward it to their child. Set **before** `open()`.
+    fn set_topk(&mut self, _ordering: &[SortSpec], _k: usize) {}
+
+    /// Tell a source that a `DISTINCT` over exactly `vars` sits directly above
+    /// it (through row-preserving operators only), so it may return each
+    /// distinct combination of those variables once and leave the others
+    /// unbound. Default no-op; the `DistinctOperator` above stays
+    /// authoritative, so honoring it never changes results. Set **before**
+    /// `open()`.
+    fn set_distinct(&mut self, _vars: &[VarId]) {}
 
     // ------------------------------------------------------------------
     // EXPLAIN introspection (never called on the hot path)

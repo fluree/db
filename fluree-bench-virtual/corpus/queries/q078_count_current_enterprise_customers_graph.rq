@@ -1,0 +1,21 @@
+# q078 count_current_enterprise_customers_graph — audit F1 (F-AUD-8, the q038
+#   class), DIRECT/Graph-path MULTI-CONSTRAINT case (D-c5 over-count guard).
+# Coverage: the graph-source-direct (no FROM) analogue of q077 — an UNGROUPED COUNT
+#   carrying TWO folded constant-object constraints, edw:isCurrent true (xsd:boolean)
+#   AND edw:segment "Enterprise" (xsd:string). At the audit tip this shape rewrites to
+#   a SPLIT (a class scan + one standalone const-object scan per constraint, no
+#   variable-object member to fold onto) and MISSES the single-table fused gate, so it
+#   materializes — exactly the q038 gap, with a second constraint. F1's
+#   combine_constrained_class_scan recombines the split into one
+#   class-scan-with-star_constraints pattern, so the single-table fold applies BOTH
+#   constraints per row via the same 9b machinery (resolve_star_constraint_checks +
+#   row_satisfies_constraints). The oracle is the CONSTRAINED count (current Enterprise
+#   customers = 50038, i.e. q022's Enterprise row): dropping EITHER constraint
+#   over-counts (300000 if segment is ignored; all-segment Enterprise incl. non-current
+#   if isCurrent is ignored). The manifest COUNT shortcut stays declined for a
+#   constraint-bearing plan. Rides FLUREE_FUSED_R2RML_AGG (switch-off reverts to the
+#   materialized path). Exec path: graph(alias).query() — the direct virtual-dataset
+#   shape (contrast q077's FROM/dataset path).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT (COUNT(*) AS ?n)
+WHERE { ?c a edw:Customer ; edw:isCurrent true ; edw:segment "Enterprise" . }

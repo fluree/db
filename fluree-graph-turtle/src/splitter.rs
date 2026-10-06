@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::{parse, tokenize, TokenKind};
-use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, TermId};
+use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
 
 // ============================================================================
 // Configuration
@@ -177,12 +177,12 @@ fn extract_prefix_block_from_bytes(buf: &[u8]) -> Result<(String, u64), SplitErr
 
     for tok in &tokens {
         match tok.kind {
-            TokenKind::KwPrefix | TokenKind::KwBase => {
+            TokenKind::KwPrefix | TokenKind::KwBase | TokenKind::KwVersion => {
                 in_directive = true;
                 sparql_directive = false;
                 saw_any_directive = true;
             }
-            TokenKind::KwSparqlPrefix | TokenKind::KwSparqlBase => {
+            TokenKind::KwSparqlPrefix | TokenKind::KwSparqlBase | TokenKind::KwSparqlVersion => {
                 in_directive = true;
                 sparql_directive = true;
                 saw_any_directive = true;
@@ -192,9 +192,23 @@ fn extract_prefix_block_from_bytes(buf: &[u8]) -> Result<(String, u64), SplitErr
                 in_directive = false;
                 last_directive_end = tok.end;
             }
-            TokenKind::Iri if in_directive && sparql_directive => {
-                // SPARQL-style directives end after the IRI (no dot required).
-                // `PREFIX ns: <iri>` and `BASE <iri>` both terminate here.
+            TokenKind::Iri
+            | TokenKind::IriEscaped(_)
+            | TokenKind::String
+            | TokenKind::StringEscaped(_)
+                if in_directive && sparql_directive =>
+            {
+                // SPARQL-style directives end after their operand (no dot
+                // required): `PREFIX ns: <iri>`, `BASE <iri>`, `VERSION "1.2"`.
+                //
+                // `IriEscaped` is the same operand: an IRI containing a `\u`
+                // escape lexes as its own token. Without it the directive
+                // never closed, so the prefix block ran on until the next `.`
+                // and swallowed the first data statement — which the prelude
+                // parse ignores and `data_start` skips past. A streaming
+                // import silently dropped that triple; the directory-rechunk
+                // path, which prepends the prefix block to every chunk,
+                // re-asserted it in each one instead.
                 in_directive = false;
                 last_directive_end = tok.end;
             }
@@ -235,7 +249,7 @@ fn extract_prefix_block_from_bytes(buf: &[u8]) -> Result<(String, u64), SplitErr
     tracing::info!(
         prefix_len = prefix_text.len(),
         data_start,
-        prefix_first_500 = &prefix_text[..prefix_text.len().min(500)],
+        prefix_first_500 = prefix_text.chars().take(500).collect::<String>(),
         "prefix block extracted"
     );
 
@@ -292,6 +306,11 @@ struct Lookahead {
     pending_quote_char: u8,
     /// `\r` was the last byte — check for `\n` to form CRLF.
     pending_cr: bool,
+    /// A `<` was the last byte in Normal state; waiting to see whether it
+    /// opens an IRI (`<http://…>`) or, followed by a second `<`, an RDF 1.2
+    /// reified triple (`<< s p o >>`), whose contents are ordinary terms —
+    /// including string literals that may contain `>` and `.`.
+    pending_lt: bool,
 }
 
 /// Compute chunk byte ranges by scanning the file for statement boundaries.
@@ -359,6 +378,22 @@ pub fn compute_chunk_boundaries(
                     }
                 }
                 // The dot was not a boundary — fall through to process `b` normally.
+            }
+
+            // Handle a pending `<`: `<<` opens a reified triple, not an IRI.
+            // Scanning `<< :a :q "x > y . z" >>` as an IRI would exit at the
+            // `>` inside the string and then take the `.` as a statement
+            // boundary, splitting a chunk in the middle of a literal.
+            if lookahead.pending_lt {
+                lookahead.pending_lt = false;
+                prefix_check.feed(b, abs_pos)?;
+                state = match b {
+                    b'<' => ScanState::Normal,
+                    b'>' => ScanState::Normal, // `<>` — the empty relative IRI
+                    _ => ScanState::InIri,
+                };
+                prev_byte = Some(b);
+                continue;
             }
 
             // Handle pending CR for CRLF detection.
@@ -532,7 +567,11 @@ fn advance_state(
                     lookahead.pending_quote_char = b'\'';
                     Ok(ScanState::Normal)
                 }
-                b'<' => Ok(ScanState::InIri),
+                b'<' => {
+                    // Resolved on the next byte: IRI, or `<<` reified triple.
+                    lookahead.pending_lt = true;
+                    Ok(ScanState::Normal)
+                }
                 b'#' => Ok(ScanState::InComment),
                 b'.' => {
                     lookahead.pending_dot = Some(abs_pos);
@@ -890,7 +929,9 @@ impl GraphSink for PreludeSink {
         TermId::new(0)
     }
 
-    fn emit_triple(&mut self, _subject: TermId, _predicate: TermId, _object: TermId) {}
+    fn emit_triple(&mut self, _subject: TermId, _predicate: TermId, _object: TermId) -> SinkResult {
+        Ok(())
+    }
 
     fn emit_list_item(
         &mut self,
@@ -898,7 +939,8 @@ impl GraphSink for PreludeSink {
         _predicate: TermId,
         _object: TermId,
         _index: i32,
-    ) {
+    ) -> SinkResult {
+        Ok(())
     }
 }
 
@@ -988,7 +1030,7 @@ impl StreamingTurtleReader {
             chunk_size_mb = chunk_size_bytes / (1024 * 1024),
             prefix_bytes = prefix_block.len(),
             data_start,
-            prefix_first_200 = &prefix_block[..prefix_block.len().min(200)],
+            prefix_first_200 = prefix_block.chars().take(200).collect::<String>(),
             "streaming reader: prefix extracted, spawning reader thread"
         );
 
@@ -1950,6 +1992,93 @@ ex:bob ex:name \"Bob\" .
     }
 
     #[test]
+    fn star_statements_split_on_statement_ends_and_keep_their_reifiers() {
+        // RDF 1.2 constructs the pre-scan never sees as tokens: `<< … >>`
+        // (its `<` opens the IRI state until the first `>`), `{| … |}` bodies
+        // with decimals and `;`, and `~ reifier`. None may be mistaken for a
+        // statement boundary, and every chunk must parse with its reifier
+        // attachments intact.
+        let ttl = "\
+@prefix ex: <http://example.org/> .
+
+ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.9 ; ex:source \"hr.system\" |} .
+<< ex:alice ex:knows ex:carol >> ex:certainty 0.5 .
+ex:bob ex:knows ex:dave {| ex:since \"2024-01-01\" |} .
+ex:carol ex:age 42 ~ ex:claim2 .
+";
+        let f = write_temp(ttl);
+        let config = TurtleSplitConfig {
+            chunk_size_bytes: 60, // force multiple chunks
+        };
+        let reader = TurtleChunkReader::new(f.path(), &config).unwrap();
+        assert!(reader.chunk_count() > 1, "{}", reader.chunk_count());
+
+        let mut annotated_edges = 0;
+        for i in 0..reader.chunk_count() {
+            let chunk_text = reader.read_chunk(i).unwrap().unwrap();
+            let json = crate::parse_to_json(&chunk_text).unwrap_or_else(|e| {
+                panic!("chunk {i} must be valid Turtle-star: {e}\n{chunk_text}")
+            });
+            for node in json.as_array().unwrap() {
+                for (key, values) in node.as_object().unwrap() {
+                    if key.starts_with('@') {
+                        continue;
+                    }
+                    annotated_edges += values
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|v| v.get("@annotation").is_some())
+                        .count();
+                }
+            }
+        }
+        assert_eq!(annotated_edges, 4, "one reifier per star statement");
+    }
+
+    #[test]
+    fn reified_triple_with_gt_and_dot_inside_a_string_does_not_split_mid_statement() {
+        // `<<` must not be scanned as the start of an IRI: the `>` inside the
+        // literal would end the bogus IRI and the following ` . ` would be
+        // taken for a statement boundary, cutting the chunk inside the string.
+        let ttl = "\
+@prefix ex: <http://example.org/> .
+
+ex:s ex:p << ex:a ex:q \"has > and . here\" >> .
+ex:t ex:u ex:v .
+ex:w ex:x << ex:b ex:y <http://example.org/o> >> .
+";
+        let f = write_temp(ttl);
+        let config = TurtleSplitConfig {
+            chunk_size_bytes: 20, // force a boundary search right after the first statement
+        };
+        let reader = TurtleChunkReader::new(f.path(), &config).unwrap();
+        let mut subjects = Vec::new();
+        for i in 0..reader.chunk_count() {
+            let chunk_text = reader.read_chunk(i).unwrap().unwrap();
+            let json = crate::parse_to_json(&chunk_text).unwrap_or_else(|e| {
+                panic!("chunk {i} must be valid Turtle-star: {e}\n{chunk_text}")
+            });
+            for node in json.as_array().unwrap() {
+                subjects.push(node["@id"].as_str().unwrap().to_string());
+            }
+        }
+        assert!(reader.chunk_count() >= 2, "{}", reader.chunk_count());
+        assert!(
+            subjects.contains(&"http://example.org/s".to_string()),
+            "{subjects:?}"
+        );
+        assert!(
+            subjects.contains(&"http://example.org/t".to_string()),
+            "{subjects:?}"
+        );
+        assert!(
+            subjects.contains(&"http://example.org/w".to_string()),
+            "{subjects:?}"
+        );
+    }
+
+    #[test]
     fn test_roundtrip_chunks_preserve_all_triples() {
         let ttl = "\
 @prefix ex: <http://example.org/> .
@@ -2065,6 +2194,44 @@ ex:bob ex:name \"Bob\" .
     }
 
     // ---- StreamingTurtleReader tests ----
+
+    fn assert_unicode_prefix_logging(limit: usize) {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::enabled!(tracing::Level::INFO));
+            for character in ['±', '界', '🦀'] {
+                let start = "@prefix ex: <http://example.org/";
+                // Put a multibyte character across the old byte cutoff.
+                let prefix = format!(
+                    "{start}{}{character}/> .\n",
+                    "a".repeat(limit - 1 - start.len())
+                );
+                assert!(!prefix.is_char_boundary(limit));
+                let data = "ex:alice ex:name \"Alice\" .\n";
+                let f = write_temp(&format!("{prefix}{data}"));
+                let mut reader = StreamingTurtleReader::new(f.path(), 64 * 1024, 2, None)
+                    .expect("Unicode prefix logging must not panic");
+                assert_eq!(reader.prefix_block(), prefix);
+                let (_, raw) = reader.recv_chunk().unwrap().unwrap();
+                assert_eq!(String::from_utf8(raw).unwrap(), data);
+                assert!(reader.recv_chunk().unwrap().is_none());
+                assert_eq!(reader.join().unwrap(), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn unicode_prefix_logging_at_byte_500() {
+        assert_unicode_prefix_logging(500);
+    }
+
+    #[test]
+    fn unicode_prefix_logging_at_byte_200() {
+        assert_unicode_prefix_logging(200);
+    }
 
     /// Helper: receive a chunk from the reader, prepend prefix, return full TTL text.
     fn recv_as_text(reader: &StreamingTurtleReader) -> Option<(usize, String)> {
@@ -2211,6 +2378,89 @@ ex:bob ex:name \"Bob\" .
         }
 
         assert_eq!(count, 2, "expected 2 chunks for 2 statements");
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn escaped_iri_in_a_prefix_directive_does_not_swallow_the_next_statement() {
+        // A SPARQL-style directive ends at its operand. An IRI carrying a
+        // `\u` escape lexes as a distinct token, and while that token was not
+        // recognised as an operand the directive never closed: the prefix
+        // block ran on to the next `.`, absorbing the first data statement.
+        // Streaming import then dropped it entirely.
+        let ttl = "PREFIX ex: <http://example.org/caf\\u00E9/>\n\
+                   ex:a ex:b ex:c .\n\
+                   ex:d ex:e ex:f .\n";
+        let f = write_temp(ttl);
+        let (prefix, data_start) = extract_prefix_block(f.path()).unwrap();
+        assert!(
+            !prefix.contains("ex:a"),
+            "the prefix block must stop at the directive's IRI: {prefix:?}"
+        );
+
+        let mut reader = StreamingTurtleReader::new(f.path(), 1, 2, None).unwrap();
+        let mut subjects = Vec::new();
+        while let Some((_i, text)) = recv_as_text(&reader) {
+            let json = crate::parse_to_json(&text).expect("chunk parses");
+            for node in json.as_array().unwrap() {
+                subjects.push(node["@id"].as_str().unwrap().to_string());
+            }
+        }
+        reader.join().unwrap();
+        subjects.sort();
+        subjects.dedup();
+        assert_eq!(
+            subjects,
+            vec![
+                "http://example.org/caf\u{e9}/a".to_string(),
+                "http://example.org/caf\u{e9}/d".to_string()
+            ],
+            "both statements must survive the split (data_start={data_start})"
+        );
+    }
+
+    #[test]
+    fn test_streaming_star_statements_split_cleanly() {
+        // The production bulk-import path. `StreamingTurtleReader` scans by
+        // line rather than by byte state, so it never had the IRI-state hazard
+        // the byte scanner did — but nothing pinned that it handles RDF 1.2
+        // statements, which is what bulk import now ingests. Each of these
+        // ends its statement on its own line, so each must be its own chunk
+        // and each must parse with its reifier attachment intact.
+        let ttl = "\
+@prefix ex: <http://example.org/> .
+
+ex:s ex:p ex:o ~ ex:claim1 {| ex:confidence 0.9 |} .
+ex:a ex:b ex:c {| ex:note \"ends with a period. really\" |} .
+<< ex:x ex:y ex:z >> ex:source ex:crm .
+ex:t ex:u ex:v .
+";
+        let f = write_temp(ttl);
+        let mut reader = StreamingTurtleReader::new(f.path(), 1, 2, None).unwrap();
+
+        let mut chunks = 0;
+        let mut annotated = 0;
+        while let Some((idx, text)) = recv_as_text(&reader) {
+            let json = crate::parse_to_json(&text)
+                .unwrap_or_else(|e| panic!("chunk {idx} must be valid Turtle-star: {e}\n{text}"));
+            for node in json.as_array().unwrap() {
+                for (key, values) in node.as_object().unwrap() {
+                    if key.starts_with('@') {
+                        continue;
+                    }
+                    annotated += values
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|v| v.get("@annotation").is_some())
+                        .count();
+                }
+            }
+            chunks += 1;
+        }
+
+        assert_eq!(chunks, 4, "expected one chunk per statement");
+        assert_eq!(annotated, 3, "one reifier per star statement, none lost");
         reader.join().unwrap();
     }
 

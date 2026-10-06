@@ -18,6 +18,8 @@
 //!   `RangeOptions::history_mode` — published parameters for the
 //!   `range_with_overlay` core API, below the planner.
 
+use crate::binding::UnmatchedOptional;
+
 /// Whether a query is evaluating current state or full history.
 ///
 /// History queries return the merged stream of assert + retract events
@@ -52,9 +54,7 @@ impl TemporalMode {
 /// Planning-time context threaded through the operator-tree builder.
 ///
 /// Carries decisions that must be made once at planning and captured at
-/// operator construction — never read again at runtime. Currently this
-/// is just [`TemporalMode`]; future planning inputs that want the same
-/// "decide once, capture at construction" discipline should land here.
+/// operator construction — never read again at runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub struct PlanningContext {
     /// Temporal mode for this query.
@@ -70,6 +70,25 @@ pub struct PlanningContext {
     /// and the stats-cache key so a trusted view is never reused for a
     /// non-vouched (policy / dataset) execution at the same overlay epoch.
     pub allow_semantic_elision: bool,
+    /// Whether the query runs against a dataset whose default graph is the
+    /// union of **two or more** graphs (a SPARQL `FROM`-derived default union).
+    /// When set, the default union is an RDF merge (a *set*), not a bag
+    /// (SPARQL §13.2): the [`DatasetOperator`](crate::dataset_operator)
+    /// deduplicates emitted triples across members, and the planner both forces
+    /// `EmitMask::ALL` on the first scan (so a pruned column can't collapse
+    /// distinct triples) and declines the fused count/aggregate fast paths
+    /// (which assume bag cardinality over the union). Only ever `true` in
+    /// current mode — history datasets keep per-event (assert/retract) rows.
+    pub multi_default_graph: bool,
+    /// What an unmatched OPTIONAL binds its optional-only variables to — the
+    /// surface language's null semantics. Folded in from `Query` at the plan
+    /// root; defaults to SPARQL's `Unbound`.
+    pub unmatched_optional: UnmatchedOptional,
+    /// Desired output prefix of a streaming join block. This is a startup-cost
+    /// hint, never a cap on input or output rows. Unlike a source row budget,
+    /// it remains useful through DISTINCT and FILTER. Blocking query modifiers
+    /// must clear it because they need the complete input.
+    pub row_goal: Option<usize>,
 }
 
 impl PlanningContext {
@@ -79,6 +98,9 @@ impl PlanningContext {
         Self {
             mode: TemporalMode::Current,
             allow_semantic_elision: false,
+            multi_default_graph: false,
+            unmatched_optional: UnmatchedOptional::Unbound,
+            row_goal: None,
         }
     }
 
@@ -88,6 +110,9 @@ impl PlanningContext {
         Self {
             mode: TemporalMode::History,
             allow_semantic_elision: false,
+            multi_default_graph: false,
+            unmatched_optional: UnmatchedOptional::Unbound,
+            row_goal: None,
         }
     }
 
@@ -97,6 +122,32 @@ impl PlanningContext {
     #[inline]
     pub const fn with_semantic_elision(mut self, allow: bool) -> Self {
         self.allow_semantic_elision = allow && self.mode.is_current();
+        self
+    }
+
+    /// Record that the default graph is a `>= 2`-member union (see
+    /// [`Self::multi_default_graph`]). No-op in history mode, which keeps the
+    /// multi-`FROM` default union a BAG — the one place it is not a set:
+    /// history rows carry per-event assert/retract provenance the dedup key
+    /// deliberately ignores, so a triple present in two members yields one row
+    /// per member's event stream (user-facing corollary: `COUNT(*)` over a
+    /// multi-`FROM` history query counts per member, not per merged triple).
+    #[inline]
+    pub const fn with_multi_default_graph(mut self, multi: bool) -> Self {
+        self.multi_default_graph = multi && self.mode.is_current();
+        self
+    }
+
+    /// Set the surface language's OPTIONAL null semantics (see
+    /// [`Self::unmatched_optional`]).
+    #[inline]
+    pub const fn with_unmatched_optional(mut self, unmatched: UnmatchedOptional) -> Self {
+        self.unmatched_optional = unmatched;
+        self
+    }
+
+    pub(crate) const fn with_row_goal(mut self, goal: Option<usize>) -> Self {
+        self.row_goal = goal;
         self
     }
 

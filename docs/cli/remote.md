@@ -124,6 +124,26 @@ Remote:
   Auth: token configured
 ```
 
+### fluree remote ledgers
+
+List the ledgers your token can access on a remote, with the serving tiers
+each offers (`query` = the remote executes queries; `blocks` = raw index
+content is served for peer-mode local execution). Requires a bearer token
+with storage scope; the listing is the remote's auth-filtered catalog.
+
+```bash
+fluree remote ledgers [NAME]   # NAME defaults to the only configured remote
+```
+
+```
+LEDGER            COMMIT T   INDEX T   SERVING
+inventory:main    42         40        query+blocks
+orders:main       17         17        query
+```
+
+Track one for peer-mode local querying with
+`fluree track add <ledger> --remote <name> --mode peer` (see [track](track.md)).
+
 ## See Also
 
 - [upstream](upstream.md) - Configure upstream tracking

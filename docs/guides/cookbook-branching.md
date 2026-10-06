@@ -29,7 +29,8 @@ fluree branch drop experiment
 
 - **Branches are isolated** — Transactions on one branch are invisible to others
 - **Branches are cheap** — Creating a branch doesn't copy data; it creates a new commit pointer
-- **Merge is fast-forward** — The target branch must not have diverged. If it has, rebase first
+- **Merge takes two shapes** — If the target's head is on the source's line of commits, the merge fast-forwards and the source's commits become the target's line. Otherwise the merge folds the source's changes into one commit on the target, resolving overlapping edits by `--strategy`
+- **Merge runs in any direction.** A branch merges into the one it came from, into one created from it, or into a branch that shares an earlier commit. Use `--target` to name where the changes go
 - **Source branch survives merge** — After merging, the branch can continue receiving transactions
 
 ## Patterns
@@ -156,7 +157,41 @@ fluree branch rebase my-branch --strategy abort
 fluree branch rebase my-branch --strategy take-source
 ```
 
+### Fast-forward indexing and transaction ordering
+
+A fast-forward advances the target to the source's commit head while retaining the target's own index. It does not copy or adopt the source's index, because that index's reserved graph names belong to the source branch. Queries replay commits after the target's indexed point until indexing catches up; a target with no index replays from genesis. For a large merged range, run `fluree index mydb:main` to catch up explicitly.
+
+For embedded applications calling `Fluree::merge_branch` directly with a Raft nameservice, the fast-forward ref update goes through consensus but bypasses the per-branch work queue. It can overtake transactions already submitted to that queue. The CAS checks the target head observed during merge preparation; if another writer advances it first, the merge returns `BranchConflict` (409) and should be retried so it recomputes against the new head. Repeating an already-completed fast-forward succeeds without copying commits again.
+
+The server's Raft merge path uses `QueuedTransactor::merge`, which queues the merge alongside transactions and prepares it when the worker reaches it. That path preserves queue ordering and was not affected by the direct API's empty-queue publish failure.
+
+### Repair a target that adopted another branch's index
+
+Older direct fast-forward merges from an indexed source could adopt the source's index root, giving the target the source branch's `#txn-meta` and `#config` graph labels. Ordinary data queries could still work while the target stopped resolving its own governance configuration. Rewriting the config alone does not repair the graph registry.
+
+Run a full rebuild of the affected target:
+
+```bash
+fluree reindex mydb:main
+```
+
+In an embedded application, call `fluree.reindex("mydb:main", ReindexOptions::default()).await?` on the serving instance. After publishing the rebuilt root, reindex evicts that instance's cached ledger so subsequent loads read the corrected registry, even when the index transaction time is unchanged. Existing handles held by callers must be reacquired; other serving instances must also reload their cached ledger. Older versions without this eviction require a cache disconnect or process restart after reindex.
+
+An affected root can also cause `graph_iris[0] must be txn-meta IRI` on the second incremental indexing cycle: the first cycle stamps the target's ledger ID onto the root but retains the source's graph labels. The normal indexer falls back to a full rebuild when this validation fails; it does not permanently stop indexing. Explicit reindex repairs the target without waiting for those cycles.
+
 ### Compare branches
+
+Preview what a merge would do before doing it:
+
+```bash
+# Ahead/behind commits, conflicts, whether the merge would go through
+fluree branch diff my-branch --target main
+
+# With the values on each side of every conflict
+fluree branch diff my-branch --target main --conflict-details
+```
+
+The preview stages the merge's resolved change set on the target and validates it against the target's SHACL shapes, through the same code path the merge uses. `mergeable: yes` means neither the strategy nor the target's shapes will reject the merge; otherwise the `validation:` line carries the report the merge would fail with. Other conditions still apply at commit time, such as novelty backpressure on a ledger due for indexing. Pass `--no-validate` for a cheaper count-only preview.
 
 See what's different between two branches:
 
@@ -179,9 +214,11 @@ Each branch has its own transaction history. Query any branch at any point in ti
 fluree query --ledger mydb:experiment --at 3 'SELECT ?s ?p ?o WHERE { ?s ?p ?o }'
 ```
 
+Each branch numbers its transactions on its own clock, starting from the point where it forked, so `--at 3` on `experiment` and `--at 3` on `main` are unrelated states. A merge lands on the target as a single commit at the target's next transaction number, carrying the whole resolved change from the source, or, for a fast-forward, the source's commits simply become the target's line with their `t` values already on the target's clock. Reads below that number return what the target held at the time: merging never rewrites a branch's earlier history, and a branch's state at any `--at` is the fold of its own line of commits, not of the branches merged into it.
+
 ### Branch at a historical point
 
-By default, `branch create` starts the new branch at the source's current HEAD. Pass `--at` to start it at an earlier commit on the source branch instead — useful for recovering to a known-good state, forking off an older release, or experimenting with what-if scenarios from a past point in time.
+By default, `branch create` starts the new branch at the source's current HEAD. Pass `--at` to start it at an earlier point on the source branch instead — useful for recovering to a known-good state, forking off an older release, or experimenting with what-if scenarios from a past point in time.
 
 ```bash
 # Start a branch at transaction 5 on main
@@ -189,11 +226,16 @@ fluree branch create rewind --at t:5
 
 # Or use a hex-digest prefix of the commit
 fluree branch create rewind --at 3dd028a7
+
+# Or start from the data as of a point in time
+fluree branch create q2-close --at time:2026-06-30T23:59:59Z
 ```
+
+`--at` takes the same spellings as `fluree query --at`, and the branch starts at the commit a query at that point would read: `time:` (alias `iso:`) resolves against commit event time, `recorded:` against the wall-clock time commits were recorded, and `latest` is the HEAD. A time before the source's first commit is rejected.
 
 The commit must be reachable from the source branch's HEAD (branching from an unrelated branch's commit is rejected). The new branch starts with no index and replays from genesis on first query — acceptable for small/medium histories; if replay cost matters, transact a small no-op to force an index rebuild.
 
-Full CIDs are also accepted (`--at fluree:commit:sha256:...`) and resolve without requiring the source to be indexed; `t:N` and hex prefixes require an indexed source.
+Full CIDs are also accepted (`--at fluree:commit:sha256:...`).
 
 ## Branch lifecycle
 
@@ -220,6 +262,11 @@ curl -X POST http://localhost:8090/v1/fluree/branch \
 curl -X POST http://localhost:8090/v1/fluree/branch \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb", "branch": "rewind", "at": "t:5"}'
+
+# Branch from the data as of a point in time
+curl -X POST http://localhost:8090/v1/fluree/branch \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "branch": "q2-close", "at": "time:2026-06-30T23:59:59Z"}'
 
 # Query a specific branch
 curl -X POST 'http://localhost:8090/v1/fluree/query?ledger=mydb:dev' \

@@ -1,0 +1,287 @@
+//! SPARQL datalog rule integration tests
+//!
+//! `f:rule` datalog rules can be written as SPARQL `CONSTRUCT ... WHERE ...`
+//! queries by storing the literal with the `f:sparql` datatype. The
+//! CONSTRUCT template is the rule head (insert); the WHERE clause is the
+//! rule body.
+
+use crate::support;
+use crate::support::{genesis_ledger, normalize_rows};
+use fluree_db_api::FlureeBuilder;
+use serde_json::json;
+
+/// Grandparent derivation via a SPARQL CONSTRUCT rule — the SPARQL twin of
+/// `datalog_grandparent_rule` in `it_datalog_rules.rs`.
+#[tokio::test]
+async fn sparql_rule_grandparent() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/sparql-grandparent");
+
+    let rule_data = json!({
+        "@context": { "f": "https://ns.flur.ee/db#" },
+        "@graph": [
+            {
+                "@id": "http://example.org/grandparentRule",
+                "f:rule": {
+                    "@type": "https://ns.flur.ee/db#sparql",
+                    "@value": "PREFIX ex: <http://example.org/> \
+                               CONSTRUCT { ?person ex:grandparent ?grandparent } \
+                               WHERE { ?person ex:parent ?p . ?p ex:parent ?grandparent }"
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let family_data = json!({
+        "@context": { "ex": "http://example.org/" },
+        "@graph": [
+            {"@id": "ex:alice", "ex:parent": {"@id": "ex:bob"}},
+            {"@id": "ex:bob", "ex:parent": {"@id": "ex:charlie"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &family_data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": { "ex": "http://example.org/" },
+        "select": "?grandparent",
+        "where": {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
+        "reasoning": "datalog"
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let results = normalize_rows(&rows);
+
+    assert!(
+        results.contains(&json!("ex:charlie")),
+        "Alice should have grandparent Charlie via SPARQL rule, got {results:?}"
+    );
+}
+
+/// SPARQL rule with a FILTER comparison in the body.
+#[tokio::test]
+async fn sparql_rule_with_filter() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/sparql-filter");
+
+    let rule_data = json!({
+        "@context": { "f": "https://ns.flur.ee/db#" },
+        "@graph": [
+            {
+                "@id": "http://example.org/seniorRule",
+                "f:rule": {
+                    "@type": "https://ns.flur.ee/db#sparql",
+                    "@value": "PREFIX ex: <http://example.org/> \
+                               PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> \
+                               CONSTRUCT { ?person rdf:type ex:Senior } \
+                               WHERE { ?person ex:age ?age FILTER(?age >= 62) }"
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let people = json!({
+        "@context": { "ex": "http://example.org/" },
+        "@graph": [
+            {"@id": "ex:alice", "ex:age": 70},
+            {"@id": "ex:bob", "ex:age": 30}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &people).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": { "ex": "http://example.org/" },
+        "select": "?person",
+        "where": {"@id": "?person", "@type": "ex:Senior"},
+        "reasoning": "datalog"
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let results = normalize_rows(&rows);
+
+    assert!(
+        results.contains(&json!("ex:alice")),
+        "Alice (70) should be derived as Senior, got {results:?}"
+    );
+    assert!(
+        !results.contains(&json!("ex:bob")),
+        "Bob (30) must not be derived as Senior, got {results:?}"
+    );
+}
+
+/// A SPARQL rule using a non-monotonic construct (OPTIONAL) is rejected
+/// with an error naming the construct and the rule, and the query fails —
+/// a fixpoint cannot evaluate a left join soundly, and silently skipping the
+/// rule would answer over an incomplete rule set.
+#[tokio::test]
+async fn sparql_rule_unsupported_construct_rejected_loudly() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/sparql-unsupported");
+
+    let rule_data = json!({
+        "@context": { "f": "https://ns.flur.ee/db#" },
+        "@graph": [
+            {
+                "@id": "http://example.org/badRule",
+                "f:rule": {
+                    "@type": "https://ns.flur.ee/db#sparql",
+                    "@value": "PREFIX ex: <http://example.org/> \
+                               CONSTRUCT { ?x ex:derived true } \
+                               WHERE { ?x ex:a ?y OPTIONAL { ?x ex:b ?z } }"
+                }
+            },
+            {
+                "@id": "http://example.org/goodRule",
+                "f:rule": {
+                    "@type": "https://ns.flur.ee/db#sparql",
+                    "@value": "PREFIX ex: <http://example.org/> \
+                               CONSTRUCT { ?x ex:hasA true } \
+                               WHERE { ?x ex:a ?y }"
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": { "ex": "http://example.org/" },
+        "@graph": [ {"@id": "ex:thing", "ex:a": 1} ]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": { "ex": "http://example.org/" },
+        "select": "?x",
+        "where": {"@id": "?x", "ex:hasA": true},
+        "reasoning": "datalog"
+    });
+    let err = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .expect_err("a stored rule with OPTIONAL must fail the query, not be skipped");
+    let message = err.to_string();
+    assert!(
+        message.contains("OPTIONAL") && message.contains("badRule"),
+        "the rejection must name the construct and the rule, got: {message}"
+    );
+}
+
+/// SPARQL twin of `datalog_rule_literal_bound_property_variable_does_not_abort_other_rules`
+/// in `it_datalog_rules.rs`. `TermResolution::Incompatible` is shared engine
+/// code below both front-ends, and a SPARQL rule can put a variable in
+/// predicate position too (`?x ?p ?v`). A rule that binds `?p` to a literal and
+/// then reuses it as a predicate matches nothing — but must NOT abort the
+/// sibling rule's derivations for the whole query (the pre-fix behaviour turned
+/// the literal-in-predicate case into a hard error that dropped every rule).
+#[tokio::test]
+async fn sparql_rule_literal_bound_predicate_variable_does_not_abort_other_rules() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/sparql-literal-pred");
+
+    let rule_data = json!({
+        "@context": { "f": "https://ns.flur.ee/db#" },
+        "@graph": [
+            {
+                "@id": "http://example.org/grandparentRule",
+                "f:rule": {
+                    "@type": "https://ns.flur.ee/db#sparql",
+                    "@value": "PREFIX ex: <http://example.org/> \
+                               CONSTRUCT { ?person ex:grandparent ?gp } \
+                               WHERE { ?person ex:parent ?p . ?p ex:parent ?gp }"
+                }
+            },
+            {
+                // `?tp` binds to the STRING value of ex:tag, then is reused in
+                // predicate position — a literal can never be a predicate.
+                "@id": "http://example.org/literalPredicateRule",
+                "f:rule": {
+                    "@type": "https://ns.flur.ee/db#sparql",
+                    "@value": "PREFIX ex: <http://example.org/> \
+                               CONSTRUCT { ?x ex:derived ?v } \
+                               WHERE { ?x ex:tag ?tp . ?x ?tp ?v }"
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": { "ex": "http://example.org/" },
+        "@graph": [
+            {"@id": "ex:alice", "ex:parent": {"@id": "ex:bob"}, "ex:tag": "blue"},
+            {"@id": "ex:bob", "ex:parent": {"@id": "ex:charlie"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": { "ex": "http://example.org/" },
+        "select": "?grandparent",
+        "where": {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert!(
+        normalize_rows(&rows).contains(&json!("ex:charlie")),
+        "sound rule's derivations must survive a sibling SPARQL rule's literal-bound \
+         predicate variable, got {rows:?}"
+    );
+}
+
+/// A rule head is inferred into the default graph as plain triples: a SPARQL
+/// rule whose CONSTRUCT template annotates an edge or writes into a named
+/// graph is rejected by name, not run with those parts dropped.
+#[tokio::test]
+async fn sparql_rule_head_with_annotation_or_graph_rejected() {
+    for (name, template) in [
+        ("annotatedHead", "?x ex:derived ?y ~ ?r"),
+        ("graphHead", "GRAPH ex:inferred { ?x ex:derived ?y }"),
+    ] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger0 = genesis_ledger(&fluree, &format!("datalog/sparql-head-{name}"));
+        let rule_data = json!({
+            "@context": { "f": "https://ns.flur.ee/db#" },
+            "@id": format!("http://example.org/{name}"),
+            "f:rule": {
+                "@type": "https://ns.flur.ee/db#sparql",
+                "@value": format!(
+                    "PREFIX ex: <http://example.org/> \
+                     CONSTRUCT {{ {template} }} WHERE {{ ?x ex:a ?y }}"
+                )
+            }
+        });
+        let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+        let data = json!({
+            "@context": { "ex": "http://example.org/" },
+            "@graph": [ {"@id": "ex:thing", "ex:a": 1} ]
+        });
+        let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+        let q = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": "?x",
+            "where": {"@id": "?x", "ex:derived": "?y"},
+            "reasoning": "datalog"
+        });
+        let err = support::query_jsonld(&fluree, &ledger, &q)
+            .await
+            .expect_err("the rule must be rejected, not run without its annotation or graph");
+        let message = err.to_string();
+        assert!(
+            message.contains(name) && message.contains("named graph or annotates"),
+            "{name}: {message}"
+        );
+    }
+}

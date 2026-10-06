@@ -31,6 +31,28 @@ Relational database mapping:
 - Join optimization
 - Supported databases (PostgreSQL, MySQL, etc.)
 
+### [Delta Lake tables](delta.md)
+
+Delta tables read in place:
+- Deletion vectors, column mapping and partition values applied per the Delta protocol
+- R2RML mappings with `rr:tableName`, tables addressed by path
+- Time travel by Delta version (`@snapshot:`) or commit time (`@time:`)
+
+### [Connecting to lakehouse platforms](lakehouse-platforms.md)
+
+Step-by-step setup for tables that live in a platform:
+- ADLS Gen2 and Microsoft Fabric OneLake: finding a table's location, creating a service principal, the role it needs
+- Databricks: external tables, Unity Catalog's temporary credentials, the Iceberg REST endpoint
+- What the common errors mean
+
+### [SQL endpoints](sql.md)
+
+Relational databases and warehouses through a Trino-protocol endpoint:
+- Trino / Starburst / PrestoDB, or the `fluree-sql-bridge` sidecar
+- R2RML mappings with `rr:tableName` and `rr:sqlQuery`
+- One SQL statement per graph block where its shape allows; typed filter pushdown and exact `COUNT` per table otherwise
+- No database drivers in the Fluree binary
+
 ### [BM25 Graph Source](bm25.md)
 
 Full-text search as graph source:
@@ -232,6 +254,19 @@ See [Iceberg / Parquet](iceberg.md).
 ```
 
 See [R2RML](r2rml.md).
+
+### SQL Endpoints
+
+**Purpose:** Query relational databases and warehouses as RDF, live
+
+**Backend:** Any Trino-protocol endpoint — Trino/Starburst in front of Postgres, MySQL, SQL Server, Oracle, Snowflake, BigQuery, …, or the `fluree-sql-bridge` sidecar for a single database
+
+**Use Cases:**
+- Virtual graph over an operational database, no copy
+- One SPARQL query spanning a ledger and a warehouse table
+- Lambda deployments (every scan is a stateless HTTP request)
+
+See [SQL endpoints](sql.md).
 
 ## Architecture
 

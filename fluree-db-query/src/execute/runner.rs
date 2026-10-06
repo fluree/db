@@ -16,14 +16,14 @@ use crate::rewrite_owl_ql::Ontology;
 use crate::schema_bundle::SchemaBundleOverlay;
 use crate::stats_cache::cached_stats_view_for_db;
 use crate::var_registry::VarRegistry;
+use fluree_db_binary_index::wasm_compat::SpatialIndexProvider;
 use fluree_db_binary_index::BinaryIndexStore;
+use fluree_db_core::clock::Instant;
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::{GraphDbRef, GraphId, LedgerSnapshot, QueryCancellation, Tracker};
 use fluree_db_reasoner::DerivedFactsOverlay;
-use fluree_db_spatial::SpatialIndexProvider;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 use tracing::Instrument;
 
 use super::operator_tree::build_operator_tree;
@@ -90,16 +90,32 @@ impl ExecutableQuery {
         Self { query, reasoning }
     }
 
-    /// True if any pattern in this query calls `fulltext(...)`.
+    /// True if any expression in this query calls `fulltext(...)`.
     ///
     /// The query-context setup code checks this before allocating the
     /// per-graph fulltext arena map and resolving the English `lang_id`,
     /// skipping that work for queries that don't use full-text scoring.
+    ///
+    /// Covers WHERE patterns plus the expression positions outside them:
+    /// ORDER BY expression binds, post-aggregation binds, and HAVING.
+    /// (Aggregate inputs are variables only — expression arguments lower
+    /// to synthetic binds inside `patterns` first.)
     pub fn uses_fulltext(&self) -> bool {
+        let target = crate::ir::Function::Fulltext;
         self.query
             .patterns
             .iter()
-            .any(|p| p.contains_function(&crate::ir::Function::Fulltext))
+            .any(|p| p.contains_function(&target))
+            || self
+                .query
+                .order_binds
+                .iter()
+                .any(|(_, expr)| expr.contains_function(&target))
+            || self.query.grouping.as_ref().is_some_and(|g| {
+                g.aggregation()
+                    .is_some_and(|a| a.binds.iter().any(|(_, e)| e.contains_function(&target)))
+                    || g.having().is_some_and(|h| h.contains_function(&target))
+            })
     }
 }
 
@@ -122,6 +138,12 @@ pub struct PreparedExecution {
     /// the request tracker by [`execute_prepared`] so a capped (incomplete)
     /// closure surfaces in response metadata.
     pub reasoning_diagnostics: Option<fluree_db_reasoner::ReasoningDiagnostics>,
+    /// Whether any reasoning/entailment mode was enabled for this query.
+    ///
+    /// Threaded onto the [`ExecutionContext`] in `execute_prepared_into` and
+    /// read by the R2RML rewriter to refuse an exact-class wildcard fusion that
+    /// could drop a subclass-entailed subject.
+    pub reasoning_active: bool,
 }
 
 /// Inputs that the preparation phase needs to know up front.
@@ -291,8 +313,9 @@ pub async fn prepare_execution_with_config(
                 db.t,
                 &reasoning,
                 query.reasoning.rules_source_g_id,
+                binary_store,
             )
-            .await;
+            .await?;
 
             // Step 4: Build ontology for OWL2-QL mode (if enabled)
             let reasoning_overlay_for_ontology: Option<ReasoningOverlay<'_>> = derived_outcome
@@ -448,6 +471,7 @@ pub async fn prepare_execution_with_config(
             operator,
             derived_overlay: derived_outcome.overlay,
             reasoning_diagnostics: derived_outcome.diagnostics,
+            reasoning_active: reasoning.has_any_enabled(),
         })
     }
     .instrument(span)
@@ -656,6 +680,15 @@ pub struct ContextConfig<'a, 'b> {
     /// for Fluree-system predicates. Surfaced via
     /// `opts.includeSystemFacts: true` on JSON-LD queries.
     pub include_system_facts: bool,
+    /// `@vocab` prefix a Cypher query was lowered against (from
+    /// `Query::cypher_vocab`); see [`ExecutionContext::cypher_vocab`].
+    pub cypher_vocab: Option<Arc<str>>,
+    /// When true, the injected true-wildcard crawl scan renders R2RML
+    /// `RefObjectMap` objects by templating the parent IRI from the child row's
+    /// FK columns (no parent-table scan, dangling-FK relaxed). Default `false`;
+    /// set only by the graph-source browse-crawl path. See
+    /// [`ExecutionContext::trust_fk_refs`].
+    pub trust_fk_refs: bool,
     /// Binary columnar index store for `BinaryScanOperator`.
     ///
     /// This is the explicit path — separate from `LedgerSnapshot.range_provider` which
@@ -740,6 +773,20 @@ async fn execute_prepared_into<'a, S: BatchSink>(
         .map(|o| o as &dyn fluree_db_core::OverlayProvider)
         .unwrap_or(db.overlay);
 
+    // Dataset execution scans through per-graph `GraphRef`s, not the
+    // top-level context overlay — splice the derived-facts overlay into
+    // every ref matching the primary execution view, or datalog / OWL2-RL
+    // derived facts are invisible to dataset queries.
+    let patched_dataset = match (config.dataset, reasoning_overlay.as_ref()) {
+        (Some(ds), Some(_)) => Some(ds.with_overlay_for_graph(
+            db.snapshot.ledger_id.as_str(),
+            db.g_id,
+            db.t,
+            effective_overlay,
+        )),
+        _ => None,
+    };
+
     let mut ctx = ExecutionContext::with_time_and_overlay(
         db.snapshot,
         vars,
@@ -772,17 +819,36 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     if db.eager || prepared.derived_overlay.is_some() {
         ctx = ctx.with_eager_materialization();
     }
+    // Let the R2RML rewriter see whether entailment is active so it can refuse
+    // an exact-class wildcard fusion that a subclass-entailed subject would
+    // otherwise be dropped by.
+    if prepared.reasoning_active {
+        ctx = ctx.with_reasoning_active(true);
+    }
 
     if let Some(tracker) = config.tracker {
         ctx = ctx.with_tracker(tracker.clone());
     }
     if let Some(cancellation) = config.cancellation {
+        // F-AUD-3 site C: give this query its share of the process memory budget
+        // instead of letting it (and every concurrent query) compare its own counter
+        // against the FULL budget. `FLUREE_QUERY_BUDGET_SHARE_DIV` (default 1) is the
+        // divisor; div==1 pins nothing, so the checkpoint falls back to the full
+        // process budget exactly as before. An explicit ceiling already pinned by the
+        // embedder wins (never clobbered). See `context::per_query_memory_ceiling`.
+        let div = crate::context::query_budget_share_div();
+        if div > 1 && cancellation.memory_limit().is_none() {
+            let full = crate::context::query_memory_budget_bytes();
+            if full != 0 {
+                cancellation.set_memory_limit(crate::context::per_query_memory_ceiling(full, div));
+            }
+        }
         ctx = ctx.with_cancellation(cancellation);
     }
     if let Some(enforcer) = config.policy_enforcer {
         ctx = ctx.with_policy_enforcer(enforcer);
     }
-    if let Some(dataset) = config.dataset {
+    if let Some(dataset) = patched_dataset.as_ref().or(config.dataset) {
         ctx = ctx.with_dataset(dataset);
     }
     if let Some((r2rml_provider, r2rml_table_provider)) = config.r2rml {
@@ -797,8 +863,14 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     if config.strict_bind_errors {
         ctx = ctx.with_strict_bind_errors();
     }
+    if let Some(vocab) = config.cypher_vocab.clone() {
+        ctx.cypher_vocab = Some(vocab);
+    }
     if config.include_system_facts {
         ctx = ctx.with_include_system_facts(true);
+    }
+    if config.trust_fk_refs {
+        ctx = ctx.with_trust_fk_refs(true);
     }
     if let Some(store) = config.binary_store {
         ctx = ctx.with_binary_store(store, config.binary_g_id);
@@ -818,7 +890,7 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     }
 
     // Precompute which graphs in the dataset are R2RML-backed.
-    if let (Some(r2rml_provider), Some(dataset)) = (ctx.r2rml_provider, ctx.dataset) {
+    if let (Some(r2rml_provider), Some(dataset)) = (ctx.r2rml_provider, ctx.explicit_dataset()) {
         let mut r2rml_ids = std::collections::HashSet::new();
         for graph_ref in dataset.default_graphs() {
             let is_r2rml = r2rml_provider.has_r2rml_mapping(&graph_ref.ledger_id).await;
@@ -838,7 +910,7 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     }
     // Also check the primary snapshot's ledger_id (for single-source graph source queries)
     if let Some(provider) = ctx.r2rml_provider {
-        if ctx.dataset.is_none() {
+        if ctx.explicit_dataset().is_none() {
             let is_r2rml = provider.has_r2rml_mapping(&db.snapshot.ledger_id).await;
             if is_r2rml {
                 ctx.r2rml_graph_ids
@@ -863,6 +935,14 @@ pub async fn execute<'a>(
     query: &ExecutableQuery,
     config: ContextConfig<'a, '_>,
 ) -> Result<Vec<Batch>> {
-    let prepared = prepare_execution(db, query).await?;
+    // A `>= 2`-member default graph is a set (SPARQL §13.2); plan for it as
+    // the dataset paths do, so the members' scans deduplicate on full rows.
+    let mut prepare_config = PrepareConfig::default();
+    prepare_config.planning = prepare_config.planning.with_multi_default_graph(
+        config
+            .dataset
+            .is_some_and(|ds| ds.default_graphs().len() >= 2),
+    );
+    let prepared = prepare_execution_with_config(db, query, &prepare_config).await?;
     execute_prepared(db, vars, prepared, config).await
 }

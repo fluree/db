@@ -691,6 +691,7 @@ mod tests {
             output: crate::QueryOutput::select_all(vec![]),
             batches: vec![],
             binary_graph: None,
+            from_graph_source: false,
         }
     }
 
@@ -822,6 +823,7 @@ mod tests {
             output: crate::QueryOutput::select_all(var_ids),
             batches: vec![batch],
             binary_graph: None,
+            from_graph_source: false,
         }
     }
 
@@ -923,7 +925,7 @@ mod tests {
                     Sid::new(3, "JSON"),
                 ),
                 Binding::lit(
-                    FlakeValue::Vector(vec![1.0, 2.5, -3.0]),
+                    FlakeValue::Vector(vec![1.0, 2.5, -3.0].into()),
                     Sid::new(2, "double"),
                 ),
             ]],

@@ -6,6 +6,8 @@
 //! - `x-fdb-time`: Execution time (e.g., "12.34ms")
 //! - `x-fdb-fuel`: Fuel consumed (as string, e.g., "42")
 //! - `x-fdb-policy`: Policy stats as base64-encoded JSON
+//! - `x-fdb-policy-enforcement`: Whether policy governed the request, as JSON
+//!   (only when it did); absent means the request ran unenforced
 //! - `x-fdb-reasoning`: OWL2-RL materialization outcome as JSON (only when a
 //!   reasoning mode ran); `"capped": true` means results may be incomplete
 
@@ -19,6 +21,8 @@ pub const X_FDB_TIME: &str = "x-fdb-time";
 pub const X_FDB_FUEL: &str = "x-fdb-fuel";
 /// Header name for policy stats (base64-encoded JSON)
 pub const X_FDB_POLICY: &str = "x-fdb-policy";
+/// Header name for the policy-enforcement state (JSON)
+pub const X_FDB_POLICY_ENFORCEMENT: &str = "x-fdb-policy-enforcement";
 /// Header name for the reasoning materialization outcome (JSON)
 pub const X_FDB_REASONING: &str = "x-fdb-reasoning";
 
@@ -51,6 +55,17 @@ pub fn tracking_headers(tally: &TrackingTally) -> HeaderMap {
             let encoded = STANDARD.encode(json.as_bytes());
             if let Ok(value) = HeaderValue::from_str(&encoded) {
                 headers.insert(HeaderName::from_static(X_FDB_POLICY), value);
+            }
+        }
+    }
+
+    // Add the policy-enforcement header when policy governed the request.
+    // Plain JSON, like reasoning: two booleans, no user data, and the state a
+    // caller reading CSV/TSV (which has no body to carry a tally) needs most.
+    if let Some(ref enforcement) = tally.policy_enforcement {
+        if let Ok(json) = serde_json::to_string(enforcement) {
+            if let Ok(value) = HeaderValue::from_str(&json) {
+                headers.insert(HeaderName::from_static(X_FDB_POLICY_ENFORCEMENT), value);
             }
         }
     }

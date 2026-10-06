@@ -147,6 +147,11 @@ Iceberg graph sources require an [R2RML mapping](r2rml.md) that defines how tabl
 
 See [Iceberg / Parquet](iceberg.md) for full configuration details and examples.
 
+View policy is enforced on Iceberg and SQL sources for static targeting
+(`f:onProperty`, `f:onClass`, `f:onSubject`, defaults); `f:query` policies fail
+closed. Stored policies and the class hierarchy come from a model ledger named
+at registration (`--model`). See [Access policy](iceberg.md#access-policy).
+
 **Query:**
 ```json
 {
@@ -157,6 +162,23 @@ See [Iceberg / Parquet](iceberg.md) for full configuration details and examples.
     { "@id": "?order", "ex:total": "?total" }
   ]
 }
+```
+
+### 4. SQL Endpoints
+
+**Backend:** Tables behind a Trino-protocol HTTP endpoint (Trino / Starburst / PrestoDB, or the `fluree-sql-bridge` sidecar), via R2RML mapping
+
+**Purpose:** Virtual graph over a relational database or warehouse, read live
+
+SQL sources use the same [R2RML mapping](r2rml.md) as Iceberg sources and additionally accept `rr:sqlQuery`. The engine compiles a graph block over the source into one SQL statement where the block's shape allows — joins, `OPTIONAL`, `VALUES`, `UNION`, grouping and sub-selects included — and otherwise pushes one typed single-table `SELECT` per triples map and joins itself. No database driver is linked into Fluree; the endpoint holds the connections.
+
+See [SQL endpoints](sql.md) for configuration, pushdown rules and the bridge.
+
+**Query:**
+```sparql
+PREFIX ex: <http://example.org/>
+SELECT ?name ?total FROM <orders-db:main>
+WHERE { ?o ex:customer ?c ; ex:total ?total . ?c ex:name ?name . FILTER(?total > 100) }
 ```
 
 ## Creating Graph Sources
@@ -201,23 +223,76 @@ SELECT ?s ?p ?o FROM <execution-log:main> WHERE { ?s ?p ?o } LIMIT 10
 ```json
 {
   "from": "mydb:main",
+  "from-named": ["warehouse-orders:main"],
   "select": ["?customer", "?orderId", "?total"],
   "where": [
     { "@id": "?customer", "schema:name": "?name" },
     { "@id": "?customer", "ex:customerId": "?custId" },
-    {
-      "graph": "warehouse-orders:main",
-      "where": [
-        { "@id": "?order", "ex:customerId": "?custId" },
-        { "@id": "?order", "ex:orderId": "?orderId" },
-        { "@id": "?order", "ex:total": "?total" }
-      ]
-    }
+    ["graph", "warehouse-orders:main", {
+      "@id": "?order",
+      "ex:customerId": "?custId",
+      "ex:orderId": "?orderId",
+      "ex:total": "?total"
+    }]
   ]
 }
 ```
 
+A graph pattern is the **array form** `["graph", <name>, <pattern>]` — an object
+with a `"graph"` key is parsed as an ordinary node pattern and fails. The graph
+source must also be part of the dataset (`"from-named"` here, `FROM NAMED` in
+SPARQL), or the block matches nothing. Address a graph source by its full id:
+dataset-local `fromNamed` aliases do not currently resolve to graph sources.
+
 Iceberg graph sources use R2RML mappings to define how table rows become RDF triples. See [Iceberg / Parquet](iceberg.md) and [R2RML](r2rml.md) for details.
+
+### Query Patterns a Graph Source Cannot Evaluate
+
+A graph source has no native RDF index. Its triples are materialized per query from the backing table or index, which is enough for triple patterns but not for the constructs that need an index to walk. Three of them are refused rather than answered:
+
+- **Property-path quantifiers** — `p+`, `p*`, `p?`, and any quantified combination such as `^p+`, `(a|b)+`, or `(a/b)+`
+- **`shortestPath` / `allShortestPaths`**
+- **Subqueries** — a nested SPARQL `SELECT`, or a JSON-LD sub-`select`
+
+A query using one against a graph source returns **HTTP 400 `err:db/InvalidQuery`**, naming the pattern kind. The refusal is deliberate: these patterns would otherwise read the graph source's empty native index and return a wrong answer as a success — nothing at all for `p+`, and the starting node alone for `p*` and `p?`. Unquantified alternation (`a|b`) and inverse (`^p`) are unaffected; they lower to ordinary triple patterns and run normally.
+
+**Workaround: bounded fixed-length paths.** Sequence paths do lower to table scans, so a traversal whose maximum depth you know can be written as a union of explicit hops:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+SELECT ?boss FROM <warehouse-hr:main> WHERE {
+  { ex:emp1 ex:manager ?boss }
+  UNION { ex:emp1 ex:manager/ex:manager ?boss }
+  UNION { ex:emp1 ex:manager/ex:manager/ex:manager ?boss }
+}
+```
+
+Pick that maximum depth deliberately and state it wherever the query is documented: results are silently incomplete beyond the depth you enumerate, and nothing in the response marks the truncation.
+
+For genuinely unbounded traversal, materialize the graph source into a native ledger first — see [Materializing a Native Twin](iceberg.md#materializing-a-native-twin). A native ledger evaluates all of these patterns normally.
+
+### Patterns Must Be Inside the GRAPH Block
+
+Patterns reach a graph source only inside a `GRAPH <gs_id> { … }` block. Fluree adds that block automatically when you address a graph source directly — but **not** to a query that already contains a `GRAPH` block of its own, since that is taken as explicit scoping. In a query that mixes the two, any triple pattern left at the top level has nothing to route it, and it returns **HTTP 400 `err:db/InvalidQuery`**:
+
+```sparql
+-- Refused: `?order ex:total ?total` is outside every GRAPH block
+SELECT ?total ?item FROM <warehouse-orders:main> WHERE {
+  ?order ex:total ?total .
+  GRAPH <warehouse-items:main> { ?order ex:item ?item }
+}
+
+-- Correct: every pattern is scoped
+SELECT ?total ?item FROM <warehouse-orders:main> WHERE {
+  GRAPH <warehouse-orders:main> { ?order ex:total ?total }
+  GRAPH <warehouse-items:main> { ?order ex:item ?item }
+}
+```
+
+Either move the pattern inside a `GRAPH` block naming the source it belongs to, or drop the explicit `GRAPH` block so the whole query is scoped automatically.
+
+One gap remains here: a top-level pattern inside `OPTIONAL`, `MINUS`, `UNION`, or `EXISTS` is **not** refused, because refusing it would reject queries that do return rows today. Such a block is evaluated against an empty index, so it matches nothing — a top-level `OPTIONAL` never binds, and a top-level `MINUS` excludes nothing. Scope those blocks with `GRAPH` as well.
 
 ### Search Indexes (BM25, Vector)
 

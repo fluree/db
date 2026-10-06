@@ -33,6 +33,30 @@ use fluree_vocab::{db, fluree};
 /// (not imported) to avoid adding a transact → indexer layering inversion;
 /// the two sites are asserted in sync by the debug_assert in emit paths.
 const RESERVED_PREDICATE_NAMESPACES: &[u16] = &[FLUREE_DB, FLUREE_COMMIT, FLUREE_URN];
+
+/// Narrow a datatype dictionary ID to the width the index stores.
+///
+/// Returns an error message naming the limit if the ID does not fit.
+fn checked_dt_id(dt_id: u32) -> Result<u16, String> {
+    DatatypeDictId::try_from_dict_id(dt_id)
+        .map(DatatypeDictId::as_u16)
+        .ok_or_else(|| {
+            format!(
+                "datatype dict overflow (dt_id={dt_id} exceeds the maximum of {})",
+                DatatypeDictId::MAX
+            )
+        })
+}
+
+/// System-injected txn-meta predicates that legitimately live in a reserved
+/// namespace: `build_commit` strips any user-supplied claim for these and
+/// injects the system-controlled value (`f:identity` for provenance,
+/// `db:receivedAt` for the dual-stamp audit axis). They must flow through
+/// the resolver like ordinary entries so they stay queryable post-index.
+fn is_system_txn_meta_entry(entry: &fluree_db_novelty::TxnMetaEntry) -> bool {
+    entry.predicate_ns == FLUREE_DB
+        && (entry.predicate_name == db::IDENTITY || entry.predicate_name == db::RECEIVED_AT)
+}
 use num_bigint::BigInt;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
@@ -498,7 +522,8 @@ impl CommitResolver {
         writer: &mut W,
     ) -> Result<u32, ResolverError> {
         debug_assert!(
-            !RESERVED_PREDICATE_NAMESPACES.contains(&entry.predicate_ns),
+            !RESERVED_PREDICATE_NAMESPACES.contains(&entry.predicate_ns)
+                || is_system_txn_meta_entry(entry),
             "TxnMetaEntry in reserved namespace {} reached resolver — extract_txn_meta guard bypassed?",
             entry.predicate_ns
         );
@@ -625,18 +650,9 @@ impl CommitResolver {
                 let str_id = dicts.strings.get_or_insert(value)?;
                 let dt_prefix = self.lookup_prefix(*dt_ns);
                 let dt_id = dicts.datatypes.get_or_insert_parts(dt_prefix, dt_name);
-                // Match resolve_single_op()'s u8 constraint for format consistency
-                if dt_id > u8::MAX as u32 {
-                    return Err(ResolverError::Resolve(format!(
-                        "txn_meta datatype dict overflow (dt_id={dt_id} exceeds u8 max)"
-                    )));
-                }
-                Ok((
-                    ObjKind::LEX_ID,
-                    ObjKey::encode_u32_id(str_id),
-                    dt_id as u16,
-                    0,
-                ))
+                let dt_id = checked_dt_id(dt_id)
+                    .map_err(|e| ResolverError::Resolve(format!("txn_meta {e}")))?;
+                Ok((ObjKind::LEX_ID, ObjKey::encode_u32_id(str_id), dt_id, 0))
             }
         }
     }
@@ -671,14 +687,7 @@ impl CommitResolver {
         // way, `(op.dt_ns_code, op.dt_name)` here is guaranteed canonical.
         let prefix = self.lookup_prefix(op.dt_ns_code);
         let dt_id = dicts.datatypes.get_or_insert_parts(prefix, op.dt_name);
-        // Bulk import path: enforce u8 dt ids for now (imports are allowed to error here).
-        // Operationally, the binary format supports widening dt to u16.
-        if dt_id > u8::MAX as u32 {
-            return Err(CommitCodecError::InvalidOp(format!(
-                "import not available: datatype dict overflow (dt_id={dt_id} exceeds u8 max)"
-            )));
-        }
-        let dt_id = dt_id as u16;
+        let dt_id = checked_dt_id(dt_id).map_err(CommitCodecError::InvalidOp)?;
 
         // 5. List index (convert Option<i32> to u32 with sentinel) — needed
         // by vector fact-identity lookup before object encode.
@@ -1150,6 +1159,9 @@ pub struct SharedResolverState {
     /// extended. `ArenaOnly` by default so behavior is unchanged until a caller
     /// opts the rebuild into inline decimals.
     pub decimal_encoding: fluree_db_core::DecimalEncoding,
+    /// Sticky: any resolved user-data op carried a list index (`@list`
+    /// value). Feeds `IndexRoot.has_list_meta` at root assembly.
+    pub saw_list_meta: bool,
 }
 
 impl SharedResolverState {
@@ -1197,6 +1209,7 @@ impl SharedResolverState {
             fulltext_hook_config: crate::fulltext_hook::FulltextHookConfig::default(),
             schema_hook: None,
             decimal_encoding: fluree_db_core::DecimalEncoding::default(),
+            saw_list_meta: false,
         }
     }
 
@@ -1327,6 +1340,7 @@ impl SharedResolverState {
             // Sticky: an incremental rebuild inherits the base root's policy so
             // it never mixes inline and arena encodings under one identity.
             decimal_encoding: root.decimal_encoding(),
+            saw_list_meta: false,
         })
     }
 
@@ -1552,14 +1566,10 @@ impl SharedResolverState {
 
         // 4. Resolve datatype (global, with ValueTypeTag capture)
         let dt_id = self.resolve_datatype(op.dt_ns_code, op.dt_name);
-        if dt_id > u8::MAX as u32 {
-            return Err(CommitCodecError::InvalidOp(format!(
-                "datatype dict overflow (dt_id={dt_id} exceeds u8 max)"
-            )));
-        }
-        let dt_id = dt_id as u16;
+        let dt_id = checked_dt_id(dt_id).map_err(CommitCodecError::InvalidOp)?;
 
         // 5. List index — needed by vector fact-identity lookup before object encode.
+        self.saw_list_meta |= op.i.is_some();
         let i = match op.i {
             Some(idx) if idx >= 0 => idx as u32,
             Some(idx) => {
@@ -2039,7 +2049,8 @@ impl SharedResolverState {
         chunk: &mut RebuildChunk,
     ) -> Result<u32, ResolverError> {
         debug_assert!(
-            !RESERVED_PREDICATE_NAMESPACES.contains(&entry.predicate_ns),
+            !RESERVED_PREDICATE_NAMESPACES.contains(&entry.predicate_ns)
+                || is_system_txn_meta_entry(entry),
             "TxnMetaEntry in reserved namespace {} reached resolver — extract_txn_meta guard bypassed?",
             entry.predicate_ns
         );
@@ -2141,17 +2152,9 @@ impl SharedResolverState {
             } => {
                 let str_id = chunk.strings.get_or_insert(value.as_bytes());
                 let dt_id = self.resolve_datatype(*dt_ns, dt_name);
-                if dt_id > u8::MAX as u32 {
-                    return Err(ResolverError::Resolve(format!(
-                        "txn_meta datatype dict overflow (dt_id={dt_id} exceeds u8 max)"
-                    )));
-                }
-                Ok((
-                    ObjKind::LEX_ID,
-                    ObjKey::encode_u32_id(str_id),
-                    dt_id as u16,
-                    0,
-                ))
+                let dt_id = checked_dt_id(dt_id)
+                    .map_err(|e| ResolverError::Resolve(format!("txn_meta {e}")))?;
+                Ok((ObjKind::LEX_ID, ObjKey::encode_u32_id(str_id), dt_id, 0))
             }
         }
     }

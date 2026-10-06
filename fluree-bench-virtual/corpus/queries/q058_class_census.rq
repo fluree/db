@@ -1,0 +1,9 @@
+# q058 class_census
+# Intent: "How many of each kind of thing are there?" — the class census.
+# BI lineage (BI-explore-4): count of subjects per rdf:type.
+# Exploration family: variable-type rdf:type census + GROUP BY. GROUP BY is
+# non-empty, so the COUNT(*) manifest shortcut cannot apply on the virtual
+# target; it materializes every rdf:type triple across every TriplesMap.
+SELECT ?type (COUNT(?s) AS ?n)
+WHERE { ?s a ?type }
+GROUP BY ?type

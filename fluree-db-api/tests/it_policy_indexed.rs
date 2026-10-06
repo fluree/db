@@ -113,7 +113,7 @@ async fn policy_class_survives_indexing() {
 
             let alice_opts = GovernanceOptions {
                 identity: Some("http://example.org/ns/aliceIdentity".to_string()),
-                default_allow: false,
+                default_allow: Some(false),
                 ..Default::default()
             };
 
@@ -327,7 +327,7 @@ async fn policy_batched_join_lane_declines_index_only() {
 
             let alice_opts = GovernanceOptions {
                 identity: Some("http://example.org/ns/aliceIdentity".to_string()),
-                default_allow: false,
+                default_allow: Some(false),
                 ..Default::default()
             };
             let policy_ctx = policy_builder::build_policy_context_from_opts(
@@ -371,6 +371,43 @@ async fn policy_batched_join_lane_declines_index_only() {
                     && !rows[0].to_string().contains("222-22-2222"),
                 "index-only policy view must hide Bob's SSN, got: {jsonld:#?}"
             );
+
+            // COUNT(*) over the same join must respect the restricted view,
+            // including when a count drain attempts the batched subject lane.
+            let mut count_query = query.clone();
+            count_query["select"] = json!(["(as (count *) ?n)"]);
+            let count =
+                support::query_jsonld_with_policy(&fluree, &ledger_indexed, &count_query, &policy_ctx)
+                    .await
+                    .expect("join count with policy");
+            assert_eq!(
+                count.to_jsonld(&ledger_indexed.snapshot).expect("count jsonld"),
+                json!([[1]]),
+                "join count must exclude the hidden SSN"
+            );
+            count_query["select"] = json!(["?name", "(as (count *) ?n)"]);
+            count_query["groupBy"] = json!(["?name"]);
+            let grouped =
+                support::query_jsonld_with_policy(&fluree, &ledger_indexed, &count_query, &policy_ctx)
+                    .await
+                    .expect("grouped join count with policy");
+            let grouped = grouped.to_jsonld(&ledger_indexed.snapshot).expect("grouped jsonld");
+            assert_eq!(grouped, json!([[rows[0][0], 1]]));
+            let mut minus_query = json!({
+                "select": ["?name"],
+                "where": [
+                    {"@id":"?u", "http://schema.org/name":"?name"},
+                    ["minus", {"@id":"?u", "http://schema.org/ssn":"?ssn"}]
+                ]
+            });
+            let minus = support::query_jsonld_with_policy(&fluree, &ledger_indexed, &minus_query, &policy_ctx)
+                .await.expect("MINUS with policy");
+            assert_eq!(minus.to_jsonld(&ledger_indexed.snapshot).unwrap(), json!([["Bob"]]),
+                "a hidden fact must not eliminate its subject through MINUS");
+            minus_query["select"] = json!(["(as (count *) ?n)"]);
+            let count = support::query_jsonld_with_policy(&fluree, &ledger_indexed, &minus_query, &policy_ctx)
+                .await.expect("MINUS count with policy");
+            assert_eq!(count.to_jsonld(&ledger_indexed.snapshot).unwrap(), json!([[1]]));
         })
         .await;
 }
@@ -459,12 +496,12 @@ async fn policy_count_respects_predicate_coverage() {
 
             let opts_allow = GovernanceOptions {
                 identity: Some("http://example.org/ns/aliceIdentity".to_string()),
-                default_allow: true,
+                default_allow: Some(true),
                 ..Default::default()
             };
             let opts_deny = GovernanceOptions {
                 identity: Some("http://example.org/ns/aliceIdentity".to_string()),
-                default_allow: false,
+                default_allow: Some(false),
                 ..Default::default()
             };
 
@@ -615,7 +652,7 @@ async fn policy_stats_count_by_predicate_uses_filtered_fallback() {
             // not the raw index count of 2.
             let alice_opts = GovernanceOptions {
                 identity: Some("http://example.org/ns/aliceIdentity".to_string()),
-                default_allow: true,
+                default_allow: Some(true),
                 ..Default::default()
             };
             let policy_ctx = policy_builder::build_policy_context_from_opts(

@@ -13,21 +13,24 @@ use crate::fast_path_common::{
     object_probe_lane_plan, subject_probe_lane_plan, ObjectProbeOps, ProbeLanePlan, ProbeOps,
     RowFate,
 };
+use crate::group_aggregate::{binding_to_group_key_normalized, CompositeGroupKey};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::object_binding::{late_materialized_object_binding, materialized_object_binding};
+use crate::operator::flush::FlushSchedule;
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
 use crate::operator::{
-    compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
+    compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, CountGroup, Operator,
+    OperatorState,
 };
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
+use fluree_db_core::clock::Instant;
 use fluree_db_core::subject_id::SubjectId;
-use fluree_db_core::{GraphId, IndexType, ObjectBounds, Sid, BATCHED_JOIN_SIZE};
+use fluree_db_core::{DatatypeDictId, GraphId, IndexType, ObjectBounds, Sid, BATCHED_JOIN_SIZE};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
 use tracing::Instrument;
 
 /// Emit a debug flush summary only when the batched existence probe did non-trivial
@@ -35,30 +38,143 @@ use tracing::Instrument;
 const BATCHED_EXISTS_DEBUG_MIN_ACCUM: usize = 8;
 const BATCHED_EXISTS_DEBUG_MIN_MS: u64 = 10;
 
-/// Floor for the adaptive first-flush threshold under a row budget: never flush
-/// an absurdly small batch (per-flush setup cost), even for `LIMIT 1`.
-const MIN_ADAPTIVE_FLUSH: usize = 1024;
-/// Geometric growth of the flush threshold after each budgeted flush, so a
-/// selective join (many left rows → few output rows, LIMIT not yet satisfied)
-/// converges back to the full `BATCHED_JOIN_SIZE` and stops paying per-flush
-/// overhead. The cap is therefore effectively first-flush-only.
-const ADAPTIVE_FLUSH_GROWTH: usize = 8;
+fn checked_join_count(count: u64, additional: u64) -> Result<u64> {
+    count
+        .checked_add(additional)
+        .ok_or_else(|| QueryError::execution("COUNT(*) overflow in nested-loop join drain_count"))
+}
 
-/// Prepared per-leaf inputs shared by every batched-probe path
-/// (`scan_matches`, `flush_batched_object_accumulator_binary`,
-/// `batched_subject_probe_binary`, `batched_subject_star_spot`). Owns the
-/// leaf blob, decoded header/dir, the leaf-id hash, and the optional
-/// sidecar bytes — the leaflet loop body destructures this and proceeds
-/// without repeating the fetch+decode dance at each site.
-struct LeafScan {
-    leaf_bytes: Vec<u8>,
-    header: fluree_db_binary_index::format::leaf::LeafHeaderV3,
-    dir: fluree_db_binary_index::format::leaf::DecodedLeafDirV3,
-    leaf_id: u128,
+/// Counts folded once per driving row, after all matching right rows have been
+/// checked. Runtime fallback batches use the same normalized group keys.
+struct GroupedCountDrain {
+    left_columns: Vec<usize>,
+    output_columns: Vec<usize>,
+    groups: hashbrown::HashMap<CompositeGroupKey, CountGroup, FxBuildHasher>,
+    key: CompositeGroupKey,
+    graph_view: Option<BinaryGraphView>,
+    counted_rows: u64,
+}
+
+impl GroupedCountDrain {
+    fn add_row(&mut self, batch: &Batch, row: usize, count: u64, from_left: bool) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let columns = if from_left {
+            &self.left_columns
+        } else {
+            &self.output_columns
+        };
+        self.key.0.clear();
+        let store = self.graph_view.as_ref().map(BinaryGraphView::store);
+        self.key.0.extend(columns.iter().map(|&col| {
+            binding_to_group_key_normalized(
+                batch.get_by_col(row, col),
+                store,
+                self.graph_view.as_ref(),
+            )
+        }));
+        let (_, group) = self
+            .groups
+            .raw_entry_mut()
+            .from_key(&self.key)
+            .or_insert_with(|| {
+                (
+                    self.key.clone(),
+                    CountGroup {
+                        keys: columns
+                            .iter()
+                            .map(|&col| batch.get_by_col(row, col).clone())
+                            .collect(),
+                        count: 0,
+                    },
+                )
+            });
+        group.count = checked_join_count(group.count, count)?;
+        Ok(())
+    }
+
+    fn record_growth(&self, ctx: &ExecutionContext<'_>, groups_before: usize) -> Result<()> {
+        ctx.record_alloc((self.groups.len() - groups_before) * crate::context::GROUP_EST_BYTES);
+        ctx.checkpoint()
+    }
+}
+
+/// Prepared per-leaf inputs shared by the batched probe paths and the range
+/// semijoin walk. Owns the leaf blob, decoded header/dir, the leaf-id hash,
+/// and the optional sidecar bytes; [`LeafScan::load_leaflet`] reads one
+/// leaflet from them.
+pub(crate) struct LeafScan {
+    pub(crate) leaf_bytes: fluree_db_binary_index::SharedLeafBytes,
+    pub(crate) header: fluree_db_binary_index::format::leaf::LeafHeaderV3,
+    pub(crate) dir: fluree_db_binary_index::format::leaf::DecodedLeafDirV3,
+    pub(crate) leaf_id: u128,
     /// Sidecar bytes for time-travel replay. `None` at `max_t` (the base
     /// leaflet alone is authoritative); always fetched when `need_replay`
     /// is true so `replay_leaflet_at_t` can reconstruct historical state.
-    sidecar_bytes: Option<Vec<u8>>,
+    pub(crate) sidecar_bytes: Option<Vec<u8>>,
+}
+
+impl LeafScan {
+    /// Load one leaflet's `proj` columns, through the store's leaflet cache
+    /// when it has one, and replay it to `replay_to` on a historical read. An
+    /// empty-after-retract leaflet starts empty so the replay can rebuild it.
+    pub(crate) fn load_leaflet(
+        &self,
+        store: &BinaryIndexStore,
+        leaflet_idx: usize,
+        proj: &fluree_db_binary_index::ColumnProjection,
+        replay_to: Option<i64>,
+    ) -> Result<fluree_db_binary_index::ColumnBatch> {
+        use fluree_db_binary_index::read::column_loader::{
+            load_leaflet_columns, load_leaflet_columns_cached, LeafletDecodeSpec,
+        };
+
+        let entry = &self.dir.entries[leaflet_idx];
+        let batch = if entry.row_count == 0 {
+            fluree_db_binary_index::ColumnBatch::empty()
+        } else {
+            match store.leaflet_cache() {
+                Some(cache) => {
+                    let spec = LeafletDecodeSpec {
+                        leaf_id: self.leaf_id,
+                        leaflet_idx: u32::try_from(leaflet_idx).map_err(|_| {
+                            QueryError::Internal("leaflet idx exceeds u32".to_string())
+                        })?,
+                        order: self.header.order,
+                        decode_set: proj.effective(),
+                    };
+                    load_leaflet_columns_cached(
+                        &self.leaf_bytes,
+                        entry,
+                        self.dir.payload_base,
+                        cache,
+                        spec,
+                    )
+                }
+                None => load_leaflet_columns(
+                    &self.leaf_bytes,
+                    entry,
+                    self.dir.payload_base,
+                    proj,
+                    self.header.order,
+                ),
+            }
+            .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
+        };
+        let Some(to_t) = replay_to else {
+            return Ok(batch);
+        };
+        let replayed = fluree_db_binary_index::replay_leaflet_at_t(
+            &batch,
+            entry,
+            self.sidecar_bytes.as_deref(),
+            to_t,
+            self.header.order,
+        )
+        .map_err(|e| QueryError::Internal(format!("replay leaflet: {e}")))?;
+        Ok(replayed.unwrap_or(batch))
+    }
 }
 
 /// Read-only view of a single joined row — a stored left-batch row plus the
@@ -85,6 +201,19 @@ impl RowAccess for CombinedRowView<'_> {
             Some(self.left_batch.get_by_col(self.left_row, pos))
         } else {
             self.right.get(pos - self.left_len)
+        }
+    }
+
+    fn for_each_binding(&self, f: &mut dyn FnMut(VarId, &Binding)) {
+        for (pos, var) in self.schema.iter().enumerate() {
+            let b = if pos < self.left_len {
+                Some(self.left_batch.get_by_col(self.left_row, pos))
+            } else {
+                self.right.get(pos - self.left_len)
+            };
+            if let Some(b) = b {
+                f(*var, b);
+            }
         }
     }
 }
@@ -117,7 +246,7 @@ fn apply_inline_filters_view<R: RowAccess>(
     Ok(true)
 }
 
-fn prepare_leaf_for_scan(
+pub(crate) fn prepare_leaf_for_scan(
     store: &BinaryIndexStore,
     leaf_entry: &fluree_db_binary_index::format::branch::LeafEntry,
     need_replay: bool,
@@ -127,7 +256,7 @@ fn prepare_leaf_for_scan(
     };
 
     let leaf_bytes = store
-        .get_leaf_bytes_sync(&leaf_entry.leaf_cid)
+        .get_leaf_bytes_shared(&leaf_entry.leaf_cid)
         .map_err(|e| QueryError::Internal(format!("fetch leaf: {e}")))?;
     let sidecar_bytes: Option<Vec<u8>> = if need_replay {
         store
@@ -379,7 +508,20 @@ fn is_batched_subject_exists_eligible(
     let no_obj_bind = !bind_instructions
         .iter()
         .any(|b| b.position == PatternPosition::Object);
-    let no_constraint = right_pattern.dtc.is_none();
+    // An `f:reifies*` chain tags a constant ref object with an explicit `@id`
+    // datatype so the lookup key encodes as a ref. The probe compares a ref
+    // constant against ref values only (`term_matches_probe_value`), so that
+    // constraint is already enforced and must not cost the lane: without it
+    // every reifier candidate of a predicate-only or object-bound quoted
+    // triple opened its own point scan.
+    let no_constraint = match &right_pattern.dtc {
+        None => true,
+        Some(fluree_db_core::DatatypeConstraint::Explicit(dt)) => {
+            matches!(&right_pattern.o, Term::Sid(_) | Term::Iri(_))
+                && *dt == fluree_db_core::edge::id_datatype_sid()
+        }
+        Some(_) => false,
+    };
 
     has_subject_bind && pred_fixed && obj_fixed && no_obj_bind && no_constraint
 }
@@ -460,19 +602,21 @@ pub struct NestedLoopJoinOperator {
     /// Accumulated entries for batched processing: (stored_batch_idx, row_idx, subject_s_id)
     /// Stores the raw s_id directly to avoid dictionary round-trips with EncodedSid.
     batched_accumulator: Vec<(usize, usize, u64)>,
-    /// Advisory row budget from a top-of-tree `LIMIT` (see
-    /// `Operator::set_row_budget`). When set, the first accumulator flush is
-    /// capped near this size instead of `BATCHED_JOIN_SIZE`, so a small `LIMIT`
-    /// doesn't buffer ~100k left rows before producing anything. Advisory only —
-    /// a fully-drained join yields the identical multiset and order.
-    row_budget: Option<usize>,
-    /// Current accumulator-full flush threshold. `BATCHED_JOIN_SIZE` by default;
-    /// lowered by `set_row_budget` and grown geometrically per flush.
-    batched_flush_threshold: usize,
+    /// Accumulator size that triggers a flush. `BATCHED_JOIN_SIZE` throughout
+    /// unless `set_row_budget` starts it near the budget, so a small `LIMIT`
+    /// doesn't buffer ~100k left rows before producing anything. Each flush
+    /// probes the whole key range of its batch, so ramping without a budget
+    /// would repeat that walk on a full drain.
+    flush_schedule: FlushSchedule,
     /// Left batches retained for the batched flush
     stored_left_batches: Vec<Batch>,
     /// Pre-built output batches from the batched path, ready to emit
     batched_output: VecDeque<Batch>,
+    /// Present only during `drain_count`: matches counted without constructing
+    /// output batches. Runtime fallbacks still emit rows through `next_batch`.
+    count_only: Option<u64>,
+    /// Present during a grouped drain; only keys from the left are eligible.
+    grouped_count: Option<GroupedCountDrain>,
     /// Cached index into `stored_left_batches` for the currently active left batch.
     ///
     /// This prevents storing/cloning the same `current_left_batch` repeatedly.
@@ -607,26 +751,32 @@ impl NestedLoopJoinOperator {
 
         // Determine right pattern output vars (vars that are still unbound after substitution),
         // filtered by the emission mask. This allows plan-time pruning of unused vars.
+        //
+        // A variable repeated across positions (`?x <p> ?x`, `?x ?x ?o`) is one
+        // output column, not two: the right scan's own schema folds the repeat
+        // into a single slot (`schema_from_pattern_with_emit`) and enforces the
+        // implied equality per row (`within_row_var_equality_ok`), so emitting
+        // it twice here would only build a batch schema that names the same
+        // VarId in two columns — which `Batch::new` rejects outright.
         let mut right_output_vars: Vec<VarId> = Vec::new();
+        let push_right_var = |out: &mut Vec<VarId>, v: VarId| {
+            if !left_var_positions.contains_key(&v) && !out.contains(&v) {
+                out.push(v);
+            }
+        };
         if right_emit.s {
             if let Ref::Var(v) = &right_pattern.s {
-                if !left_var_positions.contains_key(v) {
-                    right_output_vars.push(*v);
-                }
+                push_right_var(&mut right_output_vars, *v);
             }
         }
         if right_emit.p {
             if let Ref::Var(v) = &right_pattern.p {
-                if !left_var_positions.contains_key(v) {
-                    right_output_vars.push(*v);
-                }
+                push_right_var(&mut right_output_vars, *v);
             }
         }
         if right_emit.o {
             if let Term::Var(v) = &right_pattern.o {
-                if !left_var_positions.contains_key(v) {
-                    right_output_vars.push(*v);
-                }
+                push_right_var(&mut right_output_vars, *v);
             }
         }
 
@@ -751,10 +901,11 @@ impl NestedLoopJoinOperator {
             batched_predicate,
             batched_overlay_mode: ProbeLanePlan::Clean,
             batched_accumulator: Vec::new(),
-            row_budget: None,
-            batched_flush_threshold: BATCHED_JOIN_SIZE,
+            flush_schedule: FlushSchedule::fixed(BATCHED_JOIN_SIZE),
             stored_left_batches: Vec::new(),
             batched_output: VecDeque::new(),
+            count_only: None,
+            grouped_count: None,
             current_left_batch_stored_idx: None,
             inline_ops,
             right_scan_inline_ops,
@@ -926,8 +1077,17 @@ impl NestedLoopJoinOperator {
                             // Use Term::Iri so scan can encode for each target ledger
                             pattern.o = Term::Iri(iri.clone());
                         }
-                        Binding::Lit { val, .. } => {
+                        Binding::Lit { val, dtc, .. } => {
                             pattern.o = Term::Value(val.clone());
+                            // A string binding is one RDF term: `"bob"`,
+                            // `"bob"@en`, `"bob"^^xsd:anyURI` and
+                            // `"bob"^^ex:custom` share a dictionary key and
+                            // must not probe each other's rows. Numeric/other
+                            // constraints are left off so cross-subtype
+                            // matching stays as before.
+                            if crate::binding::is_string_dict_term(binding) {
+                                pattern.dtc = Some(dtc.clone());
+                            }
                         }
                         Binding::EncodedLit {
                             o_kind,
@@ -959,6 +1119,49 @@ impl NestedLoopJoinOperator {
                                         ))
                                     })?;
                                 pattern.o = Term::Value(val);
+                                // Same term-identity rule as the `Lit` arm:
+                                // a string binding probes only rows with its
+                                // exact tag / datatype.
+                                //
+                                // Read straight off the encoded triple: the
+                                // datatype id already names the datatype, so
+                                // this needs no `OTypeRegistry` (a 15-element
+                                // `Vec`, and `decode_value_from_kind` above
+                                // builds one already). Only the three reserved
+                                // string-dictionary ids can appear here —
+                                // `late_materialized_object_binding` keeps
+                                // every other string datatype materialized, so
+                                // those reach the `Lit` arm above instead.
+                                let dt = DatatypeDictId::from_u16(*dt_id);
+                                let dtc = if !crate::binding::is_string_dict_term(binding) {
+                                    None
+                                } else if dt == DatatypeDictId::LANG_STRING {
+                                    gv.store().lang_tag_for_id(*lang_id).map(|tag| {
+                                        fluree_db_core::DatatypeConstraint::LangTag(Arc::from(tag))
+                                    })
+                                } else {
+                                    let sid = crate::eval::rdf::reserved_datatype_sid(dt);
+                                    // Unreachable fallback by the argument
+                                    // above: only the three reserved ids can
+                                    // appear on an encoded string-dict
+                                    // binding, and the two non-langString
+                                    // ones both have well-known Sids. Loud
+                                    // when a future widening of the encoded
+                                    // set forgets this probe site.
+                                    debug_assert!(
+                                        sid.is_some(),
+                                        "encoded string-dict binding carries non-reserved \
+                                         dt_id {dt_id}; late_materialized_object_binding \
+                                         keeps those datatypes materialized"
+                                    );
+                                    sid.or_else(|| {
+                                        gv.store().dt_sids().get(*dt_id as usize).cloned()
+                                    })
+                                    .map(fluree_db_core::DatatypeConstraint::Explicit)
+                                };
+                                if dtc.is_some() {
+                                    pattern.dtc = dtc;
+                                }
                             }
                             // Otherwise leave as variable
                         }
@@ -1117,11 +1320,10 @@ impl Operator for NestedLoopJoinOperator {
     /// to cap the batched accumulator's first flush, which lets backpressure
     /// stop the left scan once the top-level `LIMIT` is satisfied.
     fn set_row_budget(&mut self, budget: usize) {
-        self.row_budget = Some(budget);
-        self.batched_flush_threshold = budget.clamp(MIN_ADAPTIVE_FLUSH, BATCHED_JOIN_SIZE);
+        self.flush_schedule = FlushSchedule::budgeted(budget, BATCHED_JOIN_SIZE);
         tracing::debug!(
             budget,
-            flush_threshold = self.batched_flush_threshold,
+            flush_threshold = self.flush_schedule.size(),
             "nested-loop join: row budget set"
         );
     }
@@ -1139,6 +1341,8 @@ impl Operator for NestedLoopJoinOperator {
 
         // Reset state for fresh execution
         self.pending_output.clear();
+        self.count_only = None;
+        self.grouped_count = None;
         self.pending_right_row = 0;
         self.current_left_batch = None;
         self.current_left_row = 0;
@@ -1389,21 +1593,11 @@ impl Operator for NestedLoopJoinOperator {
                 if let Some(key) = resolved {
                     let batch_idx = self.ensure_current_batch_stored();
                     self.batched_accumulator.push((batch_idx, left_row, key));
-                    if self.batched_accumulator.len() >= self.batched_flush_threshold {
+                    if self.batched_accumulator.len() >= self.flush_schedule.size() {
                         ctx.check_cancelled()?;
                         self.flush_batched_accumulator_for_ctx(ctx).await?;
                         ctx.check_cancelled()?;
-                        // Under a budget the first flush is capped near the
-                        // budget; grow geometrically toward the full batch size
-                        // so a selective join stops paying per-flush overhead.
-                        if self.row_budget.is_some()
-                            && self.batched_flush_threshold < BATCHED_JOIN_SIZE
-                        {
-                            self.batched_flush_threshold = self
-                                .batched_flush_threshold
-                                .saturating_mul(ADAPTIVE_FLUSH_GROWTH)
-                                .min(BATCHED_JOIN_SIZE);
-                        }
+                        self.flush_schedule.advance();
                     }
                 } else {
                     // Fall back to per-row scan for unsupported binding types.
@@ -1455,6 +1649,111 @@ impl Operator for NestedLoopJoinOperator {
         }
     }
 
+    async fn drain_count(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<u64>> {
+        // Reuse the regular driver and all its runtime admission/fallback
+        // rules. Only subject probes without BIND on joined rows avoid emission.
+        if !self.state.can_next()
+            || !self.batched_eligible
+            || self.right_new_vars.is_empty()
+            || self.inline_has_bind()
+        {
+            return Ok(None);
+        }
+        self.count_only = Some(0);
+        let result: Result<u64> = async {
+            let mut materialized_rows = 0;
+            loop {
+                ctx.checkpoint()?;
+                match self.next_batch(ctx).await? {
+                    Some(batch) => {
+                        // Includes buffered output from an earlier next_batch
+                        // call and rows from any per-row runtime fallback.
+                        materialized_rows =
+                            checked_join_count(materialized_rows, batch.len() as u64)?;
+                    }
+                    None => break,
+                }
+            }
+            ctx.checkpoint()?;
+            Ok(materialized_rows)
+        }
+        .await;
+        // Clear the mode even on cancellation/error, before propagating it.
+        let counted_rows = self.count_only.take().expect("count drain mode");
+        let materialized_rows = result?;
+        let total = checked_join_count(counted_rows, materialized_rows)?;
+        tracing::debug!(
+            counted_rows,
+            materialized_rows,
+            "nested-loop count drain complete"
+        );
+        Ok(Some(total))
+    }
+
+    async fn drain_grouped_count(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        group_vars: &[VarId],
+    ) -> Result<Option<Vec<CountGroup>>> {
+        if !self.state.can_next()
+            || !self.batched_eligible
+            || self.right_new_vars.is_empty()
+            || self.inline_has_bind()
+            || group_vars.is_empty()
+        {
+            return Ok(None);
+        }
+        let left_columns: Option<Vec<_>> = group_vars
+            .iter()
+            .map(|var| self.left_schema.iter().position(|v| v == var))
+            .collect();
+        let output_columns: Option<Vec<_>> = group_vars
+            .iter()
+            .map(|var| self.schema().iter().position(|v| v == var))
+            .collect();
+        let (Some(left_columns), Some(output_columns)) = (left_columns, output_columns) else {
+            return Ok(None);
+        };
+        self.grouped_count = Some(GroupedCountDrain {
+            left_columns,
+            output_columns,
+            groups: hashbrown::HashMap::with_hasher(FxBuildHasher),
+            key: CompositeGroupKey(Vec::with_capacity(group_vars.len())),
+            graph_view: ctx.graph_view(),
+            counted_rows: 0,
+        });
+        let result: Result<u64> = async {
+            let mut materialized_rows = 0;
+            loop {
+                ctx.checkpoint()?;
+                let Some(batch) = self.next_batch(ctx).await? else {
+                    break;
+                };
+                // Buffered output and runtime fallbacks contain fully unified
+                // bindings, including previously unbound left subject keys.
+                let groups = self.grouped_count.as_mut().expect("grouped drain mode");
+                let before = groups.groups.len();
+                for row in 0..batch.len() {
+                    groups.add_row(&batch, row, 1, false)?;
+                }
+                groups.record_growth(ctx, before)?;
+                materialized_rows = checked_join_count(materialized_rows, batch.len() as u64)?;
+            }
+            ctx.checkpoint()?;
+            Ok(materialized_rows)
+        }
+        .await;
+        let groups = self.grouped_count.take().expect("grouped drain mode");
+        let materialized_rows = result?;
+        tracing::debug!(
+            counted_rows = groups.counted_rows,
+            materialized_rows,
+            groups = groups.groups.len(),
+            "nested-loop grouped count drain complete"
+        );
+        Ok(Some(groups.groups.into_values().collect()))
+    }
+
     fn close(&mut self) {
         self.left.close();
         self.current_left_batch = None;
@@ -1469,6 +1768,8 @@ impl Operator for NestedLoopJoinOperator {
         self.batched_accumulator.clear();
         self.stored_left_batches.clear();
         self.batched_output.clear();
+        self.count_only = None;
+        self.grouped_count = None;
         self.state = OperatorState::Closed;
     }
 
@@ -1489,8 +1790,25 @@ impl NestedLoopJoinOperator {
     /// Build output batch from pending results
     async fn build_output_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
         let batch_size = ctx.batch_size;
+        // Size the columns by what is actually pending, capped at the batch
+        // size. In per-row mode the pending output is one left row's matches
+        // — StarBench P4 (`<< ?s ?p ?o >> ?d ?e`): ~22 rows per reifier over
+        // 21.4M reifiers — and a column pre-allocated at full batch capacity
+        // kept ~360 KB × columns alive per emitted batch. The server retains
+        // every batch of a delimited response until it formats them, which
+        // ran to 240 GB. Dense right batches still get the full capacity.
+        let mut pending_rows = 0usize;
+        for (_, _, right_batch) in &self.pending_output {
+            pending_rows += right_batch.len();
+            if pending_rows >= batch_size {
+                break;
+            }
+        }
+        let capacity = pending_rows
+            .saturating_sub(self.pending_right_row)
+            .clamp(1, batch_size);
         let mut output_columns: Vec<Vec<Binding>> = (0..self.combined_schema.len())
-            .map(|_| Vec::with_capacity(batch_size))
+            .map(|_| Vec::with_capacity(capacity))
             .collect();
 
         let mut rows_added = 0;
@@ -1585,6 +1903,10 @@ impl NestedLoopJoinOperator {
         &mut self,
         ctx: &ExecutionContext<'_>,
     ) -> Result<()> {
+        tracing::debug!(
+            input_rows = self.batched_accumulator.len(),
+            "join batched probe input"
+        );
         if ctx.binary_store.is_none() {
             return Err(crate::error::QueryError::execution(
                 "binary_store is required for batched joins — no non-binary fallback exists",
@@ -1636,17 +1958,17 @@ impl NestedLoopJoinOperator {
     /// object. Decline cases route to the overlay-correct per-row fallback
     /// BEFORE any accumulation, so a flush never reroutes mid-stream.
     fn compute_batched_overlay_mode(&self, ctx: &ExecutionContext<'_>) -> Result<ProbeLanePlan> {
-        // BEFORE the overlay-free return: the batched lanes read raw leaflets in
-        // `Clean` mode too and never run per-leaf `filter_flakes` policy
-        // filtering, so a restrictive policy must decline regardless of novelty
-        // state. This mirrors the same ordering in `subject_probe_lane_plan` /
-        // `object_probe_lane_plan`; without it this early `Clean` return would
-        // bypass their (correctly gated) decision.
-        if !ctx.allow_unfiltered() {
-            return Ok(ProbeLanePlan::Decline);
-        }
-        if ctx.overlay_free_single_graph() {
-            return Ok(ProbeLanePlan::Clean);
+        // The lane planners' own admission, so an overlay-free graph settles
+        // as `Clean` without needing a store — and its history and policy
+        // gates run before that `Clean` regardless of eligibility. With no
+        // batched predicate there is nothing for a policy to clear, and the
+        // empty set declines under any non-root policy.
+        let preds: &[&Sid] = match self.batched_predicate.as_ref() {
+            Some(pred) => &[pred],
+            None => &[],
+        };
+        if let Some(plan) = crate::fast_path_common::probe_lane_admission(ctx, preds) {
+            return Ok(plan);
         }
         if !(self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
         {
@@ -1772,29 +2094,23 @@ impl NestedLoopJoinOperator {
         mut probe_ops: Option<&mut ProbeOps>,
         on_match: &mut dyn FnMut(&[usize], &Binding) -> Result<()>,
     ) -> Result<()> {
-        use fluree_db_binary_index::read::column_loader::load_leaflet_columns_cached;
         use fluree_db_core::o_type::OType;
 
-        let cache = store.leaflet_cache();
         let scan_start = Instant::now();
 
         let mut leaflets_scanned: u64 = 0;
         let mut matched_rows: u64 = 0;
         let need_replay = ctx.to_t < store.max_t();
+        let replay_to = need_replay.then_some(ctx.to_t);
         let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
+        let proj = fluree_db_binary_index::ColumnProjection::all();
 
         for leaf_idx in leaf_range {
             ctx.check_cancelled()?;
             let leaf_entry = &branch.leaves[leaf_idx];
-            let LeafScan {
-                leaf_bytes,
-                header,
-                dir,
-                leaf_id,
-                sidecar_bytes,
-            } = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
+            let leaf = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
 
-            for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
+            for (leaflet_idx, entry) in leaf.dir.entries.iter().enumerate() {
                 ctx.check_cancelled()?;
                 leaflets_scanned += 1;
                 // An empty-after-retract leaflet (`row_count == 0`) is preserved
@@ -1812,59 +2128,8 @@ impl NestedLoopJoinOperator {
                     continue;
                 }
 
-                // Load all columns via V3 column loader (cached when available).
-                // For empty-after-retract leaflets we start from an empty batch
-                // and let `replay_leaflet_at_t` reconstruct rows from the sidecar.
-                let batch = if entry.row_count == 0 {
-                    fluree_db_binary_index::ColumnBatch::empty()
-                } else if let Some(c) = &cache {
-                    load_leaflet_columns_cached(
-                        &leaf_bytes,
-                        entry,
-                        dir.payload_base,
-                        c,
-                        fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
-                            leaf_id,
-                            leaflet_idx: u32::try_from(leaflet_idx).map_err(|_| {
-                                QueryError::Internal("leaflet idx exceeds u32".to_string())
-                            })?,
-                            order: header.order,
-                            decode_set: fluree_db_binary_index::ColumnSet::ALL,
-                        },
-                    )
-                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                } else {
-                    use fluree_db_binary_index::read::column_loader::load_leaflet_columns;
-                    load_leaflet_columns(
-                        &leaf_bytes,
-                        entry,
-                        dir.payload_base,
-                        &fluree_db_binary_index::ColumnProjection::all(),
-                        header.order,
-                    )
-                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                };
+                let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to)?;
                 ctx.check_cancelled()?;
-
-                // Apply time-travel replay when querying a historical snapshot.
-                // The cached `batch` reflects latest base state; `replay_leaflet_at_t`
-                // reconstructs the state at `ctx.to_t` using the history sidecar.
-                let batch = if need_replay {
-                    match fluree_db_binary_index::replay_leaflet_at_t(
-                        &batch,
-                        entry,
-                        sidecar_bytes.as_deref(),
-                        ctx.to_t,
-                        header.order,
-                    )
-                    .map_err(|e| QueryError::Internal(format!("replay leaflet: {e}")))?
-                    {
-                        Some(replayed) => replayed,
-                        None => batch,
-                    }
-                } else {
-                    batch
-                };
 
                 let row_count = batch.row_count;
 
@@ -1939,10 +2204,10 @@ impl NestedLoopJoinOperator {
                         } else {
                             let o_i = batch.o_i.get_or(row, u32::MAX);
                             let t = batch.t.get_or(row, 0) as i64;
-                            self.build_batched_object_binding(
+                            build_probe_object_binding(
                                 ctx,
                                 store,
-                                dict_overlay,
+                                dict_overlay.as_ref(),
                                 p_id,
                                 o_type_val,
                                 o_key_val,
@@ -1982,10 +2247,10 @@ impl NestedLoopJoinOperator {
                     {
                         Binding::encoded_sid(op.o_key)
                     } else {
-                        self.build_batched_object_binding(
+                        build_probe_object_binding(
                             ctx,
                             store,
-                            dict_overlay,
+                            dict_overlay.as_ref(),
                             p_id,
                             op.o_type,
                             op.o_key,
@@ -2005,6 +2270,13 @@ impl NestedLoopJoinOperator {
             matched_rows,
             "join batched binary scan complete"
         );
+
+        // The join reads leaflets itself here, so these rows cross no other
+        // charging surface: without this a subject-driven NLJ chain expanded
+        // its whole probe side for free. `matched_rows` is already tallied by
+        // the loop above for the debug line, so the charge costs one
+        // `fetch_add` at the scan boundary and nothing per row.
+        charge_probe_rows(ctx, matched_rows as usize)?;
 
         Ok(())
     }
@@ -2041,192 +2313,8 @@ impl NestedLoopJoinOperator {
         let Some(bounds) = &self.object_bounds else {
             return Ok(true);
         };
-        use fluree_db_core::o_type::{DecodeKind, OType};
-        let val = match (OType::from_u16(o_type).decode_kind(), dict_overlay.as_ref()) {
-            (DecodeKind::IriRef, Some(ov)) => {
-                let iri = ov.resolve_subject_iri(o_key).map_err(|e| {
-                    QueryError::Internal(format!("resolve_subject_iri (injected bounds): {e}"))
-                })?;
-                fluree_db_core::FlakeValue::Ref(store.encode_iri(&iri))
-            }
-            (DecodeKind::StringDict, Some(ov)) => {
-                let s = ov.resolve_string_value(o_key as u32).map_err(|e| {
-                    QueryError::Internal(format!("resolve_string_value (injected bounds): {e}"))
-                })?;
-                fluree_db_core::FlakeValue::String(s)
-            }
-            (DecodeKind::JsonArena, Some(ov)) => {
-                let s = ov.resolve_string_value(o_key as u32).map_err(|e| {
-                    QueryError::Internal(format!(
-                        "resolve_string_value (injected bounds json): {e}"
-                    ))
-                })?;
-                fluree_db_core::FlakeValue::Json(s)
-            }
-            _ => store
-                .decode_value_v3(o_type, o_key, p_id, ctx.binary_g_id)
-                .map_err(|e| {
-                    QueryError::Internal(format!("decode_value_v3 (injected bounds): {e}"))
-                })?,
-        };
+        let val = decode_overlay_object(ctx, store, dict_overlay.as_ref(), p_id, o_type, o_key)?;
         Ok(bounds.matches(&val))
-    }
-
-    /// Build the late-materialized object binding for one non-ref matched row.
-    ///
-    /// Shared by base leaflet rows in `scan_matches` and by injected novelty
-    /// asserts (whose `o_type`/`o_key`/`o_i`/`t` come from the overlay op), so
-    /// both produce identical binding representations. Novelty-minted
-    /// string/subject ids resolve through `dict_overlay`.
-    #[allow(clippy::too_many_arguments)]
-    fn build_batched_object_binding(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        store: &BinaryIndexStore,
-        dict_overlay: &Option<crate::dict_overlay::DictOverlay>,
-        p_id: u32,
-        o_type_val: u16,
-        o_key_val: u64,
-        o_i: u32,
-        t: i64,
-    ) -> Result<Binding> {
-        use fluree_db_core::o_type::OType;
-        let ot = OType::from_u16(o_type_val);
-        Ok(
-            // Prefer a stable EncodedLit representation when possible so that
-            // formatters can materialize using the root's canonical datatype table.
-            match ot.decode_kind() {
-                fluree_db_core::o_type::DecodeKind::StringDict => {
-                    use fluree_db_core::ids::DatatypeDictId;
-                    use fluree_db_core::value_id::ObjKind;
-
-                    let (dt_id, lang_id) = if ot.is_lang_string() {
-                        (DatatypeDictId::LANG_STRING.as_u16(), ot.payload())
-                    } else if o_type_val == OType::FULLTEXT.as_u16() {
-                        (DatatypeDictId::FULL_TEXT.as_u16(), 0)
-                    } else {
-                        (DatatypeDictId::STRING.as_u16(), 0)
-                    };
-
-                    Binding::EncodedLit {
-                        o_kind: ObjKind::LEX_ID.as_u8(),
-                        o_key: o_key_val,
-                        p_id,
-                        dt_id,
-                        lang_id,
-                        i_val: if o_i == u32::MAX {
-                            i32::MIN
-                        } else {
-                            o_i as i32
-                        },
-                        t,
-                    }
-                }
-                fluree_db_core::o_type::DecodeKind::JsonArena => {
-                    use fluree_db_core::ids::DatatypeDictId;
-                    use fluree_db_core::value_id::ObjKind;
-                    Binding::EncodedLit {
-                        o_kind: ObjKind::JSON_ID.as_u8(),
-                        o_key: o_key_val,
-                        p_id,
-                        dt_id: DatatypeDictId::JSON.as_u16(),
-                        lang_id: 0,
-                        i_val: if o_i == u32::MAX {
-                            i32::MIN
-                        } else {
-                            o_i as i32
-                        },
-                        t,
-                    }
-                }
-                fluree_db_core::o_type::DecodeKind::VectorArena => {
-                    use fluree_db_core::ids::DatatypeDictId;
-                    use fluree_db_core::value_id::ObjKind;
-                    Binding::EncodedLit {
-                        o_kind: ObjKind::VECTOR_ID.as_u8(),
-                        o_key: o_key_val,
-                        p_id,
-                        dt_id: DatatypeDictId::VECTOR.as_u16(),
-                        lang_id: 0,
-                        i_val: if o_i == u32::MAX {
-                            i32::MIN
-                        } else {
-                            o_i as i32
-                        },
-                        t,
-                    }
-                }
-                fluree_db_core::o_type::DecodeKind::NumBigArena => {
-                    use fluree_db_core::ids::DatatypeDictId;
-                    use fluree_db_core::value_id::ObjKind;
-                    Binding::EncodedLit {
-                        o_kind: ObjKind::NUM_BIG.as_u8(),
-                        o_key: o_key_val,
-                        p_id,
-                        dt_id: DatatypeDictId::DECIMAL.as_u16(),
-                        lang_id: 0,
-                        i_val: if o_i == u32::MAX {
-                            i32::MIN
-                        } else {
-                            o_i as i32
-                        },
-                        t,
-                    }
-                }
-                _ => {
-                    // Inline numerics with a reserved dict id stay encoded
-                    // (cheap through DISTINCT/joins, materialized at projection);
-                    // everything else decodes eagerly via DictOverlay.
-                    if let Some(encoded) = crate::object_binding::inline_numeric_encoded_lit(
-                        o_type_val, o_key_val, p_id, o_i, t,
-                    ) {
-                        encoded
-                    } else {
-                        // Fallback: decode eagerly, using DictOverlay for
-                        // novelty-aware resolution of string/subject IDs.
-                        use fluree_db_core::o_type::{DecodeKind, OType as OT};
-                        let ot = OT::from_u16(o_type_val);
-                        let val: fluree_db_core::FlakeValue =
-                            match (ot.decode_kind(), dict_overlay.as_ref()) {
-                                (DecodeKind::IriRef, Some(ov)) => {
-                                    let iri = ov.resolve_subject_iri(o_key_val).map_err(|e| {
-                                        crate::error::QueryError::Internal(format!(
-                                            "resolve_subject_iri (batched join): {e}"
-                                        ))
-                                    })?;
-                                    fluree_db_core::FlakeValue::Ref(store.encode_iri(&iri))
-                                }
-                                (DecodeKind::StringDict, Some(ov)) => {
-                                    let s =
-                                        ov.resolve_string_value(o_key_val as u32).map_err(|e| {
-                                            crate::error::QueryError::Internal(format!(
-                                                "resolve_string_value (batched join): {e}"
-                                            ))
-                                        })?;
-                                    fluree_db_core::FlakeValue::String(s)
-                                }
-                                (DecodeKind::JsonArena, Some(ov)) => {
-                                    let s =
-                                        ov.resolve_string_value(o_key_val as u32).map_err(|e| {
-                                            crate::error::QueryError::Internal(format!(
-                                                "resolve_string_value (batched join json): {e}"
-                                            ))
-                                        })?;
-                                    fluree_db_core::FlakeValue::Json(s)
-                                }
-                                _ => store
-                                    .decode_value_v3(o_type_val, o_key_val, p_id, ctx.binary_g_id)
-                                    .map_err(|e| {
-                                        crate::error::QueryError::Internal(format!(
-                                            "decode_value_v3 (batched join): {e}"
-                                        ))
-                                    })?,
-                            };
-                        materialized_object_binding(store, o_type_val, p_id, val, Some(t), None)
-                    }
-                }
-            },
-        )
     }
 
     /// Phase 5: Assemble scattered results into output batches in left-row order.
@@ -2418,7 +2506,8 @@ impl NestedLoopJoinOperator {
         //    per accumulator slot). Inline FILTERs run against a `CombinedRowView`
         //    over the stored left row + right tail — no per-match `combined` Vec.
         //    `emit_right_scatter_to_output` writes left columns (cloned once) and
-        //    right tails directly into the output columns.
+        //    right tails directly into the output columns. During `drain_count`,
+        //    the same callback counts surviving matches without scatter/output.
         //  * Bind/general path: full combined rows scattered into
         //    `Vec<Vec<Vec<Binding>>>`, then transposed by `emit_scatter_to_output`.
         //    Binds may append or clobber columns, so the row must be materialized.
@@ -2426,7 +2515,20 @@ impl NestedLoopJoinOperator {
         if right_width >= 1 && !self.inline_has_bind() {
             let left_len = self.left_schema.len();
             let combined_schema = self.combined_schema.clone();
-            let mut scatter: Vec<Vec<Binding>> = vec![Vec::new(); self.batched_accumulator.len()];
+            let count_only = self.count_only.is_some();
+            let grouped_count = self.grouped_count.is_some();
+            let mut row_counts = if grouped_count {
+                vec![0u64; self.batched_accumulator.len()]
+            } else {
+                Vec::new()
+            };
+            let mut counted_rows = 0;
+            let mut scatter: Vec<Vec<Binding>> = if count_only || grouped_count {
+                ctx.checkpoint()?;
+                Vec::new()
+            } else {
+                vec![Vec::new(); self.batched_accumulator.len()]
+            };
             {
                 let mut on_match = |accum_indices: &[usize], obj: &Binding| -> Result<()> {
                     // Right-side tail (object + any right-scan inline outputs) is
@@ -2436,6 +2538,11 @@ impl NestedLoopJoinOperator {
                         right_bindings.push(obj.clone());
                     }
                     if !self.apply_right_scan_inline_ops(ctx, &mut right_bindings)? {
+                        return Ok(());
+                    }
+                    if count_only && self.inline_ops.is_empty() {
+                        counted_rows =
+                            checked_join_count(counted_rows, accum_indices.len() as u64)?;
                         return Ok(());
                     }
                     for &accum_idx in accum_indices {
@@ -2452,7 +2559,13 @@ impl NestedLoopJoinOperator {
                                 continue;
                             }
                         }
-                        scatter[accum_idx].extend(right_bindings.iter().cloned());
+                        if count_only {
+                            counted_rows = checked_join_count(counted_rows, 1)?;
+                        } else if grouped_count {
+                            row_counts[accum_idx] = checked_join_count(row_counts[accum_idx], 1)?;
+                        } else {
+                            scatter[accum_idx].extend(right_bindings.iter().cloned());
+                        }
                     }
                     Ok(())
                 };
@@ -2469,7 +2582,34 @@ impl NestedLoopJoinOperator {
                     &mut on_match,
                 )?;
             }
-            self.emit_right_scatter_to_output(scatter, right_width, ctx.batch_size)?;
+            if let Some(groups) = self.grouped_count.as_mut() {
+                // A flush may contain many input batches. Bound the interval
+                // between budget/deadline checks while growing the group map.
+                let batch_size = ctx.batch_size.max(1);
+                for (chunk_idx, counts) in row_counts.chunks(batch_size).enumerate() {
+                    let before = groups.groups.len();
+                    for (offset, &count) in counts.iter().enumerate() {
+                        let (batch_idx, row_idx, _) =
+                            self.batched_accumulator[chunk_idx * batch_size + offset];
+                        groups.add_row(
+                            &self.stored_left_batches[batch_idx],
+                            row_idx,
+                            count,
+                            true,
+                        )?;
+                        groups.counted_rows = checked_join_count(groups.counted_rows, count)?;
+                    }
+                    groups.record_growth(ctx, before)?;
+                }
+                self.clear_batched_state();
+            } else if let Some(total) = self.count_only.as_mut() {
+                ctx.checkpoint()?;
+                *total = checked_join_count(*total, counted_rows)?;
+                tracing::debug!(counted_rows, "join batched count flush complete");
+                self.clear_batched_state();
+            } else {
+                self.emit_right_scatter_to_output(scatter, right_width, ctx.batch_size)?;
+            }
         } else {
             let mut scatter: Vec<Vec<Vec<Binding>>> =
                 vec![Vec::new(); self.batched_accumulator.len()];
@@ -2553,7 +2693,6 @@ impl NestedLoopJoinOperator {
         use fluree_db_binary_index::format::run_record_v2::{
             cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
         };
-        use fluree_db_binary_index::read::column_loader::load_leaflet_columns;
         use fluree_db_binary_index::RunSortOrder;
         use fluree_db_core::o_type::OType;
 
@@ -2642,21 +2781,15 @@ impl NestedLoopJoinOperator {
         leaf_indices.sort_unstable();
         leaf_indices.dedup();
 
-        let cache = store.leaflet_cache();
         let need_replay = ctx.to_t < store.max_t();
+        let replay_to = need_replay.then_some(ctx.to_t);
         let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
         for leaf_idx in leaf_indices {
             ctx.check_cancelled()?;
             let leaf_entry = &branch.leaves[leaf_idx];
-            let LeafScan {
-                leaf_bytes,
-                header,
-                dir,
-                leaf_id,
-                sidecar_bytes,
-            } = prepare_leaf_for_scan(&store, leaf_entry, need_replay)?;
+            let leaf = prepare_leaf_for_scan(&store, leaf_entry, need_replay)?;
 
-            for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
+            for (leaflet_idx, entry) in leaf.dir.entries.iter().enumerate() {
                 ctx.check_cancelled()?;
                 let needs_history_replay =
                     need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
@@ -2707,50 +2840,9 @@ impl NestedLoopJoinOperator {
                         internal: ColumnSet::EMPTY,
                     }
                 };
-                let batch = if entry.row_count == 0 {
-                    fluree_db_binary_index::ColumnBatch::empty()
-                } else if let Some(c) = &cache {
-                    let leaflet_idx_u32 = u32::try_from(leaflet_idx)
-                        .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?;
-                    // Projection-aware + inserting: caches under the decoded
-                    // column set (CORE, or ALL for replay) so repeat probes hit
-                    // instead of re-decoding, and never collides with a wider entry.
-                    fluree_db_binary_index::read::column_loader::load_leaflet_columns_cached(
-                        &leaf_bytes,
-                        entry,
-                        dir.payload_base,
-                        c,
-                        fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
-                            leaf_id,
-                            leaflet_idx: leaflet_idx_u32,
-                            order: header.order,
-                            decode_set: proj.effective(),
-                        },
-                    )
-                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                } else {
-                    load_leaflet_columns(&leaf_bytes, entry, dir.payload_base, &proj, header.order)
-                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                };
-                ctx.check_cancelled()?;
-
-                // Apply time-travel replay when querying a historical snapshot.
-                let batch = if need_replay {
-                    match fluree_db_binary_index::replay_leaflet_at_t(
-                        &batch,
-                        entry,
-                        sidecar_bytes.as_deref(),
-                        ctx.to_t,
-                        header.order,
-                    )
-                    .map_err(|e| QueryError::Internal(format!("replay leaflet: {e}")))?
-                    {
-                        Some(replayed) => replayed,
-                        None => batch,
-                    }
-                } else {
-                    batch
-                };
+                // The cache keys on the decoded column set, so this narrow
+                // entry never collides with a wider one.
+                let batch = leaf.load_leaflet(&store, leaflet_idx, &proj, replay_to)?;
                 ctx.check_cancelled()?;
 
                 // OPST leaflets are ordered by (o_type, o_key, p_id, s_id, t...).
@@ -2914,6 +3006,13 @@ impl NestedLoopJoinOperator {
             matched_rows,
             "join batched object flush complete"
         );
+
+        // The object-driven (POST) lane reads its own leaflets rather than
+        // going through `scan_matches`, so its rows need their own charge at
+        // this boundary — `matched_rows` is already tallied for the debug
+        // line above.
+        charge_probe_rows(ctx, matched_rows as usize)?;
+
         Ok(())
     }
 
@@ -3080,6 +3179,9 @@ fn term_matches_probe_value(
     }
 }
 
+/// Object binding for a non-ref row matched on a batched lane: the scan's
+/// late-materialized form when it has one, so every lane keys a literal
+/// alike, else the decoded value (novelty ids resolve through `dict_overlay`).
 #[allow(clippy::too_many_arguments)]
 fn build_probe_object_binding(
     ctx: &ExecutionContext<'_>,
@@ -3091,38 +3193,13 @@ fn build_probe_object_binding(
     o_i: u32,
     t: i64,
 ) -> Result<Binding> {
-    use fluree_db_core::o_type::{DecodeKind, OType};
-
     if let Some(binding) =
         late_materialized_object_binding(o_type_val, o_key_val, p_id, t, o_i, None)
     {
         return Ok(binding);
     }
 
-    let ot = OType::from_u16(o_type_val);
-    let val: fluree_db_core::FlakeValue = match (ot.decode_kind(), dict_overlay) {
-        (DecodeKind::IriRef, Some(ov)) => {
-            let iri = ov.resolve_subject_iri(o_key_val).map_err(|e| {
-                QueryError::Internal(format!("resolve_subject_iri (batched probe): {e}"))
-            })?;
-            fluree_db_core::FlakeValue::Ref(store.encode_iri(&iri))
-        }
-        (DecodeKind::StringDict, Some(ov)) => {
-            let s = ov.resolve_string_value(o_key_val as u32).map_err(|e| {
-                QueryError::Internal(format!("resolve_string_value (batched probe): {e}"))
-            })?;
-            fluree_db_core::FlakeValue::String(s)
-        }
-        (DecodeKind::JsonArena, Some(ov)) => {
-            let s = ov.resolve_string_value(o_key_val as u32).map_err(|e| {
-                QueryError::Internal(format!("resolve_string_value (batched probe json): {e}"))
-            })?;
-            fluree_db_core::FlakeValue::Json(s)
-        }
-        _ => store
-            .decode_value_v3(o_type_val, o_key_val, p_id, ctx.binary_g_id)
-            .map_err(|e| QueryError::Internal(format!("decode_value_v3 (batched probe): {e}")))?,
-    };
+    let val = decode_overlay_object(ctx, store, dict_overlay, p_id, o_type_val, o_key_val)?;
     Ok(materialized_object_binding(
         store,
         o_type_val,
@@ -3133,12 +3210,11 @@ fn build_probe_object_binding(
     ))
 }
 
-/// Decode an object value for filter evaluation (bounds / bound-object) on
-/// an injected novelty assert. Novelty-minted subject and string ids resolve
-/// through `dict_overlay` (which falls back to the base dictionaries for
-/// indexed ids); everything else decodes from the store, mirroring
-/// `build_probe_object_binding`.
-fn decode_probe_filter_value(
+/// Decode an object value from its `(o_type, o_key)`. Subject and string ids
+/// resolve through `dict_overlay` when there is one, so ids minted in novelty
+/// decode too (the overlay falls back to the base dictionaries); everything
+/// else decodes from the store.
+fn decode_overlay_object(
     ctx: &ExecutionContext<'_>,
     store: &BinaryIndexStore,
     dict_overlay: Option<&crate::dict_overlay::DictOverlay>,
@@ -3147,31 +3223,29 @@ fn decode_probe_filter_value(
     o_key: u64,
 ) -> Result<fluree_db_core::FlakeValue> {
     use fluree_db_core::o_type::{DecodeKind, OType};
+    use fluree_db_core::FlakeValue;
+    let decode_err = |what: &str, e: &dyn std::fmt::Display| {
+        QueryError::Internal(format!("{what} (object decode): {e}"))
+    };
     Ok(
         match (OType::from_u16(o_type).decode_kind(), dict_overlay) {
             (DecodeKind::IriRef, Some(ov)) => {
-                let iri = ov.resolve_subject_iri(o_key).map_err(|e| {
-                    QueryError::Internal(format!("resolve_subject_iri (probe filter): {e}"))
-                })?;
-                fluree_db_core::FlakeValue::Ref(store.encode_iri(&iri))
+                let iri = ov
+                    .resolve_subject_iri(o_key)
+                    .map_err(|e| decode_err("resolve_subject_iri", &e))?;
+                FlakeValue::Ref(store.encode_iri(&iri))
             }
-            (DecodeKind::StringDict, Some(ov)) => {
-                let s = ov.resolve_string_value(o_key as u32).map_err(|e| {
-                    QueryError::Internal(format!("resolve_string_value (probe filter): {e}"))
-                })?;
-                fluree_db_core::FlakeValue::String(s)
-            }
-            (DecodeKind::JsonArena, Some(ov)) => {
-                let s = ov.resolve_string_value(o_key as u32).map_err(|e| {
-                    QueryError::Internal(format!("resolve_string_value (probe filter json): {e}"))
-                })?;
-                fluree_db_core::FlakeValue::Json(s)
-            }
+            (DecodeKind::StringDict, Some(ov)) => FlakeValue::String(
+                ov.resolve_string_value(o_key as u32)
+                    .map_err(|e| decode_err("resolve_string_value", &e))?,
+            ),
+            (DecodeKind::JsonArena, Some(ov)) => FlakeValue::Json(
+                ov.resolve_string_value(o_key as u32)
+                    .map_err(|e| decode_err("resolve_string_value", &e))?,
+            ),
             _ => store
                 .decode_value_v3(o_type, o_key, p_id, ctx.binary_g_id)
-                .map_err(|e| {
-                    QueryError::Internal(format!("decode_value_v3 (probe filter): {e}"))
-                })?,
+                .map_err(|e| decode_err("decode_value_v3", &e))?,
         },
     )
 }
@@ -3186,14 +3260,51 @@ pub(crate) struct SubjectProbeParams<'a> {
     pub dict_overlay: Option<&'a crate::dict_overlay::DictOverlay>,
 }
 
+/// Probe a batch of subjects for one predicate, charging the rows it
+/// returns.
+///
+/// The charge lives here rather than at the call sites because both
+/// `PropertyJoinOperator` and `NestedLoopJoinOperator` reach the index
+/// through this primitive. Pricing it per call site meant the same read
+/// was billed in one operator and free in the other, so a query's cost
+/// depended on which lane the planner picked. One charge per call, using
+/// the match count — never per row inside the leaflet loops (hot-loop
+/// purity, see [`charge_probe_rows`]).
 pub(crate) fn batched_subject_probe_binary(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    params: &SubjectProbeParams<'_>,
+    probe_ops: Option<&mut ProbeOps>,
+) -> Result<Vec<BatchedSubjectProbeMatch>> {
+    let matches = batched_subject_probe_binary_uncharged(ctx, store, params, probe_ops)?;
+    charge_probe_rows(ctx, matches.len())?;
+    Ok(matches)
+}
+
+/// Charge a batch of index-probe rows at [`PER_ROW_MICRO_FUEL`].
+///
+/// One `fetch_add` for the whole batch, at the boundary where the matches
+/// are handed back — never per iteration inside the leaflet merge loops.
+/// A never-taken branch in those loops measured +5-15% end-to-end (see
+/// CLAUDE.md's hot-loop purity rule), and `consume_fuel` short-circuits
+/// on an untracked query before touching the atomic at all.
+///
+/// [`PER_ROW_MICRO_FUEL`]: fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL
+fn charge_probe_rows(ctx: &ExecutionContext<'_>, rows: usize) -> Result<()> {
+    ctx.tracker
+        .consume_fuel(rows as u64 * fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL)?;
+    Ok(())
+}
+
+fn batched_subject_probe_binary_uncharged(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
     params: &SubjectProbeParams<'_>,
     mut probe_ops: Option<&mut ProbeOps>,
 ) -> Result<Vec<BatchedSubjectProbeMatch>> {
-    use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
-    use fluree_db_binary_index::read::column_loader::load_leaflet_columns_cached;
+    use fluree_db_binary_index::format::run_record_v2::{
+        cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
+    };
     use fluree_db_binary_index::{ColumnProjection, RunSortOrder};
 
     if params.subject_ids.is_empty() {
@@ -3244,23 +3355,18 @@ pub(crate) fn batched_subject_probe_binary(
         g_id: ctx.binary_g_id,
     };
     let leaf_range = branch.find_leaves_in_range(&min_key, &max_key, cmp);
-    let cache = store.leaflet_cache();
     let need_replay = ctx.to_t < store.max_t();
+    let replay_to = need_replay.then_some(ctx.to_t);
     let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
+    let proj = ColumnProjection::all();
     let mut out = Vec::new();
 
     for leaf_idx in leaf_range {
         ctx.check_cancelled()?;
         let leaf_entry = &branch.leaves[leaf_idx];
-        let LeafScan {
-            leaf_bytes,
-            header,
-            dir,
-            leaf_id,
-            sidecar_bytes,
-        } = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
+        let leaf = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
 
-        for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
+        for (leaflet_idx, entry) in leaf.dir.entries.iter().enumerate() {
             ctx.check_cancelled()?;
             let needs_history_replay =
                 need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
@@ -3271,64 +3377,49 @@ pub(crate) fn batched_subject_probe_binary(
                 continue;
             }
 
-            let batch = if entry.row_count == 0 {
-                fluree_db_binary_index::ColumnBatch::empty()
-            } else if let Some(c) = &cache {
-                load_leaflet_columns_cached(
-                    &leaf_bytes,
-                    entry,
-                    dir.payload_base,
-                    c,
-                    fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
-                        leaf_id,
-                        leaflet_idx: u32::try_from(leaflet_idx).map_err(|_| {
-                            QueryError::Internal("leaflet idx exceeds u32".to_string())
-                        })?,
-                        order: header.order,
-                        decode_set: fluree_db_binary_index::ColumnSet::ALL,
-                    },
-                )
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-            } else {
-                use fluree_db_binary_index::read::column_loader::load_leaflet_columns;
-                load_leaflet_columns(
-                    &leaf_bytes,
-                    entry,
-                    dir.payload_base,
-                    &ColumnProjection::all(),
-                    header.order,
-                )
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-            };
-            ctx.check_cancelled()?;
-
-            // Apply time-travel replay when querying a historical snapshot.
-            let batch = if need_replay {
-                match fluree_db_binary_index::replay_leaflet_at_t(
-                    &batch,
-                    entry,
-                    sidecar_bytes.as_deref(),
-                    ctx.to_t,
-                    header.order,
-                )
-                .map_err(|e| QueryError::Internal(format!("replay leaflet: {e}")))?
-                {
-                    Some(replayed) => replayed,
-                    None => batch,
+            // Directory-level subject skip: for a predicate-homogeneous leaflet
+            // the stored keys ascend by subject, so first_key/last_key bound its
+            // subject range. A scattered probe set spans the whole predicate
+            // partition but only touches a few leaflets — decline the rest here,
+            // before the (expensive) column decode + p-run scan, rather than
+            // after it (the `subj_start >= subj_end` check below). Only sound on
+            // homogeneous leaflets — a mixed-predicate leaflet resets s_id at each
+            // predicate boundary, so its key range isn't a clean subject interval
+            // — and only when not replaying history (a current-state key range can
+            // omit subjects that existed at an earlier `t`).
+            if entry.p_const == Some(p_id) && !needs_history_replay {
+                let lo = read_ordered_key_v2(RunSortOrder::Psot, &entry.first_key)
+                    .s_id
+                    .as_u64();
+                let hi = read_ordered_key_v2(RunSortOrder::Psot, &entry.last_key)
+                    .s_id
+                    .as_u64();
+                let a = unique_s_ids.partition_point(|&x| x < lo);
+                let b = unique_s_ids.partition_point(|&x| x <= hi);
+                if a >= b {
+                    continue;
                 }
-            } else {
-                batch
-            };
+            }
+
+            let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to)?;
             ctx.check_cancelled()?;
 
             let row_count = batch.row_count;
-            let p_start = (0..row_count)
-                .position(|i| batch.p_id.get_or(i, 0) >= p_id)
-                .unwrap_or(row_count);
-            let p_end = (p_start..row_count)
-                .position(|i| batch.p_id.get_or(p_start + i, 0) > p_id)
-                .map(|offset| p_start + offset)
-                .unwrap_or(row_count);
+            // A p-homogeneous leaflet is entirely this predicate — its p-run is
+            // the whole leaflet, so skip the two linear scans that would walk
+            // every row only to rediscover [0, row_count).
+            let (p_start, p_end) = if entry.p_const == Some(p_id) {
+                (0, row_count)
+            } else {
+                let p_start = (0..row_count)
+                    .position(|i| batch.p_id.get_or(i, 0) >= p_id)
+                    .unwrap_or(row_count);
+                let p_end = (p_start..row_count)
+                    .position(|i| batch.p_id.get_or(p_start + i, 0) > p_id)
+                    .map(|offset| p_start + offset)
+                    .unwrap_or(row_count);
+                (p_start, p_end)
+            };
             if p_start == p_end {
                 continue;
             }
@@ -3416,7 +3507,7 @@ pub(crate) fn batched_subject_probe_binary(
         for &s_id in &unique_s_ids {
             probe.drain_asserts_for_subject(s_id, |op| {
                 if params.object_bounds.is_some() || params.bound_object.is_some() {
-                    let decoded = decode_probe_filter_value(
+                    let decoded = decode_overlay_object(
                         ctx,
                         store,
                         params.dict_overlay,
@@ -3461,7 +3552,30 @@ pub(crate) fn batched_subject_probe_binary(
     Ok(out)
 }
 
+/// Walk a batch of subjects across several predicates in SPOT order,
+/// charging the rows it returns. See [`batched_subject_probe_binary`] for
+/// why the charge lives in the primitive rather than at the call sites.
 pub(crate) fn batched_subject_star_spot(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    subject_ids: &[u64],
+    predicates: &[SpotStarPredicateParams<'_>],
+    dict_overlay: Option<&crate::dict_overlay::DictOverlay>,
+    probe_ops: Option<&mut ProbeOps>,
+) -> Result<Vec<BatchedSpotStarMatch>> {
+    let matches = batched_subject_star_spot_uncharged(
+        ctx,
+        store,
+        subject_ids,
+        predicates,
+        dict_overlay,
+        probe_ops,
+    )?;
+    charge_probe_rows(ctx, matches.len())?;
+    Ok(matches)
+}
+
+fn batched_subject_star_spot_uncharged(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
     subject_ids: &[u64],
@@ -3469,8 +3583,9 @@ pub(crate) fn batched_subject_star_spot(
     dict_overlay: Option<&crate::dict_overlay::DictOverlay>,
     mut probe_ops: Option<&mut ProbeOps>,
 ) -> Result<Vec<BatchedSpotStarMatch>> {
-    use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
-    use fluree_db_binary_index::read::column_loader::load_leaflet_columns_cached;
+    use fluree_db_binary_index::format::run_record_v2::{
+        cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
+    };
     use fluree_db_binary_index::{ColumnProjection, RunSortOrder};
 
     if subject_ids.is_empty() || predicates.is_empty() {
@@ -3528,76 +3643,39 @@ pub(crate) fn batched_subject_star_spot(
         g_id: ctx.binary_g_id,
     };
     let leaf_range = branch.find_leaves_in_range(&min_key, &max_key, cmp);
-    let cache = store.leaflet_cache();
     let need_replay = ctx.to_t < store.max_t();
+    let replay_to = need_replay.then_some(ctx.to_t);
     let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
+    let proj = ColumnProjection::all();
     let mut out = Vec::new();
+    let (mut leaflets_read, mut leaflets_replayed, mut leaflets_skipped) = (0u64, 0u64, 0u64);
 
     for leaf_idx in leaf_range {
         ctx.check_cancelled()?;
         let leaf_entry = &branch.leaves[leaf_idx];
-        let LeafScan {
-            leaf_bytes,
-            header,
-            dir,
-            leaf_id,
-            sidecar_bytes,
-        } = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
+        let leaf = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
 
-        for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
+        for (leaflet_idx, entry) in leaf.dir.entries.iter().enumerate() {
             let needs_history_replay =
                 need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
             if entry.row_count == 0 && !needs_history_replay {
                 continue;
             }
-
-            let batch = if entry.row_count == 0 {
-                fluree_db_binary_index::ColumnBatch::empty()
-            } else if let Some(c) = &cache {
-                load_leaflet_columns_cached(
-                    &leaf_bytes,
-                    entry,
-                    dir.payload_base,
-                    c,
-                    fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
-                        leaf_id,
-                        leaflet_idx: u32::try_from(leaflet_idx).map_err(|_| {
-                            QueryError::Internal("leaflet idx exceeds u32".to_string())
-                        })?,
-                        order: header.order,
-                        decode_set: fluree_db_binary_index::ColumnSet::ALL,
-                    },
-                )
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-            } else {
-                use fluree_db_binary_index::read::column_loader::load_leaflet_columns;
-                load_leaflet_columns(
-                    &leaf_bytes,
-                    entry,
-                    dir.payload_base,
-                    &ColumnProjection::all(),
-                    header.order,
-                )
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-            };
-
-            // Apply time-travel replay when querying a historical snapshot.
-            let batch = if need_replay {
-                match fluree_db_binary_index::replay_leaflet_at_t(
-                    &batch,
-                    entry,
-                    sidecar_bytes.as_deref(),
-                    ctx.to_t,
-                    header.order,
-                )
-                .map_err(|e| QueryError::Internal(format!("replay leaflet: {e}")))?
-                {
-                    Some(replayed) => replayed,
-                    None => batch,
+            // Without replay the directory keys bound the leaflet's rows, so a
+            // leaflet holding none of the probed subjects is skipped unread.
+            if !needs_history_replay {
+                let first_s = read_ordered_key_v2(RunSortOrder::Spot, &entry.first_key).s_id;
+                let last_s = read_ordered_key_v2(RunSortOrder::Spot, &entry.last_key).s_id;
+                let next = unique_s_ids.partition_point(|&s| s < first_s.as_u64());
+                if unique_s_ids.get(next).is_none_or(|&s| s > last_s.as_u64()) {
+                    leaflets_skipped += 1;
+                    continue;
                 }
-            } else {
-                batch
-            };
+            }
+            leaflets_read += 1;
+            leaflets_replayed += u64::from(needs_history_replay);
+
+            let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to)?;
 
             let row_count = batch.row_count;
             if row_count == 0 {
@@ -3687,6 +3765,14 @@ pub(crate) fn batched_subject_star_spot(
         }
     }
 
+    tracing::debug!(
+        subjects = unique_s_ids.len(),
+        leaflets_read,
+        leaflets_replayed,
+        leaflets_skipped,
+        "spot star walk"
+    );
+
     // Inject novelty-only matches per probed subject, dispatching each assert
     // to its predicate's filters and emit shape.
     if let Some(probe) = probe_ops {
@@ -3696,7 +3782,7 @@ pub(crate) fn batched_subject_star_spot(
                     return Ok(());
                 };
                 if predicate.object_bounds.is_some() || predicate.bound_object.is_some() {
-                    let decoded = decode_probe_filter_value(
+                    let decoded = decode_overlay_object(
                         ctx,
                         store,
                         dict_overlay,
@@ -3746,6 +3832,234 @@ pub(crate) fn batched_subject_star_spot(
 mod tests {
     use super::*;
     use fluree_db_core::Sid;
+
+    fn count_join(inline_ops: Vec<InlineOperator>, batches: Vec<Batch>) -> NestedLoopJoinOperator {
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        NestedLoopJoinOperator::new(
+            Box::new(crate::seed::BatchReplayOperator::new(
+                schema.clone(),
+                batches,
+            )),
+            schema,
+            TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Sid(Sid::new(100, "edge")),
+                Term::Var(VarId(1)),
+            ),
+            None,
+            inline_ops,
+            EmitMask::ALL,
+            crate::temporal_mode::TemporalMode::Current,
+        )
+    }
+
+    fn buffered_count_rows(join: &NestedLoopJoinOperator, rows: usize) -> Batch {
+        Batch::new(
+            join.combined_schema.clone(),
+            vec![vec![Binding::Unbound; rows]; join.combined_schema.len()],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn count_drain_counts_only_remaining_rows_and_exhausts() {
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let mut join = count_join(vec![], vec![]).with_out_schema(Some(&[]));
+        assert_eq!(join.drain_count(&ctx).await.unwrap(), None);
+        join.open(&ctx).await.unwrap();
+        join.batched_output.push_back(buffered_count_rows(&join, 2));
+        join.batched_output.push_back(buffered_count_rows(&join, 3));
+        // COUNT must preserve the row count even after projection to no columns.
+        assert_eq!(join.next_batch(&ctx).await.unwrap().unwrap().len(), 2);
+        assert_eq!(join.drain_count(&ctx).await.unwrap(), Some(3));
+        assert!(join.count_only.is_none());
+        assert!(join.next_batch(&ctx).await.unwrap().is_none());
+        assert_eq!(join.drain_count(&ctx).await.unwrap(), None);
+        assert_eq!(join.state, OperatorState::Exhausted);
+        join.close();
+    }
+
+    #[tokio::test]
+    async fn count_drain_declines_bind_without_consuming_input() {
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let mut join = count_join(
+            vec![InlineOperator::Bind {
+                var: VarId(2),
+                expr: crate::ir::Expression::Var(VarId(1)),
+            }],
+            vec![],
+        );
+        join.open(&ctx).await.unwrap();
+        join.batched_output.push_back(buffered_count_rows(&join, 3));
+        assert_eq!(join.drain_count(&ctx).await.unwrap(), None);
+        assert!(join
+            .drain_grouped_count(&ctx, &[VarId(0)])
+            .await
+            .unwrap()
+            .is_none());
+        assert!(join.grouped_count.is_none());
+        assert!(join.count_only.is_none());
+        assert_eq!(join.next_batch(&ctx).await.unwrap().unwrap().len(), 3);
+        join.close();
+    }
+
+    #[tokio::test]
+    async fn count_drain_skips_poisoned_and_invalid_subjects() {
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let batch = Batch::new(
+            Arc::from(vec![VarId(0)].into_boxed_slice()),
+            vec![vec![
+                Binding::Poisoned,
+                Binding::lit(fluree_db_core::FlakeValue::Long(1), Sid::xsd_integer()),
+            ]],
+        )
+        .unwrap();
+        let mut join = count_join(vec![], vec![batch]);
+        join.open(&ctx).await.unwrap();
+        assert_eq!(join.drain_count(&ctx).await.unwrap(), Some(0));
+        assert!(join.count_only.is_none());
+        join.close();
+    }
+
+    #[tokio::test]
+    async fn count_drain_checks_budgets_and_clears_mode_on_error() {
+        use fluree_db_core::{QueryCancellation, QueryCancellationReason};
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        for cancelled in [false, true] {
+            let cancellation = QueryCancellation::new();
+            if cancelled {
+                cancellation.cancel_with(QueryCancellationReason::Timeout);
+            } else {
+                cancellation.set_memory_limit(1);
+                cancellation.record_alloc(2);
+            }
+            let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancellation);
+            let mut join = count_join(vec![], vec![]);
+            join.open(&ctx).await.unwrap();
+            let err = join.drain_count(&ctx).await.unwrap_err();
+            if cancelled {
+                assert!(matches!(err, QueryError::Cancelled { .. }), "{err:?}");
+            } else {
+                assert!(
+                    matches!(err, QueryError::MemoryBudgetExceeded { .. }),
+                    "{err:?}"
+                );
+            }
+            assert!(join.count_only.is_none());
+            join.close();
+        }
+        assert_eq!(checked_join_count(u64::MAX - 1, 1).unwrap(), u64::MAX);
+        assert!(checked_join_count(u64::MAX, 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn grouped_drain_counts_remaining_rows_and_preserves_declined_input() {
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let mut join = count_join(vec![], vec![]).with_out_schema(Some(&[VarId(0)]));
+        assert!(join
+            .drain_grouped_count(&ctx, &[VarId(0)])
+            .await
+            .unwrap()
+            .is_none());
+        join.open(&ctx).await.unwrap();
+        join.batched_output.push_back(buffered_count_rows(&join, 2));
+        let key = Binding::lit(fluree_db_core::FlakeValue::Long(1), Sid::xsd_integer());
+        join.batched_output.push_back(
+            Batch::new(
+                join.combined_schema.clone(),
+                vec![
+                    vec![key.clone(), Binding::Unbound, key.clone()],
+                    vec![Binding::Unbound; 3],
+                ],
+            )
+            .unwrap(),
+        );
+        // A key introduced on the right or absent after projection must decline
+        // without consuming even already-buffered output.
+        assert!(join
+            .drain_grouped_count(&ctx, &[VarId(1)])
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(join.next_batch(&ctx).await.unwrap().unwrap().len(), 2);
+        let groups = join
+            .drain_grouped_count(&ctx, &[VarId(0)])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups
+                .iter()
+                .find(|g| g.keys == [key.clone()])
+                .unwrap()
+                .count,
+            2
+        );
+        assert_eq!(
+            groups
+                .iter()
+                .find(|g| g.keys == [Binding::Unbound])
+                .unwrap()
+                .count,
+            1
+        );
+        assert!(join.grouped_count.is_none());
+        assert!(join.next_batch(&ctx).await.unwrap().is_none());
+        join.close();
+        let mut join = count_join(vec![], vec![]);
+        join.open(&ctx).await.unwrap();
+        assert!(join
+            .drain_grouped_count(&ctx, &[VarId(0)])
+            .await
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        join.close();
+    }
+
+    #[tokio::test]
+    async fn grouped_drain_checks_group_growth_and_cancellation() {
+        use fluree_db_core::{QueryCancellation, QueryCancellationReason};
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        for cancelled in [false, true] {
+            let cancellation = QueryCancellation::new();
+            if cancelled {
+                cancellation.cancel_with(QueryCancellationReason::Timeout);
+            } else {
+                cancellation.set_memory_limit(1);
+            }
+            let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancellation);
+            let mut join = count_join(vec![], vec![]);
+            join.open(&ctx).await.unwrap();
+            join.batched_output.push_back(buffered_count_rows(&join, 1));
+            let err = join
+                .drain_grouped_count(&ctx, &[VarId(0)])
+                .await
+                .unwrap_err();
+            if cancelled {
+                assert!(matches!(err, QueryError::Cancelled { .. }), "{err:?}");
+            } else {
+                assert!(
+                    matches!(err, QueryError::MemoryBudgetExceeded { .. }),
+                    "{err:?}"
+                );
+                assert!(ctx.mem_used() >= crate::context::GROUP_EST_BYTES);
+            }
+            assert!(join.grouped_count.is_none());
+            join.close();
+        }
+    }
 
     #[test]
     fn test_bind_instruction_creation() {
@@ -3959,7 +4273,7 @@ mod tests {
         use fluree_db_core::{FlakeValue, LedgerSnapshot};
 
         // Minimal context (db is unused here; only batch_size matters).
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let mut vars = VarRegistry::new();
         let x = vars.get_or_insert("?x"); // VarId(0)
         let v = vars.get_or_insert("?v"); // VarId(1)
@@ -4087,7 +4401,7 @@ mod tests {
             )
         };
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
 
         // Root / no policy on an overlay-free single graph => Clean (the batched
@@ -4102,19 +4416,25 @@ mod tests {
             "overlay-free single graph with no policy should permit the batched Clean lane"
         );
 
-        // Non-root view policy => Decline regardless of overlay-free state, so the
-        // join falls back to the per-row scan path that applies filter_flakes.
-        let wrapper = PolicyWrapper::new(
-            PolicySet::default(),
-            PolicySet::default(),
-            false, // root
-            false, // default_allow
-            HashMap::new(),
-        );
-        let enforcer = Arc::new(QueryPolicyEnforcer::new(Arc::new(PolicyContext::new(
-            wrapper, None,
-        ))));
-        let ctx_policy = ExecutionContext::new(&snapshot, &vars).with_policy_enforcer(enforcer);
+        // Non-root view policy that can touch the probed predicate => Decline
+        // regardless of overlay-free state, so the join falls back to the
+        // per-row scan path that applies filter_flakes. An empty view set under
+        // a deny default hides every flake of the predicate, which the lanes
+        // cannot short-circuit, so it declines too.
+        let policed = |default_allow: bool| {
+            let wrapper = PolicyWrapper::new(
+                PolicySet::default(),
+                PolicySet::default(),
+                false, // root
+                default_allow,
+                HashMap::new(),
+            );
+            Arc::new(QueryPolicyEnforcer::new(Arc::new(PolicyContext::new(
+                wrapper, None,
+            ))))
+        };
+        let ctx_policy =
+            ExecutionContext::new(&snapshot, &vars).with_policy_enforcer(policed(false));
         let join_policy = make_join();
         assert!(
             matches!(
@@ -4123,7 +4443,22 @@ mod tests {
                     .unwrap(),
                 ProbeLanePlan::Decline
             ),
-            "non-root view policy must decline the batched lane (force the filtered per-row fallback)"
+            "a view policy that hides the probed predicate must decline the batched lane"
+        );
+
+        // Non-root view policy that provably cannot touch the probed predicate
+        // (no rule covers it, default allows) => the lane stays on.
+        let ctx_untouched =
+            ExecutionContext::new(&snapshot, &vars).with_policy_enforcer(policed(true));
+        let join_untouched = make_join();
+        assert!(
+            matches!(
+                join_untouched
+                    .compute_batched_overlay_mode(&ctx_untouched)
+                    .unwrap(),
+                ProbeLanePlan::Clean
+            ),
+            "a view policy that cannot touch the probed predicate must keep the batched lane"
         );
     }
 
@@ -4174,6 +4509,48 @@ mod tests {
         assert_eq!(join.right_index_hint, Some(IndexType::Opst));
         assert_eq!(join.right_scan_inline_ops.len(), 1);
         assert!(join.inline_ops.is_empty());
+    }
+
+    #[test]
+    fn batched_existence_admits_id_typed_ref_constants_only() {
+        use fluree_db_core::{DatatypeConstraint, FlakeValue};
+        let bound_subject = vec![BindInstruction {
+            position: PatternPosition::Subject,
+            left_col: 0,
+        }];
+        let id_dt = fluree_db_core::edge::id_datatype_sid();
+        let mut reifies_pred = TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Sid(Sid::new(7, "reifiesPredicate")),
+            Term::Sid(Sid::new(100, "TREATS")),
+        );
+        // The `@id` tag an f:reifies* chain puts on a ref constant is
+        // already what the ref-only probe comparison enforces.
+        reifies_pred.dtc = Some(DatatypeConstraint::Explicit(id_dt.clone()));
+        assert!(is_batched_subject_exists_eligible(
+            &bound_subject,
+            &reifies_pred
+        ));
+
+        // Any other explicit datatype still needs the per-row scan's filter.
+        let mut typed_literal = reifies_pred.clone();
+        typed_literal.o = Term::Value(FlakeValue::Long(1));
+        typed_literal.dtc = Some(DatatypeConstraint::Explicit(Sid::new(
+            fluree_vocab::namespaces::XSD,
+            "integer",
+        )));
+        assert!(!is_batched_subject_exists_eligible(
+            &bound_subject,
+            &typed_literal
+        ));
+
+        // An `@id` tag on a literal constant is not a ref comparison.
+        let mut id_tagged_literal = reifies_pred.clone();
+        id_tagged_literal.o = Term::Value(FlakeValue::Long(1));
+        assert!(!is_batched_subject_exists_eligible(
+            &bound_subject,
+            &id_tagged_literal
+        ));
     }
 
     #[test]
@@ -4289,7 +4666,7 @@ mod tests {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::{FlakeValue, LedgerSnapshot};
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let mut vars = VarRegistry::new();
         let s = vars.get_or_insert("?s"); // VarId(0)
         let x = vars.get_or_insert("?x"); // VarId(1)

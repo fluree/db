@@ -27,6 +27,8 @@ struct ServerMeta {
     storage_path: String,
     #[serde(default)]
     connection_config: Option<String>,
+    #[serde(default)]
+    bolt_listen_addr: Option<String>,
     config_path: Option<String>,
     started_at: String,
     /// The raw args passed to the `_child` process (for `restart`).
@@ -59,7 +61,10 @@ pub async fn run(action: ServerAction, config_override: Option<&Path>) -> CliRes
             listen_addr,
             storage_path,
             connection_config,
+            memory,
             log_level,
+            bolt_listen_addr,
+            bolt_default_db,
             profile,
             extra_args,
         } => {
@@ -68,7 +73,10 @@ pub async fn run(action: ServerAction, config_override: Option<&Path>) -> CliRes
                 listen_addr,
                 storage_path,
                 connection_config,
+                memory,
                 log_level,
+                bolt_listen_addr,
+                bolt_default_db,
                 profile,
                 &extra_args,
             )
@@ -79,7 +87,10 @@ pub async fn run(action: ServerAction, config_override: Option<&Path>) -> CliRes
             listen_addr,
             storage_path,
             connection_config,
+            memory,
             log_level,
+            bolt_listen_addr,
+            bolt_default_db,
             profile,
             dry_run,
             extra_args,
@@ -89,7 +100,10 @@ pub async fn run(action: ServerAction, config_override: Option<&Path>) -> CliRes
                 listen_addr,
                 storage_path,
                 connection_config,
+                memory,
                 log_level,
+                bolt_listen_addr,
+                bolt_default_db,
                 profile,
                 dry_run,
                 &extra_args,
@@ -104,16 +118,24 @@ pub async fn run(action: ServerAction, config_override: Option<&Path>) -> CliRes
             listen_addr,
             storage_path,
             connection_config,
+            memory,
             log_level,
+            bolt_listen_addr,
+            bolt_default_db,
             profile,
             extra_args,
         } => {
+            if memory {
+                return Err(memory_needs_foreground());
+            }
             run_restart(
                 config_override,
                 listen_addr,
                 storage_path,
                 connection_config,
                 log_level,
+                bolt_listen_addr,
+                bolt_default_db,
                 profile,
                 &extra_args,
             )
@@ -130,27 +152,40 @@ pub async fn run(action: ServerAction, config_override: Option<&Path>) -> CliRes
 // `fluree server run` — foreground
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn run_foreground(
     config_override: Option<&Path>,
     listen_addr: Option<SocketAddr>,
     storage_path: Option<PathBuf>,
     connection_config: Option<PathBuf>,
+    memory: bool,
     log_level: Option<String>,
+    bolt_listen_addr: Option<SocketAddr>,
+    bolt_default_db: Option<String>,
     profile: Option<String>,
     extra_args: &[String],
 ) -> CliResult<()> {
-    let dirs = config::require_fluree_dir(config_override)?;
-    let data_dir = dirs.data_dir();
-
     let server_config = build_server_config(
         config_override,
         listen_addr,
-        storage_path.clone(),
+        storage_path,
         connection_config,
+        memory,
         log_level,
+        bolt_listen_addr,
+        bolt_default_db,
         profile,
         extra_args,
     )?;
+
+    // A memory server keeps nothing in a project, so it needs no `.fluree/`
+    // and writes no server.meta.json (so no CLI auto-routing either).
+    let meta_file = if server_config.memory {
+        None
+    } else {
+        let dirs = config::require_fluree_dir(config_override)?;
+        Some(meta_path(dirs.data_dir()))
+    };
 
     let telemetry_config = TelemetryConfig::with_server_config(&server_config);
     init_logging(&telemetry_config);
@@ -163,7 +198,34 @@ async fn run_foreground(
     );
 
     // Write server.meta.json so CLI auto-routing works for foreground servers too.
-    let meta_file = meta_path(data_dir);
+    if let Some(meta_file) = &meta_file {
+        write_foreground_meta(meta_file, &server_config, config_override);
+    }
+
+    let server = FlureeServer::new(server_config).await.map_err(|e| {
+        if let Some(meta_file) = &meta_file {
+            remove_meta(meta_file, "after server init failure");
+        }
+        CliError::Server(format!("failed to initialize server: {e}"))
+    })?;
+    let result = server.run().await;
+
+    // Clean up meta file on exit (normal shutdown or error).
+    if let Some(meta_file) = &meta_file {
+        remove_meta(meta_file, "on shutdown");
+    }
+
+    result.map_err(|e| CliError::Server(format!("server error: {e}")))?;
+
+    shutdown_tracer().await;
+    Ok(())
+}
+
+fn write_foreground_meta(
+    meta_file: &Path,
+    server_config: &ServerConfig,
+    config_override: Option<&Path>,
+) {
     let meta = ServerMeta {
         pid: std::process::id(),
         listen_addr: server_config.listen_addr.to_string(),
@@ -176,31 +238,20 @@ async fn run_foreground(
             .connection_config
             .as_ref()
             .map(|p| p.display().to_string()),
+        bolt_listen_addr: server_config.bolt_listen_addr.map(|a| a.to_string()),
         config_path: config_override.map(|p| p.display().to_string()),
         started_at: now_iso8601(),
         args: Vec::new(),
     };
     if let Ok(json) = serde_json::to_string_pretty(&meta) {
-        let _ = fs::write(&meta_file, json);
+        let _ = fs::write(meta_file, json);
     }
+}
 
-    let server = FlureeServer::new(server_config).await.map_err(|e| {
-        if let Err(rm_err) = fs::remove_file(&meta_file) {
-            tracing::warn!(path = %meta_file.display(), error = %rm_err, "failed to remove meta file after server init failure");
-        }
-        CliError::Server(format!("failed to initialize server: {e}"))
-    })?;
-    let result = server.run().await;
-
-    // Clean up meta file on exit (normal shutdown or error).
-    if let Err(rm_err) = fs::remove_file(&meta_file) {
-        tracing::warn!(path = %meta_file.display(), error = %rm_err, "failed to remove meta file on shutdown");
+fn remove_meta(meta_file: &Path, when: &str) {
+    if let Err(rm_err) = fs::remove_file(meta_file) {
+        tracing::warn!(path = %meta_file.display(), error = %rm_err, "failed to remove meta file {when}");
     }
-
-    result.map_err(|e| CliError::Server(format!("server error: {e}")))?;
-
-    shutdown_tracer().await;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -213,21 +264,31 @@ async fn run_start(
     listen_addr: Option<SocketAddr>,
     storage_path: Option<PathBuf>,
     connection_config: Option<PathBuf>,
+    memory: bool,
     log_level: Option<String>,
+    bolt_listen_addr: Option<SocketAddr>,
+    bolt_default_db: Option<String>,
     profile: Option<String>,
     dry_run: bool,
     extra_args: &[String],
 ) -> CliResult<()> {
-    let dirs = config::require_fluree_dir(config_override)?;
     let server_config = build_server_config(
         config_override,
         listen_addr,
         storage_path.clone(),
         connection_config,
+        memory,
         log_level.clone(),
+        bolt_listen_addr,
+        bolt_default_db,
         profile.clone(),
         extra_args,
     )?;
+    // Checked after resolving, so `FLUREE_MEMORY_STORAGE` and `-- --memory` are caught too.
+    if server_config.memory {
+        return Err(memory_needs_foreground());
+    }
+    let dirs = config::require_fluree_dir(config_override)?;
 
     if dry_run {
         print_resolved_config(&server_config, &dirs);
@@ -311,6 +372,7 @@ async fn run_start(
             .connection_config
             .as_ref()
             .map(|p| p.display().to_string()),
+        bolt_listen_addr: server_config.bolt_listen_addr.map(|a| a.to_string()),
         config_path: config_override.map(|p| p.display().to_string()),
         started_at: now_iso8601(),
         args: child_args,
@@ -341,6 +403,16 @@ async fn run_start(
     }
 
     Ok(())
+}
+
+/// A background server keeps its pid, log and metadata in `.fluree/`, which
+/// memory mode promises not to need.
+fn memory_needs_foreground() -> CliError {
+    CliError::Server(
+        "memory storage (--memory / FLUREE_MEMORY_STORAGE) is only available in the foreground; \
+         use 'fluree server run --memory'"
+            .into(),
+    )
 }
 
 /// Start the server using pre-built child args (used by `restart` to replay
@@ -419,6 +491,10 @@ async fn run_start_with_child_args(
         connection_config: child_args
             .windows(2)
             .find(|w| w[0] == "--connection-config")
+            .map(|w| w[1].clone()),
+        bolt_listen_addr: child_args
+            .windows(2)
+            .find(|w| w[0] == "--bolt-listen-addr")
             .map(|w| w[1].clone()),
         config_path: config_override.map(|p| p.display().to_string()),
         started_at: now_iso8601(),
@@ -553,6 +629,9 @@ async fn run_status(config_override: Option<&Path>) -> CliResult<()> {
         } else {
             eprintln!("  storage_path: {}", m.storage_path);
         }
+        if let Some(ref bolt) = m.bolt_listen_addr {
+            eprintln!("  bolt:         {bolt}");
+        }
         eprintln!("  started_at:   {}", m.started_at);
         if let Some(uptime) = format_uptime(&m.started_at) {
             eprintln!("  uptime:       {uptime}");
@@ -597,15 +676,38 @@ async fn run_status(config_override: Option<&Path>) -> CliResult<()> {
 // `fluree server restart`
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn run_restart(
     config_override: Option<&Path>,
     listen_addr: Option<SocketAddr>,
     storage_path: Option<PathBuf>,
     connection_config: Option<PathBuf>,
     log_level: Option<String>,
+    bolt_listen_addr: Option<SocketAddr>,
+    bolt_default_db: Option<String>,
     profile: Option<String>,
     extra_args: &[String],
 ) -> CliResult<()> {
+    // Resolved and refused before anything stops, as `start` does, so
+    // `FLUREE_MEMORY_STORAGE` and `-- --memory` are caught too. Checked on
+    // this command's own arguments: the replayed ones always name a storage
+    // path, which would quietly outrank the environment.
+    let resolved = build_server_config(
+        config_override,
+        listen_addr,
+        storage_path.clone(),
+        connection_config.clone(),
+        false,
+        log_level.clone(),
+        bolt_listen_addr,
+        bolt_default_db.clone(),
+        profile.clone(),
+        extra_args,
+    )?;
+    if resolved.memory {
+        return Err(memory_needs_foreground());
+    }
+
     let dirs = config::require_fluree_dir(config_override)?;
     let data_dir = dirs.data_dir();
 
@@ -630,6 +732,8 @@ async fn run_restart(
             storage_path.as_deref(),
             connection_config.as_deref(),
             log_level.as_deref(),
+            bolt_listen_addr.as_ref(),
+            bolt_default_db.as_deref(),
             profile.as_deref(),
             extra_args,
         );
@@ -642,7 +746,10 @@ async fn run_restart(
         listen_addr,
         storage_path,
         connection_config,
+        false,
         log_level,
+        bolt_listen_addr,
+        bolt_default_db,
         profile,
         false,
         extra_args,
@@ -739,12 +846,16 @@ async fn run_child(args: &[String]) -> CliResult<()> {
 // ---------------------------------------------------------------------------
 
 /// Build a `ServerConfig` by merging the config file with CLI flag overrides.
+#[allow(clippy::too_many_arguments)]
 fn build_server_config(
     config_override: Option<&Path>,
     listen_addr: Option<SocketAddr>,
     storage_path: Option<PathBuf>,
     connection_config: Option<PathBuf>,
+    memory: bool,
     log_level: Option<String>,
+    bolt_listen_addr: Option<SocketAddr>,
+    bolt_default_db: Option<String>,
     profile: Option<String>,
     extra_args: &[String],
 ) -> CliResult<ServerConfig> {
@@ -759,24 +870,33 @@ fn build_server_config(
         args.push(addr.to_string());
     }
 
-    if let Some(ref path) = connection_config {
-        // Connection config takes precedence — don't set a default storage path
+    // Connection config takes precedence over a storage path. With neither
+    // flag, the storage path is left to the server's own precedence
+    // (`FLUREE_STORAGE_PATH`, then the profile and config file) and only
+    // defaulted after that, below.
+    if memory {
+        args.push("--memory".into());
+    } else if let Some(ref path) = connection_config {
         args.push("--connection-config".into());
         args.push(path.display().to_string());
     } else if let Some(ref path) = storage_path {
         args.push("--storage-path".into());
         args.push(path.display().to_string());
-    } else {
-        // Default: use the CLI's resolved storage path
-        let dirs = config::require_fluree_dir(config_override)?;
-        let resolved = config::resolve_storage_path(&dirs);
-        args.push("--storage-path".into());
-        args.push(resolved.display().to_string());
     }
 
     if let Some(ref level) = log_level {
         args.push("--log-level".into());
         args.push(level.clone());
+    }
+
+    if let Some(addr) = bolt_listen_addr {
+        args.push("--bolt-listen-addr".into());
+        args.push(addr.to_string());
+    }
+
+    if let Some(ref db) = bolt_default_db {
+        args.push("--bolt-default-db".into());
+        args.push(db.clone());
     }
 
     if let Some(ref p) = profile {
@@ -819,6 +939,15 @@ fn build_server_config(
         eprintln!("{} config file: {e}", "warning:".yellow().bold());
     }
 
+    // Nothing named a storage location: use the project's `.fluree/storage`.
+    if !server_config.memory
+        && server_config.storage_path.is_none()
+        && server_config.connection_config.is_none()
+    {
+        let dirs = config::require_fluree_dir(config_override)?;
+        server_config.storage_path = Some(config::default_storage_path(&dirs));
+    }
+
     Ok(server_config)
 }
 
@@ -851,6 +980,27 @@ fn build_child_args(
     if let Some(ref path) = config.connection_config {
         args.push("--connection-config".into());
         args.push(path.display().to_string());
+    }
+
+    // Bolt flags from the resolved config — skipped when the user supplied
+    // them via `--` passthrough (forwarded verbatim below), which would
+    // otherwise duplicate the flag and fail the child's arg parse.
+    let in_extra = |flag: &str| {
+        extra_args
+            .iter()
+            .any(|a| a == flag || a.starts_with(&format!("{flag}=")))
+    };
+    if let Some(addr) = config.bolt_listen_addr {
+        if !in_extra("--bolt-listen-addr") {
+            args.push("--bolt-listen-addr".into());
+            args.push(addr.to_string());
+        }
+    }
+    if let Some(ref db) = config.bolt_default_db {
+        if !in_extra("--bolt-default-db") {
+            args.push("--bolt-default-db".into());
+            args.push(db.clone());
+        }
     }
 
     // Pass through explicit overrides
@@ -894,6 +1044,8 @@ fn merge_restart_args(
     new_storage_path: Option<&Path>,
     new_connection_config: Option<&Path>,
     new_log_level: Option<&str>,
+    new_bolt_listen_addr: Option<&SocketAddr>,
+    new_bolt_default_db: Option<&str>,
     new_profile: Option<&str>,
     new_extra_args: &[String],
 ) -> Vec<String> {
@@ -942,12 +1094,24 @@ fn merge_restart_args(
                 result.push(new_profile.unwrap().to_string());
                 i += 2;
             }
+            "--bolt-listen-addr" if new_bolt_listen_addr.is_some() => {
+                result.push("--bolt-listen-addr".into());
+                result.push(new_bolt_listen_addr.unwrap().to_string());
+                i += 2;
+            }
+            "--bolt-default-db" if new_bolt_default_db.is_some() => {
+                result.push("--bolt-default-db".into());
+                result.push(new_bolt_default_db.unwrap().to_string());
+                i += 2;
+            }
             // Known flag with a value argument — copy both
             "--listen-addr"
             | "--storage-path"
             | "--connection-config"
             | "--log-level"
             | "--profile"
+            | "--bolt-listen-addr"
+            | "--bolt-default-db"
             | "--config-file" => {
                 result.push(old_args[i].clone());
                 if i + 1 < old_args.len() {
@@ -981,6 +1145,18 @@ fn merge_restart_args(
         if !has("--connection-config") {
             result.push("--connection-config".into());
             result.push(path.display().to_string());
+        }
+    }
+    if let Some(addr) = new_bolt_listen_addr {
+        if !has("--bolt-listen-addr") {
+            result.push("--bolt-listen-addr".into());
+            result.push(addr.to_string());
+        }
+    }
+    if let Some(db) = new_bolt_default_db {
+        if !has("--bolt-default-db") {
+            result.push("--bolt-default-db".into());
+            result.push(db.to_string());
         }
     }
     if let Some(level) = new_log_level {
@@ -1025,6 +1201,16 @@ fn print_resolved_config(config: &ServerConfig, dirs: &FlureeDir) {
         );
     }
     eprintln!("  log_level:    {}", config.log_level);
+    eprintln!(
+        "  bolt:         {}",
+        config
+            .bolt_listen_addr
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "(disabled)".into())
+    );
+    if let Some(ref db) = config.bolt_default_db {
+        eprintln!("    default_db: {db}");
+    }
     eprintln!("  cors_enabled: {}", config.cors_enabled);
     eprintln!("  indexing:     {}", config.indexing_enabled);
     if config.indexing_enabled {
@@ -1299,4 +1485,135 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy as u64;
     era * 146_097 + doe as i64 - 719_468
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, PoisonError};
+
+    /// Tests here set the server's env vars; hold this while they do.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    const ENV_VARS: [&str; 2] = ["FLUREE_STORAGE_PATH", "FLUREE_MEMORY_STORAGE"];
+
+    fn project(config: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), config).unwrap();
+        dir
+    }
+
+    fn resolve(
+        dir: &tempfile::TempDir,
+        flag: Option<&str>,
+        memory: bool,
+        profile: Option<&str>,
+        env: &[(&str, &str)],
+    ) -> ServerConfig {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        // SAFETY: holding ENV_LOCK, no concurrent mutation of these variables.
+        for var in ENV_VARS {
+            std::env::remove_var(var);
+        }
+        for (var, value) in env {
+            std::env::set_var(var, value);
+        }
+        let config = build_server_config(
+            Some(dir.path()),
+            None,
+            flag.map(PathBuf::from),
+            None,
+            memory,
+            None,
+            None,
+            None,
+            profile.map(String::from),
+            &[],
+        );
+        for var in ENV_VARS {
+            std::env::remove_var(var);
+        }
+        config.unwrap()
+    }
+
+    fn storage_path(
+        dir: &tempfile::TempDir,
+        flag: Option<&str>,
+        profile: Option<&str>,
+        env: Option<&str>,
+    ) -> Option<PathBuf> {
+        let env: Vec<_> = env
+            .map(|v| ("FLUREE_STORAGE_PATH", v))
+            .into_iter()
+            .collect();
+        resolve(dir, flag, false, profile, &env).storage_path
+    }
+
+    /// Flag, then `FLUREE_STORAGE_PATH`, then profile, then config file,
+    /// then the project default, as `docs/operations/configuration.md` says.
+    #[test]
+    fn storage_path_precedence() {
+        let dir = project(
+            "[server]\nstorage_path = \"/from/file\"\n\n\
+             [profiles.prod.server]\nstorage_path = \"/from/profile\"\n",
+        );
+        let path = |flag, profile, env| storage_path(&dir, flag, profile, env);
+        let p = |s: &str| Some(PathBuf::from(s));
+
+        assert_eq!(
+            path(Some("/from/flag"), Some("prod"), Some("/from/env")),
+            p("/from/flag")
+        );
+        assert_eq!(path(None, Some("prod"), Some("/from/env")), p("/from/env"));
+        assert_eq!(path(None, Some("prod"), None), p("/from/profile"));
+        assert_eq!(path(None, None, None), p("/from/file"));
+
+        let bare = project("");
+        assert_eq!(
+            storage_path(&bare, None, None, None),
+            Some(bare.path().join("storage"))
+        );
+    }
+
+    /// `--memory` beats a storage path from `FLUREE_STORAGE_PATH`, a profile
+    /// or the config file, and the project default is not filled in.
+    #[test]
+    fn memory_flag_beats_every_other_storage_path() {
+        let dir = project(
+            "[server]\nstorage_path = \"/from/file\"\n\n\
+             [profiles.prod.server]\nstorage_path = \"/from/profile\"\n",
+        );
+        let bare = project("");
+        for (dir, profile, env) in [
+            (&dir, Some("prod"), Some("/from/env")),
+            (&dir, Some("prod"), None),
+            (&dir, None, None),
+            (&bare, None, None),
+        ] {
+            let env: Vec<_> = env
+                .map(|v| ("FLUREE_STORAGE_PATH", v))
+                .into_iter()
+                .collect();
+            let config = resolve(dir, None, true, profile, &env);
+            assert!(config.memory, "profile={profile:?} env={env:?}");
+            assert_eq!(config.storage_path, None, "profile={profile:?} env={env:?}");
+            assert_eq!(config.storage_type_str(), "memory");
+        }
+    }
+
+    /// `FLUREE_MEMORY_STORAGE` ranks as an environment setting: a `--storage-path`
+    /// flag beats it, and it beats a path from the config file.
+    #[test]
+    fn memory_env_yields_to_a_storage_path_flag() {
+        let dir = project("[server]\nstorage_path = \"/from/file\"\n");
+        let env = [("FLUREE_MEMORY_STORAGE", "true")];
+
+        let flagged = resolve(&dir, Some("/from/flag"), false, None, &env);
+        assert!(!flagged.memory);
+        assert_eq!(flagged.storage_path, Some(PathBuf::from("/from/flag")));
+
+        let unflagged = resolve(&dir, None, false, None, &env);
+        assert!(unflagged.memory);
+        assert_eq!(unflagged.storage_path, None);
+    }
 }

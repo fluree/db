@@ -27,7 +27,7 @@ pub mod sync_task;
 
 pub use forward::{ForwardingClient, ForwardingError};
 pub use proxy_nameservice::ProxyNameService;
-pub use proxy_storage::ProxyStorage;
+pub use proxy_storage::{ProxyReadMode, ProxyStorage};
 pub use state::{
     GraphSourceNeedsRefresh, NeedsRefresh, PeerState, RemoteGraphSourceWatermark,
     RemoteLedgerWatermark,

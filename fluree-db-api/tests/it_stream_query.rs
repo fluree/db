@@ -238,3 +238,32 @@ async fn ask_query_is_rejected_before_streaming() {
         ),
     }
 }
+
+/// N5 lock: the streaming query path rejects a SPARQL `FROM`/`FROM NAMED`
+/// dataset clause (it does not build datasets), whereas the buffered `query`
+/// path supports a within-ledger `FROM`. This is a deliberate surface
+/// asymmetry, and it exercises the very same `validate_sparql_for_view` guard
+/// the R2RML query path uses to reject `FROM` — so it locks both.
+#[tokio::test]
+async fn sparql_from_clause_is_rejected_before_streaming() {
+    let (fluree, ledger) = seed_three().await;
+    let graph = support::graphdb_from_ledger(&ledger);
+
+    let result = fluree
+        .plan_stream_query(
+            &graph,
+            &OwnedStreamQuery::Sparql(
+                "PREFIX a: <http://a.co/> SELECT ?name FROM <urn:g1> { ?s a:name ?name }"
+                    .to_string(),
+            ),
+        )
+        .await;
+
+    match result {
+        Ok(_) => panic!("a SPARQL FROM clause must be rejected on the streaming endpoint"),
+        Err(e) => assert!(
+            e.to_string().contains("FROM"),
+            "error should mention the unsupported FROM clause, got: {e}"
+        ),
+    }
+}

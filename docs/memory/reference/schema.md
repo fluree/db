@@ -27,6 +27,7 @@ A memory's kind is expressed via `rdf:type` (`a` in Turtle) — there is no `mem
 | `mem:content` | `xsd:string` (indexed as `@fulltext`) | ✅ | The textual content; BM25-searchable |
 | `mem:scope` | IRI — `mem:repo` or `mem:user` | ✅ | Which TTL file it lives in |
 | `mem:createdAt` | `xsd:dateTime` | ✅ | Insertion timestamp |
+| `mem:updatedAt` | `xsd:dateTime` | optional | Last update — stamped by every `update`, including one that changes no field, which means "re-verified at HEAD" |
 | `mem:tag` | `xsd:string` (multi-valued) | optional | Free-form tags |
 | `mem:artifactRef` | `xsd:string` (multi-valued) | optional | File / symbol / URL references |
 | `mem:branch` | `xsd:string` | optional | Git branch captured at write time |

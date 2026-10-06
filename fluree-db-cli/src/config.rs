@@ -1,5 +1,6 @@
 use crate::error::{CliError, CliResult};
 use fluree_db_api::server_defaults::{self, ConfigFormat, FlureeDir, CONFIG_FILE_TOML, FLUREE_DIR};
+use fluree_db_api::LedgerId;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -262,6 +263,11 @@ pub fn clear_active_ledger(fluree_dir: &Path) -> CliResult<()> {
     Ok(())
 }
 
+/// The project's default storage directory, `<data dir>/storage`.
+pub fn default_storage_path(dirs: &FlureeDir) -> PathBuf {
+    dirs.data_dir().join(STORAGE_DIR)
+}
+
 /// Resolve the storage path for the Fluree instance.
 ///
 /// Checks the config file (`config.toml` / `config.jsonld`) in
@@ -363,6 +369,42 @@ pub fn read_indexing_thresholds(config_dir: &Path) -> IndexingThresholds {
     }
 }
 
+/// The `[doc]` table of the config file: model endpoints for `fluree doc`.
+///
+/// An absent section reads as unconfigured — the pipeline then runs
+/// deterministic and offline, which is the documented behavior for a machine
+/// with nothing set up. A section that is present but malformed is an error:
+/// someone configured a model on purpose, and silently running without it
+/// would look like success.
+pub fn read_doc_config(config_dir: &Path) -> CliResult<fluree_db_doc::DocConfig> {
+    let Some((path, format)) = detect_config_file(config_dir) else {
+        return Ok(fluree_db_doc::DocConfig::default());
+    };
+    let content = fs::read_to_string(&path)
+        .map_err(|e| CliError::Config(format!("{}: {e}", path.display())))?;
+    let bad = |e: String| CliError::Config(format!("{}: [doc] section: {e}", path.display()));
+    match format {
+        ConfigFileFormat::Toml => {
+            let doc: toml::Value = toml::from_str(&content)
+                .map_err(|e| CliError::Config(format!("{}: {e}", path.display())))?;
+            match doc.get("doc").cloned() {
+                Some(v) => v
+                    .try_into()
+                    .map_err(|e: toml::de::Error| bad(e.to_string())),
+                None => Ok(fluree_db_doc::DocConfig::default()),
+            }
+        }
+        ConfigFileFormat::JsonLd => {
+            let doc: serde_json::Value = serde_json::from_str(&content)
+                .map_err(|e| CliError::Config(format!("{}: {e}", path.display())))?;
+            match doc.get("doc").cloned() {
+                Some(v) => serde_json::from_value(v).map_err(|e| bad(e.to_string())),
+                None => Ok(fluree_db_doc::DocConfig::default()),
+            }
+        }
+    }
+}
+
 /// Prefix map type: prefix -> IRI namespace
 pub type PrefixMap = std::collections::HashMap<String, String>;
 
@@ -438,14 +480,32 @@ use serde::{Deserialize, Serialize};
 
 /// Configuration for a tracked (remote-only) ledger.
 ///
-/// Tracked ledgers have no local data — all operations are proxied to the
-/// remote server via HTTP. This is distinct from upstreams, which track
-/// a local ledger's relationship to a remote for ref-level sync.
+/// Tracked ledgers have no local data stored in `.fluree/storage` — this is
+/// distinct from upstreams, which track a local ledger's relationship to a
+/// remote for ref-level sync. The [`TrackMode`] selects how queries execute.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackedLedgerConfig {
-    pub local_alias: String,
+    pub local_alias: LedgerId,
     pub remote: String,
-    pub remote_alias: String,
+    pub remote_alias: LedgerId,
+    /// How queries against this tracked ledger execute (default: proxy).
+    #[serde(default)]
+    pub mode: TrackMode,
+}
+
+/// Query execution mode for a tracked ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrackMode {
+    /// Query-shipping: every query is an HTTP round-trip executed by the
+    /// remote server (its compute, row-level policy applied).
+    #[default]
+    Proxy,
+    /// Peer: queries execute locally against index blocks fetched on demand
+    /// from the remote's raw storage tier and cached by CID. Requires a
+    /// token with `fluree.storage.*` scope for the ledger. Writes still
+    /// forward to the remote over HTTP.
+    Peer,
 }
 
 /// TOML structure for sync configuration in config.toml
@@ -624,7 +684,7 @@ impl TomlSyncConfigStore {
 
             // Build [remotes.auth] sub-table with all populated fields
             {
-                use fluree_db_nameservice_sync::RemoteAuthType;
+                use fluree_db_nameservice_sync::{OidcLoginFlow, RemoteAuthType};
 
                 let auth = &remote.auth;
                 let has_any = auth.auth_type.is_some()
@@ -634,7 +694,8 @@ impl TomlSyncConfigStore {
                     || auth.exchange_url.is_some()
                     || auth.refresh_token.is_some()
                     || auth.scopes.is_some()
-                    || auth.redirect_port.is_some();
+                    || auth.redirect_port.is_some()
+                    || auth.login_flow.is_some();
 
                 if has_any {
                     let mut auth_table = Table::new();
@@ -667,6 +728,13 @@ impl TomlSyncConfigStore {
                     }
                     if let Some(port) = auth.redirect_port {
                         auth_table.insert("redirect_port", Value::from(i64::from(port)).into());
+                    }
+                    if let Some(flow) = auth.login_flow {
+                        let flow_str = match flow {
+                            OidcLoginFlow::DeviceCode => "device_code",
+                            OidcLoginFlow::AuthCodePkce => "auth_code_pkce",
+                        };
+                        auth_table.insert("login_flow", Value::from(flow_str).into());
                     }
                     table.insert("auth", Item::Table(auth_table));
                 }
@@ -709,6 +777,10 @@ impl TomlSyncConfigStore {
                 "remote_alias",
                 Value::from(tracked.remote_alias.as_str()).into(),
             );
+            // Only write non-default modes to keep configs tidy.
+            if tracked.mode == TrackMode::Peer {
+                table.insert("mode", Value::from("peer").into());
+            }
             tracked_aot.push(table);
         }
 
@@ -785,13 +857,13 @@ impl SyncConfigStore for TomlSyncConfigStore {
 
     async fn get_upstream(
         &self,
-        local_alias: &str,
+        local_alias: &LedgerId,
     ) -> fluree_db_nameservice_sync::Result<Option<UpstreamConfig>> {
         let config = self.read_sync_config();
         Ok(config
             .upstreams
             .into_iter()
-            .find(|u| u.local_alias == local_alias))
+            .find(|u| u.local_alias == *local_alias))
     }
 
     async fn set_upstream(
@@ -815,9 +887,12 @@ impl SyncConfigStore for TomlSyncConfigStore {
             .map_err(|e| fluree_db_nameservice_sync::SyncError::Config(e.to_string()))
     }
 
-    async fn remove_upstream(&self, local_alias: &str) -> fluree_db_nameservice_sync::Result<()> {
+    async fn remove_upstream(
+        &self,
+        local_alias: &LedgerId,
+    ) -> fluree_db_nameservice_sync::Result<()> {
         let mut config = self.read_sync_config();
-        config.upstreams.retain(|u| u.local_alias != local_alias);
+        config.upstreams.retain(|u| u.local_alias != *local_alias);
         self.write_sync_config(&config)
             .map_err(|e| fluree_db_nameservice_sync::SyncError::Config(e.to_string()))
     }
@@ -837,11 +912,11 @@ impl TomlSyncConfigStore {
     }
 
     /// Get a tracked ledger by local name.
-    pub fn get_tracked(&self, local_alias: &str) -> Option<TrackedLedgerConfig> {
+    pub fn get_tracked(&self, local_alias: &LedgerId) -> Option<TrackedLedgerConfig> {
         self.read_sync_config()
             .tracked_ledgers
             .into_iter()
-            .find(|t| t.local_alias == local_alias)
+            .find(|t| t.local_alias == *local_alias)
     }
 
     /// Add a tracked ledger. Replaces if the name already exists.
@@ -862,12 +937,12 @@ impl TomlSyncConfigStore {
     }
 
     /// Remove a tracked ledger by local name. Returns true if it existed.
-    pub fn remove_tracked(&self, local_alias: &str) -> CliResult<bool> {
+    pub fn remove_tracked(&self, local_alias: &LedgerId) -> CliResult<bool> {
         let mut config = self.read_sync_config();
         let before = config.tracked_ledgers.len();
         config
             .tracked_ledgers
-            .retain(|t| t.local_alias != local_alias);
+            .retain(|t| t.local_alias != *local_alias);
         let removed = config.tracked_ledgers.len() < before;
         if removed {
             self.write_sync_config(&config)?;
@@ -1004,6 +1079,83 @@ mod tests {
         let dirs = FlureeDir::unified(fluree_dir.clone());
         let result = resolve_storage_path(&dirs);
         assert_eq!(result, fluree_dir.join("storage"));
+    }
+
+    /// Regression guard for the read/write asymmetry of the remote config:
+    /// reads deserialize via serde, but writes go through the hand-rolled
+    /// `toml_edit` builder in `write_sync_config_toml` — a field missing
+    /// from that builder round-trips to `None` with green CI everywhere
+    /// else. Every `RemoteAuth` field is constructed here WITHOUT
+    /// `..Default::default()`, so adding a field breaks this test at
+    /// compile time and forces both the writer branch and this assertion
+    /// to be updated together.
+    #[tokio::test]
+    async fn remote_auth_round_trips_every_field_through_toml_store() {
+        use fluree_db_nameservice::RemoteName;
+        use fluree_db_nameservice_sync::{
+            OidcLoginFlow, RemoteAuth, RemoteAuthType, RemoteConfig, RemoteEndpoint,
+            SyncConfigStore,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = TomlSyncConfigStore::new(tmp.path().to_path_buf());
+
+        let auth = RemoteAuth {
+            auth_type: Some(RemoteAuthType::OidcDevice),
+            token: Some("access-tok".into()),
+            issuer: Some("https://idp.example.com".into()),
+            client_id: Some("fluree-cli".into()),
+            exchange_url: Some("https://api.example.com/auth/exchange".into()),
+            refresh_token: Some("refresh-tok".into()),
+            scopes: Some(vec!["openid".into(), "offline_access".into()]),
+            redirect_port: Some(8400),
+            login_flow: Some(OidcLoginFlow::AuthCodePkce),
+        };
+        store
+            .set_remote(&RemoteConfig {
+                name: RemoteName::new("origin"),
+                endpoint: RemoteEndpoint::Http {
+                    base_url: "https://api.example.com/v1/fluree".into(),
+                },
+                auth: auth.clone(),
+                fetch_interval_secs: Some(30),
+            })
+            .await
+            .unwrap();
+
+        let read = store
+            .get_remote(&RemoteName::new("origin"))
+            .await
+            .unwrap()
+            .expect("remote persisted")
+            .auth;
+
+        assert_eq!(read.auth_type, auth.auth_type);
+        assert_eq!(read.token, auth.token);
+        assert_eq!(read.issuer, auth.issuer);
+        assert_eq!(read.client_id, auth.client_id);
+        assert_eq!(read.exchange_url, auth.exchange_url);
+        assert_eq!(read.refresh_token, auth.refresh_token);
+        assert_eq!(read.scopes, auth.scopes);
+        assert_eq!(read.redirect_port, auth.redirect_port);
+        assert_eq!(read.login_flow, auth.login_flow);
+
+        // Second write cycle: set_remote reads the existing file, rebuilds
+        // the auth table, and rewrites it — the pass where a writer-omitted
+        // field actually vanishes. Flip the flow to prove overwrites stick.
+        let mut updated = store
+            .get_remote(&RemoteName::new("origin"))
+            .await
+            .unwrap()
+            .unwrap();
+        updated.auth.login_flow = Some(OidcLoginFlow::DeviceCode);
+        store.set_remote(&updated).await.unwrap();
+        let reread = store
+            .get_remote(&RemoteName::new("origin"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reread.auth.login_flow, Some(OidcLoginFlow::DeviceCode));
     }
 
     #[cfg(unix)]

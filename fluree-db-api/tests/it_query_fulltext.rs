@@ -99,7 +99,9 @@ async fn index_and_load(
     alias: &str,
     t: i64,
 ) -> LedgerState {
-    let completion = handle.trigger(alias, t).await;
+    let completion = handle
+        .trigger(&fluree_db_api::LedgerId::parse(alias).unwrap(), t)
+        .await;
     match completion.wait().await {
         fluree_db_api::IndexOutcome::Completed { .. } => {}
         fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
@@ -1376,5 +1378,599 @@ async fn fulltext_configured_two_commits_two_values_full_rebuild() {
                 "query for '{term}' must return at least one row; both configured assertions must be in arena after full rebuild: {rows:?}"
             );
         }
+    }
+}
+
+/// Persisted-backend reproducer for the Solo/S3 bug report (2026-07-03):
+/// arena builds correctly at index time, but `fulltext(?v, "…")` returns
+/// unbound for every value when the query runs in a *separate process* that
+/// loads the index from persisted storage.
+///
+/// All prior reproducers in this file use `FlureeBuilder::memory()` where the
+/// indexer and query side share one process. This test mirrors the field
+/// deployment shape: instance A (the "indexing Lambda") writes config + data
+/// and publishes a full index to file storage, then is dropped; instance B
+/// (the "query Lambda") is a fresh `Fluree` over the same directory that must
+/// load the FTA1 arena via the FIR6 root and score both an untagged
+/// `xsd:string` and an `@en`-tagged value on the configured predicate.
+#[tokio::test]
+async fn fulltext_configured_persisted_reload_scores_plain_and_langtagged() {
+    use fluree_db_api::ReindexOptions;
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let ledger_id = "it/fulltext-persisted:main";
+    let no_auto = fluree_db_api::IndexConfig {
+        reindex_min_bytes: 1_000_000_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+
+    // ── Instance A: writer + indexer (the "indexing Lambda") ──────────────
+    {
+        let fluree = FlureeBuilder::file(&path).build().expect("file fluree");
+        let ledger = fluree.create_ledger(ledger_id).await.expect("create");
+
+        // Config: rdfs:label is a fulltext-configured predicate (ncit shape).
+        let config_iri = format!("urn:fluree:{ledger_id}#config");
+        let config_trig = format!(
+            r"
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+            GRAPH <{config_iri}> {{
+                <urn:config:main> rdf:type f:LedgerConfig .
+                <urn:config:main> f:fullTextDefaults <urn:config:ft> .
+                <urn:config:ft> rdf:type f:FullTextDefaults .
+                <urn:config:ft> f:property <urn:config:ft:label> .
+                <urn:config:ft:label> rdf:type f:FullTextProperty .
+                <urn:config:ft:label> f:target rdfs:label .
+            }}
+        "
+        );
+        let ledger = fluree
+            .stage_owned(ledger)
+            .upsert_turtle(&config_trig)
+            .execute()
+            .await
+            .expect("write config")
+            .ledger;
+
+        // Data: both probe shapes from the bug report — untagged xsd:string
+        // and @en-tagged — plus filler so the arena has corpus stats.
+        let ledger = fluree
+            .insert_with_opts(
+                ledger,
+                &json!({
+                    "@context": {
+                        "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+                        "ex": "http://ex.test/"
+                    },
+                    "@graph": [
+                        {"@id": "ex:ZZTESTPLAIN", "rdfs:label": "Qjklm Marker Syndrome"},
+                        {"@id": "ex:ZZTESTEN",
+                         "rdfs:label": {"@value": "Zqxwv Marker Syndrome", "@language": "en"}},
+                        {"@id": "ex:OTHER1", "rdfs:label": "Unrelated cardiac disorder"},
+                        {"@id": "ex:OTHER2", "rdfs:label": "Another unrelated entry"}
+                    ]
+                }),
+                TxnOpts::default(),
+                CommitOpts::default(),
+                &no_auto,
+            )
+            .await
+            .expect("insert probes")
+            .ledger;
+        let _ = ledger;
+
+        // Full reindex — same admin-reindex path the field report used.
+        fluree
+            .reindex(ledger_id, ReindexOptions::default())
+            .await
+            .expect("reindex");
+    }
+
+    // ── Instance B: fresh process (the "query Lambda") ─────────────────────
+    let fluree = FlureeBuilder::file(&path).build().expect("re-open fluree");
+    let loaded = fluree.ledger(ledger_id).await.expect("load ledger");
+
+    for (probe, expect_id) in [("qjklm", "ex:ZZTESTPLAIN"), ("zqxwv", "ex:ZZTESTEN")] {
+        let bind = format!("(fulltext ?label \"{probe}\")");
+        let query = json!({
+            "@context": {
+                "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+                "ex": "http://ex.test/"
+            },
+            "select": ["?s", "?label", "?score"],
+            "where": [
+                {"@id": "?s", "rdfs:label": "?label"},
+                ["bind", "?score", bind],
+                ["filter", "(> ?score 0)"]
+            ]
+        });
+        let result = support::query_jsonld(&fluree, &loaded, &query)
+            .await
+            .expect("query");
+        let json_rows = result.to_jsonld(&loaded.snapshot).expect("jsonld");
+        let rows = json_rows.as_array().cloned().unwrap_or_default();
+        let hit = rows.iter().any(|row| {
+            row.as_array()
+                .and_then(|r| r.first())
+                .and_then(|v| v.as_str())
+                .is_some_and(|id| id == expect_id)
+        });
+        assert!(
+            hit,
+            "persisted reload: fulltext(\"{probe}\") must score {expect_id} > 0 \
+             when the arena is loaded from disk in a fresh process, got rows: {rows:?}"
+        );
+    }
+}
+
+/// Shared setup for the persisted-backend tests below: a file-backed Fluree
+/// over `path` with `rdfs:label` fulltext-configured and the given docs
+/// committed, followed by a full reindex. The instance is dropped before
+/// return so a fresh instance sees only persisted state.
+async fn persisted_setup_with_labels(path: &str, ledger_id: &str, docs: &JsonValue) {
+    use fluree_db_api::ReindexOptions;
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    let no_auto = fluree_db_api::IndexConfig {
+        reindex_min_bytes: 1_000_000_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+    let fluree = FlureeBuilder::file(path).build().expect("file fluree");
+    let ledger = fluree.create_ledger(ledger_id).await.expect("create");
+
+    let config_iri = format!("urn:fluree:{ledger_id}#config");
+    let config_trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:fullTextDefaults <urn:config:ft> .
+            <urn:config:ft> rdf:type f:FullTextDefaults .
+            <urn:config:ft> f:property <urn:config:ft:label> .
+            <urn:config:ft:label> rdf:type f:FullTextProperty .
+            <urn:config:ft:label> f:target rdfs:label .
+        }}
+    "
+    );
+    let ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&config_trig)
+        .execute()
+        .await
+        .expect("write config")
+        .ledger;
+
+    let ledger = fluree
+        .insert_with_opts(
+            ledger,
+            docs,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &no_auto,
+        )
+        .await
+        .expect("insert docs")
+        .ledger;
+    let _ = ledger;
+
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+}
+
+/// Run a `fulltext(?label, probe)` query on `rdfs:label` and return the set
+/// of matching subject ids (compacted against the `ex:` prefix).
+async fn persisted_query_label_hits(
+    fluree: &support::MemoryFluree,
+    loaded: &support::MemoryLedger,
+    probe: &str,
+) -> Vec<String> {
+    let bind = format!("(fulltext ?label \"{probe}\")");
+    let query = json!({
+        "@context": {
+            "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+            "ex": "http://ex.test/"
+        },
+        "select": ["?s", "?score"],
+        "where": [
+            {"@id": "?s", "rdfs:label": "?label"},
+            ["bind", "?score", bind],
+            ["filter", "(> ?score 0)"]
+        ]
+    });
+    let result = support::query_jsonld(fluree, loaded, &query)
+        .await
+        .expect("query");
+    let json_rows = result.to_jsonld(&loaded.snapshot).expect("jsonld");
+    json_rows
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| {
+                    row.as_array()?
+                        .first()?
+                        .as_str()
+                        .map(std::string::ToString::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Persisted incremental indexing: after a full reindex + process restart,
+/// a new commit on the configured predicate is picked up by the incremental
+/// indexer (prior FTA1 arena fetched from persisted storage, extended, and
+/// re-published), and a further fresh process scores both old and new values.
+#[tokio::test]
+async fn fulltext_configured_persisted_incremental_extends_arena() {
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let ledger_id = "it/fulltext-persisted-incr:main";
+    let no_auto = fluree_db_api::IndexConfig {
+        reindex_min_bytes: 1_000_000_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+
+    persisted_setup_with_labels(
+        &path,
+        ledger_id,
+        &json!({
+            "@context": {
+                "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+                "ex": "http://ex.test/"
+            },
+            "@graph": [
+                {"@id": "ex:OLD", "rdfs:label": "Qjklm Marker Syndrome"},
+                {"@id": "ex:FILLER", "rdfs:label": "Unrelated cardiac disorder"}
+            ]
+        }),
+    )
+    .await;
+
+    // Fresh process: commit a new value, then incremental index (prior index
+    // exists, so build_index_for_ledger takes the incremental path and must
+    // fetch + extend the persisted arena).
+    {
+        let fluree = FlureeBuilder::file(&path).build().expect("re-open");
+        let ledger = fluree.ledger(ledger_id).await.expect("load");
+        let ledger = fluree
+            .insert_with_opts(
+                ledger,
+                &json!({
+                    "@context": {
+                        "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+                        "ex": "http://ex.test/"
+                    },
+                    "@id": "ex:NEW",
+                    "rdfs:label": "Wvbnm Novel Finding"
+                }),
+                TxnOpts::default(),
+                CommitOpts::default(),
+                &no_auto,
+            )
+            .await
+            .expect("insert new label")
+            .ledger;
+        let _ = ledger;
+
+        let idx_config = fluree_db_indexer::IndexerConfig::default()
+            .with_fulltext_config_provider(fluree.fulltext_config_provider());
+        let result = fluree_db_indexer::build_index_for_ledger(
+            fluree.content_store(ledger_id),
+            fluree.nameservice(),
+            ledger_id,
+            idx_config,
+        )
+        .await
+        .expect("incremental build");
+        fluree
+            .nameservice_mode()
+            .publisher()
+            .expect("publisher")
+            .publish_index_allow_equal(ledger_id, result.index_t, &result.root_id)
+            .await
+            .expect("publish incremental");
+    }
+
+    // Another fresh process: both the pre-existing and the incrementally
+    // added value must score from the persisted arena.
+    let fluree = FlureeBuilder::file(&path).build().expect("re-open 2");
+    let loaded = fluree.ledger(ledger_id).await.expect("load final");
+    let old_hits = persisted_query_label_hits(&fluree, &loaded, "qjklm").await;
+    assert!(
+        old_hits.iter().any(|id| id == "ex:OLD"),
+        "incremental index must preserve prior persisted arena docs, got {old_hits:?}"
+    );
+    let new_hits = persisted_query_label_hits(&fluree, &loaded, "wvbnm").await;
+    assert!(
+        new_hits.iter().any(|id| id == "ex:NEW"),
+        "incremental index must extend the persisted arena with new docs, got {new_hits:?}"
+    );
+}
+
+/// Persisted novelty/overlay: a commit made AFTER the last index build (and
+/// never indexed) must still score via the novelty-delta path when queried
+/// from a fresh process — both for the unindexed value itself and without
+/// breaking scores for indexed values.
+#[tokio::test]
+async fn fulltext_configured_persisted_novelty_scores_unindexed_commit() {
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let ledger_id = "it/fulltext-persisted-novelty:main";
+    let no_auto = fluree_db_api::IndexConfig {
+        reindex_min_bytes: 1_000_000_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+
+    persisted_setup_with_labels(
+        &path,
+        ledger_id,
+        &json!({
+            "@context": {
+                "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+                "ex": "http://ex.test/"
+            },
+            "@graph": [
+                {"@id": "ex:INDEXED", "rdfs:label": "Qjklm Marker Syndrome"},
+                {"@id": "ex:FILLER", "rdfs:label": "Unrelated cardiac disorder"}
+            ]
+        }),
+    )
+    .await;
+
+    // Fresh process: commit a new value but do NOT index it.
+    {
+        let fluree = FlureeBuilder::file(&path).build().expect("re-open");
+        let ledger = fluree.ledger(ledger_id).await.expect("load");
+        let ledger = fluree
+            .insert_with_opts(
+                ledger,
+                &json!({
+                    "@context": {
+                        "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+                        "ex": "http://ex.test/"
+                    },
+                    "@id": "ex:NOVELTY",
+                    "rdfs:label": "Xplqr Overlay Finding"
+                }),
+                TxnOpts::default(),
+                CommitOpts::default(),
+                &no_auto,
+            )
+            .await
+            .expect("insert novelty label")
+            .ledger;
+        let _ = ledger;
+    }
+
+    // Fresh process: the unindexed (novelty) value must score, and the
+    // indexed value must keep scoring.
+    let fluree = FlureeBuilder::file(&path).build().expect("re-open 2");
+    let loaded = fluree.ledger(ledger_id).await.expect("load with novelty");
+    let novelty_hits = persisted_query_label_hits(&fluree, &loaded, "xplqr").await;
+    assert!(
+        novelty_hits.iter().any(|id| id == "ex:NOVELTY"),
+        "unindexed novelty value on a configured predicate must score, got {novelty_hits:?}"
+    );
+    let indexed_hits = persisted_query_label_hits(&fluree, &loaded, "qjklm").await;
+    assert!(
+        indexed_hits.iter().any(|id| id == "ex:INDEXED"),
+        "indexed value must keep scoring with novelty present, got {indexed_hits:?}"
+    );
+}
+
+/// Persisted language buckets: language-tagged values on a configured
+/// predicate build language-specific arenas — a French value is analyzed
+/// with the French stemmer in its own `(g_id, p_id, lang_id)` bucket, and
+/// English/untagged values live in the English bucket. Verified across a
+/// process restart so the buckets round-trip through the FIR6 root.
+#[tokio::test]
+async fn fulltext_configured_persisted_language_buckets() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let ledger_id = "it/fulltext-persisted-lang:main";
+
+    persisted_setup_with_labels(
+        &path,
+        ledger_id,
+        &json!({
+            "@context": {
+                "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+                "ex": "http://ex.test/"
+            },
+            "@graph": [
+                {"@id": "ex:FR",
+                 "rdfs:label": {"@value": "Maladies cardiaques chroniques", "@language": "fr"}},
+                {"@id": "ex:EN",
+                 "rdfs:label": {"@value": "Chronic heart diseases", "@language": "en"}},
+                {"@id": "ex:PLAIN", "rdfs:label": "Chronic kidney disease"}
+            ]
+        }),
+    )
+    .await;
+
+    let fluree = FlureeBuilder::file(&path).build().expect("re-open");
+    let loaded = fluree.ledger(ledger_id).await.expect("load");
+
+    // French bucket: "maladie" (singular) must match "Maladies" via the
+    // French stemmer — this only works if the @fr value was analyzed with
+    // the French analyzer in its own arena bucket.
+    let fr_hits = persisted_query_label_hits(&fluree, &loaded, "maladie").await;
+    assert!(
+        fr_hits.iter().any(|id| id == "ex:FR"),
+        "@fr value must score via its language-specific arena (French stemming), got {fr_hits:?}"
+    );
+
+    // English bucket: "diseases" matches the @en value; the untagged value
+    // shares the English bucket, so "disease" matches it too.
+    let en_hits = persisted_query_label_hits(&fluree, &loaded, "diseases").await;
+    assert!(
+        en_hits.iter().any(|id| id == "ex:EN"),
+        "@en value must score via the English bucket, got {en_hits:?}"
+    );
+    assert!(
+        en_hits.iter().any(|id| id == "ex:PLAIN"),
+        "untagged value must share the English bucket, got {en_hits:?}"
+    );
+
+    // Cross-bucket isolation: a French-only term must not surface the
+    // English-bucket docs.
+    assert!(
+        !fr_hits.iter().any(|id| id == "ex:EN" || id == "ex:PLAIN"),
+        "French query terms must not match English-bucket docs, got {fr_hits:?}"
+    );
+}
+
+/// Perf smoke harness for per-row `fulltext()` cost at scale (run manually):
+///
+/// ```sh
+/// cargo test -p fluree-db-api --test grp_query --release \
+///     fulltext_perf_50k_labels -- --ignored --nocapture
+/// ```
+///
+/// Seeds 50k configured labels, full-reindexes, then commits ONE extra label
+/// WITHOUT indexing so the overlay epoch is non-zero — forcing the eager
+/// materialization / `Binding::Lit` path for every row, which is the
+/// production norm (the Solo/S3 27s report shape). Prints wall time for
+/// cold and warm runs; asserts only correctness (hit counts), not timing.
+#[tokio::test]
+#[ignore = "perf smoke — run manually with --ignored --nocapture"]
+async fn fulltext_perf_50k_labels() {
+    use fluree_db_api::ReindexOptions;
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    const N: usize = 50_000;
+    let words = [
+        "disease",
+        "syndrome",
+        "carcinoma",
+        "gene",
+        "protein",
+        "receptor",
+        "chronic",
+        "acute",
+        "cardiac",
+        "renal",
+        "hepatic",
+        "neural",
+        "benign",
+        "malignant",
+        "primary",
+        "secondary",
+        "infection",
+        "deficiency",
+        "disorder",
+        "lesion",
+    ];
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let ledger_id = "it/fulltext-perf:main";
+    let no_auto = fluree_db_api::IndexConfig {
+        reindex_min_bytes: 1_000_000_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+
+    {
+        let fluree = FlureeBuilder::file(&path).build().expect("file fluree");
+        let ledger = fluree.create_ledger(ledger_id).await.expect("create");
+
+        let config_iri = format!("urn:fluree:{ledger_id}#config");
+        let config_trig = format!(
+            r"
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+            GRAPH <{config_iri}> {{
+                <urn:config:main> rdf:type f:LedgerConfig .
+                <urn:config:main> f:fullTextDefaults <urn:config:ft> .
+                <urn:config:ft> rdf:type f:FullTextDefaults .
+                <urn:config:ft> f:property <urn:config:ft:label> .
+                <urn:config:ft:label> rdf:type f:FullTextProperty .
+                <urn:config:ft:label> f:target rdfs:label .
+            }}
+        "
+        );
+        let mut ledger = fluree
+            .stage_owned(ledger)
+            .upsert_turtle(&config_trig)
+            .execute()
+            .await
+            .expect("write config")
+            .ledger;
+
+        // Bulk-seed N labels via turtle (3 pseudo-random pool words each).
+        let mut turtle = String::from("@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n");
+        for i in 0..N {
+            let a = words[i % words.len()];
+            let b = words[(i / words.len() + 3) % words.len()];
+            let c = words[(i * 7 + 11) % words.len()];
+            turtle.push_str(&format!(
+                "<http://ex.test/C{i}> rdfs:label \"{a} {b} {c} entry {i}\" .\n"
+            ));
+        }
+        ledger = fluree
+            .stage_owned(ledger)
+            .upsert_turtle(&turtle)
+            .execute()
+            .await
+            .expect("seed labels")
+            .ledger;
+        let _ = ledger;
+
+        fluree
+            .reindex(ledger_id, ReindexOptions::default())
+            .await
+            .expect("reindex");
+
+        // One unindexed commit → overlay epoch != 0 → eager materialization.
+        let ledger = fluree.ledger(ledger_id).await.expect("reload");
+        let _ = fluree
+            .insert_with_opts(
+                ledger,
+                &json!({
+                    "@context": {
+                        "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+                        "ex": "http://ex.test/"
+                    },
+                    "@id": "ex:NOVELTY",
+                    "rdfs:label": "xplqr overlay entry"
+                }),
+                TxnOpts::default(),
+                CommitOpts::default(),
+                &no_auto,
+            )
+            .await
+            .expect("novelty commit");
+    }
+
+    let fluree = FlureeBuilder::file(&path).build().expect("re-open");
+    let loaded = fluree.ledger(ledger_id).await.expect("load");
+
+    // "disease" appears in a large fraction of the pool-generated labels.
+    for run in ["cold", "warm"] {
+        let start = std::time::Instant::now();
+        let hits = persisted_query_label_hits(&fluree, &loaded, "disease").await;
+        let elapsed = start.elapsed();
+        println!(
+            "fulltext_perf_50k: {run} run: {} hits in {elapsed:?}",
+            hits.len()
+        );
+        assert!(
+            hits.len() > 1000,
+            "{run}: expected thousands of 'disease' hits, got {}",
+            hits.len()
+        );
     }
 }

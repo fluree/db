@@ -14,6 +14,7 @@ pub const PROP_SEVERITY: &str = "https://ns.flur.ee/memory#severity";
 pub const PROP_ARTIFACT_REF: &str = "https://ns.flur.ee/memory#artifactRef";
 pub const PROP_BRANCH: &str = "https://ns.flur.ee/memory#branch";
 pub const PROP_CREATED_AT: &str = "https://ns.flur.ee/memory#createdAt";
+pub const PROP_UPDATED_AT: &str = "https://ns.flur.ee/memory#updatedAt";
 pub const PROP_RATIONALE: &str = "https://ns.flur.ee/memory#rationale";
 pub const PROP_ALTERNATIVES: &str = "https://ns.flur.ee/memory#alternatives";
 
@@ -24,7 +25,7 @@ pub const SCOPE_USER: &str = "https://ns.flur.ee/memory#user";
 /// Properties that are OPTIONAL in most SPARQL projections for Memory rows.
 ///
 /// Each tuple is `(property_iri, var_name)` where `var_name` is used as `?{var_name}`.
-pub const OPTIONAL_PROPS: [(&str, &str); 7] = [
+pub const OPTIONAL_PROPS: [(&str, &str); 8] = [
     (PROP_SCOPE, "scope"),
     (PROP_SEVERITY, "severity"),
     (PROP_TAG, "tag"),
@@ -32,4 +33,5 @@ pub const OPTIONAL_PROPS: [(&str, &str); 7] = [
     (PROP_BRANCH, "branch"),
     (PROP_RATIONALE, "rationale"),
     (PROP_ALTERNATIVES, "alternatives"),
+    (PROP_UPDATED_AT, "updatedAt"),
 ];

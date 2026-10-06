@@ -12,12 +12,12 @@ use crate::operator::{
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::BinaryGraphView;
+use fluree_db_core::clock::Instant;
 use fluree_db_core::value_id::ObjKind;
 use fluree_db_core::{DatatypeConstraint, DatatypeDictId, FlakeValue, Sid};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
-use std::time::Instant;
 use tracing::Instrument;
 
 /// Keep sort diagnostics cheap by only surfacing non-trivial blocking sorts at
@@ -63,9 +63,7 @@ fn materialize_encoded_for_sort(
                 other => {
                     let dt_sid = gv
                         .store()
-                        .dt_sids()
-                        .get(*dt_id as usize)
-                        .cloned()
+                        .resolve_dt_id_sid_for_value(*dt_id, &other)
                         .unwrap_or_else(|| Sid::new(0, ""));
                     let meta = gv.store().decode_meta(*lang_id, *i_val);
                     let dtc = match meta.and_then(|m| m.lang.map(Arc::from)) {
@@ -159,6 +157,11 @@ impl SortSpec {
             var,
             direction: SortDirection::Ascending,
         }
+    }
+
+    /// `true` for an ascending key.
+    pub fn ascending(&self) -> bool {
+        matches!(self.direction, SortDirection::Ascending)
     }
 
     /// Create a descending sort specification
@@ -317,10 +320,8 @@ pub fn compare_bindings(a: &Binding, b: &Binding) -> Ordering {
         (Binding::EncodedPid { p_id: a }, Binding::EncodedPid { p_id: b }) => a.cmp(b),
         // Cross-IRI type comparisons: Sid < IriMatch/Iri < EncodedSid/EncodedPid
         // (Prefer materialized over encoded for consistent ordering)
-        (Binding::Sid { sid: _, .. }, Binding::IriMatch { .. } | Binding::Iri(_)) => Ordering::Less,
-        (Binding::IriMatch { .. } | Binding::Iri(_), Binding::Sid { sid: _, .. }) => {
-            Ordering::Greater
-        }
+        (Binding::Sid { .. }, Binding::IriMatch { .. } | Binding::Iri(_)) => Ordering::Less,
+        (Binding::IriMatch { .. } | Binding::Iri(_), Binding::Sid { .. }) => Ordering::Greater,
         (Binding::IriMatch { iri: a, .. }, Binding::Iri(b)) => a.as_ref().cmp(b.as_ref()),
         (Binding::Iri(a), Binding::IriMatch { iri: b, .. }) => a.as_ref().cmp(b.as_ref()),
         // Encoded IRI types sort after decoded types when mixed
@@ -576,6 +577,17 @@ impl SortOperator {
 
 #[async_trait]
 impl Operator for SortOperator {
+    /// Item 11 (F-AUD-7): DECLINE forwarding — a full sort must consume ALL input
+    /// to order it; the scan-side top-k for `ORDER BY … LIMIT` travels a separate
+    /// channel (`set_topk`, PR-5/item 8), not the row budget. Explicit (was a
+    /// silent trait-default no-op) so the swallow is observable.
+    fn set_row_budget(&mut self, budget: usize) {
+        tracing::debug!(
+            budget,
+            "SORT row-budget swallowed (a full sort needs all input; top-k uses set_topk)"
+        );
+    }
+
     fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
         vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
     }
@@ -1088,7 +1100,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sort_single_column_asc() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -1109,7 +1121,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sort_single_column_desc() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -1130,7 +1142,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sort_multi_column() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -1158,7 +1170,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sort_with_unbound() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -1199,7 +1211,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sort_across_batches() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -1221,7 +1233,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sort_emits_in_batches() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         // Use small batch size
         let ctx = ExecutionContext::new(&snapshot, &vars).with_batch_size(3);
@@ -1250,7 +1262,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sort_empty_input() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -1265,7 +1277,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sort_preserves_schema() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -1296,7 +1308,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sort_state_transitions() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 

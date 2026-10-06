@@ -8,6 +8,7 @@ mod rest;
 mod table_identifier;
 
 pub use direct::DirectCatalogClient;
+pub use direct::{match_warehouse_table_dir, warehouse_dir_name};
 pub use rest::{RestCatalogClient, RestCatalogConfig};
 pub use table_identifier::{encode_namespace_for_rest, parse_table_identifier, TableIdentifier};
 
@@ -28,6 +29,12 @@ pub struct LoadTableResponse {
     pub config: HashMap<String, serde_json::Value>,
     /// Vended storage credentials (if catalog supports credential delegation)
     pub credentials: Option<VendedCredentials>,
+    /// The parsed inline `metadata` object the REST `loadTable` response carries,
+    /// when present and parseable. Retained so callers (e.g. metadata preview)
+    /// can read the full table schema/snapshot without a second S3 fetch of the
+    /// metadata JSON. `None` for Direct mode (no inline metadata) or when the
+    /// catalog omits it.
+    pub metadata: Option<crate::metadata::TableMetadata>,
 }
 
 /// Iceberg catalog client trait.

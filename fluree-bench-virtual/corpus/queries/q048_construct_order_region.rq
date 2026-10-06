@@ -1,0 +1,10 @@
+# q048 construct_order_region
+# Intent: CONSTRUCT over a fact->dim join (WHERE is R2RML-rewritten normally).
+# BI lineage (BI-22): "Build a flattened order->customer-region graph."
+# Predicates verified against enterprise.ttl — FactOrder: orderTotal, customer; DimCustomer: geography; DimGeography: region.
+# Determinism: unordered LIMIT truncates a larger set (any k rows are valid) -> hash_gate=rows_only; gated on row count + invariants, not an exact hash.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+CONSTRUCT { ?o edw:orderTotal ?tot ; edw:custRegion ?region . }
+WHERE { ?o a edw:Order ; edw:orderTotal ?tot ; edw:customer ?c .
+        ?c edw:geography ?g . ?g edw:region ?region . }
+LIMIT 5000

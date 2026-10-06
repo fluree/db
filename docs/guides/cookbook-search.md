@@ -8,6 +8,15 @@ This guide covers practical patterns for both approaches.
 
 ### 1. Insert searchable data
 
+There are two ways to make string values searchable. The examples below use
+the `@fulltext` datatype annotation — the zero-config path, handy for a
+self-contained cookbook. Note that it stores values under the Fluree-specific
+`f:fullText` datatype instead of `xsd:string`; if you're building
+standards-conformant RDF (or want to search values already in your ledger,
+or need non-English analysis), declare the properties once with
+[`f:fullTextDefaults` in the ledger's `#config` graph](../indexing-and-search/fulltext.md#configured-full-text-properties-ffulltextdefaults)
+instead — the queries in this guide work identically with either setup.
+
 Annotate string values with `@fulltext` to make them searchable:
 
 ```bash

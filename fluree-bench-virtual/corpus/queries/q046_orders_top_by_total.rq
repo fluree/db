@@ -1,0 +1,10 @@
+# q046 orders_top_by_total
+# Intent: Same query + ORDER BY DESC + LIMIT (H2 primary: top-k drains the full scan on virtual).
+# BI lineage (BI-21): "Show me the 10 biggest orders."
+# Predicates verified against enterprise.ttl — FactOrder: orderId, orderTotal.
+# Determinism: ORDER BY + LIMIT top-k with a unique tiebreaker appended to the sort key so the selected rows (and the result hash) are exact across engines; perf shape unchanged (still top-k over a full scan, H2 intact).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?oid ?tot
+WHERE { ?o a edw:Order ; edw:orderId ?oid ; edw:orderTotal ?tot . }
+ORDER BY DESC(?tot) ?oid
+LIMIT 10

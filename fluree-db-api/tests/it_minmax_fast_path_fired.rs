@@ -2,12 +2,24 @@
 //! (not just agree with) aggregates over a multi-language predicate on a
 //! bulk-imported (lex-sorted) index.
 //!
-//! Kept as the only test in this binary: the assertion relies on a thread-local
-//! tracing subscriber (`set_default`), and concurrent tests in the same process
-//! push parts of query execution onto threads the subscriber can't see.
+//! Kept as the ONLY test in its own `[[test]]` binary (not bundled into
+//! `grp_misc`), same convention as `it_cyclic_bgp_probe`. The assertions here
+//! are about instrumentation, which is process-shared in two ways that a
+//! bundled parallel run exposes: (1) tracing's callsite-interest cache is
+//! process-global — it is rebuilt when a dispatcher registers, but a callsite
+//! hit concurrently with that rebuild can briefly see stale interest and drop
+//! an event (this bit once under bare `cargo test` with heavy
+//! concurrent-build load); (2) the `set_default` capture is thread-local, so
+//! the assertions are sound only while every asserted event is emitted on
+//! this thread — fast-path internals fan work out to the shared work-stealing
+//! rayon pool, where an event lands on whichever participating thread's
+//! subscriber happens to be active. Neither hazard is deterministic; a
+//! standalone binary removes both under bare `cargo test` (bundled siblings
+//! share one process), which is what contributors reach for first. nextest
+//! already isolates per-process.
 #![cfg(feature = "native")]
 
-use crate::support;
+mod support;
 use fluree_db_api::FlureeBuilder;
 use std::io::Write;
 use tempfile::TempDir;

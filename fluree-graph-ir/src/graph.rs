@@ -4,7 +4,7 @@
 //! Call `dedupe()` explicitly if you want set semantics.
 
 use crate::{Term, Triple};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// A collection of RDF triples
 ///
@@ -34,10 +34,27 @@ use std::collections::BTreeMap;
 /// // Or canonicalize (sort + dedupe)
 /// graph.canonicalize();
 /// ```
+/// An RDF 1.2 reifier attachment: `reifier` reifies `triple`.
+///
+/// Fluree's edge-annotation model reifies *asserted* edges, so the base
+/// triple is always present in the graph's triple list as well; this record
+/// only carries the attachment. The reifier's own description (an
+/// annotation body such as `{| ex:confidence 0.9 |}`) is ordinary triples
+/// with `reifier` as their subject.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Reification {
+    /// The reified (and asserted) base triple.
+    pub triple: Triple,
+    /// The reifier: an IRI or a blank node.
+    pub reifier: Term,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Graph {
     /// The triples in this graph
     triples: Vec<Triple>,
+    /// Reifier attachments, in emission order. See [`Reification`].
+    reifications: Vec<Reification>,
     /// Base IRI from parsing (for reconstruction)
     pub base: Option<String>,
     /// Prefix mappings from parsing (deterministic order via BTreeMap)
@@ -68,6 +85,11 @@ impl Graph {
         self.prefixes.insert(prefix.into(), namespace.into());
     }
 
+    /// Reserve room for at least `additional` more triples.
+    pub fn reserve(&mut self, additional: usize) {
+        self.triples.reserve(additional);
+    }
+
     /// Add a triple to the graph
     pub fn add(&mut self, triple: Triple) {
         self.triples.push(triple);
@@ -85,9 +107,59 @@ impl Graph {
         self.add(Triple::with_list_index(s, p, o, index));
     }
 
+    /// Record that `reifier` reifies the base triple `(s, p, o)`.
+    ///
+    /// Does not add the base triple itself; producers emit it separately
+    /// (see [`GraphSink::emit_reified_triple`](crate::GraphSink::emit_reified_triple)).
+    pub fn add_reification(&mut self, s: Term, p: Term, o: Term, reifier: Term) {
+        self.reifications.push(Reification {
+            triple: Triple::new(s, p, o),
+            reifier,
+        });
+    }
+
+    /// Reifier attachments, in emission order.
+    pub fn reifications(&self) -> &[Reification] {
+        &self.reifications
+    }
+
+    /// Index reifiers by their base triple for graph serialization.
+    ///
+    /// Borrows the triples and reifiers without cloning them, preserving
+    /// attachment order within each triple's reifier list.
+    #[inline]
+    pub fn reifiers_by_triple(&self) -> HashMap<&Triple, Vec<&Term>> {
+        let mut reifiers: HashMap<&Triple, Vec<&Term>> = HashMap::new();
+        for r in &self.reifications {
+            reifiers.entry(&r.triple).or_default().push(&r.reifier);
+        }
+        reifiers
+    }
+
+    /// Number of reifier attachments.
+    pub fn reifications_len(&self) -> usize {
+        self.reifications.len()
+    }
+
+    /// Drop every reification recorded after the first `len`.
+    pub fn truncate_reifications(&mut self, len: usize) {
+        self.reifications.truncate(len);
+    }
+
     /// Get the number of triples
     pub fn len(&self) -> usize {
         self.triples.len()
+    }
+
+    /// Drop every triple past `len`, keeping the first `len` in insertion
+    /// order. No-op if the graph is already that short.
+    ///
+    /// Exists for statement-scoped rollback: a sink that has emitted part of
+    /// a statement before it turned out to be invalid rewinds to the mark it
+    /// took at the statement boundary (see
+    /// [`GraphSink::abort_statement`](crate::GraphSink::abort_statement)).
+    pub fn truncate(&mut self, len: usize) {
+        self.triples.truncate(len);
     }
 
     /// Check if the graph is empty
@@ -120,6 +192,8 @@ impl Graph {
         // Sort first to group duplicates
         self.triples.sort();
         self.triples.dedup();
+        self.reifications.sort();
+        self.reifications.dedup();
     }
 
     /// Sort and dedupe in one pass (canonicalize)
@@ -187,6 +261,7 @@ impl FromIterator<Triple> for Graph {
     fn from_iter<T: IntoIterator<Item = Triple>>(iter: T) -> Self {
         Graph {
             triples: iter.into_iter().collect(),
+            reifications: Vec::new(),
             base: None,
             prefixes: BTreeMap::new(),
         }

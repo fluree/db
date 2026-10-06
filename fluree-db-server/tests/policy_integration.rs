@@ -60,12 +60,29 @@ fn create_jws(claims: &JsonValue, signing_key: &SigningKey) -> String {
 fn identity_token(signing_key: &SigningKey, identity: &str, ledger: &str) -> String {
     let claims = serde_json::json!({
         "iss": did_from_pubkey(&signing_key.verifying_key().to_bytes()),
+        "aud": "fluree-policy-test",
         "exp": now_secs() + 3600,
         "iat": now_secs(),
         "fluree.identity": identity,
         "fluree.ledger.read.ledgers": [ledger],
     });
     create_jws(&claims, signing_key)
+}
+
+fn delegated_token(identity: &str, ledger: &str, policy: JsonValue) -> String {
+    let key = SigningKey::from_bytes(&[200; 32]);
+    create_jws(
+        &serde_json::json!({
+            "iss": did_from_pubkey(&key.verifying_key().to_bytes()),
+            "aud": "fluree-policy-test",
+            "exp": now_secs() + 300,
+            "fluree.identity": identity,
+            "fluree.ledger.read.ledgers": [ledger],
+            "fluree.ledger.write.ledgers": [ledger],
+            "fluree.policy": policy,
+        }),
+        &key,
+    )
 }
 
 async fn policy_test_state() -> (TempDir, Arc<AppState>) {
@@ -76,6 +93,12 @@ async fn policy_test_state() -> (TempDir, Arc<AppState>) {
         storage_path: Some(tmp.path().to_path_buf()),
         data_auth_mode: DataAuthMode::Optional,
         data_auth_insecure_accept_any_issuer: true,
+        data_auth_audience: Some("fluree-policy-test".into()),
+        data_auth_policy_authorities: vec![did_from_pubkey(
+            &SigningKey::from_bytes(&[200; 32])
+                .verifying_key()
+                .to_bytes(),
+        )],
         ..Default::default()
     };
     let telemetry = TelemetryConfig::with_server_config(&cfg);
@@ -245,7 +268,7 @@ async fn setup_policy_ledger(app: axum::Router, ledger: &str) -> axum::Router {
 ///
 /// The query selects `?name` and `?class` for all `ex:Document` subjects.
 /// `default-allow` is controlled by the caller. No `opts.identity` — the
-/// server injects it from the Bearer token via `force_query_auth_opts`.
+/// server binds it from the verified Bearer token.
 async fn query_docs(
     app: axum::Router,
     ledger: &str,
@@ -414,18 +437,9 @@ async fn identity_without_policy_class_default_allow_false_denies_all() {
     );
 }
 
-/// An identity with no subject node in the ledger must be allowed when
-/// `default-allow: true` is set.
-///
-/// Rationale: `default-allow: true` is an explicit admin opt-in that applies to
-/// every requester not specifically restricted by a policy — including unknown
-/// identities. A common pattern is an application layer in front of the DB that
-/// handles authorization itself and uses credential-signed writes only so that
-/// Fluree records *who* transacted for provenance. In that setup a first-time DID
-/// must be able to transact without being pre-provisioned, and reads must follow
-/// the same opt-in. Callers who want fail-closed behavior set `default-allow: false`.
+/// Caller default-allow cannot give an unknown authenticated identity access.
 #[tokio::test]
-async fn unknown_identity_allowed_with_default_allow_true() {
+async fn unknown_identity_cannot_choose_default_allow_true() {
     let (_tmp, state) = policy_test_state().await;
     let app = setup_policy_ledger(build_router(state), "policy5:main").await;
 
@@ -437,14 +451,10 @@ async fn unknown_identity_allowed_with_default_allow_true() {
     );
 
     let (status, json) = query_docs(app, "policy5:main", Some(&token), true).await;
-    assert_eq!(status, StatusCode::OK);
-
-    let names = names_from_results(&json);
-    assert_eq!(
-        names.len(),
-        3,
-        "unknown identity + default-allow:true must see all documents; got: {names:?}"
-    );
+    assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+    assert!(json
+        .to_string()
+        .contains("Credential does not permit policy selection"));
 }
 
 /// A property-level `f:allow: false` on `ex:content` should strip that field
@@ -582,19 +592,9 @@ async fn property_level_deny_hides_ex_content_field() {
     );
 }
 
-/// A **known** identity subject (exists in the ledger) with no `f:policyClass` and
-/// `default-allow: true` should see all documents.
-///
-/// This validates the `FoundNoPolicies` path: the identity subject node is present in the
-/// ledger (so it is not `NotFound`), but it carries no policy class binding. With no
-/// restrictions and `default_allow = true`, access is granted to everything.
-///
-/// Contrast with `unknown_identity_allowed_with_default_allow_true` which uses an
-/// identity that has NO subject node at all (`NotFound`) — that path also now honors
-/// `default_allow`, so both tests succeed for the same reason: empty restrictions +
-/// permissive default.
+/// A local identity record with no policies does not confer delegation authority.
 #[tokio::test]
-async fn known_identity_no_policy_class_default_allow_true_allows_all() {
+async fn unassigned_identity_cannot_choose_default_allow_true() {
     let (_tmp, state) = policy_test_state().await;
     let app = setup_policy_ledger(build_router(state), "policy7:main").await;
 
@@ -625,26 +625,13 @@ async fn known_identity_no_policy_class_default_allow_true_allows_all() {
     );
 
     let (status, json) = query_docs(app, "policy7:main", Some(&token), true).await;
-    assert_eq!(status, StatusCode::OK);
-
-    let names = names_from_results(&json);
-    assert_eq!(
-        names.len(),
-        3,
-        "known identity with no policyClass + default-allow:true must see all 3 docs; got: {names:?}"
-    );
+    assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+    assert!(json
+        .to_string()
+        .contains("Credential does not permit policy selection"));
 }
 
-// ── Root-bearer impersonation tests ──────────────────────────────────────────
-//
-// These exercise the "service-account impersonation" pattern: a bearer
-// identity that has no `f:policyClass` on the target ledger may delegate to a
-// body- or header-supplied target identity for policy testing. The check is
-// performed via `fluree_db_api::identity_has_no_policies` — only the
-// `FoundNoPolicies` outcome enables impersonation.
-
-/// Insert a registered identity subject with no `f:policyClass` so it qualifies
-/// as a root-equivalent (FoundNoPolicies) identity for impersonation.
+/// Register an identity without policy assignments to exercise delegation boundaries.
 async fn register_root_identity(app: &axum::Router, ledger: &str, identity_iri: &str) {
     let tx = serde_json::json!({
         "@context": { "ex": "http://example.org/" },
@@ -669,8 +656,8 @@ async fn register_root_identity(app: &axum::Router, ledger: &str, identity_iri: 
     );
 }
 
-/// Query as `bearer_identity`, requesting impersonation as `target_identity`
-/// via body `opts.identity`. Server should honor when bearer is root.
+/// Query with a bearer token and a conflicting body `opts.identity`.
+/// The verified token's policy selection must govern the result.
 async fn query_docs_as(
     app: axum::Router,
     ledger: &str,
@@ -705,35 +692,36 @@ async fn query_docs_as(
     json_body(resp).await
 }
 
-/// A root bearer (no f:policyClass) can impersonate the employee identity and
-/// receives the employee's filtered view (public + internal docs only).
+/// An explicitly trusted issuer can select employee classes for an app identity.
+/// Matching request identity is accepted.
 #[tokio::test]
-async fn root_bearer_can_impersonate_employee_via_body_opts() {
+async fn policy_authority_can_delegate_employee_access() {
     let (_tmp, state) = policy_test_state().await;
     let app = setup_policy_ledger(build_router(state), "imp1:main").await;
     register_root_identity(&app, "imp1:main", "http://example.org/svc-bearer").await;
 
-    let signing_key = SigningKey::from_bytes(&[10u8; 32]);
-    let token = identity_token(&signing_key, "http://example.org/svc-bearer", "imp1:main");
+    let token = delegated_token(
+        "http://example.org/svc-bearer",
+        "imp1:main",
+        serde_json::json!({"policy-class": ["http://example.org/EmployeeClass"]}),
+    );
 
     let (status, json) =
-        query_docs_as(app, "imp1:main", &token, "http://example.org/employee-user").await;
+        query_docs_as(app, "imp1:main", &token, "http://example.org/svc-bearer").await;
     assert_eq!(status, StatusCode::OK);
 
     let names = names_from_results(&json);
     assert_eq!(
         names.len(),
         2,
-        "impersonating employee should see exactly 2 docs; got: {names:?}"
+        "delegated employee access should see exactly 2 docs; got: {names:?}"
     );
     assert!(names.contains(&"Public Post"));
     assert!(names.contains(&"Internal Memo"));
     assert!(!names.contains(&"Executive Salaries"));
 }
 
-/// A restricted bearer (employee) attempting impersonation has the
-/// `opts.identity` force-overridden by the server back to its own bearer
-/// identity — it sees its own filtered view, NOT the target's.
+/// A restricted bearer receives an explicit refusal for conflicting identity.
 #[tokio::test]
 async fn restricted_bearer_cannot_impersonate_manager() {
     let (_tmp, state) = policy_test_state().await;
@@ -746,33 +734,26 @@ async fn restricted_bearer_cannot_impersonate_manager() {
         "imp2:main",
     );
 
-    // Employee tries to impersonate manager — should be force-overridden.
+    // Employee tries to impersonate manager — reject the conflicting selection.
     let (status, json) =
         query_docs_as(app, "imp2:main", &token, "http://example.org/manager-user").await;
-    assert_eq!(status, StatusCode::OK);
-
-    let names = names_from_results(&json);
-    assert_eq!(
-        names.len(),
-        2,
-        "restricted bearer should see employee view (2 docs), not manager view (3); got: {names:?}"
-    );
-    assert!(!names.contains(&"Executive Salaries"));
+    assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+    assert!(json
+        .to_string()
+        .contains("Credential does not permit policy selection"));
 }
 
-/// Root bearer impersonates via the `fluree-identity` HTTP header on a SPARQL
-/// query; result set matches the impersonated identity's policy.
+/// Signed selection governs SPARQL when identity headers agree.
 #[tokio::test]
-async fn root_bearer_can_impersonate_via_sparql_header() {
+async fn policy_authority_can_delegate_sparql_access() {
     let (_tmp, state) = policy_test_state().await;
     let app = setup_policy_ledger(build_router(state), "imp3:main").await;
     register_root_identity(&app, "imp3:main", "http://example.org/svc-bearer-sparql").await;
 
-    let signing_key = SigningKey::from_bytes(&[12u8; 32]);
-    let token = identity_token(
-        &signing_key,
+    let token = delegated_token(
         "http://example.org/svc-bearer-sparql",
         "imp3:main",
+        serde_json::json!({"policy-class": ["http://example.org/PublicClass"]}),
     );
 
     let sparql = "PREFIX ex: <http://example.org/> \
@@ -786,7 +767,7 @@ async fn root_bearer_can_impersonate_via_sparql_header() {
         .uri("/v1/fluree/query/imp3:main")
         .header("content-type", "application/sparql-query")
         .header("authorization", format!("Bearer {token}"))
-        .header("fluree-identity", "http://example.org/public-user");
+        .header("fluree-identity", "http://example.org/svc-bearer-sparql");
 
     let resp = app
         .oneshot(req.body(Body::from(sparql)).unwrap())
@@ -808,12 +789,12 @@ async fn root_bearer_can_impersonate_via_sparql_header() {
     assert_eq!(
         names.len(),
         1,
-        "impersonated public-user should see 1 doc via SPARQL; got: {names:?}"
+        "delegated public access should see 1 doc via SPARQL; got: {names:?}"
     );
     assert_eq!(names[0], "Public Post");
 }
 
-/// Restricted bearer attempting SPARQL impersonation via header is force-overridden.
+/// Restricted bearer attempting SPARQL impersonation via header is rejected.
 #[tokio::test]
 async fn restricted_bearer_cannot_impersonate_via_sparql_header() {
     let (_tmp, state) = policy_test_state().await;
@@ -845,31 +826,11 @@ async fn restricted_bearer_cannot_impersonate_via_sparql_header() {
         .unwrap();
 
     let (status, json) = json_body(resp).await;
-    assert_eq!(status, StatusCode::OK);
-
-    let bindings = json
-        .pointer("/results/bindings")
-        .and_then(|v| v.as_array())
-        .expect("expected SPARQL results.bindings array");
-    let names: Vec<&str> = bindings
-        .iter()
-        .filter_map(|b| b.pointer("/name/value").and_then(|v| v.as_str()))
-        .collect();
-    assert_eq!(
-        names.len(),
-        2,
-        "restricted SPARQL bearer should see employee view (2), not manager (3); got: {names:?}"
-    );
-    assert!(!names.contains(&"Executive Salaries"));
+    assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+    assert!(json
+        .to_string()
+        .contains("Credential does not permit policy selection"));
 }
-
-// ── Inline policy and policy-values tests ────────────────────────────────────
-//
-// These exercise the ad-hoc policy CLI flags (`--policy` / `--policy-file` and
-// `--policy-values` / `--policy-values-file`) via their on-the-wire forms:
-// body `opts.policy` / `opts.policy-values` for JSON-LD, and
-// `fluree-policy` / `fluree-policy-values` headers for SPARQL. These are the
-// "test policies before persisting them" path.
 
 /// Helper: extract names from SPARQL results bindings.
 fn sparql_names(json: &JsonValue) -> Vec<&str> {
@@ -897,21 +858,12 @@ fn jsonld_select_names(json: &JsonValue) -> Vec<&str> {
         .collect()
 }
 
-/// Helper: build a root bearer token (identity has no f:policyClass on the
-/// ledger, so it qualifies for the impersonation gate when needed).
-async fn root_bearer(app: &axum::Router, ledger: &str, key_byte: u8, identity: &str) -> String {
-    register_root_identity(app, ledger, identity).await;
-    let signing_key = SigningKey::from_bytes(&[key_byte; 32]);
-    identity_token(&signing_key, identity, ledger)
-}
-
 /// Inline JSON-LD policy supplied via `opts.policy` filters results to public
 /// documents only — verifies the `--policy` flag's body-opts transport.
 #[tokio::test]
 async fn inline_policy_via_body_opts_filters_to_public() {
     let (_tmp, state) = policy_test_state().await;
     let app = setup_policy_ledger(build_router(state), "inline1:main").await;
-    let token = root_bearer(&app, "inline1:main", 20, "http://example.org/inline-svc").await;
 
     // Inline policy: only documents with classification = "public" are visible.
     let inline_policy = serde_json::json!([
@@ -938,6 +890,12 @@ async fn inline_policy_via_body_opts_filters_to_public() {
             {"@id": "?doc", "schema:name": "?name"}
         ]
     });
+
+    let token = delegated_token(
+        "http://example.org/inline-svc",
+        "inline1:main",
+        body["opts"].clone(),
+    );
 
     let req = Request::builder()
         .method("POST")
@@ -1237,14 +1195,12 @@ async fn comma_separated_policy_class_header() {
 // ── Write-policy enforcement tests ───────────────────────────────────────────
 //
 // These validate the end-to-end policy path for transactions:
-//   bearer identity → `apply_auth_identity_to_opts`
-//   → `fluree_db_api::build_policy_context`
-//   → `TxBuilder.policy(ctx)` → `Fluree::transact_tracked_with_policy`
+//   verified bearer → authorization binding → consensus governance
+//   → `fluree_db_api::build_transact_policy_context` → policy-enforced commit
 //
-// Covers JSON-LD `/v1/fluree/update`, SPARQL UPDATE, and the impersonation
-// gate's behavior on writes. The setup installs a required `f:modify` gate on
-// the employee class (denies modifying `ex:content` unless the target doc's
-// classification is "internal") and a blanket `f:allow: true` modify policy on
+// Covers JSON-LD `/v1/fluree/update`, SPARQL UPDATE, and explicit delegation
+// on writes. The setup denies employee modifications to `ex:content`
+// and installs a blanket `f:allow: true` modify policy on
 // the manager class, so both the denial and the allow paths exercise real
 // policy evaluation rather than a no-policy fallthrough.
 
@@ -1252,6 +1208,7 @@ async fn comma_separated_policy_class_header() {
 fn identity_token_rw(signing_key: &SigningKey, identity: &str, ledger: &str) -> String {
     let claims = serde_json::json!({
         "iss": did_from_pubkey(&signing_key.verifying_key().to_bytes()),
+        "aud": "fluree-policy-test",
         "exp": now_secs() + 3600,
         "iat": now_secs(),
         "fluree.identity": identity,
@@ -1400,24 +1357,24 @@ async fn manager_bearer_update_allowed() {
     );
 }
 
-/// A root bearer (no `f:policyClass`) impersonating the employee identity via
-/// `opts.identity` is rejected. Policy enforcement follows the impersonated
-/// identity, not the bearer's own unrestricted service-account identity —
-/// impersonation doesn't bypass policy, it tests under the target's view.
+/// Grant-derived employee classes enforce modify restrictions on the write path.
 #[tokio::test]
-async fn root_bearer_impersonating_employee_update_denied() {
+async fn delegated_employee_write_enforces_modify_policy() {
     let (_tmp, state) = policy_test_state().await;
     let app = setup_policy_ledger(build_router(state), "wpol3:main").await;
     add_modify_policies(&app, "wpol3:main").await;
     register_root_identity(&app, "wpol3:main", "http://example.org/svc-writer").await;
 
-    let signing_key = SigningKey::from_bytes(&[32u8; 32]);
-    let token = identity_token_rw(&signing_key, "http://example.org/svc-writer", "wpol3:main");
+    let token = delegated_token(
+        "http://example.org/svc-writer",
+        "wpol3:main",
+        serde_json::json!({"policy-class": ["http://example.org/EmployeeClass"]}),
+    );
 
     let mut body = modify_public_doc_content_body();
     body.as_object_mut().unwrap().insert(
         "opts".to_string(),
-        serde_json::json!({"identity": "http://example.org/employee-user"}),
+        serde_json::json!({"identity": "http://example.org/svc-writer"}),
     );
 
     let req = Request::builder()
@@ -1435,7 +1392,7 @@ async fn root_bearer_impersonating_employee_update_denied() {
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
-        "impersonated employee write must be rejected; got body: {json}"
+        "delegated employee write must be rejected; got body: {json}"
     );
     let err_msg = json
         .get("error")
@@ -1633,7 +1590,18 @@ async fn cypher_classifications(
 #[tokio::test]
 async fn cypher_read_enforces_policy() {
     let (_tmp, state) = policy_test_state().await;
+    let fluree = state.fluree.clone();
     let app = setup_policy_ledger(build_router(state), "cypherpol:main").await;
+    // The seed data is RDF-flavored (`ex:` IRIs); bare Cypher identifiers
+    // reach it through the ledger's `@vocab` — the RDF-compat mode (the
+    // default Cypher resolution is bare namespace-0 names).
+    fluree
+        .set_default_context(
+            "cypherpol:main",
+            &serde_json::json!({"@vocab": "http://example.org/"}),
+        )
+        .await
+        .expect("set @vocab");
 
     let signing_key = SigningKey::from_bytes(&[1u8; 32]);
 
@@ -1669,8 +1637,17 @@ async fn cypher_read_enforces_policy() {
 #[tokio::test]
 async fn cypher_write_under_employee_bearer_denied() {
     let (_tmp, state) = policy_test_state().await;
+    let fluree = state.fluree.clone();
     let app = setup_policy_ledger(build_router(state), "cypherwpol:main").await;
     add_modify_policies(&app, "cypherwpol:main").await;
+    // RDF-compat: bare Cypher names resolve through the ledger `@vocab`.
+    fluree
+        .set_default_context(
+            "cypherwpol:main",
+            &serde_json::json!({"@vocab": "http://example.org/"}),
+        )
+        .await
+        .expect("set @vocab");
 
     let signing_key = SigningKey::from_bytes(&[34u8; 32]);
     let token = identity_token_rw(
@@ -1711,3 +1688,871 @@ async fn cypher_write_under_employee_bearer_denied() {
         "expected exMessage in error; got: {err_msg}"
     );
 }
+
+// ── policy tracking / enforcement reporting ──────────────────────────────────
+
+/// Run the standard document query with policy tracking requested via the
+/// `fluree-track-policy` header, returning the tracked envelope and the
+/// `x-fdb-policy-enforcement` response header.
+async fn tracked_query_docs(
+    app: axum::Router,
+    ledger: &str,
+    token: Option<&str>,
+    default_allow: bool,
+) -> (StatusCode, JsonValue, Option<String>) {
+    let body = serde_json::json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "schema": "http://schema.org/"
+        },
+        "opts": { "default-allow": default_allow },
+        "select": ["?name", "?class"],
+        "where": [
+            {"@id": "?doc", "@type": "ex:Document"},
+            {"@id": "?doc", "schema:name": "?name"},
+            {"@id": "?doc", "ex:classification": "?class"}
+        ]
+    });
+
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/fluree/query/{ledger}"))
+        .header("content-type", "application/json")
+        .header("fluree-track-policy", "true");
+
+    if let Some(tok) = token {
+        req = req.header("authorization", format!("Bearer {tok}"));
+    }
+
+    let resp = app
+        .oneshot(req.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let enforcement_header = resp
+        .headers()
+        .get("x-fdb-policy-enforcement")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let (status, json) = json_body(resp).await;
+    (status, json, enforcement_header)
+}
+
+/// An identity whose policies actually execute reports per-policy counts and
+/// enforcement with a non-empty view-policy set. No test covered the read-path
+/// tally at all before — the only policy-tracking test was on a transaction.
+#[tokio::test]
+async fn tracked_read_under_policies_reports_executed_and_allowed() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "policytrack1:main").await;
+
+    let signing_key = SigningKey::from_bytes(&[11u8; 32]);
+    let token = identity_token(
+        &signing_key,
+        "http://example.org/public-user",
+        "policytrack1:main",
+    );
+
+    let (status, json, enforcement_header) =
+        tracked_query_docs(app, "policytrack1:main", Some(&token), false).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let stats = json["policy"]
+        .as_object()
+        .unwrap_or_else(|| panic!("policy tally should be present; got: {json}"));
+    let public = stats
+        .get("http://example.org/public-policy")
+        .unwrap_or_else(|| panic!("the public policy should have executed; got: {json}"));
+    assert!(
+        public["executed"].as_u64().unwrap_or(0) > 0,
+        "policy executed count should be non-zero; got: {json}"
+    );
+    assert!(
+        public["allowed"].as_u64().unwrap_or(0) > 0,
+        "the public user can see the public doc, so some flakes were allowed; got: {json}"
+    );
+
+    assert_eq!(
+        json["policy_enforcement"],
+        serde_json::json!({"enforced": true, "denies_all_data": false}),
+        "policies exist for this identity, so the view set is not empty; got: {json}"
+    );
+    assert_eq!(
+        enforcement_header.as_deref(),
+        Some(r#"{"enforced":true,"denies_all_data":false}"#),
+        "the same state must ride the response header"
+    );
+}
+
+/// The reported case: an identity with no `f:policyClass` and
+/// `default-allow: false`. The result is empty and no policy ever runs, so the
+/// tally is `{}` — the enforcement record is the only thing distinguishing
+/// this from an unenforced request.
+///
+/// Companion to `identity_without_policy_class_default_allow_false_denies_all`,
+/// which pins the filtering itself.
+#[tokio::test]
+async fn tracked_read_zero_policy_identity_reports_deny_all() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "policytrack2:main").await;
+
+    let signing_key = SigningKey::from_bytes(&[12u8; 32]);
+    let token = identity_token(
+        &signing_key,
+        "http://example.org/unknown-user",
+        "policytrack2:main",
+    );
+
+    let (status, json, enforcement_header) =
+        tracked_query_docs(app, "policytrack2:main", Some(&token), false).await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(
+        json["result"],
+        serde_json::json!([]),
+        "fail-closed: no data rows; got: {json}"
+    );
+    assert_eq!(
+        json["policy"],
+        serde_json::json!({}),
+        "nothing executes under an empty policy set; got: {json}"
+    );
+    assert_eq!(
+        json["policy_enforcement"],
+        serde_json::json!({"enforced": true, "denies_all_data": true}),
+        "enforced, and the configuration grants no view of the data; got: {json}"
+    );
+    assert_eq!(
+        enforcement_header.as_deref(),
+        Some(r#"{"enforced":true,"denies_all_data":true}"#)
+    );
+}
+
+/// An anonymous request explicitly selecting deny must engage enforcement.
+#[tokio::test]
+async fn tracked_read_anonymous_explicit_deny_is_enforced() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "policytrack3:main").await;
+
+    let (status, json, enforcement_header) =
+        tracked_query_docs(app, "policytrack3:main", None, false).await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(json["result"], serde_json::json!([]));
+    assert_eq!(
+        json["policy_enforcement"],
+        serde_json::json!({"enforced": true, "denies_all_data": true})
+    );
+    assert_eq!(
+        enforcement_header.as_deref(),
+        Some(r#"{"enforced":true,"denies_all_data":true}"#)
+    );
+}
+
+/// Creates a ledger with 3 documents, **no policies at all**, and a config graph
+/// declaring `f:defaultAllow <value>`.
+///
+/// Zero policies is the whole point: an identity-carrying request resolves to an
+/// empty restriction set, so `default_allow` alone decides what it sees.
+async fn setup_default_allow_config_ledger(
+    app: axum::Router,
+    ledger: &str,
+    configured_default_allow: bool,
+) -> axum::Router {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "ledger": ledger }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED, "create ledger");
+
+    let config_iri = format!("urn:fluree:{ledger}#config");
+    let trig = format!(
+        r#"
+        @prefix f:      <https://ns.flur.ee/db#> .
+        @prefix rdf:    <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        @prefix ex:     <http://example.org/> .
+        @prefix schema: <http://schema.org/> .
+
+        ex:doc1 rdf:type ex:Document ; schema:name "Public Post" ;
+                ex:classification "public" .
+        ex:doc2 rdf:type ex:Document ; schema:name "Internal Memo" ;
+                ex:classification "internal" .
+        ex:doc3 rdf:type ex:Document ; schema:name "Executive Salaries" ;
+                ex:classification "confidential" .
+
+        GRAPH <{config_iri}> {{
+            <urn:cfg:main> rdf:type f:LedgerConfig .
+            <urn:cfg:main> f:policyDefaults <urn:cfg:policy> .
+            <urn:cfg:policy> f:defaultAllow {configured_default_allow} .
+        }}
+    "#
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/fluree/upsert/{ledger}"))
+                .header("content-type", "application/trig")
+                .body(Body::from(trig))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "seed data + config: {}",
+        resp.status()
+    );
+
+    app
+}
+
+/// Same document query as [`query_docs`], but `default-allow` is only present in
+/// `opts` when the caller names it — the unset case is the one that lets the
+/// ledger's `f:defaultAllow` govern, and it is unreachable through `query_docs`.
+async fn query_docs_tri_state(
+    app: axum::Router,
+    ledger: &str,
+    token: Option<&str>,
+    opts_default_allow: Option<bool>,
+    header_default_allow: Option<&str>,
+) -> (StatusCode, JsonValue) {
+    let mut opts = serde_json::Map::new();
+    if let Some(v) = opts_default_allow {
+        opts.insert("default-allow".to_string(), JsonValue::Bool(v));
+    }
+
+    let body = serde_json::json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "schema": "http://schema.org/"
+        },
+        "opts": JsonValue::Object(opts),
+        "select": ["?name", "?class"],
+        "where": [
+            {"@id": "?doc", "@type": "ex:Document"},
+            {"@id": "?doc", "schema:name": "?name"},
+            {"@id": "?doc", "ex:classification": "?class"}
+        ]
+    });
+
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/fluree/query/{ledger}"))
+        .header("content-type", "application/json");
+
+    if let Some(tok) = token {
+        req = req.header("authorization", format!("Bearer {tok}"));
+    }
+    if let Some(v) = header_default_allow {
+        req = req.header("fluree-default-allow", v);
+    }
+
+    let resp = app
+        .oneshot(req.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+
+    json_body(resp).await
+}
+
+/// The operator scenario, end to end over HTTP: a ledger configured
+/// `f:defaultAllow true` must apply to a request whose only policy signal is the
+/// identity the server injects from the Bearer token.
+///
+/// This is the seam the API-layer tests can't reach — `FlureeHeaders`, the
+/// header→opts injection, and authorization binding all sit between the wire
+/// and `merge_policy_opts`. Before the tri-state change this returned `[]`.
+#[tokio::test]
+async fn config_default_allow_true_applies_to_bearer_identity_over_http() {
+    let (_tmp, state) = policy_test_state().await;
+    let app =
+        setup_default_allow_config_ledger(build_router(state), "policy-cfg-allow:main", true).await;
+
+    let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+    let token = identity_token(
+        &signing_key,
+        "http://example.org/unknown-user",
+        "policy-cfg-allow:main",
+    );
+
+    let (status, json) =
+        query_docs_tri_state(app, "policy-cfg-allow:main", Some(&token), None, None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let names = names_from_results(&json);
+    assert_eq!(
+        names.len(),
+        3,
+        "ledger f:defaultAllow true must govern an identity-only request; got: {names:?}"
+    );
+}
+
+/// The request still wins when it names `default-allow` explicitly — through
+/// body opts and through the `fluree-default-allow` header, which is the path
+/// `inject_into_opts` was restructured for.
+#[tokio::test]
+async fn explicit_request_default_allow_false_overrides_config_over_http() {
+    let (_tmp, state) = policy_test_state().await;
+    let app =
+        setup_default_allow_config_ledger(build_router(state), "policy-cfg-override:main", true)
+            .await;
+
+    let signing_key = SigningKey::from_bytes(&[10u8; 32]);
+    let token = identity_token(
+        &signing_key,
+        "http://example.org/unknown-user",
+        "policy-cfg-override:main",
+    );
+
+    // Body opts.
+    let (status, json) = query_docs_tri_state(
+        app.clone(),
+        "policy-cfg-override:main",
+        Some(&token),
+        Some(false),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let names = names_from_results(&json);
+    assert!(
+        names.is_empty(),
+        "explicit opts default-allow:false must beat config true; got: {names:?}"
+    );
+
+    // Header, with no `default-allow` in the body at all.
+    let (status, json) = query_docs_tri_state(
+        app,
+        "policy-cfg-override:main",
+        Some(&token),
+        None,
+        Some("false"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let names = names_from_results(&json);
+    assert!(
+        names.is_empty(),
+        "explicit fluree-default-allow:false header must beat config true; got: {names:?}"
+    );
+}
+
+/// The seam between the tri-state `f:defaultAllow` change and the enforcement
+/// signal: the signal is derived from the *effective* `default_allow`, so a
+/// ledger that opens itself through config must change it even though the
+/// request never mentions `default-allow`.
+///
+/// Neither half could test this alone — before the tri-state change the config
+/// value never reached an identity-carrying request at all, and the signal
+/// reads whatever the policy wrapper ended up with. Both orientations are
+/// pinned so the signal can't silently decouple from the config it reports on:
+/// an identity with no rules under a configured allow can be denied nothing,
+/// so the context is root and no enforcement is reported; under a configured
+/// deny it is enforced and denies all data.
+#[tokio::test]
+async fn enforcement_signal_follows_configured_default_allow() {
+    async fn tracked_config_query(
+        app: axum::Router,
+        ledger: &str,
+        token: &str,
+    ) -> (StatusCode, JsonValue) {
+        // Note the absence of `default-allow` in opts: leaving it unset is what
+        // lets the ledger's configured value govern.
+        let body = serde_json::json!({
+            "@context": {"ex": "http://example.org/", "schema": "http://schema.org/"},
+            "opts": { "meta": { "policy": true } },
+            "select": ["?name"],
+            "where": [
+                {"@id": "?doc", "@type": "ex:Document"},
+                {"@id": "?doc", "schema:name": "?name"}
+            ]
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/fluree/query/{ledger}"))
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        json_body(resp).await
+    }
+
+    // Configured open: the identity selects no rules and the configuration
+    // allows by default, so nothing can be denied — the context is root and
+    // the request runs unenforced.
+    let (_tmp, state) = policy_test_state().await;
+    let app =
+        setup_default_allow_config_ledger(build_router(state), "policy-cfg-sig-open:main", true)
+            .await;
+    let signing_key = SigningKey::from_bytes(&[21u8; 32]);
+    let token = identity_token(
+        &signing_key,
+        "http://example.org/unknown-user",
+        "policy-cfg-sig-open:main",
+    );
+    let (status, json) = tracked_config_query(app, "policy-cfg-sig-open:main", &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json["result"].as_array().map(Vec::len),
+        Some(3),
+        "config default-allow true opens the ledger to this identity; got: {json}"
+    );
+    assert!(
+        json.get("policy_enforcement")
+            .is_none_or(JsonValue::is_null),
+        "zero rules under a configured allow is root, so no enforcement is claimed; got: {json}"
+    );
+
+    // Configured closed: same request, opposite bit.
+    let (_tmp2, state2) = policy_test_state().await;
+    let app2 =
+        setup_default_allow_config_ledger(build_router(state2), "policy-cfg-sig-shut:main", false)
+            .await;
+    let signing_key2 = SigningKey::from_bytes(&[22u8; 32]);
+    let token2 = identity_token(
+        &signing_key2,
+        "http://example.org/unknown-user",
+        "policy-cfg-sig-shut:main",
+    );
+    let (status, json) = tracked_config_query(app2, "policy-cfg-sig-shut:main", &token2).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json["result"],
+        serde_json::json!([]),
+        "config default-allow false keeps it fail-closed; got: {json}"
+    );
+    assert_eq!(
+        json["policy_enforcement"],
+        serde_json::json!({"enforced": true, "denies_all_data": true}),
+        "no policies and no permissive default: no data flake could return; got: {json}"
+    );
+}
+
+// ── SPARQL `# PRAGMA` policy selection ─────────────────────────────────────
+//
+// A SPARQL request names its policy with pragmas, the counterpart of a JSON-LD
+// body's `opts`. Each test mirrors a header test above: the pragma must select
+// the same policies, win over a header naming the same thing, and be held to a
+// bound credential exactly as a header is.
+
+const DOCS_SPARQL: &str = "PREFIX ex: <http://example.org/>\n\
+                           PREFIX schema: <http://schema.org/>\n\
+                           SELECT ?name WHERE { ?doc a ex:Document ; schema:name ?name . }";
+
+async fn sparql_query(
+    app: axum::Router,
+    ledger: &str,
+    sparql: &str,
+    headers: &[(&str, &str)],
+) -> (StatusCode, JsonValue) {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/fluree/query/{ledger}"))
+        .header("content-type", "application/sparql-query");
+    for (name, value) in headers {
+        req = req.header(*name, *value);
+    }
+    let resp = app
+        .oneshot(req.body(Body::from(sparql.to_string())).unwrap())
+        .await
+        .unwrap();
+    json_body(resp).await
+}
+
+/// Twin of `restricted_bearer_cannot_impersonate_via_sparql_header`.
+#[tokio::test]
+async fn restricted_bearer_cannot_impersonate_via_sparql_pragma() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag1:main").await;
+    let token = identity_token(
+        &SigningKey::from_bytes(&[80u8; 32]),
+        "http://example.org/employee-user",
+        "prag1:main",
+    );
+
+    let sparql = format!("# PRAGMA identity: <http://example.org/manager-user>\n{DOCS_SPARQL}");
+    let bearer = format!("Bearer {token}");
+    let (status, json) =
+        sparql_query(app, "prag1:main", &sparql, &[("authorization", &bearer)]).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+    assert!(json
+        .to_string()
+        .contains("Credential does not permit policy selection"));
+}
+
+/// Twin of `policy_authority_can_delegate_sparql_access`: a pragma naming the
+/// credential's own identity is accepted and the delegated classes apply. A
+/// guard against over-refusal, not a regression test: ignoring the pragma
+/// gives the same answer.
+#[tokio::test]
+async fn delegated_sparql_pragma_identity_is_accepted() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag2:main").await;
+    register_root_identity(&app, "prag2:main", "http://example.org/svc-pragma").await;
+    let token = delegated_token(
+        "http://example.org/svc-pragma",
+        "prag2:main",
+        serde_json::json!({"policy-class": ["http://example.org/PublicClass"]}),
+    );
+
+    let sparql = format!("# PRAGMA identity: <http://example.org/svc-pragma>\n{DOCS_SPARQL}");
+    let bearer = format!("Bearer {token}");
+    let (status, json) =
+        sparql_query(app, "prag2:main", &sparql, &[("authorization", &bearer)]).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(sparql_names(&json), vec!["Public Post"]);
+}
+
+/// Twin of `multi_value_policy_class_via_repeated_sparql_headers`; the classes
+/// are written with the query's own `ex:` prefix.
+#[tokio::test]
+async fn policy_class_via_sparql_pragma_expands_query_prefixes() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag3:main").await;
+
+    let sparql = format!("# PRAGMA policy-class: ex:PublicClass, ex:EmployeeClass\n{DOCS_SPARQL}");
+    let (status, json) = sparql_query(app, "prag3:main", &sparql, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let mut names = sparql_names(&json);
+    names.sort_unstable();
+    assert_eq!(names, vec!["Internal Memo", "Public Post"]);
+}
+
+/// Twin of `policy_values_via_header_for_sparql`. The inline policy document has
+/// no pragma and stays a header; its values and `default-allow` ride pragmas.
+#[tokio::test]
+async fn policy_values_via_sparql_pragma() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag4:main").await;
+    assign_docs_to_identities(&app, "prag4:main").await;
+
+    let inline_policy = serde_json::json!([{
+        "@id": "ex:adhocByAssignment",
+        "@type": "f:AccessPolicy",
+        "f:action": [{"@id": "f:view"}],
+        "f:query": {
+            "@type": "@json",
+            "@value": {
+                "@context": {"ex": "http://example.org/"},
+                "where": [{"@id": "?$this", "ex:assignedTo": "?$identity"}]
+            }
+        }
+    }]);
+    let sparql = format!(
+        "# PRAGMA policy-values: {{\"?$identity\": {{\"@id\": \"http://example.org/manager-user\"}}}}\n\
+         # PRAGMA default-allow: false\n{DOCS_SPARQL}"
+    );
+    let policy = inline_policy.to_string();
+    let (status, json) =
+        sparql_query(app, "prag4:main", &sparql, &[("fluree-policy", &policy)]).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(sparql_names(&json), vec!["Executive Salaries"]);
+}
+
+/// On an unauthenticated request a pragma is the caller's own option, so it
+/// wins over the header that names the same thing — as a JSON-LD body's `opts`
+/// do. Under a credential it may only repeat the headers' selection; see
+/// `request_credential_sparql_pragma_cannot_change_header_selection`.
+#[tokio::test]
+async fn sparql_pragma_policy_class_wins_over_header() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag5:main").await;
+
+    let sparql = format!("# PRAGMA policy-class: ex:ManagerClass\n{DOCS_SPARQL}");
+    let (status, json) = sparql_query(
+        app,
+        "prag5:main",
+        &sparql,
+        &[("fluree-policy-class", "http://example.org/PublicClass")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(sparql_names(&json).len(), 3, "{json}");
+}
+
+/// A gateway that holds the request-selection credential for its user.
+fn request_selection_token(ledger: &str) -> String {
+    delegated_token(
+        "http://example.org/app-gateway",
+        ledger,
+        serde_json::json!("request"),
+    )
+}
+
+/// An application holding a request-selected credential forwards its end
+/// user's SPARQL and selects policy in headers. The text's pragmas may repeat
+/// that selection or narrow `default-allow`, never replace it or add to it: a
+/// class beside the header's identity would select the rules, and
+/// `default-allow: true` would widen them.
+#[tokio::test]
+async fn request_credential_sparql_pragma_cannot_change_header_selection() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag10:main").await;
+    let bearer = format!("Bearer {}", request_selection_token("prag10:main"));
+    let run = |pragma: &str, headers: Vec<(&'static str, &'static str)>| {
+        let app = app.clone();
+        let bearer = bearer.clone();
+        let sparql = format!("{pragma}\n{DOCS_SPARQL}");
+        async move {
+            let mut headers: Vec<(&str, &str)> = headers;
+            headers.push(("authorization", &bearer));
+            let (status, json) = sparql_query(app, "prag10:main", &sparql, &headers).await;
+            let mut names: Vec<String> =
+                sparql_names(&json).into_iter().map(String::from).collect();
+            names.sort_unstable();
+            (status, json, names)
+        }
+    };
+    let employee = || vec![("fluree-identity", "http://example.org/employee-user")];
+
+    for pragma in [
+        "",
+        "# PRAGMA identity: <http://example.org/employee-user>",
+        "# PRAGMA default-allow: false",
+    ] {
+        let (status, json, names) = run(pragma, employee()).await;
+        assert_eq!(status, StatusCode::OK, "{pragma:?}: {json}");
+        assert_eq!(names, ["Internal Memo", "Public Post"], "{pragma:?}");
+    }
+
+    for pragma in [
+        "# PRAGMA identity: <http://example.org/manager-user>",
+        "# PRAGMA policy-class: ex:ManagerClass",
+        "# PRAGMA default-allow: true",
+    ] {
+        let (status, json, _) = run(pragma, employee()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{pragma:?}: {json}");
+        assert!(!json.to_string().contains("Executive Salaries"), "{json}");
+    }
+
+    let (status, json, _) = run(
+        "# PRAGMA policy-class: ex:ManagerClass",
+        vec![("fluree-policy-class", "http://example.org/EmployeeClass")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+
+    // Headers that select nothing leave the selection to the pragmas.
+    let (status, json, names) = run(
+        "# PRAGMA identity: <http://example.org/employee-user>",
+        vec![],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(names, ["Internal Memo", "Public Post"]);
+}
+
+fn rewrite_doc1_content_sparql(identity: &str) -> String {
+    format!(
+        "# PRAGMA identity: <{identity}>\n\
+         PREFIX ex: <http://example.org/>\n\
+         DELETE {{ ex:doc1 ex:content ?c }}\n\
+         INSERT {{ ex:doc1 ex:content \"rewritten\" }}\n\
+         WHERE {{ ex:doc1 ex:content ?c }}"
+    )
+}
+
+async fn sparql_update(
+    app: axum::Router,
+    ledger: &str,
+    sparql: &str,
+    token: Option<&str>,
+) -> (StatusCode, JsonValue) {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/fluree/update/{ledger}"))
+        .header("content-type", "application/sparql-update");
+    if let Some(token) = token {
+        req = req.header("authorization", format!("Bearer {token}"));
+    }
+    let resp = app
+        .oneshot(req.body(Body::from(sparql.to_string())).unwrap())
+        .await
+        .unwrap();
+    json_body(resp).await
+}
+
+/// Twin of `sparql_update_under_employee_bearer_denied`, with the identity
+/// named by pragma on an unauthenticated request; the manager control shows
+/// the gate is real.
+#[tokio::test]
+async fn sparql_update_pragma_identity_enforces_modify_policy() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag6:main").await;
+    add_modify_policies(&app, "prag6:main").await;
+
+    let employee = rewrite_doc1_content_sparql("http://example.org/employee-user");
+    let (status, json) = sparql_update(app.clone(), "prag6:main", &employee, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    assert!(
+        json.to_string()
+            .contains("Employees may not modify document content."),
+        "{json}"
+    );
+
+    let manager = rewrite_doc1_content_sparql("http://example.org/manager-user");
+    let (status, json) = sparql_update(app, "prag6:main", &manager, None).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+}
+
+#[tokio::test]
+async fn sparql_update_pragma_cannot_escape_bearer_identity() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag7:main").await;
+    add_modify_policies(&app, "prag7:main").await;
+    let token = identity_token_rw(
+        &SigningKey::from_bytes(&[81u8; 32]),
+        "http://example.org/employee-user",
+        "prag7:main",
+    );
+
+    let sparql = rewrite_doc1_content_sparql("http://example.org/manager-user");
+    let (status, json) = sparql_update(app, "prag7:main", &sparql, Some(&token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+    assert!(json
+        .to_string()
+        .contains("Credential does not permit policy selection"));
+}
+
+/// The update twin of `request_credential_sparql_pragma_cannot_change_header_selection`.
+/// The pragma's identity would also be recorded as the commit's author.
+#[tokio::test]
+async fn request_credential_sparql_update_pragma_cannot_replace_header_identity() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag11:main").await;
+    add_modify_policies(&app, "prag11:main").await;
+    let bearer = format!("Bearer {}", request_selection_token("prag11:main"));
+    let update = |sparql: String| {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/fluree/update/prag11:main")
+            .header("content-type", "application/sparql-update")
+            .header("authorization", &bearer)
+            .header("fluree-identity", "http://example.org/employee-user")
+            .body(Body::from(sparql))
+            .unwrap();
+        let app = app.clone();
+        async move { json_body(app.oneshot(req).await.unwrap()).await }
+    };
+
+    // Repeating the header's identity is accepted, and its policy still governs.
+    let (status, json) = update(rewrite_doc1_content_sparql(
+        "http://example.org/employee-user",
+    ))
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "control: {json}");
+    assert!(
+        json.to_string()
+            .contains("Employees may not modify document content."),
+        "{json}"
+    );
+
+    let (status, json) = update(rewrite_doc1_content_sparql(
+        "http://example.org/manager-user",
+    ))
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+}
+
+fn docs_alias(ledger: &str, pragma: &str) -> JsonValue {
+    serde_json::json!({
+        "queries": {
+            "sparql_docs": {
+                "language": "sparql",
+                "query": format!(
+                    "{pragma}\nPREFIX ex: <http://example.org/>\n\
+                     PREFIX schema: <http://schema.org/>\n\
+                     SELECT ?name FROM <{ledger}> WHERE {{ ?doc a ex:Document ; schema:name ?name }}"
+                )
+            }
+        }
+    })
+}
+
+/// Twin of `multi_query_sparql_alias_enforces_policy_for_restricted_identity`:
+/// an alias's pragma cannot lift the bearer's policy.
+#[tokio::test]
+async fn multi_query_sparql_alias_pragma_cannot_escape_bearer() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag8:main").await;
+    let token = identity_token(
+        &SigningKey::from_bytes(&[82u8; 32]),
+        "http://example.org/public-user",
+        "prag8:main",
+    );
+
+    let envelope = docs_alias(
+        "prag8:main",
+        "# PRAGMA identity: <http://example.org/manager-user>",
+    );
+    let (status, body) = post_envelope(app, &envelope, Some(&token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(!body.to_string().contains("Executive Salaries"), "{body}");
+}
+
+/// Under a request-selected credential, the envelope's selection is the
+/// application's, and an alias's pragmas may only repeat it.
+#[tokio::test]
+async fn request_credential_multi_query_alias_pragma_cannot_change_envelope_selection() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag12:main").await;
+    let token = request_selection_token("prag12:main");
+    let envelope = |pragma: &str| {
+        let mut envelope = docs_alias("prag12:main", pragma);
+        envelope["opts"] = serde_json::json!({"identity": "http://example.org/employee-user"});
+        envelope
+    };
+
+    let (status, body) = post_envelope(app.clone(), &envelope(""), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let alias = serde_json::to_string(&body["results"]["sparql_docs"]).unwrap();
+    assert!(alias.contains("Internal Memo"), "control: {alias}");
+    assert!(!alias.contains("Executive Salaries"), "control: {alias}");
+
+    let (status, body) = post_envelope(
+        app,
+        &envelope("# PRAGMA identity: <http://example.org/manager-user>"),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(!body.to_string().contains("Executive Salaries"), "{body}");
+}
+
+/// An alias's pragma selects its policy the way its JSON-LD twin's body `opts`
+/// do.
+#[tokio::test]
+async fn multi_query_sparql_alias_pragma_selects_policy() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag9:main").await;
+
+    let envelope = docs_alias("prag9:main", "# PRAGMA policy-class: ex:PublicClass");
+    let (status, body) = post_envelope(app, &envelope, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let alias = serde_json::to_string(&body["results"]["sparql_docs"]).unwrap();
+    assert!(alias.contains("Public Post"), "{alias}");
+    assert!(
+        !alias.contains("Internal Memo") && !alias.contains("Executive Salaries"),
+        "{alias}"
+    );
+}
+
+#[path = "policy_authorization_regression.rs"]
+mod policy_authorization_regression;

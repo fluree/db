@@ -55,12 +55,19 @@
 //! Downstream consumers (HTTP servers, custom dispatchers) can also
 //! call [`run_envelope`] directly if they want to skip the builder.
 
+use fluree_db_core::clock::Instant;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Duration;
 
 use serde_json::Value as JsonValue;
+// Used only by the native parallel dispatcher; the wasm32 twin runs
+// sequentially without spawn or deadline machinery.
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::sync::Semaphore;
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::task::JoinSet;
+#[cfg(not(target_arch = "wasm32"))]
 use tracing::Instrument;
 
 use super::response::{assemble_response, ResponseAssemblyError};
@@ -155,12 +162,18 @@ pub(crate) struct AliasOutcome {
 pub(crate) enum AliasOutcomeKind {
     Success {
         data: JsonValue,
-        tally: Option<TrackingTally>,
+        /// Boxed: a tally is several optional maps and lists, far larger than
+        /// the other variants.
+        tally: Option<Box<TrackingTally>>,
     },
     Error {
         code: String,
         message: String,
     },
+    /// Only the native dispatcher constructs this — the wasm32 twin runs
+    /// without deadline enforcement (no monotonic-timer machinery there) —
+    /// but response assembly consumes it on every target.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     Timeout {
         /// Effective timeout that fired, in milliseconds. May be the
         /// envelope wall deadline or the sub-query's own
@@ -460,6 +473,7 @@ pub(crate) async fn run_envelope(
 ///
 /// Crate-internal — exposed via [`run_envelope`] which feeds the
 /// outcomes through [`assemble_response`].
+#[cfg(not(target_arch = "wasm32"))]
 async fn dispatch_subqueries(
     fluree: Arc<Fluree>,
     envelope: MultiQueryRequest,
@@ -541,28 +555,7 @@ async fn dispatch_subqueries(
                 );
                 let kind = match tokio::time::timeout(effective, exec).await {
                     Ok(Ok(output)) => {
-                        // Per-sub-query post-format size check. If a
-                        // single sub-query already exceeds the cap we
-                        // mark it as an error and drop the data, so a
-                        // runaway query doesn't sit in memory waiting
-                        // for envelope assembly to reject it.
-                        let bytes = serde_json::to_vec(&output.data)
-                            .map(|v| v.len())
-                            .unwrap_or(0);
-                        if bytes > config.max_subquery_response_bytes {
-                            AliasOutcomeKind::Error {
-                                code: "response_too_large".into(),
-                                message: format!(
-                                    "sub-query result is {bytes} bytes, exceeds per-sub-query cap of {} bytes",
-                                    config.max_subquery_response_bytes
-                                ),
-                            }
-                        } else {
-                            AliasOutcomeKind::Success {
-                                data: output.data,
-                                tally: output.tally,
-                            }
-                        }
+                        success_or_size_error(output, config.max_subquery_response_bytes)
                     }
                     Ok(Err(api_err)) => AliasOutcomeKind::Error {
                         code: classify_error(&api_err),
@@ -644,6 +637,72 @@ async fn dispatch_subqueries(
         .collect()
 }
 
+/// Per-sub-query post-format size check, shared by the native (parallel)
+/// and wasm32 (sequential) dispatchers. If a single sub-query already
+/// exceeds the cap we mark it as an error and drop the data, so a runaway
+/// query doesn't sit in memory waiting for envelope assembly to reject it.
+fn success_or_size_error(output: SubqueryOutput, max_bytes: usize) -> AliasOutcomeKind {
+    let bytes = serde_json::to_vec(&output.data)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    if bytes > max_bytes {
+        AliasOutcomeKind::Error {
+            code: "response_too_large".into(),
+            message: format!(
+                "sub-query result is {bytes} bytes, exceeds per-sub-query cap of {max_bytes} bytes"
+            ),
+        }
+    } else {
+        AliasOutcomeKind::Success {
+            data: output.data,
+            tally: output.tally.map(Box::new),
+        }
+    }
+}
+
+/// wasm32 twin of [`dispatch_subqueries`]: single-threaded and without an
+/// ambient tokio runtime — `JoinSet::spawn` would panic and
+/// `tokio::time::{timeout, sleep_until}` abort at their first
+/// `std::time::Instant` read. Sub-queries run sequentially with no deadline
+/// enforcement; cancelling a runaway envelope on wasm is the embedder's job
+/// (dropping the future from the browser side).
+#[cfg(target_arch = "wasm32")]
+async fn dispatch_subqueries(
+    fluree: Arc<Fluree>,
+    envelope: MultiQueryRequest,
+    snapshot: Arc<EnvelopeSnapshot>,
+    config: DispatchConfig,
+    default_format: Option<FormatterConfig>,
+    execution: QueryExecutionOptions,
+) -> Vec<AliasOutcome> {
+    let envelope_context = envelope.context.clone();
+    let envelope_opts = envelope.opts.clone();
+
+    let mut outcomes = Vec::with_capacity(envelope.queries.len());
+    for (alias, sub) in envelope.queries {
+        tracing::debug!(alias = %alias, "mq.sub.sequential");
+        let kind = match execute_subquery(
+            fluree.as_ref(),
+            sub,
+            envelope_context.as_ref(),
+            envelope_opts.as_ref(),
+            default_format.as_ref(),
+            snapshot.as_ref(),
+            execution.clone(),
+        )
+        .await
+        {
+            Ok(output) => success_or_size_error(output, config.max_subquery_response_bytes),
+            Err(api_err) => AliasOutcomeKind::Error {
+                code: classify_error(&api_err),
+                message: api_err.to_string(),
+            },
+        };
+        outcomes.push(AliasOutcome { alias, kind });
+    }
+    outcomes
+}
+
 /// Build the rewritten sub-query body (merged @context/opts + snapshot
 /// applied), then dispatch to the language-specific helper and return
 /// the raw output. Errors propagate as `ApiError` which the dispatcher
@@ -671,12 +730,22 @@ async fn execute_subquery(
     // user-supplied envelope `meta: true` clobber a server-forced
     // bearer identity. Precedence (most specific wins):
     //
-    //   sub.query["opts"]   ← body (server may pre-inject here)
+    //   sub.query["opts"]   ← body (server may pre-inject here); for a
+    //                         SPARQL alias, its `# PRAGMA` options
     //   sub.opts            ← per-sub-query override
     //   envelope.opts       ← envelope defaults
-    let body_opts = sub.query.as_object().and_then(|o| o.get("opts").cloned());
+    let body_opts = match sub.language {
+        SubqueryLanguage::JsonLd => sub.query.as_object().and_then(|o| o.get("opts").cloned()),
+        SubqueryLanguage::Sparql => {
+            super::sparql_pragma_opts(sub.query.as_str().unwrap_or_default())
+                .map_err(ApiError::invalid_query)?
+        }
+    };
     let envelope_with_sub = merged_opts(envelope_opts, sub.opts.as_ref());
-    let merged_opts_val = merged_opts(envelope_with_sub.as_ref(), body_opts.as_ref());
+    let mut merged_opts_val = merged_opts(envelope_with_sub.as_ref(), body_opts.as_ref());
+    if matches!(sub.language, SubqueryLanguage::Sparql) {
+        super::hold_pragma_tracking(&mut merged_opts_val, envelope_with_sub.as_ref());
+    }
     let tracking_opts = TrackingOptions::from_opts_value(merged_opts_val.as_ref());
     let tracking_enabled = tracking_opts.track_time
         || tracking_opts.track_fuel
@@ -750,19 +819,21 @@ async fn execute_subquery(
                 .filter(|cfg| !matches!(cfg.format, OutputFormat::JsonLd))
                 .cloned();
 
-            // Policy enforcement for SPARQL aliases. SPARQL bodies carry no
-            // `opts` block, so identity / policy-class / inline policy can only
-            // reach execution through the merged envelope/sub opts assembled
-            // above. Parse them into `GovernanceOptions` and thread them
+            // Policy enforcement for SPARQL aliases. Identity / policy-class /
+            // inline policy reach execution through the merged envelope/sub/
+            // pragma opts assembled above. Parse them into `GovernanceOptions` and thread them
             // down; `run_sparql_subquery` only diverts to the policy path when
             // an actual policy input is present. The identity here is whatever
             // the caller (HTTP handler) resolved through its impersonation gate
             // — this layer stays authn/authz-agnostic, mirroring JSON-LD.
-            let policy_opts = match &merged_opts_val {
+            let mut policy_opts = match &merged_opts_val {
                 Some(opts) => GovernanceOptions::from_json(&serde_json::json!({ "opts": opts }))
                     .map_err(|e| ApiError::query(format!("invalid sub-query opts: {e}")))?,
                 None => GovernanceOptions::default(),
             };
+            // The verified identity for `f:overrideControl` never comes from
+            // the envelope; it rides the execution options from the auth layer.
+            policy_opts.server_identity = execution.server_identity.clone();
             run_sparql_subquery(
                 fluree,
                 &with_snapshot,
@@ -784,6 +855,7 @@ async fn execute_subquery(
 /// check this helper would diverge from the merge — body-level
 /// `opts.timeoutMs` would show up in the merged opts but never reach
 /// `tokio::time::timeout`.
+#[cfg(not(target_arch = "wasm32"))]
 fn sub_query_timeout_ms(
     sub: &MultiQuerySubquery,
     envelope_opts: Option<&JsonValue>,

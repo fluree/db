@@ -44,6 +44,7 @@ pub(crate) mod fast_group_count_firsts;
 pub(crate) mod fast_label_regex_type;
 pub(crate) mod fast_min_max_string;
 pub(crate) mod fast_path_common;
+pub mod fast_path_outcome;
 pub(crate) mod fast_path_plus_count_all;
 pub(crate) mod fast_post_order_limit;
 pub(crate) mod fast_predicate_scalar_agg;
@@ -52,8 +53,11 @@ pub(crate) mod fast_string_fold;
 pub(crate) mod fast_string_prefix_count_all;
 pub(crate) mod fast_sum_strlen_group_concat;
 pub(crate) mod fast_union_star_count_all;
+pub(crate) mod fast_vector_topk;
+pub(crate) mod fast_whole_graph_agg;
 pub mod filter;
 pub(crate) mod filter_fold;
+pub(crate) mod frontier;
 pub mod geo_rewrite;
 pub mod geo_search;
 pub mod graph;
@@ -63,13 +67,16 @@ pub mod hash_join;
 pub mod having;
 pub mod ir;
 pub mod join;
+pub mod lang_support;
 pub mod limit;
 pub mod materializer;
+pub(crate) mod membership_join;
 pub mod minus;
 pub(crate) mod object_binding;
 pub mod offset;
 pub mod operator;
 pub mod optional;
+pub(crate) mod optional_filter_fold;
 pub mod parse;
 pub mod plan_node;
 pub mod planner;
@@ -78,10 +85,12 @@ pub mod project;
 pub mod property_join;
 pub mod property_path;
 pub mod r2rml;
+pub mod range_semijoin;
 pub mod reasoning;
 pub mod remote_service;
 pub mod rewrite;
 pub mod rewrite_owl_ql;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod s2_search;
 pub mod schema_bundle;
 pub mod search_readability;
@@ -108,15 +117,17 @@ pub use binary_history::BinaryHistoryScanOperator;
 pub use binary_range::BinaryRangeProvider;
 pub use binary_scan::BinaryScanOperator;
 pub use bind::BindOperator;
-pub use binding::{Batch, BatchError, BatchView, Binding, RelValue, RowAccess, RowView};
+pub use binding::{
+    Batch, BatchError, BatchView, Binding, RelValue, RowAccess, RowView, UnmatchedOptional,
+};
 pub use context::{ExecutionContext, WellKnownDatatypes};
 pub use dataset::{ActiveGraph, ActiveGraphs, DataSet, GraphRef};
 pub use dataset_operator::{DatasetBuilder, DatasetOperator, ScanDatasetBuilder};
 pub use distinct::DistinctOperator;
 pub use error::{QueryError, Result};
 pub use execute::{
-    build_operator_tree, execute, expand_edge_annotation_patterns, run_operator, ContextConfig,
-    ExecutableQuery,
+    build_operator_tree, execute, expand_edge_annotation_patterns, fast_paths_disabled,
+    run_operator, set_fast_paths_disabled, ContextConfig, ExecutableQuery,
 };
 pub use exists::ExistsOperator;
 pub use explain::{
@@ -137,7 +148,7 @@ pub use ir::{
 };
 pub use join::{BindInstruction, NestedLoopJoinOperator, PatternPosition, UnifyInstruction};
 pub use limit::LimitOperator;
-pub use materializer::{ComparableValue, JoinKey, Materializer};
+pub use materializer::{ComparableValue, JoinKey, JoinKeyMode, Materializer};
 pub use minus::MinusOperator;
 pub use offset::OffsetOperator;
 pub use operator::{BoxedOperator, Operator, OperatorState};
@@ -158,7 +169,7 @@ pub use rewrite_owl_ql::{rewrite_owl_ql_patterns, Ontology, OwlQlContext};
 pub use seed::{EmptyOperator, SeedOperator};
 pub use shortest_path::ShortestPathOperator;
 pub use sort::{compare_bindings, compare_flake_values, SortDirection, SortOperator, SortSpec};
-pub use stats_query::StatsCountByPredicateOperator;
+pub use stats_query::stats_count_by_predicate_operator;
 pub use subquery::SubqueryOperator;
 pub use temporal_mode::{PlanningContext, TemporalMode};
 pub use unwind::UnwindOperator;
@@ -312,7 +323,8 @@ impl Drop for WhereCursor<'_> {
 /// Strict-by-default: bind evaluation errors become query errors, matching
 /// the strict semantics of [`execute::ContextConfig`]. `dataset = Some(_)`
 /// enables GRAPH pattern resolution against named graphs; `None` is the
-/// single-graph case.
+/// single-graph case. `unmatched_optional` is the WHERE's surface-language
+/// OPTIONAL null semantics (Cypher writes pass `Poisoned`).
 ///
 /// History-range planning is detected at the dataset/view layer
 /// (`view::dataset_query`) before this entry point runs; the WHERE-clause
@@ -322,6 +334,7 @@ pub async fn execute_where_streaming<'a>(
     vars: &'a VarRegistry,
     patterns: &[Pattern],
     dataset: Option<&'a DataSet<'a>>,
+    unmatched_optional: UnmatchedOptional,
 ) -> Result<WhereCursor<'a>> {
     if patterns.is_empty() {
         let schema: Arc<[VarId]> = Arc::new([]);
@@ -333,17 +346,42 @@ pub async fn execute_where_streaming<'a>(
         });
     }
 
+    // Plan with the same cached stats view the read path uses — without it,
+    // `reorder_patterns` falls back to default selectivities, where a bound-
+    // object seek (`?a <id> 4112` → 1 row) ties with a class scan
+    // (`?a rdf:type User` → N rows) and lowering order wins, turning an
+    // update's anchored MATCH into a full label scan.
+    //
+    // A WHERE that is one plain triple has no join order to choose (index
+    // selection is fixed by the bound terms), so skip the stats view
+    // entirely: its cache key includes the overlay epoch, which advances on
+    // every commit, so under a write-heavy load every update's WHERE misses
+    // the cache and rebuilds the novelty-merged view — measured at +60% on
+    // pattern-form deletes (`DELETE WHERE { <s> ?p ?o }`). A single compound
+    // pattern (UNION/OPTIONAL/subquery) still carries interior join
+    // decisions and keeps the stats-driven planning.
+    let single_triple = patterns.len() == 1 && matches!(patterns[0], Pattern::Triple(_));
+    let stats = if single_triple {
+        None
+    } else {
+        let binary_store = ExecutionContext::extract_binary_store(db.snapshot);
+        stats_cache::cached_stats_view_for_db(db, binary_store.as_ref(), false)
+    };
+
     let mut ctx = ExecutionContext::from_graph_db_ref(db, vars).with_strict_bind_errors();
     if let Some(ds) = dataset {
         ctx = ctx.with_dataset(ds);
     }
-    let mut operator = build_where_operators_seeded(
-        None,
-        patterns,
-        None,
-        None,
-        &temporal_mode::PlanningContext::current(),
-    )?;
+    // The UPDATE-WHERE path can carry a multi-member default union
+    // (`USING <g1> USING <g2>`): arm the SPARQL §13.2 set-merge exactly as
+    // the query path does (#1469), so a triple present in both graphs binds
+    // ONE solution — observable e.g. through per-solution INSERT-template
+    // blank minting. Single-graph datasets keep the flag off (byte-identical
+    // planning).
+    let planning = temporal_mode::PlanningContext::current()
+        .with_multi_default_graph(dataset.is_some_and(|ds| ds.default_graphs().len() >= 2))
+        .with_unmatched_optional(unmatched_optional);
+    let mut operator = build_where_operators_seeded(None, patterns, stats, None, &planning)?;
     operator.open(&ctx).await?;
     Ok(WhereCursor {
         inner: CursorInner::Operator(Box::new(WhereCursorOperator {
@@ -366,7 +404,8 @@ pub async fn execute_where<'a>(
     patterns: &[Pattern],
     dataset: Option<&'a DataSet<'a>>,
 ) -> Result<Vec<Batch>> {
-    let mut cursor = execute_where_streaming(db, vars, patterns, dataset).await?;
+    let mut cursor =
+        execute_where_streaming(db, vars, patterns, dataset, UnmatchedOptional::default()).await?;
     let mut batches = Vec::new();
     while let Some(batch) = cursor.next_batch().await? {
         batches.push(batch);
@@ -405,9 +444,10 @@ mod tests {
         let overlay = NoOverlay;
         let db = GraphDbRef::new(&snapshot, 0, &overlay, 0);
 
-        let mut cursor = execute_where_streaming(db, &vars, &[], None)
-            .await
-            .expect("cursor");
+        let mut cursor =
+            execute_where_streaming(db, &vars, &[], None, UnmatchedOptional::default())
+                .await
+                .expect("cursor");
 
         let first: Option<Batch> = cursor.next_batch().await.expect("first");
         assert!(first.is_some(), "empty-patterns cursor emits one batch");
@@ -432,9 +472,10 @@ mod tests {
         let overlay = NoOverlay;
         let db = GraphDbRef::new(&snapshot, 0, &overlay, 0);
 
-        let mut cursor = execute_where_streaming(db, &vars, &[], None)
-            .await
-            .expect("cursor");
+        let mut cursor =
+            execute_where_streaming(db, &vars, &[], None, UnmatchedOptional::default())
+                .await
+                .expect("cursor");
 
         let _ = cursor.next_batch().await.expect("first");
         cursor.close();
@@ -456,9 +497,10 @@ mod tests {
         let overlay = NoOverlay;
         let db = GraphDbRef::new(&snapshot, 0, &overlay, 0);
 
-        let mut cursor = execute_where_streaming(db, &vars, &[], None)
-            .await
-            .expect("cursor");
+        let mut cursor =
+            execute_where_streaming(db, &vars, &[], None, UnmatchedOptional::default())
+                .await
+                .expect("cursor");
 
         // Close BEFORE consuming the pending empty batch.
         cursor.close();

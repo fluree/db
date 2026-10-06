@@ -87,6 +87,7 @@ The request is malformed or contains invalid data.
 - Invalid SPARQL syntax
 - Invalid IRI format
 - Type mismatch
+- Invalid branch operation (`err:api/BadRequest`), such as branching from a ledger with no commits or merging a branch into itself
 
 **Error typing:**
 
@@ -179,6 +180,23 @@ The requested resource doesn't exist.
 - Check if ledger was created
 - Verify entity IRI
 
+A dataset member (`FROM` / `FROM NAMED`, JSON-LD `from` / `fromNamed`, or a
+`graph()` / `db()` address) that names a graph its ledger does not have is a
+404 with `@type` `err:db/GraphNotFound`:
+
+```json
+{
+  "error": "Graph not found: ...",
+  "status": 404,
+  "@type": "err:db/GraphNotFound"
+}
+```
+
+A commit reference that names no commit of the ledger (an `@commit:` pin,
+`at`, commit show's `commit`, or a revert's commits) is a 404 with `@type`
+`err:db/CommitNotFound`. A malformed one (too short, an abbreviated CID, or a
+prefix that matches several commits) is a 400.
+
 #### 408 Request Timeout
 
 The request took too long to process.
@@ -211,6 +229,7 @@ The request conflicts with current server state.
 **Common Causes:**
 - Concurrent modification conflict
 - Ledger already exists
+- Branch conflict (`err:db/CommitConflict`), such as a merge or rebase with `strategy=abort` meeting conflicting changes, or another maintenance operation holding the ledger (retry when it completes)
 - Resource state conflict
 
 **Example:**
@@ -229,27 +248,41 @@ The request conflicts with current server state.
 
 #### 413 Payload Too Large
 
-The request or response exceeds size limits.
+The request was refused because of its size. The server emits **two distinct
+`@type` codes** on this status — clients must branch on `@type`, not the
+status, because the remedies differ.
 
-**Common Causes:**
-- Transaction too large
-- Query result too large
-- Request body exceeds limit
+**`err:db/PayloadTooLarge`** — the raw HTTP request body exceeds the server's
+configured body-size limit. Rejected before parsing; nothing was staged.
 
-**Example:**
 ```json
 {
-  "error": "request body exceeds configured limit",
+  "error": "request body exceeds the configured limit",
   "status": 413,
   "@type": "err:db/PayloadTooLarge"
 }
 ```
 
-**How to Fix:**
-- Split large transactions into batches
-- Use LIMIT clause for queries
-- Use pagination for large result sets
-- Increase size limits (if appropriate)
+Fix: send a smaller request (split large transactions into batches) or raise
+the server's body limit.
+
+**`err:db/NoveltyDeltaTooLarge`** — the parsed transaction's novelty delta
+alone meets or exceeds `reindex_max_bytes`, so no amount of indexer draining
+can ever admit it. This is a permanent refusal of this payload at this
+configuration — retrying the same request can never succeed, which is why it
+is a 413 and not the retryable 503 below, and why it never carries
+`Retry-After`.
+
+```json
+{
+  "error": "Transaction would exceed novelty limit: current=0, delta=2048576, max=1048576",
+  "status": 413,
+  "@type": "err:db/NoveltyDeltaTooLarge"
+}
+```
+
+Fix: split the transaction into smaller pieces (each below
+`reindex_max_bytes`) or raise `--reindex-max-bytes`.
 
 #### 415 Unsupported Media Type
 
@@ -296,6 +329,28 @@ The request is well-formed but semantically invalid.
 - Validate data before submitting
 - Check business rules
 - Review constraint requirements
+
+**`err:db/DatatypeLimitExceeded`**: the write would bring the ledger past the
+number of distinct datatypes its index can store. Fifteen common datatypes
+are reserved and never count, among them `xsd:string`, `xsd:integer`, and
+`rdf:langString`. A ledger holds at most 16,369 others, including other XSD
+types such as `xsd:int`. Each datatype IRI counts once, from the first write
+that uses it, and still counts after its data is retracted. See
+[Datatype Limit](../concepts/datatypes.md#datatype-limit). The write is refused before anything is committed, so the ledger
+is unchanged. Transactions, SPARQL updates, and pushed commits all return
+this code.
+
+```json
+{
+  "error": "datatype limit exceeded: the ledger holds 16369 of at most 16369 non-reserved datatypes, and this write would add 1 more",
+  "status": 422,
+  "@type": "err:db/DatatypeLimitExceeded"
+}
+```
+
+Datatype IDs are never released, so retrying the same write cannot succeed,
+and the response carries no `Retry-After`. Fix: type the new values with
+datatypes the ledger already holds.
 
 #### 429 Too Many Requests
 
@@ -380,31 +435,38 @@ Error communicating with upstream service.
 
 #### 503 Service Unavailable
 
-The server is temporarily unavailable.
+Retryable capacity pressure: every 503 this server emits means "the request
+was refused by a condition that clears on its own — come back shortly". None
+of them indicate a fault in the request. The `@type` identifies the cause:
 
-**Common Causes:**
-- Server overloaded
-- Maintenance mode
-- Resource exhaustion
+| `@type` | Cause |
+|---|---|
+| `err:db/NoveltyAtMax` | Novelty backpressure: in-memory novelty is at `reindex_max_bytes` (or this transaction would cross it, while still fitting once novelty drains). Clears when the indexer catches up. |
+| `err:db/NoveltyDeferred` | Materialization deferred by the same novelty capacity condition (including a fan-out window where every incomplete target was deferred, none failed). |
+| `err:system/InternalError` | Status passthrough from the consensus committer's admission control ("committer overloaded; in-flight operation cap reached") — still retryable capacity, but without a dedicated code yet. |
 
 **Example:**
 ```json
 {
-  "error": "service unavailable",
+  "error": "Transaction error: Novelty at maximum size, reindexing required",
   "status": 503,
-  "@type": "err:db/ServiceUnavailable"
+  "@type": "err:db/NoveltyAtMax"
 }
 ```
 
-**Response Headers:**
+**Response Headers:** every 503 carries `Retry-After` (delta-seconds,
+jittered per response to spread out synchronized retries):
 ```http
-Retry-After: 300
+Retry-After: 5
 ```
 
 **How to Fix:**
-- Wait and retry (check Retry-After header)
-- Implement retry logic with exponential backoff
-- Check service status page
+- Wait at least `Retry-After` seconds, then retry the same request
+- Idempotent retries are safe: replay the request with the same
+  `Idempotency-Key` — a novelty refusal does not consume the key
+- Keep your own exponential backoff as the outer bound for repeated 503s
+- If a ledger 503s persistently, check indexer health and
+  `--reindex-max-bytes` sizing
 
 #### 504 Gateway Timeout
 

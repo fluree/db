@@ -1,0 +1,8 @@
+# q006 enterprise_accounts
+# Intent: String equality + numeric (double) range FILTER on a dimension.
+# BI lineage (BI-05): "Which enterprise accounts have annual revenue over $10M?"
+# Predicates verified against enterprise.ttl — DimAccount: tier, annualRevenue, name.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?name ?rev
+WHERE { ?a a edw:Account ; edw:tier "Platinum" ; edw:name ?name ; edw:annualRevenue ?rev .
+        FILTER(?rev > 10000000) }

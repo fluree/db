@@ -236,7 +236,7 @@ fn encode_object(
         FlakeValue::Vector(v) => {
             buf.push(OTag::Vector as u8);
             encode_varint(v.len() as u64, buf);
-            for &element in v {
+            for &element in v.iter() {
                 buf.extend_from_slice(&element.to_le_bytes());
             }
         }
@@ -357,7 +357,7 @@ pub fn decode_op(
 
     // Object (tag + payload)
     let o_tag = OTag::from_u8(read_u8(data, pos)?)?;
-    let o = decode_object(o_tag, data, pos, dicts)?;
+    let o = decode_object(o_tag, data, pos, dicts, dt_ns_code, dt_name)?;
 
     // Flags
     let flags = read_u8(data, pos)?;
@@ -402,14 +402,21 @@ pub fn decode_op(
 /// Decode a binary object value into a [`FlakeValue`].
 ///
 /// Delegates binary parsing to [`raw_reader::decode_raw_object`] (shared with
-/// the zero-copy raw reader) and converts via `TryFrom<RawObject> for FlakeValue`.
+/// the zero-copy raw reader), applies the same datatype retagging, and converts
+/// via `TryFrom<RawObject> for FlakeValue`.
 fn decode_object(
     tag: OTag,
     data: &[u8],
     pos: &mut usize,
     dicts: &ReadDicts,
+    dt_ns_code: u16,
+    dt_name: &str,
 ) -> Result<FlakeValue, CommitCodecError> {
-    let raw = super::raw_reader::decode_raw_object(tag, data, pos, dicts)?;
+    let raw = super::raw_reader::retype_string_literal(
+        super::raw_reader::decode_raw_object(tag, data, pos, dicts)?,
+        dt_ns_code,
+        dt_name,
+    );
     FlakeValue::try_from(raw).map_err(|e| CommitCodecError::InvalidOp(e.to_string()))
 }
 
@@ -656,7 +663,7 @@ mod tests {
         let flake = Flake::new(
             Sid::new(101, "x"),
             Sid::new(101, "embedding"),
-            FlakeValue::Vector(vec![1.0, 2.5, -3.7]),
+            FlakeValue::Vector(vec![1.0, 2.5, -3.7].into()),
             Sid::new(2, "vector"),
             1,
             true,
@@ -687,7 +694,7 @@ mod tests {
         let flake = Flake::new(
             Sid::new(101, "x"),
             Sid::new(101, "embedding"),
-            FlakeValue::Vector(vec![]),
+            FlakeValue::Vector(vec![].into()),
             Sid::new(2, "vector"),
             1,
             true,
@@ -702,6 +709,100 @@ mod tests {
         let mut pos = 0;
         let decoded = decode_op(&buf, &mut pos, &read_dicts, 1).unwrap();
         assert_eq!(pos, buf.len());
-        assert_eq!(decoded.o, FlakeValue::Vector(vec![]));
+        assert_eq!(decoded.o, FlakeValue::Vector(vec![].into()));
+    }
+
+    fn decode_string_under(lexical: &str, dt_ns_code: u16, dt_name: &str) -> FlakeValue {
+        let flake = Flake::new(
+            Sid::new(101, "a"),
+            Sid::new(101, "p"),
+            FlakeValue::String(lexical.to_string()),
+            Sid::new(dt_ns_code, dt_name),
+            1,
+            true,
+            None,
+        );
+        let mut dicts = CommitDicts::new();
+        let mut buf = Vec::new();
+        encode_op(&flake, &mut dicts, &mut buf).unwrap();
+        let read_dicts = round_trip_dicts(&dicts);
+        let mut pos = 0;
+        let decoded = decode_op(&buf, &mut pos, &read_dicts, 1).unwrap();
+        assert_eq!(pos, buf.len());
+        decoded.o
+    }
+
+    /// Issue #1987: commits from SPARQL UPDATE stored well-typed literals as
+    /// strings. They read back as the typed value every other surface commits.
+    #[test]
+    fn string_under_typed_xsd_datatype_reads_as_typed_value() {
+        use crate::temporal::{Date, DateTime, GYear, Time};
+        assert_eq!(
+            decode_string_under("2026-09-08", 2, "date"),
+            FlakeValue::Date(Box::new(Date::parse("2026-09-08").unwrap()))
+        );
+        assert_eq!(
+            decode_string_under("2026-09-08T12:34:56Z", 2, "dateTime"),
+            FlakeValue::DateTime(Box::new(DateTime::parse("2026-09-08T12:34:56Z").unwrap()))
+        );
+        assert_eq!(
+            decode_string_under("12:34:56", 2, "time"),
+            FlakeValue::Time(Box::new(Time::parse("12:34:56").unwrap()))
+        );
+        assert_eq!(
+            decode_string_under("2026", 2, "gYear"),
+            FlakeValue::GYear(Box::new(GYear::parse("2026").unwrap()))
+        );
+        assert_eq!(
+            decode_string_under("20705", 2, "long"),
+            FlakeValue::Long(20705)
+        );
+        assert_eq!(
+            decode_string_under("true", 2, "boolean"),
+            FlakeValue::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn string_that_is_not_its_datatype_stays_a_string() {
+        for (lexical, dt_ns_code, dt_name) in [
+            ("1990-00-00", 2, "date"),
+            ("abc", 2, "integer"),
+            ("300", 2, "byte"),
+            ("2026-09-08", 2, "string"),
+            ("2026-09-08", 2, "anyURI"),
+            ("2026-09-08", 101, "date"),
+        ] {
+            assert_eq!(
+                decode_string_under(lexical, dt_ns_code, dt_name),
+                FlakeValue::String(lexical.to_string()),
+                "{lexical}^^{dt_ns_code}:{dt_name}"
+            );
+        }
+    }
+
+    /// SPARQL UPDATE also committed `geo:wktLiteral` POINTs as strings. They
+    /// read back as the point every other surface commits.
+    #[test]
+    fn wkt_point_string_reads_as_geo_point() {
+        use fluree_vocab::{geo, geo_names, namespaces};
+        let point = "POINT(2.35 48.85)";
+        let committed = crate::coerce::coerce_string_value(point, geo::WKT_LITERAL).unwrap();
+        assert!(matches!(committed, FlakeValue::GeoPoint(_)));
+        assert_eq!(
+            decode_string_under(point, namespaces::OGC_GEO, geo_names::WKT_LITERAL),
+            committed
+        );
+        for other in [
+            "POLYGON((0 0, 1 0, 1 1, 0 0))",
+            "POINT(0 91)",
+            "POINT EMPTY",
+        ] {
+            assert_eq!(
+                decode_string_under(other, namespaces::OGC_GEO, geo_names::WKT_LITERAL),
+                FlakeValue::String(other.to_string()),
+                "{other}"
+            );
+        }
     }
 }

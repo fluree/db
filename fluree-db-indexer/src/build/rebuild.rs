@@ -4,7 +4,7 @@
 //! sorted run files, builds per-graph leaf/branch indexes for all sort
 //! orders, and writes an `IndexRoot` (FIR6) descriptor to storage.
 
-use fluree_db_binary_index::{GraphArenaRefs, RunRecord, VectorDictRef};
+use fluree_db_binary_index::{BinaryPrevIndexRef, GraphArenaRefs, RunRecord, VectorDictRef};
 use fluree_db_core::{ContentId, ContentKind, ContentStore};
 
 use crate::error::{IndexerError, Result};
@@ -39,6 +39,33 @@ fn dedicated_rebuild_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// The rebuild's session directories, removed when dropped.
+///
+/// Both trees hold plaintext ledger content — sorted commit runs, dictionaries,
+/// staged leaves — and default to the system temp directory. Tying their
+/// removal to a drop rather than to the success path means every exit clears
+/// them: an early `?`, a panic unwinding the blocking task, or the normal
+/// return. A directory that was never created is not an error.
+struct SessionDirs {
+    run_dir: std::path::PathBuf,
+    index_dir: std::path::PathBuf,
+}
+
+impl Drop for SessionDirs {
+    fn drop(&mut self) {
+        for dir in [&self.run_dir, &self.index_dir] {
+            match std::fs::remove_dir_all(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(dir = %dir.display(), %e, "failed to remove index build session dir");
+                }
+            }
+        }
+    }
+}
+
+/// Build a binary index from the full commit chain, from scratch.
 ///
 /// Unlike `build_index_for_ledger`, this skips the nameservice lookup and
 /// the "already current" early-return check. Use this when you already have
@@ -89,9 +116,18 @@ where
         .ok_or(IndexerError::NoCommits)?;
 
     // Determine output directory for binary index artifacts
+    let staging_in_temp = config.data_dir.is_none();
     let data_dir = config
         .data_dir
         .unwrap_or_else(|| std::env::temp_dir().join("fluree-index"));
+    if staging_in_temp && !commit_store.permits_plaintext_cache() {
+        tracing::warn!(
+            ledger = %ledger_id,
+            ?data_dir,
+            "encrypted storage: index build staging defaults to the system temp directory; \
+             set IndexerConfig::data_dir to a directory on an encrypted volume"
+        );
+    }
     let ledger_id_path = fluree_db_core::address_path::ledger_id_to_path_prefix(ledger_id)
         .unwrap_or_else(|_| ledger_id.replace(':', "/"));
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -119,7 +155,10 @@ where
 
     // Capture values for the blocking task
     let ledger_id = ledger_id.to_string();
-    let _prev_root_id = record.index_head_id.clone();
+    let prev_index = record.index_head_id.clone().map(|id| BinaryPrevIndexRef {
+        t: record.index_t,
+        id,
+    });
     let commit_t = record.commit_t;
     // Drive the rebuild's `block_on` on a dedicated runtime so the future, its
     // timers, and any tasks it spawns are advanced by dedicated workers rather
@@ -155,6 +194,13 @@ where
 
     tokio::task::spawn_blocking(move || {
         let _guard = parent_span.enter(); // safe: spawn_blocking pins to one thread
+                                          // Owned by the blocking task, not the caller's future: the task runs to
+                                          // completion even when the caller is cancelled, so the directories are
+                                          // removed only after the last write to them.
+        let _session_dirs = SessionDirs {
+            run_dir: run_dir.clone(),
+            index_dir: index_dir.clone(),
+        };
         handle.block_on(async {
             std::fs::create_dir_all(&run_dir)
                 .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
@@ -178,7 +224,7 @@ where
             let walk_started = std::time::Instant::now();
             let (commit_cids, ledger_split_mode) = {
                 // stop_at_t=0 collects all commits (t starts at 1).
-                let (dag, split_mode) = fluree_db_core::collect_dag_cids_with_split_mode(
+                let (dag, split_mode) = fluree_db_core::collect_first_parent_cids_with_split_mode(
                     &content_store,
                     &head_commit_id,
                     0,
@@ -574,6 +620,7 @@ where
                     subject_count: subject_dicts[ci].len(),
                     string_count: string_dicts[ci].len() as u64,
                     types_map_path: Some(types_path),
+                    duplicates_removed: 0,
                 });
             }
 
@@ -743,6 +790,14 @@ where
                     zstd_level: 1,
                     run_budget_bytes: config.run_budget_bytes,
                     worker_count: 1,
+                    // The rebuild path has no CLI/server-style entry point,
+                    // so raise the soft limit here before detecting the
+                    // budget (library embedders reach this cold).
+                    fd_budget: {
+                        let raise = fluree_db_core::fd_limit::raise_nofile_soft_to_hard();
+                        fluree_db_core::fd_limit::log_raise_outcome(&raise);
+                        fluree_db_core::fd_limit::FdBudget::detect()
+                    },
                     remap_progress: None,
                     build_progress: None,
                     stage_marker: None,
@@ -790,6 +845,7 @@ where
                 total_remapped: 0,
                 remap_elapsed: std::time::Duration::from_millis(total_remap_ms as u64),
                 build_elapsed: std::time::Duration::from_millis(total_build_ms as u64),
+                duplicates_removed: 0,
             };
 
             tracing::info!(
@@ -973,6 +1029,12 @@ where
                     properties: Some(properties),
                     classes: root_classes,
                     graphs: Some(final_graphs),
+                    // A full rebuild walks the entire commit chain from
+                    // genesis, feeding every record — asserts and retracts,
+                    // including facts later retracted — through the stats
+                    // hook, so the historical tag sets cover every `t` the
+                    // ledger has ever had.
+                    historical_since_t: Some(0),
                 }
             };
 
@@ -1120,6 +1182,7 @@ where
                 total_commit_size,
                 total_asserts,
                 total_retracts,
+                saw_list_meta: shared.saw_list_meta,
                 db_stats: Some(db_stats),
                 db_schema,
                 sketch_ref,
@@ -1127,12 +1190,12 @@ where
                 // how decimals were just encoded.
                 decimal_encoding: shared.decimal_encoding,
                 attachment_events: config.attachment_events.clone(),
+                prev_index: prev_index.clone(),
             };
 
             let result = super::root_assembly::encode_and_write_root_v6(
                 &content_store,
                 fir6_inputs,
-                None, // GC chain deferred for V3 milestone.
                 IndexStats {
                     flake_count: total_rows as usize,
                     leaf_count: v3_result
@@ -1149,17 +1212,9 @@ where
 
             drop(_span_v3);
 
-            // Clean up ephemeral session directories.
-            if let Err(e) = std::fs::remove_dir_all(&run_dir) {
-                tracing::warn!(?run_dir, %e, "failed to clean up tmp_import session dir");
-            }
-            if let Err(e) = std::fs::remove_dir_all(&index_dir) {
-                tracing::warn!(?index_dir, %e, "failed to clean up index session dir");
-            }
-
             Ok(result)
         })
     })
     .await
-    .map_err(|e| IndexerError::StorageWrite(format!("index build task panicked: {e}")))?
+    .map_err(|e| IndexerError::from_join("index build task", e))?
 }

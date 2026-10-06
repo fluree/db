@@ -1,0 +1,7 @@
+# q003 distinct_regions
+# Intent: DISTINCT over a single dimension column.
+# BI lineage (BI-03): "Which regions do we operate in?"
+# Predicates verified against enterprise.ttl — DimGeography: region.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT DISTINCT ?region
+WHERE { ?g a edw:Geography ; edw:region ?region . }

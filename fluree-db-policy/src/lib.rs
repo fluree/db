@@ -62,8 +62,9 @@ pub use index::{build_policy_set, compute_class_check_needed, get_all_classes_fo
 pub use query_eval::{NoOpQueryExecutor, PolicyQueryExecutor, PolicyQueryFut};
 pub use schema::{is_schema_flake, is_schema_predicate};
 pub use types::{
-    FlakePolicyEntry, PolicyAction, PolicyDecision, PolicyQuery, PolicyRestriction, PolicySet,
-    PolicyValue, PolicyWrapper, PropertyPolicyEntry, TargetMode,
+    ConditionState, FlakePolicyEntry, PolicyAction, PolicyDecision, PolicyQuery,
+    PolicyQueryLanguage, PolicyRestriction, PolicySet, PolicyValue, PolicyWrapper,
+    PropertyPolicyEntry, TargetMode, WriteFlakeInfo, WriteVerb, WriteVerbs,
 };
 pub use wire::{
     build_policy_set_from_wire, wire_to_restrictions, PolicyArtifactWire, WireOrigin,

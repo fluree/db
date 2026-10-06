@@ -1,0 +1,12 @@
+# q075 minmax_order_total_dataset — promoted from A3 probe-06 (audit item 9, F-AUD-8)
+# Coverage: ungrouped MIN/MAX over a numeric (xsd:double) fact column. Before item 9
+#   MIN/MAX declined the fused fold (resolve_agg_folds returned None for anything but
+#   COUNT/SUM/AVG) and full-materialized the FACT_ORDER star. Item 9 folds MIN/MAX
+#   directly from the scanned column via the same term-materialization + compare_bindings
+#   the generic agg_min/agg_max uses (byte-parity), streaming instead of buffering every
+#   value. Rides the existing FLUREE_FUSED_R2RML_AGG switch (a widening; switch-off reverts).
+# Exec path: query_from() FROM <enterprise-sf01-v:main> (the deployed solo/chat shape).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT (MIN(?tot) AS ?lo) (MAX(?tot) AS ?hi)
+FROM <enterprise-sf01-v:main>
+WHERE { ?o a edw:Order ; edw:orderTotal ?tot . }

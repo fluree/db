@@ -16,6 +16,10 @@
 //! pipelines; this bench stresses the canonical join/filter/aggregate
 //! pipeline on a moderately-sized dataset.
 //!
+//! A separate correlated Explore-Q5 fixture also measures the range semi-join
+//! on indexed data and novelty/policy fallbacks (`support/range_semijoin.rs`).
+//! Filter with `query_range_semijoin` to run that matrix alone.
+//!
 //! ## Setup discipline
 //!
 //! Each scale level builds the dataset once, populates a file-backed
@@ -230,5 +234,12 @@ fn bench_query_hot_bsbm(c: &mut Criterion) {
     drop(fluree);
 }
 
-criterion_group!(benches, bench_query_hot_bsbm);
+#[path = "support/range_semijoin.rs"]
+mod range_semijoin;
+
+criterion_group!(
+    benches,
+    bench_query_hot_bsbm,
+    range_semijoin::bench_range_semijoin
+);
 criterion_main!(benches);

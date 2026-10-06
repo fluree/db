@@ -36,7 +36,15 @@ pub fn parse_property_path(tokens: &mut TokenStream) -> Result<PropertyPath, Str
 }
 
 /// Parse path alternatives: `path1 | path2 | ...`
+///
+/// Recursion-guarded: grouped paths (`( path )`) re-enter here from
+/// `parse_path_primary`, so each group counts one nesting level against the
+/// stream's depth ceiling.
 fn parse_path_alternative(tokens: &mut TokenStream) -> Result<PropertyPath, String> {
+    tokens.with_recursion_guard(parse_path_alternative_inner)
+}
+
+fn parse_path_alternative_inner(tokens: &mut TokenStream) -> Result<PropertyPath, String> {
     let start = tokens.current_span();
     let mut left = parse_path_sequence(tokens)?;
 

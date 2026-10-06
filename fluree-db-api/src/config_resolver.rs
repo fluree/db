@@ -20,13 +20,15 @@
 //! Identity gating happens at the request boundary (not here) because
 //! the server-verified identity is only available per-request.
 
+use fluree_db_core::VerifiedIdentity;
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use fluree_db_core::ledger_config::{
     DatalogDefaults, FullTextDefaults, FullTextProperty, GraphConfig, GraphSourceRef, LedgerConfig,
-    OntologyImportBinding, OverrideControl, PolicyDefaults, ReasoningDefaults, ResolvedConfig,
-    RollbackGuard, ShaclDefaults, TransactDefaults, TrustMode, TrustPolicy, ValidationMode,
+    OntologyImportBinding, OverrideControl, PolicyDefaults, QueryDefaults, ReasoningDefaults,
+    ResolvedConfig, RollbackGuard, ServingDefaults, ShaclDefaults, TransactDefaults, TrustMode,
+    TrustPolicy, ValidationMode,
 };
 use fluree_db_core::{GraphDbRef, LedgerSnapshot, OverlayProvider, Sid, CONFIG_GRAPH_ID};
 use fluree_db_novelty::Novelty;
@@ -54,6 +56,46 @@ pub async fn resolve_ledger_config(
     overlay: &dyn OverlayProvider,
     to_t: i64,
 ) -> Result<Option<LedgerConfig>> {
+    let Some(config_sid) = resolve_config_sid(snapshot, overlay, to_t).await? else {
+        return Ok(None);
+    };
+
+    // Read the config_id (@id)
+    let config_id = snapshot.decode_sid(&config_sid);
+
+    // Read each setting group
+    let policy = read_policy_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let shacl = read_shacl_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let reasoning = read_reasoning_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let datalog = read_datalog_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let transact = read_transact_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let full_text = read_fulltext_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let serving = read_serving_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let query = read_query_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let graph_overrides = read_graph_overrides(snapshot, overlay, to_t, &config_sid).await?;
+
+    Ok(Some(LedgerConfig {
+        config_id,
+        policy,
+        shacl,
+        reasoning,
+        datalog,
+        transact,
+        full_text,
+        serving,
+        query,
+        graph_overrides,
+    }))
+}
+
+/// Locate the single `f:LedgerConfig` subject in the config graph as-of `to_t`,
+/// or `None` when the ledger has no config. Shared prefix of
+/// [`resolve_ledger_config`] and [`resolve_serving_only`].
+async fn resolve_config_sid(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+) -> Result<Option<Sid>> {
     // Cheap guard: if the config graph (CONFIG_GRAPH_ID) holds no data in either
     // the novelty overlay or the base index, there can be no `f:LedgerConfig` —
     // skip the type scan entirely. Without this, the `?s rdf:type f:LedgerConfig`
@@ -128,28 +170,21 @@ pub async fn resolve_ledger_config(
         with_iris.into_iter().next().unwrap().1
     };
 
-    // Read the config_id (@id)
-    let config_id = snapshot.decode_sid(&config_sid);
+    Ok(Some(config_sid))
+}
 
-    // Read each setting group
-    let policy = read_policy_defaults(snapshot, overlay, to_t, &config_sid).await?;
-    let shacl = read_shacl_defaults(snapshot, overlay, to_t, &config_sid).await?;
-    let reasoning = read_reasoning_defaults(snapshot, overlay, to_t, &config_sid).await?;
-    let datalog = read_datalog_defaults(snapshot, overlay, to_t, &config_sid).await?;
-    let transact = read_transact_defaults(snapshot, overlay, to_t, &config_sid).await?;
-    let full_text = read_fulltext_defaults(snapshot, overlay, to_t, &config_sid).await?;
-    let graph_overrides = read_graph_overrides(snapshot, overlay, to_t, &config_sid).await?;
-
-    Ok(Some(LedgerConfig {
-        config_id,
-        policy,
-        shacl,
-        reasoning,
-        datalog,
-        transact,
-        full_text,
-        graph_overrides,
-    }))
+/// Resolve only the serving posture (`f:servingDefaults`), skipping the other
+/// setting groups. The serving gates read only `config.serving`, so this
+/// avoids the wasted group reads a full [`resolve_ledger_config`] would do.
+pub async fn resolve_serving_only(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+) -> Result<Option<ServingDefaults>> {
+    let Some(config_sid) = resolve_config_sid(snapshot, overlay, to_t).await? else {
+        return Ok(None);
+    };
+    read_serving_defaults(snapshot, overlay, to_t, &config_sid).await
 }
 
 // ============================================================================
@@ -237,8 +272,8 @@ fn matches_graph_target(target: &str, graph_iri: Option<&str>) -> bool {
 /// this as "only the `@fulltext` datatype path contributes entries."
 pub fn configured_fulltext_properties_for_indexer(
     config: &LedgerConfig,
-) -> Vec<fluree_db_indexer::ConfiguredFulltextProperty> {
-    use fluree_db_indexer::{ConfiguredFulltextProperty, ConfiguredFulltextScope};
+) -> Vec<crate::wasm_compat::ConfiguredFulltextProperty> {
+    use crate::wasm_compat::{ConfiguredFulltextProperty, ConfiguredFulltextScope};
 
     let mut out: Vec<ConfiguredFulltextProperty> = Vec::new();
 
@@ -299,50 +334,80 @@ pub fn configured_fulltext_properties_for_indexer(
 
 /// Merge config policy defaults with query-time opts.
 ///
-/// `server_identity` is the auth-layer-verified identity (NOT `opts.identity`
-/// which is the user-settable policy evaluation context).
+/// Override control is checked against `opts.server_identity`, the
+/// auth-layer-verified identity, never against `opts.identity`, which is the
+/// user-settable policy evaluation context.
 ///
 /// Algorithm:
 /// 1. No config policy → return opts unchanged
-/// 2. Query specifies policy → check override control:
-///    - Permitted → keep query opts
-///    - Denied → log warning, apply config defaults
-/// 3. No query policy → apply config defaults
-pub fn merge_policy_opts(
-    resolved: &ResolvedConfig,
-    opts: &GovernanceOptions,
-    server_identity: Option<&str>,
-) -> GovernanceOptions {
+/// 2. Override control denies a policy-carrying request → log warning and let
+///    config *force* its values over the request's (the documented truth table)
+/// 3. Otherwise → config fills only what the request left genuinely unset;
+///    `policy_class` additionally applies only when the request carried no
+///    policy inputs at all, preserving the pre-tri-state behavior
+///
+/// The distinction that matters for `default_allow`: `None` means the caller
+/// never spoke, so config governs; `Some(v)` is an explicit request value and
+/// survives, because the only thing entitled to overrule an explicit caller
+/// value is override control saying so.
+pub fn merge_policy_opts(resolved: &ResolvedConfig, opts: &GovernanceOptions) -> GovernanceOptions {
     let policy = match &resolved.policy {
         Some(p) => p,
         None => return opts.clone(),
     };
 
-    // Does the query specify any policy inputs?
-    let query_has_policy = opts.has_any_policy_inputs();
-
-    if query_has_policy {
-        // Check if override is permitted
-        if policy.override_control.permits_override(server_identity) {
-            return opts.clone();
-        }
-        tracing::warn!(
-            server_identity,
-            "Query-time policy override denied by config override control — applying config defaults"
-        );
+    // No configured grant may widen an explicit deny-all selection. This is
+    // also how an empty host authorization survives the JSON/consensus wire.
+    if opts.denies_all() {
+        return opts.clone();
     }
 
-    // Apply config defaults
+    let query_selects_policy = opts.selects_policy_set();
+    let server_identity = opts.server_identity.as_ref();
+    let override_denied =
+        query_selects_policy && !policy.override_control.permits_override(server_identity);
+
     let mut merged = opts.clone();
 
-    // Apply default_allow from config (config says deny-by-default)
-    if let Some(default_allow) = policy.default_allow {
-        merged.default_allow = default_allow;
+    if override_denied {
+        tracing::warn!(
+            server_identity = ?server_identity,
+            "Query-time policy override denied by config override control — applying config defaults"
+        );
+
+        // Denying an override must clear *all* caller-selected grants, even
+        // fields for which config has no replacement. Inline required grants
+        // and policy-values can otherwise weaken the configured policy set.
+        merged.policy_class = policy.policy_class.clone();
+        merged.policy = None;
+        merged.policy_values = None;
+        merged.default_allow = if opts.default_allow == Some(false) {
+            Some(false)
+        } else {
+            policy.default_allow
+        };
+        if !merged.has_any_policy_inputs() {
+            merged.policy = Some(serde_json::json!([]));
+        }
+        return merged;
     }
 
-    // Apply policy_class from config
-    if let Some(ref classes) = policy.policy_class {
-        merged.policy_class = Some(classes.clone());
+    // Config fills only a genuine unset. An explicit `Some(false)` reaches here
+    // via a request that carries no *other* policy selection, and it
+    // must not be clobbered by config's `f:defaultAllow true`.
+    if merged.default_allow.is_none() {
+        merged.default_allow = policy.default_allow;
+    }
+
+    // policy_class stays request-first: config supplies it only when the request
+    // did not select a policy set (a deny default alone only narrows it).
+    // Widening this to "fill when unset" would
+    // start applying config's f:policyClass to identity-carrying requests on the
+    // local path, which it never has — see the note in fluree_ext.rs::wrap_policy.
+    if !query_selects_policy {
+        if let Some(ref classes) = policy.policy_class {
+            merged.policy_class = Some(classes.clone());
+        }
     }
 
     // policy_source (GraphSourceRef) is resolved to graph IDs by the caller
@@ -367,7 +432,7 @@ pub fn merge_policy_opts(
 ///   - Denied → `Force`
 pub fn merge_reasoning(
     resolved: &ResolvedConfig,
-    server_identity: Option<&str>,
+    server_identity: Option<&VerifiedIdentity>,
 ) -> Option<(Vec<String>, ReasoningModePrecedence)> {
     let reasoning = resolved.reasoning.as_ref()?;
     let modes = reasoning.modes.as_ref()?;
@@ -397,15 +462,19 @@ pub fn merge_reasoning(
 /// of these values.
 pub fn config_reasoning_budget(
     resolved: &ResolvedConfig,
-    server_identity: Option<&str>,
+    server_identity: Option<&VerifiedIdentity>,
 ) -> Option<ConfigReasoningBudget> {
     let reasoning = resolved.reasoning.as_ref()?;
-    if reasoning.max_facts.is_none() && reasoning.max_seconds.is_none() {
+    if reasoning.max_facts.is_none()
+        && reasoning.max_seconds.is_none()
+        && reasoning.max_memory_mb.is_none()
+    {
         return None;
     }
     Some(ConfigReasoningBudget {
         max_facts: reasoning.max_facts,
         max_seconds: reasoning.max_seconds,
+        max_memory_mb: reasoning.max_memory_mb,
         force: !reasoning.override_control.permits_override(server_identity),
     })
 }
@@ -419,26 +488,59 @@ pub struct EffectiveShaclConfig {
     pub validation_mode: ValidationMode,
 }
 
-/// Compute effective SHACL settings from resolved config.
+/// Compute effective SHACL settings from resolved config, honoring a
+/// transaction-requested validation mode under override control.
 ///
 /// Returns `None` if no SHACL config section is present. When `None`,
 /// callers fall back to the shapes-exist heuristic (see `stage_with_config_shacl`).
 ///
-/// Override control is recognized but not actively gated — there's no
-/// transaction-time SHACL override mechanism yet. When one is added
-/// (e.g., `TxnOpts.skip_shacl`), the gate goes here.
+/// `requested_mode` is the transaction's `opts.validationMode`
+/// (`TxnOpts::validation_mode`); `server_identity` is the auth-layer-verified
+/// identity (NOT the user-settable `opts.identity`). Gating is asymmetric:
+///
+/// - **Strengthening** (config `Warn`, request `Reject`) is always honored —
+///   asking for stricter validation needs no permission.
+/// - **Softening** (config `Reject`, request `Warn`) is honored only when the
+///   SHACL group's `f:overrideControl` permits it for `server_identity`
+///   (`f:OverrideAll` — the default — permits everyone; `f:OverrideNone`
+///   denies all; an identity-restricted list checks membership). A denied
+///   request keeps the configured posture and logs a warning; it does not
+///   fail the transaction.
+///
+/// The request can never toggle `enabled` — only the failure handling of
+/// validation that config already turned on.
 pub fn merge_shacl_opts(
     resolved: &ResolvedConfig,
-    _server_identity: Option<&str>,
+    requested_mode: Option<ValidationMode>,
+    server_identity: Option<&VerifiedIdentity>,
 ) -> Option<EffectiveShaclConfig> {
     let shacl = resolved.shacl.as_ref()?;
+    let config_mode = shacl.validation_mode.unwrap_or(ValidationMode::Reject);
+    let validation_mode = match requested_mode {
+        None => config_mode,
+        Some(ValidationMode::Reject) => ValidationMode::Reject,
+        Some(ValidationMode::Warn) => {
+            if config_mode == ValidationMode::Warn
+                || shacl.override_control.permits_override(server_identity)
+            {
+                ValidationMode::Warn
+            } else {
+                tracing::warn!(
+                    server_identity = ?server_identity,
+                    "Transaction-requested SHACL warn mode denied by config override control \
+                     — keeping configured reject posture"
+                );
+                config_mode
+            }
+        }
+    };
     Some(EffectiveShaclConfig {
         // Default `false` per docs/ledger-config/setting-groups.md — opt-in is
         // the safer posture. Prior code defaulted to `true`, silently enabling
         // SHACL for any config that declared an `f:shaclDefaults` section
         // without setting `f:shaclEnabled`, diverging from documented behavior.
         enabled: shacl.enabled.unwrap_or(false),
-        validation_mode: shacl.validation_mode.unwrap_or(ValidationMode::Reject),
+        validation_mode,
     })
 }
 
@@ -466,7 +568,7 @@ pub struct EffectiveDatalogConfig {
 /// when `false`, config settings are forced.
 pub fn merge_datalog_opts(
     resolved: &ResolvedConfig,
-    server_identity: Option<&str>,
+    server_identity: Option<&VerifiedIdentity>,
 ) -> Option<EffectiveDatalogConfig> {
     let datalog = resolved.datalog.as_ref()?;
     let override_allowed = datalog.override_control.permits_override(server_identity);
@@ -600,6 +702,7 @@ impl MergeableGroup for ReasoningDefaults {
             ontology_import_map: import_map,
             max_facts: self.max_facts.or(base.max_facts),
             max_seconds: self.max_seconds.or(base.max_seconds),
+            max_memory_mb: self.max_memory_mb.or(base.max_memory_mb),
             override_control: base.override_control.effective_min(&self.override_control),
         }
     }
@@ -847,6 +950,121 @@ async fn read_iri_list_field(
     }
 }
 
+/// Read `f:reasoningModes`, accepting every shape users naturally write:
+///
+/// - repeated IRI objects — `f:reasoningModes f:rdfs, f:datalog`
+/// - repeated string literals — `f:reasoningModes "rdfs"`
+/// - an RDF collection of either — `f:reasoningModes ( "rdfs" "datalog" )`
+///
+/// `ReasoningModes::from_mode_strings` downstream handles both full IRIs
+/// and bare mode names, so all shapes normalize to the same modes.
+///
+/// This is deliberately more permissive than [`read_iri_list_field`]
+/// (which stays IRI-only for `f:policyClass` / `f:allowedIdentities`,
+/// where a stray string must not widen policy). Before this reader,
+/// string-literal and collection shapes silently produced no modes —
+/// config-declared reasoning never engaged and queries returned
+/// non-entailed results with no error.
+async fn read_reasoning_modes_field(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    subject_sid: &Sid,
+) -> Result<Option<Vec<String>>> {
+    let pred_sid = match try_encode(snapshot, config_iris::REASONING_MODES) {
+        Some(sid) => sid,
+        None => return Ok(None),
+    };
+
+    let bindings = query_config_predicate(snapshot, overlay, to_t, subject_sid, &pred_sid).await?;
+    let mut values = Vec::new();
+    for binding in bindings {
+        if let Some((fluree_db_core::FlakeValue::String(s), _)) = binding.as_lit() {
+            values.push(s.to_string());
+            continue;
+        }
+        let Some(sid) = binding.as_sid() else {
+            continue;
+        };
+        // An object ref is either a mode IRI or the head of an RDF
+        // collection. Distinguish by probing `rdf:first`.
+        match read_rdf_list_values(snapshot, overlay, to_t, sid).await? {
+            Some(items) => values.extend(items),
+            None => {
+                if let Some(iri) = snapshot.decode_sid(sid) {
+                    values.push(iri);
+                }
+            }
+        }
+    }
+
+    if values.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(values))
+    }
+}
+
+/// Walk an RDF collection (`rdf:first`/`rdf:rest`.. `rdf:nil`) starting at
+/// `head`, returning each element as a string (string literals verbatim,
+/// IRI refs decoded). Returns `Ok(None)` when `head` is not a list node
+/// (no `rdf:first`), so callers can fall back to treating it as a plain
+/// IRI value.
+async fn read_rdf_list_values(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    head: &Sid,
+) -> Result<Option<Vec<String>>> {
+    use fluree_vocab::rdf;
+
+    let (Some(first_sid), Some(rest_sid)) = (
+        try_encode(snapshot, rdf::FIRST),
+        try_encode(snapshot, rdf::REST),
+    ) else {
+        return Ok(None);
+    };
+
+    let mut node = head.clone();
+    let mut values = Vec::new();
+    let mut is_list = false;
+    // Bounded walk: a malformed cyclic list must not spin forever.
+    for _ in 0..MAX_RDF_LIST_LEN {
+        let firsts = query_config_predicate(snapshot, overlay, to_t, &node, &first_sid).await?;
+        if firsts.is_empty() {
+            return if is_list { Ok(Some(values)) } else { Ok(None) };
+        }
+        is_list = true;
+        for binding in &firsts {
+            if let Some((fluree_db_core::FlakeValue::String(s), _)) = binding.as_lit() {
+                values.push(s.to_string());
+            } else if let Some(sid) = binding.as_sid() {
+                if let Some(iri) = snapshot.decode_sid(sid) {
+                    values.push(iri);
+                }
+            }
+        }
+        let rests = query_config_predicate(snapshot, overlay, to_t, &node, &rest_sid).await?;
+        let Some(next) = rests.iter().find_map(|b| b.as_sid().cloned()) else {
+            return Ok(Some(values));
+        };
+        if snapshot.decode_sid(&next).as_deref() == Some(rdf::NIL) {
+            return Ok(Some(values));
+        }
+        node = next;
+    }
+    tracing::warn!(
+        "f:reasoningModes RDF collection exceeded {MAX_RDF_LIST_LEN} entries \
+         (malformed or cyclic list?); truncating"
+    );
+    Ok(Some(values))
+}
+
+/// Upper bound on RDF-collection length when walking `f:reasoningModes`
+/// lists; there are only a handful of reasoning modes, so anything near
+/// this is a malformed (likely cyclic) list.
+const MAX_RDF_LIST_LEN: usize = 64;
+
 /// Read an integer field from a subject at the config graph.
 async fn read_i64_field(
     snapshot: &LedgerSnapshot,
@@ -995,14 +1213,7 @@ async fn read_reasoning_defaults(
         None => return Ok(None),
     };
 
-    let modes = read_iri_list_field(
-        snapshot,
-        overlay,
-        to_t,
-        &group_sid,
-        config_iris::REASONING_MODES,
-    )
-    .await?;
+    let modes = read_reasoning_modes_field(snapshot, overlay, to_t, &group_sid).await?;
     let schema_source = read_graph_source_ref(
         snapshot,
         overlay,
@@ -1036,6 +1247,14 @@ async fn read_reasoning_defaults(
         config_iris::REASONING_MAX_SECONDS,
     )
     .await?;
+    let max_memory_mb = read_budget_field(
+        snapshot,
+        overlay,
+        to_t,
+        &group_sid,
+        config_iris::REASONING_MAX_MEMORY_MB,
+    )
+    .await?;
     let override_control = read_override_control(snapshot, overlay, to_t, &group_sid).await?;
 
     Ok(Some(ReasoningDefaults {
@@ -1045,6 +1264,7 @@ async fn read_reasoning_defaults(
         ontology_import_map,
         max_facts,
         max_seconds,
+        max_memory_mb,
         override_control,
     }))
 }
@@ -1194,6 +1414,95 @@ async fn read_datalog_defaults(
         rules_source,
         allow_query_time_rules,
         override_control,
+    }))
+}
+
+/// Read serving defaults from the LedgerConfig subject.
+///
+/// Ledger-scoped group: read only off `f:LedgerConfig` (never GraphConfig)
+/// and carries no override control.
+async fn read_serving_defaults(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    parent_sid: &Sid,
+) -> Result<Option<ServingDefaults>> {
+    let group_sid = match read_ref_field(
+        snapshot,
+        overlay,
+        to_t,
+        parent_sid,
+        config_iris::SERVING_DEFAULTS,
+    )
+    .await?
+    {
+        Some(sid) => sid,
+        None => return Ok(None),
+    };
+
+    let serve_query = read_bool_field(
+        snapshot,
+        overlay,
+        to_t,
+        &group_sid,
+        config_iris::SERVE_QUERY,
+    )
+    .await?;
+    let serve_blocks = read_bool_field(
+        snapshot,
+        overlay,
+        to_t,
+        &group_sid,
+        config_iris::SERVE_BLOCKS,
+    )
+    .await?;
+    let public_visibility = read_bool_field(
+        snapshot,
+        overlay,
+        to_t,
+        &group_sid,
+        config_iris::PUBLIC_VISIBILITY,
+    )
+    .await?;
+
+    Ok(Some(ServingDefaults {
+        serve_query,
+        serve_blocks,
+        public_visibility,
+    }))
+}
+
+/// Read query defaults from the LedgerConfig subject.
+///
+/// Ledger-scoped group: read only off `f:LedgerConfig` (never GraphConfig)
+/// and carries no override control.
+async fn read_query_defaults(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    parent_sid: &Sid,
+) -> Result<Option<QueryDefaults>> {
+    let Some(group_sid) = read_ref_field(
+        snapshot,
+        overlay,
+        to_t,
+        parent_sid,
+        config_iris::QUERY_DEFAULTS,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let union_default_graph = read_bool_field(
+        snapshot,
+        overlay,
+        to_t,
+        &group_sid,
+        config_iris::UNION_DEFAULT_GRAPH,
+    )
+    .await?;
+    Ok(Some(QueryDefaults {
+        union_default_graph,
     }))
 }
 
@@ -1801,7 +2110,7 @@ mod tests {
             graph_overrides: vec![GraphConfig {
                 target_graph: "urn:other:graph".into(),
                 reasoning: Some(ReasoningDefaults {
-                    modes: Some(vec!["owl2-rl".into()]),
+                    modes: Some(vec!["owl2rl".into()]),
                     ..Default::default()
                 }),
                 policy: None,
@@ -1878,7 +2187,7 @@ mod tests {
 
     #[test]
     fn ledger_wide_override_none_blocks_per_graph_reasoning() {
-        // Truth table: `reasoningModes: [rdfs]`, OverrideNone | `[owl2-rl]` | → **rdfs**
+        // Truth table: `reasoningModes: [rdfs]`, OverrideNone | `[owl2rl]` | → **rdfs**
         let config = LedgerConfig {
             reasoning: Some(ReasoningDefaults {
                 modes: Some(vec!["rdfs".into()]),
@@ -1888,7 +2197,7 @@ mod tests {
             graph_overrides: vec![GraphConfig {
                 target_graph: config_iris::DEFAULT_GRAPH.into(),
                 reasoning: Some(ReasoningDefaults {
-                    modes: Some(vec!["owl2-rl".into()]),
+                    modes: Some(vec!["owl2rl".into()]),
                     ..Default::default()
                 }),
                 policy: None,
@@ -1903,6 +2212,92 @@ mod tests {
         let resolved = resolve_effective_config(&config, None);
         let r = resolved.reasoning.unwrap();
         assert_eq!(r.modes.as_deref(), Some(&["rdfs".into()][..])); // ledger-wide wins
+    }
+
+    /// Asymmetric transaction-mode gating: strengthening is free, softening
+    /// obeys the SHACL group's override control against the verified identity.
+    #[test]
+    fn merge_shacl_opts_gates_requested_mode() {
+        use fluree_db_core::ledger_config::ShaclDefaults;
+
+        let resolved_with = |control: OverrideControl| ResolvedConfig {
+            shacl: Some(ShaclDefaults {
+                enabled: Some(true),
+                shapes_source: None,
+                validation_mode: Some(ValidationMode::Reject),
+                override_control: control,
+            }),
+            ..Default::default()
+        };
+
+        // AllowAll (default): softening honored for anyone, identity or not.
+        let cfg = resolved_with(OverrideControl::AllowAll);
+        assert_eq!(
+            merge_shacl_opts(&cfg, Some(ValidationMode::Warn), None)
+                .unwrap()
+                .validation_mode,
+            ValidationMode::Warn
+        );
+
+        // OverrideNone: softening denied, configured posture kept.
+        let cfg = resolved_with(OverrideControl::None);
+        assert_eq!(
+            merge_shacl_opts(
+                &cfg,
+                Some(ValidationMode::Warn),
+                Some(&VerifiedIdentity::new("did:key:alice"))
+            )
+            .unwrap()
+            .validation_mode,
+            ValidationMode::Reject
+        );
+        // ...but strengthening a Warn posture never needs permission.
+        let warn_cfg = ResolvedConfig {
+            shacl: Some(ShaclDefaults {
+                enabled: Some(true),
+                shapes_source: None,
+                validation_mode: Some(ValidationMode::Warn),
+                override_control: OverrideControl::None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_shacl_opts(&warn_cfg, Some(ValidationMode::Reject), None)
+                .unwrap()
+                .validation_mode,
+            ValidationMode::Reject
+        );
+
+        // IdentityRestricted: only the listed verified identity may soften.
+        let cfg = resolved_with(OverrideControl::IdentityRestricted {
+            allowed_identities: HashSet::from([std::sync::Arc::from("did:key:remediator")]),
+        });
+        assert_eq!(
+            merge_shacl_opts(
+                &cfg,
+                Some(ValidationMode::Warn),
+                Some(&VerifiedIdentity::new("did:key:remediator"))
+            )
+            .unwrap()
+            .validation_mode,
+            ValidationMode::Warn
+        );
+        assert_eq!(
+            merge_shacl_opts(
+                &cfg,
+                Some(ValidationMode::Warn),
+                Some(&VerifiedIdentity::new("did:key:intruder"))
+            )
+            .unwrap()
+            .validation_mode,
+            ValidationMode::Reject
+        );
+        assert_eq!(
+            merge_shacl_opts(&cfg, Some(ValidationMode::Warn), None)
+                .unwrap()
+                .validation_mode,
+            ValidationMode::Reject
+        );
     }
 
     #[test]
@@ -1955,7 +2350,7 @@ mod tests {
                     ..Default::default()
                 }),
                 reasoning: Some(ReasoningDefaults {
-                    modes: Some(vec!["owl2-rl".into()]),
+                    modes: Some(vec!["owl2rl".into()]),
                     ..Default::default()
                 }),
                 shacl: None,
@@ -1972,7 +2367,7 @@ mod tests {
         assert_eq!(p.default_allow, Some(false));
         // Reasoning: per-graph wins (AllowAll)
         let r = resolved.reasoning.unwrap();
-        assert_eq!(r.modes.as_deref(), Some(&["owl2-rl".into()][..]));
+        assert_eq!(r.modes.as_deref(), Some(&["owl2rl".into()][..]));
     }
 
     #[test]
@@ -1981,7 +2376,7 @@ mod tests {
             graph_overrides: vec![GraphConfig {
                 target_graph: config_iris::DEFAULT_GRAPH.into(),
                 reasoning: Some(ReasoningDefaults {
-                    modes: Some(vec!["owl2-ql".into()]),
+                    modes: Some(vec!["owl2ql".into()]),
                     ..Default::default()
                 }),
                 policy: None,
@@ -1997,7 +2392,7 @@ mod tests {
         assert!(resolved.reasoning.is_some());
         assert_eq!(
             resolved.reasoning.unwrap().modes.as_deref(),
-            Some(&["owl2-ql".into()][..])
+            Some(&["owl2ql".into()][..])
         );
     }
 
@@ -2007,7 +2402,7 @@ mod tests {
             graph_overrides: vec![GraphConfig {
                 target_graph: config_iris::TXN_META_GRAPH.into(),
                 reasoning: Some(ReasoningDefaults {
-                    modes: Some(vec!["owl2-rl".into()]),
+                    modes: Some(vec!["owl2rl".into()]),
                     ..Default::default()
                 }),
                 policy: None,
@@ -2032,7 +2427,7 @@ mod tests {
             identity: Some("did:key:alice".into()),
             ..Default::default()
         };
-        let merged = merge_policy_opts(&resolved, &opts, None);
+        let merged = merge_policy_opts(&resolved, &opts);
         assert_eq!(merged.identity.as_deref(), Some("did:key:alice"));
     }
 
@@ -2047,8 +2442,8 @@ mod tests {
             ..Default::default()
         };
         let opts = GovernanceOptions::default();
-        let merged = merge_policy_opts(&resolved, &opts, None);
-        assert!(!merged.default_allow);
+        let merged = merge_policy_opts(&resolved, &opts);
+        assert_eq!(merged.default_allow, Some(false));
         assert_eq!(
             merged.policy_class.as_deref(),
             Some(&["ex:DefaultPolicy".into()][..])
@@ -2069,7 +2464,7 @@ mod tests {
             identity: Some("did:key:alice".into()),
             ..Default::default()
         };
-        let merged = merge_policy_opts(&resolved, &opts, None);
+        let merged = merge_policy_opts(&resolved, &opts);
         // Query opts kept because AllowAll permits override
         assert_eq!(merged.identity.as_deref(), Some("did:key:alice"));
     }
@@ -2087,11 +2482,12 @@ mod tests {
         };
         let opts = GovernanceOptions {
             identity: Some("did:key:alice".into()),
+            server_identity: Some(VerifiedIdentity::new("did:key:alice")),
             ..Default::default()
         };
-        let merged = merge_policy_opts(&resolved, &opts, Some("did:key:alice"));
+        let merged = merge_policy_opts(&resolved, &opts);
         // Config defaults applied despite query specifying identity
-        assert!(!merged.default_allow);
+        assert_eq!(merged.default_allow, Some(false));
         assert_eq!(
             merged.policy_class.as_deref(),
             Some(&["ex:Locked".into()][..])
@@ -2112,9 +2508,10 @@ mod tests {
         };
         let opts = GovernanceOptions {
             identity: Some("did:key:user".into()),
+            server_identity: Some(VerifiedIdentity::new("did:key:admin")),
             ..Default::default()
         };
-        let merged = merge_policy_opts(&resolved, &opts, Some("did:key:admin"));
+        let merged = merge_policy_opts(&resolved, &opts);
         // Server identity is admin → override permitted
         assert_eq!(merged.identity.as_deref(), Some("did:key:user"));
     }
@@ -2134,15 +2531,270 @@ mod tests {
         };
         let opts = GovernanceOptions {
             identity: Some("did:key:user".into()),
+            server_identity: Some(VerifiedIdentity::new("did:key:non-admin")),
             ..Default::default()
         };
-        let merged = merge_policy_opts(&resolved, &opts, Some("did:key:non-admin"));
+        let merged = merge_policy_opts(&resolved, &opts);
         // Server identity is not admin → override denied
-        assert!(!merged.default_allow);
+        assert_eq!(merged.default_allow, Some(false));
         assert_eq!(
             merged.policy_class.as_deref(),
             Some(&["ex:Restricted".into()][..])
         );
+    }
+
+    // --- merge_policy_opts: the tri-state default_allow ---
+    //
+    // Every test above supplies an explicit `default_allow`, so none of them can
+    // see the case the tri-state exists for: a request that carries policy
+    // inputs but says nothing about default-allow.
+
+    /// The headline case. An identity-only request used to short-circuit the
+    /// merge entirely, so config's `f:defaultAllow true` never applied.
+    #[test]
+    fn config_default_allow_fills_unset_request() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(true),
+                override_control: OverrideControl::AllowAll,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            identity: Some("did:key:alice".into()),
+            ..Default::default()
+        };
+        let merged = merge_policy_opts(&resolved, &opts);
+        assert_eq!(merged.identity.as_deref(), Some("did:key:alice"));
+        assert_eq!(
+            merged.default_allow,
+            Some(true),
+            "config default-allow must fill a request that never named it"
+        );
+    }
+
+    /// An explicit request value wins over config in both directions, even
+    /// though override control is `AllowAll`.
+    #[test]
+    fn explicit_request_default_allow_wins_over_config() {
+        let open_config = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(true),
+                override_control: OverrideControl::AllowAll,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let deny = GovernanceOptions {
+            identity: Some("did:key:alice".into()),
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_policy_opts(&open_config, &deny).default_allow,
+            Some(false)
+        );
+
+        let closed_config = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(false),
+                override_control: OverrideControl::AllowAll,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let allow = GovernanceOptions {
+            identity: Some("did:key:alice".into()),
+            default_allow: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_policy_opts(&closed_config, &allow).default_allow,
+            Some(true)
+        );
+    }
+
+    /// Unset on both sides stays unset, and resolves fail-closed.
+    #[test]
+    fn unset_on_both_sides_resolves_fail_closed() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: None,
+                policy_class: Some(vec!["ex:SomePolicy".into()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            identity: Some("did:key:alice".into()),
+            ..Default::default()
+        };
+        let merged = merge_policy_opts(&resolved, &opts);
+        assert_eq!(merged.default_allow, None);
+        assert!(
+            !merged.effective_default_allow(),
+            "nobody configured a default → deny"
+        );
+    }
+
+    /// A config that configures no policy at all leaves the request untouched.
+    #[test]
+    fn no_config_policy_leaves_default_allow_unset() {
+        let resolved = ResolvedConfig::default();
+        let opts = GovernanceOptions {
+            identity: Some("did:key:alice".into()),
+            ..Default::default()
+        };
+        assert_eq!(merge_policy_opts(&resolved, &opts).default_allow, None);
+    }
+
+    /// Either explicit default engages enforcement; absent remains no input.
+    #[test]
+    fn either_explicit_default_counts_as_a_policy_input() {
+        let unset = GovernanceOptions::default();
+        assert!(!unset.has_any_policy_inputs());
+        assert!(!unset.selects_policy_set());
+
+        let explicit_false = GovernanceOptions {
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        assert!(explicit_false.has_any_policy_inputs());
+        assert!(!explicit_false.selects_policy_set());
+
+        let explicit_true = GovernanceOptions {
+            default_allow: Some(true),
+            ..Default::default()
+        };
+        assert!(explicit_true.has_any_policy_inputs());
+        assert!(explicit_true.selects_policy_set());
+
+        let empty_classes = GovernanceOptions {
+            policy_class: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(empty_classes.has_any_policy_inputs());
+        assert!(empty_classes.selects_policy_set());
+    }
+
+    /// An explicit `Some(false)` survives even though it carries no *other*
+    /// policy input and so lands on the config-defaults path.
+    ///
+    /// This is the shape a per-source `SourcePolicyOverride` takes when it names
+    /// only `default_allow: false`: `SourcePolicyOverride::has_policy()` counts
+    /// `is_some()` so the override is applied. Config still supplies the
+    /// class selection, without overwriting the explicit deny default.
+    #[test]
+    fn explicit_false_survives_the_no_policy_input_path() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_policy_opts(&resolved, &opts).default_allow,
+            Some(false),
+            "config f:defaultAllow true must not clobber an explicit request false"
+        );
+    }
+
+    /// The same shape as it actually arrives: through
+    /// `SourcePolicyOverride::to_query_connection_options()`.
+    #[test]
+    fn per_source_override_of_only_default_allow_false_survives_config() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let override_opts = crate::dataset::SourcePolicyOverride {
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        assert!(
+            override_opts.has_policy(),
+            "an override naming only default_allow is still an override"
+        );
+
+        let opts = override_opts.to_query_connection_options();
+        assert!(
+            opts.has_any_policy_inputs(),
+            "an explicit deny default engages enforcement"
+        );
+        assert_eq!(
+            merge_policy_opts(&resolved, &opts).default_allow,
+            Some(false)
+        );
+    }
+
+    /// Override control still overrules an explicit request value — that is the
+    /// one thing entitled to, and the documented truth table.
+    #[test]
+    fn override_control_none_still_forces_config_over_explicit_request() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(false),
+                override_control: OverrideControl::None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            default_allow: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_policy_opts(&resolved, &opts).default_allow,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn denied_override_clears_inline_classes_values_and_permissive_defaults() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                override_control: OverrideControl::None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            identity: Some("did:key:employee".into()),
+            policy_class: Some(vec!["ex:Manager".into()]),
+            policy: Some(serde_json::json!([{"f:required": true, "f:allow": true}])),
+            policy_values: Some(std::collections::HashMap::from([(
+                "?$identity".into(),
+                serde_json::json!({"@id": "did:key:manager"}),
+            )])),
+            default_allow: Some(true),
+            ..Default::default()
+        };
+        let merged = merge_policy_opts(&resolved, &opts);
+        assert_eq!(merged.identity, opts.identity);
+        assert!(
+            merged.policy_class.is_none()
+                && merged.policy.is_none()
+                && merged.policy_values.is_none()
+        );
+        assert!(!merged.effective_default_allow());
+        let anonymous = merge_policy_opts(
+            &resolved,
+            &GovernanceOptions {
+                default_allow: Some(true),
+                ..Default::default()
+            },
+        );
+        assert!(anonymous.has_any_policy_inputs());
+        assert!(!anonymous.effective_default_allow());
     }
 
     // --- merge_reasoning ---
@@ -2172,14 +2824,14 @@ mod tests {
     fn config_reasoning_with_allow_all_gives_default_unless() {
         let resolved = ResolvedConfig {
             reasoning: Some(ReasoningDefaults {
-                modes: Some(vec!["owl2-rl".into()]),
+                modes: Some(vec!["owl2rl".into()]),
                 override_control: OverrideControl::AllowAll,
                 ..Default::default()
             }),
             ..Default::default()
         };
         let (modes, prec) = merge_reasoning(&resolved, None).unwrap();
-        assert_eq!(modes, vec!["owl2-rl".to_string()]);
+        assert_eq!(modes, vec!["owl2rl".to_string()]);
         assert_eq!(prec, ReasoningModePrecedence::DefaultUnlessQueryOverrides);
     }
 
@@ -2195,7 +2847,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let (_modes, prec) = merge_reasoning(&resolved, Some("did:key:admin")).unwrap();
+        let (_modes, prec) =
+            merge_reasoning(&resolved, Some(&VerifiedIdentity::new("did:key:admin"))).unwrap();
         assert_eq!(prec, ReasoningModePrecedence::DefaultUnlessQueryOverrides);
     }
 
@@ -2211,7 +2864,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let (_modes, prec) = merge_reasoning(&resolved, Some("did:key:user")).unwrap();
+        let (_modes, prec) =
+            merge_reasoning(&resolved, Some(&VerifiedIdentity::new("did:key:user"))).unwrap();
         assert_eq!(prec, ReasoningModePrecedence::Force);
     }
 
@@ -2299,12 +2953,12 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            !config_reasoning_budget(&resolved, Some("did:key:admin"))
+            !config_reasoning_budget(&resolved, Some(&VerifiedIdentity::new("did:key:admin")))
                 .unwrap()
                 .force
         );
         assert!(
-            config_reasoning_budget(&resolved, Some("did:key:user"))
+            config_reasoning_budget(&resolved, Some(&VerifiedIdentity::new("did:key:user")))
                 .unwrap()
                 .force
         );

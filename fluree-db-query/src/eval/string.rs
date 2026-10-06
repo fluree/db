@@ -58,16 +58,18 @@ fn extract_lang_tag<R: RowAccess>(
     if let Expression::Var(var_id) = expr {
         match row.get(*var_id) {
             Some(Binding::Lit { dtc, .. }) => {
-                return dtc.lang_tag().map(Arc::from);
+                // Clone the constraint's existing Arc rather than
+                // re-allocating from the &str view.
+                if let fluree_db_core::DatatypeConstraint::LangTag(tag) = dtc {
+                    return Some(Arc::clone(tag));
+                }
+                return None;
             }
             Some(Binding::EncodedLit { lang_id, .. }) => {
-                if let Some(store) = ctx.and_then(|c| c.binary_store.as_deref()) {
-                    if let Some(meta) = store.decode_meta(*lang_id, i32::MIN) {
-                        if let Some(lang_str) = meta.lang {
-                            return Some(Arc::from(lang_str));
-                        }
-                    }
-                }
+                // Memoized per query (LangTagCache) — one store meta-decode
+                // per distinct id instead of a String + Arc allocation pair
+                // per row.
+                return ctx.and_then(|c| c.lang_tag_for_id(*lang_id));
             }
             _ => {}
         }
@@ -94,6 +96,49 @@ pub fn eval_str<R: RowAccess>(
     ctx: Option<&ExecutionContext<'_>>,
 ) -> Result<Option<ComparableValue>> {
     check_arity(args, 1, "STR")?;
+    // A stored xsd:float narrows to f32 on the way into `ComparableValue`
+    // (the numeric lanes are single-precision), but its lexical form belongs
+    // to the stored f64: the serializer prints `canonical_xsd_double` of it,
+    // and STR() must agree per-term (#1695's float sibling). For the
+    // bare-variable shape — the only one whose argument IS a stored term —
+    // read the f64 straight from the binding. No widening artifact can
+    // arise: this f64 was parsed from the lexical, never widened from an
+    // f32. (A float value computed inside the expression is a genuine f32
+    // and keeps `canonical_xsd_float` via `into_string_value`.)
+    if let Expression::Var(var_id) = &args[0] {
+        if let Some(d) = crate::eval::stored_float_f64(row, *var_id, ctx) {
+            return Ok(Some(ComparableValue::String(Arc::from(
+                fluree_graph_ir::canonical_xsd_double(d),
+            ))));
+        }
+        // A late-materialized subject resolves once per distinct id per
+        // query; the memoized string is exactly what the generic path below
+        // produces for it (see `ExecutionContext::subject_iri_str_memo`).
+        if let (Some(ctx), Some(crate::binding::Binding::EncodedSid { s_id, .. })) =
+            (ctx, row.get(*var_id))
+        {
+            let s_id = *s_id;
+            let memo = ctx.subject_iri_str_memo(s_id, || {
+                // The generic path below, verbatim: an encoded subject
+                // evaluates to `ComparableValue::Iri` (one dictionary walk
+                // and one string build per call), a materialized one to `Sid`.
+                let v = args[0].eval_to_comparable(row, Some(ctx)).ok().flatten()?;
+                let s = match &v {
+                    ComparableValue::Sid(..) => {
+                        v.into_string_value_with_namespaces(Some(ctx.active_snapshot.namespaces()))
+                    }
+                    _ => v.into_string_value(),
+                };
+                match s {
+                    Some(ComparableValue::String(s)) => Some(s),
+                    _ => None,
+                }
+            });
+            if let Some(iri) = memo {
+                return Ok(Some(ComparableValue::String(iri)));
+            }
+        }
+    }
     let val = args[0].eval_to_comparable(row, ctx)?;
     Ok(val.and_then(|v| match &v {
         ComparableValue::Sid(..) => {
@@ -106,14 +151,22 @@ pub fn eval_str<R: RowAccess>(
     }))
 }
 
+/// `strict` selects the SPARQL behavior for non-literal arguments: a type
+/// error, evaluated as "no value" (`Ok(None)`) so a FILTER excludes the row
+/// and a project-expression/BIND leaves the variable unbound (§17.2/§18.5).
+/// The lenient (JSON-LD surface) mode keeps the historical behavior of
+/// returning `""` for any non-literal. See decision D-12.
 pub fn eval_lang<R: RowAccess>(
     args: &[Expression],
     row: &R,
     ctx: Option<&ExecutionContext<'_>>,
+    strict: bool,
 ) -> Result<Option<ComparableValue>> {
     check_arity(args, 1, "LANG")?;
-    let tag = match &args[0] {
-        Expression::Var(var_id) => match row.get(*var_id) {
+    // Fast path: a bare variable reads the binding's language tag directly,
+    // without materializing the value.
+    if let Expression::Var(var_id) = &args[0] {
+        let tag = match row.get(*var_id) {
             Some(Binding::Lit { dtc, .. }) => dtc
                 .lang_tag()
                 .map(std::string::ToString::to_string)
@@ -128,11 +181,25 @@ pub fn eval_lang<R: RowAccess>(
                     String::new()
                 }
             }
+            // SPARQL §17.4.2.2: LANG of a non-literal (IRI/ref, bnode) or an
+            // unbound variable is a type error → no value.
+            _ if strict => return Ok(None),
             _ => String::new(),
-        },
-        _ => String::new(),
+        };
+        return Ok(Some(ComparableValue::String(Arc::from(tag))));
+    }
+    // General case: evaluate the argument expression and read the tag off the
+    // resulting value (only lang-tagged strings carry one).
+    let tag: Arc<str> = match args[0].eval_to_comparable(row, ctx)? {
+        Some(ComparableValue::TypedLiteral {
+            dtc: Some(fluree_vocab::UnresolvedDatatypeConstraint::LangTag(tag)),
+            ..
+        }) => tag,
+        Some(ComparableValue::Sid(_) | ComparableValue::Iri(_)) if strict => return Ok(None),
+        None if strict => return Ok(None),
+        _ => Arc::from(""),
     };
-    Ok(Some(ComparableValue::String(Arc::from(tag))))
+    Ok(Some(ComparableValue::String(tag)))
 }
 
 pub fn eval_lcase<R: RowAccess>(
@@ -204,11 +271,11 @@ pub fn eval_contains<R: RowAccess>(
     check_arity(args, 2, "CONTAINS")?;
     let haystack = args[0].eval_to_comparable(row, ctx)?;
     let needle = args[1].eval_to_comparable(row, ctx)?;
-    match (haystack, needle) {
-        (Some(ComparableValue::String(h)), Some(ComparableValue::String(n))) => {
-            Ok(Some(ComparableValue::Bool(h.contains(n.as_ref()))))
-        }
-        (None, _) | (_, None) => Ok(None),
+    let (Some(haystack), Some(needle)) = (haystack, needle) else {
+        return Ok(None);
+    };
+    match (haystack.string_arg(), needle.string_arg()) {
+        (Some(h), Some(n)) => Ok(Some(ComparableValue::Bool(h.contains(n)))),
         _ => Err(QueryError::InvalidFilter(
             "CONTAINS requires string arguments".to_string(),
         )),
@@ -223,11 +290,11 @@ pub fn eval_str_starts<R: RowAccess>(
     check_arity(args, 2, "STRSTARTS")?;
     let haystack = args[0].eval_to_comparable(row, ctx)?;
     let prefix = args[1].eval_to_comparable(row, ctx)?;
-    match (haystack, prefix) {
-        (Some(ComparableValue::String(h)), Some(ComparableValue::String(p))) => {
-            Ok(Some(ComparableValue::Bool(h.starts_with(p.as_ref()))))
-        }
-        (None, _) | (_, None) => Ok(None),
+    let (Some(haystack), Some(prefix)) = (haystack, prefix) else {
+        return Ok(None);
+    };
+    match (haystack.string_arg(), prefix.string_arg()) {
+        (Some(h), Some(p)) => Ok(Some(ComparableValue::Bool(h.starts_with(p)))),
         _ => Err(QueryError::InvalidFilter(
             "STRSTARTS requires string arguments".to_string(),
         )),
@@ -242,11 +309,11 @@ pub fn eval_str_ends<R: RowAccess>(
     check_arity(args, 2, "STRENDS")?;
     let haystack = args[0].eval_to_comparable(row, ctx)?;
     let suffix = args[1].eval_to_comparable(row, ctx)?;
-    match (haystack, suffix) {
-        (Some(ComparableValue::String(h)), Some(ComparableValue::String(s))) => {
-            Ok(Some(ComparableValue::Bool(h.ends_with(s.as_ref()))))
-        }
-        (None, _) | (_, None) => Ok(None),
+    let (Some(haystack), Some(suffix)) = (haystack, suffix) else {
+        return Ok(None);
+    };
+    match (haystack.string_arg(), suffix.string_arg()) {
+        (Some(h), Some(s)) => Ok(Some(ComparableValue::Bool(h.ends_with(s)))),
         _ => Err(QueryError::InvalidFilter(
             "STRENDS requires string arguments".to_string(),
         )),
@@ -279,18 +346,20 @@ pub fn eval_regex<R: RowAccess>(
         String::new()
     };
 
-    match (text, pattern) {
-        (Some(ComparableValue::String(t)), Some(ComparableValue::String(p))) => {
-            if let Some(prefix) = anchored_literal_regex_prefix(&p, &flags) {
+    let (Some(text), Some(pattern)) = (text, pattern) else {
+        return Ok(None);
+    };
+    match (text.string_arg(), pattern.string_arg()) {
+        (Some(t), Some(p)) => {
+            if let Some(prefix) = anchored_literal_regex_prefix(p, &flags) {
                 return Ok(Some(ComparableValue::Bool(t.starts_with(prefix))));
             }
-            let re = build_regex_with_flags(&p, &flags)?;
+            let re = build_regex_with_flags(p, &flags)?;
             if let Some(ctx) = ctx {
                 ctx.tracker.consume_fuel(1)?;
             }
-            Ok(Some(ComparableValue::Bool(re.is_match(&t))))
+            Ok(Some(ComparableValue::Bool(re.is_match(t))))
         }
-        (None, _) | (_, None) => Ok(None),
         _ => Err(QueryError::InvalidFilter(
             "REGEX requires string arguments".to_string(),
         )),
@@ -306,20 +375,48 @@ pub fn eval_concat<R: RowAccess>(
     // Per W3C: preserve language tag only if ALL args have the same tag
     let mut common_lang: Option<Option<Arc<str>>> = None;
     for arg in args {
-        let lang = extract_lang_tag(arg, row, ctx);
+        // CONCAT requires string arguments (§17.4.3.5). A non-string bound value
+        // (e.g. an xsd:integer) or an unbound argument is a type error, so the
+        // whole result is unbound — not silently skipped/coerced (concat02).
+        let Some(val) = arg.eval_to_comparable(row, ctx)? else {
+            return Ok(None);
+        };
+        // §17.4.3.5: CONCAT accepts only strings — plain, xsd:string, or
+        // language-tagged. An IRI or a foreign-datatype literal (both of which
+        // `as_str()` would expose) is a type error → the whole result is unbound.
+        let s = match &val {
+            ComparableValue::String(s) => s.as_ref(),
+            ComparableValue::TypedLiteral {
+                val: FlakeValue::String(s),
+                dtc,
+            } if !matches!(dtc, Some(UnresolvedDatatypeConstraint::Explicit(_))) => s.as_str(),
+            _ => return Ok(None),
+        };
+        // The language tag can live on the VALUE itself (a constant `"a"@en`,
+        // a STRLANG/REPLACE result — both `TypedLiteral{LangTag}`) or only on
+        // the raw BINDING (the Var fast paths `extract_lang_tag` reads).
+        // Prefer the value's own tag, then fall back to the binding's —
+        // reading only the binding dropped the tag for constant/computed
+        // args, so `CONCAT("a"@en, "b"@en)` came back plain instead of @en.
+        let value_lang = match &val {
+            ComparableValue::TypedLiteral {
+                dtc: Some(UnresolvedDatatypeConstraint::LangTag(t)),
+                ..
+            } => Some(Arc::clone(t)),
+            _ => None,
+        };
+        let lang = value_lang.or_else(|| extract_lang_tag(arg, row, ctx));
         match &common_lang {
             None => common_lang = Some(lang),
-            Some(prev) => {
-                if *prev != lang {
-                    common_lang = Some(None); // mismatch → no tag
-                }
-            }
+            // RDF 1.1 language tags compare case-insensitively; the first
+            // argument's spelling is kept for the result.
+            Some(Some(prev)) => match &lang {
+                Some(l) if prev.eq_ignore_ascii_case(l) => {}
+                _ => common_lang = Some(None), // mismatch → no tag
+            },
+            Some(None) => {}
         }
-        if let Some(val) = arg.eval_to_comparable(row, ctx)? {
-            if let Some(s) = val.as_str() {
-                result.push_str(s);
-            }
-        }
+        result.push_str(s);
     }
     let lang = common_lang.flatten();
     Ok(Some(string_with_lang(&result, lang)))
@@ -457,20 +554,19 @@ pub fn eval_replace<R: RowAccess>(
         String::new()
     };
 
-    match (input, pattern, replacement) {
-        (
-            Some(ComparableValue::String(s)),
-            Some(ComparableValue::String(p)),
-            Some(ComparableValue::String(r)),
-        ) => {
-            let re = build_regex_with_flags(&p, &flags)?;
+    match (
+        input.as_ref().and_then(ComparableValue::string_arg),
+        pattern.as_ref().and_then(ComparableValue::string_arg),
+        replacement.as_ref().and_then(ComparableValue::string_arg),
+    ) {
+        (Some(s), Some(p), Some(r)) => {
+            let re = build_regex_with_flags(p, &flags)?;
             if let Some(ctx) = ctx {
                 ctx.tracker.consume_fuel(1)?;
             }
-            let replaced = re.replace_all(&s, r.as_ref()).into_owned();
+            let replaced = re.replace_all(s, r).into_owned();
             Ok(Some(string_with_lang(&replaced, lang)))
         }
-        (None, _, _) | (_, None, _) | (_, _, None) => Ok(None),
         _ => Ok(None),
     }
 }
@@ -494,10 +590,10 @@ pub fn eval_substr<R: RowAccess>(
         None
     };
 
-    let s = match input {
-        Some(ComparableValue::String(s)) => s,
-        None => return Ok(None),
-        _ => {
+    let s = match input.as_ref().and_then(ComparableValue::string_arg) {
+        Some(s) => s,
+        None if input.is_none() => return Ok(None),
+        None => {
             return Err(QueryError::InvalidFilter(
                 "SUBSTR requires a string as first argument".to_string(),
             ))
@@ -604,11 +700,21 @@ pub fn eval_str_dt<R: RowAccess>(
     let dt = args[1].eval_to_comparable(row, ctx)?;
     match (val, dt) {
         (Some(ComparableValue::String(s)), Some(dt_val)) => {
+            // The datatype argument usually arrives as a Sid — a constant IRI
+            // in expression position lowers through the IRI encoder — which
+            // `as_str()` deliberately does not expose. Decode it back to the
+            // full IRI; without it the constructed literal silently lost its
+            // datatype (DATATYPE(STRDT(?x, xsd:integer)) came back unbound
+            // and the EBV/equality paths saw a plain string).
+            let dt_iri: Option<Arc<str>> = match &dt_val {
+                ComparableValue::Sid(sid) => ctx
+                    .and_then(|c| c.active_snapshot.decode_sid(sid))
+                    .map(Arc::from),
+                other => other.as_str().map(Arc::from),
+            };
             Ok(Some(ComparableValue::TypedLiteral {
                 val: FlakeValue::String(s.to_string()),
-                dtc: dt_val
-                    .as_str()
-                    .map(|s| UnresolvedDatatypeConstraint::Explicit(Arc::from(s))),
+                dtc: dt_iri.map(UnresolvedDatatypeConstraint::Explicit),
             }))
         }
         (Some(_), Some(_)) => Ok(None),
@@ -996,5 +1102,127 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, Some(string_with_lang("engli", Some(Arc::from("EN")))));
+    }
+
+    // #1468: a stored language-tagged literal is now carried as a lang
+    // `TypedLiteral` through the eval path. The string builtins that accept a
+    // plain literal with a language tag (§17.4.3) must stay transparent to it —
+    // not raise a "requires string argument" type error.
+
+    fn iri_batch(iri: &str) -> Batch {
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let col = vec![Binding::Iri(Arc::from(iri))];
+        Batch::new(schema, vec![col]).unwrap()
+    }
+
+    #[test]
+    fn test_contains_accepts_stored_lang_literal() {
+        let batch = lang_batch("foobar", "en");
+        let row = batch.row_view(0).unwrap();
+        let r =
+            eval_contains::<_>(&[Expression::Var(VarId(0)), s_const("oba")], &row, None).unwrap();
+        assert_eq!(r, Some(ComparableValue::Bool(true)));
+    }
+
+    #[test]
+    fn test_strstarts_strends_accept_stored_lang_literal() {
+        let batch = lang_batch("foobar", "en");
+        let row = batch.row_view(0).unwrap();
+        let starts =
+            eval_str_starts::<_>(&[Expression::Var(VarId(0)), s_const("foo")], &row, None).unwrap();
+        assert_eq!(starts, Some(ComparableValue::Bool(true)));
+        let ends =
+            eval_str_ends::<_>(&[Expression::Var(VarId(0)), s_const("bar")], &row, None).unwrap();
+        assert_eq!(ends, Some(ComparableValue::Bool(true)));
+    }
+
+    #[test]
+    fn test_regex_accepts_stored_lang_literal() {
+        let batch = lang_batch("foobar", "en");
+        let row = batch.row_view(0).unwrap();
+        let r = eval_regex::<_>(&[Expression::Var(VarId(0)), s_const("o+b")], &row, None).unwrap();
+        assert_eq!(r, Some(ComparableValue::Bool(true)));
+    }
+
+    #[test]
+    fn test_replace_preserves_lang_on_stored_lang_literal() {
+        let batch = lang_batch("foobar", "en");
+        let row = batch.row_view(0).unwrap();
+        let r = eval_replace::<_>(
+            &[Expression::Var(VarId(0)), s_const("o+"), s_const("0")],
+            &row,
+            None,
+        )
+        .unwrap();
+        // REPLACE preserves the input's language tag (§17.4.3.6).
+        assert_eq!(r, Some(string_with_lang("f0bar", Some(Arc::from("en")))));
+    }
+
+    #[test]
+    fn test_substr_preserves_lang_on_stored_lang_literal() {
+        let batch = lang_batch("foobar", "en");
+        let row = batch.row_view(0).unwrap();
+        let r = eval_substr::<_>(
+            &[
+                Expression::Var(VarId(0)),
+                Expression::Const(FlakeValue::Long(2)),
+            ],
+            &row,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r, Some(string_with_lang("oobar", Some(Arc::from("en")))));
+    }
+
+    #[test]
+    fn test_ucase_lcase_accept_stored_lang_literal() {
+        // UCASE/LCASE read the value via `as_str` and take the tag off the
+        // binding via `extract_lang_tag`, so they accept the lang variant and
+        // (as before this change) preserve the tag — no type error.
+        let batch = lang_batch("Foobar", "en");
+        let row = batch.row_view(0).unwrap();
+        let up = eval_ucase::<_>(&[Expression::Var(VarId(0))], &row, None).unwrap();
+        assert_eq!(up, Some(string_with_lang("FOOBAR", Some(Arc::from("en")))));
+        let down = eval_lcase::<_>(&[Expression::Var(VarId(0))], &row, None).unwrap();
+        assert_eq!(
+            down,
+            Some(string_with_lang("foobar", Some(Arc::from("en"))))
+        );
+    }
+
+    #[test]
+    fn test_contains_iri_argument_stays_type_error() {
+        // An IRI argument is NOT a string — the sweep must keep it a type error
+        // (not silently accept it via the lang-transparent path).
+        let batch = iri_batch("http://example.org/x");
+        let row = batch.row_view(0).unwrap();
+        let r = eval_contains::<_>(&[Expression::Var(VarId(0)), s_const("x")], &row, None);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_contains_accepts_explicit_xsd_string() {
+        // The two string choke-points must agree: STRBEFORE (str_arg_and_lang)
+        // already accepted an explicit xsd:string datatype as a simple
+        // literal; CONTAINS (string_arg) type-errored on the same value.
+        let batch = make_string_batch();
+        let row = batch.row_view(0).unwrap();
+        let r = eval_contains::<_>(
+            &[
+                strdt_const("hello", "http://www.w3.org/2001/XMLSchema#string"),
+                s_const("ell"),
+            ],
+            &row,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r, Some(ComparableValue::Bool(true)));
+        // A foreign datatype stays a type error.
+        let err = eval_contains::<_>(
+            &[strdt_const("hello", "http://example.org/dt"), s_const("l")],
+            &row,
+            None,
+        );
+        assert!(err.is_err(), "foreign-datatype arg must stay a type error");
     }
 }

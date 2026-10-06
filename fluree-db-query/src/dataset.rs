@@ -176,6 +176,13 @@ pub struct DataSet<'a> {
     default_graphs: Vec<GraphRef<'a>>,
     /// Named graphs keyed by IRI string (not Sid)
     named_graphs: HashMap<Arc<str>, GraphRef<'a>>,
+    /// Further names for graphs, addressable by `GRAPH <name>` but not
+    /// enumerated by `GRAPH ?g`, so one graph never binds `?g` twice.
+    named_graph_aliases: HashMap<Arc<str>, GraphRef<'a>>,
+    /// Whether the query named this dataset (`FROM` / `FROM NAMED`). A
+    /// ledger's union default graph is not named by the query; see
+    /// [`Self::implicit`].
+    explicit: bool,
 }
 
 impl<'a> DataSet<'a> {
@@ -184,7 +191,25 @@ impl<'a> DataSet<'a> {
         Self {
             default_graphs: Vec::new(),
             named_graphs: HashMap::new(),
+            named_graph_aliases: HashMap::new(),
+            explicit: true,
         }
+    }
+
+    /// Mark this dataset as one the query did not name: a ledger's union
+    /// default graph, whose members are that ledger's graphs. Only
+    /// default-graph patterns read it as a dataset. `GRAPH` resolution, graph
+    /// sources, and as-of time behave as they do with no dataset at all, so
+    /// switching the union on changes nothing but what the default graph
+    /// holds.
+    pub fn implicit(mut self) -> Self {
+        self.explicit = false;
+        self
+    }
+
+    /// Whether the query named this dataset; see [`Self::implicit`].
+    pub fn is_explicit(&self) -> bool {
+        self.explicit
     }
 
     /// Add a default graph
@@ -199,6 +224,18 @@ impl<'a> DataSet<'a> {
         self
     }
 
+    /// Add a name that resolves to `graph` for `GRAPH <name>` without being
+    /// enumerated by `GRAPH ?g`. A name already present as a named graph
+    /// keeps that entry.
+    pub fn with_named_graph_alias(
+        mut self,
+        name: impl Into<Arc<str>>,
+        graph: GraphRef<'a>,
+    ) -> Self {
+        self.named_graph_aliases.insert(name.into(), graph);
+        self
+    }
+
     /// Get default graph references
     pub fn default_graphs(&self) -> &[GraphRef<'a>] {
         &self.default_graphs
@@ -206,7 +243,9 @@ impl<'a> DataSet<'a> {
 
     /// Get a named graph by IRI (None if not found)
     pub fn named_graph(&self, iri: &str) -> Option<&GraphRef<'a>> {
-        self.named_graphs.get(iri)
+        self.named_graphs
+            .get(iri)
+            .or_else(|| self.named_graph_aliases.get(iri))
     }
 
     /// Get all named graph IRIs (for GRAPH ?g iteration)
@@ -216,7 +255,54 @@ impl<'a> DataSet<'a> {
 
     /// Check if a named graph exists
     pub fn has_named_graph(&self, iri: &str) -> bool {
-        self.named_graphs.contains_key(iri)
+        self.named_graphs.contains_key(iri) || self.named_graph_aliases.contains_key(iri)
+    }
+
+    /// Copy of this dataset where every graph matching the primary
+    /// execution view — same ledger, graph id, and `to_t` — reads through
+    /// `overlay` instead of its original overlay reference.
+    ///
+    /// Used by the executor to splice the reasoning derived-facts overlay
+    /// into dataset execution: dataset scans go through per-graph
+    /// [`GraphRef`]s, not the top-level context overlay, so without this
+    /// datalog / OWL2-RL derived facts (computed against the primary view)
+    /// are invisible to dataset queries.
+    pub fn with_overlay_for_graph<'b>(
+        &self,
+        ledger_id: &str,
+        g_id: GraphId,
+        to_t: i64,
+        overlay: &'b dyn OverlayProvider,
+    ) -> DataSet<'b>
+    where
+        'a: 'b,
+    {
+        let patch = |graph: &GraphRef<'a>| -> GraphRef<'b> {
+            let matches =
+                graph.ledger_id.as_ref() == ledger_id && graph.g_id == g_id && graph.to_t == to_t;
+            GraphRef {
+                snapshot: graph.snapshot,
+                g_id: graph.g_id,
+                overlay: if matches { overlay } else { graph.overlay },
+                to_t: graph.to_t,
+                ledger_id: Arc::clone(&graph.ledger_id),
+                policy_enforcer: graph.policy_enforcer.clone(),
+            }
+        };
+        DataSet {
+            default_graphs: self.default_graphs.iter().map(&patch).collect(),
+            named_graphs: self
+                .named_graphs
+                .iter()
+                .map(|(iri, g)| (Arc::clone(iri), patch(g)))
+                .collect(),
+            named_graph_aliases: self
+                .named_graph_aliases
+                .iter()
+                .map(|(iri, g)| (Arc::clone(iri), patch(g)))
+                .collect(),
+            explicit: self.explicit,
+        }
     }
 
     /// True when any constituent graph (default or named) enforces a non-root

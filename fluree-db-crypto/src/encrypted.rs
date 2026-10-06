@@ -49,7 +49,8 @@ use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use async_trait::async_trait;
 use fluree_db_core::{
-    sha256_hex, ContentAddressedWrite, ContentKind, ContentWriteResult, StorageRead, StorageWrite,
+    sha256_hex, ContentAddressedWrite, ContentKind, ContentWriteResult, EncryptionAdmin,
+    StorageRead, StorageWrite,
 };
 use rand_core::{OsRng, RngCore};
 use std::fmt::{self, Debug};
@@ -117,7 +118,13 @@ where
 
     /// Encrypt plaintext and build the complete envelope.
     fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let key = self.keys.current_key();
+        Self::encrypt_with(&self.keys, plaintext)
+    }
+
+    /// [`Self::encrypt`] with only the key provider, for callers that cannot
+    /// borrow the storage.
+    fn encrypt_with(keys: &K, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let key = keys.current_key();
 
         // Create cipher from key
         let cipher =
@@ -152,12 +159,17 @@ where
 
     /// Decrypt an envelope and return the plaintext.
     fn decrypt(&self, envelope: &[u8]) -> Result<Vec<u8>> {
+        Self::decrypt_with(&self.keys, envelope)
+    }
+
+    /// [`Self::decrypt`] with only the key provider, for callers that cannot
+    /// borrow the storage.
+    fn decrypt_with(keys: &K, envelope: &[u8]) -> Result<Vec<u8>> {
         // Parse and validate header
         let header = parse_header(envelope)?;
 
         // Look up the key
-        let key = self
-            .keys
+        let key = keys
             .key_by_id(header.key_id)
             .ok_or_else(|| EncryptionError::unknown_key_id(header.key_id))?;
 
@@ -223,8 +235,8 @@ where
 #[async_trait]
 impl<S, K> StorageRead for EncryptedStorage<S, K>
 where
-    S: StorageRead,
-    K: KeyProvider,
+    S: StorageRead + StorageWrite + Clone + Send + Sync + 'static,
+    K: KeyProvider + 'static,
 {
     async fn read_bytes(&self, address: &str) -> fluree_db_core::error::Result<Vec<u8>> {
         // Read encrypted bytes from underlying storage
@@ -247,6 +259,78 @@ where
         // Pass through - listing doesn't need encryption
         self.inner.list_prefix(prefix).await
     }
+
+    /// Reads come back decrypted, so a read-through disk cache of them
+    /// would be a plaintext copy of the ledger outside the encrypted tier.
+    fn permits_plaintext_cache(&self) -> bool {
+        false
+    }
+
+    fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>> {
+        Some(Arc::new(self.clone()))
+    }
+}
+
+/// The rotation surface: classify a blob by the key its header names, and
+/// re-envelope it under the current key in place.
+#[async_trait]
+impl<S, K> EncryptionAdmin for EncryptedStorage<S, K>
+where
+    S: StorageRead + StorageWrite + Clone + Send + Sync + 'static,
+    K: KeyProvider + 'static,
+{
+    fn key_ids(&self) -> Vec<u32> {
+        self.keys.key_ids()
+    }
+
+    fn current_key_id(&self) -> u32 {
+        self.keys.current_key().id()
+    }
+
+    async fn key_id_at(&self, address: &str) -> fluree_db_core::error::Result<Option<u32>> {
+        // Header only: a ranged read on the inner storage, no decryption.
+        // An address that is empty or gone (a lock file, or a blob collected
+        // between listing and this read) holds no envelope.
+        let prefix = match self
+            .inner
+            .read_byte_range(address, 0..HEADER_LEN as u64)
+            .await
+        {
+            Ok(prefix) => prefix,
+            Err(fluree_db_core::error::Error::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        match crate::envelope::key_id_of_header(&prefix) {
+            Ok(id) => Ok(Some(id)),
+            // Not an envelope: plaintext left by an unencrypted run, or a
+            // nameservice record. Reported, never rewritten.
+            Err(EncryptionError::InvalidFormat { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn reencrypt(&self, address: &str) -> fluree_db_core::error::Result<Option<u64>> {
+        let envelope = self.inner.read_bytes(address).await?;
+        let header = parse_header(&envelope)?;
+        let current = self.keys.current_key();
+        if header.key_id == current.id() {
+            return Ok(None);
+        }
+        let plaintext = self.decrypt(&envelope)?;
+        let rewritten = self.encrypt(&plaintext)?;
+        self.inner.write_bytes(address, &rewritten).await?;
+
+        // Read back through the same path a reader takes: the write must
+        // decrypt under the current key to exactly what was there before.
+        let check = self.inner.read_bytes(address).await?;
+        let check_header = parse_header(&check)?;
+        if check_header.key_id != current.id() || self.decrypt(&check)? != plaintext {
+            return Err(fluree_db_core::error::Error::storage(format!(
+                "re-encryption of {address} did not read back under the current key"
+            )));
+        }
+        Ok(Some(plaintext.len() as u64))
+    }
 }
 
 #[async_trait]
@@ -268,6 +352,17 @@ where
     async fn delete(&self, address: &str) -> fluree_db_core::error::Result<()> {
         // Pass through - deletion doesn't need encryption
         self.inner.delete(address).await
+    }
+
+    async fn delete_many(
+        &self,
+        addresses: &[String],
+    ) -> Vec<(String, fluree_db_core::error::Error)> {
+        self.inner.delete_many(addresses).await
+    }
+
+    async fn sync(&self) -> fluree_db_core::error::Result<()> {
+        self.inner.sync().await
     }
 }
 
@@ -368,8 +463,8 @@ mod nameservice_impls {
     #[async_trait]
     impl<S, K> StorageCas for EncryptedStorage<S, K>
     where
-        S: StorageCas,
-        K: KeyProvider,
+        S: StorageCas + 'static,
+        K: KeyProvider + 'static,
     {
         async fn insert(&self, address: &str, bytes: &[u8]) -> StorageExtResult<bool> {
             let encrypted = self
@@ -386,15 +481,18 @@ mod nameservice_impls {
         where
             F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError>
                 + Send
-                + Sync,
-            T: Send,
+                + Sync
+                + 'static,
+            T: Send + 'static,
         {
+            // The closure may run off this task, so it owns its keys.
+            let keys = Arc::clone(&self.keys);
             self.inner
-                .compare_and_swap(address, |current_encrypted| {
+                .compare_and_swap(address, move |current_encrypted| {
                     // Decrypt current value if present
                     let current_plaintext = current_encrypted
                         .map(|enc| {
-                            self.decrypt(enc)
+                            Self::decrypt_with(&keys, enc)
                                 .map_err(|e| StorageExtError::other(e.to_string()))
                         })
                         .transpose()?;
@@ -402,8 +500,7 @@ mod nameservice_impls {
                     let current_ref = current_plaintext.as_deref();
                     match f(current_ref)? {
                         CasAction::Write(plaintext) => {
-                            let encrypted = self
-                                .encrypt(&plaintext)
+                            let encrypted = Self::encrypt_with(&keys, &plaintext)
                                 .map_err(|e| StorageExtError::other(e.to_string()))?;
                             Ok(CasAction::Write(encrypted))
                         }
@@ -657,5 +754,24 @@ mod tests {
         let raw = storage.read_bytes(&result.address).await.unwrap();
         assert_ne!(raw.as_slice(), plaintext);
         assert!(raw.len() > plaintext.len()); // Encrypted data is larger
+    }
+
+    #[test]
+    fn encrypted_storage_forbids_plaintext_cache() {
+        use fluree_db_core::{ContentStore, Storage, StorageContentStore};
+        use std::sync::Arc;
+
+        let plain = MemoryStorage::new();
+        assert!(plain.permits_plaintext_cache());
+
+        let encrypted = EncryptedStorage::new(plain, test_provider());
+        assert!(!encrypted.permits_plaintext_cache());
+
+        // The answer must survive type erasure and the content-store bridge,
+        // which is how the binary-index reader sees the storage.
+        let erased: Arc<dyn Storage> = Arc::new(encrypted);
+        assert!(!erased.permits_plaintext_cache());
+        let cs = StorageContentStore::new(erased, "db:main", "memory");
+        assert!(!cs.permits_plaintext_cache());
     }
 }

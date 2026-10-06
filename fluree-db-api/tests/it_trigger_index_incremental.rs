@@ -1,35 +1,26 @@
 #![cfg(feature = "native")]
 
 use crate::support;
-use async_trait::async_trait;
+use crate::support::hooked_storage::{HookedStorage, StorageHooks};
 use fluree_db_api::tx::IndexingMode;
 use fluree_db_api::{Fluree, IndexerConfig, NameServiceMode, TriggerIndexOptions};
 use fluree_db_connection::config::ConnectionConfig;
-use fluree_db_core::{ContentKind, ContentStore, MemoryStorage, StorageMethod};
+use fluree_db_core::ContentStore;
 use fluree_db_nameservice::memory::MemoryNameService;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-#[derive(Debug, Clone)]
-struct CountingStorage {
-    inner: MemoryStorage,
-    index_leaf_writes: Arc<AtomicU64>,
-    index_branch_writes: Arc<AtomicU64>,
-    index_root_writes: Arc<AtomicU64>,
+/// Storage hooks that count index artifact writes by the address written.
+#[derive(Debug, Default)]
+struct IndexWriteCounts {
+    index_leaf_writes: AtomicU64,
+    index_branch_writes: AtomicU64,
+    index_root_writes: AtomicU64,
 }
 
-impl CountingStorage {
-    fn new() -> Self {
-        Self {
-            inner: MemoryStorage::new(),
-            index_leaf_writes: Arc::new(AtomicU64::new(0)),
-            index_branch_writes: Arc::new(AtomicU64::new(0)),
-            index_root_writes: Arc::new(AtomicU64::new(0)),
-        }
-    }
-
+impl IndexWriteCounts {
     fn snapshot_counts(&self) -> (u64, u64, u64) {
         (
             self.index_leaf_writes.load(Ordering::Relaxed),
@@ -39,31 +30,8 @@ impl CountingStorage {
     }
 }
 
-#[async_trait]
-impl fluree_db_core::StorageRead for CountingStorage {
-    async fn read_bytes(&self, address: &str) -> fluree_db_core::error::Result<Vec<u8>> {
-        self.inner.read_bytes(address).await
-    }
-
-    async fn exists(&self, address: &str) -> fluree_db_core::error::Result<bool> {
-        self.inner.exists(address).await
-    }
-
-    async fn list_prefix(&self, prefix: &str) -> fluree_db_core::error::Result<Vec<String>> {
-        self.inner.list_prefix(prefix).await
-    }
-
-    fn resolve_local_path(&self, address: &str) -> Option<std::path::PathBuf> {
-        self.inner.resolve_local_path(address)
-    }
-}
-
-impl CountingStorage {
-    /// Increment the appropriate counter based on what kind of artifact the
-    /// address points at. Used by both `write_bytes` and
-    /// `content_write_bytes_with_hash` so writes are counted regardless of
-    /// which entry point the indexer uses to upload a CAS blob.
-    fn note_address(&self, address: &str) {
+impl StorageHooks for IndexWriteCounts {
+    fn after_write(&self, address: &str) {
         if address.contains("/index/objects/leaves/") {
             self.index_leaf_writes.fetch_add(1, Ordering::Relaxed);
         } else if address.contains("/index/objects/branches/") {
@@ -74,45 +42,9 @@ impl CountingStorage {
     }
 }
 
-#[async_trait]
-impl fluree_db_core::StorageWrite for CountingStorage {
-    async fn write_bytes(&self, address: &str, bytes: &[u8]) -> fluree_db_core::error::Result<()> {
-        self.note_address(address);
-        self.inner.write_bytes(address, bytes).await
-    }
-
-    async fn delete(&self, address: &str) -> fluree_db_core::error::Result<()> {
-        self.inner.delete(address).await
-    }
-}
-
-impl StorageMethod for CountingStorage {
-    fn storage_method(&self) -> &str {
-        self.inner.storage_method()
-    }
-}
-
-#[async_trait]
-impl fluree_db_core::ContentAddressedWrite for CountingStorage {
-    async fn content_write_bytes_with_hash(
-        &self,
-        kind: ContentKind,
-        ledger_id: &str,
-        content_hash_hex: &str,
-        bytes: &[u8],
-    ) -> fluree_db_core::error::Result<fluree_db_core::storage::ContentWriteResult> {
-        let result = self
-            .inner
-            .content_write_bytes_with_hash(kind, ledger_id, content_hash_hex, bytes)
-            .await?;
-        self.note_address(&result.address);
-        Ok(result)
-    }
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn trigger_index_second_run_uses_incremental_not_full_rebuild() {
-    let storage = CountingStorage::new();
+    let storage = HookedStorage::new(IndexWriteCounts::default());
     let nameservice = MemoryNameService::new();
 
     let mut fluree: Fluree = Fluree::new(
@@ -164,12 +96,12 @@ async fn trigger_index_second_run_uses_incremental_not_full_rebuild() {
             ledger = r1.ledger;
 
             // First trigger builds the initial full index (no prior root).
-            let before1 = storage.snapshot_counts();
+            let before1 = storage.hooks().snapshot_counts();
             let res1 = fluree
                 .trigger_index(ledger_id, TriggerIndexOptions::default())
                 .await
                 .expect("trigger_index #1");
-            let after1 = storage.snapshot_counts();
+            let after1 = storage.hooks().snapshot_counts();
             let delta1_leaf = after1.0 - before1.0;
             assert!(
                 delta1_leaf >= 8,
@@ -192,12 +124,12 @@ async fn trigger_index_second_run_uses_incremental_not_full_rebuild() {
             let r2 = fluree.insert(ledger, &tx2).await.expect("update insert");
             ledger = r2.ledger;
 
-            let before2 = storage.snapshot_counts();
+            let before2 = storage.hooks().snapshot_counts();
             let res2 = fluree
                 .trigger_index(ledger_id, TriggerIndexOptions::default())
                 .await
                 .expect("trigger_index #2");
-            let after2 = storage.snapshot_counts();
+            let after2 = storage.hooks().snapshot_counts();
             let delta2_leaf = after2.0 - before2.0;
             // Second run should be incremental: it should write *far fewer* index leaves
             // than the initial full build.

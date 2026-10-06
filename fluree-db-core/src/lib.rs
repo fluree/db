@@ -28,6 +28,7 @@ pub mod address;
 pub mod address_path;
 pub mod annotation_index;
 pub mod cancellation;
+pub mod clock;
 pub mod coerce;
 pub mod commit;
 pub mod comparator;
@@ -40,10 +41,13 @@ pub mod db;
 pub mod dict_novelty;
 /// Shared LRU disk cache for content-addressed blobs (index artifacts, Iceberg
 /// data files), with a single global byte budget. Native (filesystem) only.
-#[cfg(feature = "native")]
+/// Also compiled on wasm32 (std::fs stubs): every read misses, writes are
+/// best-effort no-ops, so CAS consumers fall through to pure fetch. SEAM(wasm).
+#[cfg(any(feature = "native", target_arch = "wasm32"))]
 pub mod disk_cache;
 pub mod edge;
 pub mod error;
+pub mod fd_limit;
 pub mod flake;
 pub mod geo;
 pub mod graph_db_ref;
@@ -69,31 +73,38 @@ pub mod runtime_small_dicts;
 pub mod schema_hierarchy;
 pub mod serde;
 pub mod sid;
+pub mod skolem;
 pub mod stats_view;
 pub mod stats_wire;
 pub mod storage;
 pub mod subject_id;
 pub mod sysmem;
+#[cfg(feature = "native")]
+pub mod task;
 pub mod temporal;
 pub mod tracking;
 pub mod value;
 pub mod value_id;
 pub mod vec_bi_dict;
+pub mod verified_identity;
+// moka stand-in for wasm32 (clock-free LRU); compiled on native only for its
+// unit tests. See module docs.
+#[cfg(any(target_arch = "wasm32", test))]
+pub mod wasm_cache;
 
 // Re-export main types
-pub use address::{
-    extract_identifier, extract_ledger_prefix, extract_path, parse_fluree_address,
-    ParsedFlureeAddress,
-};
+pub use address::{extract_identifier, extract_path, parse_fluree_address, ParsedFlureeAddress};
 pub use annotation_index::{AnnotationIndexRoot, AnnotationStats};
 pub use cancellation::{QueryCancellation, QueryCancellationReason};
 pub use coerce::{coerce_json_value, coerce_value, CoercionError, CoercionResult};
 pub use commit::{
-    collect_dag_cids, collect_dag_cids_with_split_mode, commit_to_summary, find_common_ancestor,
-    first_t_where_graph_registered, load_commit_by_id, load_commit_envelope_by_id,
-    trace_commit_envelopes_by_id, trace_commits_by_id, walk_commit_summaries, Commit,
-    CommitEnvelope, CommitSummary, CommonAncestor, GraphRegistrationProbe, TxnMetaEntry,
-    TxnMetaValue, TxnSignature, MAX_TXN_META_BYTES, MAX_TXN_META_ENTRIES,
+    collect_dag_cids, collect_first_parent_cids, collect_first_parent_cids_with_split_mode,
+    commit_to_summary, diff_branches, find_common_ancestor, first_t_where_graph_registered,
+    load_commit_by_id, load_commit_envelope_by_id, plan_commit_transfer, plan_commit_transfer_page,
+    trace_commit_envelopes_by_id, trace_commits_by_id, trace_first_parent_commits_by_id,
+    walk_commit_summaries, BranchDiff, Commit, CommitEnvelope, CommitSummary, CommitTransferPage,
+    CommitTransferPlan, CommonAncestor, GraphRegistrationProbe, TxnMetaEntry, TxnMetaValue,
+    TxnSignature, MAX_TXN_META_BYTES, MAX_TXN_META_ENTRIES,
 };
 pub use comparator::IndexType;
 pub use conflict_key::ConflictKey;
@@ -102,21 +113,21 @@ pub use content_kind::{
     ContentKind, DictKind, CODEC_FLUREE_ANNOTATION_FORWARD_BRANCH,
     CODEC_FLUREE_ANNOTATION_FORWARD_LEAF, CODEC_FLUREE_ANNOTATION_REVERSE_BRANCH,
     CODEC_FLUREE_ANNOTATION_REVERSE_LEAF, CODEC_FLUREE_COMMIT, CODEC_FLUREE_DICT_BLOB,
-    CODEC_FLUREE_GARBAGE, CODEC_FLUREE_GRAPH_SOURCE_SNAPSHOT, CODEC_FLUREE_HISTORY_SIDECAR,
-    CODEC_FLUREE_INDEX_BRANCH, CODEC_FLUREE_INDEX_LEAF, CODEC_FLUREE_INDEX_ROOT,
-    CODEC_FLUREE_LEDGER_CONFIG, CODEC_FLUREE_STATS_SKETCH, CODEC_FLUREE_TXN,
+    CODEC_FLUREE_GARBAGE, CODEC_FLUREE_GRAPH_SOURCE_MAPPING, CODEC_FLUREE_GRAPH_SOURCE_SNAPSHOT,
+    CODEC_FLUREE_HISTORY_SIDECAR, CODEC_FLUREE_INDEX_BRANCH, CODEC_FLUREE_INDEX_LEAF,
+    CODEC_FLUREE_INDEX_ROOT, CODEC_FLUREE_LEDGER_CONFIG, CODEC_FLUREE_SPATIAL_INDEX,
+    CODEC_FLUREE_STATS_SKETCH, CODEC_FLUREE_TXN,
 };
 pub use datatype_constraint::DatatypeConstraint;
-pub use datatypes::dt_compatible;
 pub use db::{load_ledger_snapshot, LedgerSnapshot, LedgerSnapshotMetadata};
 pub use dict_novelty::DictNovelty;
 pub use edge::{id_datatype_sid, xsd_string_datatype_sid, EdgeKey, EdgeKeyDecodeError};
 pub use error::{Error, Result};
-pub use flake::{Flake, FlakeMeta};
+pub use flake::{normalize_lang_tag, Flake, FlakeMeta};
 pub use graph_db_ref::GraphDbRef;
 pub use graph_registry::{
     config_graph_iri, txn_meta_graph_iri, GraphRegistry, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID,
-    FIRST_USER_GRAPH_ID, TXN_META_GRAPH_ID,
+    DEFAULT_GRAPH_IRI, FIRST_USER_GRAPH_ID, TXN_META_GRAPH_ID,
 };
 pub use ids::{
     DatatypeDictId, GraphId, LangId, ListIndex, PredicateId, RuntimeDatatypeId, RuntimePredicateId,
@@ -128,9 +139,10 @@ pub use index_stats::{
     IndexStats, PropertyStatEntry,
 };
 pub use ledger_id::{
-    format_ledger_id, normalize_ledger_id, parse_ledger_id_with_time, split_ledger_id,
-    split_time_travel_suffix, validate_branch_name, LedgerIdParseError, LedgerIdTimeSpec,
-    ParsedLedgerId, DEFAULT_BRANCH,
+    format_ledger_id, normalize_ledger_id, parse_ledger_id_with_time, parse_time_travel_spec,
+    split_ledger_id, split_time_travel_suffix, validate_branch_name, validate_ledger_name,
+    IntoLedgerId, LedgerId, LedgerIdParseError, LedgerIdTimeSpec, LedgerName, LedgerRef,
+    ParsedLedgerId, COMMIT_PREFIX_MIN_LEN, DEFAULT_BRANCH, LEDGER_URN_PREFIX, TIME_TRAVEL_TAGS,
 };
 pub use namespaces::{
     default_namespace_codes, is_owl_class_class, is_owl_datatype_property_class,
@@ -153,14 +165,17 @@ pub use o_type_registry::OTypeRegistry;
 pub use overlay::{NoOverlay, OverlayProvider, OverlaySegmentMeta};
 pub use prefix_trie::PrefixTrie;
 pub use range::{
-    flake_matches_range_eq, range, range_bounded_with_overlay, range_with_overlay, ObjectBounds,
-    RangeMatch, RangeOptions, RangeTest, BATCHED_JOIN_SIZE,
+    flake_matches_range_eq, overlay_eq_bounds, range, range_bounded_with_overlay,
+    range_with_overlay, ObjectBounds, RangeMatch, RangeOptions, RangeTest, BATCHED_JOIN_SIZE,
 };
 pub use range_provider::{RangeProvider, RangeQuery};
 pub use runtime_small_dicts::RuntimeSmallDicts;
-pub use schema_hierarchy::SchemaHierarchy;
+pub use schema_hierarchy::{
+    compute_schema_hierarchy_with_overlay, SchemaHierarchy, SchemaHierarchyCache,
+};
 pub use sid::{Sid, SidInterner};
 pub use stats_view::{PropertyStatData, StatsView};
+pub use storage::EncryptionAdmin;
 pub use storage::{
     bridge_content_store,
     content_address,
@@ -175,6 +190,7 @@ pub use storage::{
     ContentAddressedWrite,
     ContentStore,
     ContentWriteResult,
+    Durability,
     ListResult,
     MemoryContentStore,
     MemoryStorage,
@@ -200,13 +216,15 @@ pub use storage::{FileStorage, STORAGE_METHOD_FILE};
 pub use subject_id::{SubjectId, SubjectIdColumn, SubjectIdEncoding};
 pub use temporal::{Date, DateTime, Time};
 pub use tracking::{
-    FuelExceededError, PolicyStats, ReasoningTally, Tracker, TrackingOptions, TrackingTally,
+    FuelExceededError, PolicyEnforcement, PolicyStats, PushedStatement, ReasoningTally, Tracker,
+    TrackingOptions, TrackingTally,
 };
 pub use value::{
     parse_decimal, parse_decimal_string, parse_double, parse_integer, parse_integer_string,
     FlakeValue, GeoPointBits,
 };
 pub use value_id::{DecimalEncoding, ObjKey, ObjKeyError, ObjKind, ObjPair, ValueTypeTag};
+pub use verified_identity::VerifiedIdentity;
 
 /// Prelude module for convenient imports of storage traits and common types.
 ///

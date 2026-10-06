@@ -168,10 +168,10 @@ fn truncation_resume_and_message(
                 }
             }
         } else if let Some(ref iso) = ctx.iso_timestamp {
-            // Multi-ledger: advise using @iso: for time-pinning
+            // Multi-ledger: advise using @time: for time-pinning
             msg.push_str(&format!(
                 " To retrieve the next batch, re-issue your query with \
-                 @iso:{} on each FROM clause and add OFFSET {} LIMIT {}.",
+                 @time:{} on each FROM clause and add OFFSET {} LIMIT {}.",
                 iso, row_count, ctx.resume_limit
             ));
         }
@@ -622,6 +622,7 @@ mod tests {
             output: crate::QueryOutput::select_all(var_ids),
             batches: vec![batch],
             binary_graph: None,
+            from_graph_source: false,
         }
     }
 
@@ -758,7 +759,10 @@ mod tests {
                     FlakeValue::Json(r#"{"k":[1,2]}"#.to_string()),
                     Sid::new(3, "JSON"),
                 ),
-                Binding::lit(FlakeValue::Vector(vec![1.0, -2.5]), Sid::new(2, "double")),
+                Binding::lit(
+                    FlakeValue::Vector(vec![1.0, -2.5].into()),
+                    Sid::new(2, "double"),
+                ),
             ]],
         );
         assert_parity(&r, &super::super::config::FormatterConfig::agent_json());

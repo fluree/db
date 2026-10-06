@@ -1,0 +1,15 @@
+# q077 count_current_enterprise_customers_dataset — audit item 9b (the q038 class),
+#   MULTI-CONSTRAINT case (D-c5 over-count guard).
+# Coverage: a COUNT carrying TWO folded constant-object constraints — edw:isCurrent true
+#   (xsd:boolean) AND edw:segment "Enterprise" (xsd:string). Item 9b removes the
+#   single-table decline-on-star_constraints guard and APPLIES each constraint per row in
+#   the fused fold (resolve_star_constraint_checks + row_satisfies_constraints). The oracle
+#   is the CONSTRAINED count (current Enterprise customers = 50038, i.e. q022's Enterprise
+#   row): dropping EITHER constraint over-counts (300000 if segment is ignored; all-segment
+#   Enterprise incl. non-current if isCurrent is ignored). The manifest COUNT shortcut stays
+#   declined for a constraint-bearing plan. Rides FLUREE_FUSED_R2RML_AGG (switch-off reverts).
+# Exec path: query_from() FROM <enterprise-sf01-v:main> (the deployed solo/chat shape).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT (COUNT(*) AS ?n)
+FROM <enterprise-sf01-v:main>
+WHERE { ?c a edw:Customer ; edw:isCurrent true ; edw:segment "Enterprise" . }

@@ -1,0 +1,8 @@
+# q033 employee_managers
+# Intent: Dimension self-join (Employee->Employee via manager).
+# BI lineage (BI-17): "Who is each employee's manager?"
+# Predicates verified against enterprise.ttl — DimEmployee: name, manager(->DimEmployee).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?en ?mn
+WHERE { ?e a edw:Employee ; edw:name ?en ; edw:manager ?m .
+        ?m edw:name ?mn . }

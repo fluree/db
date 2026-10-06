@@ -63,8 +63,9 @@ const IRI_SEGMENT: &AsciiSet = &CONTROLS
     .add(b']')
     .add(b'@');
 
-/// Percent-encode a CSV cell value so it is safe to append after `base_iri`.
-fn iri_segment(s: &str) -> Cow<'_, str> {
+/// Percent-encode a value so it is safe to embed as one IRI segment (also
+/// used by the Cypher importer's minted node ids).
+pub(crate) fn iri_segment(s: &str) -> Cow<'_, str> {
     utf8_percent_encode(s, IRI_SEGMENT).into()
 }
 

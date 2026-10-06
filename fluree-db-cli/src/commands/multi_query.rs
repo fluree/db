@@ -422,10 +422,10 @@ mod tests {
     }
 
     #[test]
-    fn inject_policy_default_allow_only_when_true() {
+    fn inject_policy_default_allow_only_when_explicitly_set() {
+        // Neither flag: nothing injected, so the ledger's f:defaultAllow governs.
         let mut envelope = envelope_with_dummy_query();
         let policy = PolicyArgs {
-            default_allow: false,
             // Without other flags this would be is_set() == false; add
             // an identity so injection runs.
             identity: Some("ex:alice".into()),
@@ -434,6 +434,17 @@ mod tests {
         inject_policy_into_envelope(&mut envelope, &policy).unwrap();
         let opts = envelope.opts.unwrap();
         assert!(opts.as_object().unwrap().get("default-allow").is_none());
+
+        // `--no-default-allow`: the explicit fail-closed value rides along.
+        let mut envelope = envelope_with_dummy_query();
+        let policy = PolicyArgs {
+            identity: Some("ex:alice".into()),
+            no_default_allow: true,
+            ..Default::default()
+        };
+        inject_policy_into_envelope(&mut envelope, &policy).unwrap();
+        let opts = envelope.opts.unwrap();
+        assert_eq!(opts["default-allow"], serde_json::Value::Bool(false));
     }
 
     #[test]

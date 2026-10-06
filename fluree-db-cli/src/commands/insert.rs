@@ -195,7 +195,9 @@ pub async fn run(
         } => {
             let client = client.with_policy(policy.clone());
             let result = match data_format {
-                detect::DataFormat::Turtle => client.insert_turtle(&remote_alias, &content).await?,
+                detect::DataFormat::Turtle | detect::DataFormat::Trig => {
+                    client.insert_turtle(&remote_alias, &content).await?
+                }
                 detect::DataFormat::JsonLd => {
                     let json: serde_json::Value = serde_json::from_str(&content)?;
                     client.insert_jsonld(&remote_alias, &json).await?
@@ -214,7 +216,7 @@ pub async fn run(
             let graph = fluree.graph(&alias);
 
             let result = match data_format {
-                detect::DataFormat::Turtle => {
+                detect::DataFormat::Turtle | detect::DataFormat::Trig => {
                     let mut b = graph
                         .transact()
                         .insert_turtle(&content)
@@ -246,6 +248,11 @@ pub async fn run(
 }
 
 /// Build a `PolicyContext` from `PolicyArgs` against a freshly-loaded ledger state.
+///
+/// The CLI has no auth layer, so the transact builders that take this context
+/// never get a `server_identity`: an `f:IdentityRestricted` override control
+/// (policy defaults, SHACL `validationMode`) denies CLI writes by design.
+///
 /// Returns `None` when no policy flags are set.
 pub async fn build_policy_ctx(
     fluree: &fluree_db_api::Fluree,
@@ -257,7 +264,11 @@ pub async fn build_policy_ctx(
     }
     let ledger = fluree.ledger(alias).await?;
     let opts = policy.to_options().map_err(CliError::Usage)?;
-    let ctx = fluree_db_api::build_policy_context(
+    // Config-aware: honors f:policySource (same-ledger named graphs and
+    // cross-ledger model references) and merges config policy defaults,
+    // matching server-side transact enforcement.
+    let ctx = fluree_db_api::build_transact_policy_context(
+        fluree,
         &ledger.snapshot,
         ledger.novelty.as_ref(),
         Some(ledger.novelty.as_ref()),
@@ -265,7 +276,7 @@ pub async fn build_policy_ctx(
         &opts,
     )
     .await?;
-    Ok(Some(ctx))
+    Ok(ctx)
 }
 
 /// Print transaction result from remote server JSON response.

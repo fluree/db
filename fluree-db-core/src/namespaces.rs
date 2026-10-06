@@ -252,6 +252,42 @@ pub fn is_reifies_list_index(sid: &Sid) -> bool {
 /// table over byte-prefix-disambiguated arms; cost is dominated by the
 /// string-equality dispatch but stays bounded — the hot path on a
 /// non-`FLUREE_DB` SID returns after the integer compare alone.
+/// Whether a predicate affects the RDFS schema hierarchy
+/// (`rdfs:subClassOf` / `rdfs:subPropertyOf`).
+///
+/// Used by the commit path to bump the schema epoch that invalidates the
+/// shared [`SchemaHierarchy`] cache — a single integer compare on the
+/// namespace code before the (bounded) name match.
+/// Whether a flake can affect compiled SHACL shapes: any `sh:*` predicate
+/// (constraints, targets, paths, meta-encoded `sh:in`/list values), or an
+/// `rdf:type` edge whose object is in the SHACL namespace (shape typing) or
+/// is `rdfs:Class` / `owl:Class` (implicit class targets).
+///
+/// Used by the commit path to bump the SHACL epoch that lets transaction
+/// enforcement reuse the previously compiled shapes — cost is one integer
+/// compare per flake on the common path.
+#[inline]
+pub fn is_shacl_affecting_flake(flake: &crate::Flake) -> bool {
+    use fluree_vocab::namespaces::{OWL, RDF, RDFS, SHACL};
+    if flake.p.namespace_code == SHACL {
+        return true;
+    }
+    if flake.p.namespace_code == RDF && &*flake.p.name == "type" {
+        if let crate::value::FlakeValue::Ref(o) = &flake.o {
+            return o.namespace_code == SHACL
+                || (o.namespace_code == RDFS && &*o.name == "Class")
+                || (o.namespace_code == OWL && &*o.name == "Class");
+        }
+    }
+    false
+}
+
+#[inline]
+pub fn is_rdfs_hierarchy_predicate(sid: &Sid) -> bool {
+    sid.namespace_code == fluree_vocab::namespaces::RDFS
+        && matches!(sid.name.as_ref(), "subClassOf" | "subPropertyOf")
+}
+
 #[inline]
 pub fn is_reserved_reifies_predicate(sid: &Sid) -> bool {
     if sid.namespace_code != FLUREE_DB {

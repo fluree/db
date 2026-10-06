@@ -464,3 +464,186 @@ mod tests {
         assert!(a_transitive.contains(&c));
     }
 }
+
+/// Compute the current RDFS hierarchy from full ledger state — indexed
+/// snapshot plus overlay (novelty) — by scanning `rdfs:subClassOf` and
+/// `rdfs:subPropertyOf` and merging with the indexed [`IndexSchema`].
+///
+/// This is the overlay-aware counterpart of
+/// [`crate::LedgerSnapshot::schema_hierarchy`] (which reflects only the last
+/// index build). Cost is proportional to the number of hierarchy edges (two
+/// bound-predicate scans + transitive closure), not to data size.
+pub async fn compute_schema_hierarchy_with_overlay(
+    snapshot: &crate::LedgerSnapshot,
+    overlay: &dyn crate::OverlayProvider,
+    to_t: i64,
+) -> crate::error::Result<Option<SchemaHierarchy>> {
+    use crate::index_schema::SchemaPredicateInfo;
+    use crate::value::FlakeValue;
+    use crate::{GraphDbRef, IndexType, RangeMatch, RangeTest};
+    use fluree_vocab::namespaces::RDFS;
+
+    let mut subclass_of: HashMap<Sid, Vec<Sid>> = HashMap::new();
+    let mut subproperty_of: HashMap<Sid, Vec<Sid>> = HashMap::new();
+
+    // Scan the full default-graph state (indexed + unindexed commits + overlay).
+    let db = GraphDbRef::new(snapshot, 0, overlay, to_t);
+
+    for flake in db
+        .range(
+            IndexType::Psot,
+            RangeTest::Eq,
+            RangeMatch::predicate(Sid::new(RDFS, "subClassOf")),
+        )
+        .await?
+    {
+        if flake.op {
+            if let FlakeValue::Ref(parent) = flake.o {
+                subclass_of.entry(flake.s).or_default().push(parent);
+            }
+        }
+    }
+
+    for flake in db
+        .range(
+            IndexType::Psot,
+            RangeTest::Eq,
+            RangeMatch::predicate(Sid::new(RDFS, "subPropertyOf")),
+        )
+        .await?
+    {
+        if flake.op {
+            if let FlakeValue::Ref(parent) = flake.o {
+                subproperty_of.entry(flake.s).or_default().push(parent);
+            }
+        }
+    }
+
+    // Merge scanned edges into the indexed schema (if any): memory-backed and
+    // novelty-only states often carry relationships the indexed root doesn't.
+    let mut schema: IndexSchema = snapshot.schema.clone().unwrap_or_default();
+    schema.t = to_t;
+
+    let mut by_id: HashMap<Sid, SchemaPredicateInfo> = schema
+        .pred
+        .vals
+        .into_iter()
+        .map(|spi| (spi.id.clone(), spi))
+        .collect();
+
+    for (id, mut parents) in subclass_of {
+        parents.sort();
+        parents.dedup();
+        by_id
+            .entry(id.clone())
+            .and_modify(|spi| {
+                spi.subclass_of.extend(parents.clone());
+                spi.subclass_of.sort();
+                spi.subclass_of.dedup();
+            })
+            .or_insert(SchemaPredicateInfo {
+                id,
+                subclass_of: parents,
+                parent_props: Vec::new(),
+                child_props: Vec::new(),
+            });
+    }
+
+    for (child, mut parents) in subproperty_of {
+        parents.sort();
+        parents.dedup();
+
+        by_id
+            .entry(child.clone())
+            .and_modify(|spi| {
+                spi.parent_props.extend(parents.clone());
+                spi.parent_props.sort();
+                spi.parent_props.dedup();
+            })
+            .or_insert(SchemaPredicateInfo {
+                id: child.clone(),
+                subclass_of: Vec::new(),
+                parent_props: parents.clone(),
+                child_props: Vec::new(),
+            });
+
+        for parent in parents {
+            by_id
+                .entry(parent.clone())
+                .and_modify(|spi| {
+                    spi.child_props.push(child.clone());
+                    spi.child_props.sort();
+                    spi.child_props.dedup();
+                })
+                .or_insert(SchemaPredicateInfo {
+                    id: parent,
+                    subclass_of: Vec::new(),
+                    parent_props: Vec::new(),
+                    child_props: vec![child.clone()],
+                });
+        }
+    }
+
+    let mut vals: Vec<SchemaPredicateInfo> = by_id.into_values().collect();
+    vals.sort_by(|a, b| a.id.cmp(&b.id));
+    schema.pred.vals = vals;
+
+    if schema.pred.vals.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(SchemaHierarchy::from_db_root_schema(&schema)))
+    }
+}
+
+/// Shared, epoch-invalidated cache of the **current** RDFS hierarchy.
+///
+/// Held on the ledger state (`Arc`-shared into read views) so SHACL
+/// enforcement, policy targeting, and rdfs query reasoning all pull one
+/// up-to-date hierarchy. Commits that assert or retract
+/// `rdfs:subClassOf` / `rdfs:subPropertyOf` bump the novelty schema epoch
+/// (see `Novelty::schema_epoch`), invalidating the entry; the vastly more
+/// common non-schema commits do no work and keep the cache warm. Rebuilds
+/// happen lazily on the next consumer.
+///
+/// Head-state only: entries are keyed by `(indexed schema t, novelty schema
+/// epoch)`. Historical (time-travel) consumers must compute their own
+/// hierarchy at their `t` via [`compute_schema_hierarchy_with_overlay`].
+#[derive(Debug, Default)]
+pub struct SchemaHierarchyCache {
+    inner: parking_lot::RwLock<Option<CacheEntry>>,
+}
+
+#[derive(Debug, Clone)]
+struct CacheEntry {
+    snapshot_schema_t: i64,
+    novelty_schema_epoch: u64,
+    hierarchy: Option<SchemaHierarchy>,
+}
+
+impl SchemaHierarchyCache {
+    /// The current hierarchy for head state, rebuilding if the schema
+    /// changed since the cached entry (or nothing is cached yet).
+    pub async fn current(
+        &self,
+        snapshot: &crate::LedgerSnapshot,
+        overlay: &dyn crate::OverlayProvider,
+        to_t: i64,
+        novelty_schema_epoch: u64,
+    ) -> crate::error::Result<Option<SchemaHierarchy>> {
+        let snapshot_schema_t = snapshot.schema.as_ref().map(|s| s.t).unwrap_or(0);
+        if let Some(entry) = self.inner.read().as_ref() {
+            if entry.snapshot_schema_t == snapshot_schema_t
+                && entry.novelty_schema_epoch == novelty_schema_epoch
+            {
+                return Ok(entry.hierarchy.clone());
+            }
+        }
+        let hierarchy = compute_schema_hierarchy_with_overlay(snapshot, overlay, to_t).await?;
+        *self.inner.write() = Some(CacheEntry {
+            snapshot_schema_t,
+            novelty_schema_epoch,
+            hierarchy: hierarchy.clone(),
+        });
+        Ok(hierarchy)
+    }
+}

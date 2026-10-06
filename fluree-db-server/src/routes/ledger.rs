@@ -12,7 +12,9 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use fluree_db_api::wire::{ReindexRequest, ReindexResponse};
+use fluree_db_api::wire::{
+    ReindexRequest, ReindexResponse, SweepPlanResponse, SweepRequest, SweepResponse,
+};
 use fluree_db_api::{
     ApiError, BranchDropReport, DropMode, DropNamedGraphReport, DropReport, DropStatus,
 };
@@ -336,10 +338,18 @@ async fn drop_local(state: Arc<AppState>, request: Request) -> Result<Json<DropR
                 drop_status = gs_status,
                 "graph source dropped"
             );
+            // Same convention as the ledger path above: report the count only
+            // when a hard drop actually removed artifacts.
+            let files_deleted = if gs_report.files_deleted > 0 {
+                Some(gs_report.files_deleted)
+            } else {
+                None
+            };
+
             return Ok(Json(DropResponse {
                 ledger_id: format!("{}:{}", gs_report.name, gs_report.branch),
                 status: gs_status.to_string(),
-                files_deleted: None,
+                files_deleted,
                 branches_dropped: Vec::new(),
                 warnings: gs_report.warnings,
             }));
@@ -350,6 +360,130 @@ async fn drop_local(state: Arc<AppState>, request: Request) -> Result<Json<DropR
     }
     .instrument(span)
     .await
+}
+
+// =============================================================================
+// Storage sweep
+// =============================================================================
+
+/// Report which index artifacts are orphaned, without deleting them.
+///
+/// POST /fluree/sweep/plan
+///
+/// Runs the same exclusive hold as the destructive form, so the report
+/// reflects a quiesced ledger. In peer mode, forwards to the transaction
+/// server: the hold only excludes the in-process indexer, so it has to run
+/// where indexing does.
+pub async fn sweep_plan(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+
+    sweep_plan_local(state, request).await.into_response()
+}
+
+async fn sweep_plan_local(
+    state: Arc<AppState>,
+    request: Request,
+) -> Result<Json<SweepPlanResponse>> {
+    let (req, span) = sweep_request_span(&state, request, "ledger:sweep-plan").await?;
+
+    async move {
+        let span = tracing::Span::current();
+        tracing::info!(status = "start", ledger = %req.ledger, "sweep plan requested");
+
+        let plan = state
+            .fluree
+            .plan_index_sweep(&req.ledger)
+            .await
+            .map_err(|e| {
+                let server_error = ServerError::Api(e);
+                set_span_error_code(&span, "error:SweepFailed");
+                tracing::error!(error = %server_error, "sweep plan failed");
+                server_error
+            })?;
+
+        tracing::info!(
+            status = "success",
+            orphans = plan.orphans.len(),
+            scanned = plan.scanned,
+            "sweep plan complete"
+        );
+        Ok(Json(SweepPlanResponse::new(req.ledger, plan)))
+    }
+    .instrument(span)
+    .await
+}
+
+/// Reclaim index artifacts that no index chain references.
+///
+/// POST /fluree/sweep
+///
+/// Covers every branch of the named ledger, because dict blobs are shared
+/// across branches. In peer mode, forwards to the transaction server.
+pub async fn sweep(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+
+    sweep_local(state, request).await.into_response()
+}
+
+async fn sweep_local(state: Arc<AppState>, request: Request) -> Result<Json<SweepResponse>> {
+    let (req, span) = sweep_request_span(&state, request, "ledger:sweep").await?;
+
+    async move {
+        let span = tracing::Span::current();
+        tracing::info!(status = "start", ledger = %req.ledger, "sweep requested");
+
+        let result = state
+            .fluree
+            .sweep_index_storage(&req.ledger)
+            .await
+            .map_err(|e| {
+                let server_error = ServerError::Api(e);
+                set_span_error_code(&span, "error:SweepFailed");
+                tracing::error!(error = %server_error, "sweep failed");
+                server_error
+            })?;
+
+        tracing::info!(
+            status = "success",
+            reclaimed = result.reclaimed,
+            failed = result.failures.len(),
+            "sweep complete"
+        );
+        Ok(Json(SweepResponse::new(req.ledger, result)))
+    }
+    .instrument(span)
+    .await
+}
+
+/// Parse a sweep request body and build its tracing span.
+async fn sweep_request_span(
+    state: &Arc<AppState>,
+    request: Request,
+    operation: &'static str,
+) -> Result<(SweepRequest, tracing::Span)> {
+    let headers = FlureeHeaders::from_headers(request.headers())?;
+    let body_bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+    let req: SweepRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))?;
+
+    let request_id = extract_request_id(&headers.raw, &state.telemetry_config);
+    let trace_id = extract_trace_id(&headers.raw);
+    let span = create_request_span(
+        operation,
+        request_id.as_deref(),
+        trace_id.as_deref(),
+        Some(&req.ledger),
+        None,
+        None,
+    );
+
+    Ok((req, span))
 }
 
 // =============================================================================
@@ -432,12 +566,26 @@ pub struct ListEntry {
     #[serde(rename = "type")]
     pub entry_type: String,
     pub t: i64,
+    /// Source ledger aliases this graph source is derived from. Empty for
+    /// ledger entries, which are nobody's derivative.
+    ///
+    /// Carried here so a client can pair an index against its source's `t` —
+    /// the staleness check behind `fluree bm25 list` — from this one response.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<String>,
 }
 
 /// List all ledgers and graph sources
 ///
 /// GET /fluree/ledgers
-pub async fn list_ledgers(State(state): State<Arc<AppState>>) -> Result<Json<Vec<ListEntry>>> {
+///
+/// Follows data auth like `/info` and `/exists`: a bearer is required when
+/// data auth is, and a request carrying one sees only what its token can read.
+pub async fn list_ledgers(
+    State(state): State<Arc<AppState>>,
+    bearer: MaybeDataBearer,
+) -> Result<Json<Vec<ListEntry>>> {
+    let readable = |id: &fluree_db_api::LedgerId| bearer.0.as_ref().is_none_or(|p| p.can_read(id));
     let ledger_records = state
         .fluree
         .nameservice()
@@ -455,7 +603,7 @@ pub async fn list_ledgers(State(state): State<Arc<AppState>>) -> Result<Json<Vec
     let mut entries = Vec::new();
 
     for r in &ledger_records {
-        if r.retracted {
+        if r.retracted || !readable(&r.ledger_id) {
             continue;
         }
         entries.push(ListEntry {
@@ -463,62 +611,24 @@ pub async fn list_ledgers(State(state): State<Arc<AppState>>) -> Result<Json<Vec
             branch: r.branch.clone(),
             entry_type: "Ledger".to_string(),
             t: r.commit_t,
+            dependencies: Vec::new(),
         });
     }
 
     for gs in &gs_records {
-        if gs.retracted {
+        if gs.retracted || !readable(&gs.graph_source_id) {
             continue;
         }
         entries.push(ListEntry {
             name: gs.name.clone(),
             branch: gs.branch.clone(),
-            entry_type: format_source_type(&gs.source_type),
+            entry_type: fluree_db_api::ledger_info::graph_source_type_label(&gs.source_type),
             t: gs.index_t,
+            dependencies: gs.dependencies.clone(),
         });
     }
 
     Ok(Json(entries))
-}
-
-fn format_source_type(st: &fluree_db_nameservice::GraphSourceType) -> String {
-    match st {
-        fluree_db_nameservice::GraphSourceType::Bm25 => "BM25".to_string(),
-        fluree_db_nameservice::GraphSourceType::Vector => "Vector".to_string(),
-        fluree_db_nameservice::GraphSourceType::Geo => "Geo".to_string(),
-        fluree_db_nameservice::GraphSourceType::R2rml => "R2RML".to_string(),
-        fluree_db_nameservice::GraphSourceType::Iceberg => "Iceberg".to_string(),
-        fluree_db_nameservice::GraphSourceType::Unknown(s) => format!("Unknown({s})"),
-    }
-}
-
-/// Build a JSON representation of a graph source record for the info endpoint.
-fn graph_source_info_json(gs: &fluree_db_nameservice::GraphSourceRecord) -> JsonValue {
-    let mut obj = serde_json::json!({
-        "name": gs.name,
-        "branch": gs.branch,
-        "type": format_source_type(&gs.source_type),
-        "graph_source_id": gs.graph_source_id,
-        "retracted": gs.retracted,
-        "index_t": gs.index_t,
-    });
-
-    if let Some(ref id) = gs.index_id {
-        obj["index_id"] = serde_json::Value::String(id.to_string());
-    }
-
-    if !gs.dependencies.is_empty() {
-        obj["dependencies"] = serde_json::json!(gs.dependencies);
-    }
-
-    // Include parsed config if non-empty
-    if !gs.config.is_empty() && gs.config != "{}" {
-        if let Ok(parsed) = serde_json::from_str::<JsonValue>(&gs.config) {
-            obj["config"] = parsed;
-        }
-    }
-
-    obj
 }
 
 // =============================================================================
@@ -599,7 +709,7 @@ pub async fn info(
             return Err(ServerError::unauthorized("Bearer token required"));
         }
         if let Some(p) = bearer.0.as_ref() {
-            if !p.can_read(alias) {
+            if !p.can_read(&crate::error::scope_id(alias)?) {
                 set_span_error_code(&span, "error:Forbidden");
                 // Avoid existence leak
                 return Err(ServerError::not_found("Ledger not found"));
@@ -614,15 +724,21 @@ pub async fn info(
 
         // Non-proxy mode: load ledger and return comprehensive info.
         // If ledger is not found, fall back to graph source lookup.
-        let ledger_state = match super::query::load_ledger_for_query(&state, alias, &span).await {
+        let ledger_state = match super::query::load_ledger_or_missing(&state, alias, &span).await {
             Ok(ls) => ls,
-            Err(ServerError::Api(ref e)) if e.is_not_found() => {
-                // Try graph source lookup
+            Err(ref missing @ ServerError::Api(ref e)) if e.is_not_found() => {
+                // Try graph source lookup. A virtual (R2RML/Iceberg) dataset is
+                // routed through the SHARED api builder so its `/info` returns
+                // real classes/properties/counts (metadata-only) with NO secrets.
                 if let Ok(Some(gs)) = state.fluree.nameservice().lookup_graph_source(alias).await {
+                    let info =
+                        fluree_db_api::ledger_info::build_graph_source_info(&state.fluree, &gs)
+                            .await
+                            .map_err(ServerError::Api)?;
                     tracing::info!(status = "success", "graph source info retrieved");
-                    return Ok(Json(graph_source_info_json(&gs)).into_response());
+                    return Ok(Json(info).into_response());
                 }
-                set_span_error_code(&span, "error:NotFound");
+                super::query::report_missing_ledger(&span, missing);
                 return Err(ServerError::Api(ApiError::NotFound(alias.to_string())));
             }
             Err(e) => return Err(e),
@@ -713,7 +829,7 @@ async fn info_simplified(state: &AppState, alias: &str, span: &tracing::Span) ->
                 "ledger info retrieved (simplified)"
             );
             return Ok(Json(LedgerInfoResponse {
-                ledger_id: record.ledger_id.clone(),
+                ledger_id: record.ledger_id.clone().to_string(),
                 t: record.commit_t,
                 commit_head_id: record.commit_head_id.clone(),
                 index_head_id: record.index_head_id.clone(),
@@ -729,10 +845,13 @@ async fn info_simplified(state: &AppState, alias: &str, span: &tracing::Span) ->
         }
     }
 
-    // Try graph source lookup
+    // Try graph source lookup (shared builder: redacted, virtual-aware).
     if let Ok(Some(gs)) = state.fluree.nameservice().lookup_graph_source(alias).await {
+        let info = fluree_db_api::ledger_info::build_graph_source_info(&state.fluree, &gs)
+            .await
+            .map_err(ServerError::Api)?;
         tracing::info!(status = "success", "graph source info retrieved");
-        return Ok(Json(graph_source_info_json(&gs)).into_response());
+        return Ok(Json(info).into_response());
     }
 
     let server_error = ServerError::Api(ApiError::NotFound(alias.to_string()));
@@ -822,7 +941,7 @@ pub async fn exists(
             return Err(ServerError::unauthorized("Bearer token required"));
         }
         if let Some(p) = bearer.0.as_ref() {
-            if !p.can_read(&alias) {
+            if !p.can_read(&crate::error::scope_id(&alias)?) {
                 set_span_error_code(&span, "error:Forbidden");
                 // Avoid existence leak
                 return Err(ServerError::not_found("Ledger not found"));
@@ -894,11 +1013,14 @@ pub struct CreateBranchRequest {
     /// Source branch to create from (defaults to "main")
     #[serde(default)]
     pub source: Option<String>,
-    /// Optional commit reference to branch at.
+    /// Optional point on the source branch to branch at.
     ///
-    /// Accepts `"t:N"` for a transaction number or a hex digest / full CID
-    /// for prefix resolution. When omitted, the branch starts at the source
-    /// branch's current HEAD.
+    /// The same spellings as export's and a query's `at`
+    /// ([`fluree_db_api::TimeSpec::parse_at`]): `t:N`, `time:<ISO-8601>`
+    /// (alias `iso:`), `recorded:<ISO-8601>`, `commit:<prefix>`, `latest`, or a
+    /// bare transaction number, timestamp, hex digest prefix or full CID. The
+    /// branch starts at the commit a query pinned at `@<at>` would read. When
+    /// omitted (or `latest`), the branch starts at the source's current HEAD.
     #[serde(default)]
     pub at: Option<String>,
 }
@@ -924,9 +1046,11 @@ pub struct CreateBranchResponse {
 /// - `ledger`: Ledger name (e.g., "mydb")
 /// - `branch`: New branch name (e.g., "feature-x")
 /// - `source`: Source branch (optional, defaults to "main")
+/// - `at`: Point on the source to branch at (optional, defaults to its HEAD)
 ///
 /// Returns 201 Created on success, 409 Conflict if branch already exists,
-/// 404 Not Found if source branch does not exist.
+/// 404 Not Found if source branch does not exist, 400 Bad Request if the
+/// source branch has no commits or `at` names no commit on it.
 pub async fn create_branch(State(state): State<Arc<AppState>>, request: Request) -> Response {
     if state.config.server_role == ServerRole::Peer {
         return forward_write_request(&state, request).await;
@@ -949,13 +1073,11 @@ async fn create_branch_local(state: Arc<AppState>, request: Request) -> Result<i
     let ledger = req.ledger;
     let branch = req.branch;
 
-    let at_commit = match req.at.as_deref() {
-        Some(s) => Some(
-            fluree_db_api::CommitRef::parse(s)
-                .map_err(|e| ServerError::bad_request(e.to_string()))?,
-        ),
-        None => None,
-    };
+    let at = req
+        .at
+        .as_deref()
+        .map(super::export::parse_time_spec)
+        .transpose()?;
 
     let request_id = extract_request_id(&headers.raw, &state.telemetry_config);
     let trace_id = extract_trace_id(&headers.raw);
@@ -980,7 +1102,7 @@ async fn create_branch_local(state: Arc<AppState>, request: Request) -> Result<i
 
         let record = match state
             .fluree
-            .create_branch(&ledger, &branch, Some(&source), at_commit)
+            .create_branch(&ledger, &branch, Some(&source), at)
             .await
         {
             Ok(record) => record,
@@ -993,7 +1115,7 @@ async fn create_branch_local(state: Arc<AppState>, request: Request) -> Result<i
         };
 
         let response = CreateBranchResponse {
-            ledger_id: record.ledger_id.clone(),
+            ledger_id: record.ledger_id.clone().to_string(),
             branch: record.branch.clone(),
             source: record.source_branch.unwrap_or_default(),
             t: record.commit_t,
@@ -1037,24 +1159,31 @@ pub async fn list_branches(
             set_span_error_code(&span, "error:Unauthorized");
             return Err(ServerError::unauthorized("Bearer token required"));
         }
-        if let Some(p) = bearer.0.as_ref() {
-            if !p.can_read(&ledger) {
-                set_span_error_code(&span, "error:Forbidden");
-                return Err(ServerError::not_found("Ledger not found"));
-            }
-        }
-
         let records = state
             .fluree
             .list_branches(&ledger)
             .await
             .map_err(ServerError::Api)?;
 
+        // Scopes name branches, not ledgers: list only the branches this
+        // token may read, and don't reveal the ledger when that is none.
+        let records: Vec<_> = match bearer.0.as_ref() {
+            Some(p) => records
+                .into_iter()
+                .filter(|r| p.can_read(&r.ledger_id))
+                .collect(),
+            None => records,
+        };
+        if bearer.0.is_some() && records.is_empty() {
+            set_span_error_code(&span, "error:Forbidden");
+            return Err(ServerError::not_found("Ledger not found"));
+        }
+
         let branches = records
             .into_iter()
             .map(|r| BranchInfo {
                 branch: r.branch,
-                ledger_id: r.ledger_id,
+                ledger_id: r.ledger_id.to_string(),
                 t: r.commit_t,
                 source: r.source_branch,
             })
@@ -1804,12 +1933,12 @@ fn parse_commit_ref(s: &str) -> Result<fluree_db_api::CommitRef> {
 /// returned).
 ///
 /// **What this does NOT protect:** the underlying divergence walk. The
-/// `count` field on each side reflects the full unbounded divergence —
-/// computed by walking every commit envelope between HEAD and the common
-/// ancestor — so a request against branches diverged by N commits costs N
+/// `count` field on each side reflects the full unbounded divergence. It is
+/// computed by walking every commit envelope down to the commit the other
+/// side holds, so a request against branches diverged by N commits costs N
 /// envelope reads regardless of the cap. If you need to reject huge
-/// divergences, add an operational guard before invoking the walk
-/// (e.g., refuse when ancestor.t < target.t - SOME_LIMIT).
+/// divergences, add an operational guard before invoking the walk, such as
+/// refusing when either side is more than some number of commits ahead.
 const PREVIEW_HARD_MAX_COMMITS: usize = 5_000;
 
 /// Hard cap on `max_conflict_keys`. 25x the recommended default.
@@ -1817,10 +1946,22 @@ const PREVIEW_HARD_MAX_COMMITS: usize = 5_000;
 /// **What this protects:** the size of `conflicts.keys` in the response.
 ///
 /// **What this does NOT protect:** the conflict computation. When
-/// `include_conflicts=true`, both `compute_delta_keys` walks scan the full
-/// per-side delta regardless of cap. Clients that need a fast preview
+/// `include_conflicts=true`, both delta-key walks scan the full per-side
+/// delta regardless of cap. Clients that need a fast preview
 /// should pass `include_conflicts=false`.
 const PREVIEW_HARD_MAX_CONFLICT_KEYS: usize = 5_000;
+
+/// Hard cap on `max_changes`. 10x the recommended default.
+///
+/// **What this protects:** the size of `changes.entries` in the response
+/// (counted in flakes; cut at subject boundaries, so a single huge subject
+/// may overshoot by its own size).
+///
+/// **What this does NOT protect:** the change computation. When
+/// `include_changes=true`, the source-side commits since the divergence are
+/// fully replayed (one commit blob load per commit) regardless of cap —
+/// the same cost the merge itself pays. Each pagination page re-pays it.
+const PREVIEW_HARD_MAX_CHANGES: usize = 5_000;
 
 /// Query parameters for [`merge_preview`].
 #[derive(Deserialize)]
@@ -1845,6 +1986,21 @@ pub struct MergePreviewQuery {
     /// Strategy used for conflict resolution labels. Defaults to take-both.
     #[serde(default)]
     pub strategy: Option<String>,
+    /// Include the aggregate netted change set the merge would apply.
+    #[serde(default)]
+    pub include_changes: Option<bool>,
+    /// Cap on change entries returned, counted in flakes and cut at subject
+    /// boundaries. `0` = stats-only (exact counts, no payload). Defaults to 500.
+    #[serde(default)]
+    pub max_changes: Option<usize>,
+    /// Pagination cursor: return only subjects sorting strictly after this
+    /// full IRI. Pass the previous response's `changes.next_cursor`.
+    #[serde(default)]
+    pub changes_after_subject: Option<String>,
+    /// Validate the resolved change set against the target's SHACL shapes and
+    /// fold the outcome into `mergeable`. Defaults to true.
+    #[serde(default)]
+    pub include_validation: Option<bool>,
 }
 
 /// Read-only branch merge preview.
@@ -1881,8 +2037,23 @@ pub async fn merge_preview(
             set_span_error_code(&span, "error:Unauthorized");
             return Err(ServerError::unauthorized("Bearer token required"));
         }
+        // Authorize every branch the preview reads: the source, and the
+        // target — explicit, or the source's parent the API defaults to.
         if let Some(p) = bearer.0.as_ref() {
-            if !p.can_read(&ledger) {
+            let name = fluree_db_api::LedgerName::parse(&ledger)?;
+            let source = name.with_branch(&params.source)?;
+            let target = match params.target.as_deref() {
+                Some(t) => Some(name.with_branch(t)?),
+                None => state
+                    .fluree
+                    .nameservice()
+                    .lookup(&source)
+                    .await?
+                    .and_then(|r| r.source_branch)
+                    .map(|b| name.with_branch(&b))
+                    .transpose()?,
+            };
+            if !p.can_read(&source) || target.is_some_and(|t| !p.can_read(&t)) {
                 set_span_error_code(&span, "error:Forbidden");
                 return Err(ServerError::not_found("Ledger not found"));
             }
@@ -1932,6 +2103,21 @@ pub async fn merge_preview(
             return Err(ServerError::bad_request(
                 "strategy=abort requires include_conflicts=true for mergeable preview",
             ));
+        }
+        if let Some(b) = params.include_changes {
+            opts.include_changes = b;
+        }
+        if let Some(n) = params.max_changes {
+            opts.max_changes = Some(n.min(PREVIEW_HARD_MAX_CHANGES));
+        }
+        if params.changes_after_subject.is_some() && !opts.include_changes {
+            return Err(ServerError::bad_request(
+                "changes_after_subject requires include_changes=true",
+            ));
+        }
+        opts.changes_after_subject = params.changes_after_subject.clone();
+        if let Some(b) = params.include_validation {
+            opts.include_validation = b;
         }
 
         let preview = state
@@ -1985,6 +2171,10 @@ pub struct RevertPreviewQuery {
     /// Strategy used for the `revertable` verdict. Defaults to `abort`.
     #[serde(default)]
     pub strategy: Option<String>,
+    /// Validate the inverted state against the branch's SHACL shapes and
+    /// fold the outcome into `revertable`. Defaults to true.
+    #[serde(default)]
+    pub include_validation: Option<bool>,
 }
 
 /// Read-only revert preview.
@@ -2019,8 +2209,10 @@ pub async fn revert_preview(
             set_span_error_code(&span, "error:Unauthorized");
             return Err(ServerError::unauthorized("Bearer token required"));
         }
+        // Authorize the branch the preview reads, not the bare ledger name.
         if let Some(p) = bearer.0.as_ref() {
-            if !p.can_read(&ledger) {
+            let branch = fluree_db_api::LedgerName::parse(&ledger)?.with_branch(&params.branch)?;
+            if !p.can_read(&branch) {
                 set_span_error_code(&span, "error:Forbidden");
                 return Err(ServerError::not_found("Ledger not found"));
             }
@@ -2035,6 +2227,9 @@ pub async fn revert_preview(
         }
         if let Some(b) = params.include_conflicts {
             opts.include_conflicts = b;
+        }
+        if let Some(b) = params.include_validation {
+            opts.include_validation = b;
         }
         if let Some(s) = params.strategy.as_deref() {
             opts.conflict_strategy =

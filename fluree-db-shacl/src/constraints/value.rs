@@ -3,6 +3,15 @@
 use super::{Constraint, ConstraintViolation};
 use fluree_db_core::FlakeValue;
 
+/// Value equality for sh:hasValue / sh:in: numeric literals compare by value
+/// across representations (1 == 1.0 == 1.00), everything else by term equality.
+fn values_equal(a: &FlakeValue, b: &FlakeValue) -> bool {
+    if a.is_numeric() && b.is_numeric() {
+        return a.numeric_cmp(b) == Some(std::cmp::Ordering::Equal);
+    }
+    a == b
+}
+
 /// Validate sh:hasValue constraint
 ///
 /// Checks that the value set contains the expected value.
@@ -10,12 +19,13 @@ pub fn validate_has_value(
     values: &[FlakeValue],
     expected: &FlakeValue,
 ) -> Option<ConstraintViolation> {
-    if values.contains(expected) {
+    if values.iter().any(|v| values_equal(v, expected)) {
         None
     } else {
         Some(ConstraintViolation {
             constraint: Constraint::HasValue(expected.clone()),
             value: None,
+            value_index: None,
             message: format!("Required value {expected:?} not found"),
         })
     }
@@ -25,12 +35,13 @@ pub fn validate_has_value(
 ///
 /// Checks that a value is in the allowed set.
 pub fn validate_in(value: &FlakeValue, allowed: &[FlakeValue]) -> Option<ConstraintViolation> {
-    if allowed.contains(value) {
+    if allowed.iter().any(|a| values_equal(value, a)) {
         None
     } else {
         Some(ConstraintViolation {
             constraint: Constraint::In(allowed.to_vec()),
             value: Some(value.clone()),
+            value_index: None,
             message: format!(
                 "Value {:?} is not in the allowed set of {} values",
                 value,
@@ -47,6 +58,7 @@ pub fn validate_min_inclusive(value: &FlakeValue, min: &FlakeValue) -> Option<Co
         _ => Some(ConstraintViolation {
             constraint: Constraint::MinInclusive(min.clone()),
             value: Some(value.clone()),
+            value_index: None,
             message: format!("Value {value:?} is less than minimum {min:?}"),
         }),
     }
@@ -59,6 +71,7 @@ pub fn validate_max_inclusive(value: &FlakeValue, max: &FlakeValue) -> Option<Co
         _ => Some(ConstraintViolation {
             constraint: Constraint::MaxInclusive(max.clone()),
             value: Some(value.clone()),
+            value_index: None,
             message: format!("Value {value:?} exceeds maximum {max:?}"),
         }),
     }
@@ -71,6 +84,7 @@ pub fn validate_min_exclusive(value: &FlakeValue, min: &FlakeValue) -> Option<Co
         _ => Some(ConstraintViolation {
             constraint: Constraint::MinExclusive(min.clone()),
             value: Some(value.clone()),
+            value_index: None,
             message: format!("Value {value:?} must be greater than {min:?}"),
         }),
     }
@@ -83,6 +97,7 @@ pub fn validate_max_exclusive(value: &FlakeValue, max: &FlakeValue) -> Option<Co
         _ => Some(ConstraintViolation {
             constraint: Constraint::MaxExclusive(max.clone()),
             value: Some(value.clone()),
+            value_index: None,
             message: format!("Value {value:?} must be less than {max:?}"),
         }),
     }
@@ -212,6 +227,19 @@ mod tests {
         assert!(validate_max_exclusive(&FlakeValue::Long(9), &max).is_none());
         assert!(validate_max_exclusive(&FlakeValue::Long(10), &max).is_some());
         assert!(validate_max_exclusive(&FlakeValue::Long(11), &max).is_some());
+    }
+
+    #[test]
+    fn test_in_and_has_value_numeric_across_representations() {
+        // sh:in / sh:hasValue use value equality for numerics: an integer 1
+        // matches a decimal 1.0 constraint value and vice versa.
+        let allowed = vec![dec("1.0"), dec("2.0")];
+        assert!(validate_in(&FlakeValue::Long(1), &allowed).is_none());
+        assert!(validate_in(&FlakeValue::Long(3), &allowed).is_some());
+
+        let values = vec![FlakeValue::Long(42)];
+        assert!(validate_has_value(&values, &dec("42.00")).is_none());
+        assert!(validate_has_value(&values, &dec("42.5")).is_some());
     }
 
     #[test]

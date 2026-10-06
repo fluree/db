@@ -77,8 +77,13 @@ pub enum LiteralValue {
     Bytes(Vec<u8>),
     /// Date: days since 1970-01-01
     Date(i32),
-    /// Timestamp: microseconds since epoch
+    /// Timestamp WITHOUT zone (`timestamp`): microseconds since epoch, wall-clock
+    /// frame. Only ever compared against a physically-`timestamp` column (item 10).
     Timestamp(i64),
+    /// Timestamp WITH zone (`timestamptz`): microseconds since epoch, UTC frame.
+    /// Only ever compared against a physically-`timestamptz` column (item 10) — the
+    /// frame (naive vs UTC) is matched at emit time so the micros are comparable.
+    TimestampTz(i64),
     /// Decimal: (unscaled_value, precision, scale)
     Decimal {
         unscaled: i128,
@@ -100,6 +105,7 @@ impl LiteralValue {
             Self::Bytes(v) => TypedValue::Bytes(v.clone()),
             Self::Date(v) => TypedValue::Date(*v),
             Self::Timestamp(v) => TypedValue::Timestamp(*v),
+            Self::TimestampTz(v) => TypedValue::TimestampTz(*v),
             Self::Decimal {
                 unscaled,
                 precision,
@@ -123,7 +129,8 @@ impl LiteralValue {
             TypedValue::String(v) => Self::String(v.clone()),
             TypedValue::Bytes(v) => Self::Bytes(v.clone()),
             TypedValue::Date(v) => Self::Date(*v),
-            TypedValue::Timestamp(v) | TypedValue::TimestampTz(v) => Self::Timestamp(*v),
+            TypedValue::Timestamp(v) => Self::Timestamp(*v),
+            TypedValue::TimestampTz(v) => Self::TimestampTz(*v),
             TypedValue::Uuid(v) => Self::Bytes(v.to_vec()),
             TypedValue::Decimal {
                 unscaled,
@@ -150,6 +157,7 @@ impl std::fmt::Display for LiteralValue {
             Self::Bytes(v) => write!(f, "bytes[{}]", v.len()),
             Self::Date(v) => write!(f, "date({v})"),
             Self::Timestamp(v) => write!(f, "ts({v})"),
+            Self::TimestampTz(v) => write!(f, "tstz({v})"),
             Self::Decimal {
                 unscaled, scale, ..
             } => {

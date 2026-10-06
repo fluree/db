@@ -1,0 +1,15 @@
+# q084 enterprise_customer_page_crawl — browse-parity: a FILTERED "View
+#   Instances" page (shape 4, array-where form). Binds ?s to Enterprise-segment
+#   customers via a co-subject const-object pattern (folded onto the crawl
+#   wildcard as a pruning star_constraint, W4-1b), limit 20. Confirms the filtered
+#   class-page crawl returns native-shape node documents. RowsOnly: the LIMIT
+#   truncates the unordered 50038-row Enterprise-current set.
+{
+  "@context": {"edw": "http://ns.fluree.dev/edw#"},
+  "select": {"?s": ["*"]},
+  "where": [
+    {"@id": "?s", "@type": "edw:Customer"},
+    {"@id": "?s", "edw:segment": "Enterprise"}
+  ],
+  "limit": 20
+}

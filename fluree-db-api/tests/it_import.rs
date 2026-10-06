@@ -1061,6 +1061,148 @@ ex:bob   ex:worksFor ex:acme .
     );
 }
 
+/// A bulk import with no RDF collections anywhere must record
+/// `IndexRoot.has_list_meta = Some(false)` — an exact observation, not
+/// `None`. That is what lets filtered-DELETE staging skip list-meta
+/// hydration on bulk-imported ledgers, which are the large ones.
+#[tokio::test]
+async fn import_without_lists_records_has_list_meta_false() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let ttl = r"
+@prefix ex: <http://example.org/> .
+ex:alice ex:worksFor ex:acme ; ex:name 'Alice' .
+ex:bob   ex:worksFor ex:acme ; ex:name 'Bob' .
+";
+    let ttl_path = write_ttl(data_dir.path(), "plain.ttl", ttl);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let ledger_id = "test/import-no-lists:main";
+    let result = fluree
+        .create(ledger_id)
+        .import(&ttl_path)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("plain import should succeed");
+    assert!(result.root_id.is_some(), "index should have been built");
+
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load imported ledger");
+    assert_eq!(
+        ledger.snapshot.has_list_meta,
+        Some(false),
+        "bulk import observed no list positions and must say so exactly"
+    );
+}
+
+/// The load-bearing half: one RDF collection anywhere in the import must
+/// record `Some(true)`. A wrongly-`false` root would let staging skip
+/// position hydration, and the list retraction below would silently do
+/// nothing — so the flag is asserted AND exercised.
+#[tokio::test]
+async fn import_with_list_records_has_list_meta_true_and_still_retracts() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // `ex:bob` carries no collection; `ex:alice`'s is the only one in the
+    // dataset, so the bit has to survive being OR'd across chunks.
+    let ttl = r"
+@prefix ex: <http://example.org/> .
+ex:bob   ex:name 'Bob' .
+ex:alice ex:items ( 'a' 'b' 'c' ) .
+";
+    let ttl_path = write_ttl(data_dir.path(), "listed.ttl", ttl);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let ledger_id = "test/import-with-lists:main";
+    let result = fluree
+        .create(ledger_id)
+        .import(&ttl_path)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("list-bearing import should succeed");
+    assert!(result.root_id.is_some(), "index should have been built");
+
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load imported ledger");
+    assert_eq!(
+        ledger.snapshot.has_list_meta,
+        Some(true),
+        "one collection in the import must flip the flag on"
+    );
+
+    // And it is not merely reported: a filtered DELETE of one entry has to
+    // land, which needs hydration to have run.
+    let ctx = json!({"ex": "http://example.org/"});
+    let items = |v: &serde_json::Value| -> Vec<String> {
+        v.as_array()
+            .and_then(|a| a.first())
+            .and_then(|node| node.get("ex:items"))
+            .map(|v| match v {
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect(),
+                other => other.as_str().map(str::to_string).into_iter().collect(),
+            })
+            .unwrap_or_default()
+    };
+    let read = json!({
+        "@context": ctx,
+        "select": {"?s": ["ex:items"]},
+        "where": {"@id": "?s"},
+        "values": ["?s", [{"@id": "ex:alice"}]]
+    });
+
+    let before = support::query_jsonld_formatted(&fluree, &ledger, &read)
+        .await
+        .expect("list query");
+    assert_eq!(items(&before), vec!["a", "b", "c"]);
+
+    let del = json!({
+        "@context": ctx,
+        "where": [{"@id": "?s", "ex:items": "b"}],
+        "delete": [{"@id": "?s", "ex:items": "b"}]
+    });
+    let r = fluree
+        .update_with_opts(
+            ledger,
+            &del,
+            fluree_db_api::TxnOpts::default(),
+            fluree_db_api::CommitOpts::default(),
+            // Unreachable thresholds: the delete must not trigger a rebuild
+            // that would re-derive the flag and mask a wrong root.
+            &fluree_db_api::IndexConfig {
+                reindex_min_bytes: 1 << 40,
+                reindex_max_bytes: 1 << 41,
+            },
+        )
+        .await
+        .expect("filtered delete");
+    assert_eq!(r.receipt.flake_count, 1);
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let after = support::query_jsonld_formatted(&fluree, &ledger, &read)
+        .await
+        .expect("list query");
+    assert_eq!(items(&after), vec!["a", "c"], "the entry must actually go");
+}
+
 /// Firewall regression: a JSON-LD bulk import that hand-writes a
 /// fully-expanded `https://ns.flur.ee/db#reifies*` IRI must be rejected,
 /// exactly as the transact path rejects it. The expanded form carries none
@@ -1374,6 +1516,176 @@ GRAPH <http://example.org/graphs/audit> {
     );
 }
 
+/// Bulk import reads a `.trig` file with graph blocks through TriG phase 1,
+/// which rebuilt the default graph with every directive first and expanded
+/// every block with the file's final prefix map. A redefined `@prefix` must
+/// apply only to what follows it, in the default graph and in the blocks.
+#[tokio::test]
+async fn import_trig_applies_a_redefined_prefix_only_after_it() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let trig = "@prefix ex: <http://a.org/> .\n\
+                ex:x ex:p \"d1\" .\n\
+                GRAPH <http://example.org/g1> { ex:y ex:p \"g1\" . }\n\
+                @prefix ex: <http://b.org/> .\n\
+                ex:z ex:p \"d2\" .\n\
+                GRAPH <http://example.org/g2> { ex:w ex:p \"g2\" . }\n";
+    let path = data_dir.path().join("data.trig");
+    std::fs::write(&path, trig).expect("write trig");
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    fluree
+        .create("test/trig-directives:main")
+        .import(&path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("trig import should succeed");
+    let ledger = fluree
+        .ledger("test/trig-directives:main")
+        .await
+        .expect("load ledger");
+
+    let rows = |sparql: &'static str| {
+        let (fluree, ledger) = (&fluree, &ledger);
+        async move {
+            let result = support::query_sparql(fluree, ledger, sparql)
+                .await
+                .expect("query");
+            let json = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+            let cell = |c: &serde_json::Value| {
+                c.as_str()
+                    .or_else(|| c.get("@id").and_then(|v| v.as_str()))
+                    .or_else(|| c.get("@value").and_then(|v| v.as_str()))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| c.to_string())
+            };
+            let mut rows: Vec<String> = json
+                .as_array()
+                .expect("rows")
+                .iter()
+                .map(|r| {
+                    r.as_array()
+                        .expect("row")
+                        .iter()
+                        .map(cell)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect();
+            rows.sort();
+            rows
+        }
+    };
+    assert_eq!(
+        rows("SELECT ?s ?p ?o WHERE { ?s ?p ?o }").await,
+        [
+            "http://a.org/x http://a.org/p d1",
+            "http://b.org/z http://b.org/p d2",
+        ],
+        "default graph"
+    );
+    assert_eq!(
+        rows("SELECT ?g ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o } }").await,
+        [
+            "http://example.org/g1 http://a.org/y http://a.org/p g1",
+            "http://example.org/g2 http://b.org/w http://b.org/p g2",
+        ],
+        "graph blocks"
+    );
+}
+
+/// TriG-star inside a `GRAPH` block on the bulk-import path: the reifier
+/// bundle is spooled into the named graph's index and the annotation is
+/// visible to a named-graph-scoped query.
+#[tokio::test]
+async fn import_trig_star_named_graph_annotation_is_queryable() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let trig = r#"@prefix ex: <http://example.org/> .
+@prefix schema: <http://schema.org/> .
+
+ex:alice schema:name "Alice" .
+
+GRAPH <http://example.org/graphs/audit> {
+    ex:event1 schema:actor ex:alice {| ex:confidence "high" |} .
+    ex:event2 schema:actor ex:alice ~ ex:claim2 {| ex:confidence "low"@en |} .
+    ex:claim2 ex:source ex:sensor .
+}
+"#;
+
+    let path = data_dir.path().join("data.trig");
+    {
+        let mut f = std::fs::File::create(&path).expect("create trig");
+        f.write_all(trig.as_bytes()).expect("write trig");
+    }
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    fluree
+        .create("test/trig-star:main")
+        .import(&path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("trig-star import should succeed");
+
+    let ledger = fluree
+        .ledger("test/trig-star:main")
+        .await
+        .expect("load ledger");
+
+    let named_alias = "test/trig-star:main#http://example.org/graphs/audit";
+    let q = json!({
+        "@context": {"ex": "http://example.org/", "schema": "http://schema.org/"},
+        "from": named_alias,
+        "select": ["?e", "?c"],
+        "where": {
+            "@id": "?e",
+            "schema:actor": {"@id": "ex:alice", "@annotation": {"ex:confidence": "?c"}}
+        }
+    });
+    let qr = fluree
+        .query_connection(&q)
+        .await
+        .expect("named-graph annotation query");
+    let json = qr.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let mut rows = json.as_array().expect("array").clone();
+    rows.sort_by_key(std::string::ToString::to_string);
+    assert_eq!(
+        rows,
+        vec![
+            json!(["ex:event1", "high"]),
+            json!(["ex:event2", {"@value": "low", "@language": "en"}]),
+        ],
+        "both annotated edges hydrate in the named graph, lang tag intact; got {json}"
+    );
+
+    // The named reifier is an ordinary node in the same graph.
+    let q2 = json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": named_alias,
+        "select": ["?src"],
+        "where": {"@id": "ex:claim2", "ex:source": "?src"}
+    });
+    let qr = fluree.query_connection(&q2).await.expect("reifier query");
+    let json = qr.to_jsonld(&ledger.snapshot).expect("jsonld");
+    assert_eq!(
+        extract_nth_column(&json, 0),
+        vec!["ex:sensor"],
+        "got {json}"
+    );
+}
+
 #[tokio::test]
 async fn import_trig_compact_named_graph_is_queryable() {
     // Issue #1278: the compact W3C TriG form `<iri> { ... }` (no GRAPH keyword)
@@ -1436,6 +1748,412 @@ ex:alice schema:name "Alice" .
         vec!["User login", "User logout"],
         "compact-form named-graph data must be indexed and queryable; got {json_named}"
     );
+}
+
+// TriG scopes blank-node labels to the whole document: a label shared between
+// the default graph and a GRAPH block must skolemize to ONE node, and the same
+// label in a different document (file/commit) must stay a DIFFERENT node.
+// Regression: named-graph blanks used to mint from the bare label (`fdb-b0`) —
+// diverging from the default graph within one document AND colliding across
+// every document in the ledger.
+#[tokio::test]
+async fn import_trig_blank_label_document_scoped() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // File 1: `_:shared` referenced from the default graph AND a GRAPH block.
+    let trig1 = r#"@prefix ex: <http://example.org/> .
+@prefix schema: <http://schema.org/> .
+
+ex:alice ex:knows _:shared .
+_:shared schema:name "Document-scoped node" .
+
+GRAPH <http://example.org/graphs/g1> {
+    ex:bob ex:knows _:shared .
+}
+"#;
+    // File 2: the same label in another document's GRAPH block.
+    let trig2 = r"@prefix ex: <http://example.org/> .
+
+GRAPH <http://example.org/graphs/g2> {
+    ex:carol ex:knows _:shared .
+}
+";
+    std::fs::write(data_dir.path().join("a.trig"), trig1).expect("write trig1");
+    std::fs::write(data_dir.path().join("b.trig"), trig2).expect("write trig2");
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    fluree
+        .create("test/trig-bnode-scope:main")
+        .import(data_dir.path())
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("trig import should succeed");
+
+    let ledger = fluree
+        .ledger("test/trig-bnode-scope:main")
+        .await
+        .expect("load ledger");
+
+    // Scans with a variable predicate and picks out the blank-node ref, so
+    // the assertions stay focused on node identity rather than predicate
+    // resolution (covered by import_trig_bound_predicate_queryable).
+    let knows_object = |json: &serde_json::Value, subject: &str| -> String {
+        let rows = json.as_array().expect("array result");
+        let refs: Vec<String> = rows
+            .iter()
+            .map(|r| r.as_array().expect("row"))
+            .filter(|r| r[0].as_str() == Some(subject))
+            .filter_map(|r| r[2].as_str())
+            .filter(|o| o.starts_with("_:fdb-"))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            refs.len(),
+            1,
+            "expected one _:fdb- ref for {subject}: {json}"
+        );
+        refs.into_iter().next().unwrap()
+    };
+
+    // Default graph: the node alice knows.
+    let qr = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({
+            "select": ["?s", "?p", "?o"],
+            "where": {"@id": "?s", "?p": "?o"}
+        }),
+    )
+    .await
+    .expect("default-graph query");
+    let default_node = knows_object(
+        &qr.to_jsonld(&ledger.snapshot).expect("jsonld"),
+        "http://example.org/alice",
+    );
+
+    // Named graph g1 (same document): must be the SAME node.
+    let qr = fluree
+        .query_connection(&json!({
+            "from": "test/trig-bnode-scope:main#http://example.org/graphs/g1",
+            "select": ["?s", "?p", "?o"],
+            "where": {"@id": "?s", "?p": "?o"}
+        }))
+        .await
+        .expect("g1 query");
+    let g1_node = knows_object(
+        &qr.to_jsonld(&ledger.snapshot).expect("jsonld"),
+        "http://example.org/bob",
+    );
+    assert_eq!(
+        g1_node, default_node,
+        "TriG label scope spans default graph and GRAPH blocks of one document"
+    );
+
+    // Named graph g2 (different document): must be a DIFFERENT node.
+    let qr = fluree
+        .query_connection(&json!({
+            "from": "test/trig-bnode-scope:main#http://example.org/graphs/g2",
+            "select": ["?s", "?p", "?o"],
+            "where": {"@id": "?s", "?p": "?o"}
+        }))
+        .await
+        .expect("g2 query");
+    let g2_node = knows_object(
+        &qr.to_jsonld(&ledger.snapshot).expect("jsonld"),
+        "http://example.org/carol",
+    );
+    assert_ne!(
+        g2_node, default_node,
+        "the same label in a different document must stay a distinct node"
+    );
+}
+
+// ============================================================================
+// Turtle blank-node label scoping across CHUNK boundaries
+//
+// Same contract as the TriG test above, applied to the chunked bulk-import
+// path: bulk import cuts one Turtle document into many chunks (one commit
+// each), so a labeled blank node must still resolve to ONE subject across all
+// of them, and must stay distinct between input files.
+// ============================================================================
+
+/// Build a Turtle document large enough to be split across import chunks, with
+/// `_:shared` referenced in the FIRST statement and again in the LAST.
+///
+/// `marker` distinguishes documents; the filler is sized so a 1 MB chunk cannot
+/// hold the whole file.
+fn multi_chunk_ttl(marker: &str, filler_triples: usize) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(filler_triples * 128 + 256);
+    s.push_str("@prefix ex: <http://example.org/> .\n");
+    s.push_str("@prefix schema: <http://schema.org/> .\n\n");
+    let _ = writeln!(s, "_:shared schema:name \"{marker}\" .");
+    for i in 0..filler_triples {
+        let _ = writeln!(
+            s,
+            "ex:{marker}-filler{i} schema:description \"padding that pushes the two _:shared statements into different import chunks\" ."
+        );
+    }
+    let _ = writeln!(s, "_:shared schema:jobTitle \"{marker}\" .");
+    s
+}
+
+/// Like [`multi_chunk_ttl`], but the first and last statements each contain an
+/// ANONYMOUS blank node (`[ … ]`) rather than a labeled one.
+///
+/// Both land at the same ordinal within their respective chunks (the filler
+/// mints none), which is exactly the case where a per-chunk mint counter under
+/// a document-shared skolem base collides.
+fn multi_chunk_anon_ttl(filler_triples: usize) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(filler_triples * 128 + 256);
+    s.push_str("@prefix ex: <http://example.org/> .\n");
+    s.push_str("@prefix schema: <http://schema.org/> .\n\n");
+    s.push_str("ex:doc ex:first [ schema:name \"anon-first\" ] .\n");
+    for i in 0..filler_triples {
+        let _ = writeln!(
+            s,
+            "ex:anon-filler{i} schema:description \"padding that pushes the two anonymous nodes into different import chunks\" ."
+        );
+    }
+    s.push_str("ex:doc ex:last [ schema:name \"anon-last\" ] .\n");
+    s
+}
+
+/// Resolve the single subject carrying `predicate` = `marker`.
+async fn sole_subject_for(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+    predicate: &str,
+    marker: &str,
+) -> String {
+    let qr = support::query_jsonld(
+        fluree,
+        ledger,
+        &json!({"select": ["?s"], "where": {"@id": "?s", predicate: marker}}),
+    )
+    .await
+    .expect("subject query");
+    let rows = qr.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let subjects: Vec<String> = rows
+        .as_array()
+        .expect("array result")
+        .iter()
+        .filter_map(|r| match r {
+            serde_json::Value::Array(cols) => cols[0].as_str(),
+            other => other.as_str(),
+        })
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        subjects.len(),
+        1,
+        "expected exactly one subject for {predicate} = {marker}: {rows}"
+    );
+    let subject = subjects.into_iter().next().unwrap();
+    assert!(
+        subject.starts_with("_:fdb-"),
+        "expected a skolemized blank node, got {subject}"
+    );
+    subject
+}
+
+// Regression: `parse_chunk` used to derive the skolemization key from the
+// per-chunk commit `t`, so `_:shared` in chunk 0 and `_:shared` in chunk 1 of
+// ONE file became two different subjects — the chunked-Turtle sibling of the
+// TriG bug fixed in #1432. Runs with 2 parse threads: the two occurrences are
+// skolemized on different workers with no shared state between them.
+#[tokio::test]
+async fn import_ttl_blank_label_scoped_across_chunks() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // ~1.5 MB against a 1 MB chunk size — at least two chunks.
+    let ttl = multi_chunk_ttl("solo", 12_000);
+    assert!(ttl.len() > 1024 * 1024, "fixture must exceed one chunk");
+    let path = write_ttl(data_dir.path(), "big.ttl", &ttl);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let result = fluree
+        .create("test/ttl-bnode-chunks:main")
+        .import(&path)
+        .threads(2)
+        .chunk_size_mb(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("chunked import should succeed");
+    assert!(
+        result.t > 1,
+        "test is vacuous unless the file was split: {} chunk(s)",
+        result.t
+    );
+
+    let ledger = fluree
+        .ledger("test/ttl-bnode-chunks:main")
+        .await
+        .expect("load ledger");
+
+    let first = sole_subject_for(&fluree, &ledger, "http://schema.org/name", "solo").await;
+    let last = sole_subject_for(&fluree, &ledger, "http://schema.org/jobTitle", "solo").await;
+    assert_eq!(
+        first, last,
+        "a labeled blank node is scoped to its document, not to the chunk it lands in"
+    );
+}
+
+// The counterpart constraint, and the one a document-scoped skolem base can
+// easily break: ANONYMOUS nodes carry no label to unify on, so two of them must
+// stay distinct even when they sit at the same ordinal in different chunks of
+// one document. The mint counter is per-sink (per chunk), so it only separates
+// them if the minted label also carries something chunk-unique.
+#[tokio::test]
+async fn import_ttl_anonymous_nodes_distinct_across_chunks() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let ttl = multi_chunk_anon_ttl(12_000);
+    assert!(ttl.len() > 1024 * 1024, "fixture must exceed one chunk");
+    let path = write_ttl(data_dir.path(), "anon.ttl", &ttl);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let result = fluree
+        .create("test/ttl-anon-chunks:main")
+        .import(&path)
+        .threads(2)
+        .chunk_size_mb(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("chunked import should succeed");
+    assert!(
+        result.t > 1,
+        "test is vacuous unless the file was split: {} chunk(s)",
+        result.t
+    );
+
+    let ledger = fluree
+        .ledger("test/ttl-anon-chunks:main")
+        .await
+        .expect("load ledger");
+
+    let first = sole_subject_for(&fluree, &ledger, "http://schema.org/name", "anon-first").await;
+    let last = sole_subject_for(&fluree, &ledger, "http://schema.org/name", "anon-last").await;
+    assert_ne!(
+        first, last,
+        "two anonymous nodes are two nodes, however the chunker happens to cut the file"
+    );
+}
+
+// The other half of the contract: chunk boundaries must not merge labels
+// ACROSS files. Two multi-chunk files in one directory take the local-rechunk
+// arm, so each is sub-split *and* interleaved with the other in the same
+// import session.
+#[tokio::test]
+async fn import_ttl_blank_labels_distinct_across_files() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    write_ttl(data_dir.path(), "a.ttl", &multi_chunk_ttl("alpha", 12_000));
+    write_ttl(data_dir.path(), "b.ttl", &multi_chunk_ttl("beta", 12_000));
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let result = fluree
+        .create("test/ttl-bnode-files:main")
+        .import(data_dir.path())
+        .threads(2)
+        .chunk_size_mb(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("directory import should succeed");
+    assert!(
+        result.t > 2,
+        "test is vacuous unless both files were split: {} chunk(s)",
+        result.t
+    );
+
+    let ledger = fluree
+        .ledger("test/ttl-bnode-files:main")
+        .await
+        .expect("load ledger");
+
+    let alpha_first = sole_subject_for(&fluree, &ledger, "http://schema.org/name", "alpha").await;
+    let alpha_last =
+        sole_subject_for(&fluree, &ledger, "http://schema.org/jobTitle", "alpha").await;
+    let beta_first = sole_subject_for(&fluree, &ledger, "http://schema.org/name", "beta").await;
+    let beta_last = sole_subject_for(&fluree, &ledger, "http://schema.org/jobTitle", "beta").await;
+
+    assert_eq!(
+        alpha_first, alpha_last,
+        "a.ttl's label spans its own chunks"
+    );
+    assert_eq!(beta_first, beta_last, "b.ttl's label spans its own chunks");
+    assert_ne!(
+        alpha_first, beta_first,
+        "the same label in two files denotes two different nodes"
+    );
+}
+
+// Small files never reach the splitter, but they can be *coalesced* into one
+// chunk — which would merge their labels just as wrongly. `coalesce_unsafe`
+// refuses to coalesce any file containing `_:`; this pins that guarantee.
+#[tokio::test]
+async fn import_ttl_blank_labels_distinct_across_small_files() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let doc = |marker: &str| {
+        format!("@prefix schema: <http://schema.org/> .\n\n_:shared schema:name \"{marker}\" .\n")
+    };
+    write_ttl(data_dir.path(), "a.ttl", &doc("small-a"));
+    write_ttl(data_dir.path(), "b.ttl", &doc("small-b"));
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    fluree
+        .create("test/ttl-bnode-small:main")
+        .import(data_dir.path())
+        .threads(1)
+        // Coalescing only engages above this threshold, and the default (64)
+        // would leave two files well under it — the test would pass without
+        // ever reaching the code path it exists to cover.
+        .coalesce_small_files_threshold(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("directory import should succeed");
+
+    let ledger = fluree
+        .ledger("test/ttl-bnode-small:main")
+        .await
+        .expect("load ledger");
+
+    let a = sole_subject_for(&fluree, &ledger, "http://schema.org/name", "small-a").await;
+    let b = sole_subject_for(&fluree, &ledger, "http://schema.org/name", "small-b").await;
+    assert_ne!(a, b, "each file is its own document");
 }
 
 // ============================================================================
@@ -1947,20 +2665,35 @@ async fn import_directory_blank_nodes_not_coalesced() {
         &ledger,
         &json!({
             "@context": {"schema": "http://schema.org/"},
-            "select": ["?name"],
-            "where": {"schema:name": "?name"}
+            "select": ["?s", "?name"],
+            "where": {"@id": "?s", "schema:name": "?name"}
         }),
     )
     .await
     .expect("query names");
-    let names = extract_sorted_strings(&qr.to_jsonld(&ledger.snapshot).unwrap());
+    let rows = qr.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let rows = rows.as_array().expect("array result");
+
+    // Distinct SUBJECTS is the assertion that actually pins `coalesce_unsafe`.
+    // Counting names does not: if two files' `_:b1` merged, the merged subject
+    // would simply carry both names and the name count would be unchanged.
+    let subjects: std::collections::BTreeSet<&str> = rows
+        .iter()
+        .filter_map(|r| r.as_array().and_then(|row| row[0].as_str()))
+        .collect();
     assert_eq!(
-        names.len(),
+        subjects.len(),
         N,
         "every file's blank node must stay distinct (no cross-file merge)"
     );
-    assert!(names.contains(&"blank-0".to_string()));
-    assert!(names.contains(&"blank-79".to_string()));
+
+    let names: std::collections::BTreeSet<&str> = rows
+        .iter()
+        .filter_map(|r| r.as_array().and_then(|row| row[1].as_str()))
+        .collect();
+    assert_eq!(names.len(), N, "no name may be lost");
+    assert!(names.contains("blank-0"));
+    assert!(names.contains("blank-79"));
 }
 
 /// `coalesce_small_files_threshold(0)` disables coalescing: every small file
@@ -2081,4 +2814,994 @@ async fn import_directory_splits_large_compressed_file() {
     let objs = extract_nth_column(&qr.to_jsonld(&ledger.snapshot).unwrap(), 0);
     assert!(objs.contains(&"name-0".to_string()));
     assert!(objs.contains(&"name-39999".to_string()));
+}
+
+// Regression: the serial TriG import path allocated namespace codes only in
+// `state.ns_registry`, invisible to the SpoolContext (which resolves
+// code->prefix via the SHARED allocator at record-push time, mid-parse). Its
+// empty-prefix fallback wrote suffix-only predicate strings ("name" instead
+// of "http://schema.org/name") into the index's predicate dict, so
+// bound-predicate patterns matched nothing and results rendered bare
+// suffixes. The TriG path now allocates through a shared-allocator-backed
+// WorkerCache like the parallel Turtle path.
+#[tokio::test]
+async fn import_trig_bound_predicate_queryable() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let trig = r#"@prefix ex: <http://example.org/> .
+@prefix schema: <http://schema.org/> .
+
+ex:alice schema:name "Alice" .
+ex:bob schema:name "Bob" .
+
+GRAPH <http://example.org/graphs/g1> {
+    ex:event1 schema:description "login" .
+}
+"#;
+    let path = data_dir.path().join("data.trig");
+    std::fs::write(&path, trig).expect("write trig");
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+    fluree
+        .create("test/bound-pred:main")
+        .import(&path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("import");
+    let ledger = fluree.ledger("test/bound-pred:main").await.expect("ledger");
+
+    // Full scan must render complete predicate IRIs (not bare suffixes).
+    let scan = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"select": ["?s","?p","?o"], "where": {"@id": "?s", "?p": "?o"}}),
+    )
+    .await
+    .expect("scan");
+    let scan_rows = scan.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let preds: Vec<&str> = scan_rows
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|r| r.as_array().and_then(|row| row[1].as_str()))
+        .collect();
+    assert!(
+        preds.iter().all(|p| *p == "http://schema.org/name"),
+        "predicates must decode to full IRIs; got {scan_rows}"
+    );
+
+    // Bound-predicate pattern must match via the index predicate dict.
+    let bound = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"select": ["?s","?o"], "where": {"@id": "?s", "http://schema.org/name": "?o"}}),
+    )
+    .await
+    .expect("bound");
+    let bound_rows = bound.to_jsonld(&ledger.snapshot).expect("jsonld");
+    assert_eq!(
+        bound_rows.as_array().map(Vec::len),
+        Some(2),
+        "bound-predicate must match both subjects; got {bound_rows}"
+    );
+
+    // Named graph too: bound predicate against the GRAPH-block data.
+    let named = fluree
+        .query_connection(&json!({
+            "from": "test/bound-pred:main#http://example.org/graphs/g1",
+            "select": ["?s","?o"],
+            "where": {"@id": "?s", "http://schema.org/description": "?o"}
+        }))
+        .await
+        .expect("named bound");
+    let named_rows = named.to_jsonld(&ledger.snapshot).expect("jsonld");
+    assert_eq!(
+        named_rows.as_array().map(Vec::len),
+        Some(1),
+        "named-graph bound-predicate must match; got {named_rows}"
+    );
+}
+
+// ============================================================================
+// Incremental index over an imported (sketch-less) base preserves stats
+// ============================================================================
+
+/// Bulk import writes `sketch_ref: None`, so the first incremental index
+/// cannot merge base property stats from HLL registers. It must fall back to
+/// seeding from the base root's persisted per-graph property stats —
+/// previously it started from zero and persisted DELTA-ONLY stats (base
+/// predicates vanished; net-zero churn kept count 0), which silently broke
+/// stats-driven folds and planner selectivities on every imported ledger
+/// after its first post-import write.
+#[tokio::test]
+async fn incremental_index_over_import_preserves_property_stats() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let ttl = r#"
+@prefix ex: <http://example.org/ns/> .
+@prefix schema: <http://schema.org/> .
+
+ex:alice a ex:User ;
+    schema:name "Alice" ;
+    schema:age 42 .
+
+ex:bob a ex:User ;
+    schema:name "Bob" ;
+    schema:age 22 .
+"#;
+    let ttl_path = write_ttl(data_dir.path(), "people.ttl", ttl);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    let ledger_id = "test/import-incr-stats:main";
+    fluree
+        .create(ledger_id)
+        .import(&ttl_path)
+        .threads(2)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("import should succeed");
+
+    // Post-import writes: net-zero churn on schema:age (retract+assert) and
+    // a brand-new predicate.
+    let ledger = fluree.ledger(ledger_id).await.expect("load after import");
+    let ctx = json!({"ex": "http://example.org/ns/", "schema": "http://schema.org/"});
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx,
+                "delete": [{"@id": "ex:alice", "schema:age": 42}],
+                "insert": [{"@id": "ex:alice", "schema:age": 43}]
+            }),
+        )
+        .await
+        .expect("churn age")
+        .ledger;
+    let _ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": ctx,
+                "@id": "ex:cam", "@type": "ex:User", "ex:brandnew": 7
+            }),
+        )
+        .await
+        .expect("new predicate")
+        .ledger;
+
+    // Incremental index (base exists, small gap).
+    support::build_and_publish_index(&fluree, ledger_id).await;
+    let db = fluree.db(ledger_id).await.expect("incremental view");
+
+    let stats = db.snapshot.stats.as_ref().expect("index stats");
+    let g0 = stats
+        .graphs
+        .as_ref()
+        .expect("per-graph stats")
+        .iter()
+        .find(|g| g.g_id == 0)
+        .expect("default graph stats");
+    let prop_sum: u64 = g0.properties.iter().map(|p| p.count).sum();
+    assert_eq!(
+        prop_sum,
+        g0.flakes,
+        "per-graph property counts must cover all flakes; entries: {:?}",
+        g0.properties
+            .iter()
+            .map(|p| (p.p_id, p.count))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        g0.properties.iter().all(|p| p.count > 0),
+        "net-zero churn must keep the base count: {:?}",
+        g0.properties
+            .iter()
+            .map(|p| (p.p_id, p.count))
+            .collect::<Vec<_>>()
+    );
+    // ndv floors survive even though the base had no HLL registers.
+    assert!(
+        g0.properties.iter().any(|p| p.ndv_values >= 2),
+        "base ndv estimates must not reset: {:?}",
+        g0.properties
+            .iter()
+            .map(|p| (p.p_id, p.ndv_values))
+            .collect::<Vec<_>>()
+    );
+}
+
+// ============================================================================
+// Duplicate-statement deduplication (#1651)
+// ============================================================================
+
+/// SPARQL `COUNT(*)` over all default-graph triples.
+async fn count_all_triples(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+) -> u64 {
+    let qr = support::query_sparql(fluree, ledger, "SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }")
+        .await
+        .expect("count query");
+    let json = qr.to_sparql_json(&ledger.snapshot).expect("format");
+    json["results"]["bindings"][0]["c"]["value"]
+        .as_str()
+        .expect("count value")
+        .parse()
+        .expect("count number")
+}
+
+// The issue #1651 minimal repro: an RDF graph is a set of triples, so a
+// 6-line file with every line duplicated holds 3 facts, blank-node lines
+// included (labeled blank nodes are document-scoped). All copies land in one
+// chunk, so this pins the chunk-sort dedup lane.
+#[tokio::test]
+async fn import_deduplicates_repeated_statements() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let nt = r#"<http://ex.org/pub1> <http://ex.org/hasId> _:id1 .
+_:id1 <http://ex.org/scheme> <http://ex.org/doi> .
+<http://ex.org/pub1> <http://ex.org/hasId> _:id1 .
+_:id1 <http://ex.org/scheme> <http://ex.org/doi> .
+<http://ex.org/pub2> <http://ex.org/title> "Hello" .
+<http://ex.org/pub2> <http://ex.org/title> "Hello" .
+"#;
+    let path = write_data(data_dir.path(), "dupe.nt", nt);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+
+    let result = fluree
+        .create("test/import-dedup:main")
+        .import(&path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("import");
+
+    assert_eq!(result.duplicates_removed, 3, "three duplicated lines");
+    // flake_count reports raw commit ops — the commit chain keeps every op.
+    assert_eq!(result.flake_count, 6);
+
+    let ledger = fluree.ledger("test/import-dedup:main").await.expect("load");
+    assert_eq!(count_all_triples(&fluree, &ledger).await, 3);
+}
+
+// Copies of the same statement split across import chunks meet only in the
+// k-way SPOT/secondary merges — the chunk-sort dedup cannot see them. Pins
+// the merge lane (`next_unique_assert`) plus the stats discount: per-property
+// counts must describe the set view, not the op log.
+#[tokio::test]
+async fn import_deduplicates_repeated_statements_across_chunks() {
+    use std::fmt::Write as _;
+
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let mut ttl = String::new();
+    ttl.push_str("@prefix ex: <http://example.org/> .\n");
+    ttl.push_str("@prefix schema: <http://schema.org/> .\n\n");
+    ttl.push_str("_:dupbn schema:name \"bn-dup\" .\n");
+    ttl.push_str("ex:dup schema:jobTitle \"iri-dup\" .\n");
+    for i in 0..12_000 {
+        let _ = writeln!(
+            ttl,
+            "ex:filler{i} schema:description \"padding that pushes the trailing duplicates into a later import chunk\" ."
+        );
+    }
+    ttl.push_str("_:dupbn schema:name \"bn-dup\" .\n");
+    ttl.push_str("ex:dup schema:jobTitle \"iri-dup\" .\n");
+    assert!(ttl.len() > 1024 * 1024, "fixture must exceed one chunk");
+    let path = write_ttl(data_dir.path(), "big-dupes.ttl", &ttl);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+
+    let result = fluree
+        .create("test/import-dedup-chunks:main")
+        .import(&path)
+        .threads(2)
+        .chunk_size_mb(1)
+        .memory_budget_mb(256)
+        .collect_id_stats(true)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("chunked import");
+    assert!(
+        result.t > 1,
+        "test is vacuous unless the file was split: {} chunk(s)",
+        result.t
+    );
+    assert_eq!(
+        result.duplicates_removed, 2,
+        "one bnode + one IRI duplicate"
+    );
+
+    let ledger = fluree
+        .ledger("test/import-dedup-chunks:main")
+        .await
+        .expect("load");
+
+    // One row per fact, duplicate-free.
+    assert_eq!(count_all_triples(&fluree, &ledger).await, 12_002);
+
+    // Per-property stats describe the set view: exactly one jobTitle fact,
+    // even though the op log holds two (merge-dedup discount applied).
+    assert_eq!(
+        property_count(&ledger.snapshot, "http://schema.org/jobTitle"),
+        Some(1),
+        "stats must discount the merge-collapsed duplicate"
+    );
+    assert_eq!(
+        property_count(&ledger.snapshot, "http://schema.org/name"),
+        Some(1)
+    );
+}
+
+// Near misses must all survive: statements differing only in language tag,
+// only in datatype, or plain-vs-tagged are distinct RDF facts.
+#[tokio::test]
+async fn import_preserves_near_miss_statements() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let ttl = r#"
+@prefix ex: <http://example.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+ex:pub ex:title "Hello"@en .
+ex:pub ex:title "Hello"@de .
+ex:pub ex:title "Hello" .
+ex:n ex:v "5" .
+ex:n ex:v 5 .
+ex:n ex:v "5"^^xsd:byte .
+"#;
+    let path = write_ttl(data_dir.path(), "near-miss.ttl", ttl);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+
+    let result = fluree
+        .create("test/import-near-miss:main")
+        .import(&path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("import");
+
+    assert_eq!(result.duplicates_removed, 0, "no line is a duplicate fact");
+
+    let ledger = fluree
+        .ledger("test/import-near-miss:main")
+        .await
+        .expect("load");
+    assert_eq!(count_all_triples(&fluree, &ledger).await, 6);
+}
+
+// Adversarial language-tag introduction order across chunks. Chunk 2 parses
+// "de" before "en" while chunk 1 established "en" first; a first-seen global
+// lang dictionary makes chunk 2's local→global remap non-monotone, which
+// un-sorts its remapped stream within (subject, predicate) — the two @en
+// copies then never sit adjacent in the merge and the duplicate survives.
+// Lexical assignment on both sides (chunk sort + unified dict) keeps every
+// remap monotone; this pins that.
+#[tokio::test]
+async fn import_deduplicates_lang_tagged_across_chunks_adversarial_order() {
+    use std::fmt::Write as _;
+
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let mut ttl = String::new();
+    ttl.push_str("@prefix ex: <http://example.org/> .\n");
+    ttl.push_str("@prefix schema: <http://schema.org/> .\n\n");
+    ttl.push_str("ex:l schema:name \"shared\"@en .\n");
+    for i in 0..12_000 {
+        let _ = writeln!(
+            ttl,
+            "ex:filler{i} schema:description \"padding that pushes the trailing statements into a later import chunk\" ."
+        );
+    }
+    // Same subject and predicate: the lang id is the deciding sort component,
+    // and "de" enters this chunk's dictionary first.
+    ttl.push_str("ex:l schema:name \"anders\"@de .\n");
+    ttl.push_str("ex:l schema:name \"shared\"@en .\n");
+    assert!(ttl.len() > 1024 * 1024, "fixture must exceed one chunk");
+    let path = write_ttl(data_dir.path(), "lang-dupes.ttl", &ttl);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+
+    let result = fluree
+        .create("test/import-dedup-lang:main")
+        .import(&path)
+        .threads(2)
+        .chunk_size_mb(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("chunked import");
+    assert!(
+        result.t > 1,
+        "test is vacuous unless the file was split: {} chunk(s)",
+        result.t
+    );
+    assert_eq!(result.duplicates_removed, 1, "the repeated @en statement");
+
+    let ledger = fluree
+        .ledger("test/import-dedup-lang:main")
+        .await
+        .expect("load");
+
+    let qr = support::query_sparql(
+        &fluree,
+        &ledger,
+        "SELECT ?o WHERE { <http://example.org/l> <http://schema.org/name> ?o }",
+    )
+    .await
+    .expect("name query");
+    let json = qr.to_sparql_json(&ledger.snapshot).expect("format");
+    let bindings = json["results"]["bindings"].as_array().expect("bindings");
+    assert_eq!(
+        bindings.len(),
+        2,
+        "one @en fact (deduped) plus the @de fact: {bindings:?}"
+    );
+}
+
+// ============================================================================
+// Reserved system graphs on the bulk-import path (issue #1846)
+//
+// Bulk import bypasses `stage()`, so #1838's data-write reserved-graph guard
+// never sees a `GRAPH <urn:fluree:{ledger}#txn-meta> { … }` block. The flakes
+// were encoded into the commit blob under the reserved g_id and then dropped
+// by the graph-scoped index builder — which builds g_id 1 only from the
+// synthetic commit-metadata chunk and has no pass for g_id 2 at all.
+//
+// The tests below pin the END-TO-END property rather than the write path. That
+// distinction is the whole point: the write path was already *correct* (the
+// allocator really did assign g_id 1), so any assertion about what the import
+// wrote passes against the bug. What was wrong is that correctly-routed records
+// were unreachable.
+// ============================================================================
+
+/// What happened to a named graph a TriG file asked to fill.
+#[derive(Debug)]
+enum NamedGraphImportOutcome {
+    /// The import was refused. Carries the error message.
+    Refused(String),
+    /// The import committed and every triple in the block reads back.
+    Readable,
+    /// The import committed and the block's triples are NOT readable.
+    /// This is the #1846 defect; no test below may observe it.
+    PersistedButUnreachable { expected: usize, found: usize },
+}
+
+/// Import a one-block TriG file and classify the outcome for that block.
+///
+/// `probe_alias` is the ledger-scoped graph address to read the block back
+/// through (`L#<full-iri>` for user graphs, `L#txn-meta` / `L#config` for the
+/// reserved pair). Every triple in the block carries `marker_predicate`, so the
+/// readback count is exact and does not collide with the commit metadata that
+/// legitimately occupies `#txn-meta`.
+async fn import_one_named_graph(
+    ledger_id: &str,
+    trig: &str,
+    probe_alias: &str,
+    marker_predicate: &str,
+    expected: usize,
+) -> NamedGraphImportOutcome {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let path = data_dir.path().join("data.trig");
+    std::fs::write(&path, trig).expect("write trig");
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let imported = fluree
+        .create(ledger_id)
+        .import(&path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await;
+
+    if let Err(e) = imported {
+        return NamedGraphImportOutcome::Refused(e.to_string());
+    }
+
+    let Ok(ledger) = fluree.ledger(ledger_id).await else {
+        return NamedGraphImportOutcome::PersistedButUnreachable { expected, found: 0 };
+    };
+
+    // Read the block back through its graph address, counting only the
+    // marker-predicate triples the fixture put there.
+    let q = json!({
+        "from": probe_alias,
+        "select": ["?s", "?o"],
+        "where": {"@id": "?s", marker_predicate: "?o"}
+    });
+    let found = match fluree.query_connection(&q).await {
+        Ok(qr) => qr
+            .to_jsonld(&ledger.snapshot)
+            .ok()
+            .and_then(|v| v.as_array().map(Vec::len))
+            .unwrap_or(0),
+        // An address that will not resolve is a form of unreachable.
+        Err(_) => 0,
+    };
+
+    if found == expected {
+        NamedGraphImportOutcome::Readable
+    } else {
+        NamedGraphImportOutcome::PersistedButUnreachable { expected, found }
+    }
+}
+
+const MARKER: &str = "http://example.org/probe#marker";
+
+fn marker_block(graph_iri: &str, n: usize) -> String {
+    let triples: String = (0..n)
+        .map(|i| format!("    <http://example.org/s{i}> <{MARKER}> \"v{i}\" .\n"))
+        .collect();
+    format!(
+        "<http://example.org/seed> <{MARKER}> \"base\" .\n\nGRAPH <{graph_iri}> {{\n{triples}}}\n"
+    )
+}
+
+/// **The #1846 invariant, stated as a property.**
+///
+/// For a TriG file naming any graph, exactly one of these must hold after
+/// import: the import was *refused*, or every triple in the block is *readable
+/// back* from that graph. "Committed, and silently unreachable" is the third
+/// state and it is the bug.
+///
+/// Run across all three graph kinds in one test on purpose. A future half-fix
+/// that refuses `#txn-meta` and forgets `#config` — the exact shape the issue
+/// itself missed, since it never tested `#config` — fails here.
+#[tokio::test]
+async fn import_trig_reserved_graph_refused_or_readable_never_persisted_unreachable() {
+    let cases: [(&str, &str, &str); 3] = [
+        // (label, graph IRI in the file, address to read it back through)
+        (
+            "user",
+            "http://example.org/graphs/audit",
+            "#http://example.org/graphs/audit",
+        ),
+        ("txn-meta", "urn:fluree:{L}#txn-meta", "#txn-meta"),
+        ("config", "urn:fluree:{L}#config", "#config"),
+    ];
+
+    for (label, graph_tpl, alias_suffix) in cases {
+        let ledger_id = format!("test/reserved-prop-{label}:main");
+        let graph_iri = graph_tpl.replace("{L}", &ledger_id);
+        let probe_alias = format!("{ledger_id}{alias_suffix}");
+
+        let outcome = import_one_named_graph(
+            &ledger_id,
+            &marker_block(&graph_iri, 3),
+            &probe_alias,
+            MARKER,
+            3,
+        )
+        .await;
+
+        match outcome {
+            // A refusal only satisfies the property if it is a refusal *of
+            // this block*. Without this check a blanket parse failure would
+            // satisfy every arm vacuously.
+            NamedGraphImportOutcome::Refused(msg) => assert!(
+                msg.contains(&graph_iri)
+                    || msg.contains("reserved system graph")
+                    || msg.contains("ledger config graph"),
+                "`{label}` was refused, but not for naming <{graph_iri}>: {msg}"
+            ),
+            NamedGraphImportOutcome::Readable => {}
+            NamedGraphImportOutcome::PersistedButUnreachable { expected, found } => {
+                panic!(
+                    "#1846: `{label}` graph <{graph_iri}> was committed but is not readable \
+                     ({found}/{expected} triples visible at `{probe_alias}`). The import must \
+                     either refuse the block or make its triples reachable — never persist \
+                     them unreachably."
+                );
+            }
+        }
+    }
+}
+
+/// The user-graph arm of the property, asserted positively and separately:
+/// the guard must not catch ordinary named graphs, which is exactly what a
+/// faithful `--format trig` export will start emitting in volume (#1847).
+#[tokio::test]
+async fn import_trig_reserved_graph_guard_still_admits_user_named_graphs() {
+    let ledger_id = "test/reserved-user-graph:main";
+    let graph_iri = "http://example.org/graphs/audit";
+    let probe_alias = format!("{ledger_id}#{graph_iri}");
+
+    let outcome = import_one_named_graph(
+        ledger_id,
+        &marker_block(graph_iri, 3),
+        &probe_alias,
+        MARKER,
+        3,
+    )
+    .await;
+    assert!(
+        matches!(outcome, NamedGraphImportOutcome::Readable),
+        "a user named graph must import and read back, got {outcome:?}"
+    );
+
+    // …and it must land in the user range, not a reserved slot.
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let path = data_dir.path().join("data.trig");
+    std::fs::write(&path, marker_block(graph_iri, 3)).expect("write trig");
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    fluree
+        .create("test/reserved-user-gid:main")
+        .import(&path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("user named graph import must succeed");
+    let view = fluree
+        .db(&format!("test/reserved-user-gid:main#{graph_iri}"))
+        .await
+        .expect("user graph must be addressable");
+    assert!(
+        view.graph_id >= fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID,
+        "user graph must get a user g_id, got {}",
+        view.graph_id
+    );
+}
+
+/// The issue's own fixture: a `GRAPH <urn:fluree:{ledger}#txn-meta>` block
+/// carrying forged commit records. Refused, and no ledger is left behind.
+///
+/// The forged records matter specifically because `resolve_commit_prefix`
+/// scans g_id 1 through the novelty overlay as well as the index — so on a
+/// replica that has not indexed yet, a persisted forgery is *live*, not merely
+/// invisible.
+#[tokio::test]
+async fn import_trig_reserved_graph_refuses_txn_meta_block() {
+    let ledger_id = "test/reserved-txnmeta:main";
+    let trig = format!(
+        r#"@prefix f: <https://ns.flur.ee/db#> .
+
+<http://example.org/seed> <http://example.org/v> "base" .
+
+GRAPH <urn:fluree:{ledger_id}#txn-meta> {{
+    <fluree:commit:sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef> f:address "bafyforged" .
+    <fluree:commit:sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef> f:alias "{ledger_id}" .
+    <fluree:commit:sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef> f:time "1700000000" .
+}}
+"#
+    );
+
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let path = data_dir.path().join("forged.trig");
+    std::fs::write(&path, &trig).expect("write trig");
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let err = fluree
+        .create(ledger_id)
+        .import(&path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect_err("import into the ledger's txn-meta graph must be refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("reserved system graph") && msg.contains("#txn-meta"),
+        "expected the same refusal every other write surface emits, got: {msg}"
+    );
+
+    // A refused import leaves a *registered but empty* ledger — pre-existing
+    // behavior shared by every import refusal (the `f:reifies` firewall does
+    // the same), not something this guard introduces. What matters is that the
+    // chunk is aborted whole: t stays 0, so not one flake of the forged block
+    // reached storage.
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("create registers the ledger even when the import is refused");
+    assert_eq!(
+        ledger.t(),
+        0,
+        "a refused chunk must commit nothing at all, not even its default-graph triples"
+    );
+}
+
+/// The variant the issue never tested. `#config` has the identical defect —
+/// no index pass builds g_id 2 from data chunks — but a *different* cause, so
+/// it gets a different message: config is writable by ordinary transactions,
+/// which makes this a capability gap rather than a security refusal.
+#[tokio::test]
+async fn import_trig_reserved_graph_refuses_config_block_with_distinct_message() {
+    let ledger_id = "test/reserved-config:main";
+    let trig = format!(
+        r#"@prefix f: <https://ns.flur.ee/db#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+<http://example.org/seed> <http://example.org/v> "base" .
+
+GRAPH <urn:fluree:{ledger_id}#config> {{
+    <urn:config:forged> rdf:type f:LedgerConfig .
+    <urn:config:forged> f:indexing "forged" .
+}}
+"#
+    );
+
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let path = data_dir.path().join("forged.trig");
+    std::fs::write(&path, &trig).expect("write trig");
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let err = fluree
+        .create(ledger_id)
+        .import(&path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect_err("import into the ledger's config graph must be refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cannot populate the ledger config graph"),
+        "config must get the capability-gap message, not the reserved-graph \
+         security refusal, so the two cannot be transposed unnoticed; got: {msg}"
+    );
+    assert!(
+        !msg.contains("reserved system graph"),
+        "config must NOT reuse the txn-meta security wording; got: {msg}"
+    );
+}
+
+/// The `<#txn-meta>` *sentinel* spelling is a different construct and stays
+/// supported: `parse_trig_phase1` routes it to the commit envelope's
+/// `txn_meta` field, so it never reaches the named-graph loop the guard sits
+/// in. Without this test the guard could be "tightened" to match the fragment
+/// and would silently break legitimate commit metadata on import.
+#[tokio::test]
+async fn import_trig_reserved_graph_sentinel_txn_meta_still_accepted() {
+    let ledger_id = "test/reserved-sentinel:main";
+    let trig = r#"@prefix f: <https://ns.flur.ee/db#> .
+
+<http://example.org/seed> <http://example.org/v> "base" .
+
+GRAPH <#txn-meta> {
+    <fluree:commit:this> f:author "alice" .
+}
+"#;
+
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let path = data_dir.path().join("meta.trig");
+    std::fs::write(&path, trig).expect("write trig");
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    fluree
+        .create(ledger_id)
+        .import(&path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("the `<#txn-meta>` sidecar spelling must remain accepted");
+}
+
+/// The forgery channel, tested in the only state where it is live.
+///
+/// On an INDEXED ledger the forged records are invisible — the graph-scoped
+/// index builder filters them out — so an indexed-only test reports "not
+/// readable" and passes against the bug. On an UNINDEXED one they are live:
+/// `load_novelty` routes every blob flake by its graph Sid, the registry maps
+/// the reserved IRI to g_id 1, and the records land exactly where
+/// `resolve_commit_prefix` scans. That is the state `clone` / `pull
+/// --no-indexes` and the automatic large-transfer index skip leave a consumer
+/// in.
+///
+/// So this test deletes the index ref and reloads before asserting. The
+/// assertion is about *reachability*, not about the refusal, which is what
+/// makes it fail if the guard is removed: without the guard the import
+/// commits, and the reload surfaces the forged record.
+#[tokio::test]
+async fn import_trig_reserved_graph_forged_txn_meta_absent_on_unindexed_reload() {
+    const FORGED: &str =
+        "fluree:commit:sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    let ledger_id = "test/unindexed-forgery:main";
+
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let trig = format!(
+        r#"@prefix f: <https://ns.flur.ee/db#> .
+
+<http://example.org/seed> <http://example.org/v> "base" .
+
+GRAPH <urn:fluree:{ledger_id}#txn-meta> {{
+    <{FORGED}> f:address "bafyforged" .
+    <{FORGED}> f:alias "{ledger_id}" .
+    <{FORGED}> f:time "1700000000" .
+}}
+"#
+    );
+    let path = data_dir.path().join("forged.trig");
+    std::fs::write(&path, &trig).expect("write trig");
+
+    let root = db_dir.path().to_string_lossy().to_string();
+    {
+        let fluree = FlureeBuilder::file(root.clone())
+            .build()
+            .expect("build file-backed Fluree");
+        // The import may be refused (fixed) or succeed (bug present). Either
+        // way the reachability assertion below is the one that decides.
+        let _ = fluree
+            .create(ledger_id)
+            .import(&path)
+            .threads(1)
+            .memory_budget_mb(256)
+            .cleanup(false)
+            .execute()
+            .await;
+    }
+
+    // Drop the index ref, reproducing a commits-only replica.
+    let index_ref = db_dir
+        .path()
+        .join("ns@v2")
+        .join("test/unindexed-forgery")
+        .join("main.index.json");
+    if index_ref.exists() {
+        std::fs::remove_file(&index_ref).expect("remove index ref");
+    }
+
+    // Fresh handle so nothing is served from the first instance's caches.
+    let fluree = FlureeBuilder::file(root)
+        .build()
+        .expect("rebuild file-backed Fluree");
+    let Ok(ledger) = fluree.ledger(ledger_id).await else {
+        return; // No ledger at all is trivially free of forged provenance.
+    };
+
+    let q = json!({
+        "from": format!("{ledger_id}#txn-meta"),
+        "select": ["?p", "?o"],
+        "where": {"@id": FORGED, "?p": "?o"}
+    });
+    let rows = match fluree.query_connection(&q).await {
+        Ok(qr) => qr
+            .to_jsonld(&ledger.snapshot)
+            .ok()
+            .and_then(|v| v.as_array().map(Vec::len))
+            .unwrap_or(0),
+        Err(_) => 0,
+    };
+    assert_eq!(
+        rows, 0,
+        "#1846: forged commit provenance is live in the txn-meta graph of an \
+         unindexed ledger — this is the state a `--no-indexes` clone leaves a \
+         consumer in, and it is where `resolve_commit_prefix` looks"
+    );
+}
+
+/// The positive half of the #1846 load-side drop: legitimate commit metadata
+/// must still be there afterwards.
+///
+/// The `<#txn-meta>` sidecar supplies `f:author` through the commit *envelope*,
+/// not the flake stream. On an unindexed reload that metadata is regenerated by
+/// `generate_commit_flakes` with `g: None` and then stamped into the txn-meta
+/// graph — passing through the very same one-pass filter that drops forgeries.
+/// If that filter were even slightly too broad, this is what would silently
+/// disappear, and an absent-metadata failure is not something a forgery test
+/// can catch.
+#[tokio::test]
+async fn import_trig_reserved_graph_sentinel_txn_meta_survives_unindexed_reload() {
+    let ledger_id = "test/sentinel-survives:main";
+    let trig = r#"@prefix f: <https://ns.flur.ee/db#> .
+
+<http://example.org/seed> <http://example.org/v> "base" .
+
+GRAPH <#txn-meta> {
+    <fluree:commit:this> f:author "alice" .
+}
+"#;
+
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let path = data_dir.path().join("meta.trig");
+    std::fs::write(&path, trig).expect("write trig");
+    let root = db_dir.path().to_string_lossy().to_string();
+
+    {
+        let fluree = FlureeBuilder::file(root.clone())
+            .build()
+            .expect("build file-backed Fluree");
+        fluree
+            .create(ledger_id)
+            .import(&path)
+            .threads(1)
+            .memory_budget_mb(256)
+            .cleanup(false)
+            .execute()
+            .await
+            .expect("the `<#txn-meta>` sidecar spelling must remain accepted");
+    }
+
+    // Drop the index ref so the read goes through `load_novelty`, which is
+    // where the forgery filter runs.
+    let index_ref = db_dir
+        .path()
+        .join("ns@v2")
+        .join("test/sentinel-survives")
+        .join("main.index.json");
+    if index_ref.exists() {
+        std::fs::remove_file(&index_ref).expect("remove index ref");
+    }
+
+    let fluree = FlureeBuilder::file(root)
+        .build()
+        .expect("rebuild file-backed Fluree");
+    let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+    let rows = fluree
+        .query_connection(&json!({
+            "from": format!("{ledger_id}#txn-meta"),
+            "select": ["?s", "?o"],
+            "where": {"@id": "?s", "https://ns.flur.ee/db#author": "?o"}
+        }))
+        .await
+        .expect("txn-meta must be queryable")
+        .to_jsonld(&ledger.snapshot)
+        .expect("jsonld");
+
+    let authors = extract_nth_column(&rows, 1);
+    assert_eq!(
+        authors,
+        vec!["alice".to_string()],
+        "envelope-supplied commit metadata must survive the load-side drop; got {rows}"
+    );
 }

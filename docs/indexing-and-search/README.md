@@ -25,8 +25,8 @@ Manual index rebuilding for recovery and maintenance:
 ### [Inline Fulltext Search](fulltext.md)
 
 Inline BM25-ranked text scoring. Two entry points, same query surface:
-- **`@fulltext` datatype** — per-value annotation (analogous to `@vector`), always English, zero config
-- **`f:fullTextDefaults` config** — declare properties + language once at the ledger level; supports 18 languages with Snowball stemming and per-graph overrides for multilingual setups
+- **`f:fullTextDefaults` config** (recommended) — declare properties + language once in the ledger's `#config` graph; values keep their standard `xsd:string` / `rdf:langString` datatypes, with 18 languages of Snowball stemming and per-graph overrides for multilingual setups
+- **`@fulltext` datatype** — per-value annotation (analogous to `@vector`), always English, zero config; stores values under the custom `f:fullText` datatype, so best suited to siloed databases or properties orthogonal to your core RDF model
 - `fulltext(?var, "query")` scoring function in `bind` expressions (same for both paths)
 - Automatic per-(graph, property, language) fulltext arena construction during background indexing
 - Unified scoring across indexed and novelty documents
@@ -277,8 +277,8 @@ let result = fluree.drop_full_text_index("products-search:main").await?;
 
 ### Vector Search
 
-- **Flat scan (inline functions)**: O(n) brute-force, viable up to ~100K vectors with binary indexing; binary index provides ~6x speedup over novelty-only scans and ~25x for filtered queries
-- **HNSW index**: O(log n) approximate nearest neighbor, recommended for 100K+ vectors or strict latency requirements
+- **Flat scan (inline functions)**: O(n) brute-force, exact and strongly consistent (novelty included). Queries matching the canonical top-k signature (`dotProduct` + threshold/order/limit over one vector predicate) run a parallel shard-scan fast path at ~6M vectors/sec (768-dim) — interactive to ~1M vectors; general-shape queries pay pipeline costs per row and stay interactive to ~100K
+- **HNSW index**: O(log n) approximate nearest neighbor, eventually consistent; recommended for multi-million-vector corpora, strict latency targets at any size, or query shapes the fast path doesn't serve
 - **Space**: ~1.5x embedding size
 - **Updates**: Incremental, O(1) per vector
 - See [Vector Search -- Performance and Scaling](vector-search.md#performance-and-scaling) for benchmark data and guidance on when to adopt HNSW
@@ -449,7 +449,7 @@ The `Bm25MaintenanceWorker` watches for source ledger commits and syncs indexes 
 ### 1. Choose Appropriate Index Type
 
 - **Structured queries**: Use core graph indexes
-- **Keyword search (< 500K docs)**: Use inline `@fulltext` for zero-config BM25 scoring
+- **Keyword search (< 500K docs)**: Use inline fulltext (`f:fullTextDefaults` config; or the `@fulltext` datatype for siloed data) for BM25 scoring
 - **Keyword search (1M+ docs)**: Use the BM25 graph source for WAND-optimized top-k retrieval
 - **Semantic similarity**: Use vector search
 - **Hybrid**: Combine multiple indexes
@@ -512,7 +512,7 @@ Limit results for performance:
 ## Related Documentation
 
 - [Background Indexing](background-indexing.md) - Core index details
-- [Inline Fulltext Search](fulltext.md) - `@fulltext` datatype and `fulltext()` scoring
+- [Inline Fulltext Search](fulltext.md) - `f:fullTextDefaults` config, `@fulltext` datatype, and `fulltext()` scoring
 - [BM25](bm25.md) - Dedicated full-text search graph source
 - [Vector Search](vector-search.md) - Similarity search
 - [Graph Sources](../graph-sources/README.md) - Graph source concepts

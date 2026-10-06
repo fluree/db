@@ -29,6 +29,10 @@ pub enum R2rmlError {
     #[error("Unknown TriplesMap: {0}")]
     UnknownTriplesMap(String),
 
+    /// Two or more rr:TriplesMap definitions resolve to the same subject IRI
+    #[error("Duplicate TriplesMap IRI: {0}")]
+    DuplicateTriplesMap(String),
+
     /// Column not found in table
     #[error("Column not found: {column} in table {table}")]
     ColumnNotFound { column: String, table: String },
@@ -40,6 +44,13 @@ pub enum R2rmlError {
     /// Unsupported feature
     #[error("Unsupported feature: {0}")]
     Unsupported(String),
+
+    /// A materialize (twin) build was refused because the source snapshots read
+    /// during the build cannot be trusted — a table moved off its pinned
+    /// `metadata_location` mid-build, or loadTable caching (hence snapshot pinning)
+    /// is disabled. (id=3717339918: replaces a stringly `Result<(), String>`.)
+    #[error("Build snapshot integrity: {0}")]
+    BuildSnapshotIntegrity(String),
 }
 
 /// Result type for R2RML operations

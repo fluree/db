@@ -1,15 +1,16 @@
 //! OAuth2 client credentials flow authentication.
 
+use crate::auth::token::CachedToken;
 use crate::auth::{CatalogAuth, SendCatalogAuth};
 use crate::error::{IcebergError, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
-use rand::Rng;
+use chrono::{Duration, Utc};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::Instrument;
 
 /// OAuth2 client credentials configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OAuth2Config {
     pub token_url: String,
     pub client_id: String,
@@ -18,31 +19,21 @@ pub struct OAuth2Config {
     pub audience: Option<String>,
 }
 
-/// Cached token with expiration.
-#[derive(Debug, Clone)]
-struct CachedToken {
-    access_token: String,
-    token_type: String,
-    expires_at: DateTime<Utc>,
-}
-
-impl CachedToken {
-    /// Check if token is expired or will expire within buffer period.
-    ///
-    /// Uses a 30-second base buffer plus 0-5s jitter to avoid thundering herds.
-    fn is_expired(&self) -> bool {
-        let jitter = rand::thread_rng().gen_range(0..5);
-        let buffer = Duration::seconds(30 + jitter);
-        Utc::now() + buffer >= self.expires_at
-    }
-
-    /// Get the authorization header value.
-    fn authorization_header(&self) -> String {
-        // Use token_type from response (don't hardcode "Bearer")
-        format!("{} {}", self.token_type, self.access_token)
+/// Redacting `Debug`: never leak `client_secret` via a `{:?}` in a log or error.
+impl std::fmt::Debug for OAuth2Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuth2Config")
+            .field("token_url", &self.token_url)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"***")
+            .field("scope", &self.scope)
+            .field("audience", &self.audience)
+            .finish()
     }
 }
 
+// `CachedToken` (with its redacting Debug + jittered expiry) is shared across the
+// refreshing auth providers — see `crate::auth::token` (imported above).
 /// OAuth2 client credentials authentication.
 ///
 /// Handles token acquisition and automatic refresh before expiration.
@@ -63,8 +54,12 @@ impl std::fmt::Debug for OAuth2ClientCredentials {
 
 impl OAuth2ClientCredentials {
     /// Create a new OAuth2 auth provider.
+    ///
+    /// The HTTP client is SSRF-hardened (see [`crate::net::hardened_client_builder`]):
+    /// it follows no redirects and resolves the token endpoint through the guard
+    /// resolver, so the token request cannot be bounced to an internal address.
     pub fn new(config: OAuth2Config) -> Result<Self> {
-        let http_client = reqwest::Client::builder()
+        let http_client = crate::net::hardened_client_builder()
             .connect_timeout(std::time::Duration::from_secs(30))
             .timeout(std::time::Duration::from_secs(60))
             .build()
@@ -78,12 +73,30 @@ impl OAuth2ClientCredentials {
     }
 
     /// Fetch a new access token from the token endpoint.
+    ///
+    /// Wrapped in an `iceberg.oauth_token` timing span so a cold token exchange is
+    /// visible as a discrete child of the `r2rml.load_table` span in a trace
+    /// (isolating OAuth cost from the rest of the catalog round-trip). No fields
+    /// are recorded on the span to avoid capturing the secret/token.
     async fn fetch_token(&self) -> Result<CachedToken> {
+        self.fetch_token_inner()
+            .instrument(tracing::debug_span!("iceberg.oauth_token"))
+            .await
+    }
+
+    async fn fetch_token_inner(&self) -> Result<CachedToken> {
         let mut form = vec![
             ("grant_type", "client_credentials".to_string()),
-            ("client_id", self.config.client_id.clone()),
             ("client_secret", self.config.client_secret.clone()),
         ];
+
+        // Only send `client_id` when non-empty. Some catalogs (notably Snowflake
+        // Horizon / Polaris for the `session:role:` token exchange) reject the
+        // request with `invalid_scope` if a non-empty `client_id` is present, and
+        // require it to be omitted entirely.
+        if !self.config.client_id.is_empty() {
+            form.push(("client_id", self.config.client_id.clone()));
+        }
 
         if let Some(scope) = &self.config.scope {
             form.push(("scope", scope.clone()));
@@ -247,5 +260,211 @@ mod tests {
             expires_at: Utc::now() + Duration::hours(1),
         };
         assert_eq!(custom_token.authorization_header(), "MAC my-access-token");
+    }
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Parse a `application/x-www-form-urlencoded` body into key/value pairs,
+    /// percent-decoding each component so value assertions are encoding-agnostic.
+    fn parse_form(body: &[u8]) -> Vec<(String, String)> {
+        let s = std::str::from_utf8(body).unwrap();
+        s.split('&')
+            .filter(|kv| !kv.is_empty())
+            .map(|kv| {
+                let mut it = kv.splitn(2, '=');
+                let k = decode(it.next().unwrap_or(""));
+                let v = decode(it.next().unwrap_or(""));
+                (k, v)
+            })
+            .collect()
+    }
+
+    /// Minimal `application/x-www-form-urlencoded` component decoder (`+` -> space,
+    /// `%XX` -> byte). Sufficient for the ASCII scope/audience values under test.
+    fn decode(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'+' => {
+                    out.push(b' ');
+                    i += 1;
+                }
+                b'%' if i + 2 < bytes.len() => {
+                    let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap();
+                    out.push(u8::from_str_radix(hex, 16).unwrap());
+                    i += 3;
+                }
+                b => {
+                    out.push(b);
+                    i += 1;
+                }
+            }
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    async fn mock_token_server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/oauth/tokens"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(
+                        r#"{"access_token":"abc123","token_type":"Bearer","expires_in":3600}"#,
+                    ),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn fetch_token_encodes_scope_and_omits_empty_client_id() {
+        let server = mock_token_server().await;
+        let config = OAuth2Config {
+            token_url: format!("{}/v1/oauth/tokens", server.uri()),
+            client_id: String::new(), // empty -> must be omitted
+            client_secret: "pat-secret".to_string(),
+            scope: Some("session:role:ICEBERG_READER".to_string()),
+            audience: None,
+        };
+        let auth = OAuth2ClientCredentials::new(config).unwrap();
+        let token = auth.fetch_token().await.unwrap();
+        assert_eq!(token.access_token, "abc123");
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        let form = parse_form(&reqs[0].body);
+
+        // (a) scope IS form-encoded in the token request
+        assert_eq!(
+            form.iter()
+                .find(|(k, _)| k == "scope")
+                .map(|(_, v)| v.as_str()),
+            Some("session:role:ICEBERG_READER")
+        );
+        // (b) client_id is OMITTED when empty
+        assert!(
+            !form.iter().any(|(k, _)| k == "client_id"),
+            "client_id must be omitted when empty, got: {form:?}"
+        );
+        // client_secret + grant_type always present
+        assert_eq!(
+            form.iter()
+                .find(|(k, _)| k == "client_secret")
+                .map(|(_, v)| v.as_str()),
+            Some("pat-secret")
+        );
+        // (c) audience absent when None
+        assert!(!form.iter().any(|(k, _)| k == "audience"));
+    }
+
+    #[tokio::test]
+    async fn fetch_token_includes_client_id_when_non_empty_and_audience() {
+        let server = mock_token_server().await;
+        let config = OAuth2Config {
+            token_url: format!("{}/v1/oauth/tokens", server.uri()),
+            client_id: "my-client".to_string(),
+            client_secret: "the-secret".to_string(),
+            scope: Some("PRINCIPAL_ROLE:ALL".to_string()),
+            audience: Some("polaris".to_string()),
+        };
+        let auth = OAuth2ClientCredentials::new(config).unwrap();
+        auth.fetch_token().await.unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        let form = parse_form(&reqs[0].body);
+
+        // (b) client_id is PRESENT when non-empty
+        assert_eq!(
+            form.iter()
+                .find(|(k, _)| k == "client_id")
+                .map(|(_, v)| v.as_str()),
+            Some("my-client")
+        );
+        // (c) audience sent when Some
+        assert_eq!(
+            form.iter()
+                .find(|(k, _)| k == "audience")
+                .map(|(_, v)| v.as_str()),
+            Some("polaris")
+        );
+        assert_eq!(
+            form.iter()
+                .find(|(k, _)| k == "scope")
+                .map(|(_, v)| v.as_str()),
+            Some("PRINCIPAL_ROLE:ALL")
+        );
+    }
+
+    /// The token exchange is wrapped in an `iceberg.oauth_token` DEBUG span
+    /// (`fetch_token` -> `.instrument(...)`). A host tracing subscriber filtering
+    /// on `fluree=debug` captures it, giving the trace waterfall a discrete bar for
+    /// the (cold) OAuth round-trip. This asserts the span is actually emitted for a
+    /// token fetch, exercising the exact `.instrument(debug_span!(...))` wiring also
+    /// used for the `r2rml.load_table` / `iceberg.scan_plan` / `iceberg.parquet_read`
+    /// spans (those need a live catalog + S3 to drive, so they cannot be unit-tested
+    /// here without a live backend).
+    #[tokio::test]
+    async fn fetch_token_emits_oauth_token_span() {
+        use std::sync::Mutex;
+
+        // Minimal span-name-capturing subscriber (avoids a `tracing-subscriber`
+        // dev-dependency): records every created span's name. `enabled` restricts
+        // interest to our span so unrelated internal spans are ignored.
+        struct SpanNameCapture(Arc<Mutex<Vec<String>>>);
+        impl tracing::Subscriber for SpanNameCapture {
+            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+                meta.name() == "iceberg.oauth_token"
+            }
+            fn new_span(&self, attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(attrs.metadata().name().to_string());
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let names = Arc::new(Mutex::new(Vec::<String>::new()));
+        // Install as the PROCESS-GLOBAL default (not a thread-local `set_default`).
+        // `set_global_default` rebuilds the callsite-interest cache against this
+        // subscriber, so the `iceberg.oauth_token` callsite is (re-)evaluated as
+        // enabled even if a sibling unit test in this same binary already hit it
+        // under the no-op default and cached it as "never" (a thread-local default
+        // does NOT rebuild interest and so is order-dependent / flaky here). This
+        // makes the assertion deterministic regardless of test order/parallelism;
+        // `enabled` only admits our span, so other tests are behavior-unaffected.
+        // Safe because this is the crate's only `set_global_default` caller.
+        tracing::subscriber::set_global_default(SpanNameCapture(Arc::clone(&names)))
+            .expect("no other global tracing subscriber should be installed in tests");
+
+        let server = mock_token_server().await;
+        let config = OAuth2Config {
+            token_url: format!("{}/v1/oauth/tokens", server.uri()),
+            client_id: String::new(),
+            client_secret: "pat-secret".to_string(),
+            scope: None,
+            audience: None,
+        };
+        let auth = OAuth2ClientCredentials::new(config).unwrap();
+        auth.fetch_token().await.unwrap();
+
+        let captured = names.lock().unwrap();
+        assert!(
+            captured.iter().any(|n| n == "iceberg.oauth_token"),
+            "expected an `iceberg.oauth_token` span to be created for a token fetch; \
+             captured spans: {captured:?}"
+        );
     }
 }

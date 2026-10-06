@@ -86,32 +86,36 @@ pub(super) struct LoweredModifiers {
 }
 
 impl<E: IriEncoder> LoweringContext<'_, E> {
+    /// The registered variables a user can see, in registration order.
+    ///
+    /// This is what `*` denotes — both in `SELECT *` and in
+    /// `COUNT(DISTINCT *)`, which counts distinct solution *mappings* and so
+    /// must range over the same variables. Three categories are hidden:
+    /// - `?__*` — planner / aggregate / property-path synthetics.
+    /// - `?#*`  — annotation-reifier synthetics
+    ///   (see `annotation::INTERNAL_VAR_PREFIX`).
+    /// - `_:*`  — SPARQL blank-node variables. Per SPARQL §4.1.4 these are
+    ///   non-distinguished and not in SELECT scope, so they don't appear in
+    ///   `SELECT *` results. Hiding them here also covers blank-node-labelled
+    ///   reifiers (`~ _:ann`, `_:ann rdf:reifies …`).
+    ///
+    /// The registry spans the whole query, so this can name variables from
+    /// sibling or nested scopes; consumers intersect it with the scope they
+    /// actually operate on.
+    pub(super) fn user_visible_vars(&self) -> Vec<VarId> {
+        self.vars
+            .iter()
+            .filter(|(name, _)| {
+                !name.starts_with("?__") && !name.starts_with("?#") && !name.starts_with("_:")
+            })
+            .map(|(_, id)| id)
+            .collect()
+    }
+
     /// Lower SELECT clause to a list of VarIds.
     pub(super) fn lower_select_clause(&mut self, clause: &SelectClause) -> Result<Vec<VarId>> {
         match &clause.variables {
-            SelectVariables::Star => {
-                // SELECT * — return user-visible registered variables.
-                //
-                // Hide three categories:
-                // - `?__*` — planner / aggregate / property-path synthetics.
-                // - `?#*`  — annotation-reifier synthetics
-                //   (see `annotation::INTERNAL_VAR_PREFIX`).
-                // - `_:*`  — SPARQL blank-node variables. Per SPARQL §4.1.4
-                //   these are non-distinguished and not in SELECT scope, so
-                //   they don't appear in `SELECT *` results. Hiding them
-                //   here also covers blank-node-labelled reifiers
-                //   (`~ _:ann`, `_:ann rdf:reifies …`).
-                Ok(self
-                    .vars
-                    .iter()
-                    .filter(|(name, _)| {
-                        !name.starts_with("?__")
-                            && !name.starts_with("?#")
-                            && !name.starts_with("_:")
-                    })
-                    .map(|(_, id)| id)
-                    .collect())
-            }
+            SelectVariables::Star => Ok(self.user_visible_vars()),
             SelectVariables::Explicit(vars) => {
                 let mut result = Vec::with_capacity(vars.len());
                 for var in vars {
@@ -602,6 +606,20 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         // Lower WHERE patterns (mut: SELECT-expression / GROUP BY / aggregate-
         // input BINDs are appended below, just as in the top-level pipeline).
         let mut patterns = self.lower_graph_pattern(&subselect.pattern)?;
+
+        // Trailing VALUES clause (`SubSelect ::= … SolutionModifier
+        // ValuesClause`): joined with the subquery's WHERE result by
+        // appending the VALUES table to the subquery's own pattern list —
+        // i.e. before this subquery's projection/modifiers. For a
+        // modifier-free subquery this is exactly the spec's
+        // `M := Join(M, ToMultiSet(data))` insertion point (§18.2.4.3, which
+        // applies VALUES before Project); with GROUP BY it approximates the
+        // spec by joining before grouping rather than after HAVING. Appended
+        // before the `SELECT *` var computation below so VALUES-introduced
+        // variables are in scope of `*`.
+        if let Some(values) = &subselect.values {
+            patterns.extend(self.lower_graph_pattern(values)?);
+        }
 
         // Build a SelectClause so the shared SELECT/modifier lowering applies.
         // REDUCED is treated as DISTINCT (handled when assembling the pattern).

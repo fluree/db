@@ -22,7 +22,7 @@ impl VarId {
 /// Registry mapping variable names to compact VarId indices
 ///
 /// Uses `Arc<str>` for cheap cloning and deduplication, aligning with `Sid.name`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct VarRegistry {
     name_to_id: HashMap<Arc<str>, VarId>,
     id_to_name: Vec<Arc<str>>,

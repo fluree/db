@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "query_id": "q015",
+  "result_hash": "3da954820cb2c16334ed44a5cc8c1f8f9cb726c53db1db6163587a9901d56d49",
+  "rows": 5000,
+  "head_rows": [
+    "ORD-000000000022\u001fCompleted\u001f8.09100000000e1\u001fReturned",
+    "ORD-000000000031\u001fCompleted\u001f6.99400000000e1\u001fPending",
+    "ORD-000000000144\u001fCompleted\u001f9.10500000000e1\u001fPending",
+    "ORD-000000000170\u001fCancelled\u001f8.60200000000e1\u001fDelivered",
+    "ORD-000000000199\u001fCancelled\u001f1.44100000000e1\u001fInTransit",
+    "ORD-000000000249\u001fCompleted\u001f1.16120000000e2\u001fInTransit",
+    "ORD-000000000304\u001fShipped\u001f1.77600000000e1\u001fDelivered",
+    "ORD-000000000446\u001fCompleted\u001f7.87400000000e1\u001fPending",
+    "ORD-000000000477\u001fCancelled\u001f1.13650000000e2\u001fInTransit",
+    "ORD-000000000535\u001fCompleted\u001f3.10300000000e1\u001fPending",
+    "ORD-000000000566\u001fReturned\u001f5.50000000000e0\u001fDelivered",
+    "ORD-000000000580\u001fReturned\u001f1.88300000000e1\u001fInTransit",
+    "ORD-000000000625\u001fCancelled\u001f6.72100000000e1\u001fReturned",
+    "ORD-000000000637\u001fReturned\u001f1.05120000000e2\u001fDelivered",
+    "ORD-000000000647\u001fCompleted\u001f5.63900000000e1\u001fReturned",
+    "ORD-000000000671\u001fCompleted\u001f5.16900000000e1\u001fPending",
+    "ORD-000000000701\u001fCompleted\u001f6.28500000000e1\u001fDelivered",
+    "ORD-000000000785\u001fCancelled\u001f1.17200000000e2\u001fInTransit",
+    "ORD-000000000815\u001fShipped\u001f2.15100000000e1\u001fReturned",
+    "ORD-000000000824\u001fReturned\u001f7.13200000000e1\u001fPending"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

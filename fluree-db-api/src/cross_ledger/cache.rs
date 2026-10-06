@@ -27,6 +27,11 @@
 //!   under TinyLFU eviction. There is no watermark-on-write channel.
 
 use super::types::{ResolutionKey, ResolvedGraph};
+// moka's eviction clock reads std::time::Instant at cache construction, which
+// aborts on wasm32-unknown-unknown; use core's clock-free LRU stand-in there.
+#[cfg(target_arch = "wasm32")]
+use fluree_db_core::wasm_cache::Cache;
+#[cfg(not(target_arch = "wasm32"))]
 use moka::sync::Cache;
 use std::sync::Arc;
 

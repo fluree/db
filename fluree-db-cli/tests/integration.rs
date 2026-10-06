@@ -262,6 +262,58 @@ fn query_and_insert_accept_ledger_flag() {
         .stdout(predicate::str::contains("Carol"));
 }
 
+/// #1466 end to end: `--format json` on a SPARQL query prints the abbreviated
+/// IRI the query's own PREFIX declares. The W3C result writers emit absolute
+/// IRIs (#45); the CLI is a display surface and deliberately does not, so this
+/// pins the deviation against the real rendered bytes rather than the config.
+#[test]
+fn query_sparql_json_output_keeps_compact_iris() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "curiedb");
+
+    let assertion = fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "curiedb",
+            "--sparql",
+            "--format",
+            "json",
+            "-e",
+            "PREFIX ex: <http://example.org/> SELECT ?s WHERE { ?s ex:name \"Alice\" }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ex:alice"));
+    let stdout = String::from_utf8(assertion.get_output().stdout.clone()).unwrap();
+    assert!(
+        !stdout.contains("http://example.org/alice"),
+        "CLI json output should stay compacted, got: {stdout}"
+    );
+}
+
+/// Same contract for the delimited display formats.
+#[test]
+fn query_csv_output_keeps_compact_iris() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "curiecsv");
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "curiecsv",
+            "--sparql",
+            "--format",
+            "csv",
+            "-e",
+            "PREFIX ex: <http://example.org/> SELECT ?s WHERE { ?s ex:name \"Alice\" }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ex:alice"));
+}
+
 #[test]
 fn query_ledger_flag_rejects_extra_positional() {
     let tmp = TempDir::new().unwrap();
@@ -453,6 +505,162 @@ fn query_ndjson_local_sparql_at_rejects_inline_from() {
         .stderr(predicate::str::contains(
             "SPARQL query already contains FROM/FROM NAMED",
         ));
+}
+
+#[test]
+fn query_connection_remote_routes_to_named_remote() {
+    // `--connection=<remote>` forces the connection-scoped path against a named
+    // remote. With `require_equals`, the `=value` form is parsed as the remote
+    // (not the following query string), and the request routes through the
+    // remote resolver — which errors for an unknown remote.
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--connection=definitely-no-such-remote",
+            "SELECT ?s WHERE { ?s ?p ?o }",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("definitely-no-such-remote"));
+}
+
+#[test]
+fn query_cypher_remote_rejects_non_cypher_json_format() {
+    // The remote Cypher endpoint renders cypher-json only; RDF JSON-LD /
+    // typed-json / delimited shapes are client-side on the local path. The CLI
+    // rejects them before any network call (the remote here is never reached).
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["remote", "add", "origin", "http://127.0.0.1:1"])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "mydb",
+            "--cypher",
+            "--remote",
+            "origin",
+            "--format",
+            "json",
+            "-e",
+            "MATCH (n) RETURN n",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cypher-json"))
+        .stderr(predicate::str::contains("--direct"));
+}
+
+#[test]
+fn query_cypher_remote_rejects_time_travel() {
+    // `--at` has no remote Cypher handling; rejected before any network call.
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["remote", "add", "origin", "http://127.0.0.1:1"])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "mydb",
+            "--cypher",
+            "--remote",
+            "origin",
+            "--at",
+            "1",
+            "-e",
+            "MATCH (n) RETURN n",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--at"))
+        .stderr(predicate::str::contains("--direct"));
+}
+
+#[test]
+fn update_cypher_remote_rejects_policy() {
+    // Cypher writes have no policy enforcement on either transport; the remote
+    // arm rejects `--policy*` before any network call (rather than silently
+    // dropping it). Proves the arm reaches policy validation instead of the old
+    // "HTTP Cypher endpoint not yet available" bail.
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["remote", "add", "origin", "http://127.0.0.1:1"])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "update",
+            "mydb",
+            "--format",
+            "cypher",
+            "--remote",
+            "origin",
+            "--policy-class",
+            "http://example.org/PolicyClass",
+            "-e",
+            "CREATE (n:Person {name: \"x\"})",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "policy enforcement is not yet supported for Cypher writes",
+        ));
+}
+
+#[test]
+fn query_bare_connection_keeps_positional_query() {
+    // A bare `--connection` (no `=value`) must not swallow the following query
+    // string: the SPARQL stays the positional input and is executed via the
+    // local connection path. With no `FROM` dataset it fails at execution, but
+    // crucially NOT with a clap parsing error about the argument.
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "mydb"]).assert().success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "mydb",
+            "--connection",
+            "SELECT ?s WHERE { ?s <http://example.org/p> ?o }",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument").not())
+        .stderr(predicate::str::contains("invalid value").not());
+}
+
+#[test]
+fn query_bare_connection_without_active_ledger_routes_to_connection_path() {
+    // #1398 review must-fix: a pure-federation query names its sources in FROM,
+    // so bare `--connection` with no active ledger (and no ledger argument) must
+    // route to the local connection path — NOT error with `NoActiveLedger`.
+    // The FROM target doesn't exist here, so the query still fails, but it fails
+    // at source resolution rather than for lack of an active ledger.
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    // Deliberately no `create` / `use`: there is no active ledger.
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--connection",
+            "SELECT ?id WHERE { ?o <http://example.org/id> ?id }",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no active ledger").not());
 }
 
 #[test]
@@ -1168,6 +1376,122 @@ fn upsert_turtle() {
         .stdout(predicate::str::contains("Committed t=1"));
 }
 
+#[test]
+fn sync_without_graph_targets_the_default_graph() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "syncdefault"])
+        .assert()
+        .success();
+    let v1 = "@prefix ex: <http://example.org/> .\nex:alice ex:name \"Alice\" .";
+    fluree_cmd(&tmp)
+        .args(["sync", "syncdefault", "-e", v1])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Synced the default graph in 'syncdefault:main': +1 asserted, -0 retracted",
+        ));
+
+    let v2 = "@prefix ex: <http://example.org/> .\nex:bob ex:name \"Bob\" .";
+    fluree_cmd(&tmp)
+        .args(["sync", "syncdefault", "-e", v2])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("+1 asserted, -1 retracted"));
+
+    fluree_cmd(&tmp)
+        .args(["sync", "syncdefault", "-e", v2])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "The default graph in 'syncdefault:main' already matches the payload",
+        ));
+}
+
+#[test]
+fn sync_graph_commits_only_the_delta() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "syncdb"])
+        .assert()
+        .success();
+    let graph = "urn:example:ontology";
+
+    let v1 = r#"{"@context": {"ex": "http://example.org/"}, "@graph": [
+        {"@id": "ex:alice", "ex:name": "Alice", "ex:role": "engineer"},
+        {"@id": "ex:bob", "ex:name": "Bob"}]}"#;
+    // First sync populates the graph: 3 asserts, nothing to retract.
+    fluree_cmd(&tmp)
+        .args(["sync", "syncdb", "--graph", graph, "-e", v1])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("+3 asserted, -0 retracted (t=1)"));
+
+    // Identical payload is a no-op: no commit, t unchanged.
+    fluree_cmd(&tmp)
+        .args(["sync", "syncdb", "--graph", graph, "-e", v1])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already matches the payload"));
+
+    // Dry run of a delta reports the counts without committing (still t=1).
+    let v2 = "@prefix ex: <http://example.org/> .\nex:alice ex:name \"Alice\" ; ex:role \"manager\" .\nex:carol ex:name \"Carol\" .";
+    fluree_cmd(&tmp)
+        .args([
+            "sync",
+            "syncdb",
+            "--graph",
+            graph,
+            "--dry-run",
+            "--json",
+            "-e",
+            v2,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"asserted\": 2"))
+        .stdout(predicate::str::contains("\"retracted\": 2"))
+        .stdout(predicate::str::contains("\"committed\": false"))
+        .stdout(predicate::str::contains("\"t\": 1"));
+
+    // Real run from Turtle (converted client-side): one commit for the delta.
+    fluree_cmd(&tmp)
+        .args(["sync", "syncdb", "--graph", graph, "-e", v2])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("+2 asserted, -2 retracted (t=2)"));
+
+    // Empty payload is refused without --allow-empty ...
+    fluree_cmd(&tmp)
+        .args([
+            "sync",
+            "syncdb",
+            "--graph",
+            graph,
+            "-e",
+            r#"{"@graph": []}"#,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--allow-empty"));
+    // ... and clears the graph with it.
+    fluree_cmd(&tmp)
+        .args([
+            "sync",
+            "syncdb",
+            "--graph",
+            graph,
+            "--allow-empty",
+            "-e",
+            r#"{"@graph": []}"#,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("+0 asserted, -3 retracted (t=3)"));
+}
+
 // ============================================================================
 // v1.1 — CSV output tests
 // ============================================================================
@@ -1258,8 +1582,16 @@ fn query_at_time_travel() {
 // v1.1 — Export tests
 // ============================================================================
 
+/// Every export test in this block used to assert a *failure* — the reason the
+/// defects in #1574, #1847 and #1859 all shipped unnoticed. Assertions here
+/// exercise the happy path and, where the point is round-tripping, re-ingest
+/// what was written.
+///
+/// Reading an export back is the only assertion that distinguishes "wrote
+/// something" from "wrote the data": `--all-graphs` produced output for years
+/// while silently dropping a dead system-graph filter, and no test looked.
 #[test]
-fn export_jsonld_requires_index() {
+fn export_jsonld_on_never_indexed_ledger() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
     fluree_cmd(&tmp)
@@ -1276,16 +1608,19 @@ fn export_jsonld_requires_index() {
         .assert()
         .success();
 
-    // JSON-LD now uses the streaming binary index path (same as other formats)
+    // A ledger that has been committed to but never indexed holds all of its
+    // rows in the novelty overlay. Export reads through that overlay, so it
+    // needs no index build (#1574).
     fluree_cmd(&tmp)
         .args(["export", "--format", "jsonld"])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("no binary index available"));
+        .success()
+        .stdout(predicate::str::contains("http://example.org/thing"))
+        .stdout(predicate::str::contains("gadget"));
 }
 
 #[test]
-fn export_ntriples_requires_index() {
+fn export_ntriples_on_never_indexed_ledger() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
     fluree_cmd(&tmp)
@@ -1302,13 +1637,335 @@ fn export_ntriples_requires_index() {
         .assert()
         .success();
 
-    // N-Triples streaming export requires a binary index; un-indexed ledgers
-    // get a clear error.
     fluree_cmd(&tmp)
         .args(["export", "--format", "ntriples"])
         .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "<http://example.org/item> <http://example.org/name> \"widget\" .",
+        ));
+}
+
+/// The claim #1574's fix rests on: reading through the novelty overlay is not
+/// an approximation of reading the index, it produces the same triples.
+///
+/// Asserted on the N-Triples line multiset rather than on bytes. Export emits
+/// overlay rows it cannot encode into the binary index's value space — a
+/// language-tagged literal whose tag is not in the persisted dictionary, a
+/// decimal — through a raw-flake tail after the main scan, so subject grouping
+/// and line order differ across an index build. That tail predates this change
+/// and fires on indexed ledgers too (any commit after the last index build);
+/// what must not differ is the data.
+#[test]
+fn export_never_indexed_matches_indexed() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "parity"])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "parity",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:alice a ex:Person ; ex:name \"Alice\" ; ex:age 30 ; ex:knows ex:bob .\n\
+             ex:bob a ex:Person ; ex:label \"Bob\"@en ; ex:score 1.5 .",
+        ])
+        .assert()
+        .success();
+
+    let before = fluree_cmd(&tmp)
+        .args(["export", "parity", "--format", "ntriples"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    fluree_cmd(&tmp)
+        .args(["index", "parity"])
+        .assert()
+        .success();
+
+    let after = fluree_cmd(&tmp)
+        .args(["export", "parity", "--format", "ntriples"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let mut before: Vec<&str> = std::str::from_utf8(&before).unwrap().lines().collect();
+    let mut after: Vec<&str> = std::str::from_utf8(&after).unwrap().lines().collect();
+    before.sort_unstable();
+    after.sort_unstable();
+    assert_eq!(
+        before, after,
+        "never-indexed export must carry the same triples as the same ledger after `fluree index`"
+    );
+    assert_eq!(
+        before.len(),
+        7,
+        "fixture should produce exactly 7 triples; a count change means the \
+         comparison above is no longer covering what it was written for: {before:?}"
+    );
+}
+
+/// The shape half of the same claim: an index build must not change which
+/// subjects open a block.
+///
+/// Triple-set equality (above) cannot see this — the pre-fix output carried
+/// every triple and still split subjects. Intra-block *predicate order* does
+/// still differ, because untranslated rows append to the block rather than
+/// sorting into `p_id` position, and that is not asserted here: it carries no
+/// meaning in Turtle. Grouping does.
+#[test]
+fn export_subject_grouping_is_the_same_indexed_or_not() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "shape"])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "shape",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:alice a ex:Person ; ex:name \"Alice\" ; ex:age 30 ; ex:knows ex:bob .\n\
+             ex:bob a ex:Person ; ex:label \"Bob\"@en ; ex:score 1.5 .",
+        ])
+        .assert()
+        .success();
+
+    let openers = |tmp: &TempDir| -> Vec<String> {
+        let out = fluree_cmd(tmp)
+            .args(["export", "shape", "--format", "turtle"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let text = String::from_utf8(out).unwrap();
+        let mut v: Vec<String> = text
+            .lines()
+            .filter(|l| l.starts_with('<'))
+            .map(|l| l.trim_end().to_string())
+            .collect();
+        v.sort();
+        v
+    };
+
+    let before = openers(&tmp);
+    fluree_cmd(&tmp).args(["index", "shape"]).assert().success();
+    let after = openers(&tmp);
+
+    assert_eq!(
+        before, after,
+        "an index build must not change which subjects open a block"
+    );
+    assert_eq!(before.len(), 2, "expected two subjects, got {before:?}");
+}
+
+/// A never-indexed export must group each subject into one block, the same as
+/// an indexed one.
+///
+/// Rows that miss V3 translation bypass the cursor's sorted merge, and a
+/// never-indexed ledger is the case that maximizes them — there is no
+/// persisted dictionary to encode a string, a language tag or a decimal
+/// against. Emitting them after the stream reopened a subject block that had
+/// already closed, so `ex:bob` appeared twice with `"Bob"@en` stranded at the
+/// end of the file. #1574 is what made that the normal case rather than the
+/// edge one, so the fix and this test belong with it.
+///
+/// **Assert the grouping, not the exit code.** The split output is valid
+/// Turtle, carries every triple, and re-imports correctly — so a test that
+/// checks the command succeeded, or that compares triple *sets*, passes
+/// against the bug. Only the block structure distinguishes them.
+#[test]
+fn export_never_indexed_groups_each_subject_once() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "grouped"])
+        .assert()
+        .success();
+    // A language-tagged literal and a decimal are both untranslatable without
+    // a persisted dictionary, so `ex:bob` has rows on both sides of the split.
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "grouped",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:alice a ex:Person ; ex:name \"Alice\" ; ex:age 30 ; ex:knows ex:bob .\n\
+             ex:bob a ex:Person ; ex:name \"Bob\"@en ; ex:score 1.5 .",
+        ])
+        .assert()
+        .success();
+
+    let turtle = String::from_utf8(
+        fluree_cmd(&tmp)
+            .args(["export", "grouped", "--format", "turtle"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+
+    // A block opener starts at column 0; continuations are indented.
+    let mut openers: Vec<&str> = turtle
+        .lines()
+        .filter(|l| l.starts_with('<'))
+        .map(str::trim_end)
+        .collect();
+    openers.sort_unstable();
+    assert_eq!(
+        openers,
+        vec!["<http://example.org/alice>", "<http://example.org/bob>"],
+        "each subject must open exactly one block; got:\n{turtle}"
+    );
+
+    // JSON-LD has the same failure mode as a repeated `@id` node object.
+    let jsonld = String::from_utf8(
+        fluree_cmd(&tmp)
+            .args(["export", "grouped", "--format", "jsonld"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        jsonld
+            .matches("\"@id\": \"http://example.org/bob\"")
+            .count(),
+        1,
+        "ex:bob must be one node object, not two:\n{jsonld}"
+    );
+}
+
+/// A subject reachable *only* through untranslated rows must still get a
+/// well-formed block of its own.
+///
+/// This is the other half of the grouping fix and a different code path:
+/// `ex:carol`'s single property is a language-tagged literal, so with no
+/// persisted dictionary nothing of hers translates, she never enters the
+/// cursor's stream at all, and she can only be emitted by the pass that
+/// drains what the base stream never reached. The sibling test covers
+/// subjects that appear on *both* sides; this one covers a subject that
+/// appears on neither until that pass runs. Getting it wrong drops her
+/// entirely or emits her as a bare one-line statement.
+#[test]
+fn export_never_indexed_blocks_a_subject_only_in_untranslated_rows() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "only"]).assert().success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "only",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:alice a ex:Person .\n\
+             ex:carol ex:label \"Carol\"@fr .",
+        ])
+        .assert()
+        .success();
+
+    let turtle = String::from_utf8(
+        fluree_cmd(&tmp)
+            .args(["export", "only", "--format", "turtle"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+
+    // Block form — subject alone on its line, predicate indented beneath —
+    // rather than the one-line statement the stranded tail used to emit.
+    assert!(
+        turtle
+            .contains("<http://example.org/carol>\n    <http://example.org/label> \"Carol\"@fr .",),
+        "carol must get her own block, not a bare statement:\n{turtle}"
+    );
+
+    let jsonld = String::from_utf8(
+        fluree_cmd(&tmp)
+            .args(["export", "only", "--format", "jsonld"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        jsonld.contains("\"@id\": \"http://example.org/carol\""),
+        "carol must reach the JSON-LD output at all:\n{jsonld}"
+    );
+}
+
+/// The command from #1574's report. `--format` defaults to `turtle`, so this
+/// wrote Turtle into a file named `.flpack` and said nothing.
+#[test]
+fn export_flpack_extension_infers_ledger_format() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "arch"]).assert().success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "arch",
+            "-e",
+            "<http://example.org/a> <http://example.org/p> \"v\" .\n",
+        ])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args(["export", "arch", "-o", "arch.flpack"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Archived"));
+
+    // The archive magic, not `@prefix`/`<http` — this is what failed before.
+    let bytes = std::fs::read(tmp.path().join("arch.flpack")).unwrap();
+    assert_eq!(
+        &bytes[..4],
+        b"FPK1",
+        "expected a fluree-pack-v1 archive, got: {:?}",
+        String::from_utf8_lossy(&bytes[..bytes.len().min(40)])
+    );
+}
+
+/// The inference only fills an absent `--format`; an explicit one that
+/// contradicts the extension is a refusal, not a guess.
+#[test]
+fn export_flpack_extension_conflicting_format_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "arch2"])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args(["export", "arch2", "--format", "turtle", "-o", "x.flpack"])
+        .assert()
         .failure()
-        .stderr(predicate::str::contains("no binary index available"));
+        .stderr(predicate::str::contains(".flpack extension"))
+        .stderr(predicate::str::contains("--format ledger"));
+    assert!(!tmp.path().join("x.flpack").exists());
 }
 
 #[test]
@@ -1336,7 +1993,7 @@ fn export_all_graphs_requires_dataset_format() {
 }
 
 #[test]
-fn export_all_graphs_nquads_requires_index() {
+fn export_all_graphs_nquads_on_never_indexed_ledger() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
     fluree_cmd(&tmp)
@@ -1355,13 +2012,1016 @@ fn export_all_graphs_nquads_requires_index() {
         .assert()
         .success();
 
-    // N-Quads streaming export requires a binary index; un-indexed ledgers
-    // get a clear error.
     fluree_cmd(&tmp)
         .args(["export", "expdb4", "--all-graphs", "--format", "nquads"])
         .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "<http://example.org/a> <http://example.org/p> \"default\" .",
+        ));
+}
+
+/// A ledger with one triple in the default graph and one in a named graph,
+/// built through the bulk-import path.
+fn seed_two_graphs(tmp: &TempDir, ledger: &str) {
+    let src = tmp.path().join(format!("{ledger}-src"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("a.trig"),
+        "<http://example.org/default1> <http://example.org/p> \"in-default\" .\n\
+         GRAPH <http://example.org/g1> { \
+             <http://example.org/s> <http://example.org/p> \"in-g1\" . }\n",
+    )
+    .unwrap();
+    fluree_cmd(tmp)
+        .args(["create", ledger, "--from"])
+        .arg(&src)
+        .assert()
+        .success();
+}
+
+/// `--all-graphs` emits user graphs and *not* the ledger's own `#txn-meta` /
+/// `#config`.
+///
+/// `is_system_graph` was written for this filter and never called, so this
+/// output carried a foreign ledger's commit history from the v4 baseline
+/// onward — and `docs/cli/export.md` was written to describe that as intended.
+#[test]
+fn export_all_graphs_excludes_system_graphs() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    seed_two_graphs(&tmp, "sysg");
+
+    fluree_cmd(&tmp)
+        .args(["export", "sysg", "--format", "trig", "--all-graphs"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("GRAPH <http://example.org/g1>"))
+        .stdout(predicate::str::contains("in-g1"))
+        .stdout(predicate::str::contains("#txn-meta").not())
+        .stdout(predicate::str::contains("#config").not());
+}
+
+/// The escape hatch, for the diagnostic case only.
+#[test]
+fn export_system_graphs_flag_emits_them() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    seed_two_graphs(&tmp, "sysg2");
+
+    fluree_cmd(&tmp)
+        .args([
+            "export",
+            "sysg2",
+            "--format",
+            "trig",
+            "--all-graphs",
+            "--system-graphs",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("#txn-meta"));
+
+    // It is a modifier on --all-graphs, not a selector.
+    fluree_cmd(&tmp)
+        .args(["export", "sysg2", "--format", "trig", "--system-graphs"])
+        .assert()
         .failure()
-        .stderr(predicate::str::contains("no binary index available"));
+        .stderr(predicate::str::contains("--all-graphs"));
+}
+
+/// #1847's actual complaint: "nothing in the output to suggest anything is
+/// missing". A dataset format is chosen precisely to carry graphs, so
+/// producing triples-only without saying so is the trap.
+#[test]
+fn export_reports_stats_and_warns_on_dropped_graphs() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    seed_two_graphs(&tmp, "statsg");
+
+    // Dataset format, no selector: name the flag that would fix it.
+    fluree_cmd(&tmp)
+        .args(["export", "statsg", "--format", "trig"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("1 named graph not exported"))
+        .stderr(predicate::str::contains("pass --all-graphs to include it"));
+
+    // Turtle cannot represent a named graph at all, so --all-graphs is the
+    // wrong advice there; the format is.
+    fluree_cmd(&tmp)
+        .args(["export", "statsg", "--format", "turtle"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("turtle cannot carry named graphs"));
+
+    // With every graph selected there is nothing to warn about, and the
+    // stats line accounts for both graphs.
+    fluree_cmd(&tmp)
+        .args(["export", "statsg", "--format", "trig", "--all-graphs"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("(2 triples, 2 graphs)"))
+        .stderr(predicate::str::contains("not exported").not());
+}
+
+/// Export → re-ingest → compare, into a ledger of the *same name*.
+///
+/// This is the round trip #1847 was filed about, and the same-name target is
+/// the part that matters: an `--all-graphs` export carrying `#txn-meta` lands
+/// those triples on the target's own reserved graph ids, where they are
+/// unreachable (#1846). Filtering system graphs on export removes the common
+/// way to produce such a file.
+#[test]
+fn export_all_graphs_round_trips_into_a_same_named_ledger() {
+    let src_home = TempDir::new().unwrap();
+    fluree_cmd(&src_home).arg("init").assert().success();
+    seed_two_graphs(&src_home, "rt");
+
+    let out = src_home.path().join("rt.trig");
+    fluree_cmd(&src_home)
+        .args(["export", "rt", "--format", "trig", "--all-graphs", "-o"])
+        .arg(&out)
+        .assert()
+        .success();
+
+    // A second store, so the target can carry the same ledger name.
+    let dst_home = TempDir::new().unwrap();
+    fluree_cmd(&dst_home).arg("init").assert().success();
+    fluree_cmd(&dst_home)
+        .args(["create", "rt", "--from"])
+        .arg(&out)
+        .assert()
+        .success();
+
+    fluree_cmd(&dst_home)
+        .args([
+            "query",
+            "rt",
+            "--sparql",
+            "SELECT ?o WHERE { GRAPH <http://example.org/g1> { ?s ?p ?o } }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("in-g1"));
+
+    fluree_cmd(&dst_home)
+        .args([
+            "query",
+            "rt",
+            "--sparql",
+            "SELECT ?o WHERE { <http://example.org/default1> <http://example.org/p> ?o }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("in-default"));
+
+    // The same file into a *differently* named ledger. This is the direction
+    // that can observe a leaked system graph: `urn:fluree:rt:main#txn-meta`
+    // does not collide with `other`'s reserved ids, so it would land as an
+    // ordinary user graph holding a foreign ledger's commit history. (Into
+    // the same-named ledger above it collides instead and vanishes — which
+    // is #1846, and is why that target cannot be the assertion.)
+    fluree_cmd(&dst_home)
+        .args(["create", "other", "--from"])
+        .arg(&out)
+        .assert()
+        .success();
+
+    fluree_cmd(&dst_home)
+        .args([
+            "query",
+            "other",
+            "--sparql",
+            "SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("g1"))
+        .stdout(predicate::str::contains("txn-meta").not())
+        .stdout(predicate::str::contains("urn:fluree").not());
+}
+
+/// `fluree export --format trig` produces dataset files routinely, and
+/// feeding one back to an existing ledger is the obvious next thing to try.
+/// `insert` and `upsert` read TriG, by extension or by `--format` (#1849).
+#[test]
+fn insert_and_upsert_read_an_exported_trig_file() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    seed_two_graphs(&tmp, "src");
+    let out = tmp.path().join("src.trig");
+    fluree_cmd(&tmp)
+        .args(["export", "src", "--format", "trig", "--all-graphs", "-o"])
+        .arg(&out)
+        .assert()
+        .success();
+
+    for (cmd, ledger, extra) in [
+        ("insert", "by-ext", &[][..]),
+        ("upsert", "by-flag", &["--format", "trig"][..]),
+    ] {
+        fluree_cmd(&tmp).args(["create", ledger]).assert().success();
+        fluree_cmd(&tmp)
+            .args([cmd, ledger])
+            .args(extra)
+            .arg("-f")
+            .arg(&out)
+            .assert()
+            .success();
+        fluree_cmd(&tmp)
+            .args([
+                "query",
+                ledger,
+                "--sparql",
+                "SELECT ?o WHERE { GRAPH <http://example.org/g1> { ?s ?p ?o } }",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("in-g1"));
+        fluree_cmd(&tmp)
+            .args([
+                "query",
+                ledger,
+                "--sparql",
+                "SELECT ?o WHERE { <http://example.org/default1> <http://example.org/p> ?o }",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("in-default"));
+    }
+}
+
+/// N-Quads is the dataset format no data command reads. It used to fail
+/// inside the Turtle parser on its fourth term, which names neither the cause
+/// nor the command that does work.
+#[test]
+fn insert_of_an_nquads_file_names_create_from() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "ds"]).assert().success();
+    let src = tmp.path().join("data.nq");
+    std::fs::write(
+        &src,
+        "<http://example.org/s> <http://example.org/p> \"v\" <http://example.org/g1> .\n",
+    )
+    .unwrap();
+
+    // By extension.
+    fluree_cmd(&tmp)
+        .args(["insert", "ds", "-f"])
+        .arg(&src)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("N-Quads"))
+        .stderr(predicate::str::contains("fluree create <ledger> --from"));
+
+    // And by an explicit --format, which took a different path to the same
+    // dead end.
+    fluree_cmd(&tmp)
+        .args(["insert", "ds", "--format", "nquads", "-f"])
+        .arg(&src)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("fluree create <ledger> --from"));
+}
+
+/// `sync` sends TriG as TriG, so a document whose blocks name the target
+/// graph syncs it, from a `.trig` file or piped in. A block for another graph
+/// is refused by the API, and nothing is committed.
+#[test]
+fn sync_of_a_trig_document_replaces_its_named_graph() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "ds"]).assert().success();
+    let graph = "http://example.org/g1";
+    let src = tmp.path().join("data.trig");
+    std::fs::write(
+        &src,
+        format!("GRAPH <{graph}> {{ <http://example.org/s> <http://example.org/p> \"v1\" , \"v2\" . }}\n"),
+    )
+    .unwrap();
+    fluree_cmd(&tmp)
+        .args(["sync", "ds", "--graph", graph, "-f"])
+        .arg(&src)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("+2 asserted, -0 retracted (t=1)"));
+
+    // Piped, with no name to go by: detected as TriG, and only the delta commits.
+    fluree_cmd(&tmp)
+        .args(["sync", "ds", "--graph", graph])
+        .write_stdin(format!(
+            "<{graph}> {{ <http://example.org/s> <http://example.org/p> \"v1\" , \"v3\" . }}\n"
+        ))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("+1 asserted, -1 retracted (t=2)"));
+
+    fluree_cmd(&tmp)
+        .args(["sync", "ds", "--graph", graph])
+        .write_stdin(
+            "GRAPH <http://example.org/g2> { <http://example.org/s> <http://example.org/p> \"v\" . }\n",
+        )
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("also has a GRAPH block for <http://example.org/g2>"));
+}
+
+/// `validate` and `--shacl` read one graph, so they refuse a TriG body even
+/// when it arrives in a `.ttl` file.
+#[test]
+fn a_trig_body_under_another_name_is_refused_by_one_graph_commands() {
+    let tmp = TempDir::new().unwrap();
+    let trig = "GRAPH <http://example.org/g1> { \
+                <http://example.org/s> <http://example.org/p> \"v\" . }\n";
+    std::fs::write(tmp.path().join("trig.ttl"), trig).unwrap();
+    std::fs::write(tmp.path().join("shapes.ttl"), VALIDATE_SHAPES_TTL).unwrap();
+    fluree_cmd(&tmp)
+        .args(["validate", "trig.ttl", "--shacl", "shapes.ttl"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("validate reads one graph"));
+
+    // A brace inside a literal is not a graph block.
+    std::fs::write(
+        tmp.path().join("data.ttl"),
+        "<http://example.org/s> <http://example.org/p> \"{v}\" .\n",
+    )
+    .unwrap();
+    fluree_cmd(&tmp)
+        .args(["validate", "data.ttl", "--shacl", "trig.ttl"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--shacl reads one graph"));
+    fluree_cmd(&tmp)
+        .args(["validate", "data.ttl", "--shacl", "shapes.ttl"])
+        .assert()
+        .success();
+}
+
+// ============================================================================
+// #1859 — RDF 1.2 annotation syntax
+// ============================================================================
+
+/// One edge, two reifiers, each with properties. Built by `insert` + `index`,
+/// which leaves the annotation arena **unsealed** — so this fixture exercises
+/// the base-index scan fallback, the path a plain `fluree index` produces.
+fn seed_annotated_indexed(tmp: &TempDir, ledger: &str) {
+    fluree_cmd(tmp).args(["create", ledger]).assert().success();
+    fluree_cmd(tmp)
+        .args([
+            "insert",
+            ledger,
+            "--format",
+            "turtle",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:alice ex:knows ex:bob\n\
+                 ~ ex:claim1 {| ex:confidence 0.8 ; ex:source ex:sourceA |}\n\
+                 ~ ex:claim2 {| ex:confidence 0.9 ; ex:source ex:sourceB |} .",
+        ])
+        .assert()
+        .success();
+    fluree_cmd(tmp).args(["index", ledger]).assert().success();
+}
+
+/// The same data through `create --from`, which runs an auto-seal reindex —
+/// so this fixture exercises the **sealed annotation arena** instead.
+fn seed_annotated_sealed(tmp: &TempDir, ledger: &str) {
+    let src = tmp.path().join(format!("{ledger}-src"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("a.ttl"),
+        "@prefix ex: <http://example.org/> .\n\
+         ex:alice ex:knows ex:bob\n\
+             ~ ex:claim1 {| ex:confidence 0.8 ; ex:source ex:sourceA |}\n\
+             ~ ex:claim2 {| ex:confidence 0.9 ; ex:source ex:sourceB |} .\n",
+    )
+    .unwrap();
+    fluree_cmd(tmp)
+        .args(["create", ledger, "--from"])
+        .arg(&src)
+        .assert()
+        .success();
+}
+
+/// Fluree exported a form Fluree refuses to ingest: `f:reifies*` is
+/// system-controlled on every write surface, and export emitted it as ordinary
+/// triples on all five RDF formats.
+#[test]
+fn export_turtle_emits_annotation_syntax() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    seed_annotated_sealed(&tmp, "ann");
+
+    fluree_cmd(&tmp)
+        .args(["export", "ann", "--format", "turtle"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("~ ex:claim1"))
+        .stdout(predicate::str::contains("~ ex:claim2"))
+        // All seven `f:reifies*` predicates are suppressed, not the three the
+        // issue happened to show.
+        .stdout(predicate::str::contains("ns.flur.ee/db#reifies").not())
+        // The reifiers' own properties stay in the stream as ordinary
+        // subjects. That is what keeps the fix to one pass.
+        .stdout(predicate::str::contains("ex:confidence"));
+}
+
+/// Same assertions against the arena-less ledger a plain `fluree index`
+/// leaves behind. Without this the suite would only ever see a sealed arena,
+/// and the fallback would be untested on the commoner workflow.
+#[test]
+fn export_turtle_emits_annotation_syntax_without_a_sealed_arena() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    seed_annotated_indexed(&tmp, "annu");
+
+    fluree_cmd(&tmp)
+        .args(["export", "annu", "--format", "turtle"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("~ <http://example.org/claim1>"))
+        .stdout(predicate::str::contains("ns.flur.ee/db#reifies").not());
+}
+
+/// And against a ledger with no index at all, where the attachment overlay is
+/// the whole history.
+#[test]
+fn export_turtle_emits_annotation_syntax_on_a_never_indexed_ledger() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "annn"]).assert().success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "annn",
+            "--format",
+            "turtle",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.8 |} .",
+        ])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args(["export", "annn", "--format", "turtle"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("~ <http://example.org/claim1>"))
+        .stdout(predicate::str::contains("ns.flur.ee/db#reifies").not());
+}
+
+#[test]
+fn export_ntriples_emits_reifies_triple_terms() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    seed_annotated_sealed(&tmp, "ann2");
+
+    fluree_cmd(&tmp)
+        .args(["export", "ann2", "--format", "ntriples"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "<http://example.org/claim1> \
+             <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> \
+             <<( <http://example.org/alice> <http://example.org/knows> \
+             <http://example.org/bob> )>> .",
+        ))
+        .stdout(predicate::str::contains("ns.flur.ee/db#reifies").not());
+}
+
+#[test]
+fn export_jsonld_emits_annotation_blocks() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    seed_annotated_sealed(&tmp, "ann3");
+
+    fluree_cmd(&tmp)
+        .args(["export", "ann3", "--format", "jsonld"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("@annotation"))
+        .stdout(predicate::str::contains("claim1"))
+        .stdout(predicate::str::contains("ns.flur.ee/db#reifies").not());
+}
+
+/// The escape hatch: pre-4.2 bytes, for anyone consuming them.
+#[test]
+fn export_raw_reifies_keeps_the_system_facts() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    seed_annotated_sealed(&tmp, "ann4");
+
+    fluree_cmd(&tmp)
+        .args(["export", "ann4", "--format", "turtle", "--raw-reifies"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reifiesSubject"))
+        .stdout(predicate::str::contains(" ~ ").not());
+}
+
+/// Export → re-ingest → query, per format.
+///
+/// The load-bearing assertion is the *absence* of `f:reifies*` in the bytes
+/// (asserted above) plus this. A test that only checked "the annotation is
+/// queryable after re-import" would pass against the bug: the raw `f:reifies*`
+/// form genuinely round-trips through the bulk-import path, which is exactly
+/// why the defect survived. Do not simplify this pair back into one.
+#[test]
+fn export_annotations_round_trip_in_every_format() {
+    let src = TempDir::new().unwrap();
+    fluree_cmd(&src).arg("init").assert().success();
+    seed_annotated_sealed(&src, "rtann");
+
+    for (fmt, ext) in [("turtle", "ttl"), ("ntriples", "nt"), ("jsonld", "jsonld")] {
+        let out = src.path().join(format!("rtann.{ext}"));
+        fluree_cmd(&src)
+            .args(["export", "rtann", "--format", fmt, "-o"])
+            .arg(&out)
+            .assert()
+            .success();
+
+        let dst = TempDir::new().unwrap();
+        fluree_cmd(&dst).arg("init").assert().success();
+        fluree_cmd(&dst)
+            .args(["create", "rtann", "--from"])
+            .arg(&out)
+            .assert()
+            .success();
+
+        // Both reifiers still reify that edge, read back through the RDF 1.2
+        // query surface rather than by naming `f:reifies*`.
+        fluree_cmd(&dst)
+            .args([
+                "query",
+                "rtann",
+                "--sparql",
+                "SELECT ?r ?c WHERE { \
+                   <http://example.org/alice> <http://example.org/knows> \
+                   <http://example.org/bob> ~ ?r . \
+                   ?r <http://example.org/confidence> ?c }",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("claim1"))
+            .stdout(predicate::str::contains("claim2"));
+    }
+}
+
+/// The bundle is up to seven predicates, not the three the issue showed: a
+/// plain literal adds `reifiesDatatype`, a language-tagged one adds
+/// `reifiesLang`. Each object shape has to reach the output.
+#[test]
+fn export_annotation_object_shapes() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let src = tmp.path().join("shapes-src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("a.ttl"),
+        "@prefix ex: <http://example.org/> .\n\
+         ex:alice ex:knows ex:bob ~ ex:cRef {| ex:src ex:a |} .\n\
+         ex:alice ex:name \"Alice\" ~ ex:cLit {| ex:src ex:b |} .\n\
+         ex:alice ex:label \"Alice\"@en ~ ex:cLang {| ex:src ex:c |} .\n",
+    )
+    .unwrap();
+    fluree_cmd(&tmp)
+        .args(["create", "shapes", "--from"])
+        .arg(&src)
+        .assert()
+        .success();
+
+    let text = String::from_utf8(
+        fluree_cmd(&tmp)
+            .args(["export", "shapes", "--format", "turtle"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    for reifier in ["cRef", "cLit", "cLang"] {
+        assert!(
+            text.contains(&format!("~ ex:{reifier}")),
+            "missing annotation marker for {reifier} in:\n{text}"
+        );
+    }
+    assert!(
+        !text.contains("ns.flur.ee/db#reifies"),
+        "reifies bundle leaked:\n{text}"
+    );
+}
+
+/// A ledger with no annotations must not pay for, or be changed by, any of
+/// this — the fast path has to be proven taken, not assumed.
+#[test]
+fn export_without_annotations_is_unchanged() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "plain"])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "plain",
+            "-e",
+            "<http://example.org/a> <http://example.org/p> \"v\" .\n",
+        ])
+        .assert()
+        .success();
+    fluree_cmd(&tmp).args(["index", "plain"]).assert().success();
+
+    fluree_cmd(&tmp)
+        .args(["export", "plain", "--format", "turtle"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "<http://example.org/a>\n    <http://example.org/p> \"v\" .",
+        ))
+        .stdout(predicate::str::contains("~").not());
+}
+
+/// An annotation written inside a named graph is not represented in the
+/// output today: the forward lookup export uses is blind to named graphs,
+/// though the rows are in the ledger and SPARQL reads them. Export must say
+/// so — suppressing the `f:reifies*` rows and then emitting no marker is
+/// exactly the silent truncation this work exists to remove.
+#[test]
+fn export_reports_annotations_it_could_not_resolve() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let src = tmp.path().join("gann-src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("a.trig"),
+        "@prefix ex: <http://example.org/> .\n\
+         GRAPH <http://example.org/g1> { \
+             ex:x ex:p ex:y ~ ex:cG {| ex:src ex:d |} . }\n",
+    )
+    .unwrap();
+    fluree_cmd(&tmp)
+        .args(["create", "gann", "--from"])
+        .arg(&src)
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args(["export", "gann", "--format", "trig", "--all-graphs"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "1 edge annotations could not be resolved",
+        ))
+        .stderr(predicate::str::contains("--raw-reifies"));
+
+    // And the named remedy works: the bundle comes out verbatim.
+    fluree_cmd(&tmp)
+        .args([
+            "export",
+            "gann",
+            "--format",
+            "trig",
+            "--all-graphs",
+            "--raw-reifies",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reifiesSubject"));
+}
+
+/// Two exports of the same ledger must produce the same bytes.
+///
+/// They did not. Untranslated rows reach the writers through
+/// `surviving_untranslated`, which collapsed fact identities in a `HashMap`
+/// and returned `into_values()` — the randomly-seeded hasher's order, fresh
+/// every process. The triple set was always right; only the order moved.
+///
+/// That is not cosmetic. Intra-block predicate order carries no meaning in
+/// Turtle, but diffing two exports, checksumming one, or content-addressing a
+/// backup all need the bytes to be stable — and #1574 makes untranslated rows
+/// the normal case for a never-indexed ledger rather than a corner.
+///
+/// The fixture is deliberately never indexed and deliberately mixed-shape: a
+/// lang tag and a decimal both miss V3 translation without a persisted
+/// dictionary, which is exactly what lands a row in that map.
+#[test]
+fn export_is_byte_stable_across_runs() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "det"]).assert().success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "det",
+            "--format",
+            "turtle",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:p1 \"one\"@en ; ex:p2 1.5 ; ex:p3 ex:z ; ex:p4 \"four\" .\n\
+             ex:b ex:p1 \"two\"@fr ; ex:p2 2.5 ; ex:p3 ex:y ; ex:p4 \"five\" .\n",
+        ])
+        .assert()
+        .success();
+
+    let first = fluree_cmd(&tmp)
+        .args(["export", "det", "--format", "turtle"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(
+        !first.is_empty(),
+        "an empty export would make every comparison below vacuously true"
+    );
+
+    // Each run is a fresh process, so a fresh hasher seed.
+    for run in 2..=5 {
+        let next = fluree_cmd(&tmp)
+            .args(["export", "det", "--format", "turtle"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        assert_eq!(
+            String::from_utf8_lossy(&first),
+            String::from_utf8_lossy(&next),
+            "run {run} differed from run 1"
+        );
+    }
+}
+
+/// An annotation on a row that missed V3 translation exports like any other,
+/// in every format.
+///
+/// It did not. Untranslated overlay rows never pass through
+/// `is_reifies_row` — only the translated writers call it — so the bundle
+/// reached the output raw while the rows that *did* translate were
+/// suppressed: a partial `f:reifies*` bundle, and no marker on the edge it
+/// described. Round-tripping that file plants a reserved predicate in the
+/// target ledger as ordinary user data.
+///
+/// The fixture is a lang-tagged object on a never-indexed ledger, which is
+/// the shape that misses translation without a persisted dictionary — and
+/// #1574 makes never-indexed the normal case rather than a corner. The
+/// PR's earlier annotation tests all used `ex:knows ex:bob`, the one object
+/// shape that translates, which is why they were green.
+#[test]
+fn an_untranslated_annotation_exports_with_its_marker() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "unt"]).assert().success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "unt",
+            "--format",
+            "turtle",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:alice ex:label \"Alice\"@en ~ ex:claimL {| ex:src ex:a |} .\n",
+        ])
+        .assert()
+        .success();
+
+    // Turtle: inline marker.
+    fluree_cmd(&tmp)
+        .args(["export", "unt", "--format", "turtle"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"Alice\"@en ~ <http://example.org/claimL>",
+        ))
+        .stdout(predicate::str::contains("reifiesObject").not())
+        .stderr(predicate::str::contains("could not be resolved").not());
+
+    // N-Triples: triple term as the object of rdf:reifies.
+    fluree_cmd(&tmp)
+        .args(["export", "unt", "--format", "ntriples"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<(",
+        ))
+        .stdout(predicate::str::contains("reifiesObject").not());
+
+    // JSON-LD: @annotation on the promoted @value object.
+    fluree_cmd(&tmp)
+        .args(["export", "unt", "--format", "jsonld"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"@annotation\":{\"@id\":\"http://example.org/claimL\"}",
+        ))
+        .stdout(predicate::str::contains("reifiesObject").not());
+
+    // The reifier's own description survives in all three; checked once.
+    fluree_cmd(&tmp)
+        .args(["export", "unt", "--format", "turtle"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<http://example.org/src>"));
+}
+
+/// The counter still fires when an annotation genuinely cannot be resolved.
+///
+/// Paired with the test above on purpose. "No warning" is satisfied by a
+/// counter that has stopped working, so a `MustNotFire` assertion alone
+/// cannot distinguish "nothing was dropped" from "the accounting is dead".
+///
+/// The fixture is an annotation inside a named graph, which the base-index
+/// seal scan cannot key on this branch.
+///
+/// **This canary has a known expiry**, recorded here so the next person does
+/// not mistake its retirement for a regression: the stacked seal fix makes
+/// named-graph annotations resolve, at which point this stops firing and
+/// must be replaced rather than deleted. The replacement wanted is a bundle
+/// the decoder rejects outright — a `GraphMismatch` or a malformed bundle —
+/// which is a corruption state rather than a defect, and which no supported
+/// write surface can produce, since every write path rejects hand-written
+/// `f:reifies*`.
+#[test]
+fn the_unresolved_counter_still_fires_when_it_should() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let src = tmp.path().join("mf-src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("a.trig"),
+        "@prefix ex: <http://example.org/> .\n\
+         GRAPH <http://example.org/g1> { \
+             ex:x ex:p ex:y ~ ex:cG {| ex:src ex:d |} . }\n",
+    )
+    .unwrap();
+    fluree_cmd(&tmp)
+        .args(["create", "mf", "--from"])
+        .arg(&src)
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args(["export", "mf", "--format", "trig", "--all-graphs"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "1 edge annotations could not be resolved",
+        ));
+}
+
+/// Every object shape keeps its annotation, including the big-numeric ones.
+///
+/// `xsd:decimal` did not. The seek key `batch_reifiers` builds needs a
+/// datatype `Sid`, and it asked `resolve_datatype_sid(o_type)` — which
+/// returns `None` for the `NUM_BIG_OVERFLOW` arena, because that arena holds
+/// both overflow `xsd:integer` and `xsd:decimal` and the o_type alone cannot
+/// say which. The `else { continue }` then skipped the row before it could
+/// be matched against the arena, so the marker was lost on *every* lookup
+/// path, sealed arena included, and the reifier came out as an orphan.
+///
+/// `resolve_datatype_sid_for_value` exists for exactly that ambiguity —
+/// added for #1329, where the same gap rendered big numerics with an empty
+/// `@type`. This call site had simply not adopted it.
+///
+/// The fixture covers all three shapes that arena serves, not just the
+/// reported one: an explicit `xsd:decimal`, a **bare** Turtle numeric
+/// (which parses as decimal, and is how anyone writes a score), and an
+/// overflow-magnitude `xsd:integer`. A small integer and a ref are controls
+/// that always worked — without them a regression that broke everything
+/// would still satisfy the assertions below.
+#[test]
+fn big_numeric_objects_keep_their_annotations() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let src = tmp.path().join("num-src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("a.ttl"),
+        "@prefix ex: <http://example.org/> .\n\
+         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\
+         ex:s ex:pRef  ex:bob                     ~ ex:cRef  {| ex:n \"ref\"  |} .\n\
+         ex:s ex:pDec  \"1.5\"^^xsd:decimal         ~ ex:cDec  {| ex:n \"dec\"  |} .\n\
+         ex:s ex:pBare 1.5                        ~ ex:cBare {| ex:n \"bare\" |} .\n\
+         ex:s ex:pBig  \"123456789012345678901234567890\"^^xsd:integer \
+             ~ ex:cBig {| ex:n \"big\" |} .\n\
+         ex:s ex:pInt  \"42\"^^xsd:integer          ~ ex:cInt  {| ex:n \"int\"  |} .\n",
+    )
+    .unwrap();
+    fluree_cmd(&tmp)
+        .args(["create", "num", "--from"])
+        .arg(&src)
+        .assert()
+        .success();
+
+    let out = fluree_cmd(&tmp)
+        .args(["export", "num", "--format", "turtle"])
+        .assert()
+        .success();
+    let out = out.get_output();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.trim().is_empty(), "empty export proves nothing");
+
+    for (pred, reifier) in [
+        ("ex:pRef", "ex:cRef"),   // control: always worked
+        ("ex:pInt", "ex:cInt"),   // control: small integer, not the big arena
+        ("ex:pDec", "ex:cDec"),   // the reported case
+        ("ex:pBare", "ex:cBare"), // a bare numeric is a decimal
+        ("ex:pBig", "ex:cBig"),   // overflow integer shares the same arena
+    ] {
+        let line = stdout
+            .lines()
+            .find(|l| l.contains(pred))
+            .unwrap_or_else(|| panic!("{pred} missing from export:\n{stdout}"));
+        assert!(
+            line.contains(&format!("~ {reifier}")),
+            "{pred} lost its annotation marker: {line}"
+        );
+    }
+
+    // Nothing was dropped, so nothing is reported.
+    fluree_cmd(&tmp)
+        .args(["export", "num", "--format", "turtle"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("could not be resolved").not());
+}
+
+/// A point-in-time export shows an annotation that was live at that time,
+/// even though it has since been retracted.
+///
+/// It did not, on the arena-less path. `scan_base_index_for_attachment_events_in`
+/// computed its own upper bound as `t.max(snapshot.t)` — right for a seal
+/// pass, which wants the whole of history, and wrong for a read at a
+/// requested `t`. Raising the bound to HEAD means the range never returns a
+/// bundle retracted after the requested time, and the filter below it can
+/// only *drop* rows, never restore them. The annotation vanished from an
+/// export that should contain it, and because no edge was then known to be
+/// annotated, nothing incremented the unresolved counter either — silent.
+///
+/// The bound is now the caller's: seal callers clamp it themselves, the
+/// export passes the requested time.
+///
+/// Three things the fixture needs, or it passes without exercising the bug:
+/// the ledger must be **indexed past** the requested `t` (otherwise
+/// `snapshot.t` is 0 and the clamp is a no-op), the annotation must be
+/// **retracted after** it (otherwise it is live at HEAD too), and the scan
+/// must be the annotation source (`FLUREE_EXPORT_ANNOTATION_SCAN`), since
+/// that is the path the bound belongs to.
+#[test]
+fn a_point_in_time_export_keeps_an_annotation_retracted_later() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "tt"]).assert().success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "tt",
+            "--format",
+            "turtle",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:knows ex:b ~ ex:c1 {| ex:conf 0.5 |} .\n",
+        ])
+        .assert()
+        .success();
+    // Retract the attachment, keeping the edge (the by-@id form).
+    fluree_cmd(&tmp)
+        .args([
+            "update",
+            "tt",
+            "--format",
+            "json",
+            "-e",
+            r#"{"@context":{"ex":"http://example.org/"},
+                "delete":{"@id":"ex:a","ex:knows":{"@id":"ex:b",
+                          "@annotation":{"@id":"ex:c1"}}}}"#,
+        ])
+        .assert()
+        .success();
+    fluree_cmd(&tmp).args(["index", "tt"]).assert().success();
+
+    // At HEAD the annotation is gone — that is the retract working.
+    fluree_cmd(&tmp)
+        .args(["export", "tt", "--format", "turtle"])
+        .env("FLUREE_EXPORT_ANNOTATION_SCAN", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("~ <http://example.org/c1>").not());
+
+    // At t=1 it was live, so it must be in the output.
+    fluree_cmd(&tmp)
+        .args(["export", "tt", "--format", "turtle", "--at", "1"])
+        .env("FLUREE_EXPORT_ANNOTATION_SCAN", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("~ <http://example.org/c1>"))
+        .stdout(predicate::str::contains("<http://example.org/knows>"));
 }
 
 // ============================================================================
@@ -1418,6 +3078,87 @@ fn config_list_empty() {
         .assert()
         .success()
         .stdout(predicate::str::contains("no configuration set"));
+}
+
+#[test]
+fn manifest_emits_machine_readable_surface() {
+    let tmp = TempDir::new().unwrap();
+    // Needs no .fluree/ directory — pure introspection of the clap tree.
+    let assert = fluree_cmd(&tmp).arg("manifest").assert().success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&stdout).expect("manifest is JSON");
+
+    assert_eq!(manifest["manifest_version"], 1);
+    assert_eq!(manifest["name"], "fluree");
+    assert!(manifest["version"].as_str().is_some_and(|v| !v.is_empty()));
+
+    let paths: Vec<Vec<&str>> = manifest["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            c["path"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p.as_str().unwrap())
+                .collect()
+        })
+        .collect();
+    // The surface dependent repos teach.
+    assert!(paths.contains(&vec!["query"]));
+    assert!(paths.contains(&vec!["remote", "add"]));
+    assert!(paths.contains(&vec!["auth", "login"]));
+    assert!(paths.contains(&vec!["model", "access", "enable"]));
+    // Hidden machine commands (this one included) never leak into the
+    // teachable surface.
+    assert!(!paths.contains(&vec!["manifest"]));
+}
+
+#[test]
+fn config_list_redacts_credentials_unless_revealed() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    // A remote with a stored bearer token — the shape `remote add --token`
+    // and `auth login` persist (access + refresh tokens).
+    fluree_cmd(&tmp)
+        .args([
+            "config",
+            "set",
+            "remotes.origin.auth.token",
+            "sekrit-access",
+        ])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args([
+            "config",
+            "set",
+            "remotes.origin.auth.refresh_token",
+            "sekrit-refresh",
+        ])
+        .assert()
+        .success();
+
+    // Default list masks both values but keeps the keys visible.
+    fluree_cmd(&tmp)
+        .args(["config", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("remotes.origin.auth.token"))
+        .stdout(predicate::str::contains("[redacted]"))
+        .stdout(predicate::str::contains("sekrit-access").not())
+        .stdout(predicate::str::contains("sekrit-refresh").not())
+        .stderr(predicate::str::contains("--reveal"));
+
+    // --reveal prints the raw values (the documented raw-config escape hatch).
+    fluree_cmd(&tmp)
+        .args(["config", "list", "--reveal"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sekrit-access"))
+        .stdout(predicate::str::contains("sekrit-refresh"));
 }
 
 // ============================================================================
@@ -1889,6 +3630,88 @@ fn auth_logout_clears_token() {
         .assert()
         .success()
         .stdout(predicate::str::contains("not configured"));
+}
+
+#[test]
+fn model_access_disable_dry_run_prints_delete_only_txn() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "model",
+            "access",
+            "disable",
+            "crm",
+            "--profile",
+            "write",
+            "--class",
+            "https://example.org/Lead",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "https://example.org/Lead/access/write/view",
+        ))
+        .stdout(predicate::str::contains(
+            "https://example.org/Lead/access/write/write",
+        ))
+        .stdout(predicate::str::contains("delete"))
+        .stdout(predicate::str::contains("insert").not());
+}
+
+#[test]
+fn model_access_disable_requires_identification() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    fluree_cmd(&tmp)
+        .args(["model", "access", "disable", "crm"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--policy-class"));
+}
+
+#[test]
+fn auth_token_prints_exactly_the_stored_token() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    fluree_cmd(&tmp)
+        .args(["remote", "add", "origin", "http://localhost:8090"])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args(["auth", "login", "--remote", "origin", "--token", "tok-789"])
+        .assert()
+        .success();
+
+    // Stdout is the token and nothing else — it must compose into
+    // FLUREE_TOKEN=$(fluree auth token) without trailing decoration.
+    fluree_cmd(&tmp)
+        .args(["auth", "token", "--remote", "origin"])
+        .assert()
+        .success()
+        .stdout(predicate::eq("tok-789\n"));
+}
+
+#[test]
+fn auth_token_without_stored_token_errors() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    fluree_cmd(&tmp)
+        .args(["remote", "add", "origin", "http://localhost:8090"])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args(["auth", "token", "--remote", "origin"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no token stored"));
 }
 
 #[test]
@@ -2567,4 +4390,1919 @@ fn update_via_stdin() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Committed t=1"));
+}
+
+// ============================================================================
+// Validate command (file mode — no .fluree required)
+// ============================================================================
+
+const VALIDATE_SHAPES_TTL: &str = r"
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix ex: <http://example.org/ns/> .
+@prefix schema: <http://schema.org/> .
+ex:UserShape a sh:NodeShape ;
+    sh:targetClass ex:User ;
+    sh:property [ sh:path schema:name ; sh:minCount 1 ] .
+";
+
+#[test]
+fn validate_file_with_shapes_reports_violation() {
+    let work = TempDir::new().unwrap();
+    std::fs::write(
+        work.path().join("data.ttl"),
+        r#"
+@prefix ex: <http://example.org/ns/> .
+@prefix schema: <http://schema.org/> .
+ex:bob a ex:User ; schema:email "bob@example.org" .
+"#,
+    )
+    .unwrap();
+    std::fs::write(work.path().join("shapes.ttl"), VALIDATE_SHAPES_TTL).unwrap();
+
+    fluree_cmd(&work)
+        .args(["validate", "data.ttl", "--shacl", "shapes.ttl"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("MinCountConstraintComponent"))
+        .stdout(predicate::str::contains("Conforms: false"));
+}
+
+#[test]
+fn validate_conforming_file_exits_zero() {
+    let work = TempDir::new().unwrap();
+    std::fs::write(
+        work.path().join("data.ttl"),
+        r#"
+@prefix ex: <http://example.org/ns/> .
+@prefix schema: <http://schema.org/> .
+ex:alice a ex:User ; schema:name "Alice" .
+"#,
+    )
+    .unwrap();
+    std::fs::write(work.path().join("shapes.ttl"), VALIDATE_SHAPES_TTL).unwrap();
+
+    fluree_cmd(&work)
+        .args(["validate", "data.ttl", "--shacl", "shapes.ttl"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Conforms: true"))
+        // t=2: the loader's staging-SHACL-disable commit precedes the data commit.
+        .stdout(predicate::str::contains("checked at t=2"));
+}
+
+#[test]
+fn validate_file_with_embedded_shapes() {
+    // Shapes and violating data in one file: the loader must not reject the
+    // load (staging-time SHACL is disabled in the ephemeral ledger) — the
+    // violation surfaces in the report instead.
+    let work = TempDir::new().unwrap();
+    let mut doc = String::from(VALIDATE_SHAPES_TTL);
+    doc.push_str("\nex:carol a ex:User ; schema:email \"carol@example.org\" .\n");
+    std::fs::write(work.path().join("embedded.ttl"), doc).unwrap();
+
+    fluree_cmd(&work)
+        .args(["validate", "embedded.ttl", "--format", "turtle"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("sh:ValidationReport"))
+        .stdout(predicate::str::contains("sh:conforms false"))
+        .stdout(predicate::str::contains("carol"));
+}
+
+#[test]
+fn validate_rejects_unknown_fail_on() {
+    let work = TempDir::new().unwrap();
+    std::fs::write(work.path().join("data.ttl"), "@prefix ex: <http://e/> .").unwrap();
+    fluree_cmd(&work)
+        .args(["validate", "data.ttl", "--fail-on", "nope"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unknown --fail-on"));
+}
+
+#[test]
+fn load_csv_upserts_via_cypher_template() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "people"])
+        .assert()
+        .success();
+
+    let csv_path = tmp.path().join("people.csv");
+    std::fs::write(&csv_path, "id,name\n1,Alice\n2,Bob\n").unwrap();
+
+    // First load: create both people from CSV via a per-row MERGE template.
+    fluree_cmd(&tmp)
+        .args([
+            "load",
+            "people",
+            "--from",
+            csv_path.to_str().unwrap(),
+            "--cypher",
+            "MERGE (n:Person {id: row.id}) SET n.name = row.name",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Loaded 2 rows"));
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "people",
+            "--cypher",
+            "MATCH (n:Person) RETURN n.name AS name ORDER BY name",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"))
+        .stdout(predicate::str::contains("Bob"));
+
+    // Second load upserts: id 1 updates in place, id 3 is new — no duplicates.
+    std::fs::write(&csv_path, "id,name\n1,Alice2\n3,Carol\n").unwrap();
+    fluree_cmd(&tmp)
+        .args([
+            "load",
+            "people",
+            "--from",
+            csv_path.to_str().unwrap(),
+            "--cypher",
+            "MERGE (n:Person {id: row.id}) SET n.name = row.name",
+        ])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "people",
+            "--cypher",
+            "MATCH (n:Person) RETURN count(n) AS c",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("3"));
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "people",
+            "--cypher",
+            "MATCH (n:Person) RETURN n.name AS name ORDER BY name",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice2"))
+        .stdout(predicate::str::contains("Carol"));
+}
+
+#[test]
+fn load_csv_dedups_within_batch_merge_key() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "people"])
+        .assert()
+        .success();
+
+    // Two rows in the same batch share id=5, which doesn't exist yet — the
+    // NOT EXISTS MERGE guard is evaluated once per row against the same
+    // pre-write snapshot, so without within-batch dedup both would pass and
+    // create duplicate Person nodes.
+    let csv_path = tmp.path().join("people.csv");
+    std::fs::write(&csv_path, "id,name\n5,Alice\n5,Bob\n").unwrap();
+
+    fluree_cmd(&tmp)
+        .args([
+            "load",
+            "people",
+            "--from",
+            csv_path.to_str().unwrap(),
+            "--cypher",
+            "MERGE (n:Person {id: row.id}) SET n.name = row.name",
+        ])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "people",
+            "--cypher",
+            "MATCH (n:Person) RETURN count(n) AS c",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1"));
+
+    // Last row in the batch wins the value, matching sequential upsert order.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "people",
+            "--cypher",
+            "MATCH (n:Person) RETURN n.name AS name",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Bob"));
+}
+
+#[test]
+fn load_csv_via_jsonld_template_injects_values() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "folks"])
+        .assert()
+        .success();
+
+    // Seed two subjects keyed by ex:id.
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "-l",
+            "folks",
+            "-e",
+            r#"{"@context": {"ex": "http://example.org/"}, "@graph": [
+                {"@id": "ex:p1", "ex:id": "1", "ex:name": "Alice"},
+                {"@id": "ex:p2", "ex:id": "2", "ex:name": "Bob"}
+            ]}"#,
+        ])
+        .assert()
+        .success();
+
+    // CSV of emails keyed by the same id; the JSON-LD template matches each
+    // subject via its ex:id and adds an ex:email. The batch rides in as the
+    // update's `values` clause, binding `?id` / `?email` per CSV column.
+    let csv_path = tmp.path().join("emails.csv");
+    std::fs::write(&csv_path, "id,email\n1,alice@ex.org\n2,bob@ex.org\n").unwrap();
+
+    fluree_cmd(&tmp)
+        .args([
+            "load",
+            "folks",
+            "--from",
+            csv_path.to_str().unwrap(),
+            "--jsonld",
+            r#"{"@context": {"ex": "http://example.org/"}, "where": {"@id": "?s", "ex:id": "?id"}, "insert": {"@id": "?s", "ex:email": "?email"}}"#,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Loaded 2 rows"));
+
+    // Both emails are now attached to the matched subjects.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "folks",
+            "-e",
+            r#"{"@context": {"ex": "http://example.org/"}, "select": {"?s": ["ex:name", "ex:email"]}, "where": {"@id": "?s", "ex:email": "?email"}}"#,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("alice@ex.org"))
+        .stdout(predicate::str::contains("bob@ex.org"));
+}
+
+#[test]
+fn load_requires_a_template_flag() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "empty"])
+        .assert()
+        .success();
+    let csv_path = tmp.path().join("x.csv");
+    std::fs::write(&csv_path, "id\n1\n").unwrap();
+    fluree_cmd(&tmp)
+        .args(["load", "empty", "--from", csv_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--cypher").or(predicate::str::contains("--jsonld")));
+}
+
+// ============================================================================
+// bm25 (full-text index management)
+// ============================================================================
+
+/// Indexes every `ex:Doc`'s `ex:title`. MUST select `@id`.
+const BM25_INDEX_QUERY: &str = r#"{"@context":{"ex":"http://example.org/"},"where":[{"@id":"?x","@type":"ex:Doc","ex:title":"?t"}],"select":{"?x":["@id","ex:title"]}}"#;
+
+/// `init` + a `docs` ledger holding one `ex:Doc`.
+fn bm25_fixture() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "docs"]).assert().success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "-e",
+            r#"{"@context":{"ex":"http://example.org/"},"@id":"ex:doc1","@type":"ex:Doc","ex:title":"Rust programming guide"}"#,
+        ])
+        .assert()
+        .success();
+    tmp
+}
+
+fn bm25_create_index(tmp: &TempDir, name: &str, ledger: &str) {
+    fluree_cmd(tmp)
+        .args([
+            "bm25",
+            "create",
+            "--name",
+            name,
+            "--ledger",
+            ledger,
+            "-e",
+            BM25_INDEX_QUERY,
+        ])
+        .assert()
+        .success();
+}
+
+fn bm25_insert_second_doc(tmp: &TempDir) {
+    fluree_cmd(tmp)
+        .args([
+            "insert",
+            "-e",
+            r#"{"@context":{"ex":"http://example.org/"},"@id":"ex:doc2","@type":"ex:Doc","ex:title":"Rust and WebAssembly"}"#,
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn bm25_list_empty_reports_no_indexes() {
+    let tmp = bm25_fixture();
+    fluree_cmd(&tmp)
+        .args(["bm25", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No BM25 full-text indexes found"));
+}
+
+#[test]
+fn bm25_create_then_list_shows_a_fresh_index() {
+    let tmp = bm25_fixture();
+    fluree_cmd(&tmp)
+        .args([
+            "bm25",
+            "create",
+            "--name",
+            "docsearch",
+            "--ledger",
+            "docs:main",
+            "-e",
+            BM25_INDEX_QUERY,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Created full-text index docsearch:main",
+        ));
+
+    // Built over the current head => listed, and not stale.
+    fluree_cmd(&tmp)
+        .args(["bm25", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("docsearch"))
+        .stdout(predicate::str::contains("docs:main"))
+        .stdout(predicate::str::contains("YES").not());
+
+    // Script mode prints nothing when nothing is stale.
+    fluree_cmd(&tmp)
+        .args(["bm25", "list", "--stale"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// A commit after the index was built must make `list` report it stale, and
+/// `--stale` must emit the alias a maintenance loop feeds back to `sync`.
+#[test]
+fn bm25_list_reports_staleness_after_a_new_commit() {
+    let tmp = bm25_fixture();
+    bm25_create_index(&tmp, "docsearch", "docs:main");
+    bm25_insert_second_doc(&tmp);
+
+    fluree_cmd(&tmp)
+        .args(["bm25", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("YES"));
+
+    fluree_cmd(&tmp)
+        .args(["bm25", "list", "--stale"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("docsearch:main"));
+
+    // ...and syncing clears it.
+    fluree_cmd(&tmp)
+        .args(["bm25", "sync", "--index", "docsearch:main"])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args(["bm25", "list", "--stale"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// A dependency alias stored WITHOUT a branch must still resolve.
+///
+/// `bm25 create --ledger docs` persists the dependency verbatim as `docs`, while
+/// ledger records are keyed `docs:main`, so the staleness lookup only matches via
+/// the implicit-`:main` retry. Without that fallback the source ledger's `t` is
+/// unknown, `LEDGER_T` renders `-`, and the index silently reports itself
+/// never-stale — a maintenance loop driven off `--stale` would skip it forever.
+#[test]
+fn bm25_list_resolves_a_branchless_dependency_alias() {
+    let tmp = bm25_fixture();
+    // No `:main` — this is what lands in the record's dependencies.
+    bm25_create_index(&tmp, "baresearch", "docs");
+    bm25_insert_second_doc(&tmp);
+
+    // The load-bearing assertion: staleness is computed despite the bare alias.
+    fluree_cmd(&tmp)
+        .args(["bm25", "list", "--stale"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("baresearch:main"));
+
+    fluree_cmd(&tmp)
+        .args(["bm25", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("YES"));
+}
+
+#[test]
+fn bm25_drop_requires_force() {
+    let tmp = bm25_fixture();
+    bm25_create_index(&tmp, "docsearch", "docs:main");
+
+    fluree_cmd(&tmp)
+        .args(["bm25", "drop", "--index", "docsearch:main"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "use --force to confirm deletion of 'docsearch:main'",
+        ));
+
+    // Still there.
+    fluree_cmd(&tmp)
+        .args(["bm25", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("docsearch"));
+
+    fluree_cmd(&tmp)
+        .args(["bm25", "drop", "--index", "docsearch:main", "--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dropped full-text index"));
+
+    fluree_cmd(&tmp)
+        .args(["bm25", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No BM25 full-text indexes found"));
+}
+
+#[test]
+fn bm25_create_rejects_a_name_with_a_colon() {
+    let tmp = bm25_fixture();
+    fluree_cmd(&tmp)
+        .args([
+            "bm25",
+            "create",
+            "--name",
+            "bad:name",
+            "--ledger",
+            "docs:main",
+            "-e",
+            BM25_INDEX_QUERY,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot contain ':'"));
+}
+
+#[test]
+fn bm25_create_rejects_invalid_json() {
+    let tmp = bm25_fixture();
+    fluree_cmd(&tmp)
+        .args([
+            "bm25",
+            "create",
+            "--name",
+            "docsearch",
+            "--ledger",
+            "docs:main",
+            "-e",
+            "{not json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "indexing query must be valid JSON",
+        ));
+}
+
+// ============================================================================
+// `create --from … --skolem-namespace`
+// ============================================================================
+
+/// Import `doc.ttl` into `ledger` and return the `@id` of its labeled blank
+/// node, as the CLI reports it.
+fn import_and_read_blank_id(tmp: &TempDir, ledger: &str, namespace: Option<&str>) -> String {
+    let data = tmp.path().join(format!("{ledger}-src"));
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(
+        data.join("doc.ttl"),
+        "@prefix schema: <http://schema.org/> .\n_:shared schema:name \"Shared\" .\n",
+    )
+    .unwrap();
+
+    let mut cmd = fluree_cmd(tmp);
+    cmd.args(["create", ledger, "--from"]).arg(&data);
+    if let Some(ns) = namespace {
+        cmd.args(["--skolem-namespace", ns]);
+    }
+    cmd.assert().success();
+
+    let out = fluree_cmd(tmp)
+        .args([
+            "query",
+            "--ledger",
+            ledger,
+            "-e",
+            r#"{"select": ["?s"], "where": {"@id": "?s", "http://schema.org/name": "Shared"}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    let id = out
+        .split(|c: char| c.is_whitespace() || c == '"' || c == '[' || c == ']')
+        .find(|tok| tok.starts_with("_:fdb-"))
+        .unwrap_or_else(|| panic!("no minted blank-node id in query output: {out}"))
+        .to_string();
+    id
+}
+
+/// The default salt is the ledger id, so two ledgers loaded from equivalent
+/// sources hold different blank nodes; `--skolem-namespace` overrides that on
+/// both sides so they line up.
+#[test]
+fn skolem_namespace_flag_controls_cross_ledger_blank_node_identity() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    let default_a = import_and_read_blank_id(&tmp, "salt-default-a", None);
+    let default_b = import_and_read_blank_id(&tmp, "salt-default-b", None);
+    assert_ne!(
+        default_a, default_b,
+        "without the flag the ledger id salts the mint"
+    );
+
+    let shared_a = import_and_read_blank_id(&tmp, "salt-shared-a", Some("one-corpus"));
+    let shared_b = import_and_read_blank_id(&tmp, "salt-shared-b", Some("one-corpus"));
+    assert_eq!(
+        shared_a, shared_b,
+        "--skolem-namespace must reach the import builder on both sides"
+    );
+}
+
+// ============================================================================
+// #1466 — table output must never Debug-print an internal binding
+// ============================================================================
+
+/// The fix, end to end through the real binary: an indexed ledger, a subject
+/// whose triples arrived after the index snapshot, and a `--format table`
+/// render that has to resolve that subject from novelty.
+///
+/// The bug printed `EncodedSid { s_id: .., t: None, op: None }` into a cell.
+///
+/// The query shape matters. Joining the novelty subject in through a *literal*
+/// — the reported repro's shape — never reaches the arm this fixes: subjects
+/// arrive at the formatter already materialized as `Binding::Sid`, so that
+/// version of this test passed with the whole `EncodedSid` arm deleted. Joining
+/// through a *reference* edge against a typed object keeps `?s`
+/// late-materialized, which is what puts a novelty-only `EncodedSid` in front
+/// of the renderer. `output.rs`'s
+/// `novelty_only_encoded_sid_from_a_real_query_renders_its_iri` asserts that
+/// property directly on the batch; this pins the same shape through the whole
+/// pipeline (insert, index, insert, query), so a regression anywhere along it —
+/// not just in the resolver — is caught.
+#[test]
+fn table_output_renders_novelty_only_subject_after_index() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "noveltytable"])
+        .assert()
+        .success();
+
+    // Base data, then persist an index over it.
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "-e",
+            "<urn:x1> a <urn:Target> ; <urn:indexed-prop> \"val1\" . \
+             <urn:s1> <urn:ref> \"val1\" ; <urn:content> \"c1\" ; \
+             <urn:knows> <urn:x1> ; a <urn:Probe> .",
+        ])
+        .assert()
+        .success();
+    fluree_cmd(&tmp).args(["index"]).assert().success();
+
+    // Commit again *without* indexing: urn:m9 exists only in novelty.
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "-e",
+            "<urn:x2> <urn:indexed-prop> \"val2\" . \
+             <urn:m9> <urn:ref> \"val2\" ; <urn:content> \"probe content\" ; \
+             <urn:knows> <urn:x1> ; a <urn:Probe> .",
+        ])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--format",
+            "table",
+            "--sparql",
+            "SELECT ?s ?o WHERE { \
+               ?s <urn:knows> ?o . \
+               ?o a <urn:Target> . }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("urn:m9"))
+        .stdout(predicate::str::contains("urn:s1"))
+        // The reported symptom, and the placeholder that replaced it: neither
+        // belongs in a correct render.
+        .stdout(predicate::str::contains("EncodedSid").not())
+        .stdout(predicate::str::contains("EncodedPid").not())
+        .stdout(predicate::str::contains("EncodedLit").not())
+        .stdout(predicate::str::contains("(unresolved ").not());
+}
+
+// ============================================================================
+// fluree doc
+// ============================================================================
+
+#[test]
+fn doc_ingest_markdown_then_search_then_skip_unchanged() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let docs = tmp.path().join("docs");
+    std::fs::create_dir_all(docs.join("hr")).unwrap();
+    std::fs::write(
+        docs.join("hr/onboarding.md"),
+        "# Onboarding Guide\n\nWelcome to the team.\n\n## Expense policy\n\nMeals under fifty dollars need no receipt. Travel must be booked through the portal.\n",
+    )
+    .unwrap();
+
+    // First run: creates the ledger, writes one document, builds the full-text index.
+    fluree_cmd(&tmp)
+        .args(["doc", "ingest", "docs", "-l", "handbook"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hr/onboarding.md"))
+        .stdout(predicate::str::contains(
+            "1 ingested, 0 unchanged, 0 failed",
+        ))
+        .stdout(predicate::str::contains("ledger index handbook: t=1"))
+        .stdout(predicate::str::contains(
+            "full-text index handbook-text:main",
+        ));
+
+    // Chunks are real nodes stamped with their document.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "handbook",
+            "-e",
+            r#"{"@context":{"doc":"https://ns.flur.ee/doc#","doc:sourceDocument":{"@type":"@id"}},
+                "where":[{"@id":"?c","@type":"doc:Chunk","doc:sourceDocument":"urn:fluree:doc:hr/onboarding.md","doc:headerPath":"?h"}],
+                "select":["?c","?h"]}"#,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("urn:fluree:doc:hr/onboarding.md/chunk/0"))
+        .stdout(predicate::str::contains("Onboarding Guide"));
+
+    // Full-text search joins the hit back to its file and section path.
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "search",
+            "receipt travel portal",
+            "-l",
+            "handbook",
+            "--mode",
+            "text",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hr/onboarding.md"))
+        .stdout(predicate::str::contains("Onboarding Guide"))
+        .stdout(predicate::str::contains(
+            "urn:fluree:doc:hr/onboarding.md/chunk/0",
+        ));
+
+    // Same bytes, same parser, same (absent) embedding model: nothing to do.
+    fluree_cmd(&tmp)
+        .args(["doc", "ingest", "docs", "-l", "handbook"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unchanged"))
+        .stdout(predicate::str::contains(
+            "0 ingested, 1 unchanged, 0 failed",
+        ));
+
+    // A forced re-ingest retracts and replaces: still exactly one chunk.
+    fluree_cmd(&tmp)
+        .args(["doc", "ingest", "docs", "-l", "handbook", "--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "1 ingested, 0 unchanged, 0 failed",
+        ));
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "handbook",
+            "-e",
+            r#"{"@context":{"doc":"https://ns.flur.ee/doc#"},
+                "where":[{"@id":"?c","@type":"doc:Chunk"}],
+                "select":["(count ?c)"]}"#,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1"))
+        .stdout(predicate::str::contains("2").not());
+}
+
+#[test]
+fn doc_ingest_dry_run_writes_nothing() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    std::fs::write(tmp.path().join("note.md"), "# Note\n\nJust a note.\n").unwrap();
+
+    fluree_cmd(&tmp)
+        .args(["doc", "ingest", "note.md", "-l", "scratch", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dry run, nothing written"));
+
+    fluree_cmd(&tmp)
+        .args(["list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("scratch").not());
+}
+
+#[test]
+fn doc_search_without_index_explains() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "empty"])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args(["doc", "search", "anything", "-l", "empty", "--mode", "text"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no full-text index"));
+    // Hybrid without an embedding endpoint says which half it cannot run.
+    fluree_cmd(&tmp)
+        .args([
+            "doc", "search", "anything", "-l", "empty", "--mode", "hybrid",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "hybrid search needs `[doc.embedding]`",
+        ));
+}
+
+/// A one-thread chat-completions server answering every request with the
+/// same JSON, fenced the way models fence it however they are asked not
+/// to. Returns its base URL and the count of requests it served.
+fn stub_llm(answer: serde_json::Value) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let (url, calls, _) = stub_llm_capturing(answer, 200);
+    (url, calls)
+}
+
+fn stub_llm_with_status(
+    answer: serde_json::Value,
+    status: u16,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let (url, calls, _) = stub_llm_capturing(answer, status);
+    (url, calls)
+}
+
+/// The same stub, keeping every request body it was sent. What the binary
+/// actually puts on the wire is the only thing that answers "does this call
+/// work against that provider", and asserting on it costs no network.
+type CapturedBodies = std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+fn stub_llm_capturing(
+    answer: serde_json::Value,
+    status: u16,
+) -> (
+    String,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    CapturedBodies,
+) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let served = calls.clone();
+    let bodies: CapturedBodies = Default::default();
+    let captured = bodies.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            let mut content_length = 0usize;
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            reader.read_exact(&mut body).ok();
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
+                captured.lock().unwrap().push(v);
+            }
+            served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let content = format!("```json\n{answer}\n```");
+            let reply = serde_json::json!({
+                "choices": [{ "message": { "role": "assistant", "content": content } }]
+            })
+            .to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.len(),
+                reply
+            );
+        }
+    });
+    (url, calls, bodies)
+}
+
+fn write_extraction_fixtures(tmp: &TempDir) {
+    let ont = tmp.path().join("ont");
+    std::fs::create_dir_all(&ont).unwrap();
+    std::fs::write(
+        ont.join("model.ttl"),
+        r#"@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix schema: <https://schema.org/> .
+schema:Person a rdfs:Class ; rdfs:label "Person" .
+schema:Organization a rdfs:Class ; rdfs:label "Organization" .
+schema:worksFor a rdf:Property ; rdfs:label "works for" ;
+    schema:domainIncludes schema:Person ; schema:rangeIncludes schema:Organization .
+schema:jobTitle a rdf:Property ; rdfs:label "job title" ;
+    schema:domainIncludes schema:Person ; schema:rangeIncludes schema:Text .
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        ont.join("entities.ttl"),
+        r#"@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix schema: <https://schema.org/> .
+<https://example.org/org/acme> a schema:Organization ;
+    skos:prefLabel "Acme Corporation" ; skos:altLabel "Acme" .
+"#,
+    )
+    .unwrap();
+    let docs = tmp.path().join("docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::write(
+        docs.join("memo.md"),
+        "# Staffing memo\n\nJane Doe joined Acme as Chief Technology Officer in March.\n\nJane Doe will present the roadmap to the Acme board.\n",
+    )
+    .unwrap();
+}
+
+const EXTRACTION_CONTEXT: &str = r#""@context":{"doc":"https://ns.flur.ee/doc#","nif":"http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#","rdf":"http://www.w3.org/1999/02/22-rdf-syntax-ns#","schema":"https://schema.org/"}"#;
+
+#[test]
+fn doc_ingest_extracts_entities_and_relations_grounded_on_model_and_gazetteer() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    let (url, calls) = stub_llm(serde_json::json!({
+        "entities": [
+            { "name": "Jane Doe", "type": "schema:Person", "nerLabel": "PERSON",
+              "context": "Jane Doe joined Acme as Chief Technology Officer",
+              "attributes": { "schema:jobTitle": "Chief Technology Officer" } },
+            // The model's spelling of a gazetteer entity: must land on its IRI.
+            { "name": "ACME", "type": "schema:Organization", "context": "joined Acme as" },
+            // Not in the text: dropped as a hallucination.
+            { "name": "Phantom LLC", "type": "schema:Organization", "context": "Phantom LLC was never here" }
+        ],
+        "relations": [
+            // A label instead of the IRI: repaired to schema:worksFor.
+            { "subjectName": "Jane Doe", "predicate": "works for", "objectName": "Acme",
+              "objectIsLiteral": false, "context": "Jane Doe joined Acme as Chief Technology Officer in March." },
+            // Not a model property: kept as evidence, never an edge.
+            { "subjectName": "Jane Doe", "predicate": "schema:knows", "objectName": "Acme",
+              "objectIsLiteral": false, "context": "Jane Doe will present the roadmap to the Acme board." }
+        ]
+    }));
+
+    let ingest = |ledger: &str, extra: &[&str]| {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.env("FLUREE_DOC_LLM_URL", &url)
+            .env("FLUREE_DOC_LLM_MODEL", "stub")
+            .args([
+                "doc",
+                "ingest",
+                "docs",
+                "-l",
+                ledger,
+                "--model",
+                "ont/model.ttl",
+                "--entities",
+                "ont/entities.ttl",
+            ])
+            .args(extra);
+        cmd
+    };
+
+    ingest("memos", &[])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "model      ont/model.ttl (2 classes, 2 properties)",
+        ))
+        .stderr(predicate::str::contains("gazetteer  1 entity"))
+        .stdout(predicate::str::contains(
+            "3 mention(s) of 2 entities (1 new), 2 relation(s) (1 rejected)",
+        ))
+        .stdout(predicate::str::contains(
+            "1 dropped (1 hallucinated, 0 off-model)",
+        ))
+        .stderr(predicate::str::contains(
+            "off-model entities: kept, flagged",
+        ));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Gazetteer mentions carry the source IRI; the model's "ACME" did too.
+    fluree_cmd(&tmp)
+        .args(["query", "memos", "-e", &format!(
+            r#"{{{EXTRACTION_CONTEXT},"where":[{{"@id":"?m","@type":"doc:Mention","nif:entity":"?e","nif:anchorOf":"?a","doc:extractedBy":"?by","doc:sourceElement":"?el"}}],"select":["?e","?a","?by","?el"],"orderBy":"?a"}}"#
+        )])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r#""https://example.org/org/acme""#).count(2))
+        .stdout(predicate::str::contains(r#""gazetteer""#).count(2))
+        .stdout(predicate::str::contains(r#""Jane Doe""#).count(1))
+        .stdout(predicate::str::contains("urn:fluree:doc:memo.md/element/"));
+
+    // The new entity is minted once, typed by the model, with its attribute.
+    fluree_cmd(&tmp)
+        .args(["query", "memos", "-e", &format!(
+            r#"{{{EXTRACTION_CONTEXT},"where":[{{"@id":"?e","@type":"doc:Entity","schema:name":"?n","schema:jobTitle":"?j","schema:worksFor":"?o"}}],"select":["?e","?n","?j","?o"]}}"#
+        )])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("urn:fluree:doc:entity/"))
+        .stdout(predicate::str::contains("Chief Technology Officer"))
+        .stdout(predicate::str::contains("https://example.org/org/acme"))
+        .stderr(predicate::str::contains("(1 rows"));
+
+    // Both relations are reified with a verdict; only the repaired one is an edge.
+    fluree_cmd(&tmp)
+        .args(["query", "memos", "-e", &format!(
+            r#"{{{EXTRACTION_CONTEXT},"where":[{{"@id":"?r","@type":"doc:Relation","rdf:predicate":"?p","doc:verdict":"?v","doc:asserted":"?a","doc:excerpt":"?x"}}],"select":["?p","?v","?a"],"orderBy":"?v"}}"#
+        )])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r#""schema:knows",
+    "rejected",
+    false"#))
+        .stdout(predicate::str::contains(r#""schema:worksFor",
+    "repaired",
+    true"#));
+
+    // Same inputs, same model, same gazetteer: nothing to do and no model call.
+    ingest("memos", &[])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("memo.md  unchanged"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // The same ask into a fresh ledger is answered from the extraction cache.
+    ingest("memos2", &[])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 chunk(s) from cache"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // A re-ingest that no longer asserts edges takes the orphaned edge away
+    // with the relation that supported it. The ledger now knows Jane Doe
+    // itself, so the known-entities block, and with it the ask, changed.
+    ingest("memos", &["--relations", "reified", "--force"])
+        .assert()
+        .success();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    fluree_cmd(&tmp)
+        .args(["query", "memos", "-e", &format!(
+            r#"{{{EXTRACTION_CONTEXT},"where":[{{"@id":"?s","schema:worksFor":"?o"}}],"select":["?s","?o"]}}"#
+        )])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("(0 rows"));
+    fluree_cmd(&tmp)
+        .args(["query", "memos", "-e", &format!(
+            r#"{{{EXTRACTION_CONTEXT},"where":[{{"@id":"?m","@type":"doc:Mention"}}],"select":["?m"]}}"#
+        )])
+        .assert()
+        .success()
+        // The earlier mentions were retracted; Jane is now known from the
+        // ledger itself, so both her spans are gazetteer hits.
+        .stderr(predicate::str::contains("(4 rows"));
+}
+
+#[test]
+fn doc_ingest_entities_alone_scan_without_a_model_and_model_needs_an_llm() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--entities",
+            "ont/entities.ttl#schema:Organization",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("gazetteer scan only"))
+        .stdout(predicate::str::contains("2 mention(s) of 1 entity (0 new)"));
+
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--model",
+            "ont/model.ttl",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--model needs a language model"));
+
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--entities",
+            "nowhere",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("nowhere: no such ledger"));
+}
+
+#[test]
+fn doc_ingest_tolerates_a_failed_chunk_and_retries_it_next_run() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    // A model that always fails: the gazetteer half still lands, the
+    // document is written, and it is not stamped as extracted.
+    let (url, calls) = stub_llm_with_status(serde_json::json!({}), 400);
+    let ingest = || {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.env("FLUREE_DOC_LLM_URL", &url)
+            .env("FLUREE_DOC_LLM_MODEL", "stub")
+            .args([
+                "doc",
+                "ingest",
+                "docs",
+                "-l",
+                "memos",
+                "--model",
+                "ont/model.ttl",
+                "--entities",
+                "ont/entities.ttl",
+            ]);
+        cmd
+    };
+    ingest()
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "2 mention(s) of 1 entity (0 new), 1 chunk(s) not extracted",
+        ))
+        .stdout(predicate::str::contains(
+            "extraction incomplete, will be retried next run",
+        ))
+        .stdout(predicate::str::contains(
+            "1 ingested, 0 unchanged, 0 failed",
+        ))
+        .stdout(predicate::str::contains("1 chunk(s) failed"))
+        // The headline is no longer green. `failed` still counts documents
+        // and the exit code is still 0 — both load-bearing for the retry
+        // loop below — but a run where every chunk of every document failed
+        // used to print a green `done:`.
+        .stdout(predicate::str::contains("done with errors:"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // Not "unchanged": the chunk is asked about again.
+    ingest()
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 chunk(s) not extracted"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+// --- begin: `fluree doc ingest` re-ingest ownership (PR-C / #1864) ----------
+// Owned by the doc-pipeline change; keep additions inside this block.
+
+/// Re-ingest retracts what the pipeline wrote and nothing else.
+///
+/// It used to issue `DELETE { ?s ?p ?o }` over every node stamped with the
+/// document plus the document node itself, so a trust weight on the source
+/// or a reviewer's note on a relation was destroyed on the next run — with
+/// the run reporting success and exiting 0.
+///
+/// The assertion is the end-to-end property, deliberately: a write-path
+/// assertion on the generated SPARQL would have passed against the bug.
+#[test]
+fn doc_ingest_reingest_keeps_triples_the_pipeline_did_not_write() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    let (url, calls) = stub_llm(serde_json::json!({
+        "entities": [
+            { "name": "Jane Doe", "type": "schema:Person",
+              "context": "Jane Doe joined Acme as Chief Technology Officer" }
+        ],
+        "relations": [
+            { "subjectName": "Jane Doe", "predicate": "schema:worksFor", "objectName": "Acme",
+              "objectIsLiteral": false,
+              "context": "Jane Doe joined Acme as Chief Technology Officer in March." }
+        ]
+    }));
+    let ingest = || {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.env("FLUREE_DOC_LLM_URL", &url)
+            .env("FLUREE_DOC_LLM_MODEL", "stub")
+            .args([
+                "doc",
+                "ingest",
+                "docs",
+                "-l",
+                "memos",
+                "--model",
+                "ont/model.ttl",
+                "--entities",
+                "ont/entities.ttl",
+            ]);
+        cmd
+    };
+    ingest().assert().success();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // What a user curates out of band: source trust on the document node —
+    // where the design puts it, because it has to be revisable — and a
+    // review note on a relation node the pipeline mints and re-mints.
+    fluree_cmd(&tmp)
+        .args([
+            "update",
+            "memos",
+            "-e",
+            r#"{"@context":{"ex":"https://example.org/","rdfs":"http://www.w3.org/2000/01/rdf-schema#"},
+                "insert":[
+                  {"@id":"urn:fluree:doc:memo.md","ex:trust":0.9},
+                  {"@id":"urn:fluree:doc:memo.md/relation/0",
+                   "ex:reviewedConfidence":1.0,"rdfs:comment":"checked by hand"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let curated = r"PREFIX ex: <https://example.org/>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        SELECT ?s ?p ?o WHERE {
+          VALUES ?p { ex:trust ex:reviewedConfidence rdfs:comment } ?s ?p ?o }";
+    fluree_cmd(&tmp)
+        .args(["query", "memos", "-e", curated])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("(3 rows"));
+
+    // Change the source so the document is re-ingested rather than skipped.
+    let memo = tmp.path().join("docs").join("memo.md");
+    let mut text = std::fs::read_to_string(&memo).unwrap();
+    text.push_str("\nJane Doe also chairs the safety committee.\n");
+    std::fs::write(&memo, text).unwrap();
+    ingest()
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 ingested"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    // The property. All three survive: two namespaces the pipeline does not
+    // write, on the two node kinds it owns.
+    fluree_cmd(&tmp)
+        .args(["query", "memos", "-e", curated])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("(3 rows"))
+        .stdout(predicate::str::contains("urn:fluree:doc:memo.md"))
+        .stdout(predicate::str::contains("checked by hand"));
+
+    // And the sweep still sweeps: one hash and one chunk, not two of each.
+    // A sweep narrowed until it retracts nothing would pass the assertion
+    // above, so pin the other side too.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "memos",
+            "-e",
+            r"PREFIX doc: <https://ns.flur.ee/doc#>
+               SELECT ?h WHERE { <urn:fluree:doc:memo.md> doc:sha256 ?h }",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("(1 rows"));
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "memos",
+            "-e",
+            r"PREFIX doc: <https://ns.flur.ee/doc#>
+               SELECT ?c WHERE { ?c a doc:Chunk ; doc:sourceDocument <urn:fluree:doc:memo.md> }",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("(1 rows"));
+}
+
+/// What `parse_extraction` tolerates, it now reports — once per run.
+///
+/// The model returns the two keys a custom `--system-prompt` would have
+/// asked for and one relation whose `objectIsLiteral` is a string. Before
+/// this, the keys vanished into serde's default, the malformed relation was
+/// dropped whole, and the run printed `0 dropped` and exited 0.
+#[test]
+fn doc_ingest_reports_the_keys_and_items_the_schema_drops() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    // Two chunks, so "once per run, not once per chunk" is testable at all.
+    let filler = "Jane Doe reviewed the quarterly plan with the Acme team. "
+        .repeat(40)
+        .to_string();
+    std::fs::write(
+        tmp.path().join("docs").join("memo.md"),
+        format!(
+            "# Staffing memo\n\nJane Doe joined Acme as Chief Technology Officer in March.\n\n\
+             {filler}\n\n## Second section\n\n{filler}\n"
+        ),
+    )
+    .unwrap();
+    let (url, calls) = stub_llm(serde_json::json!({
+        "entities": [
+            { "name": "Jane Doe", "type": "schema:Person",
+              "context": "Jane Doe joined Acme as Chief Technology Officer" }
+        ],
+        "relations": [
+            // Keeps its extra keys; the relation still lands.
+            { "subjectName": "Jane Doe", "predicate": "schema:worksFor", "objectName": "Acme",
+              "objectIsLiteral": false,
+              "context": "Jane Doe joined Acme as Chief Technology Officer in March.",
+              "confidence": 0.99, "modality": "asserted" },
+            // One type coercion; the whole relation is unreadable.
+            { "subjectName": "Jane Doe", "predicate": "schema:worksFor", "objectName": "Acme",
+              "objectIsLiteral": "true", "context": "Jane Doe joined Acme" }
+        ]
+    }));
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_LLM_URL", &url)
+        .env("FLUREE_DOC_LLM_MODEL", "stub")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--model",
+            "ont/model.ttl",
+            "--entities",
+            "ont/entities.ttl",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains(
+                "2 key(s) the extraction schema does not carry were ignored: \
+                 \"confidence\", \"modality\"",
+            )
+            .count(1),
+        )
+        .stdout(
+            predicate::str::contains("item(s) the extraction schema could not read were dropped")
+                .count(1),
+        );
+    // Two chunks were really asked about, so a once-per-chunk message would
+    // have printed twice and the count(1) above would have caught it.
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// What the shipping binary actually puts on the wire, end to end.
+///
+/// Not `chat_body` in isolation: this is the request as transmitted, so a
+/// regression anywhere between `[doc.llm]` and the socket is caught. The
+/// key set is matched exactly, in both directions — a field that should
+/// not be there is invisible to a presence assertion, and a field that
+/// silently stopped being sent is invisible to an absence one.
+#[test]
+fn doc_ingest_wire_body_carries_every_field_until_one_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    let (url, _calls, bodies) =
+        stub_llm_capturing(serde_json::json!({ "entities": [], "relations": [] }), 200);
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_LLM_URL", &url)
+        .env("FLUREE_DOC_LLM_MODEL", "stub")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--model",
+            "ont/model.ttl",
+            "--entities",
+            "ont/entities.ttl",
+        ])
+        .assert()
+        .success();
+
+    let sent = bodies.lock().unwrap();
+    assert_eq!(sent.len(), 1, "one chunk, one call");
+    let body = &sent[0];
+    let mut keys: Vec<&str> = body
+        .as_object()
+        .expect("a JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "max_completion_tokens",
+            "messages",
+            "model",
+            "response_format",
+            "temperature"
+        ],
+        "the transmitted body is not the one this build intends to send: {body}"
+    );
+    assert_eq!(body["max_completion_tokens"], 8000);
+    assert_eq!(body["model"], "stub");
+    // The stub accepted everything, so nothing was withdrawn and the run
+    // says nothing about corrections.
+    assert_eq!(body["temperature"], 0);
+    assert_eq!(body["response_format"]["type"], "json_object");
+}
+
+/// `doc:assertionMode` end to end, from a custom `--system-prompt` to the
+/// ledger. The shipped prompt is untouched — it ships verbatim with hosted
+/// extraction — so the only path today is a caller's own prompt, and that
+/// path has to actually work.
+#[test]
+fn doc_ingest_stores_assertion_mode_from_a_custom_prompt() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    std::fs::write(
+        tmp.path().join("prompt.txt"),
+        "Extract entities and relations as JSON.\n\
+         For each relation add \"assertionMode\": how the source states it — \
+         \"asserted\", \"hedged\", \"attributed\" or \"negated\".\n\
+         {guidance}## MODEL\n{model}",
+    )
+    .unwrap();
+    let (url, _calls) = stub_llm(serde_json::json!({
+        "entities": [
+            { "name": "Jane Doe", "type": "schema:Person",
+              "context": "Jane Doe joined Acme as Chief Technology Officer" }
+        ],
+        "relations": [
+            { "subjectName": "Jane Doe", "predicate": "schema:worksFor", "objectName": "Acme",
+              "objectIsLiteral": false, "assertionMode": "Hedged",
+              "context": "Jane Doe joined Acme as Chief Technology Officer in March." },
+            { "subjectName": "Jane Doe", "predicate": "schema:jobTitle",
+              "objectName": "Chief Technology Officer", "objectIsLiteral": true,
+              "assertionMode": "probably", "context": "as Chief Technology Officer" }
+        ]
+    }));
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_LLM_URL", &url)
+        .env("FLUREE_DOC_LLM_MODEL", "stub")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--model",
+            "ont/model.ttl",
+            "--entities",
+            "ont/entities.ttl",
+            "--system-prompt",
+            "prompt.txt",
+        ])
+        .assert()
+        .success()
+        // An out-of-enum value is refused out loud, not dropped quietly.
+        .stdout(predicate::str::contains(
+            "1 relation(s) named an assertionMode outside \
+             asserted / hedged / attributed / negated",
+        ))
+        // And is not reported as an ignored key: the schema carries it.
+        .stdout(predicate::str::contains("assertionMode\"").not());
+
+    // Stored on the review node beside the verdict, normalised, and only
+    // for the relation whose mode was one of the four.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "memos",
+            "-e",
+            r"PREFIX doc: <https://ns.flur.ee/doc#>
+              SELECT ?m ?v WHERE { ?r a doc:Relation ; doc:assertionMode ?m ; doc:verdict ?v }",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("(1 rows"))
+        .stdout(predicate::str::contains("hedged"));
+}
+
+/// Three refusals in a row, resolved in one call, and reported once.
+///
+/// This pins three things at the same time, and each would be invisible
+/// without the others:
+///
+/// 1. **All three fields route through the correction**, not just the
+///    budget — the mechanism is used for the fields that motivated it.
+/// 2. **A correction does not back off.** The gaps between arrivals stay
+///    far under the 2s that is the shortest retry sleep.
+///
+/// It deliberately does **not** claim that a correction avoids spending a
+/// retry: four requests are reachable either way, because the `continue`
+/// skips the budget check. That property needs a transient failure to be
+/// observable at all, and has its own test below.
+#[test]
+fn doc_ingest_takes_three_corrections_in_one_call_without_spending_a_retry() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+
+    // An endpoint that refuses every optional field, one 400 at a time,
+    // each in the words a real provider uses.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    // Request bodies with the instant each arrived. The gaps between them
+    // are what "a correction does not back off" means; whole-process wall
+    // time is not, because it also pays for starting a debug binary from
+    // cold, which is how this assertion first flaked.
+    type Arrivals = std::sync::Arc<std::sync::Mutex<Vec<(std::time::Instant, serde_json::Value)>>>;
+    let seen: Arrivals = Default::default();
+    let captured = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            let mut len = 0usize;
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; len];
+            reader.read_exact(&mut body).ok();
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            captured
+                .lock()
+                .unwrap()
+                .push((std::time::Instant::now(), parsed.clone()));
+            let refuse = |param: &str, message: &str| {
+                (
+                    400,
+                    serde_json::json!({ "error": { "param": param, "message": message } })
+                        .to_string(),
+                )
+            };
+            let (status, reply) = if parsed.get("temperature").is_some() {
+                refuse(
+                    "temperature",
+                    "Unsupported value: 'temperature' does not support 0 with this model",
+                )
+            } else if parsed.get("response_format").is_some() {
+                refuse(
+                    "response_format",
+                    "response_format.type: Input should be 'json_schema'",
+                )
+            } else if parsed.get("max_completion_tokens").is_some() {
+                refuse(
+                    "max_completion_tokens",
+                    "Unrecognized request argument supplied: max_completion_tokens",
+                )
+            } else {
+                (
+                    200,
+                    serde_json::json!({ "choices": [{ "message": {
+                    "role": "assistant",
+                    "content": "{\"entities\":[],\"relations\":[]}" } }] })
+                    .to_string(),
+                )
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.len(),
+                reply
+            );
+        }
+    });
+
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_LLM_URL", &url)
+        .env("FLUREE_DOC_LLM_MODEL", "stub")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--model",
+            "ont/model.ttl",
+            "--entities",
+            "ont/entities.ttl",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("3 call(s) were refused and resent with an adjusted request")
+                .count(1),
+        );
+
+    let arrivals = seen.lock().unwrap();
+    let sent: Vec<&serde_json::Value> = arrivals.iter().map(|(_, b)| b).collect();
+    assert_eq!(
+        sent.len(),
+        4,
+        "one call, three corrections, one answer: {sent:?}"
+    );
+    // Each refusal withdrew exactly the field it named, and nothing else.
+    assert_eq!(sent[0]["temperature"], 0);
+    assert_eq!(sent[0]["response_format"]["type"], "json_object");
+    assert_eq!(sent[0]["max_completion_tokens"], 8000);
+    assert!(sent[1].get("temperature").is_none());
+    assert_eq!(sent[1]["response_format"]["type"], "json_object");
+    assert!(sent[2].get("response_format").is_none());
+    assert_eq!(sent[2]["max_completion_tokens"], 8000);
+    assert_eq!(sent[3]["max_tokens"], 8000, "renamed, not dropped");
+    assert!(sent[3].get("max_completion_tokens").is_none());
+    // The shortest retry backoff is 2s, so any gap near it means a
+    // correction was treated as a transient failure.
+    let worst = arrivals
+        .windows(2)
+        .map(|w| w[1].0.duration_since(w[0].0))
+        .max()
+        .expect("four requests give three gaps");
+    assert!(
+        worst < std::time::Duration::from_secs(2),
+        "a correction backed off: the longest gap between requests was {worst:?}"
+    );
+}
+
+/// A dialect correction must not spend one of the three attempts that
+/// exist to ride out a transient failure.
+///
+/// Only observable when a transient actually follows a correction, which is
+/// why this is its own test and why it pays real backoff: the endpoint
+/// refuses one field, then fails twice with a 503, then answers. Four
+/// requests and a clean run. If the correction had consumed an attempt the
+/// budget would run out on the second 503 and the chunk would be reported
+/// failed instead.
+#[test]
+fn doc_ingest_keeps_its_full_retry_budget_after_a_dialect_correction() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let served = count.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            let mut len = 0usize;
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; len];
+            reader.read_exact(&mut body).ok();
+            let n = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (status, reply) = match n {
+                // One dialect refusal, then two transients, then the answer.
+                0 => (
+                    400,
+                    serde_json::json!({ "error": { "param": "temperature",
+                        "message": "Unsupported value: 'temperature'" } })
+                    .to_string(),
+                ),
+                1 | 2 => (503, serde_json::json!({ "error": "try again" }).to_string()),
+                _ => (
+                    200,
+                    serde_json::json!({ "choices": [{ "message": {
+                        "role": "assistant",
+                        "content": "{\"entities\":[],\"relations\":[]}" } }] })
+                    .to_string(),
+                ),
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.len(),
+                reply
+            );
+        }
+    });
+
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_LLM_URL", &url)
+        .env("FLUREE_DOC_LLM_MODEL", "stub")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--model",
+            "ont/model.ttl",
+            "--entities",
+            "ont/entities.ttl",
+        ])
+        .assert()
+        .success()
+        // The chunk was extracted, not abandoned.
+        .stdout(predicate::str::contains("chunk(s) failed").not())
+        .stdout(predicate::str::contains(
+            "1 call(s) were refused and resent with an adjusted request",
+        ));
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::SeqCst),
+        4,
+        "one correction plus three attempts"
+    );
+}
+
+// --- end: `fluree doc ingest` re-ingest ownership (PR-C / #1864) ------------
+
+/// A stub OpenAI-compatible `/embeddings` endpoint. Each input string becomes
+/// a 3-dim vector counting two marker words, so similarity is predictable and
+/// the assertions below are about ranking, not about a model.
+///
+/// The third dimension is a small constant: a document mentioning neither
+/// marker would otherwise embed as the zero vector, whose cosine is undefined.
+fn spawn_stub_embeddings() -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            // Read headers, then exactly Content-Length bytes of body.
+            let body = loop {
+                let n = match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break None,
+                    Ok(n) => n,
+                };
+                buf.extend_from_slice(&chunk[..n]);
+                let Some(split) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&buf[..split]).to_lowercase();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                if buf.len() >= split + 4 + len {
+                    break Some(buf[split + 4..split + 4 + len].to_vec());
+                }
+            };
+            let Some(body) = body else { continue };
+            let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let inputs: Vec<String> = req["input"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|v| v.as_str().unwrap_or_default().to_lowercase())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let data: Vec<serde_json::Value> = inputs
+                .iter()
+                .enumerate()
+                .map(|(i, text)| {
+                    let count = |w: &str| text.matches(w).count() as f64;
+                    serde_json::json!({
+                        "object": "embedding",
+                        "index": i,
+                        "embedding": [count("expense"), count("kubernetes"), 0.1],
+                    })
+                })
+                .collect();
+            let payload =
+                serde_json::json!({ "object": "list", "data": data, "model": "stub" }).to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            let _ = stream.flush();
+        }
+    });
+    format!("http://127.0.0.1:{}/v1", addr.port())
+}
+
+/// `doc search --mode vector` with no HNSW index: the CLI links no ANN
+/// library, so it scores every chunk exactly with `cosineSimilarity`
+/// (flatrank) and cuts with LIMIT. Pins that the ranking is real — the
+/// document that matches the query outranks the one that does not.
+#[test]
+fn doc_search_vector_uses_flatrank_without_an_index() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let url = spawn_stub_embeddings();
+
+    let docs = tmp.path().join("docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::write(
+        docs.join("expenses.md"),
+        "# Expense policy\n\nAn expense over fifty dollars needs a receipt. File each expense in the portal within thirty days of the expense being incurred.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        docs.join("clusters.md"),
+        "# Cluster runbook\n\nEach kubernetes node is drained before an upgrade. Restart the kubernetes scheduler only after the kubernetes control plane reports healthy.\n",
+    )
+    .unwrap();
+
+    let with_model = |tmp: &TempDir| {
+        let mut cmd = fluree_cmd(tmp);
+        cmd.env("FLUREE_DOC_EMBEDDING_URL", &url)
+            .env("FLUREE_DOC_EMBEDDING_MODEL", "stub");
+        cmd
+    };
+
+    // Ingest embeds each chunk through the stub. No vector index is created:
+    // the CLI has no usearch.
+    with_model(&tmp)
+        .args(["doc", "ingest", "docs", "-l", "handbook"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "2 ingested, 0 unchanged, 0 failed",
+        ))
+        .stdout(predicate::str::contains("full-text index"))
+        .stdout(predicate::str::contains("vector index").not());
+
+    // The embeddings are ledger data regardless, so flatrank has something to
+    // score.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "handbook",
+            "-e",
+            r#"{"@context":{"doc":"https://ns.flur.ee/doc#"},
+                "where":[{"@id":"?c","doc:embedding":"?v"}],
+                "select":["(count ?c)"]}"#,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2"));
+
+    let out = with_model(&tmp)
+        .args([
+            "doc",
+            "search",
+            "expense receipts",
+            "-l",
+            "handbook",
+            "--mode",
+            "vector",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+
+    let expenses = out.find("expenses.md");
+    let clusters = out.find("clusters.md");
+    assert!(
+        expenses.is_some(),
+        "vector search returned no hit for the matching document:\n{out}"
+    );
+    assert!(
+        expenses < clusters || clusters.is_none(),
+        "expected expenses.md to outrank clusters.md:\n{out}"
+    );
+
+    // The opposite query must invert the ranking — otherwise the assertion
+    // above would also pass on an unscored, arbitrarily ordered scan.
+    let out = with_model(&tmp)
+        .args([
+            "doc",
+            "search",
+            "kubernetes upgrade",
+            "-l",
+            "handbook",
+            "--mode",
+            "vector",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    let expenses = out.find("expenses.md");
+    let clusters = out.find("clusters.md");
+    assert!(
+        clusters.is_some(),
+        "vector search returned no hit for the matching document:\n{out}"
+    );
+    assert!(
+        clusters < expenses || expenses.is_none(),
+        "expected clusters.md to outrank expenses.md:\n{out}"
+    );
 }

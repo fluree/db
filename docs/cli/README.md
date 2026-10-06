@@ -37,7 +37,7 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | `-q, --quiet` | Suppress non-essential output |
 | `--no-color` | Disable colored output (also respects `NO_COLOR` env var) |
 | `--config <PATH>` | Path to config file |
-| `--memory-budget-mb <MB>` | Memory budget in MB for bulk import (0 = auto: 60% of system RAM). Affects chunk size, concurrency, and run budget when creating a ledger with `--from`. Set this to cap memory use; auto-detected thread count shrinks to fit it. |
+| `--memory-budget-mb <MB>` | Memory budget in MB for bulk import (0 = auto: **80% of system RAM** — sized for a dedicated machine). Affects chunk size, concurrency, and run budget when creating a ledger with `--from`. On a machine running anything else (IDE, Docker, a demo recorder), always pass an explicit budget — the auto default assumes it owns the box and can OOM a co-resident workload. Auto-detected thread count shrinks to fit the budget. |
 | `--parallelism <N>` | Number of parallel parse threads for bulk import (0 = auto: most logical cores, capped to fit the memory budget; explicit values honored as-is, floored at 1). Used when creating a ledger with `--from`. |
 | `-h, --help` | Print help |
 | `-V, --version` | Print version |
@@ -55,16 +55,32 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`info`](info.md) | Show detailed information about a ledger |
 | [`drop`](drop.md) | Drop (delete) a ledger |
 | [`graph`](graph.md) | Manage named graphs within a ledger (list, drop) |
+| [`branch`](branch.md) | Branches: create, list, drop, rebase, merge, diff, revert |
 | [`insert`](insert.md) | Insert data into a ledger |
 | [`upsert`](upsert.md) | Upsert data (insert or update existing) |
+| [`sync`](sync.md) | Make a named graph's contents exactly the supplied data, committing only the delta |
 | [`update`](update.md) | Update with WHERE/DELETE/INSERT patterns |
+| [`load`](load.md) | Stream a CSV into a ledger as batched Cypher/JSON-LD upserts (`LOAD CSV`) |
 | [`query`](query.md) | Query a ledger |
+| [`multi-query`](multi-query.md) | Run multiple queries against a single consistent snapshot |
+| [`graphql`](graphql.md) | Query a ledger through a schema derived from its data |
+| [`validate`](validate.md) | Validate data against SHACL shapes (report) |
+| [`model`](model.md) | Governance model tooling — access profiles, SHACL entity shapes, class hierarchy |
 | [`history`](history.md) | Show change history for an entity |
 | [`export`](export.md) | Export ledger data |
 | [`log`](log.md) | Show commit log |
+| [`verify`](verify.md) | Verify commit-chain integrity and referenced objects |
 | [`show`](show.md) | Show decoded commit contents (flakes with resolved IRIs) |
 | [`index`](index.md) | Build or update the binary index (incremental) |
 | [`reindex`](reindex.md) | Full reindex from commit history |
+| [`sweep`](sweep.md) | Reclaim index artifacts no index chain references |
+| [`encryption`](encryption.md) | Held encryption keys and key rotation (status, rotate, resume, pause, cancel, verify, generate-key) |
+| [`iceberg`](iceberg.md) | Map and manage Iceberg tables as graph sources (map, list, info, drop) |
+| [`delta`](delta.md) | Map and manage Delta Lake tables as graph sources (map, list, info, drop) |
+| [`sql`](sql.md) | Map and manage SQL tables as graph sources through a Trino-protocol endpoint (map, check, list, info, drop) |
+| [`materialize`](materialize.md) | Build a native ledger twin from a virtual (Iceberg/R2RML) graph source |
+| [`bm25`](bm25.md) | Manage BM25 full-text search indexes (create, list, sync, drop) |
+| [`doc`](doc.md) | Ingest a folder of documents into a searchable graph (structure, chunks, embeddings, indexes) and search it |
 
 ### Remote Sync
 
@@ -76,7 +92,9 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`clone`](clone.md) | Clone a ledger from a remote (full commit download) |
 | [`pull`](pull.md) | Pull commits from upstream |
 | [`push`](push.md) | Push to upstream remote |
+| [`publish`](publish.md) | Create on the remote, push, and set upstream in one step |
 | [`track`](track.md) | Track remote-only ledgers (no local data) |
+| [`cache`](cache.md) | Manage the remote content cache (status, clear) |
 
 **Clone and pull** transfer commits and, by default, **binary index data** from the remote (pack protocol), so the local ledger is query-ready without a separate reindex. Use `--no-indexes` to skip index transfer and reduce download size; run `fluree reindex` afterward if you need the index. Large transfers may prompt for confirmation before streaming.
 
@@ -85,6 +103,7 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | Command | Description |
 |---------|-------------|
 | [`server`](server.md) | Manage the Fluree HTTP server (run, start, stop, status, restart, logs) |
+| [`cluster`](cluster.md) | Raft cluster administration (init, add, promote, status) |
 
 Start a server directly from a project directory — it inherits the same `.fluree/` context (config, storage) as the CLI. See [`server`](server.md) for details.
 
@@ -99,13 +118,14 @@ If you're building a custom server that must support the CLI end-to-end (for exa
 | Command | Description |
 |---------|-------------|
 | [`token`](token.md) | Create, inspect, and manage JWS tokens |
-| [`auth`](auth.md) | Manage bearer tokens stored on remotes (login/logout/status) |
+| [`auth`](auth.md) | Manage bearer tokens stored on remotes (login/logout/status/token) |
 
 ### Configuration
 
 | Command | Description |
 |---------|-------------|
 | [`config`](config.md) | Manage configuration |
+| [`context`](context.md) | Get or set a ledger's default JSON-LD `@context` |
 | [`prefix`](prefix.md) | Manage IRI prefix mappings |
 | [`completions`](completions.md) | Generate shell completions |
 
@@ -133,7 +153,7 @@ When you run `fluree init`, a `.fluree/` directory is created with:
 
 ## Input Resolution
 
-Commands that accept data input (`insert`, `upsert`, `update`, `query`) use flexible argument resolution:
+Commands that accept data input (`insert`, `upsert`, `sync`, `update`, `query`) use flexible argument resolution:
 
 | Arguments | Behavior |
 |-----------|----------|
@@ -148,7 +168,9 @@ Input is resolved in this priority order: `-e` flag > positional inline > `-f` f
 The CLI auto-detects data format based on content:
 - Lines starting with `@prefix` or `@base` → Turtle
 - Content starting with `{` or `[` → JSON-LD
+- Leading `MATCH`/`MERGE`/`CREATE (`/`DETACH`, or a `.cypher`/`.cyp`/`.cql` file → Cypher
+- SPARQL query/update keywords (`SELECT`/`INSERT`/`DELETE`/`PREFIX`) → SPARQL
 - Files with `.ttl` extension → Turtle
 - Files with `.json` or `.jsonld` extension → JSON-LD
 
-You can override with `--format turtle` or `--format jsonld`.
+You can override with `--format turtle`, `--format jsonld`, `--format sparql`, or `--format cypher` (see the per-command docs for the exact set each accepts).

@@ -5,15 +5,77 @@ use crate::span::SourceSpan;
 use super::expr::{Expr, Variable};
 use super::pattern::{MapLit, Pattern};
 
-/// A Cypher statement is either a read query (terminating in RETURN)
-/// or an update (terminating in CREATE/SET/REMOVE/DELETE/MERGE without
-/// a final RETURN).
+/// A Cypher statement is either a read query (terminating in RETURN),
+/// an update (terminating in CREATE/SET/REMOVE/DELETE/MERGE without
+/// a final RETURN), a schema DDL command (accepted as a no-op), or a
+/// standalone procedure call (`CALL db.labels() YIELD label …`).
 ///
 /// v1 supports exactly one statement per request body.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Statement {
     Query(Query),
     Update(Update),
+    Schema(SchemaCommand),
+    CallProcedure(ProcedureCall),
+}
+
+/// A standalone procedure call statement:
+/// `CALL dotted.name[(args)] [YIELD col [AS alias], … [WHERE expr]]
+/// [<read clauses…>] [RETURN …]`.
+///
+/// The parser accepts any dotted name; resolution against the supported
+/// shim set (`db.labels`, `dbms.components`, …) happens at the API layer,
+/// which has the ledger stats needed to answer them. Bare `CALL proc()`
+/// implicitly yields all of the procedure's columns. After the YIELD the
+/// statement continues like any read query (`WITH` / `UNWIND` / `MATCH` /
+/// nested `CALL { … }`), the shape schema-introspection tooling emits
+/// (e.g. `CALL apoc.meta.data() YIELD … UNWIND other AS o RETURN …`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcedureCall {
+    /// Dotted procedure name as written (e.g. `db.labels`). Matched
+    /// case-insensitively at resolution.
+    pub name: String,
+    pub args: Vec<Expr>,
+    /// Explicit `YIELD` items. Empty for bare `CALL proc()` and for
+    /// `YIELD *` — both expose every column.
+    pub yields: Vec<YieldItem>,
+    /// `YIELD … WHERE expr` filter (only valid after a YIELD).
+    pub where_clause: Option<Expr>,
+    /// Read clauses following the YIELD, before the RETURN. When non-empty,
+    /// an explicit RETURN is required (the implicit all-columns return only
+    /// applies to the bare call shape).
+    pub rest: Vec<ReadClause>,
+    pub return_clause: Option<ReturnClause>,
+    pub span: SourceSpan,
+}
+
+/// One `YIELD` item: a procedure column, optionally rebound with `AS`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct YieldItem {
+    pub column: String,
+    pub alias: Option<Variable>,
+    pub span: SourceSpan,
+}
+
+/// A schema DDL command. Fluree indexes everything and has no user-managed
+/// index/constraint catalog, so these are accepted for tooling compatibility
+/// (framework migrations run them at startup): CREATE/DROP are no-op writes,
+/// SHOW answers zero rows. The command body is consumed without detailed
+/// parsing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SchemaCommand {
+    pub kind: SchemaCommandKind,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchemaCommandKind {
+    /// `CREATE [OR REPLACE] INDEX … / CONSTRAINT …` — no-op write.
+    CreateSchema,
+    /// `DROP INDEX … / CONSTRAINT …` — no-op write.
+    DropSchema,
+    /// `SHOW INDEXES / CONSTRAINTS …` — zero rows.
+    ShowSchema,
 }
 
 /// A read-shaped Cypher statement.
@@ -152,6 +214,19 @@ pub enum WriteClause {
     Set(SetClause),
     Remove(RemoveClause),
     Delete(DeleteClause),
+    /// `FOREACH (x IN <list> | <write clauses>)` — unrolled at
+    /// param-substitution time for constant lists (inline literals,
+    /// `range()`, `$param` arrays); runtime lists are deferred.
+    Foreach(ForeachClause),
+}
+
+/// `FOREACH (var IN list | body)`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ForeachClause {
+    pub var: Variable,
+    pub list: Expr,
+    pub body: Vec<WriteClause>,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug, PartialEq)]

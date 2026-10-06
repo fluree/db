@@ -454,7 +454,14 @@ mode can be added without rewriting the failure taxonomy.
 - `f:policySource` cross-ledger via `resolve_graph_ref`. The
   policy IR carries definitional/contextual term references
   separately so the model ledger contributes rules while the
-  data ledger contributes identity binding.
+  data ledger contributes identity binding. Enforced on both
+  the read path (`wrap_policy`) and the write path
+  (`build_transact_policy_context`, used by the consensus
+  transact pipeline, push replication, credentialed
+  transactions, and the CLI); the two share one restriction
+  resolver (`resolve_cross_ledger_policy_restrictions`) so the
+  identity-mode rejection and `f:policyClass` filter cannot
+  drift.
 - `f:constraintsSource` cross-ledger via the same shared
   resolver. M's `f:enforceUnique true` annotations on
   properties apply to D's transactions; a tx that would
@@ -468,7 +475,29 @@ mode can be added without rewriting the failure taxonomy.
   imports, and rdf:type for the schema-class set) are projected
   into a `SchemaBundleFlakes` against D's snapshot and feed D's
   reasoner. Single-graph only today; transitive `owl:imports`
-  recursion across multiple model ledgers is reserved.
+  recursion across multiple model ledgers is reserved, and
+  `f:followOwlImports true` combined with a cross-ledger
+  `f:schemaSource` fails closed (`ApiError::OntologyImport`)
+  rather than silently reasoning over the starting graph alone.
+- `f:shapesSource` cross-ledger via the same shared resolver.
+  M's SHACL shapes graph is projected into a wire artifact (the
+  full ShapeCompiler predicate whitelist, including `sh:sparql`
+  constraints and their `sh:prefixes`/`owl:imports` closure,
+  plus rdf:list internals) and compiled against D's staged
+  namespace registry at validation time. Enforced on the
+  JSON-LD staging path, the direct-flake Turtle insert path,
+  and `Fluree::validate_ledger` (CLI/HTTP validate); `sh:class`
+  value-set membership is resolved by querying M live at the
+  resolved `t`. Commit replay (graph-sync push) intentionally
+  *skips* SHACL re-validation for cross-ledger sources — the
+  origin already validated against M, and re-resolving M at
+  replay time could see a different head than the origin did
+  (`StagedShaclContext::origin_validated_replay`). Compiled
+  shapes are reused across transactions while M's head `t` and
+  D's shape-affecting epochs are unchanged (see
+  `CachedShapeSource` in `fluree-db-api/src/tx.rs`), so the
+  steady-state per-transaction cost is one nameservice head
+  lookup.
 - Per-request memo + per-instance governance cache, both keyed
   on `(ArtifactKind, canonical_model_ledger_id, graph_iri,
   resolved_t)`.
@@ -477,10 +506,15 @@ mode can be added without rewriting the failure taxonomy.
 - Reserved-feature rejection: `f:atT`, `f:trustPolicy`, and
   `f:rollbackGuard` are surfaced as `UnsupportedFeature` rather
   than silently ignored.
-- Identity-mode + cross-ledger policy combination fails closed
-  with a config error — the design's "M contributes rules, D
-  contributes identity" boundary is enforced at the request
-  surface.
+- Identity binding under cross-ledger policy: a request identity
+  is bind-only — it resolves against D to populate `?$identity`
+  for M's `f:query` rules and never selects rules (the design's
+  "M contributes rules, D contributes identity binding"
+  boundary). Rule selection is exclusively the policy-class
+  filter chain (request → config → `{f:AccessPolicy}` for
+  anonymous requests); an identity-carrying request with no
+  policy class anywhere fails closed with a config error rather
+  than silently defaulting.
 
 ### Reserved
 
@@ -497,7 +531,6 @@ materializers aren't implemented. Each lands as a new
   across ledgers) lands separately.
 - `f:ontologyImportMap` cross-ledger (mapping table entries
   whose `f:graphRef` targets another model ledger).
-- `f:shapesSource` cross-ledger (SHACL shapes).
 - `f:rulesSource` cross-ledger (datalog rules). The same-ledger
   routing for `f:rulesSource` is also still pending; the
   cross-ledger path will route through the shared resolver

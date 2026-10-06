@@ -602,6 +602,7 @@ async fn push_roundtrip_named_graph_retractions() {
                         cursor: None,
                         cursor_id: None,
                         limit: Some(100),
+                        ..Default::default()
                     },
                 )
                 .await
@@ -623,6 +624,8 @@ async fn push_roundtrip_named_graph_retractions() {
             let push_req = PushCommitsRequest {
                 commits: push_commits,
                 blobs: export.blobs,
+                missing_blobs: Vec::new(),
+                merged_commits: Vec::new(),
             };
 
             let push_result = fluree

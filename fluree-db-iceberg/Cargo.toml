@@ -8,17 +8,23 @@ description = "Iceberg REST catalog support for Fluree DB graph sources"
 
 [features]
 default = []
-# AWS SDK integration (credential provider + S3 storage). Enables the shared
+# AWS SDK integration (credential provider + S3 storage). GCS-backed tables are
+# read through the same S3 SDK path with the transport pinned to HTTP/1.1 (see
+# the `aws-smithy-http-client` / `hyper-rustls` deps below). Enables the shared
 # native disk cache (read-through for S3 data files).
 aws = [
     "dep:aws-credential-types",
     "dep:aws-sdk-s3",
     "dep:aws-config",
+    "dep:aws-smithy-http-client",
+    "dep:hyper-rustls",
     "fluree-db-core/native",
+    # The Arrow columnar reader (`arrow_reader.rs`) is the only `arrow` user and
+    # is itself `#[cfg(feature = "aws")]`, so pull `arrow` + `parquet/arrow` only
+    # here — a non-`aws` build compiles neither.
+    "dep:arrow",
+    "parquet/arrow",
 ]
-# Arrow columnar output (OFF by default for Lambda size)
-arrow = ["dep:arrow", "parquet/arrow"]
-
 [dependencies]
 # Core dependencies
 fluree-db-core = { path = "../fluree-db-core" }
@@ -33,7 +39,7 @@ tokio = { workspace = true, features = ["sync", "time"] }
 futures.workspace = true
 
 # HTTP client for REST catalog
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { workspace = true, features = ["form", "query"] }
 
 # Serialization
 serde = { workspace = true, features = ["derive"] }
@@ -60,7 +66,8 @@ bytes.workspace = true
 # Avro for manifest files
 apache-avro.workspace = true
 
-# Parquet for data files (metadata + range-read column access)
+# Parquet for data files (metadata + range-read column access). The `arrow`
+# feature is enabled by the `aws` feature (the Arrow reader's only consumer).
 parquet = { workspace = true }
 
 # LRU cache for Parquet footer caching
@@ -73,13 +80,21 @@ dashmap.workspace = true
 aws-credential-types = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
 aws-config = { workspace = true, optional = true }
+# HTTP/1.1-pinned transport for the S3 SDK when reading GCS-backed tables (avoids
+# the smithy-rs HTTP/2 range-read bug against the GCS S3-interop endpoint). The
+# `hyper-014` feature exposes the client builder that accepts a custom connector.
+aws-smithy-http-client = { workspace = true, features = ["hyper-014"], optional = true }
+hyper-rustls = { workspace = true, optional = true }
 
-# Optional: Arrow columnar output
-arrow = { version = "54", optional = true }
+# Optional: Arrow columnar reader (the single Iceberg decode path, gated by the
+# `aws` feature). `default-features = false` drops the unused csv/json readers
+# (compile-time only; LTO already strips them from the binary).
+arrow = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 wiremock = "0.6"
+http.workspace = true
 
 [[example]]
 name = "read_rest_catalog"
@@ -87,6 +102,12 @@ required-features = ["aws"]
 
 [[example]]
 name = "read_local_iceberg"
+required-features = ["aws"]
+
+# smoke_minio uses the aws-gated S3IcebergStorage, so it must not be built under
+# default features (bare `cargo test -p fluree-db-iceberg` compiles examples).
+[[example]]
+name = "smoke_minio"
 required-features = ["aws"]
 
 [lints]

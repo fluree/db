@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
-use crate::ledger_view::CommitRef;
-use crate::{ApiError, Fluree, HistoricalLedgerView, LedgerState, Result};
+use crate::ledger_view::{CommitRef, LedgerView};
+use crate::time_resolve;
+use crate::{ApiError, Fluree, HistoricalLedgerView, LedgerState, Result, TimeSpec};
 use fluree_db_core::ContentStore;
-use fluree_db_core::{collect_dag_cids, load_commit_envelope_by_id, CommitId};
+use fluree_db_core::LedgerId;
+use fluree_db_core::{collect_first_parent_cids, load_commit_envelope_by_id, CommitId, ContentId};
 use fluree_db_nameservice::{NameServiceError, NsRecord};
+use fluree_db_query::QueryError;
 
 impl Fluree {
     /// Attach the binary index store and range provider to an already-loaded
@@ -16,6 +19,7 @@ impl Fluree {
             state,
             &self.binary_store_cache_dir(),
             Some(Arc::clone(self.leaflet_cache())),
+            None,
         )
         .await?;
         Ok(())
@@ -32,7 +36,7 @@ impl Fluree {
     pub(crate) async fn refresh_index(&self, state: &mut LedgerState) -> Result<()> {
         if crate::ns_helpers::binary_store_missing_snapshot_namespaces(state) {
             tracing::debug!(
-                ledger_id = state.ledger_id(),
+                ledger_id = %state.ledger_id(),
                 "binary store predates snapshot namespaces; keeping existing store with snapshot namespace fallback"
             );
         }
@@ -57,9 +61,24 @@ impl Fluree {
 
     /// Load a ledger by address (e.g., "mydb:main")
     ///
-    /// This loads the ledger state using the connection-wide cache.
+    /// This loads the ledger state DIRECTLY from the nameservice and storage —
+    /// it does not read, populate, or lock the connection-wide ledger cache.
     /// The ledger state combines the indexed database with any uncommitted novelty transactions.
     pub async fn ledger(&self, ledger_id: &str) -> Result<LedgerState> {
+        self.load_ledger_uncached(ledger_id).await
+    }
+
+    /// Load a ledger's state straight from the nameservice and storage,
+    /// touching no ledger-manager state: no cache read, no cache populate, and
+    /// — the load-bearing part — **no lock acquisition**.
+    ///
+    /// The name is the constraint: the cached-handle commit path calls this
+    /// from `DetachedCacheSlot::recover` while holding that ledger's state
+    /// write lock, to repair the cache after a failed commit. Routing this
+    /// through the `LedgerManager` (whose `get_or_load`/`reload` take that
+    /// same lock) would deadlock the transact path — and the failure mode is
+    /// a hang, not a red test. Anything added here must stay manager-free.
+    pub(crate) async fn load_ledger_uncached(&self, ledger_id: &str) -> Result<LedgerState> {
         let mut state =
             LedgerState::load(&self.nameservice_mode, ledger_id, self.backend()).await?;
         self.attach_index(&mut state).await?;
@@ -120,12 +139,14 @@ impl Fluree {
     /// // Now you can transact: fluree.insert(ledger, &data).await?
     /// ```
     pub async fn create_ledger(&self, ledger_id: &str) -> Result<LedgerState> {
-        use fluree_db_core::ledger_id::normalize_ledger_id;
         use fluree_db_novelty::Novelty;
         use tracing::info;
 
-        // 1. Normalize ledger_id (ensure branch suffix)
-        let ledger_id = normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
+        // 1. Parse (default branch applied) and apply the stricter rules for
+        //    new names, which existing ledgers are not held to.
+        let ledger_id = LedgerId::parse(ledger_id)?;
+        fluree_db_core::validate_ledger_name(ledger_id.name())?;
+        fluree_db_core::validate_branch_name(ledger_id.branch())?;
         info!(ledger_id = %ledger_id, "Creating ledger");
 
         // 2. Register in nameservice via the ledger-admin surface
@@ -156,15 +177,19 @@ impl Fluree {
     /// Looks up the source branch to capture its current commit state, then
     /// creates a new [`NsRecord`] for `ledger_name:new_branch`.
     ///
-    /// When `source_commit` is `None`, the new branch starts at the source's
-    /// current HEAD and inherits its index (copied into the new branch's
-    /// storage namespace so it's safe from GC on the source). This is the
-    /// default behavior.
+    /// When `at` is `None` or [`TimeSpec::Latest`], the new branch starts at
+    /// the source's current HEAD and inherits its index (copied into the new
+    /// branch's storage namespace so it's safe from GC on the source). This is
+    /// the default behavior.
     ///
-    /// When `source_commit` is `Some(ref)`, the ref is resolved to a canonical
-    /// [`CommitId`] against the source branch, verified to be reachable from
-    /// the source HEAD, and becomes the new branch's head. The index is not
-    /// copied — the index at the source HEAD is typically too fresh for a
+    /// Any other `at` names a point on the source branch, read exactly as a
+    /// query pinned at `@<at>` on the source reads it: the new branch's head is
+    /// the commit that query would see as its head. `AtTime` / `AtRecorded`
+    /// resolve through the same timestamp resolver queries use, `AtT` names
+    /// that transaction, and `AtCommit` names that commit (a hex digest prefix,
+    /// with or without `sha256:` / `fluree:commit:`, or a full CID). The
+    /// commit is verified to be on the source's line of commits. The index is
+    /// not copied — the index at the source HEAD is typically too fresh for a
     /// historical branch point, so the new branch replays from genesis.
     ///
     /// Commits themselves are **not** copied — the branch's content store
@@ -173,16 +198,21 @@ impl Fluree {
     /// # Errors
     ///
     /// - [`ApiError::LedgerExists`] if the branch already exists
-    /// - [`ApiError::NotFound`] if the source branch does not exist, or if
-    ///   `source_commit` resolves to a commit not reachable from source HEAD
+    /// - [`ApiError::InvalidBranch`] if the source branch has no commits, or
+    ///   `at` is a malformed timestamp, a time before the source's first
+    ///   commit, a transaction number below 1, or an `AtSnapshot` (a
+    ///   graph-source table snapshot, never a commit on a ledger)
+    /// - [`ApiError::NotFound`] if the source branch does not exist
+    /// - [`ApiError::CommitNotFound`] if `at` names no commit, or one not
+    ///   reachable from source HEAD
     pub async fn create_branch(
         &self,
         ledger_name: &str,
         new_branch: &str,
         source_branch: Option<&str>,
-        source_commit: Option<CommitRef>,
+        at: Option<TimeSpec>,
     ) -> Result<NsRecord> {
-        use fluree_db_core::ledger_id::{format_ledger_id, validate_branch_name};
+        use fluree_db_core::ledger_id::validate_branch_name;
         use tracing::info;
 
         validate_branch_name(new_branch).map_err(|e| ApiError::Http {
@@ -191,8 +221,8 @@ impl Fluree {
         })?;
 
         let source = source_branch.unwrap_or("main");
-        let source_id = format_ledger_id(ledger_name, source);
-        let new_id = format_ledger_id(ledger_name, new_branch);
+        let source_id = LedgerId::from_parts(ledger_name, source)?;
+        let new_id = LedgerId::from_parts(ledger_name, new_branch)?;
 
         info!(ledger_name, new_branch, source, "Creating branch");
 
@@ -201,26 +231,31 @@ impl Fluree {
             .nameservice()
             .lookup(&source_id)
             .await?
-            .ok_or_else(|| ApiError::NotFound(source_id.clone()))?;
+            .ok_or_else(|| ApiError::NotFound(source_id.clone().to_string()))?;
 
         // Verify the source branch has a commit head before creating.
         let source_head = source_record.commit_head_id.clone().ok_or_else(|| {
-            ApiError::internal(format!("Source branch {source_id} has no commit head"))
+            ApiError::InvalidBranch(format!(
+                "Cannot branch from '{source_id}': it has no commits yet. \
+                 Transact to it first."
+            ))
         })?;
 
-        // If the caller specified a historical commit, resolve it and verify
+        // If the caller specified a historical point, resolve it and verify
         // it's reachable from source HEAD before we touch the nameservice.
-        // A ref that resolves to the source head itself is collapsed to the
+        // A point that resolves to the source head itself is collapsed to the
         // default (None) path so the user still gets an index copy — otherwise
         // `--at <head-cid>` would silently produce a slower branch than
         // omitting `--at` entirely.
-        let at_commit = if let Some(commit_ref) = source_commit {
+        let at_commit = if let Some(at) = at {
             let view = self.ledger_cached(&source_id).await?.snapshot().await;
-            let resolved = view.resolve_commit(commit_ref).await?;
+            let resolved = branch_point_commit(view, &source_id, at).await?;
             if resolved == source_head {
                 None
             } else {
-                let store = self.content_store(&source_id);
+                // Branch-aware: the line crosses the fork point into the
+                // source's own parent namespace.
+                let store = self.branched_content_store(&source_id).await?;
                 let resolved_t = verify_ancestor(&*store, &source_head, &resolved).await?;
                 Some((resolved, resolved_t))
             }
@@ -288,13 +323,11 @@ impl Fluree {
     ) -> Result<()> {
         use fluree_db_binary_index::collect_root_cas_ids_expanded;
         use fluree_db_binary_index::format::index_root::IndexRoot;
-        use fluree_db_core::storage::content_address;
         use fluree_db_core::CODEC_FLUREE_DICT_BLOB;
 
         let storage = self.backend().admin_storage_cloned().ok_or_else(|| {
             ApiError::internal("copy_index_to_branch requires managed storage backend")
         })?;
-        let method = storage.storage_method();
         // Branch-aware source store so the copy can read inherited index
         // artifacts when `source_id` itself is a branch with ancestors.
         let source_store = fluree_db_nameservice::branched_content_store_for_id(
@@ -357,7 +390,6 @@ impl Fluree {
         stream::iter(all_cids.into_iter().map(|cid| {
             let kind = cid.content_kind().expect("filtered above");
             let hex = cid.digest_hex();
-            let dst_addr = content_address(method, kind, target_id, &hex);
             let storage = storage.clone();
             let source_store = source_store.clone();
             let cid_display = cid.to_string();
@@ -368,15 +400,24 @@ impl Fluree {
                         "failed to read index artifact {cid_display} from {source_label}: {e}"
                     ))
                 })?;
+                // Content-addressed write, so derived kinds take the derived
+                // durability instead of the instance's: page-cache now, one
+                // batched flush below before the pointer is published.
                 storage
-                    .write_bytes(&dst_addr, &bytes)
+                    .content_write_bytes_with_hash(kind, target_id, &hex, &bytes)
                     .await
+                    .map(|_| ())
                     .map_err(ApiError::from)
             }
         }))
         .buffer_unordered(COPY_CONCURRENCY)
         .try_for_each(|()| async { Ok(()) })
         .await?;
+        storage.sync().await.map_err(|e| {
+            ApiError::internal(format!(
+                "failed to flush index artifacts copied to {target_id}: {e}"
+            ))
+        })?;
 
         tracing::info!(
             source = %source_id, target = %target_id,
@@ -395,21 +436,54 @@ impl Fluree {
     }
 }
 
-/// Verify `target` is reachable by walking parents from `source_head`, and
-/// return its `t` value.
+/// The commit a query pinned at `@<at>` on the source reads as its head.
 ///
-/// Used by `create_branch` when a caller specifies a historical commit — we
-/// only allow branching from commits on the source branch's ancestry.
+/// Everything but a commit spelling goes through
+/// [`time_resolve::resolve_time_spec`], the resolver queries and export use,
+/// so a branch at `time:X` and a query at `@time:X` cannot disagree.
+async fn branch_point_commit(view: LedgerView, source_id: &str, at: TimeSpec) -> Result<CommitId> {
+    if let TimeSpec::AtCommit(spelling) = at {
+        // Resolved directly rather than through its `t`: a CID stays exact, so
+        // an off-line commit reaches `verify_ancestor`'s explanation.
+        let commit_ref = match ContentId::parse_canonical(&spelling) {
+            Some(cid) => CommitRef::Exact(cid),
+            None => CommitRef::Prefix(spelling),
+        };
+        return view.resolve_commit(commit_ref).await;
+    }
+    let as_branch_error = |e| match e {
+        ApiError::Query(QueryError::InvalidQuery(msg)) => {
+            ApiError::InvalidBranch(format!("Cannot branch from '{source_id}': {msg}"))
+        }
+        other => other,
+    };
+    let state = view.to_ledger_state();
+    let t = time_resolve::resolve_time_spec(&state, &at)
+        .await
+        .map_err(as_branch_error)?;
+    LedgerView::from_state(&state)
+        .resolve_commit(CommitRef::T(t))
+        .await
+        .map_err(as_branch_error)
+}
+
+/// Verify `target` is on the source branch's line of commits, and return
+/// its `t` value.
 ///
-/// "Ancestry" here is the full commit DAG, not the linear first-parent chain:
-/// `collect_dag_cids` walks every parent edge (including merge parents), so
-/// any commit reachable from `source_head` via any sequence of parent edges
-/// is a valid branch point. This is what enables branching at a commit that
-/// originally lived on a side branch that was later merged into the source
-/// — once merged in, those commits are part of the source's ancestry too.
+/// Used by `create_branch` when a caller specifies a historical commit. The
+/// line is the branch's own history: the commits a load, an index build or
+/// a replay of that branch reads. Branching anywhere on it replays commits
+/// the branch already replays.
 ///
-/// Loads only the target commit's envelope (not its flakes) since we just
-/// need `t` for the ancestry walk's stop condition.
+/// A commit that reached the branch through a merge is not on the line, and
+/// is refused. The branch never replays it: what the merge contributed is
+/// folded into the merge commit, which was validated against the state it
+/// landed on. Branching there would instead replay the merged branch's own
+/// history, which this ledger never checked. `revert` draws the same line.
+///
+/// Loads envelopes only, and stops as soon as the line passes below
+/// `target`'s `t`. A line's `t` decreases by one per commit, so the target
+/// is out of range from there on.
 async fn verify_ancestor<C: ContentStore + ?Sized>(
     store: &C,
     source_head: &CommitId,
@@ -418,23 +492,23 @@ async fn verify_ancestor<C: ContentStore + ?Sized>(
     let target_envelope = load_commit_envelope_by_id(store, target)
         .await
         .map_err(|_| {
-            ApiError::NotFound(format!("commit {target} not found in source namespace"))
+            ApiError::CommitNotFound(format!("commit {target} not found in source namespace"))
         })?;
 
     if source_head == target {
         return Ok(target_envelope.t);
     }
 
-    // Walk backward from source_head over the full DAG (all parent edges,
-    // including merge parents), stopping once we pass below target's t.
     let stop_at = (target_envelope.t - 1).max(0);
-    let dag = collect_dag_cids(store, source_head, stop_at).await?;
+    let line = collect_first_parent_cids(store, source_head, stop_at).await?;
 
-    if dag.iter().any(|(_, cid)| cid == target) {
+    if line.iter().any(|(_, cid)| cid == target) {
         Ok(target_envelope.t)
     } else {
-        Err(ApiError::NotFound(format!(
-            "commit {target} is not an ancestor of source head {source_head}"
+        Err(ApiError::CommitNotFound(format!(
+            "commit {target} is not on the line of commits behind {source_head}. \
+             A commit that arrived through a merge cannot be branched at: branch \
+             at the merge commit instead, or at a commit on the branch that made it"
         )))
     }
 }

@@ -51,10 +51,35 @@ pub fn build_policy_set(
     restrictions: Vec<PolicyRestriction>,
     stats: Option<&IndexStats>,
     action_filter: PolicyAction,
+    hierarchy: Option<&fluree_db_core::SchemaHierarchy>,
 ) -> PolicySet {
     let mut set = PolicySet::new();
 
-    for restriction in restrictions {
+    for mut restriction in restrictions {
+        // RDFS entailment (always on for enforcement): a class policy also
+        // governs instances of subclasses, and a property policy also
+        // governs subproperties. Expanding here — before indexing — means
+        // the class→property union, class_check_needed computation, and the
+        // four evaluation-time `for_classes` checks all see the closure.
+        if let Some(h) = hierarchy {
+            if !restriction.for_classes.is_empty() {
+                let expanded: Vec<Sid> = restriction
+                    .for_classes
+                    .iter()
+                    .flat_map(|c| h.subclasses_of(c).iter().cloned())
+                    .collect();
+                restriction.for_classes.extend(expanded);
+            }
+            if restriction.target_mode == TargetMode::OnProperty {
+                let expanded: Vec<Sid> = restriction
+                    .targets
+                    .iter()
+                    .flat_map(|p| h.subproperties_of(p).iter().cloned())
+                    .collect();
+                restriction.targets.extend(expanded);
+            }
+        }
+
         // Filter by action
         match (&restriction.action, &action_filter) {
             (PolicyAction::Both, _) => {}                      // Matches any filter
@@ -92,8 +117,22 @@ pub fn build_policy_set(
                         });
                 }
             }
+            TargetMode::OnClass if action_filter == PolicyAction::Modify => {
+                // Modify sets index class policies by class, selected at
+                // evaluation time by the subject's classes (see
+                // `PolicySet::by_class`). The view-set stats expansion below
+                // is wrong for writes on both axes: it misses properties the
+                // class has never used in committed data (an allow silently
+                // fails to cover them), and its exclusive-property shortcut
+                // skips the class check exactly when the staged flake is the
+                // first counterexample to the stats (an allow leaks to
+                // non-instances).
+                for class_sid in &restriction.for_classes {
+                    set.by_class.entry(class_sid.clone()).or_default().push(idx);
+                }
+            }
             TargetMode::OnClass => {
-                // Class policies are indexed INTO by_property
+                // View sets: class policies are indexed INTO by_property
                 // Collect all properties for this restriction (union across classes + implicit)
                 let mut props_for_restriction: HashSet<Sid> = HashSet::new();
 
@@ -225,6 +264,7 @@ mod tests {
             target_mode: TargetMode::OnProperty,
             targets: [property].into_iter().collect(),
             action: PolicyAction::View,
+            verbs: None,
             value: PolicyValue::Allow,
             required: false,
             message: None,
@@ -240,6 +280,7 @@ mod tests {
             target_mode: TargetMode::OnClass,
             targets: HashSet::new(),
             action: PolicyAction::View,
+            verbs: None,
             value: PolicyValue::Allow,
             required: false,
             message: None,
@@ -255,6 +296,7 @@ mod tests {
             target_mode: TargetMode::Default,
             targets: HashSet::new(),
             action: PolicyAction::Both,
+            verbs: None,
             value: PolicyValue::Deny,
             required: false,
             message: None,
@@ -283,6 +325,7 @@ mod tests {
                     .collect(),
             }]),
             graphs: None,
+            historical_since_t: None,
         }
     }
 
@@ -293,7 +336,7 @@ mod tests {
             make_prop_restriction("p2", make_sid(100, "age")),
         ];
 
-        let set = build_policy_set(restrictions, None, PolicyAction::View);
+        let set = build_policy_set(restrictions, None, PolicyAction::View, None);
 
         assert_eq!(set.restrictions.len(), 2);
         assert_eq!(
@@ -316,7 +359,7 @@ mod tests {
 
         let restrictions = vec![make_class_restriction("c1", person_class)];
 
-        let set = build_policy_set(restrictions, Some(&stats), PolicyAction::View);
+        let set = build_policy_set(restrictions, Some(&stats), PolicyAction::View, None);
 
         assert_eq!(set.restrictions.len(), 1);
 
@@ -328,13 +371,90 @@ mod tests {
     }
 
     #[test]
+    fn test_build_policy_set_class_index_modify_uses_by_class() {
+        let person_class = make_sid(100, "Person");
+        let name_prop = make_sid(100, "name");
+
+        let stats = make_stats_with_class(person_class.clone(), vec![name_prop.clone()]);
+
+        let mut restriction = make_class_restriction("c1", person_class.clone());
+        restriction.action = PolicyAction::Modify;
+
+        let set = build_policy_set(vec![restriction], Some(&stats), PolicyAction::Modify, None);
+
+        assert_eq!(set.restrictions.len(), 1);
+        // Modify sets index class policies by class, never via stats expansion.
+        assert_eq!(set.by_class.get(&person_class), Some(&vec![0]));
+        assert!(set.by_property.is_empty());
+        // Class policies are predicate-agnostic on modify: every predicate
+        // is potentially covered.
+        assert!(set.covers_predicate(&make_sid(100, "never-seen")));
+    }
+
+    /// Modify class policies must cover properties the class has never used
+    /// in committed data (absent from stats).
+    #[test]
+    fn test_modify_class_policy_covers_never_used_property() {
+        let person_class = make_sid(100, "Person");
+        let name_prop = make_sid(100, "name");
+        let novel_prop = make_sid(100, "brandNewField");
+
+        let stats = make_stats_with_class(person_class.clone(), vec![name_prop]);
+
+        let mut restriction = make_class_restriction("c1", person_class.clone());
+        restriction.action = PolicyAction::Modify;
+
+        let set = build_policy_set(vec![restriction], Some(&stats), PolicyAction::Modify, None);
+
+        let subject = make_sid(100, "alice");
+        let entries = set.policy_entries_for_flake(
+            &subject,
+            &novel_prop,
+            std::slice::from_ref(&person_class),
+        );
+        assert_eq!(
+            entries.len(),
+            1,
+            "class policy must apply to novel property"
+        );
+        assert!(!entries[0].class_check_needed);
+    }
+
+    /// A stats-"exclusive" property must NOT make a modify class policy apply
+    /// to a non-instance: the staged flake can be the first counterexample to
+    /// the stats. (The view-set exclusivity shortcut would skip the class
+    /// check here.)
+    #[test]
+    fn test_modify_class_policy_does_not_leak_via_exclusive_property() {
+        let person_class = make_sid(100, "Person");
+        let company_class = make_sid(100, "Company");
+        let ssn_prop = make_sid(100, "ssn");
+
+        // Stats: ssn used ONLY by Person (exclusive).
+        let stats = make_stats_with_class(person_class.clone(), vec![ssn_prop.clone()]);
+
+        let mut restriction = make_class_restriction("c1", person_class);
+        restriction.action = PolicyAction::Modify;
+
+        let set = build_policy_set(vec![restriction], Some(&stats), PolicyAction::Modify, None);
+
+        // Staged flake writes the "exclusive" property onto a Company subject.
+        let subject = make_sid(100, "acme");
+        let entries = set.policy_entries_for_flake(&subject, &ssn_prop, &[company_class]);
+        assert!(
+            entries.is_empty(),
+            "class policy must not apply to a non-instance"
+        );
+    }
+
+    #[test]
     fn test_build_policy_set_defaults() {
         let restrictions = vec![
             make_prop_restriction("p1", make_sid(100, "name")),
             make_default_restriction("d1"),
         ];
 
-        let set = build_policy_set(restrictions, None, PolicyAction::View);
+        let set = build_policy_set(restrictions, None, PolicyAction::View, None);
 
         assert_eq!(set.restrictions.len(), 2);
         assert_eq!(set.defaults.len(), 1);
@@ -352,12 +472,12 @@ mod tests {
         let restrictions = vec![view_restriction, modify_restriction];
 
         // Filter for View only
-        let view_set = build_policy_set(restrictions.clone(), None, PolicyAction::View);
+        let view_set = build_policy_set(restrictions.clone(), None, PolicyAction::View, None);
         assert_eq!(view_set.restrictions.len(), 1);
         assert_eq!(view_set.restrictions[0].id, "v1");
 
         // Filter for Modify only
-        let modify_set = build_policy_set(restrictions, None, PolicyAction::Modify);
+        let modify_set = build_policy_set(restrictions, None, PolicyAction::Modify, None);
         assert_eq!(modify_set.restrictions.len(), 1);
         assert_eq!(modify_set.restrictions[0].id, "m1");
     }
@@ -424,6 +544,7 @@ mod tests {
                 },
             ]),
             graphs: None,
+            historical_since_t: None,
         };
 
         let person_only: HashSet<Sid> = [person.clone()].into_iter().collect();

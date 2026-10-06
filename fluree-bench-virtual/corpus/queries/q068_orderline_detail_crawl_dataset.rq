@@ -1,0 +1,21 @@
+# q068 orderline_detail_crawl_dataset
+# Intent: W4-1b FOLDED-CRAWL execution — the shape class NO corpus member covered
+#   (a const-object member folded onto a co-located `?s ?p ?o` wildcard). The
+#   ship-blocker returned ZERO triples for this shape (the folded wildcard emitted a
+#   subject-only row, ?p/?o unbound), so this member's row-count parity
+#   (native == virtual) catches that regression END-TO-END — exactly the gap that
+#   nearly shipped. It also exercises the W4-1/W4-1b prune path: edw:lineNumber 1
+#   folds as a star_constraint on the wildcard and pushes as an Iceberg scan filter,
+#   and the ?ol->order/product ref POMs drive the parent-lookup (F-16 telemetry:
+#   inspect whether FACT_ORDER is fully scanned vs bounded).
+# BI lineage: the round-3b 071cd59f "show me everything about entity X" detail crawl.
+# Predicates verified against enterprise-sf01-mapping.ttl — FactOrderLine: lineNumber
+#   (LINE_NUMBER xsd:integer), class OrderLine; `?p`/`?o` range over all its triples.
+# Determinism: an unordered crawl truncated by LIMIT -> hash_gate=rows_only (row-count
+#   parity; the ship-blocker regression is 0 rows, which the count catches).
+# Exec path: query_from() with FROM <enterprise-sf01-v:main> (the deployed crawl path).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?p ?o
+FROM <enterprise-sf01-v:main>
+WHERE { ?ol a edw:OrderLine ; edw:lineNumber 1 . ?ol ?p ?o . }
+LIMIT 200

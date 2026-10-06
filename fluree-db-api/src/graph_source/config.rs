@@ -400,17 +400,46 @@ pub struct IcebergCreateConfig {
     /// Branch name (defaults to "main")
     pub branch: Option<String>,
 
+    /// The reusable connection block (catalog access + IO).
+    pub connection: IcebergConnectionConfig,
+
+    /// Table identifier (e.g., "openflights.airlines"). Empty for Direct mode
+    /// (derived from the table location).
+    pub table_identifier: String,
+
+    /// Optional tombstone/delete convention for materialization (which source
+    /// column + value(s)/null mark a row as a delete). `None` => additive
+    /// materialization (no retraction). Not a connection concern, so it lives on
+    /// the create config rather than the reusable `IcebergConnectionConfig`.
+    pub delete_convention: Option<fluree_db_iceberg::DeleteConvention>,
+
+    /// Optional ordering column for latest-by-key materialization (e.g. an event
+    /// timestamp or offset). `None` => last-in-scan-order wins.
+    pub order_by: Option<String>,
+
+    /// Optional model ledger (`name:branch`) governing the source: its default
+    /// graph supplies view policies and the class/property hierarchy.
+    pub model: Option<String>,
+
+    /// Optional `default-allow` for governed requests that match no policy.
+    pub default_allow: Option<bool>,
+}
+
+/// The reusable Iceberg connection block — catalog access + IO, with **no**
+/// table or mapping.
+///
+/// Factored out of [`IcebergCreateConfig`] so catalog browse / metadata preview
+/// can run against an **unsaved** connection during onboarding (before a graph
+/// source record is created). The relationship is:
+/// `IcebergCreateConfig` = `IcebergConnectionConfig` + `table_identifier`.
+#[cfg(feature = "iceberg")]
+#[derive(Debug, Clone)]
+pub struct IcebergConnectionConfig {
     /// Catalog mode: REST or Direct S3 access.
     pub catalog_mode: CatalogMode,
 
-    /// S3 region override
-    pub s3_region: Option<String>,
-
-    /// S3 endpoint override (for MinIO, LocalStack)
-    pub s3_endpoint: Option<String>,
-
-    /// Use path-style S3 URLs
-    pub s3_path_style: bool,
+    /// Storage / IO configuration (vended credentials + S3 region/endpoint/path-style).
+    pub io: fluree_db_iceberg::config::IoConfig,
 }
 
 /// How the Iceberg catalog is accessed.
@@ -419,103 +448,227 @@ pub struct IcebergCreateConfig {
 pub enum CatalogMode {
     /// Connect to a REST catalog at the given URI.
     Rest(Box<RestCatalogMode>),
-    /// Read directly from an S3 table location (no REST catalog).
+    /// Read directly from a table location (no REST catalog): an S3 prefix,
+    /// or a local path (`file://` URI / absolute path) for catalog-less
+    /// tables on the local filesystem.
     Direct {
-        /// S3 prefix for the table root directory.
-        /// Example: "s3://bucket/warehouse/my_namespace/my_table"
+        /// Table root directory.
+        /// Examples: "s3://bucket/warehouse/my_namespace/my_table",
+        /// "file:///data/warehouse/my_namespace/my_table"
         table_location: String,
     },
 }
 
 /// REST catalog mode configuration.
+///
+/// This carries only the catalog-connection fields (`catalog_uri` / `warehouse`
+/// / `auth`); the table identifier lives on [`IcebergCreateConfig`] and
+/// vended-credential / S3 IO settings live on
+/// [`IcebergConnectionConfig::io`].
 #[cfg(feature = "iceberg")]
 #[derive(Debug, Clone)]
 pub struct RestCatalogMode {
     /// REST catalog URI
     pub catalog_uri: String,
-    /// Table identifier (e.g., "openflights.airlines")
-    pub table_identifier: String,
     /// Optional warehouse identifier
     pub warehouse: Option<String>,
     /// Authentication configuration
     pub auth: fluree_db_iceberg::auth::AuthConfig,
-    /// Whether to use vended credentials (default: true)
-    pub vended_credentials: bool,
 }
 
 #[cfg(feature = "iceberg")]
-impl IcebergCreateConfig {
-    /// Create a new Iceberg graph source config for REST catalog mode.
-    pub fn new(
-        name: impl Into<String>,
-        catalog_uri: impl Into<String>,
-        table_identifier: impl Into<String>,
-    ) -> Self {
+impl IcebergConnectionConfig {
+    /// Create a REST-catalog connection with default IO (vended credentials on).
+    pub fn rest(catalog_uri: impl Into<String>) -> Self {
         Self {
-            name: name.into(),
-            branch: None,
             catalog_mode: CatalogMode::Rest(Box::new(RestCatalogMode {
                 catalog_uri: catalog_uri.into(),
-                table_identifier: table_identifier.into(),
                 warehouse: None,
                 auth: fluree_db_iceberg::auth::AuthConfig::None,
-                vended_credentials: true,
             })),
-            s3_region: None,
-            s3_endpoint: None,
-            s3_path_style: false,
+            io: fluree_db_iceberg::config::IoConfig::default(),
         }
     }
 
-    /// Create a new Iceberg graph source config for direct S3 access (no REST catalog).
-    pub fn new_direct(name: impl Into<String>, table_location: impl Into<String>) -> Self {
+    /// Create a Direct S3 connection (no REST catalog). Vended credentials are
+    /// forced off — Direct mode uses ambient/IAM credentials.
+    pub fn direct(table_location: impl Into<String>) -> Self {
         Self {
-            name: name.into(),
-            branch: None,
             catalog_mode: CatalogMode::Direct {
                 table_location: table_location.into(),
             },
-            s3_region: None,
-            s3_endpoint: None,
-            s3_path_style: false,
+            io: fluree_db_iceberg::config::IoConfig {
+                vended_credentials: false,
+                ..Default::default()
+            },
         }
     }
 
-    /// Set the branch name.
-    pub fn with_branch(mut self, branch: impl Into<String>) -> Self {
-        self.branch = Some(branch.into());
+    /// Set bearer token authentication (REST mode only).
+    pub fn with_auth_bearer(self, token: impl Into<String>) -> Self {
+        self.with_auth_bearer_value(fluree_db_iceberg::ConfigValue::literal(token.into()))
+    }
+
+    /// Set bearer token authentication from a secret REFERENCE (REST mode only).
+    ///
+    /// `token_ref` is an opaque reference resolved at use time by the injected
+    /// [`SecretResolver`](fluree_db_iceberg::SecretResolver) (see
+    /// [`Fluree::with_secret_resolver`](crate::Fluree::with_secret_resolver)); the
+    /// token value never appears in the stored config. Mirrors
+    /// [`Self::with_auth_bearer`].
+    pub fn with_auth_bearer_token_ref(self, token_ref: impl Into<String>) -> Self {
+        self.with_auth_bearer_value(fluree_db_iceberg::ConfigValue::SecretRef {
+            secret_ref: token_ref.into(),
+        })
+    }
+
+    /// Set bearer token authentication (REST mode only), the token given as a
+    /// literal, a secret reference, or the name of an environment variable of
+    /// the process that reads the tables
+    /// ([`ConfigValue::from_env`](fluree_db_iceberg::ConfigValue::from_env)).
+    /// Only a literal is stored as the token itself.
+    pub fn with_auth_bearer_value(mut self, token: fluree_db_iceberg::ConfigValue) -> Self {
+        if let CatalogMode::Rest(ref mut rest) = self.catalog_mode {
+            rest.auth = fluree_db_iceberg::auth::AuthConfig::Bearer { token };
+        } else {
+            tracing::warn!("bearer auth has no effect in Direct catalog mode");
+        }
         self
     }
 
-    /// Set bearer token authentication (REST mode only).
-    pub fn with_auth_bearer(mut self, token: impl Into<String>) -> Self {
+    /// Set Google metadata-server authentication (REST mode only).
+    ///
+    /// Mints and refreshes short-lived Google OAuth tokens from the GCE/GKE
+    /// metadata server (Workload Identity) — for Google Iceberg REST catalogs
+    /// (BigLake), where a static bearer expires after ~1h. `scopes` is optional
+    /// (defaults to cloud-platform).
+    pub fn with_auth_google_metadata(mut self, scopes: Option<String>) -> Self {
         if let CatalogMode::Rest(ref mut rest) = self.catalog_mode {
-            rest.auth = fluree_db_iceberg::auth::AuthConfig::Bearer {
-                token: fluree_db_iceberg::ConfigValue::literal(token.into()),
+            rest.auth = fluree_db_iceberg::auth::AuthConfig::GoogleMetadata {
+                scopes,
+                metadata_url: None,
             };
         } else {
-            tracing::warn!("with_auth_bearer has no effect in Direct catalog mode");
+            tracing::warn!("with_auth_google_metadata has no effect in Direct catalog mode");
         }
         self
     }
 
     /// Set OAuth2 client credentials authentication (REST mode only).
     pub fn with_auth_oauth2(
-        mut self,
+        self,
         token_url: impl Into<String>,
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
+    ) -> Self {
+        self.with_auth_oauth2_secret_value(
+            token_url,
+            client_id,
+            fluree_db_iceberg::ConfigValue::literal(client_secret.into()),
+        )
+    }
+
+    /// Set OAuth2 client-credentials auth with the client secret supplied as a
+    /// secret REFERENCE (REST mode only).
+    ///
+    /// `client_secret_ref` is an opaque reference resolved at use time by the
+    /// injected [`SecretResolver`](fluree_db_iceberg::SecretResolver); the secret
+    /// value never appears in the stored config. `token_url` and `client_id` are
+    /// non-secret and stored literally. Scope/audience are set separately via
+    /// [`Self::with_oauth2_scope`] / [`Self::with_oauth2_audience`] (call them
+    /// AFTER this). Mirrors [`Self::with_auth_oauth2`].
+    pub fn with_auth_oauth2_client_secret_ref(
+        self,
+        token_url: impl Into<String>,
+        client_id: impl Into<String>,
+        client_secret_ref: impl Into<String>,
+    ) -> Self {
+        self.with_auth_oauth2_secret_value(
+            token_url,
+            client_id,
+            fluree_db_iceberg::ConfigValue::SecretRef {
+                secret_ref: client_secret_ref.into(),
+            },
+        )
+    }
+
+    /// Set OAuth2 client-credentials auth (REST mode only), the client secret
+    /// given as a literal, a secret reference, or the name of an environment
+    /// variable of the process that reads the tables. Scope and audience are
+    /// set afterwards, as for [`Self::with_auth_oauth2`].
+    pub fn with_auth_oauth2_secret_value(
+        mut self,
+        token_url: impl Into<String>,
+        client_id: impl Into<String>,
+        client_secret: fluree_db_iceberg::ConfigValue,
     ) -> Self {
         if let CatalogMode::Rest(ref mut rest) = self.catalog_mode {
             rest.auth = fluree_db_iceberg::auth::AuthConfig::OAuth2ClientCredentials {
                 token_url: token_url.into(),
                 client_id: fluree_db_iceberg::ConfigValue::literal(client_id.into()),
-                client_secret: fluree_db_iceberg::ConfigValue::literal(client_secret.into()),
+                client_secret,
                 scope: None,
                 audience: None,
             };
         } else {
-            tracing::warn!("with_auth_oauth2 has no effect in Direct catalog mode");
+            tracing::warn!("OAuth2 auth has no effect in Direct catalog mode");
+        }
+        self
+    }
+
+    /// Set the OAuth2 `scope` for client-credentials auth (REST + OAuth2 only).
+    ///
+    /// Mutates the existing OAuth2 auth config in place, so call this AFTER
+    /// [`Self::with_auth_oauth2`]. It has no effect (and warns) if OAuth2
+    /// client-credentials auth has not been configured. Required for
+    /// scope-gated REST catalogs such as Snowflake Horizon / Apache Polaris,
+    /// where the catalog session role is selected via
+    /// `scope=session:role:<ROLE>`.
+    pub fn with_oauth2_scope(mut self, scope: impl Into<String>) -> Self {
+        match &mut self.catalog_mode {
+            CatalogMode::Rest(rest) => {
+                if let fluree_db_iceberg::auth::AuthConfig::OAuth2ClientCredentials {
+                    scope: slot,
+                    ..
+                } = &mut rest.auth
+                {
+                    *slot = Some(scope.into());
+                } else {
+                    tracing::warn!(
+                        "with_oauth2_scope has no effect unless OAuth2 client-credentials auth is set first (call with_auth_oauth2)"
+                    );
+                }
+            }
+            CatalogMode::Direct { .. } => {
+                tracing::warn!("with_oauth2_scope has no effect in Direct catalog mode");
+            }
+        }
+        self
+    }
+
+    /// Set the OAuth2 `audience` for client-credentials auth (REST + OAuth2 only).
+    ///
+    /// Mutates the existing OAuth2 auth config in place, so call this AFTER
+    /// [`Self::with_auth_oauth2`]. It has no effect (and warns) if OAuth2
+    /// client-credentials auth has not been configured.
+    pub fn with_oauth2_audience(mut self, audience: impl Into<String>) -> Self {
+        match &mut self.catalog_mode {
+            CatalogMode::Rest(rest) => {
+                if let fluree_db_iceberg::auth::AuthConfig::OAuth2ClientCredentials {
+                    audience: slot,
+                    ..
+                } = &mut rest.auth
+                {
+                    *slot = Some(audience.into());
+                } else {
+                    tracing::warn!(
+                        "with_oauth2_audience has no effect unless OAuth2 client-credentials auth is set first (call with_auth_oauth2)"
+                    );
+                }
+            }
+            CatalogMode::Direct { .. } => {
+                tracing::warn!("with_oauth2_audience has no effect in Direct catalog mode");
+            }
         }
         self
     }
@@ -532,8 +685,8 @@ impl IcebergCreateConfig {
 
     /// Enable or disable vended credentials (REST mode only).
     pub fn with_vended_credentials(mut self, enabled: bool) -> Self {
-        if let CatalogMode::Rest(ref mut rest) = self.catalog_mode {
-            rest.vended_credentials = enabled;
+        if self.is_rest() {
+            self.io.vended_credentials = enabled;
         } else {
             tracing::warn!("with_vended_credentials has no effect in Direct catalog mode");
         }
@@ -542,19 +695,224 @@ impl IcebergCreateConfig {
 
     /// Set S3 region.
     pub fn with_s3_region(mut self, region: impl Into<String>) -> Self {
-        self.s3_region = Some(region.into());
+        self.io.s3_region = Some(region.into());
         self
     }
 
     /// Set S3 endpoint (for MinIO, LocalStack).
     pub fn with_s3_endpoint(mut self, endpoint: impl Into<String>) -> Self {
-        self.s3_endpoint = Some(endpoint.into());
+        self.io.s3_endpoint = Some(endpoint.into());
         self
     }
 
     /// Enable path-style S3 URLs.
     pub fn with_s3_path_style(mut self, enabled: bool) -> Self {
-        self.s3_path_style = enabled;
+        self.io.s3_path_style = enabled;
+        self
+    }
+
+    /// Get the catalog URI (for REST mode) or table location (for direct mode).
+    pub fn catalog_uri_or_location(&self) -> &str {
+        match &self.catalog_mode {
+            CatalogMode::Rest(rest) => &rest.catalog_uri,
+            CatalogMode::Direct { table_location } => table_location,
+        }
+    }
+
+    /// Returns `true` if this connection uses REST catalog mode.
+    pub fn is_rest(&self) -> bool {
+        matches!(self.catalog_mode, CatalogMode::Rest(_))
+    }
+
+    /// Returns `true` if this connection uses direct S3 catalog mode.
+    pub fn is_direct(&self) -> bool {
+        matches!(self.catalog_mode, CatalogMode::Direct { .. })
+    }
+}
+
+#[cfg(feature = "iceberg")]
+impl IcebergCreateConfig {
+    /// Create a new Iceberg graph source config for REST catalog mode.
+    pub fn new(
+        name: impl Into<String>,
+        catalog_uri: impl Into<String>,
+        table_identifier: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            branch: None,
+            connection: IcebergConnectionConfig::rest(catalog_uri),
+            table_identifier: table_identifier.into(),
+            delete_convention: None,
+            model: None,
+            default_allow: None,
+            order_by: None,
+        }
+    }
+
+    /// Create a new Iceberg graph source config for direct S3 access (no REST catalog).
+    pub fn new_direct(name: impl Into<String>, table_location: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            branch: None,
+            connection: IcebergConnectionConfig::direct(table_location),
+            table_identifier: String::new(),
+            delete_convention: None,
+            model: None,
+            default_allow: None,
+            order_by: None,
+        }
+    }
+
+    /// Set the branch name.
+    pub fn with_branch(mut self, branch: impl Into<String>) -> Self {
+        self.branch = Some(branch.into());
+        self
+    }
+
+    /// Set bearer token authentication (REST mode only).
+    pub fn with_auth_bearer(mut self, token: impl Into<String>) -> Self {
+        self.connection = self.connection.with_auth_bearer(token);
+        self
+    }
+
+    /// Use the GCE/GKE metadata server for refreshable Google catalog auth
+    /// (REST mode only). See [`IcebergConnectionConfig::with_auth_google_metadata`].
+    pub fn with_auth_google_metadata(mut self, scopes: Option<String>) -> Self {
+        self.connection = self.connection.with_auth_google_metadata(scopes);
+        self
+    }
+
+    /// Set OAuth2 client credentials authentication (REST mode only).
+    pub fn with_auth_oauth2(
+        mut self,
+        token_url: impl Into<String>,
+        client_id: impl Into<String>,
+        client_secret: impl Into<String>,
+    ) -> Self {
+        self.connection = self
+            .connection
+            .with_auth_oauth2(token_url, client_id, client_secret);
+        self
+    }
+
+    /// See [`IcebergConnectionConfig::with_auth_bearer_value`].
+    pub fn with_auth_bearer_value(mut self, token: fluree_db_iceberg::ConfigValue) -> Self {
+        self.connection = self.connection.with_auth_bearer_value(token);
+        self
+    }
+
+    /// See [`IcebergConnectionConfig::with_auth_oauth2_secret_value`].
+    pub fn with_auth_oauth2_secret_value(
+        mut self,
+        token_url: impl Into<String>,
+        client_id: impl Into<String>,
+        client_secret: fluree_db_iceberg::ConfigValue,
+    ) -> Self {
+        self.connection =
+            self.connection
+                .with_auth_oauth2_secret_value(token_url, client_id, client_secret);
+        self
+    }
+
+    /// Set bearer authentication from a secret *reference* (REST mode only).
+    /// See [`IcebergConnectionConfig::with_auth_bearer_token_ref`].
+    pub fn with_auth_bearer_token_ref(mut self, token_ref: impl Into<String>) -> Self {
+        self.connection = self.connection.with_auth_bearer_token_ref(token_ref);
+        self
+    }
+
+    /// Set OAuth2 client-credentials authentication with the client secret as a
+    /// secret *reference* (REST mode only). See
+    /// [`IcebergConnectionConfig::with_auth_oauth2_client_secret_ref`].
+    pub fn with_auth_oauth2_client_secret_ref(
+        mut self,
+        token_url: impl Into<String>,
+        client_id: impl Into<String>,
+        client_secret_ref: impl Into<String>,
+    ) -> Self {
+        self.connection = self.connection.with_auth_oauth2_client_secret_ref(
+            token_url,
+            client_id,
+            client_secret_ref,
+        );
+        self
+    }
+
+    /// Set the OAuth2 `scope` for client-credentials auth (REST + OAuth2 only).
+    ///
+    /// Call after [`Self::with_auth_oauth2`]. See
+    /// [`IcebergConnectionConfig::with_oauth2_scope`].
+    pub fn with_oauth2_scope(mut self, scope: impl Into<String>) -> Self {
+        self.connection = self.connection.with_oauth2_scope(scope);
+        self
+    }
+
+    /// Set the OAuth2 `audience` for client-credentials auth (REST + OAuth2 only).
+    ///
+    /// Call after [`Self::with_auth_oauth2`]. See
+    /// [`IcebergConnectionConfig::with_oauth2_audience`].
+    pub fn with_oauth2_audience(mut self, audience: impl Into<String>) -> Self {
+        self.connection = self.connection.with_oauth2_audience(audience);
+        self
+    }
+
+    /// Set the warehouse identifier (REST mode only).
+    pub fn with_warehouse(mut self, warehouse: impl Into<String>) -> Self {
+        self.connection = self.connection.with_warehouse(warehouse);
+        self
+    }
+
+    /// Enable or disable vended credentials (REST mode only).
+    pub fn with_vended_credentials(mut self, enabled: bool) -> Self {
+        self.connection = self.connection.with_vended_credentials(enabled);
+        self
+    }
+
+    /// Set S3 region.
+    pub fn with_s3_region(mut self, region: impl Into<String>) -> Self {
+        self.connection = self.connection.with_s3_region(region);
+        self
+    }
+
+    /// Set S3 endpoint (for MinIO, LocalStack).
+    pub fn with_s3_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.connection = self.connection.with_s3_endpoint(endpoint);
+        self
+    }
+
+    /// Enable path-style S3 URLs.
+    pub fn with_s3_path_style(mut self, enabled: bool) -> Self {
+        self.connection = self.connection.with_s3_path_style(enabled);
+        self
+    }
+
+    /// Set the tombstone/delete convention used during materialization.
+    pub fn with_delete_convention(
+        mut self,
+        convention: fluree_db_iceberg::DeleteConvention,
+    ) -> Self {
+        self.delete_convention = Some(convention);
+        self
+    }
+
+    /// Set the ordering column for latest-by-key materialization.
+    pub fn with_order_by(mut self, column: impl Into<String>) -> Self {
+        self.order_by = Some(column.into());
+        self
+    }
+
+    /// Reference a model ledger whose default graph holds this source's view
+    /// policies and `rdfs:subClassOf` / `rdfs:subPropertyOf` hierarchy.
+    pub fn with_model(mut self, ledger: impl Into<String>) -> Self {
+        self.model = Some(ledger.into());
+        self
+    }
+
+    /// Declare the fallback for governed requests that match no policy: `true`
+    /// keeps the source readable under authentication without a model.
+    pub fn with_default_allow(mut self, allow: bool) -> Self {
+        self.default_allow = Some(allow);
         self
     }
 
@@ -570,16 +928,13 @@ impl IcebergCreateConfig {
 
     /// Get the catalog URI (for REST mode) or table location (for direct mode).
     pub fn catalog_uri_or_location(&self) -> &str {
-        match &self.catalog_mode {
-            CatalogMode::Rest(rest) => &rest.catalog_uri,
-            CatalogMode::Direct { table_location } => table_location,
-        }
+        self.connection.catalog_uri_or_location()
     }
 
     /// Get the table identifier string (for REST mode), or derive from location (for direct mode).
     pub fn table_identifier_display(&self) -> String {
-        match &self.catalog_mode {
-            CatalogMode::Rest(rest) => rest.table_identifier.clone(),
+        match &self.connection.catalog_mode {
+            CatalogMode::Rest(_) => self.table_identifier.clone(),
             CatalogMode::Direct { table_location } => {
                 let path = table_location
                     .trim_start_matches("s3://")
@@ -600,9 +955,9 @@ impl IcebergCreateConfig {
 
     /// Convert to the internal IcebergGsConfig structure for storage.
     pub fn to_iceberg_gs_config(&self) -> IcebergGsConfig {
-        use fluree_db_iceberg::config::{CatalogConfig, IoConfig, TableConfig};
+        use fluree_db_iceberg::config::{CatalogConfig, TableConfig};
 
-        match &self.catalog_mode {
+        match &self.connection.catalog_mode {
             CatalogMode::Rest(rest) => IcebergGsConfig {
                 catalog: CatalogConfig::Rest {
                     catalog_type: "polaris".to_string(),
@@ -610,26 +965,29 @@ impl IcebergCreateConfig {
                     auth: rest.auth.clone(),
                     warehouse: rest.warehouse.clone(),
                 },
-                table: TableConfig::Identifier(rest.table_identifier.clone()),
-                io: IoConfig {
-                    vended_credentials: rest.vended_credentials,
-                    s3_region: self.s3_region.clone(),
-                    s3_endpoint: self.s3_endpoint.clone(),
-                    s3_path_style: self.s3_path_style,
-                },
+                table: TableConfig::Identifier(self.table_identifier.clone()),
+                io: self.connection.io.clone(),
                 mapping: None,
+                delete: self.delete_convention.clone(),
+                order_by: self.order_by.clone(),
+                model: self.model.clone(),
+                default_allow: self.default_allow,
             },
-            CatalogMode::Direct { table_location } => IcebergGsConfig {
-                catalog: CatalogConfig::direct(table_location),
-                table: TableConfig::Identifier(String::new()),
-                io: IoConfig {
-                    vended_credentials: false,
-                    s3_region: self.s3_region.clone(),
-                    s3_endpoint: self.s3_endpoint.clone(),
-                    s3_path_style: self.s3_path_style,
-                },
-                mapping: None,
-            },
+            CatalogMode::Direct { table_location } => {
+                // Direct never uses vended credentials, regardless of the io flag.
+                let mut io = self.connection.io.clone();
+                io.vended_credentials = false;
+                IcebergGsConfig {
+                    catalog: CatalogConfig::direct(table_location),
+                    table: TableConfig::Identifier(String::new()),
+                    io,
+                    mapping: None,
+                    delete: self.delete_convention.clone(),
+                    order_by: self.order_by.clone(),
+                    model: self.model.clone(),
+                    default_allow: self.default_allow,
+                }
+            }
         }
     }
 
@@ -638,6 +996,9 @@ impl IcebergCreateConfig {
         if self.name.trim().is_empty() {
             return Err(crate::ApiError::config("Graph source name cannot be empty"));
         }
+        if self.model.as_deref().is_some_and(|m| m.trim().is_empty()) {
+            return Err(crate::ApiError::config("model ledger id cannot be empty"));
+        }
 
         if self.name.contains(':') {
             return Err(crate::ApiError::config(
@@ -645,16 +1006,16 @@ impl IcebergCreateConfig {
             ));
         }
 
-        match &self.catalog_mode {
+        match &self.connection.catalog_mode {
             CatalogMode::Rest(rest) => {
                 if rest.catalog_uri.trim().is_empty() {
                     return Err(crate::ApiError::config("Catalog URI cannot be empty"));
                 }
-                if rest.table_identifier.trim().is_empty() {
+                if self.table_identifier.trim().is_empty() {
                     return Err(crate::ApiError::config("Table identifier cannot be empty"));
                 }
                 use fluree_db_iceberg::catalog::parse_table_identifier;
-                parse_table_identifier(&rest.table_identifier).map_err(|e| {
+                parse_table_identifier(&self.table_identifier).map_err(|e| {
                     crate::ApiError::config(format!("Invalid table identifier: {e}"))
                 })?;
             }
@@ -664,12 +1025,33 @@ impl IcebergCreateConfig {
                         "Table location cannot be empty for direct catalog mode",
                     ));
                 }
-                if !table_location.starts_with("s3://") && !table_location.starts_with("s3a://") {
+                let is_object_store =
+                    table_location.starts_with("s3://") || table_location.starts_with("s3a://");
+                // Local catalog-less tables: `file://` URIs (incl. the
+                // `file:/abs` single-slash variant) or bare absolute paths.
+                // Mirrors `fluree_db_iceberg::config`'s Direct validation.
+                let is_local = fluree_db_iceberg::is_local_location(table_location);
+                if !is_object_store && !is_local {
                     return Err(crate::ApiError::config(format!(
-                        "Direct catalog table_location must be an S3 URI (s3:// or s3a://), got: {table_location}"
+                        "Direct catalog table_location must be an S3 URI (s3:// or s3a://), a \
+                         file:// URI, or an absolute local path, got: {table_location}"
                     )));
                 }
+                // Local locations are fail-closed behind the operator allowlist
+                // (`FLUREE_ICEBERG_LOCAL_ROOTS`). Both validation gates enforce
+                // it — this one and `fluree_db_iceberg::config` — because a
+                // config can reach either first.
+                fluree_db_iceberg::ensure_local_location_allowed(table_location)
+                    .map_err(|e| crate::ApiError::config(e.to_string()))?;
             }
+        }
+
+        // Validate the tombstone/delete convention at creation time rather than
+        // deferring to the first materialize scan.
+        if let Some(delete) = &self.delete_convention {
+            delete
+                .validate()
+                .map_err(|e| crate::ApiError::config(format!("Invalid delete convention: {e}")))?;
         }
 
         Ok(())
@@ -677,12 +1059,12 @@ impl IcebergCreateConfig {
 
     /// Returns `true` if this config uses REST catalog mode.
     pub fn is_rest(&self) -> bool {
-        matches!(self.catalog_mode, CatalogMode::Rest(_))
+        self.connection.is_rest()
     }
 
     /// Returns `true` if this config uses direct S3 catalog mode.
     pub fn is_direct(&self) -> bool {
-        matches!(self.catalog_mode, CatalogMode::Direct { .. })
+        self.connection.is_direct()
     }
 }
 
@@ -738,6 +1120,18 @@ pub struct R2rmlCreateConfig {
 
 #[cfg(feature = "iceberg")]
 impl R2rmlCreateConfig {
+    /// See [`IcebergCreateConfig::with_model`].
+    pub fn with_model(mut self, ledger: impl Into<String>) -> Self {
+        self.iceberg.model = Some(ledger.into());
+        self
+    }
+
+    /// See [`IcebergCreateConfig::with_default_allow`].
+    pub fn with_default_allow(mut self, allow: bool) -> Self {
+        self.iceberg.default_allow = Some(allow);
+        self
+    }
+
     /// Create a new R2RML graph source config with REST catalog and inline mapping.
     pub fn new(
         name: impl Into<String>,
@@ -777,6 +1171,13 @@ impl R2rmlCreateConfig {
         self
     }
 
+    /// Set Google metadata-server authentication (GKE Workload Identity), with
+    /// automatic token refresh. See [`IcebergCreateConfig::with_auth_google_metadata`].
+    pub fn with_auth_google_metadata(mut self, scopes: Option<String>) -> Self {
+        self.iceberg = self.iceberg.with_auth_google_metadata(scopes);
+        self
+    }
+
     /// Set OAuth2 client credentials authentication.
     pub fn with_auth_oauth2(
         mut self,
@@ -787,6 +1188,48 @@ impl R2rmlCreateConfig {
         self.iceberg = self
             .iceberg
             .with_auth_oauth2(token_url, client_id, client_secret);
+        self
+    }
+
+    /// Set bearer authentication from a secret *reference*.
+    /// See [`IcebergConnectionConfig::with_auth_bearer_token_ref`].
+    pub fn with_auth_bearer_token_ref(mut self, token_ref: impl Into<String>) -> Self {
+        self.iceberg = self.iceberg.with_auth_bearer_token_ref(token_ref);
+        self
+    }
+
+    /// Set OAuth2 client-credentials authentication with the client secret as a
+    /// secret *reference*. See
+    /// [`IcebergConnectionConfig::with_auth_oauth2_client_secret_ref`].
+    pub fn with_auth_oauth2_client_secret_ref(
+        mut self,
+        token_url: impl Into<String>,
+        client_id: impl Into<String>,
+        client_secret_ref: impl Into<String>,
+    ) -> Self {
+        self.iceberg = self.iceberg.with_auth_oauth2_client_secret_ref(
+            token_url,
+            client_id,
+            client_secret_ref,
+        );
+        self
+    }
+
+    /// Set the OAuth2 `scope` (delegates to the underlying Iceberg config).
+    ///
+    /// Call after [`Self::with_auth_oauth2`]. See
+    /// [`IcebergCreateConfig::with_oauth2_scope`].
+    pub fn with_oauth2_scope(mut self, scope: impl Into<String>) -> Self {
+        self.iceberg = self.iceberg.with_oauth2_scope(scope);
+        self
+    }
+
+    /// Set the OAuth2 `audience` (delegates to the underlying Iceberg config).
+    ///
+    /// Call after [`Self::with_auth_oauth2`]. See
+    /// [`IcebergCreateConfig::with_oauth2_audience`].
+    pub fn with_oauth2_audience(mut self, audience: impl Into<String>) -> Self {
+        self.iceberg = self.iceberg.with_oauth2_audience(audience);
         self
     }
 
@@ -826,6 +1269,21 @@ impl R2rmlCreateConfig {
         self
     }
 
+    /// Set the tombstone/delete convention used during materialization.
+    pub fn with_delete_convention(
+        mut self,
+        convention: fluree_db_iceberg::DeleteConvention,
+    ) -> Self {
+        self.iceberg = self.iceberg.with_delete_convention(convention);
+        self
+    }
+
+    /// Set the ordering column for latest-by-key materialization.
+    pub fn with_order_by(mut self, column: impl Into<String>) -> Self {
+        self.iceberg = self.iceberg.with_order_by(column);
+        self
+    }
+
     /// Get the graph source ID (name:branch).
     pub fn graph_source_id(&self) -> String {
         self.iceberg.graph_source_id()
@@ -836,9 +1294,21 @@ impl R2rmlCreateConfig {
     /// `mapping_address` is the CAS address where the mapping was stored.
     pub fn to_iceberg_gs_config(&self, mapping_address: &str) -> IcebergGsConfig {
         let mut config = self.iceberg.to_iceberg_gs_config();
+        // Persist a concrete, resolved media type so the query path reuses it
+        // instead of re-defaulting a `null` to JSON-LD (issue #1397). An explicit
+        // media type is kept verbatim; an omitted one is filled with the resolved
+        // default (Turtle for inline/CID mappings). This needs no migration:
+        // `MappingSource::media_type` is already `Option<String>` with serde
+        // `default`, so pre-existing `null` records still deserialize and are
+        // fixed in place by the query-side default.
+        let media_type = self.mapping_media_type.clone().unwrap_or_else(|| {
+            fluree_db_r2rml::loader::MappingFormat::resolve(None, mapping_address)
+                .media_type()
+                .to_string()
+        });
         config.mapping = Some(fluree_db_iceberg::config::MappingSource {
             source: mapping_address.to_string(),
-            media_type: self.mapping_media_type.clone(),
+            media_type: Some(media_type),
         });
         config
     }
@@ -981,5 +1451,237 @@ mod tests {
         // selectOne is also valid
         let config = Bm25CreateConfig::new("search", "docs:main", json!({"selectOne": ["?x"]}));
         assert!(config.validate().is_ok());
+    }
+
+    #[cfg(feature = "iceberg")]
+    fn oauth2_auth(config: &IcebergCreateConfig) -> &fluree_db_iceberg::auth::AuthConfig {
+        match &config.connection.catalog_mode {
+            CatalogMode::Rest(rest) => &rest.auth,
+            CatalogMode::Direct { .. } => panic!("expected REST catalog mode"),
+        }
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn test_iceberg_with_oauth2_scope_and_audience() {
+        let config = IcebergCreateConfig::new("gs", "https://catalog.example.com", "ns.tbl")
+            .with_auth_oauth2("https://catalog.example.com/v1/oauth/tokens", "", "secret")
+            .with_oauth2_scope("session:role:ICEBERG_READER")
+            .with_oauth2_audience("polaris");
+
+        match oauth2_auth(&config) {
+            fluree_db_iceberg::auth::AuthConfig::OAuth2ClientCredentials {
+                scope,
+                audience,
+                ..
+            } => {
+                assert_eq!(scope.as_deref(), Some("session:role:ICEBERG_READER"));
+                assert_eq!(audience.as_deref(), Some("polaris"));
+            }
+            other => panic!("expected OAuth2 auth, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "iceberg")]
+    fn conn_auth(conn: &IcebergConnectionConfig) -> &fluree_db_iceberg::auth::AuthConfig {
+        match &conn.catalog_mode {
+            CatalogMode::Rest(rest) => &rest.auth,
+            CatalogMode::Direct { .. } => panic!("expected REST catalog mode"),
+        }
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn bearer_token_ref_builder_stores_secret_ref() {
+        let conn = IcebergConnectionConfig::rest("https://catalog.example.com")
+            .with_auth_bearer_token_ref("vault://team/bearer");
+        match conn_auth(&conn) {
+            fluree_db_iceberg::auth::AuthConfig::Bearer { token } => assert_eq!(
+                *token,
+                fluree_db_iceberg::ConfigValue::SecretRef {
+                    secret_ref: "vault://team/bearer".to_string()
+                }
+            ),
+            other => panic!("expected Bearer auth, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn oauth2_client_secret_ref_builder_stores_secret_ref_and_literal_id() {
+        let conn = IcebergConnectionConfig::rest("https://catalog.example.com")
+            .with_auth_oauth2_client_secret_ref(
+                "https://catalog.example.com/v1/oauth/tokens",
+                "svc-client",
+                "vault://team/client-secret",
+            );
+        match conn_auth(&conn) {
+            fluree_db_iceberg::auth::AuthConfig::OAuth2ClientCredentials {
+                client_id,
+                client_secret,
+                ..
+            } => {
+                // client_id is non-secret and stored as a plain literal.
+                assert_eq!(client_id.resolve().unwrap(), "svc-client");
+                // client_secret is stored as an opaque SecretRef, never a literal.
+                assert_eq!(
+                    *client_secret,
+                    fluree_db_iceberg::ConfigValue::SecretRef {
+                        secret_ref: "vault://team/client-secret".to_string()
+                    }
+                );
+            }
+            other => panic!("expected OAuth2 auth, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn debug_of_connection_config_redacts_secrets() {
+        // A future `{:?}` on the connection (in a log or error) must not leak the
+        // bearer token or the OAuth2 client secret it transitively holds via the
+        // `AuthConfig` -> `ConfigValue` chain.
+        let bearer = IcebergConnectionConfig::rest("https://catalog.example.com")
+            .with_auth_bearer("super-secret-bearer-token");
+        let dbg = format!("{bearer:?}");
+        assert!(
+            !dbg.contains("super-secret-bearer-token"),
+            "bearer token leaked in Debug: {dbg}"
+        );
+
+        let oauth = IcebergConnectionConfig::rest("https://catalog.example.com").with_auth_oauth2(
+            "https://catalog.example.com/v1/oauth/tokens",
+            "client-id-ok-to-show",
+            "super-secret-oauth-secret",
+        );
+        let dbg = format!("{oauth:?}");
+        assert!(
+            !dbg.contains("super-secret-oauth-secret"),
+            "oauth client_secret leaked in Debug: {dbg}"
+        );
+
+        // The same guarantee must hold one level up, on IcebergCreateConfig,
+        // whose derived Debug prints the connection.
+        let create = IcebergCreateConfig::new("gs", "https://catalog.example.com", "ns.tbl")
+            .with_auth_bearer("super-secret-bearer-token");
+        assert!(
+            !format!("{create:?}").contains("super-secret-bearer-token"),
+            "bearer token leaked in IcebergCreateConfig Debug"
+        );
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn test_oauth2_scope_setter_warns_without_oauth2() {
+        // Bearer auth set, scope setter should be a no-op (and not panic).
+        let config = IcebergCreateConfig::new("gs", "https://catalog.example.com", "ns.tbl")
+            .with_auth_bearer("tok")
+            .with_oauth2_scope("session:role:READER");
+        assert!(matches!(
+            oauth2_auth(&config),
+            fluree_db_iceberg::auth::AuthConfig::Bearer { .. }
+        ));
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn test_iceberg_oauth2_scope_roundtrip_no_migration() {
+        // Locks the "no migration" claim: scope/audience survive the
+        // to_iceberg_gs_config -> serialize -> deserialize round-trip that the
+        // persistence layer performs.
+        let config = IcebergCreateConfig::new("gs", "https://catalog.example.com", "ns.tbl")
+            .with_auth_oauth2(
+                "https://catalog.example.com/v1/oauth/tokens",
+                "client",
+                "secret",
+            )
+            .with_oauth2_scope("session:role:ICEBERG_READER")
+            .with_oauth2_audience("polaris");
+
+        let gs = config.to_iceberg_gs_config();
+        let serialized = serde_json::to_string(&gs).unwrap();
+        let back: IcebergGsConfig = serde_json::from_str(&serialized).unwrap();
+
+        match back.catalog {
+            fluree_db_iceberg::config::CatalogConfig::Rest { auth, .. } => match auth {
+                fluree_db_iceberg::auth::AuthConfig::OAuth2ClientCredentials {
+                    scope,
+                    audience,
+                    ..
+                } => {
+                    assert_eq!(scope.as_deref(), Some("session:role:ICEBERG_READER"));
+                    assert_eq!(audience.as_deref(), Some("polaris"));
+                }
+                other => panic!("expected OAuth2 auth after round-trip, got {other:?}"),
+            },
+            other => panic!("expected REST catalog after round-trip, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn test_r2rml_with_oauth2_scope_delegates() {
+        let config = R2rmlCreateConfig::new(
+            "gs",
+            "https://catalog.example.com",
+            "ns.tbl",
+            "@prefix rr: <http://www.w3.org/ns/r2rml#> .",
+        )
+        .with_auth_oauth2("https://catalog.example.com/v1/oauth/tokens", "", "secret")
+        .with_oauth2_scope("session:role:ICEBERG_READER")
+        .with_oauth2_audience("polaris");
+
+        match oauth2_auth(&config.iceberg) {
+            fluree_db_iceberg::auth::AuthConfig::OAuth2ClientCredentials {
+                scope,
+                audience,
+                ..
+            } => {
+                assert_eq!(scope.as_deref(), Some("session:role:ICEBERG_READER"));
+                assert_eq!(audience.as_deref(), Some("polaris"));
+            }
+            other => panic!("expected OAuth2 auth, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn test_r2rml_persists_resolved_media_type_no_migration() {
+        // Issue #1397: an omitted media type must be persisted as a concrete
+        // `text/turtle` (not `null`) so the query path reuses it; an explicit
+        // media type is preserved verbatim. The value survives the
+        // to_iceberg_gs_config -> serialize -> deserialize round-trip with no
+        // schema migration (`MappingSource::media_type` is `Option` + serde
+        // `default`).
+        let cid = "bagiibqexampleciddoesnotendwithanextension";
+        let mapping = "@prefix rr: <http://www.w3.org/ns/r2rml#> .";
+
+        // No explicit media type -> the resolved Turtle default is persisted.
+        let config = R2rmlCreateConfig::new("gs", "https://catalog.example.com", "ns.tbl", mapping);
+        let gs = config.to_iceberg_gs_config(cid);
+        assert_eq!(
+            gs.mapping.as_ref().and_then(|m| m.media_type.as_deref()),
+            Some("text/turtle"),
+            "an omitted media type must be filled with the resolved Turtle default"
+        );
+
+        // ...and survives serialize -> deserialize unchanged (no migration).
+        let serialized = serde_json::to_string(&gs).unwrap();
+        let back: IcebergGsConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(
+            back.mapping.as_ref().and_then(|m| m.media_type.as_deref()),
+            Some("text/turtle")
+        );
+
+        // An explicit media type is preserved verbatim.
+        let explicit =
+            R2rmlCreateConfig::new("gs", "https://catalog.example.com", "ns.tbl", mapping)
+                .with_mapping_media_type("application/ld+json");
+        let gs = explicit.to_iceberg_gs_config(cid);
+        assert_eq!(
+            gs.mapping.as_ref().and_then(|m| m.media_type.as_deref()),
+            Some("application/ld+json"),
+            "an explicit media type must be preserved"
+        );
     }
 }

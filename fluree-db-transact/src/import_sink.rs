@@ -24,6 +24,8 @@
 
 mod inner {
     use crate::commit_v2::StreamingCommitWriter;
+    use crate::datatype_limit::MAX_NON_RESERVED_DATATYPES;
+    use crate::error::TransactError;
     use crate::generate::{infer_datatype, DT_ID, DT_JSON};
     use crate::namespace::{NamespaceRegistry, NsAllocator, SharedNamespaceAllocator, WorkerCache};
     use crate::value_convert::{convert_native_literal, convert_string_literal};
@@ -33,12 +35,12 @@ mod inner {
     use fluree_db_core::subject_id::SubjectId;
     use fluree_db_core::value_id::{ObjKey, ObjKind};
     use fluree_db_core::DatatypeConstraint;
-    use fluree_db_core::{Flake, FlakeMeta, FlakeValue, GraphId, Sid};
+    use fluree_db_core::{DatatypeDictId, Flake, FlakeMeta, FlakeValue, GraphId, Sid};
     use fluree_db_indexer::run_index::chunk_dict::{ChunkStringDict, ChunkSubjectDict};
     use fluree_db_indexer::run_index::global_dict::{DictWorkerCache, SharedDictAllocator};
     use fluree_db_indexer::run_index::shared_pool::{SharedNumBigPool, SharedVectorArenaPool};
     use fluree_db_indexer::run_index::spool::{SpoolFileInfo, SpoolWriter};
-    use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, TermId};
+    use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
     use rustc_hash::FxHashMap;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -76,7 +78,10 @@ mod inner {
     // -----------------------------------------------------------------------
 
     /// Configuration for creating a [`SpoolContext`] — bundles all shared
-    /// allocators needed by the parallel import pipeline.
+    /// allocators needed by the parallel import pipeline. All fields are `Arc`, so
+    /// `Clone` is cheap (a handle bump) — the materialize worker pool hands each
+    /// worker its own clone.
+    #[derive(Clone)]
     pub struct SpoolConfig {
         /// Shared predicate allocator (global IDs, no remap).
         pub predicate_alloc: Arc<SharedDictAllocator>,
@@ -94,6 +99,16 @@ mod inner {
         /// the version of the root written for the import (same source) so inline
         /// decimals and the root format agree.
         pub decimal_encoding: fluree_db_core::DecimalEncoding,
+        /// Sticky: some record written through this config carried an RDF-list
+        /// position. Set once per chunk at [`SpoolContext::finish`] /
+        /// [`SpoolContext::finish_buffered`] from a plain per-chunk bool, so
+        /// the per-record path stays free of atomic traffic. Read at root
+        /// assembly to fill `IndexRoot.has_list_meta` exactly instead of
+        /// leaving it untracked — that is what lets filtered-DELETE staging
+        /// skip list-meta hydration on bulk-imported ledgers.
+        ///
+        /// Only ever set to `true`; the caller starts it `false` per import.
+        pub saw_list_meta: Arc<std::sync::atomic::AtomicBool>,
     }
 
     /// Result of finishing a [`SpoolContext`] via [`SpoolContext::finish`] —
@@ -164,6 +179,12 @@ mod inner {
         /// Decimal-encoding policy (from `SpoolConfig`): under `InlineWhenFits`,
         /// small exact decimals encode inline instead of via the numbig pool.
         decimal_encoding: fluree_db_core::DecimalEncoding,
+        /// Per-chunk mirror of `SpoolConfig::saw_list_meta` — a plain bool so
+        /// `write_record` never touches the shared atomic. Folded in at
+        /// finish.
+        saw_list_meta: bool,
+        /// The shared sticky bit this chunk folds into at finish.
+        saw_list_meta_shared: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl SpoolContext {
@@ -194,6 +215,8 @@ mod inner {
                 decimal_encoding: config.decimal_encoding,
                 next_lang_id: 1, // 0 = no language tag
                 g_id,
+                saw_list_meta: false,
+                saw_list_meta_shared: Arc::clone(&config.saw_list_meta),
             })
         }
 
@@ -208,6 +231,7 @@ mod inner {
         /// dictionaries for the merge phase. This is the backward-compatible path
         /// used by the existing import pipeline.
         pub fn finish(self) -> Result<SpoolResult, std::io::Error> {
+            self.publish_list_meta();
             let mut writer = SpoolWriter::new(&self.spool_path, self.chunk_idx)?;
             for record in &self.records {
                 writer.push(record)?;
@@ -226,12 +250,37 @@ mod inner {
         /// contains all records with chunk-local IDs ready for post-parse
         /// sorting and sorted commit file writing.
         pub fn finish_buffered(self) -> BufferedSpoolResult {
+            self.publish_list_meta();
             BufferedSpoolResult {
                 records: self.records,
                 subjects: self.subjects,
                 strings: self.strings,
                 languages: self.languages,
                 chunk_idx: self.chunk_idx,
+            }
+        }
+
+        /// Fold this chunk's list-position observation into the shared sticky
+        /// bit. Called from both finish paths.
+        ///
+        /// A context can also be dropped without finishing: every call site
+        /// has a `?` on the parse and on `into_parts()` between construction
+        /// and finish, and either one drops the sink with the context still
+        /// inside it. What makes a `Some(false)` root safe is therefore NOT
+        /// "every context finishes" but "a context that doesn't finish means
+        /// no root": both of those errors propagate a `TransactError` that
+        /// aborts the whole import, so there is no root assembled to record a
+        /// wrong flag into. A future change that tolerates per-chunk failures
+        /// would break that and has to publish the bit some other way — a
+        /// wrongly-`false` root silently skips list-meta hydration.
+        ///
+        /// Relaxed is enough: the store happens-before the join that collects
+        /// the chunk results, and the root-assembly read happens after every
+        /// worker has been joined.
+        fn publish_list_meta(&self) {
+            if self.saw_list_meta {
+                self.saw_list_meta_shared
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
@@ -244,6 +293,43 @@ mod inner {
                 .get_or_insert(sid.namespace_code, sid.name.as_bytes())
         }
 
+        /// Resolve a namespace code to its prefix via the shared allocator,
+        /// caching the result.
+        ///
+        /// A miss for a real (non-OVERFLOW) code means an importer allocated
+        /// the code outside the shared allocator — the dict entry would then
+        /// permanently store a suffix-only string ("name" instead of
+        /// "http://schema.org/name"), silently breaking bound-predicate
+        /// lookups on the imported ledger. Panic in debug so tests catch it;
+        /// warn in release. (OVERFLOW Sids legitimately carry the full IRI in
+        /// `name`, so an empty prefix is correct for them.)
+        fn cache_prefix(&mut self, code: u16) {
+            if self.ns_prefix_cache.contains_key(&code) {
+                return;
+            }
+            let prefix = match self.ns_alloc.get_prefix(code) {
+                Some(p) => p,
+                None => {
+                    debug_assert!(
+                        code >= fluree_vocab::namespaces::OVERFLOW,
+                        "namespace code {code} not registered in the shared allocator — \
+                         the spool dict would store a suffix-only string; allocate import \
+                         codes through the SpoolConfig's ns_alloc (see import_commit)"
+                    );
+                    #[cfg(not(debug_assertions))]
+                    if code < fluree_vocab::namespaces::OVERFLOW {
+                        tracing::warn!(
+                            code,
+                            "namespace code missing from shared allocator; spool dict entry \
+                             will store a bare suffix and bound lookups on it will miss"
+                        );
+                    }
+                    String::new()
+                }
+            };
+            self.ns_prefix_cache.insert(code, prefix);
+        }
+
         /// Assign a global predicate ID via `DictWorkerCache`.
         fn assign_predicate_id(&mut self, sid: &Sid) -> u32 {
             // Look up the namespace prefix, then use parts-based insertion
@@ -253,10 +339,7 @@ mod inner {
             // because that would borrow the whole `SpoolContext` mutably and
             // prevent a simultaneous mutable borrow of `self.predicates`.
             let code = sid.namespace_code;
-            if !self.ns_prefix_cache.contains_key(&code) {
-                let prefix = self.ns_alloc.get_prefix(code).unwrap_or_default();
-                self.ns_prefix_cache.insert(code, prefix);
-            }
+            self.cache_prefix(code);
             let prefix = self
                 .ns_prefix_cache
                 .get(&code)
@@ -266,18 +349,29 @@ mod inner {
         }
 
         /// Assign a global datatype ID via `DictWorkerCache`.
-        fn assign_datatype_id(&mut self, sid: &Sid) -> u16 {
+        ///
+        /// Fails once the import holds more non-reserved datatypes than a
+        /// ledger can, so no record carries an ID the index cannot store.
+        fn assign_datatype_id(&mut self, sid: &Sid) -> Result<u16, CommitCodecError> {
             let code = sid.namespace_code;
-            if !self.ns_prefix_cache.contains_key(&code) {
-                let prefix = self.ns_alloc.get_prefix(code).unwrap_or_default();
-                self.ns_prefix_cache.insert(code, prefix);
-            }
+            self.cache_prefix(code);
             let prefix = self
                 .ns_prefix_cache
                 .get(&code)
                 .map(std::string::String::as_str)
                 .unwrap_or("");
-            self.datatypes.get_or_insert_parts(prefix, &sid.name) as u16
+            let id = self.datatypes.get_or_insert_parts(prefix, &sid.name);
+            DatatypeDictId::try_from_dict_id(id)
+                .map(DatatypeDictId::as_u16)
+                .ok_or_else(|| {
+                    let max = MAX_NON_RESERVED_DATATYPES;
+                    let limit = TransactError::DatatypeLimitExceeded {
+                        used: max,
+                        adding: 1,
+                        max,
+                    };
+                    CommitCodecError::InvalidOp(limit.to_string())
+                })
         }
 
         /// Assign a chunk-local string ID via `ChunkStringDict`.
@@ -433,7 +527,9 @@ mod inner {
         }
 
         /// Write a spool record for one flake.
-        fn write_record(&mut self, rec: FlakeRecord) {
+        ///
+        /// Fails if the flake's datatype would pass the datatype limit.
+        fn write_record(&mut self, rec: FlakeRecord) -> Result<(), CommitCodecError> {
             let FlakeRecord {
                 s,
                 p,
@@ -445,9 +541,9 @@ mod inner {
             } = rec;
             let s_id = self.assign_subject_id(s);
             let p_id = self.assign_predicate_id(p);
-            let dt_id = self.assign_datatype_id(dt);
+            let dt_id = self.assign_datatype_id(dt)?;
             let Some((o_kind, o_key)) = self.resolve_object_value(o, p_id) else {
-                return; // skip spool record on unresolvable value (e.g. bad vector)
+                return Ok(()); // skip spool record on unresolvable value (e.g. bad vector)
             };
             let lang_id = lang.map(|l| self.assign_lang_id(l)).unwrap_or(0);
             let i = list_index
@@ -456,6 +552,11 @@ mod inner {
                     u32::try_from(idx).unwrap_or(LIST_INDEX_NONE)
                 })
                 .unwrap_or(LIST_INDEX_NONE);
+            // Observe the position on the branch that actually records one:
+            // an out-of-range `list_index` coerces to the sentinel above and
+            // is not a list row in the index, so gate on `i`, not on
+            // `list_index.is_some()`.
+            self.saw_list_meta |= i != LIST_INDEX_NONE;
 
             let record = RunRecord {
                 g_id: self.g_id,
@@ -471,6 +572,7 @@ mod inner {
             };
 
             self.records.push(record);
+            Ok(())
         }
 
         /// Allocate (or look up) the `g_id` for a named-graph IRI via the shared
@@ -493,11 +595,16 @@ mod inner {
         /// they enter the Tier-2 index (and the `named_graphs` routing) exactly
         /// like default-graph triples. Only invoked when an import contains named
         /// graphs — the single-graph hot path never touches this.
-        pub fn push_named_graph_record(&mut self, g_id: GraphId, rec: FlakeRecord) {
+        pub fn push_named_graph_record(
+            &mut self,
+            g_id: GraphId,
+            rec: FlakeRecord,
+        ) -> Result<(), CommitCodecError> {
             let saved = self.g_id;
             self.g_id = g_id;
-            self.write_record(rec);
+            let result = self.write_record(rec);
             self.g_id = saved;
+            result
         }
     }
 
@@ -512,9 +619,9 @@ mod inner {
     /// # Example
     ///
     /// ```ignore
-    /// let mut sink = ImportSink::new(&mut ns, t, txn_id, true)?;
+    /// let mut sink = ImportSink::new(&mut ns, t, skolem_base, 0, true)?;
     /// fluree_graph_turtle::parse(ttl, &mut sink)?;
-    /// let writer = sink.finish();
+    /// let writer = sink.into_parts();
     /// let result = writer.finish(&envelope)?;
     /// ```
     pub struct ImportSink<'a> {
@@ -523,7 +630,20 @@ mod inner {
         blank_counter: u32,
         ns: NsAllocator<'a>,
         t: i64,
-        txn_id: String,
+        /// Blank-node skolemization key for the RDF *document* being parsed.
+        ///
+        /// Every labeled blank node in the document resolves to
+        /// `fdb-{skolem_base}-{label}`, so this value must be identical for
+        /// every chunk cut from one source document and distinct between
+        /// documents. It is deliberately NOT the commit id: bulk import splits
+        /// one document across many commits. Built by
+        /// `fluree_db_core::skolem::skolem_base`.
+        skolem_base: String,
+        /// Index of this chunk within its source document, from 0.
+        ///
+        /// Separates *anonymous* nodes, which `skolem_base` alone cannot — see
+        /// `term_blank`.
+        sub_chunk: u32,
         writer: StreamingCommitWriter,
         /// First encoding error encountered (checked after parse).
         encode_error: Option<CommitCodecError>,
@@ -540,12 +660,14 @@ mod inner {
         /// # Arguments
         /// * `ns_registry` — namespace registry (seeded from predefined codes)
         /// * `t` — transaction time
-        /// * `txn_id` — unique ID for blank node skolemization
+        /// * `skolem_base` — document-scoped blank-node skolemization key
+        /// * `sub_chunk` — index of this chunk within its source document
         /// * `compress` — whether to zstd-compress the ops stream
         pub fn new(
             ns_registry: &'a mut NamespaceRegistry,
             t: i64,
-            txn_id: String,
+            skolem_base: String,
+            sub_chunk: u32,
             compress: bool,
         ) -> Result<Self, CommitCodecError> {
             Ok(Self {
@@ -554,7 +676,8 @@ mod inner {
                 blank_counter: 0,
                 ns: NsAllocator::Exclusive(ns_registry),
                 t,
-                txn_id,
+                skolem_base,
+                sub_chunk,
                 writer: StreamingCommitWriter::new(compress)?,
                 encode_error: None,
                 prefix_map: HashMap::new(),
@@ -566,7 +689,8 @@ mod inner {
         pub fn new_cached(
             worker_cache: &'a mut WorkerCache,
             t: i64,
-            txn_id: String,
+            skolem_base: String,
+            sub_chunk: u32,
             compress: bool,
         ) -> Result<Self, CommitCodecError> {
             Ok(Self {
@@ -575,7 +699,8 @@ mod inner {
                 blank_counter: 0,
                 ns: NsAllocator::Cached(worker_cache),
                 t,
-                txn_id,
+                skolem_base,
+                sub_chunk,
                 writer: StreamingCommitWriter::new(compress)?,
                 encode_error: None,
                 prefix_map: HashMap::new(),
@@ -588,11 +713,28 @@ mod inner {
             self.spool_ctx = Some(ctx);
         }
 
+        /// Intern a predicate IRI, returning its `(namespace_code, local_name)`.
+        /// Like [`GraphSink::term_iri`], this allocates + tracks the namespace code
+        /// so it is published in this chunk's `namespace_delta` — required when the
+        /// code names a `txn_meta` predicate (the materialize completion stamp),
+        /// whose namespace code must resolve when the commit is read back. Emits no
+        /// flake; only the code allocation is a side effect.
+        pub fn intern_meta_predicate(&mut self, iri: &str) -> (u16, String) {
+            let sid = self.ns.sid_for_iri(iri);
+            (sid.namespace_code, sid.name.to_string())
+        }
+
         /// Consume the sink and return the writer for finalization.
         ///
         /// Returns an error if any flake failed to encode during parsing.
+        ///
+        /// Distinct from the protocol's [`GraphSink::finish`] (flush /
+        /// finalize): this is the sink's *product*. Deferred-error semantics
+        /// are unchanged by the fallible protocol — `emit_*` still records the
+        /// first encode failure and keeps going, and this method is where it
+        /// becomes a hard error.
         #[allow(clippy::type_complexity)]
-        pub fn finish(
+        pub fn into_parts(
             self,
         ) -> Result<
             (
@@ -617,7 +759,7 @@ mod inner {
         }
 
         fn skolemize(&mut self, local: &str) -> Sid {
-            let unique_id = format!("{}-{}", self.txn_id, local);
+            let unique_id = format!("{}-{}", self.skolem_base, local);
             self.ns.blank_node_sid(&unique_id)
         }
 
@@ -658,15 +800,7 @@ mod inner {
             let dt = dtc.datatype().clone();
             let lang = dtc.lang_tag().map(std::string::ToString::to_string);
 
-            let meta = match (&lang, list_index) {
-                (Some(l), Some(i)) => Some(FlakeMeta {
-                    lang: Some(l.clone()),
-                    i: Some(i),
-                }),
-                (Some(l), None) => Some(FlakeMeta::with_lang(l)),
-                (None, Some(i)) => Some(FlakeMeta::with_index(i)),
-                (None, None) => None,
-            };
+            let meta = FlakeMeta::from_parts(lang.as_deref(), list_index);
 
             // Late hard guard: reject (FlakeValue, datatype) shapes that would
             // produce corrupt flakes (e.g. scalar object key with VECTOR_ID
@@ -700,7 +834,7 @@ mod inner {
 
             // Write spool record only after commit encoding succeeded
             if let Some(ctx) = &mut self.spool_ctx {
-                ctx.write_record(FlakeRecord {
+                let written = ctx.write_record(FlakeRecord {
                     s: &s,
                     p: &p,
                     o: &o,
@@ -709,6 +843,9 @@ mod inner {
                     list_index,
                     t: self.t,
                 });
+                if let Err(e) = written {
+                    self.encode_error.get_or_insert(e);
+                }
             }
         }
     }
@@ -743,8 +880,30 @@ mod inner {
                     id
                 }
                 None => {
+                    // Anonymous mint: leading '-' keeps the namespace
+                    // disjoint from every lexable user label (labels cannot
+                    // start with '-'), while the full skolemized
+                    // `fdb-{skolem_base}--b{sub_chunk}-{N}` stays
+                    // serializable — see `FlakeSink::term_blank` for the full
+                    // rationale.
+                    //
+                    // `sub_chunk` is in the label because the counter alone is
+                    // NOT enough: it restarts at 0 in every sink (one per
+                    // chunk) while `skolem_base` is deliberately shared by all
+                    // chunks of a document, so `-b{N}` alone would make
+                    // chunk 0's Nth anonymous node and chunk 1's Nth the same
+                    // subject. Being statement-local means nothing can
+                    // *reference* an anonymous node from elsewhere; it does
+                    // not stop two of them from colliding on an id.
+                    //
+                    // The three parts are jointly unique: `skolem_base` per
+                    // document, `sub_chunk` per chunk within a document, `N`
+                    // per anonymous node within a chunk. It is deliberately
+                    // NOT the commit ordinal — that is a property of the whole
+                    // import, so adding one file to the front of a directory
+                    // would renumber every anonymous node behind it.
                     self.blank_counter += 1;
-                    let label = format!("b{}", self.blank_counter);
+                    let label = format!("-b{}-{}", self.sub_chunk, self.blank_counter);
                     let sid = self.skolemize(&label);
                     self.add_term(ResolvedTerm::Sid(sid))
                 }
@@ -785,8 +944,14 @@ mod inner {
             })
         }
 
-        fn emit_triple(&mut self, subject: TermId, predicate: TermId, object: TermId) {
+        fn emit_triple(
+            &mut self,
+            subject: TermId,
+            predicate: TermId,
+            object: TermId,
+        ) -> SinkResult {
             self.push_triple(subject, predicate, object, None);
+            Ok(())
         }
 
         fn emit_list_item(
@@ -795,8 +960,79 @@ mod inner {
             predicate: TermId,
             object: TermId,
             index: i32,
-        ) {
+        ) -> SinkResult {
             self.push_triple(subject, predicate, object, Some(index));
+            Ok(())
+        }
+
+        fn supports_reified_triples(&self) -> bool {
+            true
+        }
+
+        /// Turtle-star reifier attachment → the durable `f:reifies*` bundle,
+        /// built by the shared
+        /// [`crate::generate::flakes::reified_triple_bundle`] (bit-identical
+        /// with the JSON-LD `@annotation` lowering and with `FlakeSink`'s
+        /// transactional path) and streamed through the commit writer (and
+        /// spool, when attached) exactly like ordinary triples. The base
+        /// triple has already been emitted by the parser via `emit_triple`.
+        fn emit_reified_triple(
+            &mut self,
+            subject: TermId,
+            predicate: TermId,
+            object: TermId,
+            reifier: TermId,
+        ) -> SinkResult {
+            let Some(s) = self.resolve_sid(subject) else {
+                return Ok(());
+            };
+            let Some(p) = self.resolve_sid(predicate) else {
+                return Ok(());
+            };
+            let Some((o, dtc)) = self.resolve_object(object) else {
+                return Ok(());
+            };
+            let Some(ann) = self.resolve_sid(reifier) else {
+                return Ok(());
+            };
+
+            let bundle = match crate::generate::flakes::reified_triple_bundle(
+                None, s, p, o, &dtc, &ann, self.t,
+            ) {
+                Ok(bundle) => bundle,
+                Err(e) => {
+                    if self.encode_error.is_none() {
+                        let msg = format!("invariant violation in reifier bundle: {e}");
+                        tracing::error!("ImportSink: {msg}");
+                        self.encode_error = Some(CommitCodecError::InvalidOp(msg));
+                    }
+                    return Ok(());
+                }
+            };
+            for flake in bundle {
+                if let Err(e) = self.writer.push_flake(&flake) {
+                    if self.encode_error.is_none() {
+                        tracing::error!("ImportSink: reifier bundle flake encode failed: {}", e);
+                        self.encode_error = Some(e);
+                    }
+                    return Ok(()); // Don't spool a flake that failed to encode
+                }
+                if let Some(ctx) = &mut self.spool_ctx {
+                    let written = ctx.write_record(FlakeRecord {
+                        s: &flake.s,
+                        p: &flake.p,
+                        o: &flake.o,
+                        dt: &flake.dt,
+                        lang: flake.m.as_ref().and_then(|m| m.lang.as_deref()),
+                        list_index: None,
+                        t: self.t,
+                    });
+                    if let Err(e) = written {
+                        self.encode_error.get_or_insert(e);
+                    }
+                }
+            }
+            Ok(())
         }
     }
 
@@ -814,7 +1050,7 @@ mod inner {
             ns: &mut NamespaceRegistry,
             t: i64,
         ) -> Result<ImportSink<'_>, CommitCodecError> {
-            ImportSink::new(ns, t, "test-txn".to_string(), true)
+            ImportSink::new(ns, t, "test-txn".to_string(), 0, true)
         }
 
         fn make_envelope(t: i64) -> crate::commit_v2::CodecEnvelope {
@@ -847,7 +1083,129 @@ mod inner {
                 vector_pool: Arc::new(SharedVectorArenaPool::new()),
                 ns_alloc: Arc::new(SharedNamespaceAllocator::from_registry(ns)),
                 decimal_encoding: fluree_db_core::DecimalEncoding::InlineWhenFits,
+                saw_list_meta: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
+        }
+
+        /// A namespace code the shared allocator has never seen must fail
+        /// loudly (debug builds) instead of silently writing a suffix-only
+        /// string into the spool's predicate dict. Regression pin for the
+        /// serial-TriG-import bug where codes were allocated only in
+        /// `state.ns_registry` and bound-predicate lookups matched nothing.
+        #[test]
+        #[cfg(debug_assertions)]
+        #[should_panic(expected = "not registered in the shared allocator")]
+        fn spool_prefix_miss_panics_in_debug() {
+            let ns = NamespaceRegistry::new();
+            let config = make_spool_config(&ns);
+            let path = std::env::temp_dir().join(format!(
+                "fluree-spool-prefix-miss-{}.spool",
+                std::process::id()
+            ));
+            let mut ctx = SpoolContext::new(&path, 0, 0, &config).unwrap();
+            // A user-range code allocated outside the shared allocator.
+            let rogue = Sid::new(fluree_vocab::namespaces::USER_START, "name");
+            let _ = ctx.assign_predicate_id(&rogue);
+        }
+
+        /// A record whose datatype would take an ID past `DatatypeDictId::MAX`
+        /// is refused, so no spooled record carries an ID the index cannot
+        /// store.
+        #[test]
+        fn spool_record_past_datatype_limit_is_refused() {
+            let ns = NamespaceRegistry::new();
+            let mut config = make_spool_config(&ns);
+            let mut full = PredicateDict::new();
+            for i in 0..DatatypeDictId::MAX {
+                full.get_or_insert(&format!("urn:dt:{i}"));
+            }
+            full.get_or_insert(fluree_vocab::xsd::STRING);
+            config.datatype_alloc = Arc::new(SharedDictAllocator::from_predicate_dict(&full));
+
+            let path = std::env::temp_dir().join(format!(
+                "fluree-spool-datatype-limit-{}.spool",
+                std::process::id()
+            ));
+            let mut ctx = SpoolContext::new(&path, 0, 0, &config).unwrap();
+            let s = Sid::new(fluree_vocab::namespaces::RDF, "subject");
+            let p = Sid::new(fluree_vocab::namespaces::RDF, "pred");
+            let o = FlakeValue::String("v".to_string());
+            let rec = |dt| FlakeRecord {
+                s: &s,
+                p: &p,
+                o: &o,
+                dt,
+                lang: None,
+                list_index: None,
+                t: 1,
+            };
+
+            let known = Sid::new(fluree_vocab::namespaces::XSD, "string");
+            ctx.write_record(rec(&known))
+                .expect("a datatype the dictionary holds is accepted");
+            assert_eq!(ctx.records[0].dt, DatatypeDictId::MAX);
+
+            let new = Sid::new(fluree_vocab::namespaces::XSD, "int");
+            let err = ctx.write_record(rec(&new)).unwrap_err();
+            assert!(
+                err.to_string().contains("datatype limit exceeded"),
+                "unexpected error: {err}"
+            );
+            assert_eq!(ctx.record_count(), 1, "the refused record is not spooled");
+        }
+
+        /// The sticky list-position bit is per-import, not per-chunk: a chunk
+        /// with no list rows must leave it alone, and a single list row in any
+        /// later chunk must flip it. Root assembly reads it to write
+        /// `IndexRoot.has_list_meta` — a wrongly-`false` root would let
+        /// filtered-DELETE staging skip position hydration and silently drop
+        /// list retractions.
+        #[test]
+        fn spool_context_tracks_list_positions_across_chunks() {
+            use std::sync::atomic::Ordering;
+
+            let ns = NamespaceRegistry::new();
+            let config = make_spool_config(&ns);
+            let dir = std::env::temp_dir();
+
+            let s = Sid::new(fluree_vocab::namespaces::RDF, "subject");
+            let p = Sid::new(fluree_vocab::namespaces::RDF, "pred");
+            let dt = Sid::new(fluree_vocab::namespaces::XSD, "string");
+            let o = FlakeValue::String("v".to_string());
+            let rec = |list_index| FlakeRecord {
+                s: &s,
+                p: &p,
+                o: &o,
+                dt: &dt,
+                lang: None,
+                list_index,
+                t: 1,
+            };
+
+            let mut ctx = SpoolContext::new(dir.join("fluree-list-meta-a.spool"), 0, 0, &config)
+                .expect("spool ctx");
+            ctx.write_record(rec(None)).unwrap();
+            let _ = ctx.finish_buffered();
+            assert!(
+                !config.saw_list_meta.load(Ordering::Relaxed),
+                "a chunk without list rows must not set the bit"
+            );
+
+            let mut ctx = SpoolContext::new(dir.join("fluree-list-meta-b.spool"), 1, 0, &config)
+                .expect("spool ctx");
+            ctx.write_record(rec(Some(0))).unwrap();
+            let _ = ctx.finish_buffered();
+            assert!(
+                config.saw_list_meta.load(Ordering::Relaxed),
+                "one list row in any chunk sets the bit"
+            );
+
+            // Sticky: a later list-free chunk must not clear it.
+            let mut ctx = SpoolContext::new(dir.join("fluree-list-meta-c.spool"), 2, 0, &config)
+                .expect("spool ctx");
+            ctx.write_record(rec(None)).unwrap();
+            let _ = ctx.finish_buffered();
+            assert!(config.saw_list_meta.load(Ordering::Relaxed));
         }
 
         #[test]
@@ -858,9 +1216,9 @@ mod inner {
             let s = sink.term_iri("http://example.org/alice");
             let p = sink.term_iri("http://example.org/name");
             let o = sink.term_literal("Alice", Datatype::xsd_string(), None);
-            sink.emit_triple(s, p, o);
+            sink.emit_triple(s, p, o).unwrap();
 
-            let (writer, _prefix_map, _spool) = sink.finish().unwrap();
+            let (writer, _prefix_map, _spool) = sink.into_parts().unwrap();
             assert_eq!(writer.op_count(), 1);
 
             let result = writer.finish(&make_envelope(1)).unwrap();
@@ -880,29 +1238,29 @@ mod inner {
             // String
             let p = sink.term_iri("http://example.org/str");
             let o = sink.term_literal("hello", Datatype::xsd_string(), None);
-            sink.emit_triple(s, p, o);
+            sink.emit_triple(s, p, o).unwrap();
 
             // Integer
             let p = sink.term_iri("http://example.org/num");
             let o = sink.term_literal_value(LiteralValue::Integer(42), Datatype::xsd_integer());
-            sink.emit_triple(s, p, o);
+            sink.emit_triple(s, p, o).unwrap();
 
             // Double
             let p = sink.term_iri("http://example.org/dbl");
             let o = sink.term_literal_value(LiteralValue::Double(3.13), Datatype::xsd_double());
-            sink.emit_triple(s, p, o);
+            sink.emit_triple(s, p, o).unwrap();
 
             // Boolean
             let p = sink.term_iri("http://example.org/flag");
             let o = sink.term_literal_value(LiteralValue::Boolean(true), Datatype::xsd_boolean());
-            sink.emit_triple(s, p, o);
+            sink.emit_triple(s, p, o).unwrap();
 
             // Ref (IRI in object position)
             let p = sink.term_iri("http://example.org/knows");
             let o = sink.term_iri("http://example.org/bob");
-            sink.emit_triple(s, p, o);
+            sink.emit_triple(s, p, o).unwrap();
 
-            let (writer, _prefix_map, _spool) = sink.finish().unwrap();
+            let (writer, _prefix_map, _spool) = sink.into_parts().unwrap();
             assert_eq!(writer.op_count(), 5);
 
             let result = writer.finish(&make_envelope(1)).unwrap();
@@ -923,9 +1281,9 @@ mod inner {
             let s = sink.term_iri("http://example.org/alice");
             let p = sink.term_iri("http://example.org/name");
             let o = sink.term_literal("Alice", Datatype::rdf_lang_string(), Some("en"));
-            sink.emit_triple(s, p, o);
+            sink.emit_triple(s, p, o).unwrap();
 
-            let (writer, _prefix_map, _spool) = sink.finish().unwrap();
+            let (writer, _prefix_map, _spool) = sink.into_parts().unwrap();
             let result = writer.finish(&make_envelope(1)).unwrap();
             let decoded = read_commit(&result.bytes).unwrap();
 
@@ -934,6 +1292,41 @@ mod inner {
             assert_eq!(f.dt, Sid::new(fluree_vocab::namespaces::RDF, "langString"));
             let meta = f.m.as_ref().expect("should have meta");
             assert_eq!(meta.lang.as_deref(), Some("en"));
+        }
+
+        #[test]
+        fn test_reified_triple_streams_jsonld_compatible_bundle() {
+            // The import path must write the SAME bundle shape as the
+            // transactional FlakeSink / JSON-LD lowering: base triple +
+            // S/P/O bundle, no f:reifiesDatatype, decodable to the base
+            // edge's EdgeKey.
+            use fluree_db_core::edge::EdgeKey;
+            use fluree_db_core::namespaces::is_reifies_datatype;
+
+            let mut ns = NamespaceRegistry::new();
+            let mut sink = make_sink_and_parse(&mut ns, 1).unwrap();
+
+            let s = sink.term_iri("http://example.org/alice");
+            let p = sink.term_iri("http://example.org/worksFor");
+            let o = sink.term_iri("http://example.org/acme");
+            let r = sink.term_iri("http://example.org/reifier");
+            sink.emit_triple(s, p, o).unwrap();
+            sink.emit_reified_triple(s, p, o, r).unwrap();
+
+            let (writer, _prefix_map, _spool) = sink.into_parts().unwrap();
+            assert_eq!(writer.op_count(), 4, "base + 3 bundle flakes");
+
+            let result = writer.finish(&make_envelope(1)).unwrap();
+            let decoded = read_commit(&result.bytes).unwrap();
+            assert_eq!(decoded.flakes.len(), 4);
+            let base = &decoded.flakes[0];
+            let bundle = &decoded.flakes[1..];
+            assert!(
+                !bundle.iter().any(|f| is_reifies_datatype(&f.p)),
+                "import bundle must omit f:reifiesDatatype: {bundle:?}"
+            );
+            let key = EdgeKey::from_reifies_facts(bundle).expect("bundle decodes");
+            assert_eq!(key, EdgeKey::from_flake(base));
         }
 
         #[test]
@@ -961,11 +1354,11 @@ mod inner {
             let o0 = sink.term_literal_value(LiteralValue::Integer(10), Datatype::xsd_integer());
             let o1 = sink.term_literal_value(LiteralValue::Integer(20), Datatype::xsd_integer());
             let o2 = sink.term_literal_value(LiteralValue::Integer(30), Datatype::xsd_integer());
-            sink.emit_list_item(s, p, o0, 0);
-            sink.emit_list_item(s, p, o1, 1);
-            sink.emit_list_item(s, p, o2, 2);
+            sink.emit_list_item(s, p, o0, 0).unwrap();
+            sink.emit_list_item(s, p, o1, 1).unwrap();
+            sink.emit_list_item(s, p, o2, 2).unwrap();
 
-            let (writer, _prefix_map, _spool) = sink.finish().unwrap();
+            let (writer, _prefix_map, _spool) = sink.into_parts().unwrap();
             assert_eq!(writer.op_count(), 3);
 
             let result = writer.finish(&make_envelope(1)).unwrap();
@@ -983,9 +1376,13 @@ mod inner {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
 
-            let mut ns = NamespaceRegistry::new();
+            let ns = NamespaceRegistry::new();
             let config = make_spool_config(&ns);
-            let mut sink = ImportSink::new(&mut ns, 1, "test-txn".to_string(), true).unwrap();
+            // Allocate through the config's shared allocator (production
+            // wiring) so spool prefix lookups resolve mid-parse.
+            let mut cache = WorkerCache::new(Arc::clone(&config.ns_alloc));
+            let mut sink =
+                ImportSink::new_cached(&mut cache, 1, "test-txn".to_string(), 0, true).unwrap();
 
             // Attach spool context
             let spool_path = dir.join("chunk_0.spool");
@@ -1000,11 +1397,11 @@ mod inner {
             let o_name = sink.term_literal("Alice", Datatype::xsd_string(), None);
             let o_age = sink.term_literal_value(LiteralValue::Integer(30), Datatype::xsd_integer());
             let bob = sink.term_iri("http://example.org/bob");
-            sink.emit_triple(s, p_name, o_name);
-            sink.emit_triple(s, p_age, o_age);
-            sink.emit_triple(s, p_knows, bob);
+            sink.emit_triple(s, p_name, o_name).unwrap();
+            sink.emit_triple(s, p_age, o_age).unwrap();
+            sink.emit_triple(s, p_knows, bob).unwrap();
 
-            let (writer, _prefix_map, spool_ctx) = sink.finish().unwrap();
+            let (writer, _prefix_map, spool_ctx) = sink.into_parts().unwrap();
             assert_eq!(writer.op_count(), 3);
 
             // Verify spool recorded the same number of records
@@ -1051,9 +1448,13 @@ mod inner {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
 
-            let mut ns = NamespaceRegistry::new();
+            let ns = NamespaceRegistry::new();
             let config = make_spool_config(&ns);
-            let mut sink = ImportSink::new(&mut ns, 1, "test-txn".to_string(), true).unwrap();
+            // Allocate through the config's shared allocator (production
+            // wiring) so spool prefix lookups resolve mid-parse.
+            let mut cache = WorkerCache::new(Arc::clone(&config.ns_alloc));
+            let mut sink =
+                ImportSink::new_cached(&mut cache, 1, "test-txn".to_string(), 0, true).unwrap();
 
             let spool_path = dir.join("chunk_0.spool");
             let spool_ctx = SpoolContext::new(&spool_path, 0, 0, &config).unwrap();
@@ -1064,16 +1465,16 @@ mod inner {
             // Language-tagged string
             let p = sink.term_iri("http://example.org/name");
             let o = sink.term_literal("Alice", Datatype::rdf_lang_string(), Some("en"));
-            sink.emit_triple(s, p, o);
+            sink.emit_triple(s, p, o).unwrap();
 
             // List items
             let p = sink.term_iri("http://example.org/scores");
             let o0 = sink.term_literal_value(LiteralValue::Integer(10), Datatype::xsd_integer());
             let o1 = sink.term_literal_value(LiteralValue::Integer(20), Datatype::xsd_integer());
-            sink.emit_list_item(s, p, o0, 0);
-            sink.emit_list_item(s, p, o1, 1);
+            sink.emit_list_item(s, p, o0, 0).unwrap();
+            sink.emit_list_item(s, p, o1, 1).unwrap();
 
-            let (_writer, _prefix_map, spool_ctx) = sink.finish().unwrap();
+            let (_writer, _prefix_map, spool_ctx) = sink.into_parts().unwrap();
             let spool_ctx = spool_ctx.unwrap();
             assert_eq!(spool_ctx.record_count(), 3);
             let result = spool_ctx.finish().unwrap();
@@ -1099,9 +1500,13 @@ mod inner {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
 
-            let mut ns = NamespaceRegistry::new();
+            let ns = NamespaceRegistry::new();
             let config = make_spool_config(&ns);
-            let mut sink = ImportSink::new(&mut ns, 1, "test-txn".to_string(), true).unwrap();
+            // Allocate through the config's shared allocator (production
+            // wiring) so spool prefix lookups resolve mid-parse.
+            let mut cache = WorkerCache::new(Arc::clone(&config.ns_alloc));
+            let mut sink =
+                ImportSink::new_cached(&mut cache, 1, "test-txn".to_string(), 0, true).unwrap();
 
             let spool_path = dir.join("chunk_0.spool");
             let spool_ctx = SpoolContext::new(&spool_path, 0, 0, &config).unwrap();
@@ -1112,10 +1517,10 @@ mod inner {
             let bob = sink.term_iri("http://example.org/bob");
             let p1 = sink.term_iri("http://example.org/knows");
             let p2 = sink.term_iri("http://example.org/likes");
-            sink.emit_triple(alice, p1, bob);
-            sink.emit_triple(alice, p2, bob);
+            sink.emit_triple(alice, p1, bob).unwrap();
+            sink.emit_triple(alice, p2, bob).unwrap();
 
-            let (_writer, _prefix_map, spool_ctx) = sink.finish().unwrap();
+            let (_writer, _prefix_map, spool_ctx) = sink.into_parts().unwrap();
             let spool_ctx = spool_ctx.unwrap();
             let result = spool_ctx.finish().unwrap();
 

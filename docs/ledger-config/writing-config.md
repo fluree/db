@@ -31,6 +31,28 @@ GRAPH <urn:fluree:mydb:main#config> {
 }
 ```
 
+## Writing from the CLI
+
+`fluree insert` and `fluree upsert` read TriG, but the recipe above writes its settings as anonymous blank nodes (`[ … ]`) inside the `GRAPH` block, which those commands do not read yet ([#1930](https://github.com/fluree/db/issues/1930)). Write the config graph with SPARQL UPDATE through `fluree update` instead:
+
+```bash
+fluree update -l mydb:main --format sparql -e '
+PREFIX f: <https://ns.flur.ee/db#>
+INSERT DATA {
+  GRAPH <urn:fluree:mydb:main#config> {
+    <urn:fluree:mydb:main:config:ledger> a f:LedgerConfig ;
+      f:datalogDefaults [
+        f:datalogEnabled true ;
+        f:rulesSource [ a f:GraphRef ; f:graphSource [ f:graphSelector f:defaultGraph ] ] ;
+        f:allowQueryTimeRules true
+      ] ;
+      f:reasoningDefaults [ f:reasoningModes f:Datalog ; f:overrideControl f:OverrideAll ] .
+  }
+}'
+```
+
+`fluree update -f config.ru --format sparql` reads the same statement from a file. The JSON-LD form below works with `fluree insert` unchanged.
+
 ## Writing via SPARQL UPDATE
 
 Use `INSERT DATA` with a `GRAPH` clause:

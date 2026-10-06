@@ -6,6 +6,7 @@
 use axum::body::Body;
 use axum::extract::Request;
 use axum::response::{IntoResponse, Response};
+use fluree_db_consensus::http::is_hop_by_hop;
 use http::{header::HeaderMap, Method, StatusCode};
 use reqwest::Client;
 use std::time::Duration;
@@ -16,18 +17,12 @@ pub struct ForwardingClient {
     base_url: String,
 }
 
-/// Headers that should NOT be forwarded (hop-by-hop headers)
-const HOP_BY_HOP_HEADERS: &[&str] = &[
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-    "host", // Always rewrite to target host
-];
+/// Whether a header stays behind when forwarding: hop-by-hop
+/// headers plus `host`, which the outbound client rewrites for the
+/// target address.
+fn stays_on_this_hop(name: &str) -> bool {
+    is_hop_by_hop(name) || name.eq_ignore_ascii_case("host")
+}
 
 impl ForwardingClient {
     pub fn new(base_url: String) -> Self {
@@ -100,8 +95,7 @@ impl ForwardingClient {
         let mut builder = Response::builder().status(status);
 
         for (name, value) in &response_headers {
-            let name_str = name.as_str().to_ascii_lowercase();
-            if !HOP_BY_HOP_HEADERS.contains(&name_str.as_str()) {
+            if !stays_on_this_hop(name.as_str()) {
                 builder = builder.header(name.clone(), value.clone());
             }
         }
@@ -123,8 +117,7 @@ fn forward_headers(
     headers: &HeaderMap,
 ) -> reqwest::RequestBuilder {
     for (name, value) in headers {
-        let name_str = name.as_str().to_ascii_lowercase();
-        if !HOP_BY_HOP_HEADERS.contains(&name_str.as_str()) {
+        if !stays_on_this_hop(name.as_str()) {
             builder = builder.header(name.clone(), value.clone());
         }
     }
@@ -174,14 +167,15 @@ mod tests {
 
     #[test]
     fn test_hop_by_hop_headers() {
-        // Verify the list contains expected headers
-        assert!(HOP_BY_HOP_HEADERS.contains(&"connection"));
-        assert!(HOP_BY_HOP_HEADERS.contains(&"host"));
-        assert!(HOP_BY_HOP_HEADERS.contains(&"transfer-encoding"));
+        // Hop-by-hop headers and `host` stay behind, case-insensitively.
+        assert!(stays_on_this_hop("connection"));
+        assert!(stays_on_this_hop("Host"));
+        assert!(stays_on_this_hop("transfer-encoding"));
+        assert!(stays_on_this_hop("Proxy-Connection"));
 
-        // Authorization should NOT be in the list (it should be forwarded)
-        assert!(!HOP_BY_HOP_HEADERS.contains(&"authorization"));
-        assert!(!HOP_BY_HOP_HEADERS.contains(&"content-type"));
+        // End-to-end headers are forwarded.
+        assert!(!stays_on_this_hop("authorization"));
+        assert!(!stays_on_this_hop("content-type"));
     }
 
     #[test]

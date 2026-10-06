@@ -412,7 +412,7 @@ In a single database, you've combined:
 | **Time travel** | Complete audit trail, historical comparison, rollback capability |
 | **Branching** | Safe experimentation without affecting production |
 | **Policies** | Automatic access control based on team and role |
-| **SPARQL + JSON-LD** | Two query languages accessing the same engine |
+| **SPARQL + JSON-LD + Cypher** | Three query languages accessing the same engine |
 
 ## Next steps
 

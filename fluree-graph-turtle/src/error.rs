@@ -22,6 +22,19 @@ pub enum TurtleError {
     /// Invalid escape sequence
     #[error("Invalid escape sequence: {0}")]
     InvalidEscape(String),
+
+    /// A construct the document expresses but this ingest path cannot carry
+    /// (e.g. an annotation on an `rdf:type` edge on the JSON-LD-converted
+    /// path). Distinct from a parse error: the Turtle is valid.
+    #[error("Unsupported on this ingest path: {0}")]
+    Unsupported(String),
+
+    /// The sink refused an emitted event, or its downstream writer failed.
+    ///
+    /// Parsing stops at the first such error — a writer sink whose pipe has
+    /// closed must not be handed the rest of the document.
+    #[error("Sink error: {0}")]
+    Sink(#[from] fluree_graph_ir::SinkError),
 }
 
 /// Result type for Turtle operations
@@ -53,6 +66,14 @@ impl TurtleError {
 /// an oversized whole-file input into a clean error instead of a silently
 /// wrapped offset that would later panic when slicing the source.
 pub const MAX_INPUT_BYTES: usize = u32::MAX as usize;
+
+/// Maximum nesting depth for the recursive Turtle constructs — blank-node
+/// property lists (`[ … ]`), collections (`( … )`), and reified triples
+/// (`<< … >>`). Each level recurses through the parser, so unbounded nesting
+/// lets a small adversarial document overflow the stack and abort the
+/// process; past this ceiling parsing fails with a clean parse error. The
+/// three constructs share one counter, so mixed nesting is bounded too.
+pub const MAX_NESTING_DEPTH: u32 = 128;
 
 /// Reject input too large for `u32` token-span offsets.
 ///

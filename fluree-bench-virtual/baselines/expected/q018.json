@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "query_id": "q018",
+  "result_hash": "9cf4367fe16131afb9fca4ccd44c04ac3050a5351a4009278dd58f203196edd6",
+  "rows": 4,
+  "head_rows": [
+    "19955\u001fCard\u001f8.98416334300e7",
+    "6597\u001fPayPal\u001f2.96692447100e7",
+    "6714\u001fGiftCard\u001f3.01747454800e7",
+    "6746\u001fBankTransfer\u001f3.03304374600e7"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

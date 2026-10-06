@@ -83,13 +83,14 @@ impl NamespaceRegistry {
     /// defaults. This indicates corrupt persisted data — no legacy data
     /// exists to recover from, so failing fast is the correct behavior.
     pub fn from_db(snapshot: &LedgerSnapshot) -> Self {
-        let mut codes = NamespaceCodes::new(); // seeded with defaults
-        let snapshot_ns: HashMap<u16, String> = snapshot
-            .namespaces()
-            .iter()
-            .map(|(&k, v)| (k, v.clone()))
-            .collect();
-        codes.merge_delta(&snapshot_ns).unwrap_or_else(|e| {
+        // Shared by refcount, not copied: a ledger with thousands of
+        // namespaces would otherwise rebuild both tables on every
+        // transaction.
+        let codes = NamespaceCodes::layered_over(
+            snapshot.shared_namespaces(),
+            snapshot.shared_namespace_reverse(),
+        )
+        .unwrap_or_else(|e| {
             panic!(
                 "namespace conflict merging snapshot into defaults — \
                  snapshot namespace codes are corrupt: {e}"
@@ -172,6 +173,15 @@ impl NamespaceRegistry {
     /// Look up a prefix by code
     pub fn get_prefix(&self, code: u16) -> Option<&str> {
         self.codes.get_prefix(code)
+    }
+
+    /// Encode an IRI to a Sid, mirroring `LedgerSnapshot::encode_iri`'s
+    /// contract: unknown namespaces fall back to the EMPTY-namespace
+    /// full-IRI Sid, which matches no stored data. Lookup-only — never
+    /// allocates a code.
+    fn encode_iri_with_fallback(&self, iri: &str) -> fluree_db_core::Sid {
+        self.lookup_sid_for_iri(iri)
+            .unwrap_or_else(|| fluree_db_core::Sid::new(fluree_vocab::namespaces::EMPTY, iri))
     }
 
     /// Check if a prefix is registered
@@ -416,7 +426,7 @@ impl SharedNamespaceAllocator {
     /// assignments from the registry.
     /// Returns `Err` on a namespace bimap conflict.
     pub fn sync_from_registry(&self, reg: &NamespaceRegistry) -> Result<(), NsAllocError> {
-        let delta = reg.codes.code_to_prefix_map().clone();
+        let delta = reg.codes.code_to_prefix_map();
         let mut inner = self.inner.write();
         inner.merge_delta(&delta)
     }
@@ -428,11 +438,7 @@ impl SharedNamespaceAllocator {
     /// the snapshot.
     pub fn snapshot(&self) -> (FxHashMap<String, u16>, u16) {
         let inner = self.inner.read();
-        let codes: FxHashMap<String, u16> = inner
-            .prefix_to_code_map()
-            .iter()
-            .map(|(k, &v)| (k.clone(), v))
-            .collect();
+        let codes: FxHashMap<String, u16> = inner.prefix_to_code_map().into_iter().collect();
         (codes, inner.next_code())
     }
 }
@@ -590,6 +596,47 @@ pub fn is_blank_node_id(iri: &str) -> bool {
     iri.starts_with("_:fdb")
 }
 
+/// Resolve a stable Fluree blank-node identifier (`_:fdb-...`) directly to
+/// its stored Sid, bypassing skolemization so writes address the existing
+/// node instead of minting a fresh one. Returns `None` for ordinary blank
+/// node labels (fresh-mint semantics) and non-blank-node strings.
+///
+/// Call sites should be at parse/lowering time (once per term), never in
+/// per-solution template instantiation.
+#[inline]
+pub fn stable_blank_node_sid(iri: &str) -> Option<Sid> {
+    fluree_db_core::ns_encoding::stable_blank_node_local(iri)
+        .map(|local| Sid::new(BLANK_NODE, local))
+}
+
+/// Like [`stable_blank_node_sid`] but for a bare label with the `_:` already
+/// stripped (e.g. Turtle parser output).
+#[inline]
+pub fn stable_blank_node_sid_from_label(label: &str) -> Option<Sid> {
+    label
+        .starts_with(fluree_db_core::ns_encoding::STABLE_BLANK_NODE_LABEL_PREFIX)
+        .then(|| Sid::new(BLANK_NODE, label))
+}
+
+/// SPARQL-lowering encoder over the staged registry — snapshot namespaces
+/// plus this transaction's allocations. Lets SHACL `sh:sparql` constraint
+/// queries lower against the same term space the staged flakes use, so a
+/// constraint over a namespace the in-flight transaction introduced matches
+/// its staged data. Mirrors `LedgerSnapshot`'s contract exactly: unknown
+/// namespaces encode to the never-matching EMPTY-namespace full-IRI Sid
+/// (constraints over vocabulary the ledger has never seen are silently
+/// inert, not errors), and `encode_iri_strict` rejects them.
+impl fluree_db_query::parse::IriEncoder for NamespaceRegistry {
+    fn encode_iri(&self, iri: &str) -> Option<Sid> {
+        Some(self.encode_iri_with_fallback(iri))
+    }
+
+    fn encode_iri_strict(&self, iri: &str) -> Option<Sid> {
+        self.lookup_sid_for_iri(iri)
+            .filter(|sid| sid.namespace_code != fluree_vocab::namespaces::EMPTY)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,6 +701,32 @@ mod tests {
         assert!(is_blank_node_id("_:fdb"));
         assert!(!is_blank_node_id("_:b1"));
         assert!(!is_blank_node_id("http://example.org/thing"));
+    }
+
+    #[test]
+    fn test_stable_blank_node_sid() {
+        // A stable id round-trips to the exact Sid blank_node_sid minted.
+        let registry = NamespaceRegistry::new();
+        let minted = registry.blank_node_sid("1234-0-b0");
+        let resolved = stable_blank_node_sid("_:fdb-1234-0-b0").expect("stable id resolves");
+        assert_eq!(resolved, minted);
+
+        // Ordinary labels and non-blank strings do not resolve.
+        assert!(stable_blank_node_sid("_:b0").is_none());
+        assert!(stable_blank_node_sid("_:fdbx").is_none()); // reserved form requires `fdb-`
+        assert!(stable_blank_node_sid("http://example.org/fdb-1").is_none());
+    }
+
+    #[test]
+    fn test_stable_blank_node_sid_from_label() {
+        let registry = NamespaceRegistry::new();
+        let minted = registry.blank_node_sid("1234-0-b0");
+        assert_eq!(
+            stable_blank_node_sid_from_label("fdb-1234-0-b0"),
+            Some(minted)
+        );
+        assert!(stable_blank_node_sid_from_label("b0").is_none());
+        assert!(stable_blank_node_sid_from_label("fdbx").is_none());
     }
 
     #[test]

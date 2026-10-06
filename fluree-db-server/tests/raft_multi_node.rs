@@ -22,7 +22,7 @@ use fluree_db_consensus::raft::admin::{
 use fluree_db_consensus::raft::liveness_monitor::LivenessConfig;
 use fluree_db_consensus::NodeId;
 use fluree_db_server::raft::{RaftBootstrapConfig, RaftIntegration};
-use fluree_db_server::{AppState, FlureeServerBuilder};
+use fluree_db_server::{AppState, FlureeServerBuilder, ServerConfig};
 use reqwest::StatusCode;
 use serde_json::json;
 use tempfile::TempDir;
@@ -120,6 +120,14 @@ impl TestCluster {
     /// monitor-driven demotion path pass sub-second thresholds so
     /// the demote / promote windows close inside the test budget.
     async fn spawn_with_liveness(count: u64, liveness_config: LivenessConfig) -> Self {
+        Self::spawn_with_config(count, liveness_config, ServerConfig::default()).await
+    }
+
+    async fn spawn_with_config(
+        count: u64,
+        liveness_config: LivenessConfig,
+        config: ServerConfig,
+    ) -> Self {
         assert!(count >= 1, "cluster must have at least one node");
 
         // Single shared data directory across all nodes — the
@@ -155,13 +163,14 @@ impl TestCluster {
                     raft_listener,
                     shared_data_tmp.path(),
                     liveness_config.clone(),
+                    config.clone(),
                 )
                 .await,
             );
         }
 
         let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(2))
+            .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
             .build()
             .expect("build reqwest client");
@@ -535,6 +544,7 @@ async fn spawn_node(
     raft_listener: TcpListener,
     shared_data_path: &std::path::Path,
     liveness_config: LivenessConfig,
+    mut config: ServerConfig,
 ) -> TestNode {
     let public_addr = public_listener.local_addr().expect("public local_addr");
     let raft_addr = raft_listener.local_addr().expect("raft local_addr");
@@ -556,7 +566,8 @@ async fn spawn_node(
     // the index roots in shared storage current — the alternative
     // (indexing off) leaves the follower's query path hunting for
     // index roots that nobody has built.
-    let server = FlureeServerBuilder::file(shared_data_path)
+    config.storage_path = Some(shared_data_path.to_path_buf());
+    let server = FlureeServerBuilder::for_config(config)
         .listen_addr(public_addr)
         .cors_enabled(false)
         .with_raft(Arc::clone(&integration), raft_addr)
@@ -599,6 +610,174 @@ async fn spawn_node(
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delegated_policy_survives_follower_forwarding_and_the_raft_command_queue() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use ed25519_dalek::{Signer, SigningKey};
+
+    let key = SigningKey::from_bytes(&[210; 32]);
+    let issuer = fluree_db_credential::did_from_pubkey(&key.verifying_key().to_bytes());
+    let audience = "raft-policy-test";
+    let cluster = TestCluster::spawn_with_config(
+        3,
+        LivenessConfig::default(),
+        ServerConfig {
+            data_auth_mode: fluree_db_server::config::DataAuthMode::Optional,
+            data_auth_trusted_issuers: vec![issuer.clone()],
+            data_auth_policy_authorities: vec![issuer.clone()],
+            data_auth_audience: Some(audience.into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    cluster.bootstrap().await;
+    let follower = cluster.pick_follower().await;
+    let leader = cluster.current_leader().await.unwrap();
+    let ledger = "raft:delegation";
+    cluster.create_ledger(follower, ledger).await;
+    cluster
+        .insert_subject(follower, ledger, "alice", "Alice")
+        .await;
+    let header = URL_SAFE_NO_PAD.encode(json!({
+        "alg": "EdDSA", "jwk": {"kty": "OKP", "crv": "Ed25519", "x": URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes())}
+    }).to_string());
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 300;
+    for allow in [false, true] {
+        let payload = URL_SAFE_NO_PAD.encode(json!({
+            "iss": issuer, "aud": audience, "exp": exp,
+            "sub": "http://example.org/application-user",
+            "fluree.ledger.read.ledgers": [ledger], "fluree.ledger.write.ledgers": [ledger],
+            "fluree.policy": {"policy": [
+                {"f:action": "f:view", "f:allow": true},
+                {"f:action": "f:modify", "f:allow": allow, "f:exMessage": "Delegated Raft write denied."}
+            ], "default-allow": false}
+        }).to_string());
+        let signing_input = format!("{header}.{payload}");
+        let token = format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(key.sign(signing_input.as_bytes()).to_bytes())
+        );
+        let idempotency_key = if allow {
+            "delegated-raft-allow"
+        } else {
+            "delegated-raft-deny"
+        };
+        let response = cluster.client.post(format!("{}/v1/fluree/insert/{ledger}", cluster.public_url(follower)))
+            .bearer_auth(&token).header("idempotency-key", idempotency_key)
+            .header("fluree-policy", r#"[{"f:allow":true}]"#)
+            .json(&json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob",
+                "opts": {"identity": "http://example.org/manager", "policy": [{"f:allow": true}], "default-allow": true}
+            })).send().await.unwrap();
+        // Conflicting caller selections fail at binding, before entering Raft.
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert!(
+            body.to_string()
+                .contains("Credential does not permit policy selection"),
+            "{body}"
+        );
+        // A request without conflicts must still carry the token's full policy
+        // through follower forwarding and the replicated transaction queue.
+        let response = cluster
+            .client
+            .post(format!(
+                "{}/v1/fluree/insert/{ledger}",
+                cluster.public_url(follower)
+            ))
+            .bearer_auth(&token)
+            .header("idempotency-key", idempotency_key)
+            .json(&json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob"
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.unwrap();
+        if allow {
+            assert_eq!(status, StatusCode::OK, "{body}");
+        } else {
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            assert!(
+                body.to_string().contains("Delegated Raft write denied"),
+                "{body}"
+            );
+        }
+        // This route submits a serialized TransactionRequest to the replicated
+        // command queue. Observe its terminal result through a different node.
+        let response = cluster
+            .client
+            .get(format!(
+                "{}/v1/fluree/submissions/{idempotency_key}/{ledger}",
+                cluster.public_url(leader)
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            body["state"],
+            if allow { "committed" } else { "failed" },
+            "{body}"
+        );
+        for node in &cluster.nodes {
+            cluster
+                .wait_for_names(
+                    node.node_id,
+                    ledger,
+                    if allow { &["Alice", "Bob"] } else { &["Alice"] },
+                    DEFAULT_TIMEOUT,
+                )
+                .await;
+        }
+    }
+
+    #[cfg(feature = "graphql")]
+    for node in [leader, follower] {
+        // The runtime Raft check must protect both ingress nodes, including
+        // anonymous callers on an intentionally optional-auth server.
+        let url = format!("{}/v1/fluree/graphql/{ledger}", cluster.public_url(node));
+        let response = cluster
+            .client
+            .post(&url)
+            .json(&json!({"query": "mutation { createPerson(input: {name: \"Eve\"}) { id } }"}))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+        assert!(
+            body.to_string()
+                .contains("GraphQL mutations are not supported in Raft mode"),
+            "{body}"
+        );
+        let response = cluster
+            .client
+            .post(&url)
+            .json(&json!({"query": "{ __typename }"}))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.get("errors").is_none(), "{body}");
+        cluster
+            .wait_for_names(node, ledger, &["Alice", "Bob"], DEFAULT_TIMEOUT)
+            .await;
+    }
+}
 
 /// Diagnostic: single-node cluster, post directly to the leader.
 /// Confirms the test harness produces a working HTTP path before the
@@ -643,6 +822,453 @@ async fn happy_path_follower_forwards_to_leader() {
             .wait_for_names(node.node_id, ledger, &["Alice", "Bob"], DEFAULT_TIMEOUT)
             .await;
     }
+}
+
+/// A TriG graph sync sent to a follower is forwarded, staged by the leader's
+/// commit worker as an RDF sync body, and replicated: an identical resync
+/// commits nothing, and a smaller payload retracts what it leaves out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rdf_graph_sync_commits_through_the_raft_queue() {
+    init_test_tracing();
+    let cluster = TestCluster::spawn(3).await;
+    cluster.bootstrap().await;
+
+    let follower = cluster.pick_follower().await;
+    let ledger = "raft:sync";
+    let graph = "urn:example:tools";
+    cluster.create_ledger(follower, ledger).await;
+
+    let sync = |triples: &'static str| {
+        let trig =
+            format!("@prefix ex: <http://example.org/> .\nGRAPH <{graph}> {{ {triples} }}\n");
+        let request = cluster
+            .client
+            .post(format!(
+                "{}/v1/fluree/sync/{ledger}?graph={graph}",
+                cluster.public_url(follower)
+            ))
+            .header("content-type", "application/trig")
+            .body(trig);
+        async move {
+            let resp = request.send().await.expect("sync request");
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.expect("sync json");
+            assert!(status.is_success(), "sync returned {status}: {body}");
+            body["t"].as_i64()
+        }
+    };
+    let names_everywhere = |expected: serde_json::Value| {
+        let query = json!({
+            "@context": { "ex": "http://example.org/" },
+            "from": format!("{ledger}#{graph}"),
+            "select": "?name",
+            "where": { "@id": "?s", "ex:name": "?name" },
+            "orderBy": "?name"
+        });
+        let cluster = &cluster;
+        async move {
+            for node in &cluster.nodes {
+                let deadline = Instant::now() + DEFAULT_TIMEOUT;
+                let mut last = serde_json::Value::Null;
+                while Instant::now() < deadline {
+                    let resp = cluster
+                        .client
+                        .post(format!("{}/v1/fluree/query", node.public_url))
+                        .header("content-type", "application/json")
+                        .body(query.to_string())
+                        .send()
+                        .await
+                        .expect("query request");
+                    last = resp.json().await.expect("query json");
+                    if last == expected {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert_eq!(last, expected, "node {}", node.node_id);
+            }
+        }
+    };
+
+    let full = r#"ex:search ex:name "search" ; ex:param [ ex:name "q" ]"#;
+    assert_eq!(sync(full).await, Some(1));
+    // Same triples, different bytes: a byte-identical keyless resubmission
+    // shares the first's content-addressed queue envelope, which the first's
+    // apply releases, so the second's worker can find it gone (#1931).
+    let resync = r#"ex:search  ex:name "search" ; ex:param [ ex:name "q" ]"#;
+    assert_eq!(
+        sync(resync).await,
+        Some(1),
+        "an identical resync must not commit"
+    );
+    names_everywhere(json!(["q", "search"])).await;
+
+    assert_eq!(sync(r#"ex:search ex:name "search""#).await, Some(2));
+    names_everywhere(json!(["search"])).await;
+
+    // A block naming another graph fails identically on every attempt, so
+    // the worker poisons it at once instead of retrying, and the queue moves
+    // on to the next sync.
+    let resp = cluster
+        .client
+        .post(format!(
+            "{}/v1/fluree/sync/{ledger}?graph={graph}",
+            cluster.public_url(follower)
+        ))
+        .header("content-type", "application/trig")
+        .body("GRAPH <urn:example:other> { <urn:x> <urn:p> \"x\" }\n")
+        .send()
+        .await
+        .expect("refused sync request");
+    let status = resp.status();
+    let body = resp.text().await.expect("refused sync body");
+    assert_eq!(status.as_u16(), 422, "{body}");
+    assert!(
+        body.contains("BodyMalformed"),
+        "refused without the retry budget: {body}"
+    );
+    assert_eq!(
+        sync(r#"ex:search ex:name "search" ; ex:tag "t""#).await,
+        Some(3)
+    );
+}
+
+/// Graph Store Protocol writes sent to a follower are forwarded to the
+/// leader (the forwarding layer sits on the write methods only), and the
+/// graph-insert body stages through the leader's commit worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn graph_store_writes_forward_through_the_raft_queue() {
+    init_test_tracing();
+    let cluster = TestCluster::spawn(3).await;
+    cluster.bootstrap().await;
+
+    let follower = cluster.pick_follower().await;
+    let ledger = "raft:gsp";
+    cluster.create_ledger(follower, ledger).await;
+    let uri = format!(
+        "{}/v1/fluree/data/{ledger}?graph=urn:example:tools",
+        cluster.public_url(follower)
+    );
+    let send = |method: reqwest::Method, body: &'static str| {
+        let request = cluster
+            .client
+            .request(method, &uri)
+            .header("content-type", "text/turtle")
+            .body(body);
+        async move {
+            let resp = request.send().await.expect("graph store request");
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            (status, body)
+        }
+    };
+
+    let (status, body) = send(
+        reqwest::Method::PUT,
+        "<http://example.org/search> <http://example.org/name> \"search\" .",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "<http://example.org/fetch> <http://example.org/name> \"fetch\" .",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    for node in &cluster.nodes {
+        let url = format!(
+            "{}/v1/fluree/data/{ledger}?graph=urn:example:tools",
+            node.public_url
+        );
+        let deadline = Instant::now() + DEFAULT_TIMEOUT;
+        let mut last = String::new();
+        while Instant::now() < deadline {
+            let resp = cluster.client.get(&url).send().await.expect("GET");
+            last = resp.text().await.unwrap_or_default();
+            if last.contains("fetch") && last.contains("search") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            last.contains("fetch") && last.contains("search"),
+            "node {}: {last}",
+            node.node_id
+        );
+    }
+
+    let (status, body) = send(reqwest::Method::DELETE, "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Build, in a local in-memory instance, a main branch that ends in a
+/// general merge of `dev`. Return the push a client would send for it: the
+/// first-parent line plus the commit `dev` made.
+async fn merged_history_push() -> fluree_db_api::PushCommitsRequest {
+    use fluree_db_api::{Base64Bytes, ConflictStrategy, FlureeBuilder};
+    use fluree_db_core::ContentStore;
+
+    let local = FlureeBuilder::memory().build_memory();
+    let insert = |ledger: &'static str, subject: &'static str, name: &'static str| {
+        let local = &local;
+        async move {
+            let state = local.ledger(ledger).await.unwrap();
+            let data = json!({
+                "@context": { "ex": "http://example.org/" },
+                "@id": format!("ex:{subject}"),
+                "ex:name": name,
+            });
+            local.insert(state, &data).await.unwrap();
+        }
+    };
+    local.create_ledger("mydb").await.unwrap();
+    insert("mydb:main", "alice", "Alice").await;
+    local
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    // Dev's commit keeps its raw transaction, so it references a txn blob
+    // that has to travel with the push.
+    let dev = local.ledger("mydb:dev").await.unwrap();
+    local
+        .transact(
+            dev,
+            fluree_db_api::TxnType::Insert,
+            &json!({
+                "@context": { "ex": "http://example.org/" },
+                "@id": "ex:bob",
+                "ex:name": "Bob",
+            }),
+            fluree_db_api::TxnOpts::default().store_raw_txn(true),
+            fluree_db_api::CommitOpts::default(),
+            &fluree_db_api::IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
+        )
+        .await
+        .unwrap();
+    insert("mydb:main", "carol", "Carol").await;
+    let report = local
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert!(!report.fast_forward);
+
+    let store = local.branched_content_store("mydb:main").await.unwrap();
+    let head = local
+        .ledger("mydb:main")
+        .await
+        .unwrap()
+        .head_commit_id
+        .clone()
+        .unwrap();
+    let plan = fluree_db_core::plan_commit_transfer(store.as_ref(), &head, None)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut request = fluree_db_api::PushCommitsRequest::default();
+    for (cids, out) in [
+        (&plan.lineage, &mut request.commits),
+        (&plan.merged, &mut request.merged_commits),
+    ] {
+        for cid in cids {
+            let bytes = store.get(cid).await.unwrap();
+            let commit = fluree_db_core::commit::codec::read_commit(&bytes).unwrap();
+            if let Some(txn) = &commit.txn {
+                let txn_bytes = store.get(txn).await.unwrap();
+                request
+                    .blobs
+                    .insert(txn.to_string(), Base64Bytes(txn_bytes));
+            }
+            out.push(Base64Bytes(bytes));
+        }
+    }
+    request
+}
+
+/// A push containing a merge, sent to a follower, is forwarded to the
+/// leader and applied through the Raft queue's `PushWithMerges` envelope.
+/// Every node then sees the merged data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn push_with_merges_through_a_follower() {
+    init_test_tracing();
+    let cluster = TestCluster::spawn(3).await;
+    cluster.bootstrap().await;
+
+    let follower = cluster.pick_follower().await;
+    let ledger = "raft:push-merges";
+    cluster.create_ledger(follower, ledger).await;
+
+    let request = merged_history_push().await;
+    assert_eq!(request.merged_commits.len(), 1, "dev's commit");
+    let resp = cluster
+        .client
+        .post(format!(
+            "{}/v1/fluree/push-merges/{ledger}",
+            cluster.public_url(follower)
+        ))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&request).unwrap())
+        .send()
+        .await
+        .expect("push request");
+    assert!(
+        resp.status().is_success(),
+        "push-merges via follower returned {}: {}",
+        resp.status(),
+        resp.text().await.unwrap_or_default()
+    );
+
+    for node in &cluster.nodes {
+        cluster
+            .wait_for_names(
+                node.node_id,
+                ledger,
+                &["Alice", "Bob", "Carol"],
+                DEFAULT_TIMEOUT,
+            )
+            .await;
+    }
+
+    // The worker also writes the merged-in commit's txn blob. Storage is
+    // shared, so any node can read it.
+    use fluree_db_core::ContentStore;
+    let side = fluree_db_core::commit::codec::read_commit(&request.merged_commits[0].0).unwrap();
+    let txn = side.txn.expect("dev's commit has a txn blob");
+    let stored = cluster.nodes[0]
+        ._state
+        .fluree
+        .content_store(ledger)
+        .get(&txn)
+        .await;
+    assert!(
+        stored.is_ok(),
+        "txn blob {txn} of dev's commit is not stored"
+    );
+}
+
+/// Regression test for the event-bus wiring bug fixed in this branch.
+///
+/// Before the fix, the raft `StateMachineAdapter` emitted
+/// `NameServiceEvent`s on `RaftIntegration::event_bus`, but the
+/// `/v1/fluree/events` SSE endpoint subscribed on the *other* bus
+/// (`Fluree::event_bus()`) — a distinct instance. Runtime commits
+/// on the raft path therefore never surfaced to SSE subscribers
+/// (peers, tooling). The snapshot the events endpoint sends on
+/// connect still populated per-ledger records because it reads
+/// straight from the nameservice, so the bug hid — connection-time
+/// data appeared, subsequent inserts did not.
+///
+/// This test opens an SSE subscription BEFORE any inserts happen,
+/// then does a live insert, and asserts an `ns-record` event with
+/// `commit_t = 1` arrives on the stream within a short window.
+/// Would fail against pre-fix code (stream stays silent).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sse_events_endpoint_emits_runtime_raft_commits() {
+    init_test_tracing();
+    let cluster = TestCluster::spawn(CLUSTER_SIZE).await;
+    cluster.bootstrap().await;
+
+    let ledger = "raft:sse-runtime";
+    cluster
+        .create_ledger(cluster.nodes[0].node_id, ledger)
+        .await;
+
+    // Subscribe against a follower — the interesting case, because
+    // the state machine adapter applies on every node and we want
+    // to verify the follower's SSE endpoint sees runtime events too.
+    let follower = cluster.pick_follower().await;
+    let follower_url = cluster
+        .nodes
+        .iter()
+        .find(|n| n.node_id == follower)
+        .map(|n| n.public_url.clone())
+        .expect("follower node has a URL");
+
+    // Long-timeout client for the SSE stream; the normal 10s
+    // read-timeout on `cluster.client` would kill an idle stream
+    // before we insert.
+    let sse_client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .no_gzip()
+        .build()
+        .expect("build sse client");
+
+    let events_url = format!("{follower_url}/v1/fluree/events?all=true");
+    let resp = sse_client
+        .get(&events_url)
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .expect("SSE subscribe");
+    assert!(
+        resp.status().is_success(),
+        "SSE endpoint returned {}: {}",
+        resp.status(),
+        resp.text().await.unwrap_or_default()
+    );
+
+    // Drive the byte stream on a background task, accumulating raw
+    // bytes into a shared buffer that the main task can scan.
+    let buffer = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+    let buffer_bg = Arc::clone(&buffer);
+    let stream_task = tokio::spawn(async move {
+        use futures::StreamExt;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => buffer_bg.lock().await.extend_from_slice(&bytes),
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Give the SSE endpoint a moment to emit its connection-time
+    // snapshot (which contains the ledger at commit_t=0), so any
+    // event we observe after this point is genuinely live.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Fire the runtime insert. Post-fix, this should produce an
+    // `ns-record` event with commit_t=1 on the SSE stream.
+    cluster
+        .insert_subject(cluster.nodes[0].node_id, ledger, "alice", "Alice")
+        .await;
+
+    // Poll the accumulated bytes for the runtime event. Give it a
+    // generous budget — raft apply + SSE emit is well under a
+    // second on a quiet machine, but CI can be slow, and nextest
+    // hard-kills a genuine hang at 360s regardless.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut saw_runtime_event = false;
+    while Instant::now() < deadline {
+        let buf = buffer.lock().await;
+        let text = String::from_utf8_lossy(&buf);
+        // Look for an ns-record event whose data payload includes
+        // `"commit_t":1`. commit_t=0 is the snapshot state (the
+        // create landing); commit_t=1 is the runtime insert.
+        if text
+            .split("event: ns-record")
+            .skip(1)
+            .any(|block| block.contains("\"commit_t\":1"))
+        {
+            saw_runtime_event = true;
+            break;
+        }
+        drop(buf);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    stream_task.abort();
+
+    assert!(
+        saw_runtime_event,
+        "did not observe an ns-record event for commit_t=1 within 10s — the raft state-machine \
+         adapter's event bus is not reaching the SSE endpoint. Captured stream so far:\n{}",
+        String::from_utf8_lossy(&buffer.lock().await),
+    );
 }
 
 /// Many transactions fan out to every node in parallel; the final
@@ -711,6 +1337,29 @@ async fn concurrent_writes_across_all_nodes() {
         cluster
             .wait_for_names(node.node_id, ledger, &expected_refs, DEFAULT_TIMEOUT)
             .await;
+    }
+
+    // Every node applied every one of these submissions, but only the
+    // node a client actually proposed through has a local waiter. A
+    // node that tracked something per applied entry would sit at
+    // CLUSTER_SIZE * PER_NODE here — the follower leak this design
+    // replaces. All submissions have completed, so even the proposing
+    // nodes are back to zero.
+    for node in &cluster.nodes {
+        let integration = node
+            ._state
+            .raft
+            .as_ref()
+            .expect("test node always has raft integration");
+        assert_eq!(
+            integration.waiter_map.len(),
+            0,
+            "node {} tracks {} waiters after {} completed submissions; \
+             a node must track only its own in-flight proposals",
+            node.node_id,
+            integration.waiter_map.len(),
+            CLUSTER_SIZE as usize * PER_NODE,
+        );
     }
 }
 
@@ -1025,6 +1674,11 @@ async fn liveness_monitor_demotes_killed_follower() {
         unreachable_after: Duration::from_millis(500),
         live_after: Duration::from_millis(200),
         refusal_backoff: Duration::from_millis(300),
+        // Tiny lag window so the frozen follower trips within a
+        // sample or two of the modest (~10-writes/s) progress loop —
+        // any real gap counts as behind. (Production uses the far
+        // larger DEFAULT_MAX_HEALTHY_LAG so normal pipelining is fine.)
+        max_healthy_lag: 1,
     };
     let mut cluster = TestCluster::spawn_with_liveness(CLUSTER_SIZE, liveness_config).await;
     cluster.bootstrap().await;
@@ -1069,18 +1723,23 @@ async fn liveness_monitor_demotes_killed_follower() {
     // than asserting an exact post-demote set.
     wait_for_voter_demoted(&cluster, leader_id, target, Duration::from_secs(5)).await;
 
-    progress_handle.abort();
-
-    // Every other live node should observe the same demotion via
-    // raft replication — the state is replicated, not leader-local.
-    for node in cluster.nodes.iter().filter(|n| n.is_alive()) {
-        let eligible = read_eligible_voters(&cluster, node.node_id).await;
-        assert!(
-            !eligible.contains(&target),
-            "node {} should observe the killed follower {target} as demoted; got {eligible:?}",
-            node.node_id
-        );
+    // Every live node observes the same demotion — the state is
+    // replicated, not leader-local. But replication + apply lag the
+    // leader's commit, so each node must be POLLED to convergence,
+    // not read once: reading a follower immediately after the leader
+    // confirmed was the flake. Keep the progress loop running so
+    // replication stays active while the followers catch up.
+    let live: Vec<NodeId> = cluster
+        .nodes
+        .iter()
+        .filter(|n| n.is_alive())
+        .map(|n| n.node_id)
+        .collect();
+    for node_id in live {
+        wait_for_voter_demoted(&cluster, node_id, target, Duration::from_secs(5)).await;
     }
+
+    progress_handle.abort();
 }
 
 /// Pick any live voter that's not the leader and not `excluded`.
@@ -1211,4 +1870,225 @@ fn spawn_log_progress(
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
+}
+
+/// Not a check: a measurement. Sequential inserts through the leader of a
+/// three-node cluster on local disk, per-request wall time, so a change to
+/// shared-payload durability can be read off this machine.
+///
+/// `cargo test -p fluree-db-server --features raft --release --test grp_raft -- --ignored --nocapture timing`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn timing_sequential_inserts_through_leader() {
+    const WARM: usize = 10;
+    const SAMPLES: usize = 100;
+
+    let cluster = TestCluster::spawn(3).await;
+    cluster.bootstrap().await;
+    let leader = cluster.current_leader().await.expect("leader");
+    let ledger = "raft:timing";
+    cluster.create_ledger(leader, ledger).await;
+
+    let mut samples = Vec::with_capacity(SAMPLES);
+    for n in 0..WARM + SAMPLES {
+        let started = std::time::Instant::now();
+        cluster
+            .insert_subject(leader, ledger, &format!("s{n}"), &format!("Name {n}"))
+            .await;
+        if n >= WARM {
+            samples.push(started.elapsed());
+        }
+    }
+    samples.sort();
+    let at = |q: f64| samples[((samples.len() - 1) as f64 * q) as usize];
+    let mean = samples.iter().sum::<Duration>() / samples.len() as u32;
+    println!(
+        "raft-3 sequential inserts={SAMPLES} median={:?} p95={:?} mean={:?}",
+        at(0.5),
+        at(0.95),
+        mean
+    );
+}
+
+/// Files whose path goes through a `commit` or `txn` directory: the source of
+/// truth a node wrote to the shared root, as opposed to index output.
+fn source_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|n| n == ".fluree-wal") {
+                continue;
+            }
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path
+                .components()
+                .any(|c| c.as_os_str() == "commit" || c.as_os_str() == "txn")
+            {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// Every node journals the shared payload root under its own log. Writes
+/// through every node leave one owned log per node; a node's payloads are
+/// on disk, and only its log directory carries its lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_node_journals_the_shared_root_under_its_own_log() {
+    let cluster = TestCluster::spawn(3).await;
+    cluster.bootstrap().await;
+    let ledger = "raft:owners";
+    cluster
+        .create_ledger(cluster.nodes[0].node_id, ledger)
+        .await;
+    for node in &cluster.nodes {
+        let subject = format!("via{}", node.node_id);
+        cluster
+            .insert_subject(node.node_id, ledger, &subject, &subject)
+            .await;
+    }
+    let owners = cluster._shared_data_tmp.path().join(".fluree-wal/owners");
+    for node in &cluster.nodes {
+        let lock = owners.join(format!("node-{}", node.node_id)).join("LOCK");
+        assert!(
+            lock.exists(),
+            "node {} received a write and must own a log at {}",
+            node.node_id,
+            lock.display()
+        );
+    }
+    assert!(
+        !cluster
+            ._shared_data_tmp
+            .path()
+            .join(".fluree-wal/LOCK")
+            .exists(),
+        "no node may journal the shared root as if it were alone on it"
+    );
+}
+
+/// A node's acknowledged payloads survive that node. The branch's commit
+/// worker is whichever voter the rendezvous hash picked, so the test finds
+/// it by the log that holds the commit keys, abandons that log as a crash
+/// would, stops the node, and removes every commit file from the shared
+/// root. A surviving node explicitly reads a missing payload through its
+/// storage, applies the stopped node's log, and serves the data. A query alone
+/// may use cached state or an index without ever reading a missing commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_survivors_miss_applies_the_stopped_workers_log() {
+    let mut cluster = TestCluster::spawn(3).await;
+    cluster.bootstrap().await;
+    let leader = cluster.current_leader().await.expect("leader");
+    let shared = cluster._shared_data_tmp.path().to_path_buf();
+
+    // Share every node's log through the process-wide registry: the same
+    // owner on the same root is the same log. Keep their segments so the
+    // records are still there to apply however slowly this test runs.
+    let probes: Vec<(NodeId, fluree_db_core::FileStorage)> = cluster
+        .nodes
+        .iter()
+        .map(|n| {
+            let probe = fluree_db_core::FileStorage::new(&shared)
+                .with_wal_owner(format!("node-{}", n.node_id));
+            probe
+                .hold_wal_segments_for_test()
+                .expect("attach to the node's log");
+            (n.node_id, probe)
+        })
+        .collect();
+
+    let ledger = "raft:survives";
+    cluster.create_ledger(leader, ledger).await;
+    cluster.insert_subject(leader, ledger, "ann", "Ann").await;
+    cluster.insert_subject(leader, ledger, "bo", "Bo").await;
+    cluster
+        .wait_for_names(leader, ledger, &["Ann", "Bo"], DEFAULT_TIMEOUT)
+        .await;
+
+    let commits: Vec<_> = source_files(&shared)
+        .into_iter()
+        .filter(|p| p.components().any(|c| c.as_os_str() == "commit"))
+        .collect();
+    assert!(
+        !commits.is_empty(),
+        "the worker wrote commits to the shared root"
+    );
+    // A log records each key verbatim, so the worker is the owner whose
+    // segments mention a commit key.
+    let keys: Vec<String> = commits
+        .iter()
+        .map(|p| {
+            p.strip_prefix(&shared)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    let mut workers = Vec::new();
+    for (node_id, _) in &probes {
+        let dir = shared.join(format!(".fluree-wal/owners/node-{node_id}"));
+        let mentions = std::fs::read_dir(&dir)
+            .expect("every node owns a log")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".wal"))
+            .any(|e| {
+                let bytes = std::fs::read(e.path()).unwrap();
+                keys.iter()
+                    .any(|k| bytes.windows(k.len()).any(|w| w == k.as_bytes()))
+            });
+        if mentions {
+            workers.push(*node_id);
+        }
+    }
+    assert_eq!(
+        workers.len(),
+        1,
+        "exactly one node wrote the commits: {workers:?}"
+    );
+    let worker = workers[0];
+
+    let (_, probe) = probes.iter().find(|(id, _)| *id == worker).unwrap();
+    probe.simulate_crash_for_test();
+    let index = cluster
+        .nodes
+        .iter()
+        .position(|n| n.node_id == worker)
+        .expect("worker is a node");
+    cluster.nodes[index].shutdown().await;
+    let expected_payload = std::fs::read(&commits[0]).expect("read payload before simulated loss");
+    for path in &commits {
+        std::fs::remove_file(path).expect("remove a payload the crash lost");
+    }
+
+    // Read through a surviving node's actual storage, bypassing ledger/index
+    // caches. Query success alone does not prove a storage miss occurred.
+    let survivor = cluster
+        .nodes
+        .iter()
+        .find(|n| n.node_id != worker && n.node_id != leader)
+        .expect("three nodes leave one that is neither worker nor leader");
+    let address = format!("fluree:file://{}", keys[0]);
+    let recovered = survivor
+        ._state
+        .fluree
+        .admin_storage()
+        .expect("file-backed survivor has storage")
+        .read_bytes(&address)
+        .await
+        .expect("a storage miss must replay the stopped worker's WAL");
+    assert_eq!(recovered, expected_payload);
+    cluster
+        .wait_for_names(survivor.node_id, ledger, &["Ann", "Bo"], DEFAULT_TIMEOUT)
+        .await;
+    assert!(
+        commits.iter().all(|p| p.exists()),
+        "the survivor's miss applied the stopped worker's log and restored every commit"
+    );
 }

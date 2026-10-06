@@ -94,8 +94,13 @@ pub fn l2_f64(a: &[f64], b: &[f64]) -> f64 {
 pub fn cosine_f64(a: &[f64], b: &[f64]) -> Option<f64> {
     debug_assert_eq!(a.len(), b.len());
 
-    // We compute dot + squared magnitudes in a single pass for cache efficiency.
-    let (dot, mag_a2, mag_b2) = dot_mag2_f64(a, b);
+    // Above the SIMD threshold, three dispatched dot-kernel passes beat one
+    // scalar fused pass; below it, the single-pass scalar loop wins.
+    let (dot, mag_a2, mag_b2) = if a.len() < SIMD_LEN_THRESHOLD {
+        dot_mag2_f64(a, b)
+    } else {
+        (dot_f64(a, b), dot_f64(a, a), dot_f64(b, b))
+    };
     if mag_a2 == 0.0 || mag_b2 == 0.0 {
         None
     } else {
@@ -394,7 +399,12 @@ pub fn l2_f32(a: &[f32], b: &[f32]) -> f32 {
 pub fn cosine_f32(a: &[f32], b: &[f32]) -> Option<f32> {
     debug_assert_eq!(a.len(), b.len());
 
-    let (dot, mag_a2, mag_b2) = dot_mag2_f32(a, b);
+    // Same pass-count trade-off as `cosine_f64`.
+    let (dot, mag_a2, mag_b2) = if a.len() < SIMD_LEN_THRESHOLD {
+        dot_mag2_f32(a, b)
+    } else {
+        (dot_f32(a, b), dot_f32(a, a), dot_f32(b, b))
+    };
     if mag_a2 == 0.0 || mag_b2 == 0.0 {
         None
     } else {

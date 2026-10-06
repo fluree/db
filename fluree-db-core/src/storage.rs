@@ -9,15 +9,126 @@
 //! - [`memory`]: In-memory backend ([`MemoryStorage`], [`MemoryContentStore`])
 //! - [`file`]: Filesystem backend behind the `native` feature ([`FileStorage`])
 
+/// When a write to `FileStorage` is reported complete.
+///
+/// Every setting is atomic — a reader never observes a partial file. They
+/// differ in what survives the machine losing power, and in how many device
+/// flushes a commit costs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Durability {
+    /// Report complete once the write is in the storage root's WAL and
+    /// that log has been flushed. The file itself is written page-cache and
+    /// flushed in the background; a restart replays the log first. Survives
+    /// power loss. A head publication costs at most one flush regardless of
+    /// how many objects the commit wrote, and publications that overlap share
+    /// one; content writes are covered by the next head publication or the
+    /// next background flush, whichever comes first.
+    ///
+    /// Unix only. Where the root cannot be journaled — a second process holds
+    /// the log, or the filesystem refuses advisory locks — writes fall back to
+    /// [`Self::Sync`] for the life of the handle.
+    #[default]
+    Wal,
+    /// Report complete once the bytes and the directory entry naming them have
+    /// been flushed to the device. Survives power loss; costs an fsync of the
+    /// staged file and one of its parent directory per write.
+    Sync,
+    /// Report complete once the bytes reach the OS page cache. Survives process
+    /// death, but a power loss or kernel panic can lose writes already reported
+    /// as committed.
+    PageCache,
+}
+
+// The env/sync helpers are consumed only by the native `FileStorage` (gated
+// on `native` + non-wasm); the enum itself is part of the portable config API.
+#[cfg_attr(
+    not(all(feature = "native", not(target_arch = "wasm32"))),
+    allow(dead_code)
+)]
+impl Durability {
+    /// Environment variable selecting the default for new `FileStorage`.
+    pub const ENV_VAR: &'static str = "FLUREE_STORAGE_FSYNC";
+
+    pub(crate) fn syncs(&self) -> bool {
+        matches!(self, Durability::Sync)
+    }
+
+    /// Default read from [`Self::ENV_VAR`], falling back to [`Self::Wal`]
+    /// when unset or unrecognized.
+    ///
+    /// Read once per storage construction rather than per write, so tests set
+    /// the field through `FileStorage::with_durability` and never race on
+    /// process environment.
+    fn from_env() -> Self {
+        Self::from_env_override().unwrap_or_default()
+    }
+
+    /// The setting [`Self::ENV_VAR`] asks for, or `None` when it is unset.
+    ///
+    /// Distinguishing "unset" from "set to on" is what lets configuration
+    /// supply a value that an operator can still override for one run.
+    pub fn from_env_override() -> Option<Self> {
+        std::env::var(Self::ENV_VAR)
+            .ok()
+            .as_deref()
+            .map(|v| Self::parse(Some(v)))
+    }
+
+    /// Resolve the setting for a storage instance.
+    ///
+    /// Environment beats configuration beats the default, matching the
+    /// precedence documented in `docs/operations/configuration.md` — a checked-in
+    /// config file never outranks an operator's one-off override.
+    pub fn resolve(configured: Option<Self>) -> Self {
+        Self::resolve_from(Self::from_env_override(), configured)
+    }
+
+    /// Pure half of [`Self::resolve`], so the precedence rule is testable
+    /// without touching process environment.
+    fn resolve_from(env: Option<Self>, configured: Option<Self>) -> Self {
+        env.or(configured).unwrap_or_default()
+    }
+
+    /// Pure half of [`Self::from_env`], so the accepted spellings are testable
+    /// without touching process environment.
+    fn parse(value: Option<&str>) -> Self {
+        match value.map(|v| v.trim().to_ascii_lowercase()) {
+            Some(v) if matches!(v.as_str(), "0" | "false" | "off" | "no") => Durability::PageCache,
+            // The per-write spelling is explicit: the truthy spellings (`1`,
+            // `true`, `on`) mean "durable", and the durable default is the log.
+            Some(v) if matches!(v.as_str(), "sync" | "fsync" | "direct") => Durability::Sync,
+            _ => Durability::Wal,
+        }
+    }
+
+    /// Parse a configuration mode name (`wal` / `sync` / `page-cache`).
+    ///
+    /// Named modes rather than the environment variable's boolean: a config
+    /// file is read to understand a deployment, and a name says what it does.
+    /// Returns `None` for an unrecognized value so the caller can reject it
+    /// rather than silently pick a durability the operator did not ask for.
+    pub fn from_mode_name(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "wal" | "journal" => Some(Durability::Wal),
+            "sync" | "fsync" => Some(Durability::Sync),
+            "page-cache" | "pagecache" => Some(Durability::PageCache),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 mod file;
 mod memory;
+pub mod residency;
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+mod wal;
 
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub use file::{FileStorage, STORAGE_METHOD_FILE};
 pub use memory::{MemoryContentStore, MemoryStorage, STORAGE_METHOD_MEMORY};
 
-use crate::address_path::{ledger_id_to_path_prefix, shared_prefix_for_path};
+use crate::address_path::{storage_ledger_id, SHARED_NAMESPACE};
 use crate::error::Result;
 use async_trait::async_trait;
 use sha2::Digest;
@@ -122,11 +233,80 @@ pub trait StorageRead: Debug + Send + Sync {
         None
     }
 
+    /// Whether bytes read from this storage may be persisted unencrypted
+    /// outside it. The binary-index disk cache spills fetched leaves,
+    /// branches and dictionaries to a local directory as a read-through
+    /// cache; a storage that decrypts on read must answer `false`, or that
+    /// cache becomes a plaintext copy of the ledger. Storages whose reads
+    /// return exactly the bytes at rest answer `true`; wrappers delegate to
+    /// what they wrap.
+    ///
+    /// Deliberately without a default: a wrapper that forgot to delegate
+    /// would silently re-open the plaintext leak, so every implementation
+    /// has to answer.
+    fn permits_plaintext_cache(&self) -> bool;
+
+    /// The encryption administration surface, when this storage encrypts
+    /// at rest. `None` for plaintext storages; wrappers delegate to what
+    /// they wrap. Required for the same reason as
+    /// [`Self::permits_plaintext_cache`]: a wrapper that answered `None` by
+    /// default would report an encrypted store as plaintext.
+    fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>>;
+
+    /// Synchronous, non-blocking lookup of already-resident bytes for a CID.
+    ///
+    /// Mirror of [`ContentStore::resolve_cached_bytes`] for address-keyed
+    /// backends: `StorageContentStore` forwards the CID straight through
+    /// (no address formatting on the lookup), so a `StorageRead` implementor
+    /// with a resident tier — e.g. a browser fetch-backed storage that
+    /// caches by CID — is consulted by the sync read path. Implementations
+    /// must not perform I/O or block; the default returns `None`.
+    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
+        let _ = id;
+        None
+    }
+
+    /// The store's residency miss register, if it participates in the sync
+    /// residency tier. Mirror of [`ContentStore::miss_register`]; see it for
+    /// the participation contract.
+    fn miss_register(&self) -> Option<&residency::MissRegister> {
+        None
+    }
+
+    /// Begin an in-flight window on the store's residency tier. Mirror of
+    /// [`ContentStore::query_guard`].
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        None
+    }
+
     /// Read a byte range from the object at the given address.
     ///
     /// The range is `[start, end)` in bytes. Returns the bytes within
     /// the range, which may be shorter than requested if the object is
     /// smaller than `range.end`.
+    ///
+    /// **Clamping is the contract, not an implementation detail.** An
+    /// implementation must size its result from the object, never from the
+    /// width of the range: `mid..u64::MAX` is the established spelling of
+    /// "read to the end" against this trait, so a `range.end` past the object
+    /// is normal input rather than an error. A `range.start` at or past the
+    /// end of the object returns `Ok(vec![])`, the same answer an empty range
+    /// gives — absence of bytes is not an error here, and callers distinguish
+    /// "no bytes" from "no object" by the `NotFound` error, not by this.
+    ///
+    /// Two known divergences, named so this paragraph stays authoritative
+    /// rather than optimistic — a contract doc that names one exception as if
+    /// it were the only one is how a backend drifts out from under it:
+    ///
+    /// - `S3Storage` returns 416 rather than an empty vec for a start past
+    ///   the end. That predates this doc and is tracked in #1712; the
+    ///   clamping half of the contract holds on every backend.
+    /// - A **zero-length object** reads as `NotFound` from `FileStorage` —
+    ///   the #1599 debris guard treats an empty blob as absent on every read
+    ///   surface, this one included — where `MemoryStorage` and this default
+    ///   implementation return `Ok(vec![])`. Deliberate, and callers relying
+    ///   on the guard want exactly that answer, but it is a divergence in
+    ///   this method's observable behavior all the same.
     ///
     /// The default implementation fetches the full object and slices.
     /// StorageBackends that support native range reads (S3, HTTP) should override
@@ -187,6 +367,36 @@ pub trait StorageWrite: Debug + Send + Sync {
     /// This is idempotent: deleting a non-existent object succeeds.
     /// Only returns an error for actual failures (network, permissions, etc).
     async fn delete(&self, address: &str) -> Result<()>;
+
+    /// Delete several objects by address, returning the ones that could not
+    /// be deleted with the error each hit.
+    ///
+    /// An absent object is not a failure, as for [`delete`](Self::delete).
+    /// The default issues one `delete` per address in order; backends with a
+    /// native batch operation override it so a caller releasing thousands of
+    /// artifacts costs a handful of requests rather than one each.
+    async fn delete_many(&self, addresses: &[String]) -> Vec<(String, crate::error::Error)> {
+        let mut failures = Vec::new();
+        for address in addresses {
+            match self.delete(address).await {
+                Ok(()) | Err(crate::error::Error::NotFound(_)) => {}
+                Err(e) => failures.push((address.clone(), e)),
+            }
+        }
+        failures
+    }
+
+    /// Make every write this storage reported complete short of the device
+    /// durable now.
+    ///
+    /// Backends whose writes are durable on return (object stores, memory)
+    /// have nothing to do and keep the default. `FileStorage` writes derived
+    /// content at page-cache durability and flushes it here, so a caller
+    /// about to publish a pointer to that content can put the content on the
+    /// device first without paying a flush per object on the write path.
+    async fn sync(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -273,6 +483,29 @@ pub trait StorageMethod {
 ///
 /// Used for type erasure in `AnyStorage`.
 pub trait Storage: StorageRead + ContentAddressedWrite + StorageMethod {}
+
+/// What a key rotation needs from an encrypting storage.
+///
+/// Addresses are hashes of plaintext, so re-enveloping a blob under a new
+/// key is an in-place overwrite at the same address: no pointer changes,
+/// and a crash between blobs leaves each one on exactly one key.
+#[async_trait]
+pub trait EncryptionAdmin: Send + Sync {
+    /// Ids of every key the storage can decrypt with, current first.
+    fn key_ids(&self) -> Vec<u32>;
+
+    /// Id of the key that encrypts new writes.
+    fn current_key_id(&self) -> u32;
+
+    /// The key id recorded in the envelope at `address`, read from its
+    /// header alone. `None` when the bytes there are not an envelope.
+    async fn key_id_at(&self, address: &str) -> Result<Option<u32>>;
+
+    /// Re-envelope the blob at `address` under the current key, verifying
+    /// the result reads back. Returns the plaintext size rewritten, or
+    /// `None` when the blob was already on the current key.
+    async fn reencrypt(&self, address: &str) -> Result<Option<u64>>;
+}
 impl<T: StorageRead + ContentAddressedWrite + StorageMethod> Storage for T {}
 
 // ============================================================================
@@ -312,6 +545,26 @@ impl StorageRead for Arc<dyn Storage> {
     fn resolve_local_path(&self, address: &str) -> Option<PathBuf> {
         self.as_ref().resolve_local_path(address)
     }
+
+    fn permits_plaintext_cache(&self) -> bool {
+        self.as_ref().permits_plaintext_cache()
+    }
+
+    fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>> {
+        self.as_ref().encryption_admin()
+    }
+
+    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
+        self.as_ref().resolve_cached_bytes(id)
+    }
+
+    fn miss_register(&self) -> Option<&residency::MissRegister> {
+        self.as_ref().miss_register()
+    }
+
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        self.as_ref().query_guard()
+    }
 }
 
 #[async_trait]
@@ -322,6 +575,14 @@ impl StorageWrite for Arc<dyn Storage> {
 
     async fn delete(&self, address: &str) -> Result<()> {
         self.as_ref().delete(address).await
+    }
+
+    async fn delete_many(&self, addresses: &[String]) -> Vec<(String, crate::error::Error)> {
+        self.as_ref().delete_many(addresses).await
+    }
+
+    async fn sync(&self) -> Result<()> {
+        self.as_ref().sync().await
     }
 }
 
@@ -390,6 +651,53 @@ pub trait ContentStore: Debug + Send + Sync {
         None
     }
 
+    /// Whether bytes returned by [`Self::get`] may be persisted unencrypted
+    /// outside this store — see [`StorageRead::permits_plaintext_cache`],
+    /// including why there is no default. The disk artifact cache consults
+    /// this before reading or writing an artifact in its directory.
+    fn permits_plaintext_cache(&self) -> bool;
+
+    /// Synchronous, non-blocking lookup of already-resident bytes for a CID.
+    ///
+    /// This is the sync residency tier for targets without a sync→async
+    /// bridge (`wasm32`): the binary-index read path consults it instead of
+    /// filesystem probes or a bridged CAS fetch, and surfaces a typed
+    /// `NeedFetch` miss when it returns `None` so an async caller can fetch
+    /// and retry. Implementations must not perform I/O or block — a hit is
+    /// an O(1) map lookup returning a shared `Arc` clone (zero copy); on a
+    /// backend with no resident tier the default returns `None`.
+    ///
+    /// Content is immutable (CID-addressed), so implementations may pin and
+    /// serve entries indefinitely without invalidation.
+    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
+        let _ = id;
+        None
+    }
+
+    /// The store's residency miss register, if it participates in the sync
+    /// residency tier.
+    ///
+    /// Returning `Some` is the participation signal: the sync read path then
+    /// serves reads *exclusively* from [`Self::resolve_cached_bytes`] —
+    /// never the filesystem or a bridged fetch — and records every miss into
+    /// this register for an async retry frame to drain (see
+    /// [`residency::MissRegister`]). A participating store must uphold the
+    /// **fetch-pins contract**: bytes returned by [`Self::get`] become (and
+    /// stay) resident, so a drained want that was fetched successfully is
+    /// guaranteed to hit on the re-run.
+    fn miss_register(&self) -> Option<&residency::MissRegister> {
+        None
+    }
+
+    /// Begin an in-flight window on the store's residency tier, if it has
+    /// one. See [`residency::InFlightGuard`]: while the returned guard is
+    /// alive the tier must not evict resident bytes, so a retry loop's
+    /// rounds observe a monotone resident set. Stores without a residency
+    /// tier return `None` (the default).
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        None
+    }
+
     /// Signal that this content is no longer needed and may be reclaimed.
     ///
     /// Implementations should make a best effort to free the underlying
@@ -400,6 +708,22 @@ pub trait ContentStore: Debug + Send + Sync {
     /// must be idempotent. This allows callers (e.g., GC) to retry without
     /// tracking which releases have already succeeded.
     async fn release(&self, id: &ContentId) -> Result<()>;
+
+    /// Release several CIDs, returning the ones that could not be released
+    /// with the error each hit.
+    ///
+    /// Same contract as [`release`](Self::release) per id. The default calls
+    /// `release` once per id; stores over a backend with a batch delete
+    /// override it so the collector's per-pass work is a few requests.
+    async fn release_many(&self, ids: &[ContentId]) -> Vec<(ContentId, crate::error::Error)> {
+        let mut failures = Vec::new();
+        for id in ids {
+            if let Err(e) = self.release(id).await {
+                failures.push((id.clone(), e));
+            }
+        }
+        failures
+    }
 
     /// Retrieve a byte range from an object by CID.
     ///
@@ -419,6 +743,13 @@ pub trait ContentStore: Debug + Send + Sync {
         }
         Ok(full[start..end].to_vec())
     }
+
+    /// Make every write this store reported complete short of the device
+    /// durable now; see [`StorageWrite::sync`]. Call it before publishing a
+    /// pointer to content written through this store.
+    async fn sync(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 // Blanket `ContentStore` impl for `Arc<dyn ContentStore>`, so callers can pass
@@ -428,6 +759,10 @@ pub trait ContentStore: Debug + Send + Sync {
 impl ContentStore for Arc<dyn ContentStore> {
     async fn has(&self, id: &ContentId) -> Result<bool> {
         self.as_ref().has(id).await
+    }
+
+    async fn sync(&self) -> Result<()> {
+        self.as_ref().sync().await
     }
 
     async fn get(&self, id: &ContentId) -> Result<Vec<u8>> {
@@ -446,8 +781,28 @@ impl ContentStore for Arc<dyn ContentStore> {
         self.as_ref().resolve_local_path(id)
     }
 
+    fn permits_plaintext_cache(&self) -> bool {
+        self.as_ref().permits_plaintext_cache()
+    }
+
+    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
+        self.as_ref().resolve_cached_bytes(id)
+    }
+
+    fn miss_register(&self) -> Option<&residency::MissRegister> {
+        self.as_ref().miss_register()
+    }
+
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        self.as_ref().query_guard()
+    }
+
     async fn release(&self, id: &ContentId) -> Result<()> {
         self.as_ref().release(id).await
+    }
+
+    async fn release_many(&self, ids: &[ContentId]) -> Vec<(ContentId, crate::error::Error)> {
+        self.as_ref().release_many(ids).await
     }
 
     async fn get_range(&self, id: &ContentId, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
@@ -473,6 +828,8 @@ pub struct StorageContentStore<S: Storage> {
     storage: S,
     ledger_id: String,
     method: String,
+    /// `(name/branch, name/@shared)`, derived once rather than per address.
+    prefixes: (String, String),
 }
 
 impl<S: Storage> StorageContentStore<S> {
@@ -484,10 +841,13 @@ impl<S: Storage> StorageContentStore<S> {
     /// * `ledger_id` - Ledger identifier (e.g., `"mydb:main"`)
     /// * `method` - Storage method name for address generation (e.g., `"file"`, `"memory"`)
     pub fn new(storage: S, ledger_id: impl Into<String>, method: impl Into<String>) -> Self {
+        let ledger_id = ledger_id.into();
+        let prefixes = storage_path_prefixes(&ledger_id);
         Self {
             storage,
-            ledger_id: ledger_id.into(),
+            ledger_id,
             method: method.into(),
+            prefixes,
         }
     }
 
@@ -496,43 +856,80 @@ impl<S: Storage> StorageContentStore<S> {
         let kind = id.content_kind().ok_or_else(|| {
             crate::error::Error::storage(format!("unknown codec {} in CID {}", id.codec(), id))
         })?;
-        let hex_digest = id.digest_hex();
-        let addr = content_address(&self.method, kind, &self.ledger_id, &hex_digest);
-        Ok(addr)
+        let (prefix, shared) = &self.prefixes;
+        let path = content_path_from_prefixes(kind, prefix, shared, &id.digest_hex());
+        Ok(format!("fluree:{}://{path}", self.method))
     }
 
     /// For dict blobs, return the pre-global-dicts address where dicts lived
     /// under the per-branch namespace (`mydb/main/index/objects/dicts/{sha}.dict`).
     /// Returns `None` for non-dict CIDs.
     fn legacy_dict_address(&self, id: &ContentId) -> Option<String> {
-        if id.codec() != crate::CODEC_FLUREE_DICT_BLOB {
-            return None;
-        }
-        let prefix = ledger_id_prefix_for_path(&self.ledger_id);
-        let hex = id.digest_hex();
-        Some(format!(
-            "fluree:{}://{}/index/objects/dicts/{}.dict",
-            self.method, prefix, hex
-        ))
+        legacy_dict_address(&self.method, &self.ledger_id, id)
     }
 
     /// Index roots were stored with a `.json` extension before the switch to `.fir6`.
     /// Returns `None` for non-IndexRoot CIDs.
     fn legacy_index_root_address(&self, id: &ContentId) -> Option<String> {
-        if id.codec() != crate::CODEC_FLUREE_INDEX_ROOT {
-            return None;
-        }
-        let prefix = ledger_id_prefix_for_path(&self.ledger_id);
-        let hex = id.digest_hex();
-        Some(format!(
-            "fluree:{}://{}/index/roots/{}.json",
-            self.method, prefix, hex
-        ))
+        legacy_index_root_address(&self.method, &self.ledger_id, id)
     }
+}
+
+/// The pre-global-dicts address, where dict blobs lived under the per-branch
+/// namespace (`mydb/main/index/objects/dicts/{sha}.dict`).
+///
+/// Returns `None` for non-dict CIDs.
+pub fn legacy_dict_address(method: &str, ledger_id: &str, id: &ContentId) -> Option<String> {
+    if id.codec() != crate::CODEC_FLUREE_DICT_BLOB {
+        return None;
+    }
+    let prefix = ledger_id_prefix_for_path(ledger_id);
+    let hex = id.digest_hex();
+    Some(format!(
+        "fluree:{method}://{prefix}/index/objects/dicts/{hex}.dict"
+    ))
+}
+
+/// The index-root address from before the `.json` to `.fir6` rename.
+///
+/// Returns `None` for non-`IndexRoot` CIDs.
+fn legacy_index_root_address(method: &str, ledger_id: &str, id: &ContentId) -> Option<String> {
+    if id.codec() != crate::CODEC_FLUREE_INDEX_ROOT {
+        return None;
+    }
+    let prefix = ledger_id_prefix_for_path(ledger_id);
+    let hex = id.digest_hex();
+    Some(format!("fluree:{method}://{prefix}/index/roots/{hex}.json"))
+}
+
+/// Every address at which a CID's blob could physically live, current layout
+/// first.
+///
+/// The storage layout has changed twice — dict blobs moved from the per-branch
+/// namespace to `@shared`, and index roots moved from `.json` to `.fir6` — and
+/// [`ContentStore::get`] falls back through the older forms. Anything deciding
+/// that a blob is unreferenced must account for all of them, or it will delete
+/// a live blob that exists only at a legacy address.
+///
+/// Returns an empty vector when the CID's codec is unrecognised. Callers that
+/// delete must treat that as "cannot locate this blob" and decline to act, not
+/// as "this blob occupies no addresses".
+pub fn candidate_addresses(method: &str, ledger_id: &str, id: &ContentId) -> Vec<String> {
+    let mut addresses = Vec::new();
+    if let Some(kind) = id.content_kind() {
+        addresses.push(content_address(method, kind, ledger_id, &id.digest_hex()));
+    }
+    addresses.extend(legacy_dict_address(method, ledger_id, id));
+    addresses.extend(legacy_index_root_address(method, ledger_id, id));
+    addresses
 }
 
 #[async_trait]
 impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
+    async fn sync(&self) -> Result<()> {
+        self.storage.sync().await
+    }
+
     async fn has(&self, id: &ContentId) -> Result<bool> {
         let address = self.cid_to_address(id)?;
         if self.storage.exists(&address).await? {
@@ -551,11 +948,15 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
 
     async fn get(&self, id: &ContentId) -> Result<Vec<u8>> {
         let address = self.cid_to_address(id)?;
-        match self.storage.read_bytes(&address).await {
+        // Keep the primary miss's message rather than discarding it: it carries
+        // the resolved path, and — for a zero-length blob — the reason the
+        // backend called it absent. Rebuilding a bare `not_found(address)` here
+        // throws both away, and this is the error a caller actually sees.
+        let primary = match self.storage.read_bytes(&address).await {
             Ok(bytes) => return Ok(bytes),
-            Err(crate::error::Error::NotFound(_)) => {}
+            Err(crate::error::Error::NotFound(reason)) => reason,
             Err(e) => return Err(e),
-        }
+        };
         // Fallback: dicts moved from per-branch to @shared namespace
         if let Some(legacy) = self.legacy_dict_address(id) {
             return self.storage.read_bytes(&legacy).await;
@@ -564,7 +965,7 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         if let Some(legacy) = self.legacy_index_root_address(id) {
             return self.storage.read_bytes(&legacy).await;
         }
-        Err(crate::error::Error::not_found(address))
+        Err(crate::error::Error::not_found(primary))
     }
 
     async fn put(&self, kind: ContentKind, bytes: &[u8]) -> Result<ContentId> {
@@ -582,17 +983,101 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
                 "CID verification failed: provided CID {id} does not match bytes"
             )));
         }
-        let address = self.cid_to_address(id)?;
-        self.storage.write_bytes(&address, bytes).await
+        let kind = id.content_kind().ok_or_else(|| {
+            crate::error::Error::storage(format!("unknown codec {} in CID {}", id.codec(), id))
+        })?;
+        // Same address `cid_to_address` derives — both go through
+        // `content_address` with this kind — but routed so the write *decides*
+        // its durability from the content kind rather than inheriting the
+        // instance default. Today's callers are all commits and txns, which
+        // land on the same answer either way; a path that ingests index blobs
+        // by CID would silently start fsyncing them.
+        self.storage
+            .content_write_bytes_with_hash(kind, &self.ledger_id, &id.digest_hex(), bytes)
+            .await?;
+        Ok(())
     }
 
     async fn release(&self, id: &ContentId) -> Result<()> {
-        let address = self.cid_to_address(id)?;
-        match self.storage.delete(&address).await {
-            Ok(()) => Ok(()),
-            Err(crate::error::Error::NotFound(_)) => Ok(()),
-            Err(e) => Err(e),
+        // Delete every address the blob could occupy, not just the current
+        // layout: on a ledger predating the `@shared` dict move or the
+        // `.fir6` rename, the only copy sits at a legacy address, and
+        // releasing just the canonical one silently reclaims nothing.
+        let mut deleted = Ok(());
+        for address in candidate_addresses(&self.method, &self.ledger_id, id) {
+            match self.storage.delete(&address).await {
+                Ok(()) | Err(crate::error::Error::NotFound(_)) => {}
+                Err(e) => {
+                    deleted = Err(e);
+                    break;
+                }
+            }
         }
+
+        // After the deletes, never before: evicting first leaves a window
+        // where a concurrent reader repopulates the entry from storage that
+        // still holds the blob. Runs even when a delete failed — the blob may
+        // be partly gone by then, and a needless eviction only costs a refetch.
+        // Off-native there is no disk cache to hold a stale entry.
+        #[cfg(feature = "native")]
+        crate::disk_cache::evict_cached_cid(id);
+
+        deleted
+    }
+
+    async fn release_many(&self, ids: &[ContentId]) -> Vec<(ContentId, crate::error::Error)> {
+        // Every candidate address of every id goes into one batch: the
+        // legacy addresses are almost always absent, and an absent object is
+        // free inside a batch where it cost a round trip on its own.
+        let mut addresses = Vec::with_capacity(ids.len() * 2);
+        let mut owner: Vec<usize> = Vec::with_capacity(ids.len() * 2);
+        for (i, id) in ids.iter().enumerate() {
+            for address in candidate_addresses(&self.method, &self.ledger_id, id) {
+                addresses.push(address);
+                owner.push(i);
+            }
+        }
+
+        let failed = self.storage.delete_many(&addresses).await;
+
+        // Deletes before evictions, for the reason `release` gives.
+        #[cfg(feature = "native")]
+        for id in ids {
+            crate::disk_cache::evict_cached_cid(id);
+        }
+
+        // One failure per id, the first address that failed.
+        let mut seen = std::collections::HashSet::new();
+        let mut failures = Vec::new();
+        for (address, error) in failed {
+            let Some(pos) = addresses.iter().position(|a| *a == address) else {
+                continue;
+            };
+            let idx = owner[pos];
+            if seen.insert(idx) {
+                failures.push((ids[idx].clone(), error));
+            }
+        }
+        failures
+    }
+
+    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
+        // CID-keyed straight through — no address formatting on the lookup.
+        // A resident tier indexes by CID regardless of which (current or
+        // legacy) address the bytes were fetched from.
+        self.storage.resolve_cached_bytes(id)
+    }
+
+    fn permits_plaintext_cache(&self) -> bool {
+        self.storage.permits_plaintext_cache()
+    }
+
+    fn miss_register(&self) -> Option<&residency::MissRegister> {
+        self.storage.miss_register()
+    }
+
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        self.storage.query_guard()
     }
 
     fn resolve_local_path(&self, id: &ContentId) -> Option<std::path::PathBuf> {
@@ -613,11 +1098,12 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
 
     async fn get_range(&self, id: &ContentId, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
         let address = self.cid_to_address(id)?;
-        match self.storage.read_byte_range(&address, range.clone()).await {
+        // Same reason-preservation as `get` above.
+        let primary = match self.storage.read_byte_range(&address, range.clone()).await {
             Ok(bytes) => return Ok(bytes),
-            Err(crate::error::Error::NotFound(_)) => {}
+            Err(crate::error::Error::NotFound(reason)) => reason,
             Err(e) => return Err(e),
-        }
+        };
         // Fallback: dicts moved from per-branch to @shared namespace
         if let Some(legacy) = self.legacy_dict_address(id) {
             match self.storage.read_byte_range(&legacy, range.clone()).await {
@@ -630,7 +1116,7 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         if let Some(legacy) = self.legacy_index_root_address(id) {
             return self.storage.read_byte_range(&legacy, range).await;
         }
-        Err(crate::error::Error::not_found(address))
+        Err(crate::error::Error::not_found(primary))
     }
 }
 
@@ -699,6 +1185,55 @@ pub enum StorageBackend {
     Managed(Arc<dyn Storage>),
     /// Append-only content-addressed storage (IPFS).
     Permanent(Arc<dyn ContentStore>),
+    /// Namespace-routed composition: mounted alias prefixes read through
+    /// their own backend, everything else uses the default backend.
+    Routed(Arc<RoutedBackend>),
+}
+
+/// Namespace-prefix routing table for [`StorageBackend::Routed`].
+///
+/// Each mount claims a ledger-name prefix (e.g. `"acme"` routes
+/// `acme/inventory:main` and every namespace under `acme/`). Store selection
+/// happens in [`StorageBackend::content_store`], the single point where a
+/// ledger's namespace is bound to a store — so ledger loading, branched-store
+/// ancestry walks, and default-context reads all route without changes.
+///
+/// Admin operations (delete, list) apply only to the default backend; mounts
+/// are read-only remote content.
+pub struct RoutedBackend {
+    default: StorageBackend,
+    mounts: Vec<(String, StorageBackend)>,
+}
+
+impl RoutedBackend {
+    /// Compose a default backend with `(prefix, backend)` mounts.
+    pub fn new(default: StorageBackend, mounts: Vec<(String, StorageBackend)>) -> Self {
+        Self { default, mounts }
+    }
+
+    /// Select the backend owning `namespace_id` (a ledger ID or name).
+    fn backend_for(&self, namespace_id: &str) -> &StorageBackend {
+        self.mounts
+            .iter()
+            .find(|(prefix, _)| {
+                namespace_id
+                    .strip_prefix(prefix.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+            .map_or(&self.default, |(_, backend)| backend)
+    }
+}
+
+impl Debug for RoutedBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RoutedBackend")
+            .field("default", &self.default)
+            .field(
+                "mounts",
+                &self.mounts.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl StorageBackend {
@@ -707,33 +1242,41 @@ impl StorageBackend {
     ///
     /// For `Managed` backends, this constructs a [`StorageContentStore`] that
     /// maps CIDs to physical addresses under the namespace. For `Permanent`
-    /// backends, the inner store is returned directly.
+    /// backends, the inner store is returned directly. For `Routed` backends,
+    /// the namespace's owning backend (mount or default) is selected first.
     pub fn content_store(&self, namespace_id: &str) -> Arc<dyn ContentStore> {
         match self {
             StorageBackend::Managed(storage) => {
                 Arc::new(content_store_for(storage.clone(), namespace_id))
             }
             StorageBackend::Permanent(store) => Arc::clone(store),
+            StorageBackend::Routed(routed) => {
+                routed.backend_for(namespace_id).content_store(namespace_id)
+            }
         }
     }
 
     /// Get the underlying raw storage for admin operations (delete, list).
     ///
-    /// Returns `Some` for `Managed` backends, `None` for `Permanent`.
+    /// Returns `Some` for `Managed` backends (and the default backend of
+    /// `Routed`), `None` for `Permanent`.
     pub fn admin_storage(&self) -> Option<&dyn Storage> {
         match self {
             StorageBackend::Managed(storage) => Some(storage.as_ref()),
             StorageBackend::Permanent(_) => None,
+            StorageBackend::Routed(routed) => routed.default.admin_storage(),
         }
     }
 
     /// Clone the admin storage as an owned `Arc<dyn Storage>`, if available.
     ///
-    /// Returns `Some` for `Managed` backends, `None` for `Permanent`.
+    /// Returns `Some` for `Managed` backends (and the default backend of
+    /// `Routed`), `None` for `Permanent`.
     pub fn admin_storage_cloned(&self) -> Option<Arc<dyn Storage>> {
         match self {
             StorageBackend::Managed(storage) => Some(Arc::clone(storage)),
             StorageBackend::Permanent(_) => None,
+            StorageBackend::Routed(routed) => routed.default.admin_storage_cloned(),
         }
     }
 }
@@ -743,6 +1286,7 @@ impl Debug for StorageBackend {
         match self {
             StorageBackend::Managed(s) => f.debug_tuple("Managed").field(s).finish(),
             StorageBackend::Permanent(s) => f.debug_tuple("Permanent").field(s).finish(),
+            StorageBackend::Routed(s) => f.debug_tuple("Routed").field(s).finish(),
         }
     }
 }
@@ -752,6 +1296,7 @@ impl Clone for StorageBackend {
         match self {
             StorageBackend::Managed(s) => StorageBackend::Managed(Arc::clone(s)),
             StorageBackend::Permanent(s) => StorageBackend::Permanent(Arc::clone(s)),
+            StorageBackend::Routed(s) => StorageBackend::Routed(Arc::clone(s)),
         }
     }
 }
@@ -805,6 +1350,12 @@ impl Debug for BranchedContentStore {
 
 #[async_trait]
 impl ContentStore for BranchedContentStore {
+    /// Writes only ever land in the branch's own store; parents are read
+    /// fallbacks.
+    async fn sync(&self) -> Result<()> {
+        self.branch_store.sync().await
+    }
+
     async fn has(&self, id: &ContentId) -> Result<bool> {
         if self.branch_store.has(id).await? {
             return Ok(true);
@@ -846,10 +1397,51 @@ impl ContentStore for BranchedContentStore {
         self.branch_store.release(id).await
     }
 
+    async fn release_many(&self, ids: &[ContentId]) -> Vec<(ContentId, crate::error::Error)> {
+        self.branch_store.release_many(ids).await
+    }
+
     fn resolve_local_path(&self, id: &ContentId) -> Option<std::path::PathBuf> {
         self.branch_store
             .resolve_local_path(id)
             .or_else(|| self.parents.iter().find_map(|p| p.resolve_local_path(id)))
+    }
+
+    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
+        self.branch_store
+            .resolve_cached_bytes(id)
+            .or_else(|| self.parents.iter().find_map(|p| p.resolve_cached_bytes(id)))
+    }
+
+    /// A read may be served by any ancestor, so every store in the
+    /// ancestry must permit the spill.
+    fn permits_plaintext_cache(&self) -> bool {
+        self.branch_store.permits_plaintext_cache()
+            && self
+                .parents
+                .iter()
+                .all(ContentStore::permits_plaintext_cache)
+    }
+
+    fn miss_register(&self) -> Option<&residency::MissRegister> {
+        self.branch_store
+            .miss_register()
+            .or_else(|| self.parents.iter().find_map(|p| p.miss_register()))
+    }
+
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        // Guard the whole ancestry chain: reads fall back through parents.
+        let mut guards: Vec<residency::InFlightGuard> = self
+            .branch_store
+            .query_guard()
+            .into_iter()
+            .chain(self.parents.iter().filter_map(ContentStore::query_guard))
+            .collect();
+        match guards.len() {
+            0 => None,
+            1 => Some(guards.remove(0)),
+            _ => Some(residency::InFlightGuard::join(guards)),
+        }
     }
 
     async fn get_range(&self, id: &ContentId, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
@@ -890,22 +1482,53 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(digest)
 }
 
-/// Convert a ledger ID to a path prefix.
-///
-/// Handles the standard ledger ID format (e.g., "mydb:main" -> "mydb/main").
+/// Convert a ledger ID to a path prefix (`"mydb:main"` -> `"mydb/main"`).
 pub fn ledger_id_prefix_for_path(ledger_id: &str) -> String {
-    ledger_id_to_path_prefix(ledger_id).unwrap_or_else(|_| ledger_id.replace(':', "/"))
+    storage_path_prefixes(ledger_id).0
 }
+
+/// `(name/branch, name/@shared)` for a ledger id a storage seam received.
+///
+/// An id that neither the current nor the persisted grammar accepts is never
+/// listed or addressed; its paths keep the pre-validation shape so a read of
+/// it misses rather than landing in another ledger's namespace.
+fn storage_path_prefixes(ledger_id: &str) -> (String, String) {
+    match storage_ledger_id(ledger_id, "a storage path") {
+        Ok(id) => (id.path_prefix(), id.shared_prefix()),
+        Err(_) => (
+            ledger_id.replace(':', "/"),
+            format!("{ledger_id}/{SHARED_NAMESPACE}").replace(':', "/"),
+        ),
+    }
+}
+
+/// Leading path segment under which graph-source artifacts (snapshots and
+/// mappings) are stored. Unlike every other content kind, these addresses do
+/// NOT begin with the owning id — they begin with this literal segment and
+/// carry the graph_source_id after it. Shared between the forward direction
+/// ([`content_path`]) and reverse parsers (e.g. the remote-mount proxy
+/// storage) so the two cannot drift.
+pub const GRAPH_SOURCES_PATH_SEGMENT: &str = "graph-sources";
 
 /// Build a storage path for content-addressed data.
 ///
 /// This determines the directory structure for different content types:
 /// - Commits: `{ledger_id}/commit/{hash}.fcv2`
 /// - Index roots: `{ledger_id}/index/roots/{hash}.fir6`
-/// - Graph sources: `graph-sources/{ledger_id}/snapshots/{hash}.gssnap`
+/// - Graph sources: `graph-sources/{graph_source_id}/snapshots/{hash}.gssnap`
+///   (note: keyed by graph_source_id, not a ledger id)
 /// - etc.
 pub fn content_path(kind: ContentKind, ledger_id: &str, hash_hex: &str) -> String {
-    let prefix = ledger_id_prefix_for_path(ledger_id);
+    let (prefix, shared) = storage_path_prefixes(ledger_id);
+    content_path_from_prefixes(kind, &prefix, &shared, hash_hex)
+}
+
+fn content_path_from_prefixes(
+    kind: ContentKind,
+    prefix: &str,
+    shared: &str,
+    hash_hex: &str,
+) -> String {
     match kind {
         ContentKind::Commit => format!("{prefix}/commit/{hash_hex}.fcv2"),
         ContentKind::Txn => format!("{prefix}/txn/{hash_hex}.json"),
@@ -914,7 +1537,6 @@ pub fn content_path(kind: ContentKind, ledger_id: &str, hash_hex: &str) -> Strin
         ContentKind::DictBlob { dict } => {
             // Dictionaries are global per ledger — shared across all branches.
             // Use the @shared namespace (can't collide with branch names since @ is forbidden).
-            let shared = shared_prefix_for_path(ledger_id);
             let ext = dict_kind_extension(dict);
             format!("{shared}/dicts/{hash_hex}.{ext}")
         }
@@ -925,14 +1547,14 @@ pub fn content_path(kind: ContentKind, ledger_id: &str, hash_hex: &str) -> Strin
         ContentKind::LedgerConfig => format!("{prefix}/config/{hash_hex}.json"),
         ContentKind::StatsSketch => format!("{prefix}/index/stats/{hash_hex}.hll"),
         ContentKind::GraphSourceSnapshot => {
-            format!("graph-sources/{prefix}/snapshots/{hash_hex}.gssnap")
+            format!("{GRAPH_SOURCES_PATH_SEGMENT}/{prefix}/snapshots/{hash_hex}.gssnap")
         }
         ContentKind::SpatialIndex => format!("{prefix}/index/spatial/{hash_hex}.bin"),
         ContentKind::HistorySidecar => {
             format!("{prefix}/index/objects/history/{hash_hex}.fhs1")
         }
         ContentKind::GraphSourceMapping => {
-            format!("graph-sources/{prefix}/mapping/{hash_hex}.ttl")
+            format!("{GRAPH_SOURCES_PATH_SEGMENT}/{prefix}/mapping/{hash_hex}.ttl")
         }
         // Forward-compatibility: unknown kinds go to a generic blob directory
         #[allow(unreachable_patterns)]
@@ -1179,8 +1801,195 @@ pub trait StorageCas: Debug + Send + Sync {
     ///
     /// The closure should be a pure function of its input — it may be called
     /// multiple times on retry.
+    ///
+    /// The closure is `'static` so an implementation can run it off the
+    /// calling task, for example on a blocking thread.
     async fn compare_and_swap<T, F>(&self, address: &str, f: F) -> StorageExtResult<CasOutcome<T>>
     where
-        F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError> + Send + Sync,
-        T: Send;
+        F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError>
+            + Send
+            + Sync
+            + 'static,
+        T: Send + 'static;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::content_kind::DictKind;
+    use crate::storage::memory::MemoryStorage;
+
+    const LEDGER: &str = "mydb:main";
+
+    /// Releasing a blob must take its cached copy with it. A cache entry that
+    /// outlives its blob reads back as a live object, so a caller deciding
+    /// what storage holds — the index-chain walk, which ends at a root storage
+    /// no longer has — would not see the ending.
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn releasing_a_blob_evicts_its_cached_copy() {
+        let storage = MemoryStorage::new();
+        let store = content_store_for(storage.clone(), LEDGER);
+        let bytes = b"root bytes";
+        let id = store.put(ContentKind::IndexRoot, bytes).await.unwrap();
+
+        let cache_dir = std::env::temp_dir().join(format!(
+            "fluree-release-evicts-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        crate::disk_cache::fetch_cached_bytes_cid(&store, &id, &cache_dir)
+            .await
+            .unwrap();
+        let cached = cache_dir.join(id.to_string());
+        assert!(cached.exists(), "the fetch should have populated the cache");
+
+        store.release(&id).await.unwrap();
+
+        assert!(
+            !cached.exists(),
+            "a released blob is still readable from the disk cache"
+        );
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    /// `candidate_addresses` exists so that callers deciding a blob is
+    /// unreferenced see every address `ContentStore::get` would resolve it to.
+    /// A dict blob left at the pre-`@shared` address is readable, so it must
+    /// also be listed — otherwise a sweep deletes a live blob.
+    #[tokio::test]
+    async fn candidate_addresses_cover_the_legacy_dict_fallback() {
+        let storage = MemoryStorage::new();
+        let id = ContentId::new(
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            b"dict bytes",
+        );
+        let legacy = legacy_dict_address(storage.storage_method(), LEDGER, &id)
+            .expect("dict CIDs have a legacy address");
+        storage.write_bytes(&legacy, b"dict bytes").await.unwrap();
+
+        let store = content_store_for(storage.clone(), LEDGER);
+        assert_eq!(
+            store.get(&id).await.unwrap(),
+            b"dict bytes",
+            "reads fall back to the legacy dict address"
+        );
+        assert!(
+            candidate_addresses(storage.storage_method(), LEDGER, &id).contains(&legacy),
+            "the address reads fall back to must be listed as a candidate"
+        );
+    }
+
+    /// Same coupling for index roots written before the `.json` to `.fir6`
+    /// rename.
+    #[tokio::test]
+    async fn candidate_addresses_cover_the_legacy_index_root_fallback() {
+        let storage = MemoryStorage::new();
+        let id = ContentId::new(ContentKind::IndexRoot, b"root bytes");
+        let legacy = legacy_index_root_address(storage.storage_method(), LEDGER, &id)
+            .expect("index-root CIDs have a legacy address");
+        storage.write_bytes(&legacy, b"root bytes").await.unwrap();
+
+        let store = content_store_for(storage.clone(), LEDGER);
+        assert_eq!(
+            store.get(&id).await.unwrap(),
+            b"root bytes",
+            "reads fall back to the legacy index-root address"
+        );
+        assert!(
+            candidate_addresses(storage.storage_method(), LEDGER, &id).contains(&legacy),
+            "the address reads fall back to must be listed as a candidate"
+        );
+    }
+
+    /// A garbage manifest names a CID, not an address. On a ledger predating
+    /// the `@shared` dict move the only copy sits at the legacy address, so
+    /// releasing just the canonical one reclaims nothing while reporting
+    /// success — the leak GC exists to prevent.
+    #[tokio::test]
+    async fn release_reclaims_a_blob_at_its_legacy_address() {
+        let storage = MemoryStorage::new();
+        let id = ContentId::new(
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            b"legacy dict",
+        );
+        let legacy = legacy_dict_address(storage.storage_method(), LEDGER, &id)
+            .expect("dict CIDs have a legacy address");
+        storage.write_bytes(&legacy, b"legacy dict").await.unwrap();
+
+        let store = content_store_for(storage.clone(), LEDGER);
+        store.release(&id).await.expect("release succeeds");
+
+        assert!(
+            !storage.exists(&legacy).await.unwrap(),
+            "the legacy-located blob must actually be reclaimed"
+        );
+        assert!(!store.has(&id).await.unwrap(), "and be unreachable after");
+    }
+
+    /// A batch release covers every candidate address of every id, so a
+    /// blob at its legacy address is reclaimed by the batch path exactly as
+    /// by [`ContentStore::release`], and an id with nothing behind it is
+    /// not a failure.
+    #[tokio::test]
+    async fn release_many_reclaims_every_candidate_address() {
+        let storage = MemoryStorage::new();
+        let canonical_id = ContentId::new(ContentKind::IndexLeaf, b"leaf bytes");
+        let canonical = content_address(
+            storage.storage_method(),
+            ContentKind::IndexLeaf,
+            LEDGER,
+            &canonical_id.digest_hex(),
+        );
+        storage
+            .write_bytes(&canonical, b"leaf bytes")
+            .await
+            .unwrap();
+
+        let legacy_id = ContentId::new(
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            b"legacy dict",
+        );
+        let legacy = legacy_dict_address(storage.storage_method(), LEDGER, &legacy_id)
+            .expect("dict CIDs have a legacy address");
+        storage.write_bytes(&legacy, b"legacy dict").await.unwrap();
+
+        let absent_id = ContentId::new(ContentKind::IndexLeaf, b"never written");
+
+        let store = content_store_for(storage.clone(), LEDGER);
+        let failures = store
+            .release_many(&[canonical_id.clone(), legacy_id.clone(), absent_id])
+            .await;
+        assert!(failures.is_empty(), "nothing should fail: {failures:?}");
+
+        assert!(!storage.exists(&canonical).await.unwrap());
+        assert!(
+            !storage.exists(&legacy).await.unwrap(),
+            "the legacy-located blob must be reclaimed by the batch path too"
+        );
+        assert!(!store.has(&canonical_id).await.unwrap());
+        assert!(!store.has(&legacy_id).await.unwrap());
+    }
+
+    /// The current-layout address always leads, so callers that only need the
+    /// canonical location can take the first entry.
+    #[test]
+    fn candidate_addresses_lead_with_the_current_layout() {
+        let id = ContentId::new(ContentKind::IndexLeaf, b"leaf");
+        let addresses = candidate_addresses("memory", LEDGER, &id);
+        assert_eq!(
+            addresses.first().map(String::as_str),
+            Some(
+                content_address("memory", ContentKind::IndexLeaf, LEDGER, &id.digest_hex())
+                    .as_str()
+            )
+        );
+    }
 }

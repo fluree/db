@@ -1,11 +1,12 @@
 //! Statement-level parser.
 
 use crate::ast::{
-    CallSubqueryClause, CreateClause, DeleteClause, MatchClause, MergeClause, OrderDirection,
-    OrderItem, ProjectionItem, Query, ReadClause, RemoveClause, RemoveItem, ReturnClause,
-    SetClause, SetItem, Statement, UnionTail, UnwindClause, Update, WithClause, WriteClause,
+    CallSubqueryClause, CreateClause, DeleteClause, ForeachClause, MatchClause, MergeClause,
+    OrderDirection, OrderItem, ProcedureCall, ProjectionItem, Query, ReadClause, RemoveClause,
+    RemoveItem, ReturnClause, SchemaCommand, SchemaCommandKind, SetClause, SetItem, Statement,
+    UnionTail, UnwindClause, Update, WithClause, WriteClause, YieldItem,
 };
-use crate::ast::{Expr, Variable};
+use crate::ast::{Expr, MapLit, ParamRef, Variable};
 use crate::diag::{DiagCode, Diagnostic};
 use crate::lex::TokenKind;
 
@@ -28,6 +29,16 @@ pub fn parse_statement(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
 fn parse_statement_inner(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
     let start = s.peek_span();
 
+    if let Some(cmd) = parse_schema_command(s)? {
+        return Ok(Statement::Schema(cmd));
+    }
+
+    // `CALL <ident>` is a procedure call (`CALL db.labels() YIELD …`);
+    // `CALL {` / `CALL (` is a subquery clause handled in the loop below.
+    if matches!(s.peek_kind(), TokenKind::Call) && matches!(s.peek_at(1), TokenKind::Ident(_)) {
+        return parse_procedure_call(s);
+    }
+
     // Categorize by first token. Queries start with MATCH / OPTIONAL /
     // WITH / UNWIND / RETURN. Writes start with CREATE / MERGE /
     // ((MATCH | OPTIONAL | WITH | UNWIND)+ then CREATE/MERGE/SET/REMOVE/DELETE).
@@ -49,6 +60,12 @@ fn parse_statement_inner(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
             }
             TokenKind::Unwind => {
                 read_clauses.push(ReadClause::Unwind(parse_unwind(s)?));
+            }
+            TokenKind::Call if matches!(s.peek_at(1), TokenKind::Ident(_)) => {
+                return Err(s.error(
+                    DiagCode::DeferredProcedure,
+                    "CALL <procedure> is supported only as the first clause of a statement",
+                ));
             }
             TokenKind::Call => {
                 read_clauses.push(ReadClause::CallSubquery(parse_call_subquery(s)?));
@@ -78,6 +95,9 @@ fn parse_statement_inner(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
                     return Err(s.error(DiagCode::UnexpectedToken, "expected DELETE after DETACH"));
                 }
                 write_clauses.push(WriteClause::Delete(parse_delete(s, true)?));
+            }
+            TokenKind::Ident(w) if w.eq_ignore_ascii_case("foreach") => {
+                write_clauses.push(WriteClause::Foreach(parse_foreach(s)?));
             }
             TokenKind::Eof => break,
             other => {
@@ -147,7 +167,7 @@ fn parse_union_tail(s: &mut TokenStream) -> Result<UnionTail, Diagnostic> {
     // (and so the AST depth that Drop / param substitution recurse over).
     let right = match parse_statement(s)? {
         Statement::Query(q) => q,
-        Statement::Update(_) => {
+        Statement::Update(_) | Statement::Schema(_) | Statement::CallProcedure(_) => {
             return Err(s.error(
                 DiagCode::UnexpectedToken,
                 "UNION cannot combine write statements — both sides must be read queries",
@@ -206,7 +226,7 @@ fn parse_unwind(s: &mut TokenStream) -> Result<UnwindClause, Diagnostic> {
     let start = s.expect(&TokenKind::Unwind)?;
     let expr = parse_expr(s)?;
     s.expect(&TokenKind::As)?;
-    let alias = parse_var(s)?;
+    let alias = parse_binding_name(s)?;
     let end = alias.span;
     Ok(UnwindClause {
         expr,
@@ -273,6 +293,12 @@ fn parse_call_body(s: &mut TokenStream) -> Result<Query, Diagnostic> {
             }
             TokenKind::With => read_clauses.push(ReadClause::With(parse_with(s)?)),
             TokenKind::Unwind => read_clauses.push(ReadClause::Unwind(parse_unwind(s)?)),
+            TokenKind::Call if matches!(s.peek_at(1), TokenKind::Ident(_)) => {
+                return Err(s.error(
+                    DiagCode::DeferredProcedure,
+                    "CALL <procedure> is supported only as the first clause of a statement",
+                ));
+            }
             TokenKind::Call => read_clauses.push(ReadClause::CallSubquery(parse_call_subquery(s)?)),
             TokenKind::Return => break parse_return(s)?,
             TokenKind::Create
@@ -334,6 +360,118 @@ fn parse_call_union_tail(s: &mut TokenStream) -> Result<UnionTail, Diagnostic> {
     })
 }
 
+/// Parse a standalone procedure-call statement:
+/// `CALL dotted.name[(args)] [YIELD col [AS alias], … | YIELD * [WHERE expr]] [RETURN …]`.
+/// The leading `CALL <ident>` has already been sighted by the caller.
+fn parse_procedure_call(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
+    let start = s.expect(&TokenKind::Call)?;
+    let mut name = parse_ident_or_keyword(s)?;
+    while s.eat(&TokenKind::Dot).is_some() {
+        name.push('.');
+        name.push_str(&parse_ident_or_keyword(s)?);
+    }
+
+    let mut args = Vec::new();
+    if s.eat(&TokenKind::LParen).is_some() {
+        if !matches!(s.peek_kind(), TokenKind::RParen) {
+            loop {
+                args.push(parse_expr(s)?);
+                if s.eat(&TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+        }
+        s.expect(&TokenKind::RParen)?;
+    }
+
+    let mut yields = Vec::new();
+    let mut where_clause = None;
+    if s.eat(&TokenKind::Yield).is_some() {
+        // `YIELD *` exposes all columns — same as omitting YIELD entirely.
+        if s.eat(&TokenKind::Star).is_none() {
+            loop {
+                let span = s.peek_span();
+                let column = parse_ident_or_keyword(s)?;
+                let alias = if s.eat(&TokenKind::As).is_some() {
+                    Some(parse_binding_name(s)?)
+                } else {
+                    None
+                };
+                yields.push(YieldItem {
+                    column,
+                    alias,
+                    span,
+                });
+                if s.eat(&TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+        }
+        if s.eat(&TokenKind::Where).is_some() {
+            where_clause = Some(parse_expr(s)?);
+        }
+    }
+
+    // After the YIELD the statement continues like a read query — the
+    // schema-introspection shape `CALL apoc.meta.data() YIELD … WHERE …
+    // UNWIND other AS o RETURN …` needs WITH / UNWIND / MATCH here.
+    let mut rest = Vec::new();
+    let return_clause = loop {
+        match s.peek_kind() {
+            TokenKind::Match => rest.push(ReadClause::Match(parse_match(s, false)?)),
+            TokenKind::Optional => {
+                s.advance();
+                rest.push(ReadClause::OptionalMatch(parse_match(s, true)?));
+            }
+            TokenKind::With => rest.push(ReadClause::With(parse_with(s)?)),
+            TokenKind::Unwind => rest.push(ReadClause::Unwind(parse_unwind(s)?)),
+            TokenKind::Call if matches!(s.peek_at(1), TokenKind::Ident(_)) => {
+                return Err(s.error(
+                    DiagCode::DeferredProcedure,
+                    "CALL <procedure> is supported only as the first clause of a statement",
+                ));
+            }
+            TokenKind::Call => rest.push(ReadClause::CallSubquery(parse_call_subquery(s)?)),
+            TokenKind::Return => break Some(parse_return(s)?),
+            TokenKind::Eof => break None,
+            TokenKind::Semicolon => {
+                return Err(s.error(
+                    DiagCode::DeferredMultiStatement,
+                    "multi-statement scripts (semicolon-separated) are deferred; \
+                     submit one statement per request",
+                ));
+            }
+            other => {
+                return Err(s.error(
+                    DiagCode::UnexpectedToken,
+                    format!(
+                        "unexpected `{other}` after CALL {name} — expected YIELD / WITH / \
+                         UNWIND / MATCH / RETURN"
+                    ),
+                ));
+            }
+        }
+    };
+
+    if return_clause.is_none() && !rest.is_empty() {
+        return Err(s.error(
+            DiagCode::UnexpectedEof,
+            "a procedure call followed by additional clauses must end in RETURN",
+        ));
+    }
+
+    let end = s.peek_span();
+    Ok(Statement::CallProcedure(ProcedureCall {
+        name,
+        args,
+        yields,
+        where_clause,
+        rest,
+        return_clause,
+        span: start.union(end),
+    }))
+}
+
 fn parse_return(s: &mut TokenStream) -> Result<ReturnClause, Diagnostic> {
     let start = s.expect(&TokenKind::Return)?;
     let distinct = s.eat(&TokenKind::Distinct).is_some();
@@ -369,7 +507,7 @@ fn parse_projection_items(s: &mut TokenStream) -> Result<Vec<ProjectionItem>, Di
             let expr = parse_expr(s)?;
             let alias = if matches!(s.peek_kind(), TokenKind::As) {
                 s.advance();
-                Some(parse_var(s)?)
+                Some(parse_binding_name(s)?)
             } else {
                 None
             };
@@ -499,12 +637,12 @@ fn parse_set_items(s: &mut TokenStream) -> Result<Vec<SetItem>, Diagnostic> {
             }
             TokenKind::Eq => {
                 s.advance();
-                let map = parse_map_lit(s)?;
+                let map = parse_set_map(s)?;
                 items.push(SetItem::MapReplace { target, map });
             }
             TokenKind::PlusEq => {
                 s.advance();
-                let map = parse_map_lit(s)?;
+                let map = parse_set_map(s)?;
                 items.push(SetItem::MapMerge { target, map });
             }
             TokenKind::Colon => {
@@ -526,6 +664,137 @@ fn parse_set_items(s: &mut TokenStream) -> Result<Vec<SetItem>, Diagnostic> {
         }
     }
     Ok(items)
+}
+
+/// Detect a schema DDL statement head: `CREATE [OR REPLACE] INDEX|CONSTRAINT`,
+/// `DROP INDEX|CONSTRAINT`, `SHOW INDEX[ES]|CONSTRAINT[S]`. Fluree has no
+/// user-managed index/constraint catalog (everything is indexed), so these
+/// are accepted for tooling compatibility; the body is consumed without
+/// detailed parsing. Returns `None` for every other statement head.
+fn parse_schema_command(s: &mut TokenStream) -> Result<Option<SchemaCommand>, Diagnostic> {
+    fn ident_at(s: &TokenStream, off: usize, words: &[&str]) -> bool {
+        matches!(s.peek_at(off), TokenKind::Ident(w)
+            if words.iter().any(|x| w.eq_ignore_ascii_case(x)))
+    }
+    let start = s.peek_span();
+    let kind = match s.peek_kind() {
+        TokenKind::Create
+            if ident_at(s, 1, &["index", "constraint"])
+                || (ident_at(s, 1, &["or"]) && ident_at(s, 2, &["replace"])) =>
+        {
+            SchemaCommandKind::CreateSchema
+        }
+        TokenKind::Ident(w)
+            if w.eq_ignore_ascii_case("drop") && ident_at(s, 1, &["index", "constraint"]) =>
+        {
+            SchemaCommandKind::DropSchema
+        }
+        TokenKind::Ident(w)
+            if w.eq_ignore_ascii_case("show")
+                && ident_at(s, 1, &["indexes", "index", "constraints", "constraint"]) =>
+        {
+            SchemaCommandKind::ShowSchema
+        }
+        _ => return Ok(None),
+    };
+    // Swallow the command body; keep the one-statement-per-request rule.
+    while !s.is_eof() {
+        if matches!(s.peek_kind(), TokenKind::Semicolon) {
+            return Err(s.error(
+                DiagCode::DeferredMultiStatement,
+                "multi-statement scripts (semicolon-separated) are deferred; \
+                 submit one statement per request",
+            ));
+        }
+        s.advance();
+    }
+    let end = s.peek_span();
+    Ok(Some(SchemaCommand {
+        kind,
+        span: start.union(end),
+    }))
+}
+
+/// The map side of `SET n = …` / `SET n += …`: an inline `{k: v, …}` literal,
+/// or a whole-map parameter (`SET n += $props`) — encoded as a single entry
+/// under [`crate::params::WHOLE_MAP_PARAM_KEY`] and expanded to real entries
+/// during param substitution (map keys parse as identifiers, so the reserved
+/// empty key cannot occur otherwise).
+fn parse_set_map(s: &mut TokenStream) -> Result<MapLit, Diagnostic> {
+    if let TokenKind::Param(name) = s.peek_kind() {
+        let name = name.clone();
+        let span = s.peek_span();
+        s.advance();
+        return Ok(MapLit {
+            entries: vec![(
+                crate::params::WHOLE_MAP_PARAM_KEY.to_string(),
+                Expr::Param(ParamRef { name, span }),
+            )],
+            span,
+        });
+    }
+    parse_map_lit(s)
+}
+
+/// Parse `FOREACH (var IN <list expr> | <write clauses>)`. The leading
+/// `FOREACH` identifier has been sighted by the caller.
+fn parse_foreach(s: &mut TokenStream) -> Result<ForeachClause, Diagnostic> {
+    let start = s.peek_span();
+    s.advance(); // FOREACH
+    s.expect(&TokenKind::LParen)?;
+    let var = parse_var(s)?;
+    if !matches!(s.peek_kind(), TokenKind::In) {
+        return Err(s.error(
+            DiagCode::UnexpectedToken,
+            "expected IN after the FOREACH variable",
+        ));
+    }
+    s.advance();
+    let list = parse_expr(s)?;
+    s.expect(&TokenKind::Pipe)?;
+    let mut body = Vec::new();
+    loop {
+        match s.peek_kind() {
+            TokenKind::Create => body.push(WriteClause::Create(parse_create(s)?)),
+            TokenKind::Merge => body.push(WriteClause::Merge(parse_merge(s)?)),
+            TokenKind::Set => body.push(WriteClause::Set(parse_set(s)?)),
+            TokenKind::Remove => body.push(WriteClause::Remove(parse_remove(s)?)),
+            TokenKind::Delete => body.push(WriteClause::Delete(parse_delete(s, false)?)),
+            TokenKind::Detach => {
+                s.advance();
+                if !matches!(s.peek_kind(), TokenKind::Delete) {
+                    return Err(s.error(DiagCode::UnexpectedToken, "expected DELETE after DETACH"));
+                }
+                body.push(WriteClause::Delete(parse_delete(s, true)?));
+            }
+            TokenKind::Ident(w) if w.eq_ignore_ascii_case("foreach") => {
+                body.push(WriteClause::Foreach(parse_foreach(s)?));
+            }
+            TokenKind::RParen => break,
+            other => {
+                return Err(s.error(
+                    DiagCode::UnexpectedToken,
+                    format!(
+                        "unexpected `{other}` in FOREACH body — expected \
+                         CREATE / MERGE / SET / REMOVE / DELETE"
+                    ),
+                ));
+            }
+        }
+    }
+    let end = s.expect(&TokenKind::RParen)?;
+    if body.is_empty() {
+        return Err(s.error(
+            DiagCode::UnexpectedToken,
+            "FOREACH body needs at least one write clause",
+        ));
+    }
+    Ok(ForeachClause {
+        var,
+        list,
+        body,
+        span: start.union(end),
+    })
 }
 
 fn parse_remove(s: &mut TokenStream) -> Result<RemoveClause, Diagnostic> {
@@ -597,23 +866,38 @@ pub(crate) fn parse_var(s: &mut TokenStream) -> Result<Variable, Diagnostic> {
 
 /// Parses an identifier or a keyword-as-identifier (Cypher allows
 /// reserved words in property/label position). We accept any token
-/// whose textual form is a valid identifier.
+/// whose textual form is a valid identifier — returning the **as-written**
+/// source text, not the token's canonical uppercase display (`{end: 1}`
+/// must produce the key `end`, not `END`).
 pub(crate) fn parse_ident_or_keyword(s: &mut TokenStream) -> Result<String, Diagnostic> {
-    let kind = s.peek_kind().clone();
-    if let TokenKind::Ident(name) = kind {
-        s.advance();
-        Ok(name)
-    } else {
-        // Accept the token's display form if it's a keyword (uppercase).
-        let display = format!("{}", s.peek_kind());
-        if display.chars().all(|c| c.is_ascii_alphabetic() || c == '_') {
+    match s.peek_ident_text() {
+        Some(text) => {
             s.advance();
-            Ok(display)
-        } else {
-            Err(s.error(
-                DiagCode::UnexpectedToken,
-                format!("expected identifier, got `{}`", s.peek_kind()),
-            ))
+            Ok(text)
         }
+        None => Err(s.error(
+            DiagCode::UnexpectedToken,
+            format!("expected identifier, got `{}`", s.peek_kind()),
+        )),
+    }
+}
+
+/// Parse a binding name — a variable introduced in name position (`AS <name>`,
+/// `UNWIND … AS <name>`, `YIELD col AS <name>`). Unlike [`parse_var`], this
+/// accepts keyword tokens as identifiers (`AS end`, `AS count`): after `AS`
+/// exactly one name is expected, so there is no grammar ambiguity. This is a
+/// deliberate leniency over strict openCypher, which requires backticking
+/// reserved words.
+pub(crate) fn parse_binding_name(s: &mut TokenStream) -> Result<Variable, Diagnostic> {
+    let span = s.peek_span();
+    match s.peek_ident_text() {
+        Some(name) => {
+            s.advance();
+            Ok(Variable { name, span })
+        }
+        None => Err(s.error(
+            DiagCode::UnexpectedToken,
+            format!("expected identifier, got `{}`", s.peek_kind()),
+        )),
     }
 }

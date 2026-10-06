@@ -140,9 +140,9 @@ impl From<&FlakeValue> for TransportValue {
             FlakeValue::Ref(sid) => TransportValue::Ref(TransportSid::from(sid)),
             FlakeValue::BigInt(bi) => TransportValue::BigInt(bi.to_string()),
             FlakeValue::Decimal(bd) => TransportValue::BigDec(bd.to_string()),
-            FlakeValue::DateTime(dt) => TransportValue::DateTime(dt.original().to_string()),
-            FlakeValue::Date(d) => TransportValue::Date(d.original().to_string()),
-            FlakeValue::Time(t) => TransportValue::Time(t.original().to_string()),
+            FlakeValue::DateTime(dt) => TransportValue::DateTime(dt.canonical()),
+            FlakeValue::Date(d) => TransportValue::Date(d.canonical()),
+            FlakeValue::Time(t) => TransportValue::Time(t.canonical()),
             FlakeValue::GYear(v) => TransportValue::String(v.to_string()),
             FlakeValue::GYearMonth(v) => TransportValue::String(v.to_string()),
             FlakeValue::GMonth(v) => TransportValue::String(v.to_string()),
@@ -151,7 +151,7 @@ impl From<&FlakeValue> for TransportValue {
             FlakeValue::YearMonthDuration(v) => TransportValue::String(v.to_string()),
             FlakeValue::DayTimeDuration(v) => TransportValue::String(v.to_string()),
             FlakeValue::Duration(v) => TransportValue::String(v.to_string()),
-            FlakeValue::Vector(v) => TransportValue::Vector(v.clone()),
+            FlakeValue::Vector(v) => TransportValue::Vector(v.to_vec()),
             FlakeValue::Json(s) => TransportValue::Json(s.clone()),
             FlakeValue::GeoPoint(bits) => TransportValue::String(bits.to_string()),
             FlakeValue::Null => TransportValue::Null,
@@ -200,7 +200,7 @@ impl TransportValue {
                     .map_err(|e| FlakesTransportError::ParseError(format!("Time: {e}")))?;
                 Ok(FlakeValue::Time(Box::new(t)))
             }
-            TransportValue::Vector(v) => Ok(FlakeValue::Vector(v.clone())),
+            TransportValue::Vector(v) => Ok(FlakeValue::Vector(v.as_slice().into())),
             TransportValue::Json(s) => Ok(FlakeValue::Json(s.clone())),
             TransportValue::Null => Ok(FlakeValue::Null),
         }
@@ -409,7 +409,7 @@ mod tests {
             (FlakeValue::Double(3.13), "double"),
             (FlakeValue::Boolean(true), "bool"),
             (FlakeValue::Ref(make_sid(1, "ref")), "ref"),
-            (FlakeValue::Vector(vec![1.0, 2.0, 3.0]), "vector"),
+            (FlakeValue::Vector(vec![1.0, 2.0, 3.0].into()), "vector"),
             (FlakeValue::Json(r#"{"key":"value"}"#.to_string()), "json"),
             (FlakeValue::Null, "null"),
         ];

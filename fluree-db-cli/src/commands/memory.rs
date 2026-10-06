@@ -3,8 +3,8 @@ use crate::context;
 use crate::error::{CliError, CliResult};
 use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_memory::{
-    format_context_paged, MemoryFilter, MemoryInput, MemoryKind, MemoryStore, MemoryUpdate,
-    RecallEngine, RecallResult, Scope, SecretDetector,
+    audit_memories, format_context_paged, AuditOptions, AuditScope, MemoryFilter, MemoryInput,
+    MemoryKind, MemoryStore, MemoryUpdate, RecallEngine, RecallResult, Scope, SecretDetector,
 };
 
 pub async fn run(action: MemoryAction, dirs: &FlureeDir) -> CliResult<()> {
@@ -66,6 +66,7 @@ pub async fn run(action: MemoryAction, dirs: &FlureeDir) -> CliResult<()> {
         } => run_update(&id, text, tags, refs, &format, dirs).await,
         MemoryAction::Forget { id } => run_forget(&id, dirs).await,
         MemoryAction::Status => run_status(dirs).await,
+        MemoryAction::Audit { all, base, format } => run_audit(all, &base, &format, dirs).await,
         MemoryAction::Export => run_export(dirs).await,
         MemoryAction::Import { file } => run_import(&file, dirs).await,
         MemoryAction::McpInstall { ide: ide_arg } => {
@@ -320,22 +321,37 @@ async fn run_recall(
         total_count: total_store,
     };
 
+    let repo_root = store.repo_root();
+
     match format {
         "json" => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&fluree_db_memory::format_recall_json(&result))
-                    .unwrap_or_default()
+                serde_json::to_string_pretty(&fluree_db_memory::format_recall_json(
+                    &result, repo_root
+                ))
+                .unwrap_or_default()
             );
         }
         "context" => {
             print!(
                 "{}",
-                format_context_paged(&paged, offset, Some(limit), total_store, has_more, None)
+                format_context_paged(
+                    &paged,
+                    offset,
+                    Some(limit),
+                    total_store,
+                    has_more,
+                    None,
+                    repo_root
+                )
             );
         }
         _ => {
-            print!("{}", fluree_db_memory::format_recall_text(&result));
+            print!(
+                "{}",
+                fluree_db_memory::format_recall_text(&result, repo_root)
+            );
             if has_more {
                 println!(
                     "  (showing results {}–{}; use --offset {} for more)",
@@ -409,6 +425,43 @@ async fn run_status(dirs: &FlureeDir) -> CliResult<()> {
     let store = build_synced_store(dirs).await?;
     let status = store.status().await.map_err(memory_err)?;
     print!("{}", fluree_db_memory::format_status_text(&status));
+    Ok(())
+}
+
+async fn run_audit(all: bool, base: &str, format: &str, dirs: &FlureeDir) -> CliResult<()> {
+    let store = build_synced_store(dirs).await?;
+
+    // Refs are repo-relative, so they need the project root. A global-mode
+    // store has none — the audit skips ref checks rather than resolving them
+    // against wherever the user happens to be standing.
+    let repo_root = store.repo_root().map(std::path::Path::to_path_buf);
+
+    let scope = match (all, fluree_db_memory::detect_git_branch()) {
+        (false, Some(branch)) => AuditScope::Branch(branch),
+        _ => AuditScope::All,
+    };
+
+    let memories = store
+        .current_memories(&MemoryFilter::default())
+        .await
+        .map_err(memory_err)?;
+    let report = audit_memories(
+        &memories,
+        repo_root.as_deref(),
+        &AuditOptions {
+            scope,
+            base_ref: Some(base.to_string()),
+        },
+    );
+
+    match format {
+        "json" => println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_default()
+        ),
+        _ => print!("{}", fluree_db_memory::format_audit_markdown(&report)),
+    }
+
     Ok(())
 }
 

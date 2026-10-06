@@ -51,9 +51,18 @@ The CLI fetches this endpoint when a remote is added (`fluree remote add`) to au
     "exchange_url": "https://data.example.com/v1/fluree/auth/exchange",
     "scopes": ["openid", "profile"],
     "redirect_port": 8400
-  }
+  },
+  "serving": { "query": true, "blocks": true },
+  "push": { "merged_commits": true },
+  "import": { "modes": ["direct"], "direct_max_bytes": 6291456 }
 }
 ```
+
+The optional `serving` object advertises the server-wide serving capabilities: `query` (the server executes queries) and `blocks` (the storage proxy serves raw replication content, enabling peer/local-compute mode). Per-ledger posture may further restrict either tier — the authoritative per-ledger view is the `serving` array on `GET /v1/fluree/storage/ns/{ledger-id}` responses (see [Query peers](../operations/query-peers.md)).
+
+The optional `push` object advertises push capabilities. `merged_commits: true` means the server implements [`POST /push-merges/*ledger`](../api/endpoints.md#post-push-mergesledger). The CLI pushes a history containing a merge only to a server that advertises it. A server that omits the object, or whose discovery cannot be read, is treated as not supporting it.
+
+The optional `import` object advertises `.flpack` import capabilities. See [Negotiated upload import](../api/endpoints.md#negotiated-upload-import-import-upload) for its fields. A server that omits it is treated as supporting direct import only.
 
 ### `api_base_url`
 
@@ -187,6 +196,10 @@ scopes = ["openid", "profile"]
 redirect_port = 8400
 token = "eyJ..."           # cached Fluree Bearer token (written by 'fluree auth login')
 refresh_token = "eyJ..."   # refresh token (written by 'fluree auth login')
+login_flow = "auth_code_pkce"  # OAuth flow the last login used: "device_code" or
+                               # "auth_code_pkce" (written by 'fluree auth login',
+                               # cleared by logout/manual logins; display-only —
+                               # flow selection is re-discovered on every login)
 
 [[remotes]]
 name = "local"
@@ -364,7 +377,7 @@ Common `401` error messages and their causes:
 | `Bearer token required` | No `Authorization: Bearer ...` header | `fluree auth login --remote <name>` |
 | `Invalid token` | Malformed JWT/JWS, bad signature | Re-issue token; check signing key |
 | `Token expired` | `exp` claim is in the past | Refresh or re-login |
-| `Untrusted issuer` | `iss` / signing key not in trusted list | Check `--trusted-issuer` / `--jwks-issuer` config |
+| `Untrusted issuer` | `iss` / signing key not in trusted list | Check `--data-auth-trusted-issuer` (or the events/admin equivalent) / `--jwks-issuer` config |
 | `OIDC issuer not configured` | Token has `kid` header but no JWKS configured | Add `--jwks-issuer` to server config |
 | `Token lacks storage proxy permissions` | Valid token but missing `fluree.storage.*` | Use operator token or `fluree track` instead |
 

@@ -7,12 +7,13 @@
 //! micro-fuel. Use the helper methods (`limit_fuel`, `used_fuel`) for
 //! user-facing decimal representations.
 
+use crate::clock::Instant;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use thiserror::Error;
 
 /// Conversion factor between fuel and micro-fuel.
@@ -72,7 +73,11 @@ pub mod schedule {
     /// Per row/flake materialized from in-memory state: `db.range` flakes,
     /// overlay/novelty rows, and history rows. The same 1 µf-per-unit rate also
     /// applies to staged flakes during transactions and bulk imports, where it
-    /// is charged as a raw count (`flakes.len()`) at those call sites.
+    /// is charged as a raw count (`flakes.len()`) at those call sites, and to
+    /// rows handled by the fused join lanes (`PropertyJoinOperator` scan/probe
+    /// drains, `ValuesOperator` join input), charged per batch/chunk at the
+    /// existing cancellation boundaries — never per iteration inside the merge
+    /// loops (hot-loop purity).
     pub const PER_ROW_MICRO_FUEL: u64 = 1;
 
     /// Transaction/commit baseline, charged once per `stage` and once per
@@ -163,6 +168,50 @@ pub struct PolicyStats {
     pub allowed: u64,
 }
 
+/// Policy-enforcement state for a request.
+///
+/// Answers the question [`PolicyStats`] cannot: whether policy governed the
+/// request at all. The per-policy stats are populated only when a policy
+/// actually *executes*, so an empty map means either "enforcement was active
+/// but no policy ran" or "the request ran unenforced" — the two states a caller
+/// most needs separated.
+///
+/// Ledger data does participate in producing it: the effective view-policy set
+/// is assembled from stored `f:AccessPolicy` nodes, selected through the
+/// identity's own `f:policyClass` assignments. What it never reflects is the
+/// data the query reads or the query itself. Three properties make it safe to
+/// report:
+///
+/// - **Query-independent.** It is settled when the view is built, before
+///   execution, and is identical for every query issued under the same policy
+///   context — so it cannot be varied to probe for a row.
+/// - **Constant per caller and ledger.** It changes only when the ledger's
+///   policy configuration or the caller's own policy assignments change, not
+///   when data is written.
+/// - **Self-describing only.** You must already be acting as an identity to
+///   see its enforcement state, so it discloses your own authorization
+///   posture and nothing about anyone else's data.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyEnforcement {
+    /// Always `true` when this record is present: the request executed under a
+    /// non-root policy context.
+    pub enforced: bool,
+    /// `true` when the effective view-policy set is empty and `default-allow`
+    /// is false — no data flake could have been returned under this request's
+    /// policy configuration.
+    ///
+    /// Not the same as "no rows were returned": schema flakes (`rdf:type` with
+    /// a schema-class object, `rdfs:subClassOf`, `rdfs:subPropertyOf`,
+    /// `rdfs:domain`, `rdfs:range`) bypass policy, so a query over the ontology
+    /// can still produce rows.
+    pub denies_all_data: bool,
+    /// Policies whose `f:query` could not be evaluated for this request and
+    /// therefore denied their targets: a graph source (Iceberg / SQL) has no
+    /// graph to run a policy query against. Empty on native ledgers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unevaluable_policies: Vec<String>,
+}
+
 /// Fuel limit exceeded. Field values are micro-fuel; use the helpers for fuel decimals.
 #[derive(Debug, Clone, Error)]
 #[error("Fuel limit exceeded")]
@@ -195,10 +244,20 @@ struct TrackerInner {
     // Policy tracking
     policy_stats: RwLock<HashMap<String, PolicyStats>>,
 
+    // Whether a non-root policy context governed this request, recorded once
+    // from the prepared view (see `Tracker::record_policy_enforcement`).
+    policy_enforcement: RwLock<Option<PolicyEnforcement>>,
+
     // Reasoning materialization outcome (recorded by query prepare when a
     // reasoning mode ran). Not gated by an option: a capped materialization
     // is a correctness signal, so any enabled tracker reports it.
     reasoning: RwLock<Option<ReasoningTally>>,
+    /// Statements the SQL pushdown lane sent to graph sources, in order,
+    /// capped at [`STATEMENT_REPORT_CAP`].
+    statements: RwLock<Vec<PushedStatement>>,
+    /// Statements sent past the cap, so a truncated report says so rather
+    /// than reading as the whole story.
+    statements_elided: AtomicU64,
 
     options: TrackingOptions,
 }
@@ -221,7 +280,10 @@ impl Tracker {
             fuel_total: AtomicU64::new(0),
             fuel_limit: options.max_fuel.unwrap_or(0),
             policy_stats: RwLock::new(HashMap::new()),
+            policy_enforcement: RwLock::new(None),
             reasoning: RwLock::new(None),
+            statements: RwLock::new(Vec::new()),
+            statements_elided: AtomicU64::new(0),
             options,
         })))
     }
@@ -306,6 +368,72 @@ impl Tracker {
         }
     }
 
+    /// Record that a non-root policy context governed this request.
+    ///
+    /// Called once, from the prepared view, before execution. Gated on
+    /// `track_policy` so the state is reported only on the same opt-in surface
+    /// as [`PolicyStats`]. Callers pass `None` for a root/unenforced context,
+    /// which leaves the field absent — the caller's output is then unchanged
+    /// from before this signal existed.
+    ///
+    /// A request that spans several graphs must pass one already-aggregated
+    /// value (see `DataSetDb::policy_enforcement`): repeated calls merge
+    /// conservatively, so a graph that was never recorded cannot weaken
+    /// `denies_all_data`.
+    pub fn record_policy_enforcement(&self, state: Option<PolicyEnforcement>) {
+        let Some(inner) = &self.0 else {
+            return;
+        };
+        if !inner.options.track_policy {
+            return;
+        }
+        let Some(state) = state else {
+            return;
+        };
+        if let Ok(mut slot) = inner.policy_enforcement.write() {
+            // A dataset query prepares several views; keep the most restrictive
+            // reading so `denies_all_data` means "every graph denied".
+            *slot = Some(match slot.take() {
+                Some(prev) => {
+                    let mut unevaluable_policies = prev.unevaluable_policies;
+                    for id in state.unevaluable_policies {
+                        if !unevaluable_policies.contains(&id) {
+                            unevaluable_policies.push(id);
+                        }
+                    }
+                    PolicyEnforcement {
+                        enforced: true,
+                        denies_all_data: prev.denies_all_data && state.denies_all_data,
+                        unevaluable_policies,
+                    }
+                }
+                None => state,
+            });
+        }
+    }
+
+    /// Record a policy whose `f:query` could not be evaluated for this request
+    /// (see [`PolicyEnforcement::unevaluable_policies`]). Recorded during
+    /// execution, so it merges into whatever enforcement state the prepared
+    /// view already stamped.
+    pub fn record_unevaluable_policy(&self, policy_id: &str) {
+        let Some(inner) = &self.0 else {
+            return;
+        };
+        if !inner.options.track_policy || policy_id.is_empty() {
+            return;
+        }
+        if let Ok(mut slot) = inner.policy_enforcement.write() {
+            let state = slot.get_or_insert_with(|| PolicyEnforcement {
+                enforced: true,
+                ..PolicyEnforcement::default()
+            });
+            if !state.unevaluable_policies.iter().any(|id| id == policy_id) {
+                state.unevaluable_policies.push(policy_id.to_string());
+            }
+        }
+    }
+
     /// Record the outcome of an OWL2-RL materialization for this request.
     ///
     /// Last write wins (a request runs at most one materialization per
@@ -316,6 +444,29 @@ impl Tracker {
         };
         if let Ok(mut slot) = inner.reasoning.write() {
             *slot = Some(tally);
+        }
+    }
+
+    /// Record a statement the SQL pushdown lane sent to `source`, so the
+    /// response reports what ran remotely.
+    pub fn record_statement(&self, source: &str, sql: &str) {
+        let Some(inner) = &self.0 else {
+            return;
+        };
+        // Bounded: outer bindings chunk at 2,000 rows and a statement may run
+        // to `statement_max_bytes` (1 MiB), so an unbounded tally over a large
+        // seed set retains tens of MiB and echoes all of it in the response.
+        // The first `STATEMENT_REPORT_CAP` are what a reader needs to see the
+        // shape; the rest are counted, never silently dropped.
+        if let Ok(mut slot) = inner.statements.write() {
+            if slot.len() >= STATEMENT_REPORT_CAP {
+                inner.statements_elided.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            slot.push(PushedStatement {
+                source: source.to_string(),
+                sql: sql.to_string(),
+            });
         }
     }
 
@@ -360,7 +511,18 @@ impl Tracker {
             } else {
                 None
             },
+            policy_enforcement: inner.policy_enforcement.read().ok().and_then(|p| p.clone()),
             reasoning: inner.reasoning.read().ok().and_then(|r| r.clone()),
+            sql: inner
+                .statements
+                .read()
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.clone()),
+            sql_elided: match inner.statements_elided.load(Ordering::Relaxed) {
+                0 => None,
+                n => Some(n),
+            },
         })
     }
 }
@@ -377,9 +539,34 @@ pub struct TrackingTally {
     /// Policy stats: `{policy-id -> {executed, allowed}}`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<HashMap<String, PolicyStats>>,
+    /// Whether policy governed this request, and whether its configuration
+    /// grants no view of the data at all. Present only when the request ran
+    /// under a non-root policy context; absent means unenforced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_enforcement: Option<PolicyEnforcement>,
     /// Reasoning materialization outcome, when a reasoning mode ran.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ReasoningTally>,
+    /// Statements the SQL pushdown lane sent to graph sources, in the order
+    /// they ran. Absent when no block was pushed down.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sql: Option<Vec<PushedStatement>>,
+    /// Statements sent beyond the reported cap. Present only when `sql` is a
+    /// prefix rather than the whole list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_elided: Option<u64>,
+}
+
+/// How many pushed statements a tracked response lists before it starts
+/// counting instead.
+pub const STATEMENT_REPORT_CAP: usize = 64;
+
+/// One statement the SQL pushdown lane sent to a graph source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushedStatement {
+    /// The graph source the statement ran against.
+    pub source: String,
+    pub sql: String,
 }
 
 /// Outcome of an OWL2-RL materialization, reported per request.
@@ -479,6 +666,85 @@ mod tests {
         t.consume_fuel(INDEX_TOUCH_MICRO_FUEL).unwrap();
         assert_eq!(t.current_fuel(), Some(1.01));
         assert_eq!(t.tally().unwrap().fuel, Some(1.01));
+    }
+
+    fn policy_tracker() -> Tracker {
+        Tracker::new(TrackingOptions {
+            track_policy: true,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn policy_enforcement_absent_when_never_recorded() {
+        // The unenforced (anonymous) request: policy tracking asked for, no
+        // policy context built, so the tally reports the empty stats map and
+        // nothing else — byte-identical to the output before this signal.
+        let t = policy_tracker();
+        t.record_policy_enforcement(None);
+        let tally = t.tally().unwrap();
+        assert_eq!(tally.policy, Some(HashMap::new()));
+        assert_eq!(tally.policy_enforcement, None);
+    }
+
+    #[test]
+    fn policy_enforcement_reports_recorded_state() {
+        let t = policy_tracker();
+        t.record_policy_enforcement(Some(PolicyEnforcement {
+            enforced: true,
+            denies_all_data: true,
+            unevaluable_policies: Vec::new(),
+        }));
+        assert_eq!(
+            t.tally().unwrap().policy_enforcement,
+            Some(PolicyEnforcement {
+                enforced: true,
+                denies_all_data: true,
+                unevaluable_policies: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn policy_enforcement_requires_policy_tracking() {
+        // Opt-in: a time-only tracker reports neither policy surface.
+        let t = Tracker::new(TrackingOptions {
+            track_time: true,
+            ..Default::default()
+        });
+        t.record_policy_enforcement(Some(PolicyEnforcement {
+            enforced: true,
+            denies_all_data: true,
+            unevaluable_policies: Vec::new(),
+        }));
+        let tally = t.tally().unwrap();
+        assert_eq!(tally.policy, None);
+        assert_eq!(tally.policy_enforcement, None);
+    }
+
+    #[test]
+    fn repeated_policy_enforcement_records_merge_conservatively() {
+        // One graph granting nothing and another granting something must not
+        // report whole-request denial.
+        let t = policy_tracker();
+        t.record_policy_enforcement(Some(PolicyEnforcement {
+            enforced: true,
+            denies_all_data: true,
+            unevaluable_policies: Vec::new(),
+        }));
+        t.record_policy_enforcement(Some(PolicyEnforcement {
+            enforced: true,
+            denies_all_data: false,
+            unevaluable_policies: Vec::new(),
+        }));
+        assert_eq!(
+            t.tally().unwrap().policy_enforcement,
+            Some(PolicyEnforcement {
+                enforced: true,
+                denies_all_data: false,
+                unevaluable_policies: Vec::new(),
+            })
+        );
     }
 
     #[test]

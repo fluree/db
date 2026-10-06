@@ -28,6 +28,13 @@ Idempotent transactions that replace values for supplied predicates:
 - Idempotent operations
 - Synchronization patterns
 
+### [Sync (graph synchronization)](sync.md)
+
+Whole-graph replacement that commits only the delta:
+- Retracts what the payload omits, asserts what it adds
+- Identical payload → no commit
+- Dry run and empty-payload safety rails
+
 ### [Update (WHERE/DELETE/INSERT)](update-where-delete-insert.md)
 
 Targeted updates to existing data:
@@ -54,6 +61,14 @@ Import RDF data in Turtle format:
 - Bulk imports
 - File uploads
 - Format conversion
+
+### [Cypher writes](../query/cypher.md)
+
+Write property-graph data with openCypher (`CREATE`/`MERGE`/`SET`/`DELETE`):
+- `MERGE` find-or-create semantics
+- Relationship properties via edge annotations
+- Writes go to the ledger-scoped `/update` endpoint (`Content-Type: application/cypher`) or `fluree update --format cypher`
+- See the [Cypher cookbook](../guides/cookbook-cypher.md) for end-to-end write patterns
 
 ### [Signed / Credentialed Transactions](signed-transactions.md)
 
@@ -204,9 +219,10 @@ POST /upsert?ledger=mydb:main
 
 ## Transaction Types
 
-- **Insert** (`POST /insert`) — add triples (JSON-LD or Turtle)
+- **Insert** (`POST /insert`) — add triples (JSON-LD, Turtle, TriG)
 - **Update** (`POST /update`) — WHERE/DELETE/INSERT (JSON-LD) or SPARQL UPDATE
 - **Upsert** (`POST /upsert`) — replace values for the predicates you supply (JSON-LD, Turtle, TriG)
+- **Sync** (`POST /sync`) — make one graph's contents exactly the payload, committing only the delta (JSON-LD, Turtle, N-Triples or TriG)
 
 ## Transaction Validation
 

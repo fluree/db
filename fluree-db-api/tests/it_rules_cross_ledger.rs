@@ -373,3 +373,117 @@ async fn missing_model_ledger_surfaces_cross_ledger_error() {
         "expected ApiError::CrossLedger for missing model ledger, got: {err:?}"
     );
 }
+
+/// Dataset-path parity: cross-ledger `f:rulesSource` must engage when
+/// the query takes the multi-ledger dataset path, which previously
+/// attached neither `rules_source_g_id` nor cross-ledger rules. The
+/// second source is an unrelated ledger — NOT M — so the rule can only
+/// arrive via the cross-ledger resolver on D's config.
+#[tokio::test]
+async fn dataset_query_pulls_rules_from_model_ledger() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let model_id = "test/cross-ledger-rules/model-ds:main";
+    let rules_graph_iri = "http://example.org/governance/rules";
+    let model = genesis_ledger(&fluree, model_id);
+
+    let rule_tx = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f":  "https://ns.flur.ee/db#"
+        },
+        "insert": [
+            ["graph", rules_graph_iri, {
+                "@id": "ex:grandparentRule",
+                "f:rule": {
+                    "@type":  "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where":    {"@id": "?p", "ex:parent": {"ex:parent": "?g"}},
+                        "insert":   {"@id": "?p", "ex:grandparent": {"@id": "?g"}}
+                    }
+                }
+            }]
+        ]
+    });
+    fluree
+        .update(model, &rule_tx)
+        .await
+        .expect("seed M with grandparent rule");
+
+    let data_id = "test/cross-ledger-rules/data-ds:main";
+    let data = genesis_ledger(&fluree, data_id);
+
+    let cfg = config_iri(data_id);
+    let cfg_trig = format!(
+        r"
+        @prefix f:   <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{cfg}> {{
+            <urn:cfg:main>     rdf:type          f:LedgerConfig .
+            <urn:cfg:main>     f:datalogDefaults <urn:cfg:datalog> .
+            <urn:cfg:datalog>  f:datalogEnabled  true .
+            <urn:cfg:datalog>  f:rulesSource     <urn:cfg:rules-ref> .
+            <urn:cfg:rules-ref> rdf:type         f:GraphRef ;
+                                f:graphSource    <urn:cfg:rules-src> .
+            <urn:cfg:rules-src> f:ledger         <{model_id}> ;
+                                f:graphSelector  <{rules_graph_iri}> .
+        }}
+    "
+    );
+    let r = fluree
+        .stage_owned(data)
+        .upsert_turtle(&cfg_trig)
+        .execute()
+        .await
+        .expect("seed D config with cross-ledger f:rulesSource");
+    let data = r.ledger;
+
+    let family = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:alice", "ex:parent": {"@id": "ex:bob"}},
+            {"@id": "ex:bob",   "ex:parent": {"@id": "ex:charlie"}}
+        ]
+    });
+    fluree
+        .insert(data, &family)
+        .await
+        .expect("insert family data into D");
+
+    let other_id = "test/cross-ledger-rules/other-ds:main";
+    let other = genesis_ledger(&fluree, other_id);
+    fluree
+        .insert(
+            other,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:unrelated",
+                "ex:note": "no rules here"
+            }),
+        )
+        .await
+        .expect("seed unrelated ledger");
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": [data_id, other_id],
+        "select": "?grandparent",
+        "where":  {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
+        "reasoning": "datalog"
+    });
+    let result = fluree
+        .query_connection(&q)
+        .await
+        .expect("dataset query with cross-ledger rule");
+    let data = fluree.ledger(data_id).await.expect("reload D ledger");
+    let rows = result.to_jsonld(&data.snapshot).expect("to_jsonld");
+    let results = normalize_rows(&rows);
+
+    assert!(
+        results.contains(&json!("ex:charlie")),
+        "M's grandparent rule (resolved cross-ledger) must derive \
+         charlie on the dataset path; got: {results:?}"
+    );
+}

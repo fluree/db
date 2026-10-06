@@ -5,11 +5,13 @@
 
 pub mod cardinality;
 pub mod datatype;
+pub mod lang;
 pub mod pair;
 pub mod pattern;
 pub mod value;
 
 use crate::compile::NodeKind;
+use crate::path::PropertyPath;
 use fluree_db_core::{FlakeValue, Sid};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -72,24 +74,22 @@ pub enum Constraint {
     LanguageIn(Vec<String>),
 
     // Qualified value shape constraints
-    /// sh:qualifiedValueShape with min/max counts
+    /// sh:qualifiedValueShape with min/max counts: the number of values
+    /// conforming to the nested shape must fall within the counts.
     QualifiedValueShape {
         /// The nested shape to validate against
-        shape: Arc<QualifiedShape>,
+        shape: Arc<NestedShape>,
         /// sh:qualifiedMinCount
         min_count: Option<usize>,
         /// sh:qualifiedMaxCount
         max_count: Option<usize>,
+        /// sh:qualifiedValueShapesDisjoint — when true, a value only counts
+        /// if it does NOT conform to any sibling qualified shape.
+        disjoint: bool,
+        /// Qualified shapes of the other property shapes of the same node
+        /// shape (filled during finalize; consulted only when `disjoint`).
+        sibling_shapes: Vec<Arc<NestedShape>>,
     },
-}
-
-/// A qualified shape for sh:qualifiedValueShape
-#[derive(Debug, Clone, PartialEq)]
-pub struct QualifiedShape {
-    /// The shape ID
-    pub id: Sid,
-    /// Constraints to apply
-    pub constraints: Vec<Constraint>,
 }
 
 /// Node-level constraints (applied to the focus node, not property values)
@@ -102,6 +102,11 @@ pub enum NodeConstraint {
         /// Properties to ignore when checking closed shape (sh:ignoredProperties)
         ignored_properties: HashSet<Sid>,
     },
+
+    /// sh:node - the node must conform to the referenced node shape. On a node
+    /// shape this applies to the focus node; on a property shape it applies to
+    /// each value node individually.
+    Node(Arc<NestedShape>),
 
     // Logical constraints
     /// sh:not - the nested shape must NOT match
@@ -120,12 +125,15 @@ pub struct NestedShape {
     /// The shape ID
     pub id: Sid,
     /// Property constraints (path → constraints on values at that path)
-    pub property_constraints: Vec<(Sid, Vec<Constraint>)>,
+    pub property_constraints: Vec<(PropertyPath, Vec<Constraint>)>,
     /// Node-level constraints
     pub node_constraints: Vec<NodeConstraint>,
     /// Value-level constraints (e.g. sh:datatype on an anonymous shape without sh:path).
     /// These constrain the focus node's own value/datatype rather than a nested property.
     pub value_constraints: Vec<Constraint>,
+    /// sh:message declared on an anonymous member shape. Named references get
+    /// their message from the referenced CompiledShape at validation time.
+    pub message: Option<String>,
 }
 
 impl Constraint {
@@ -161,6 +169,45 @@ impl Constraint {
             }
         }
     }
+
+    /// The W3C constraint-component IRI reported as
+    /// `sh:sourceConstraintComponent` for violations of this constraint.
+    ///
+    /// `QualifiedValueShape` maps to the min-count component when
+    /// `sh:qualifiedMinCount` is declared (max-count otherwise); emit sites
+    /// that know which bound actually failed pick the component directly.
+    pub fn component(&self) -> &'static str {
+        use fluree_vocab::shacl as sh;
+        match self {
+            Constraint::MinCount(_) => sh::MIN_COUNT_CONSTRAINT_COMPONENT,
+            Constraint::MaxCount(_) => sh::MAX_COUNT_CONSTRAINT_COMPONENT,
+            Constraint::Datatype(_) => sh::DATATYPE_CONSTRAINT_COMPONENT,
+            Constraint::NodeKind(_) => sh::NODE_KIND_CONSTRAINT_COMPONENT,
+            Constraint::Class(_) => sh::CLASS_CONSTRAINT_COMPONENT,
+            Constraint::MinInclusive(_) => sh::MIN_INCLUSIVE_CONSTRAINT_COMPONENT,
+            Constraint::MaxInclusive(_) => sh::MAX_INCLUSIVE_CONSTRAINT_COMPONENT,
+            Constraint::MinExclusive(_) => sh::MIN_EXCLUSIVE_CONSTRAINT_COMPONENT,
+            Constraint::MaxExclusive(_) => sh::MAX_EXCLUSIVE_CONSTRAINT_COMPONENT,
+            Constraint::Pattern(..) => sh::PATTERN_CONSTRAINT_COMPONENT,
+            Constraint::MinLength(_) => sh::MIN_LENGTH_CONSTRAINT_COMPONENT,
+            Constraint::MaxLength(_) => sh::MAX_LENGTH_CONSTRAINT_COMPONENT,
+            Constraint::HasValue(_) => sh::HAS_VALUE_CONSTRAINT_COMPONENT,
+            Constraint::In(_) => sh::IN_CONSTRAINT_COMPONENT,
+            Constraint::Equals(_) => sh::EQUALS_CONSTRAINT_COMPONENT,
+            Constraint::Disjoint(_) => sh::DISJOINT_CONSTRAINT_COMPONENT,
+            Constraint::LessThan(_) => sh::LESS_THAN_CONSTRAINT_COMPONENT,
+            Constraint::LessThanOrEquals(_) => sh::LESS_THAN_OR_EQUALS_CONSTRAINT_COMPONENT,
+            Constraint::UniqueLang(_) => sh::UNIQUE_LANG_CONSTRAINT_COMPONENT,
+            Constraint::LanguageIn(_) => sh::LANGUAGE_IN_CONSTRAINT_COMPONENT,
+            Constraint::QualifiedValueShape { min_count, .. } => {
+                if min_count.is_some() {
+                    sh::QUALIFIED_MIN_COUNT_CONSTRAINT_COMPONENT
+                } else {
+                    sh::QUALIFIED_MAX_COUNT_CONSTRAINT_COMPONENT
+                }
+            }
+        }
+    }
 }
 
 impl NodeConstraint {
@@ -177,6 +224,7 @@ impl NodeConstraint {
                     ignored_properties.len()
                 )
             }
+            NodeConstraint::Node(shape) => format!("sh:node {}", shape.id.name),
             NodeConstraint::Not(_) => "sh:not".to_string(),
             NodeConstraint::And(shapes) => format!("sh:and ({} shapes)", shapes.len()),
             NodeConstraint::Or(shapes) => format!("sh:or ({} shapes)", shapes.len()),
@@ -192,6 +240,57 @@ pub struct ConstraintViolation {
     pub constraint: Constraint,
     /// The value that violated the constraint (if applicable)
     pub value: Option<FlakeValue>,
+    /// Index of `value` within the value set being checked, when the
+    /// violation concerns exactly one value. Lets result construction
+    /// recover the value's datatype / language tag from the parallel
+    /// `datatypes` / `langs` arrays (term fidelity for `sh:value`).
+    pub value_index: Option<usize>,
     /// Human-readable message about the violation
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn component_iris_match_w3c_names() {
+        assert_eq!(
+            Constraint::MinCount(1).component(),
+            "http://www.w3.org/ns/shacl#MinCountConstraintComponent"
+        );
+        assert_eq!(
+            Constraint::Pattern("a".into(), None).component(),
+            "http://www.w3.org/ns/shacl#PatternConstraintComponent"
+        );
+        assert_eq!(
+            Constraint::LessThanOrEquals(Sid::new(0, "p")).component(),
+            "http://www.w3.org/ns/shacl#LessThanOrEqualsConstraintComponent"
+        );
+    }
+
+    #[test]
+    fn qualified_component_tracks_declared_bound() {
+        let qualified = |min_count, max_count| Constraint::QualifiedValueShape {
+            shape: Arc::new(NestedShape {
+                id: Sid::new(0, "q"),
+                property_constraints: Vec::new(),
+                node_constraints: Vec::new(),
+                value_constraints: Vec::new(),
+                message: None,
+            }),
+            min_count,
+            max_count,
+            disjoint: false,
+            sibling_shapes: Vec::new(),
+        };
+        assert_eq!(
+            qualified(Some(1), None).component(),
+            "http://www.w3.org/ns/shacl#QualifiedMinCountConstraintComponent"
+        );
+        assert_eq!(
+            qualified(None, Some(2)).component(),
+            "http://www.w3.org/ns/shacl#QualifiedMaxCountConstraintComponent"
+        );
+    }
 }

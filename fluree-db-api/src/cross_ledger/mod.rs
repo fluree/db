@@ -82,3 +82,64 @@ pub(crate) fn encode_system_iri(
             ),
         })
 }
+
+/// Resolve `f:reasoningDefaults`' `f:schemaSource` when it points at a
+/// model ledger, translating the ontology wire against the data ledger's
+/// snapshot. Returns `None` when no cross-ledger schema source is
+/// configured. Resolution is t-cached (GovernanceCache): an unchanged model
+/// head is an Arc clone, not a re-query.
+///
+/// Shared by SHACL enforcement (transaction path) and policy-context
+/// construction so both merge the model ledger's subclass/subproperty edges
+/// into their entailment hierarchy.
+pub(crate) async fn resolve_schema_closure_bundle(
+    reasoning: &fluree_db_core::ledger_config::ReasoningDefaults,
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    ctx: &mut ResolveCtx<'_>,
+) -> Result<
+    Option<std::sync::Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>>,
+    CrossLedgerError,
+> {
+    let Some(schema_source) = reasoning.schema_source.as_ref() else {
+        return Ok(None);
+    };
+    if schema_source.ledger.is_none() {
+        return Ok(None);
+    }
+    // The cross-ledger materializer resolves a single graph and does not
+    // walk `owl:imports`, so `f:followOwlImports` cannot be honored here.
+    // Skip the bundle (local-only hierarchy) rather than erroring: this
+    // resolver runs inside every transaction's enforcement setup, so a hard
+    // failure would reject every subsequent write on the ledger — including
+    // the config repair itself. The loud fail-closed rejection lives on the
+    // reasoning-query path (`resolve_configured_schema_bundle`), which is
+    // where an incomplete closure would actually change entailment results;
+    // enforcement merely falls back to the pre-feature local hierarchy.
+    if reasoning.follow_owl_imports.unwrap_or(false) {
+        tracing::warn!(
+            model_ledger = schema_source.ledger.as_deref().unwrap_or_default(),
+            graph_selector = schema_source.graph_selector.as_deref().unwrap_or_default(),
+            "`f:followOwlImports` is not supported with a cross-ledger \
+             `f:schemaSource`; skipping cross-ledger enforcement entailment \
+             (local hierarchy only). Reasoning queries against this config \
+             fail closed."
+        );
+        return Ok(None);
+    }
+    let resolved = resolve_graph_ref(schema_source, ArtifactKind::SchemaClosure, ctx).await?;
+    let GovernanceArtifact::SchemaClosure(wire) = &resolved.artifact else {
+        return Err(CrossLedgerError::TranslationFailed {
+            ledger_id: resolved.model_ledger_id.clone(),
+            graph_iri: resolved.graph_iri.clone(),
+            detail: "resolver returned a non-SchemaClosure artifact".into(),
+        });
+    };
+    let bundle = wire
+        .translate_to_schema_bundle_flakes(snapshot)
+        .map_err(|e| CrossLedgerError::TranslationFailed {
+            ledger_id: resolved.model_ledger_id.clone(),
+            graph_iri: resolved.graph_iri.clone(),
+            detail: format!("schema wire translation failed: {e}"),
+        })?;
+    Ok(Some(bundle))
+}

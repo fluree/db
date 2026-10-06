@@ -183,6 +183,9 @@ pub(crate) fn lower_query<E: IriEncoder>(
         reasoning,
         post_values: None,
         include_system_facts: ast.options.include_system_facts,
+        union_default_graph: ast.options.union_default_graph,
+        cypher_vocab: None,
+        unmatched_optional: Default::default(),
     })
 }
 
@@ -289,7 +292,7 @@ pub fn lower_unresolved_pattern<E: IriEncoder>(
                 Some(predicate) => Ok(vec![Pattern::ShortestPath(ShortestPathPattern {
                     start: start_ref,
                     end: end_ref,
-                    predicate,
+                    predicate: Some(predicate),
                     direction: *direction,
                     mode: *mode,
                     path_var: path_var_id,
@@ -297,6 +300,7 @@ pub fn lower_unresolved_pattern<E: IriEncoder>(
                     max_hops: *max_hops,
                     // JSON-LD/FQL has no `relationships()`; never build edges.
                     needs_relationships: false,
+                    node_filter: None,
                 })]),
                 // Predicate IRI not in the dictionary → no edges of that type
                 // exist → the search yields no rows.
@@ -487,6 +491,7 @@ fn lower_values_cell<E: IriEncoder>(cell: &UnresolvedValue, encoder: &E) -> Resu
     let dts = WellKnownDatatypes::new();
     match cell {
         UnresolvedValue::Unbound => Ok(Binding::Unbound),
+        UnresolvedValue::PreBound(binding) => Ok(binding.clone()),
         UnresolvedValue::Iri(iri) => {
             let sid = encoder
                 .encode_iri(iri)
@@ -502,7 +507,7 @@ fn lower_values_cell<E: IriEncoder>(cell: &UnresolvedValue, encoder: &E) -> Resu
                 LiteralValue::Decimal(d) => FlakeValue::Decimal(d.clone()),
                 LiteralValue::BigInt(n) => FlakeValue::BigInt(n.clone()),
                 LiteralValue::Boolean(b) => FlakeValue::Boolean(*b),
-                LiteralValue::Vector(v) => FlakeValue::Vector(v.clone()),
+                LiteralValue::Vector(v) => FlakeValue::Vector(v.as_slice().into()),
             };
 
             match dtc {
@@ -525,7 +530,9 @@ fn lower_values_cell<E: IriEncoder>(cell: &UnresolvedValue, encoder: &E) -> Resu
                 None => {
                     let sid = match value {
                         LiteralValue::String(_) => dts.xsd_string,
-                        LiteralValue::Long(_) => dts.xsd_long,
+                        // RDF 1.1: a bare integer is xsd:integer, matching
+                        // storage and arithmetic tagging (#1319).
+                        LiteralValue::Long(_) => dts.xsd_integer,
                         LiteralValue::Double(_) => dts.xsd_double,
                         LiteralValue::Decimal(_) => dts.xsd_decimal,
                         LiteralValue::BigInt(_) => dts.xsd_integer,
@@ -602,7 +609,14 @@ fn lower_triple_pattern<E: IriEncoder>(
             Some(DatatypeConstraint::Explicit(dt_sid))
         }
         Some(UnresolvedDatatypeConstraint::LangTag(tag)) => {
-            Some(DatatypeConstraint::LangTag(tag.clone()))
+            // BCP 47 tags compare case-insensitively; match the stored
+            // (lowercase) form.
+            Some(DatatypeConstraint::LangTag(
+                match fluree_db_core::normalize_lang_tag(tag) {
+                    std::borrow::Cow::Borrowed(_) => tag.clone(),
+                    std::borrow::Cow::Owned(s) => Arc::from(s),
+                },
+            ))
         }
         None => None,
     };
@@ -1406,22 +1420,63 @@ fn lower_subquery<E: IriEncoder>(
 
 /// Lower an unresolved CONSTRUCT template to a resolved ConstructTemplate
 ///
-/// Only processes triple patterns from the template (filters/optionals are ignored).
+/// Triples, edge annotations and named-graph blocks become template patterns,
+/// reifier attachments and per-pattern graphs; other patterns (filters,
+/// optionals, binds) are ignored.
 fn lower_construct_template<E: IriEncoder>(
     template: &UnresolvedConstructTemplate,
     encoder: &E,
     vars: &mut VarRegistry,
 ) -> Result<ConstructTemplate> {
-    let mut patterns = Vec::new();
+    let mut out = ConstructTemplate::new(Vec::new());
+    lower_construct_patterns(&template.patterns, None, encoder, vars, &mut out)?;
+    // An `@annotation` block without an `@id` names its reifier with a
+    // synthetic variable no WHERE clause binds: mint a fresh blank node for
+    // it on each row, as SPARQL does for a `[ ]` reifier.
+    out.bnode_vars = out
+        .reifications()
+        .iter()
+        .filter_map(|r| r.reifier.as_var())
+        .filter(|&v| vars.try_name(v).is_some_and(|n| n.starts_with("?__ann")))
+        .collect();
+    Ok(out)
+}
 
-    for unresolved in &template.patterns {
-        if let UnresolvedPattern::Triple(tp) = unresolved {
-            patterns.push(lower_triple_pattern(tp, encoder, vars)?);
+fn lower_construct_patterns<E: IriEncoder>(
+    patterns: &[UnresolvedPattern],
+    graph: Option<&Ref>,
+    encoder: &E,
+    vars: &mut VarRegistry,
+    out: &mut ConstructTemplate,
+) -> Result<()> {
+    for unresolved in patterns {
+        match unresolved {
+            UnresolvedPattern::Triple(tp) => {
+                out.push_pattern(lower_triple_pattern(tp, encoder, vars)?, graph.cloned());
+            }
+            UnresolvedPattern::EdgeAnnotation {
+                edge,
+                annotation,
+                body,
+            } => {
+                let triple =
+                    out.push_pattern(lower_triple_pattern(edge, encoder, vars)?, graph.cloned());
+                out.push_reification(triple, lower_ref_term(annotation, encoder, vars)?);
+                lower_construct_patterns(body, graph, encoder, vars, out)?;
+            }
+            UnresolvedPattern::Graph { name, patterns } => {
+                let name = if name.starts_with('?') {
+                    Ref::Var(vars.get_or_insert(name))
+                } else {
+                    Ref::Iri(std::sync::Arc::from(name.as_ref()))
+                };
+                lower_construct_patterns(patterns, Some(&name), encoder, vars, out)?;
+            }
+            // Filters, optionals and binds have no meaning in a template.
+            _ => {}
         }
-        // Ignore non-triple patterns in templates (filters, optionals, binds)
     }
-
-    Ok(ConstructTemplate::new(patterns))
+    Ok(())
 }
 
 // ============================================================================
@@ -1473,6 +1528,7 @@ fn lower_forward_item<E: IriEncoder>(
         UnresolvedForwardItem::Property {
             predicate,
             sub_spec,
+            modifiers,
         } => {
             let sid = encoder
                 .encode_iri(predicate)
@@ -1481,12 +1537,44 @@ fn lower_forward_item<E: IriEncoder>(
                 .as_ref()
                 .map(|nested| lower_level_boxed(nested, encoder))
                 .transpose()?;
+            let lowered_modifiers = modifiers
+                .as_ref()
+                .map(|m| lower_nested_modifiers(m, encoder))
+                .transpose()?;
             Ok(ForwardItem::Property {
                 predicate: sid,
                 sub_spec: lowered_sub,
+                modifiers: lowered_modifiers,
             })
         }
     }
+}
+
+/// Encode the sort predicates of a level's per-value modifiers.
+fn lower_nested_modifiers<E: IriEncoder>(
+    modifiers: &crate::parse::ast::UnresolvedNestedModifiers,
+    encoder: &E,
+) -> Result<Box<crate::ir::projection::NestedModifiers>> {
+    let mut order = Vec::with_capacity(modifiers.order.len());
+    for key in &modifiers.order {
+        let predicate = match &key.predicate {
+            Some(iri) => Some(
+                encoder
+                    .encode_iri(iri)
+                    .ok_or_else(|| ParseError::UnknownNamespace(iri.clone()))?,
+            ),
+            None => None,
+        };
+        order.push(crate::ir::projection::NestedOrderKey {
+            predicate,
+            descending: key.descending,
+        });
+    }
+    Ok(Box::new(crate::ir::projection::NestedModifiers {
+        order,
+        offset: modifiers.offset,
+        limit: modifiers.limit,
+    }))
 }
 
 /// Lower a reverse map (`predicate IRI -> Option<nested level>`).
@@ -1581,6 +1669,17 @@ fn lower_filter_expr_inner<E: IriEncoder>(
         UnresolvedExpression::Var(name) => {
             let var_id = vars.get_or_insert(name);
             Ok(Expression::Var(var_id))
+        }
+        // An IRI operand becomes `IRI("<iri>")`, exactly as the SPARQL lowering
+        // does for `?p = ex:knows`: the evaluator resolves the string to the
+        // ledger's `Sid` (or keeps it as an IRI value when the namespace is
+        // unknown), so the comparison is by term identity rather than by
+        // string, and an IRI-bound variable can match it.
+        UnresolvedExpression::Const(crate::parse::ast::UnresolvedFilterValue::Iri(iri)) => {
+            Ok(Expression::Call {
+                func: crate::ir::Function::Iri,
+                args: vec![Expression::Const(FlakeValue::String(iri.to_string()))],
+            })
         }
         UnresolvedExpression::Const(val) => Ok(Expression::Const(val.into())),
         UnresolvedExpression::And(exprs) => {
@@ -1707,9 +1806,11 @@ fn lower_function_name(name: &str) -> Function {
         "isblank" | "is-blank" => Function::IsBlank,
         "isliteral" | "is-literal" => Function::IsLiteral,
         "isnumeric" | "is-numeric" => Function::IsNumeric,
-        // RDF term functions
-        "lang" => Function::Lang,
-        "datatype" => Function::Datatype,
+        // RDF term functions — JSON-LD surface: lenient non-literal handling
+        // (DATATYPE of an IRI reports `@id`; LANG of a non-literal is "").
+        // See the Function docs / decision D-12.
+        "lang" => Function::Lang { strict: false },
+        "datatype" => Function::Datatype { strict: false },
         "langmatches" => Function::LangMatches,
         "sameterm" => Function::SameTerm,
         // Fluree-specific: transaction time
@@ -1824,7 +1925,7 @@ fn lower_term<E: IriEncoder>(
 /// in subject or predicate positions.
 fn lower_ref_term<E: IriEncoder>(
     term: &UnresolvedTerm,
-    _encoder: &E,
+    encoder: &E,
     vars: &mut VarRegistry,
 ) -> Result<Ref> {
     match term {
@@ -1832,7 +1933,11 @@ fn lower_ref_term<E: IriEncoder>(
             let var_id = vars.get_or_insert(name);
             Ok(Ref::Var(var_id))
         }
-        UnresolvedTerm::Iri(iri) => Ok(Ref::Iri(iri.clone())),
+        // Leaving every constant as `Ref::Iri` for "deferred encoding" kept
+        // JSON-LD joins off the batched probe lanes, which SPARQL reached
+        // through the same rule. Cross-ledger execution re-encodes pattern
+        // SIDs per graph (`reencode_sid`) for every surface alike.
+        UnresolvedTerm::Iri(iri) => Ok(encoder.encode_ref(iri)),
         UnresolvedTerm::Literal(_) => Err(ParseError::InvalidWhere(
             "Literal values are not valid in subject or predicate position".to_string(),
         )),
@@ -1848,7 +1953,7 @@ fn lower_literal(lit: &LiteralValue) -> FlakeValue {
         LiteralValue::Decimal(d) => FlakeValue::Decimal(d.clone()),
         LiteralValue::BigInt(n) => FlakeValue::BigInt(n.clone()),
         LiteralValue::Boolean(b) => FlakeValue::Boolean(*b),
-        LiteralValue::Vector(v) => FlakeValue::Vector(v.clone()),
+        LiteralValue::Vector(v) => FlakeValue::Vector(v.as_slice().into()),
     }
 }
 
@@ -2053,10 +2158,23 @@ mod tests {
         let lowered = lower_triple_pattern(&pattern, &encoder, &mut vars).unwrap();
 
         assert_eq!(lowered.s.as_var(), Some(VarId(0)));
-        // Predicate IRI is lowered to Ref::Iri for deferred encoding
-        assert_eq!(lowered.p.as_iri(), Some("http://schema.org/name"));
+        // A registered prefix encodes at lowering, as SPARQL does; operators
+        // that need a statically known predicate test for the SID form.
+        assert_eq!(
+            lowered.p.as_sid().map(|s| (s.namespace_code, &*s.name)),
+            Some((100, "name"))
+        );
         assert!(matches!(lowered.o, Term::Var(VarId(1))));
         assert!(lowered.dtc.is_none());
+
+        // An unregistered prefix stays an IRI for the scan to encode per graph.
+        let foreign = UnresolvedTriplePattern::new(
+            UnresolvedTerm::var("?s"),
+            UnresolvedTerm::iri("http://elsewhere.example/name"),
+            UnresolvedTerm::var("?name"),
+        );
+        let lowered = lower_triple_pattern(&foreign, &encoder, &mut vars).unwrap();
+        assert_eq!(lowered.p.as_iri(), Some("http://elsewhere.example/name"));
     }
 
     #[test]

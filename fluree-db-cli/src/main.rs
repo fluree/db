@@ -213,6 +213,10 @@ fn main() {
 }
 
 async fn async_main() {
+    // Best-effort raise of the open-file soft limit (macOS defaults to 256,
+    // which large imports exceed). Done before tracing init; logged after.
+    let fd_raise = fluree_db_core::fd_limit::raise_nofile_soft_to_hard();
+
     let cli = Cli::parse();
 
     // Disable color when --no-color flag or NO_COLOR env var is set.
@@ -242,6 +246,7 @@ async fn async_main() {
     if !skip_tracing {
         init_tracing(&cli);
     }
+    fluree_db_core::fd_limit::log_raise_outcome(&fd_raise);
 
     let result = fluree_db_cli::run(cli).await;
     shutdown_tracer().await;

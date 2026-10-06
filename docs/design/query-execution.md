@@ -42,6 +42,7 @@ flowchart TD
     - `DatasetOperator` wraps every triple-pattern scan. In single-graph mode (the common case) it passes through to one inner `BinaryScanOperator` with negligible overhead. In multi-graph mode (FROM/FROM NAMED datasets) it fans out one inner operator per active graph, drives their lifecycles, and stamps ledger provenance (`Binding::IriMatch`) on results that span multiple ledgers.
     - `DatasetBuilder` trait (factory pattern): the planner constructs a `ScanDatasetBuilder` at plan time; `DatasetOperator` calls `build()` at execution time during `open()` to produce per-graph `BinaryScanOperator`s.
     - Nested composition: inner operators can themselves be `DatasetOperator`s — provenance stamping passes `IriMatch` through unchanged.
+    - Default-union SET semantics (SPARQL §13.2): when the active default graph is a `>= 2`-member `FROM` union in current mode, `DatasetOperator` deduplicates emitted rows across members (`BatchDeduper`, reusing `DistinctOperator`'s `EqualityNorm` so encoded/decoded twins collapse). Cost model: this is the one place a scan is not bounded-memory streaming — the seen-set grows O(distinct emitted rows), each retained row charges one unit of fuel, and `COUNT(*)` over a union forgoes the per-member count-only shortcut (EXPLAIN reports `default_union_set_merge`). Single-graph, `FROM NAMED`-only, and history-mode scans are untouched (history unions stay bags: per-event rows must not merge). The plan must emit every variable column when the dedup can arm (`emit_is_full`), and the operator fails loud otherwise.
 
 - **Scan operators**
   - `fluree-db-query/src/binary_scan.rs`
@@ -72,6 +73,46 @@ The details differ:
 
 - `BinaryScanOperator` translates overlay flakes into integer-ID space and merges them into the decoded columnar stream.
 - `RangeScanOperator` delegates to `range_with_overlay`, which combines `RangeProvider` output with overlay output.
+
+## Bound-term resolution and the overlay-only fallback
+
+`BinaryScanOperator::open()` translates each bound term of the triple pattern
+into a persisted dictionary id (`BinaryFilter`). A term that fails to translate
+cannot constrain the base scan, so the scan would degrade into a wide walk. How
+that is handled depends on *why* the translation failed:
+
+- **Conclusive miss** — the dictionary was consulted and answered "absent"
+  (`find_subject_id` / `find_string_id` returning `Ok(None)`, or a value that
+  does not encode). The term names no base row at all, so the scan takes
+  `open_overlay_only_fallback` and reads novelty exclusively.
+- **Undecidable** — the dictionary could not answer (an I/O error). Absence is
+  unproven, so the scan stays widened and correctness is preserved by a
+  row-by-row check.
+
+A bound **subject** needs one extra step before that split. Pattern SIDs are
+encoded against `ctx.original_snapshot`, but the filter resolves them through
+`ctx.active_snapshot`, and in a per-graph context those namespace tables differ.
+`open()` therefore keeps the decoded IRI in `unresolved_bound_subject_iri` and
+probes it against the store's subject dictionary directly before deciding — so
+the common case (a subject that simply does not exist) is a single dictionary
+lookup rather than a full predicate-partition walk with an IRI resolution per
+row. This matters well beyond point queries: `join.rs` and `optional.rs` rebind
+a correlated subject to `Ref::Iri` once per driving row, so a non-batched probe
+loop pays this cost per probe.
+
+The overlay-only walk is itself key-bounded. `Segment::range`
+(`fluree-db-novelty`) seeks with `partition_point` on both ends and
+`may_overlap` prunes whole segments, so `open_overlay_only_fallback` passes
+bounds derived from whichever bound terms lead the active index order
+(`overlay_walk_bounds`). Passing `None`/`None` instead walks every flake in the
+graph's novelty on every probe.
+
+Bounds are an **optimization only** — the per-flake equality checks inside the
+walk remain the correctness backstop, the same contract as
+`fast_path_common::collect_resolved_overlay_ops`. A bound must therefore never
+be too tight: pin only components that lead the sort order *and* are fixed by an
+equality match, and let every trailing component span its full range. `first` is
+left-exclusive (hence `t: i64::MIN`); `rhs` is inclusive.
 
 ## Planner fast paths
 
@@ -141,3 +182,65 @@ needs the history sidecar, defers). Two lanes split on whether novelty is presen
   materialized through a novelty-aware graph view (the persisted-dict
   `encoded_sid` form would not resolve them).
 
+## WHERE-level early dedup (projection + distinct between joins)
+
+Deep existential chains (`?a p1 ?b . ?b p2 ?c . ?c p3 ?x` where only `?x` is
+projected/aggregated) can carry compounding duplicate multiplicity: once `?a`
+is dead, every distinct `?b` is repeated once per `?a` that produced it, and
+each join multiplies the redundancy into the next hop. On a real 6-hop
+biomedical query this reached 10.17M intermediate rows carrying 4,086 distinct
+values (2,490× redundancy, ~400× slowdown).
+
+The WHERE planner (`fluree-db-query/src/execute/where_plan.rs`,
+`build_sequential_join_block` / `build_sequential_triple_chain`) counters this
+with **early dedup**: at each join step it computes the live-variable set
+(post-WHERE required vars ∪ vars referenced by not-yet-executed
+patterns/filters/binds), trims dead columns from the join output
+(`with_out_schema`), and — when dedup is licensed — wraps the step in a
+streaming `DistinctOperator` so duplicates collapse before the next join.
+
+**Soundness gate** (`where_dedup_safe`, computed in
+`build_operator_tree_inner`): collapsing duplicate rows is only legal when
+downstream cannot observe WHERE-output multiplicity —
+
+- **grouping present** → *both* of:
+  - every aggregate must be *duplicate-insensitive*:
+    `AggregateFn::duplicate_insensitive()` = any `DISTINCT`-marked aggregate
+    (`COUNT/SUM/AVG/MEDIAN/VARIANCE/STDDEV/GROUP_CONCAT/collect DISTINCT`) plus
+    `MIN`/`MAX`/`SAMPLE`. A single plain `COUNT`/`SUM`/… blocks dedup for the
+    whole WHERE.
+  - no variable may pass through the grouping stage *raw*: every var in
+    `VariableDeps::required_aggregate_vars` must be a `GROUP BY` key or an
+    aggregate output. A non-key variable that survives grouping is emitted as
+    a per-group **list** (`Binding::Grouped`, the JSON-LD grouped-projection
+    feature — SPARQL rejects the shape), and that list observes row
+    multiplicity. This clause also covers the `GROUP BY ?g` case with *no*
+    aggregation stage, where the aggregate check alone is vacuously true.
+- **no grouping** → the query itself must be `SELECT DISTINCT`.
+
+Both clauses are checked against `variable_deps`; when it is `None`
+(wildcard/boolean/construct) dedup is off anyway, since projection pushdown —
+and therefore the live-var trimming that triggers dedup — is disabled.
+
+An outer `SELECT DISTINCT` over an aggregate query does **not** license WHERE
+dedup — it dedups *result* rows after aggregation, while a plain `COUNT` under
+it still observes pre-aggregation multiplicity (this exact miswiring was a
+correctness bug fixed alongside the aggregate-aware gate).
+
+The dedup is inserted only at steps where trimming actually dropped a dead
+variable, so queries whose variables all stay live (e.g. same-subject stars
+feeding the projection) pay nothing. Note the memory trade: `DistinctOperator`
+holds an uncapped, non-spilling hash set of the distinct rows seen at each
+insertion point, so an aggregate query that previously streamed (e.g. a
+`MAX`-only chain whose intermediates are large and already near-distinct)
+becomes resident-memory-bound for no gain. The gate errs toward the speed win. Subqueries dedup at their own boundary
+(`apply_solution_modifiers` applies the subquery's `DISTINCT`) rather than
+per-step.
+
+
+## Related
+
+This document covers the pipeline and overlay-merge semantics. For the full
+performance picture — the cost model, the specialized join operators, the
+complete fast-path catalog, frontier traversal, and where parallelism is
+applied — see [Performance architecture](performance.md).

@@ -715,3 +715,78 @@ async fn aggregates_arithmetic_over_min_max_jsonld() {
         normalize_rows(&json!([["sup:partA", 4], ["sup:partB", 4]]))
     );
 }
+
+/// JSON-LD parity for WHERE-level early-dedup semantics (see the SPARQL
+/// twins in `it_query_sparql.rs`): a fan-in chain where two subjects reach
+/// the same intermediate node, so the intermediate relation carries
+/// duplicate rows once the head var is projected away.
+///
+///   a1 --p1--> b1 --p2--> {10, 20}
+///   a2 --p1--> b1
+async fn seed_chain_fan_in(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [
+            {"@id": "ex:a1", "ex:p1": {"@id": "ex:b1"}},
+            {"@id": "ex:a2", "ex:p1": {"@id": "ex:b1"}},
+            {"@id": "ex:b1", "ex:p2": [10, 20]}
+        ]
+    });
+    fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert chain fixture")
+        .ledger
+}
+
+/// `count-distinct` over the fan-in chain: 2 distinct ?x values. The
+/// duplicate-insensitive aggregate licenses WHERE-level early dedup; the
+/// result must be identical either way.
+#[tokio::test]
+async fn count_distinct_chain_fan_in_jsonld() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_chain_fan_in(&fluree, "agg/dedup-cd:main").await;
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "select": ["(as (count-distinct ?x) ?c)"],
+        "where": [
+            {"@id": "?a", "ex:p1": "?b"},
+            {"@id": "?b", "ex:p2": "?x"}
+        ]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    assert_eq!(rows, json!([[2]]), "2 distinct ?x values: {rows}");
+}
+
+/// `selectDistinct` + plain `count` over the fan-in chain: the outer DISTINCT
+/// dedups result rows after aggregation and must not collapse the
+/// intermediate (?b) relation before the count — all 4 chain rows count.
+#[tokio::test]
+async fn select_distinct_plain_count_keeps_multiplicity_jsonld() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_chain_fan_in(&fluree, "agg/dedup-c:main").await;
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "selectDistinct": ["(as (count ?x) ?c)"],
+        "where": [
+            {"@id": "?a", "ex:p1": "?b"},
+            {"@id": "?b", "ex:p2": "?x"}
+        ]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    assert_eq!(
+        rows,
+        json!([[4]]),
+        "COUNT(?x) must count all 4 chain rows — early dedup of the \
+         intermediate (?b) relation would wrongly halve it: {rows}"
+    );
+}

@@ -1,0 +1,9 @@
+# q017 orders_never_shipped
+# Intent: Anti-join via FILTER NOT EXISTS.
+# BI lineage (BI-10): "Which orders were never shipped?"
+# Predicates verified against enterprise.ttl — FactOrder: orderId; FactShipment: order.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?oid
+WHERE { ?o a edw:Order ; edw:orderId ?oid .
+        FILTER NOT EXISTS { ?sh edw:order ?o . } }
+LIMIT 5000

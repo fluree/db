@@ -35,6 +35,7 @@ use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fmt;
+use std::sync::Arc;
 
 // ============================================================================
 // GeoPointBits — Packed lat/lng for geographic point storage
@@ -152,8 +153,14 @@ pub enum FlakeValue {
     Duration(Box<Duration>),
     /// String value (xsd:string and other string-like types)
     String(String),
-    /// Dense vector/embedding (fluree:vector)
-    Vector(Vec<f64>),
+    /// Dense vector/embedding (fluree:vector).
+    ///
+    /// Reference-counted: values flow through scan → binding → batch →
+    /// output pipelines that clone per row, and embeddings are large
+    /// (a 1536-dim vector is 12 KB). `Arc` makes every clone a refcount
+    /// bump instead of a buffer copy. Serialized as a plain number array
+    /// (same wire form as the previous `Vec<f64>`).
+    Vector(#[serde(with = "vector_arc_serde")] Arc<[f64]>),
     /// JSON value (@json datatype) - stored as serialized JSON string
     /// Deserialized on output for queries
     Json(String),
@@ -178,7 +185,8 @@ impl FlakeValue {
     pub fn max() -> Self {
         // IMPORTANT: we treat the empty vector as a special-case sentinel
         // that compares greater-than any non-empty vector (see Ord impl).
-        FlakeValue::Vector(Vec::new())
+        static EMPTY: std::sync::LazyLock<Arc<[f64]>> = std::sync::LazyLock::new(|| Arc::from([]));
+        FlakeValue::Vector(Arc::clone(&EMPTY))
     }
 
     /// Get the type discriminant for ordering
@@ -719,7 +727,7 @@ impl FlakeValue {
                 let mut hasher = Xxh64::new(0);
                 hasher.update(&[0x0C]); // type tag
                 hasher.update(&(v.len() as u64).to_le_bytes());
-                for f in v {
+                for f in v.iter() {
                     let canonical_bits = if f.is_nan() {
                         CANONICAL_NAN_BITS
                     } else if *f == 0.0 {
@@ -977,7 +985,7 @@ impl std::hash::Hash for FlakeValue {
             FlakeValue::Vector(v) => {
                 self.type_discriminant().hash(state);
                 v.len().hash(state);
-                for f in v {
+                for f in v.iter() {
                     f.to_bits().hash(state);
                 }
             }
@@ -1076,7 +1084,23 @@ impl From<&str> for FlakeValue {
 
 impl From<Vec<f64>> for FlakeValue {
     fn from(v: Vec<f64>) -> Self {
-        FlakeValue::Vector(v)
+        FlakeValue::Vector(v.into())
+    }
+}
+
+/// Serde adapter for `Arc<[f64]>` — serializes as a plain `f64` sequence
+/// (identical wire form to `Vec<f64>`) without opting the whole crate into
+/// serde's `rc` feature.
+mod vector_arc_serde {
+    use std::sync::Arc;
+
+    pub fn serialize<S: serde::Serializer>(v: &Arc<[f64]>, s: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&v[..], s)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Arc<[f64]>, D::Error> {
+        let v: Vec<f64> = serde::Deserialize::deserialize(d)?;
+        Ok(v.into())
     }
 }
 
@@ -1240,6 +1264,21 @@ fn count_significant_digits(s: &str) -> usize {
 mod tests {
     use super::*;
 
+    /// `FlakeValue::Vector` is `Arc<[f64]>` behind a `serde(with)` adapter
+    /// inside a `serde(untagged)` enum — verify it still round-trips as a
+    /// plain number array (the wire form of the previous `Vec<f64>`).
+    #[test]
+    fn test_vector_serde_roundtrip_as_number_array() {
+        let val = FlakeValue::Vector(vec![0.5, -1.25, 3.0].into());
+        let json = serde_json::to_string(&val).expect("serialize");
+        assert_eq!(json, "[0.5,-1.25,3.0]");
+        let back: FlakeValue = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            FlakeValue::Vector(v) => assert_eq!(&v[..], &[0.5, -1.25, 3.0]),
+            other => panic!("expected Vector, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_type_ordering() {
         // Type ordering: Null < Ref < Boolean < Numeric < Temporal < String < Json < Vector
@@ -1249,7 +1288,7 @@ mod tests {
         let long_val = FlakeValue::Long(42);
         let double_val = FlakeValue::Double(3.13);
         let string_val = FlakeValue::String("hello".to_string());
-        let vector_val = FlakeValue::Vector(vec![1.0, 2.0]);
+        let vector_val = FlakeValue::Vector(vec![1.0, 2.0].into());
 
         assert!(null < ref_val);
         assert!(ref_val < bool_val);
@@ -1409,9 +1448,9 @@ mod tests {
         assert!(regular < max);
 
         // max sentinel should be greater than any "real" vector values
-        let v1 = FlakeValue::Vector(vec![0.0]);
-        let v2 = FlakeValue::Vector(vec![f64::MAX]);
-        let v3 = FlakeValue::Vector(vec![f64::MAX, 0.0]);
+        let v1 = FlakeValue::Vector(vec![0.0].into());
+        let v2 = FlakeValue::Vector(vec![f64::MAX].into());
+        let v3 = FlakeValue::Vector(vec![f64::MAX, 0.0].into());
         assert!(v1 < max);
         assert!(v2 < max);
         assert!(v3 < max);

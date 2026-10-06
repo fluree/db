@@ -339,6 +339,27 @@ impl Analyzer {
         Self { tokenizer, filters }
     }
 
+    /// Process-wide shared analyzer for the given language.
+    ///
+    /// [`Self::for_language`] clones the language's whole stopword set on
+    /// every call, which is far too expensive for per-row use (query
+    /// evaluation scores one row at a time). Each language's analyzer is
+    /// built once on first use and leaked (bounded: one per `Language`
+    /// variant); all subsequent calls are a read-locked map probe.
+    pub fn shared(lang: Language) -> &'static Analyzer {
+        use std::collections::HashMap;
+        use std::sync::{LazyLock, RwLock};
+        static SHARED: LazyLock<RwLock<HashMap<Language, &'static Analyzer>>> =
+            LazyLock::new(|| RwLock::new(HashMap::new()));
+
+        if let Some(a) = SHARED.read().expect("analyzer cache poisoned").get(&lang) {
+            return a;
+        }
+        let mut map = SHARED.write().expect("analyzer cache poisoned");
+        map.entry(lang)
+            .or_insert_with(|| Box::leak(Box::new(Analyzer::for_language(lang))))
+    }
+
     /// Analyze text into tokens.
     pub fn analyze(&self, text: &str) -> Vec<Token> {
         let mut tokens = self.tokenizer.tokenize(text);

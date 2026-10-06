@@ -259,6 +259,7 @@ fn parse_query_ast_internal(
         // executor cares about have to be parsed inline. Currently
         // just `includeSystemFacts`; extend here as more land.
         query.options.include_system_facts = options::parse_include_system_facts(obj);
+        query.options.union_default_graph = options::parse_union_default_graph(obj)?;
         return Ok((query, SelectMode::Ask));
     }
 
@@ -347,6 +348,9 @@ fn parse_query_ast_internal(
     // (HAVING may introduce synthetic aggregates like (count ?x) used only for filtering.)
     opts.aggregates.extend(aggregates_from_select);
     query.options = opts;
+    // SELECT computations and HAVING parse without the `@context`; give them
+    // the same compact-IRI resolution the WHERE clause gets.
+    where_clause::resolve_atoms_outside_where(&mut query, &ctx);
 
     // GROUP BY without explicit ORDER BY defaults to ordering by the group key(s).
     if query.options.order_by.is_empty() && !query.options.group_by.is_empty() {
@@ -396,7 +400,7 @@ fn parse_query_ast_internal(
     Ok((query, select_mode))
 }
 
-fn normalize_context_value(context_val: &JsonValue) -> JsonValue {
+pub(crate) fn normalize_context_value(context_val: &JsonValue) -> JsonValue {
     if let JsonValue::Object(map) = context_val {
         if let Some(base) = map.get("@base") {
             if !map.contains_key("@vocab") {
@@ -423,7 +427,7 @@ fn normalize_context_value(context_val: &JsonValue) -> JsonValue {
 ///
 /// - `@path` and `@reverse` on the same term → error (mutually exclusive).
 /// - `@path` value must be a string or array → error otherwise.
-fn extract_path_aliases(
+pub(crate) fn extract_path_aliases(
     context_val: &JsonValue,
     parsed_context: &ParsedContext,
     policy: JsonLdParsePolicy,
@@ -540,11 +544,17 @@ fn parse_construct_query(
     // Parse template into patterns
     let template_patterns = match construct_val {
         JsonValue::Bool(true) => {
-            // Shorthand: use WHERE patterns as template (filter to triples only)
+            // Shorthand: use the WHERE clause's triples (and their edge
+            // annotations) as the template
             query
                 .patterns
                 .iter()
-                .filter(|p| matches!(p, UnresolvedPattern::Triple(_)))
+                .filter(|p| {
+                    matches!(
+                        p,
+                        UnresolvedPattern::Triple(_) | UnresolvedPattern::EdgeAnnotation { .. }
+                    )
+                })
                 .cloned()
                 .collect()
         }
@@ -575,66 +585,82 @@ fn parse_construct_query(
 
 /// Parse a CONSTRUCT template (explicit form)
 ///
-/// Parses the template node-map(s) into unresolved triple patterns.
-/// Only triple patterns are valid in templates (filters/optionals are ignored).
+/// Parses the template node-map(s) into unresolved triple patterns, edge
+/// annotations (`@annotation` on an object) and named-graph blocks
+/// (`["graph", "<iri or ?var>", node-map, ...]`, the `where` clause's form).
+/// Other patterns (filters, optionals) are ignored.
 fn parse_construct_template(
     template: &JsonValue,
     ctx: &JsonLdParseCtx,
 ) -> Result<Vec<UnresolvedPattern>> {
     let mut subject_counter = 0u32;
     let mut nested_counter = 0u32;
-
     match template {
-        JsonValue::Object(map) => {
-            // Single node-map template
-            let mut temp_query = UnresolvedQuery::new(ctx.context.clone());
-            node_map::parse_node_map(
-                map,
-                ctx,
-                &mut temp_query,
-                &mut subject_counter,
-                &mut nested_counter,
-                true,
-            )?;
-            // Filter to triple patterns only (templates don't have filters/optionals)
-            Ok(temp_query
-                .patterns
-                .into_iter()
-                .filter(|p| matches!(p, UnresolvedPattern::Triple(_)))
-                .collect())
-        }
-        JsonValue::Array(arr) => {
-            // Array of node-map templates
-            let mut patterns = Vec::new();
-            for item in arr {
-                if let JsonValue::Object(map) = item {
-                    let mut temp_query = UnresolvedQuery::new(ctx.context.clone());
-                    node_map::parse_node_map(
-                        map,
-                        ctx,
-                        &mut temp_query,
-                        &mut subject_counter,
-                        &mut nested_counter,
-                        true,
-                    )?;
-                    patterns.extend(
-                        temp_query
-                            .patterns
-                            .into_iter()
-                            .filter(|p| matches!(p, UnresolvedPattern::Triple(_))),
-                    );
-                } else {
-                    return Err(ParseError::InvalidConstruct(
-                        "construct array items must be objects".to_string(),
-                    ));
-                }
-            }
-            Ok(patterns)
+        JsonValue::Object(_) => parse_construct_items(
+            std::slice::from_ref(template),
+            ctx,
+            &mut subject_counter,
+            &mut nested_counter,
+        ),
+        JsonValue::Array(items) => {
+            parse_construct_items(items, ctx, &mut subject_counter, &mut nested_counter)
         }
         _ => Err(ParseError::InvalidConstruct(
             "construct template must be an object or array".to_string(),
         )),
     }
+}
+
+fn parse_construct_items(
+    items: &[JsonValue],
+    ctx: &JsonLdParseCtx,
+    subject_counter: &mut u32,
+    nested_counter: &mut u32,
+) -> Result<Vec<UnresolvedPattern>> {
+    let mut patterns = Vec::new();
+    for item in items {
+        match item {
+            JsonValue::Object(map) => {
+                let mut temp_query = UnresolvedQuery::new(ctx.context.clone());
+                node_map::parse_node_map(
+                    map,
+                    ctx,
+                    &mut temp_query,
+                    subject_counter,
+                    nested_counter,
+                    true,
+                )?;
+                patterns.extend(temp_query.patterns.into_iter().filter(|p| {
+                    matches!(
+                        p,
+                        UnresolvedPattern::Triple(_) | UnresolvedPattern::EdgeAnnotation { .. }
+                    )
+                }));
+            }
+            JsonValue::Array(arr) if arr.first().and_then(JsonValue::as_str) == Some("graph") => {
+                let name = arr.get(1).and_then(JsonValue::as_str).ok_or_else(|| {
+                    ParseError::InvalidConstruct(
+                        "a construct graph block is [\"graph\", <graph IRI or ?var>, node-map, ...]"
+                            .to_string(),
+                    )
+                })?;
+                let name = if name.starts_with('?') {
+                    name.to_string()
+                } else {
+                    ctx.expand_id(name)?.0
+                };
+                let inner = parse_construct_items(&arr[2..], ctx, subject_counter, nested_counter)?;
+                patterns.push(UnresolvedPattern::graph(name.as_str(), inner));
+            }
+            _ => {
+                return Err(ParseError::InvalidConstruct(
+                    "construct items must be node-map objects or [\"graph\", ...] blocks"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    Ok(patterns)
 }
 
 /// Parse the select clause
@@ -1082,6 +1108,123 @@ fn parse_inline_reverse_key(key: &str, ctx: &JsonLdParseCtx) -> Result<Option<St
 
 /// Parse a selection-level array (the value of a hydration `{key: [...]}`)
 /// into either a `Wildcard` or `Explicit` level.
+/// A nested selection's parts: the selection array (absent for a literal-valued
+/// property, which has nothing to expand) and its per-value modifiers.
+type ModifiedSelection<'a> = (
+    Option<&'a [JsonValue]>,
+    Option<Box<ast::UnresolvedNestedModifiers>>,
+);
+
+/// The object form of a nested selection: `select` plus per-value modifiers.
+///
+/// Returns the selection array alongside the modifiers, so the caller parses the
+/// level exactly as it would the bare array form.
+fn parse_modified_selection<'a>(
+    value: &'a JsonValue,
+    ctx: &JsonLdParseCtx,
+) -> Result<ModifiedSelection<'a>> {
+    let map = value.as_object().expect("caller matched an object");
+
+    for key in map.keys() {
+        if !matches!(key.as_str(), "select" | "orderBy" | "limit" | "offset") {
+            return Err(ParseError::InvalidSelect(format!(
+                "unknown key `{key}` in a nested selection; expected `select`, `orderBy`, \
+                 `limit` or `offset`"
+            )));
+        }
+    }
+
+    // `select` is optional: a literal-valued property has nothing to expand, so
+    // `{"ex:tag": {"limit": 3}}` is meaningful on its own.
+    let select = match map.get("select") {
+        None | Some(JsonValue::Null) => None,
+        Some(v) => Some(v.as_array().ok_or_else(|| {
+            ParseError::InvalidSelect("`select` in a nested selection must be an array".to_string())
+        })?),
+    };
+
+    let mut modifiers = ast::UnresolvedNestedModifiers::default();
+    if let Some(order) = map.get("orderBy") {
+        modifiers.order = parse_nested_order(order, ctx)?;
+    }
+    modifiers.limit = parse_nested_count(map.get("limit"), "limit")?;
+    modifiers.offset = parse_nested_count(map.get("offset"), "offset")?;
+
+    if modifiers.is_noop() && select.is_none() {
+        return Err(ParseError::InvalidSelect(
+            "a nested selection object needs at least one of `select`, `orderBy`, `limit` \
+             or `offset`"
+                .to_string(),
+        ));
+    }
+
+    Ok((
+        select.map(Vec::as_slice),
+        (!modifiers.is_noop()).then(|| Box::new(modifiers)),
+    ))
+}
+
+/// `orderBy` for a nested selection: a predicate name, `["desc", name]`, or
+/// `"@value"` to order by the values themselves.
+fn parse_nested_order(
+    value: &JsonValue,
+    ctx: &JsonLdParseCtx,
+) -> Result<Vec<ast::UnresolvedNestedOrderKey>> {
+    let items = match value {
+        JsonValue::Array(items) => items.clone(),
+        other => vec![other.clone()],
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let (descending, key) = match &item {
+            JsonValue::Array(pair) if pair.len() == 2 => {
+                let dir = pair[0].as_str().ok_or_else(|| {
+                    ParseError::InvalidSelect(
+                        "nested orderBy direction must be \"asc\" or \"desc\"".to_string(),
+                    )
+                })?;
+                match dir {
+                    "desc" => (true, pair[1].clone()),
+                    "asc" => (false, pair[1].clone()),
+                    other => {
+                        return Err(ParseError::InvalidSelect(format!(
+                        "unknown nested orderBy direction `{other}`; expected \"asc\" or \"desc\""
+                    )))
+                    }
+                }
+            }
+            other => (false, other.clone()),
+        };
+        let name = key.as_str().ok_or_else(|| {
+            ParseError::InvalidSelect("nested orderBy key must be a string".to_string())
+        })?;
+        // `@value` / `@id` order by the value itself: the literal for a
+        // literal-valued property, and the subject IRI for an expanded node.
+        // Neither has a predicate to read.
+        let predicate = if name == "@value" || name == "@id" {
+            None
+        } else {
+            Some(ctx.expand_vocab(name)?.0)
+        };
+        out.push(ast::UnresolvedNestedOrderKey {
+            predicate,
+            descending,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_nested_count(value: Option<&JsonValue>, key: &str) -> Result<Option<usize>> {
+    match value {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(v) => v.as_u64().map(|n| Some(n as usize)).ok_or_else(|| {
+            ParseError::InvalidSelect(format!(
+                "`{key}` in a nested selection must be a non-negative integer"
+            ))
+        }),
+    }
+}
+
 fn parse_selection_level(
     arr: &[JsonValue],
     ctx: &JsonLdParseCtx,
@@ -1103,6 +1246,20 @@ fn parse_selection_level(
             JsonValue::String(s) if s == "@id" || s == "id" || s == ctx.context.id_key.as_str() => {
                 forward.push(UnresolvedForwardItem::Id);
             }
+            // Explicit @type selection on a node is an alias for the rdf:type
+            // predicate, so `["@id", "@type"]` behaves identically to
+            // `["@id", "rdf:type"]` and the `*` wildcard (both surface types).
+            // On a literal value, the hydration formatter re-interprets an
+            // rdf:type forward item as "emit the literal's datatype".
+            JsonValue::String(s)
+                if s == "@type" || s == "type" || s == ctx.context.type_key.as_str() =>
+            {
+                forward.push(UnresolvedForwardItem::Property {
+                    predicate: node_map::RDF_TYPE.to_string(),
+                    sub_spec: None,
+                    modifiers: None,
+                });
+            }
             // Property name: "ex:name" or inline "@reverse:ex:friend"
             JsonValue::String(s) => {
                 if let Some(rev_iri) = parse_inline_reverse_key(s, ctx)? {
@@ -1115,6 +1272,7 @@ fn parse_selection_level(
                         forward.push(UnresolvedForwardItem::Property {
                             predicate: expanded,
                             sub_spec: None,
+                            modifiers: None,
                         });
                     }
                 }
@@ -1129,15 +1287,49 @@ fn parse_selection_level(
 
                 let (pred_str, sub_specs_val) = map.iter().next().unwrap();
 
-                let sub_arr = sub_specs_val.as_array().ok_or_else(|| {
-                    ParseError::InvalidSelect("nested selection value must be an array".to_string())
-                })?;
+                // Two forms. The array form is the selection alone; the object
+                // form adds per-value ordering and paging around it:
+                //   {"ex:friend": ["@id", "ex:name"]}
+                //   {"ex:friend": {"select": ["@id"], "orderBy": ["ex:name"], "limit": 5}}
+                let (sub_arr, modifiers) = match sub_specs_val {
+                    JsonValue::Array(items) => (Some(items.as_slice()), None),
+                    JsonValue::Object(_) => parse_modified_selection(sub_specs_val, ctx)?,
+                    _ => {
+                        return Err(ParseError::InvalidSelect(
+                            "nested selection value must be an array, or an object of \
+                             `select`/`orderBy`/`limit`/`offset`"
+                                .to_string(),
+                        ))
+                    }
+                };
 
-                let sub_level = parse_selection_level(sub_arr, ctx)?;
-                let nested = make_nested_spec(sub_level);
+                // No `select` means the values themselves, unexpanded — the same
+                // as the bare `"ex:tag"` string form, with modifiers attached.
+                let nested = match sub_arr {
+                    Some(arr) => make_nested_spec(parse_selection_level(arr, ctx)?),
+                    None => None,
+                };
 
                 if let Some(rev_iri) = parse_inline_reverse_key(pred_str, ctx)? {
+                    if modifiers.is_some() {
+                        return Err(ParseError::InvalidSelect(format!(
+                            "`{pred_str}` is a reverse selection, which does not accept \
+                             `orderBy`/`limit`/`offset` yet"
+                        )));
+                    }
                     reverse.insert(rev_iri, nested);
+                } else if pred_str == "@type"
+                    || pred_str == "type"
+                    || pred_str == ctx.context.type_key.as_str()
+                {
+                    // Nested `{"@type": [...]}` selects rdf:type, same as the
+                    // bare `"@type"` string form. Type values always render as
+                    // compact IRI strings, so any sub-spec is inert here.
+                    forward.push(UnresolvedForwardItem::Property {
+                        predicate: node_map::RDF_TYPE.to_string(),
+                        sub_spec: nested,
+                        modifiers,
+                    });
                 } else {
                     let (expanded, entry) = ctx.expand_vocab(pred_str)?;
                     let context_reverse = entry.as_ref().and_then(|e| e.reverse.as_ref());
@@ -1150,11 +1342,13 @@ fn parse_selection_level(
                         forward.push(UnresolvedForwardItem::Property {
                             predicate: expanded,
                             sub_spec: Some(boxed),
+                            modifiers,
                         });
                     } else {
                         forward.push(UnresolvedForwardItem::Property {
                             predicate: expanded,
                             sub_spec: None,
+                            modifiers,
                         });
                     }
                 }
@@ -1175,6 +1369,7 @@ fn parse_selection_level(
             if let UnresolvedForwardItem::Property {
                 predicate,
                 sub_spec: Some(boxed),
+                ..
             } = item
             {
                 refinements.insert(predicate, boxed);
@@ -1620,8 +1815,11 @@ mod tests {
 
         // query.patterns now contains Pattern, not TriplePattern
         if let crate::ir::Pattern::Triple(tp) = &query.patterns[0] {
-            // Predicate IRI is lowered to Ref::Iri for deferred encoding
-            assert_eq!(tp.p.as_iri(), Some("http://example.org/name"));
+            // The registered prefix encodes at lowering, as SPARQL does.
+            assert_eq!(
+                tp.p.as_sid().map(|s| (s.namespace_code, &*s.name)),
+                Some((100, "name"))
+            );
         } else {
             panic!("Expected Pattern::Triple");
         }
@@ -2482,6 +2680,61 @@ mod tests {
                     UnresolvedExpression::Const(UnresolvedFilterValue::Long(18))
                 ));
             }
+            _ => panic!("Expected Call expression"),
+        }
+    }
+
+    #[test]
+    fn filter_compact_iri_operand_resolves_through_context() {
+        // `(= ?p ex:knows)`: the prefix is defined, so the operand is the IRI
+        // http://example.org/knows — compared by term identity, like SPARQL —
+        // not the string "ex:knows" (which an IRI-bound ?p could never equal).
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?o"],
+            "where": [
+                { "@id": "?s", "?p": "?o" },
+                ["filter", "(= ?p ex:knows)"]
+            ]
+        });
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let filter = find_filter(&ast.patterns).expect("Should have a filter");
+        match filter {
+            UnresolvedExpression::Call { args, .. } => assert!(
+                matches!(
+                    &args[1],
+                    UnresolvedExpression::Const(UnresolvedFilterValue::Iri(i))
+                        if i.as_ref() == "http://example.org/knows"
+                ),
+                "expected an expanded IRI operand, got {:?}",
+                args[1]
+            ),
+            _ => panic!("Expected Call expression"),
+        }
+
+        // An undefined prefix is not expanded: the atom stays the plain
+        // string it always was (a Curie that lowers as a string), so
+        // `(= ?slot 12:30)`-style values are unaffected.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s"],
+            "where": [
+                { "@id": "?s", "?p": "?o" },
+                ["filter", "(= ?p zz:knows)"]
+            ]
+        });
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let filter = find_filter(&ast.patterns).expect("Should have a filter");
+        match filter {
+            UnresolvedExpression::Call { args, .. } => assert!(
+                matches!(
+                    &args[1],
+                    UnresolvedExpression::Const(UnresolvedFilterValue::Curie(c))
+                        if c.as_ref() == "zz:knows"
+                ),
+                "expected an unexpanded Curie operand, got {:?}",
+                args[1]
+            ),
             _ => panic!("Expected Call expression"),
         }
     }

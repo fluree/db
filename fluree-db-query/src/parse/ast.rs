@@ -61,6 +61,11 @@ pub enum UnresolvedValue {
         /// Datatype IRI or language tag constraint
         dtc: Option<UnresolvedDatatypeConstraint>,
     },
+    /// An already-resolved binding, passed through resolution verbatim.
+    /// Never produced by any parser — the Cypher sequential write driver
+    /// seeds row tables (bindings extracted from a prior query result)
+    /// back into a `Txn`'s WHERE through this variant, losslessly.
+    PreBound(crate::binding::Binding),
 }
 
 /// Unresolved term - before IRI encoding
@@ -188,7 +193,7 @@ impl UnresolvedTriplePattern {
             p,
             o,
             dtc: Some(UnresolvedDatatypeConstraint::LangTag(Arc::from(
-                lang.as_ref(),
+                fluree_db_core::normalize_lang_tag(lang.as_ref()).as_ref(),
             ))),
         }
     }
@@ -462,12 +467,30 @@ pub enum UnresolvedFilterValue {
     Double(f64),
     String(Arc<str>),
     Bool(bool),
+    /// An absolute IRI operand (`<http://…>`, or a compact IRI the query's
+    /// `@context` expanded). Lowers to `IRI(<string>)` so it compares by term
+    /// identity against `Sid` bindings, as SPARQL's `?p = ex:knows` does.
+    Iri(Arc<str>),
+    /// An unquoted `prefix:name` atom that has not been expanded yet — the
+    /// S-expression parser has no `@context`. The WHERE-clause parser resolves
+    /// it to [`Self::Iri`] when the prefix is defined; otherwise it lowers as
+    /// the plain string it always was, so `(= ?time 12:30)` keeps working.
+    Curie(Arc<str>),
+    /// An unquoted bare word (`active`, `knows`). Lowers exactly like
+    /// [`Self::String`]; the distinct variant only lets rule validation tell
+    /// an unquoted operand from a quoted string literal.
+    Bare(Arc<str>),
 }
 
 impl UnresolvedFilterValue {
     /// Create a string filter value
     pub fn string(s: impl AsRef<str>) -> Self {
         UnresolvedFilterValue::String(Arc::from(s.as_ref()))
+    }
+
+    /// Create an absolute-IRI filter value
+    pub fn iri(s: impl AsRef<str>) -> Self {
+        UnresolvedFilterValue::Iri(Arc::from(s.as_ref()))
     }
 }
 
@@ -688,6 +711,9 @@ pub struct UnresolvedOptions {
     /// `opts.includeSystemFacts: true`. See
     /// [`crate::ir::Query::include_system_facts`].
     pub include_system_facts: bool,
+    /// Parsed from `opts.unionDefaultGraph`. See
+    /// [`crate::ir::Query::union_default_graph`].
+    pub union_default_graph: Option<bool>,
 }
 
 impl UnresolvedOptions {
@@ -710,6 +736,7 @@ impl Default for UnresolvedOptions {
             reasoning: None,
             object_var_parsing: true,
             include_system_facts: false,
+            union_default_graph: None,
         }
     }
 }
@@ -817,7 +844,32 @@ pub enum UnresolvedForwardItem {
         /// Predicate IRI (expanded)
         predicate: String,
         sub_spec: Option<Box<UnresolvedNestedSelectSpec>>,
+        /// Ordering and paging for this property's values.
+        modifiers: Option<Box<UnresolvedNestedModifiers>>,
     },
+}
+
+/// Ordering and paging for one property's values, before IRI encoding.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct UnresolvedNestedModifiers {
+    pub order: Vec<UnresolvedNestedOrderKey>,
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+}
+
+impl UnresolvedNestedModifiers {
+    /// Whether this would change anything.
+    pub fn is_noop(&self) -> bool {
+        self.order.is_empty() && self.offset.is_none() && self.limit.is_none()
+    }
+}
+
+/// One sort key for [`UnresolvedNestedModifiers`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnresolvedNestedOrderKey {
+    /// Predicate IRI (expanded). `None` orders by the value itself.
+    pub predicate: Option<String>,
+    pub descending: bool,
 }
 
 /// Hydration spec (unresolved).

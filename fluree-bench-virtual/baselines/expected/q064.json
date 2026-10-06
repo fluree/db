@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "query_id": "q064",
+  "result_hash": "6802412d7fa496a1433d5b8f1f741693eeacf369fd3ba2881fee2b49cf60b311",
+  "rows": 10,
+  "head_rows": [
+    "Apparel\u001f3679",
+    "Automotive\u001f3630",
+    "Beauty\u001f3907",
+    "Electronics\u001f3779",
+    "Garden\u001f3696",
+    "Grocery\u001f3816",
+    "Home\u001f3699",
+    "Office\u001f3736",
+    "Sports\u001f3783",
+    "Toys\u001f3775"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KXRF51K352JNT14J02VZA2CZ",
+    "commit": "55b3f0112"
+  }
+}

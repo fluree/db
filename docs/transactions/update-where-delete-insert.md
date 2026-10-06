@@ -78,8 +78,9 @@ Use a top-level `graph` key to scope the update to a named graph **as the defaul
 ```
 
 This is the JSON-LD UPDATE analog of SPARQL UPDATE `WITH <iri>`:
-- WHERE patterns are evaluated against the named graph
+- WHERE patterns are evaluated against the named graph (unless `from` is also given)
 - DELETE/INSERT templates without an explicit graph are written to that named graph
+- A graph that doesn't exist reads as empty, so the WHERE matches nothing; it never falls back to the ledger's default graph
 
 ### Writing templates to specific graphs
 
@@ -107,6 +108,8 @@ There are two ways to target graphs in `insert` / `delete` templates:
 
 Notes:
 - `graph` is a **graph IRI** (a string like `"http://example.org/graphs/audit"`)
+- The ledger's own address (`urn:fluree:mydb:main`, `mydb:main` or `mydb`, with no `#fragment` and no time pin) names the ledger's **default graph** in a top-level `graph` and in `from`: the update reads and writes the default graph and never creates a named graph called by the address. A per-node `@graph` or a `["graph", …]` template resolves the address like any other graph IRI. `urn:fluree:mydb:main#config` is the config graph, not the address.
+- `urn:default` names the default graph in a top-level `graph`, in `from` and `fromNamed`, and in a `["graph", "urn:default", …]` pattern in the `where`. A per-node `@graph` or a `["graph", …]` template naming `urn:default` is refused with a `400`, since the default graph is not a named graph.
 - Named-graph reads are available after indexing completes (see `docs/query/datasets.md`)
 
 ## Dataset scoping for WHERE (`from` / `fromNamed`)
@@ -130,6 +133,7 @@ Notes:
   - a string graph IRI (shorthand for `{"graph": "<iri>"}`)
   - an object with `{"graph": "<iri>"}` (or `{"graph": ["<iri1>", "<iri2>"]}`)
   - an array of graph IRIs/selectors (multiple graphs are evaluated as a merged default graph)
+- A `from` graph that doesn't exist contributes nothing, so a lone unknown `from` graph gives the `where` an empty default graph.
 - If your `insert` / `delete` templates write into the same graph as the top-level `graph`, you can omit per-template graph selection. The top-level `graph` becomes the default target for templates that don't specify `@graph` (or `["graph", ...]` sugar).
 - If you want to write to **multiple** graphs in one update, keep a top-level `graph` as the default (optional) and use per-template `["graph", ...]` for the exceptions.
 
@@ -555,6 +559,93 @@ Calculate new values based on old:
   ]
 }
 ```
+
+## Editing Blank-Node Structures (Stable `_:fdb-` Ids)
+
+Fluree skolemizes every blank node at insert time into the reserved
+`_:fdb-...` label space, and queries return those labels as the node's `@id`.
+These ids are **stable**: referencing an `_:fdb-...` id in a later query or
+transaction denotes the existing stored node rather than minting a fresh one
+(the blank-node-syntax equivalent of RDF 1.1 §3.5 skolem IRIs). This makes
+blank-node-rooted structures — OWL restrictions, address objects, RDF lists —
+editable in place, without retracting and re-asserting the whole subtree.
+
+Workflow: query for the node's id, then use it as an ordinary `@id`:
+
+```json
+{
+  "select": "?r",
+  "where": { "@id": "ex:ClassA", "ex:restriction": "?r" }
+}
+```
+
+returns e.g. `"_:fdb-1751612345678901234-0-b0"`, which can then be edited
+directly:
+
+```json
+{
+  "where":  { "@id": "_:fdb-1751612345678901234-0-b0", "owl:someValuesFrom": "?old" },
+  "delete": { "@id": "_:fdb-1751612345678901234-0-b0", "owl:someValuesFrom": "?old" },
+  "insert": { "@id": "_:fdb-1751612345678901234-0-b0", "owl:someValuesFrom": { "@id": "ex:Gadget" } }
+}
+```
+
+The parent's reference to the node is untouched and the node keeps its
+identity across the edit.
+
+The same ids work in SPARQL, in all of SELECT patterns, `DELETE`/`INSERT`
+templates, `DELETE DATA`, `INSERT DATA`, and `DELETE WHERE`:
+
+```sparql
+DELETE { _:fdb-1751612345678901234-0-b0 owl:someValuesFrom ?old }
+INSERT { _:fdb-1751612345678901234-0-b0 owl:someValuesFrom ex:Gadget }
+WHERE  { _:fdb-1751612345678901234-0-b0 owl:someValuesFrom ?old }
+```
+
+Notes:
+
+- Only labels beginning with the reserved `_:fdb-` prefix behave this way.
+  Ordinary client-authored labels (`_:b0`) keep standard RDF semantics: a
+  fresh node per transaction on the write side, and an existential variable
+  in SPARQL WHERE patterns. Clients cannot accidentally collide with the
+  reserved space — transaction skolemization wraps client labels with a
+  transaction id before prefixing `fdb-`.
+- Strictly per spec, SPARQL forbids blank nodes in `DELETE` templates and
+  treats WHERE-pattern labels as variables; accepting `_:fdb-` ids as
+  constants is a deliberate Fluree extension (the same one Virtuoso's
+  `nodeID://` refs and Jena's `<_:label>` syntax provide).
+- Bulk import mints the same way, into the same reserved space, with the same
+  editability. Its ids carry a document scope — `_:fdb-d<14 chars>-<label>`,
+  where the scope identifies the source file and `<label>` is the label as
+  written in it (`_:fdb-d1t3k9x0abcdef-genid10`). They are `[0-9a-z-]` only,
+  so they are writable in SPARQL, Turtle and JSON-LD without escaping.
+- Ledgers imported by Fluree **4.1.4 or earlier** hold the older import format, which
+  embedded the ledger id and therefore `:` and `/` (`_:fdb-lubm:main-1-genid10`).
+  Those ids are still addressable from JSON-LD, but the SPARQL grammar does
+  not allow `:` inside a blank-node label, so they cannot be written in SPARQL
+  syntax. Re-importing the source produces ids in the current format. There is
+  no mixed-format ledger: import requires a fresh ledger, so a ledger's import
+  ids are all of one format.
+- To find out which document an import id came from, look it up in the
+  ledger's `txn-meta` graph. Each source document contributes one triple whose
+  subject is its scope — the first 19 characters of the id, `_:fdb-` plus the
+  14-character scope:
+
+  ```sparql
+  SELECT ?source WHERE {
+    GRAPH <urn:fluree:my/ledger:main#txn-meta> {
+      _:fdb-d1t3k9x0abcdef <https://ns.flur.ee/db#importSource> ?source
+    }
+  }
+  ```
+
+  `--skolem-namespace` on `fluree create --from` controls the other half of
+  the id: by default the ledger id salts the mint, so two ledgers loaded from
+  one source tree hold different blank nodes; passing the same namespace to
+  both makes them mint identical ids instead. See
+  [Blank nodes](../cli/create.md#blank-nodes) for what counts as a document —
+  in particular for `.jsonl`/`.ndjson`, where a `@context` switch ends one
+  document and starts the next.
 
 ## Error Handling
 

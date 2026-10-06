@@ -5,8 +5,16 @@
 //! dictionary tree leaves — share one pool so TinyLFU decides what stays
 //! based on actual access patterns rather than fixed budget splits.
 //!
-//! Region 3 (history journal) is **never cached** — it's cold-path data
-//! decoded on demand for time-travel replay and discarded afterwards.
+//! History is **never cached** — it lives outside the leaflet entirely, in the
+//! per-leaf history sidecar (`FHS1`, located via `LeafEntry.sidecar_cid`). It's
+//! cold-path data decoded on demand for time-travel replay and discarded
+//! afterwards, so a HEAD-only query never pays for it.
+//!
+//! Note: "Region 1" / "Region 2" here are *decode groupings* used by this cache
+//! (R1 = the key columns used for filtering and joins; R2 = the remaining
+//! per-row columns needed to reconstruct a full flake). The V3 on-disk leaflet
+//! is per-column blocks, not numbered regions — see
+//! `crate::format::leaflet` and `docs/design/index-format.md`.
 //!
 //! ## Cache Key
 //!
@@ -19,11 +27,37 @@
 
 use crate::format::leaf::DecodedLeafDirV3;
 use crate::read::types::OverlayOp;
+#[cfg(target_arch = "wasm32")]
+use crate::wasm_compat::memmap2;
 use fluree_db_core::subject_id::SubjectIdColumn;
 use fluree_db_core::{Flake, ListIndex, Sid, StatsView};
+// moka's eviction clock reads std::time::Instant at cache construction, which
+// aborts on wasm32-unknown-unknown; shadow-import core's clock-free LRU
+// stand-in there (same API subset, exact-LRU instead of TinyLFU).
+#[cfg(target_arch = "wasm32")]
+use fluree_db_core::wasm_cache::Cache;
+#[cfg(not(target_arch = "wasm32"))]
 use moka::sync::Cache;
 use std::io;
 use std::sync::Arc;
+
+/// Convert a shared loader error back into `io::Error`, preserving a typed
+/// `NeedFetch` payload when one is present.
+///
+/// Loader closures run inside the cache's `try_get_with`, which shares the
+/// error as `Arc<io::Error>`; a plain `to_string()` re-wrap severs the typed
+/// residency miss. Residency invariant: read paths should resolve residency
+/// BEFORE entering a loader closure where possible (the dict-leaf path
+/// does); this rewrap is the backstop for paths that cannot — e.g.
+/// `open_leaf_dir`'s header fetch runs inside the dir-load closure. The
+/// store-level miss register is unaffected either way: the miss was
+/// recorded inside the closure before the error propagated.
+fn arc_io_error(arc_err: std::sync::Arc<io::Error>) -> io::Error {
+    if let Some(nf) = fluree_db_core::storage::residency::NeedFetch::from_io_error(&arc_err) {
+        return nf.clone().into_io_error();
+    }
+    io::Error::new(arc_err.kind(), arc_err.to_string())
+}
 
 // ============================================================================
 // Sparse column types (for lang_id and list-index)
@@ -175,6 +209,11 @@ enum CacheKey {
     /// xxh3_128(leaf CID bytes) — content-addressed → immutable,
     /// no epoch/time dimension needed.
     LeafDir(u128),
+    /// Shared leaf-file memory mapping. Key = xxh3_128(leaf CID bytes) —
+    /// content-addressed → immutable. Caching the mapping saves the
+    /// open+mmap+munmap syscall cycle every cursor otherwise pays per leaf
+    /// access (the dominant fixed cost of an indexed point lookup).
+    LeafMmap(u128),
     /// BM25 posting leaflet. Key = xxh3_128(CAS CID bytes).
     /// Content-addressed → immutable, no epoch/time dimension needed.
     Bm25Leaflet(u128),
@@ -186,10 +225,6 @@ enum CacheKey {
     ///
     /// Key = xxh3_128 of a canonical ledger-info cache key string.
     LedgerInfo(u128),
-    /// Cached query `StatsView`.
-    ///
-    /// Key = xxh3_128 of a canonical stats-view cache key string.
-    StatsView(u128),
     /// V3 (FLI3) decoded column batch. Content-addressed via `leaf_id`
     /// (derived from leaf CID) — immutable, self-invalidating on rewrite.
     /// `leaflet_idx` selects which leaflet within the leaf.
@@ -335,10 +370,10 @@ enum CachedEntry {
     R2(CachedRegion2),
     DictLeaf(Arc<[u8]>),
     LeafDir(Arc<DecodedLeafDirV3>),
+    LeafMmap(Arc<memmap2::Mmap>),
     Bm25Leaflet(Arc<[u8]>),
     VectorShard(Arc<crate::arena::vector::VectorShard>),
     LedgerInfo(Arc<[u8]>),
-    StatsView(Arc<StatsView>),
     /// V3 decoded column batch (base columns, no overlay/replay applied).
     V3Batch(super::column_types::ColumnBatch),
     /// Translated overlay ops for one novelty segment.
@@ -353,6 +388,11 @@ impl CachedEntry {
             CachedEntry::R2(r2) => r2.byte_size(),
             CachedEntry::DictLeaf(bytes) => bytes.len(),
             CachedEntry::LeafDir(dir) => dir.byte_size(),
+            // A mapping is file-backed (reclaimable page cache), not heap:
+            // weigh it far below its length so it doesn't crowd out decoded
+            // batches, but keep it length-proportional so total mapped
+            // address space stays bounded by the cache budget (× 64).
+            CachedEntry::LeafMmap(mmap) => (mmap.len() / 64).max(16 * 1024),
             CachedEntry::Bm25Leaflet(bytes) => bytes.len(),
             CachedEntry::VectorShard(shard) => {
                 // Use capacity() for conservative accounting — correct even if
@@ -361,7 +401,6 @@ impl CachedEntry {
                     + shard.values.capacity() * std::mem::size_of::<f32>()
             }
             CachedEntry::LedgerInfo(bytes) => bytes.len(),
-            CachedEntry::StatsView(view) => view.byte_size(),
             CachedEntry::V3Batch(batch) => batch.byte_size(),
             CachedEntry::SegmentOps(seg) => seg.byte_size(),
         }
@@ -381,6 +420,45 @@ impl CachedEntry {
 /// `CacheKey` variants, so inserting R1 never evicts or implies R2.
 pub struct LeafletCache {
     inner: Cache<CacheKey, CachedEntry>,
+    /// Query planner `StatsView`s, in a pool of their own. See
+    /// [`stats_view_pool`].
+    stats_views: Cache<u128, Arc<StatsView>>,
+}
+
+impl std::fmt::Debug for LeafletCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeafletCache")
+            .field("entries", &self.entry_count())
+            .field("bytes", &self.weighted_size_bytes())
+            .field("stats_views", &self.stats_views.entry_count())
+            .field("stats_view_bytes", &self.stats_views.weighted_size())
+            .finish()
+    }
+}
+
+/// Share of the leaflet budget given to the stats view pool.
+const STATS_VIEW_BUDGET_DIVISOR: u64 = 16;
+
+/// The pool for query planner `StatsView`s.
+///
+/// Separate from leaflets so scan pressure cannot evict a view, and LRU rather
+/// than TinyLFU because views are keyed by overlay epoch: the newest is the one
+/// queries want, while frequency admission favors the epoch it replaced.
+///
+/// Weight is capped at half the budget because moka never caches an entry
+/// heavier than the whole pool, which would make an oversized view rebuild on
+/// every query. The cap means the real bound is two full-size views, not the
+/// budget: on a ledger with millions of classes that is significant memory.
+fn stats_view_pool(leaflet_budget_bytes: u64) -> Cache<u128, Arc<StatsView>> {
+    let budget = (leaflet_budget_bytes / STATS_VIEW_BUDGET_DIVISOR).max(1);
+    let max_weight = (budget / 2).clamp(1, u64::from(u32::MAX)) as usize;
+    let builder = Cache::builder()
+        .weigher(move |_key: &u128, view: &Arc<StatsView>| view.byte_size().min(max_weight) as u32)
+        .max_capacity(budget);
+    // The wasm32 stand-in is exact-LRU already and has no policy knob.
+    #[cfg(not(target_arch = "wasm32"))]
+    let builder = builder.eviction_policy(moka::policy::EvictionPolicy::lru());
+    builder.build()
 }
 
 /// Run a moka single-flight call (`get_with`/`try_get_with`) under a Tokio
@@ -399,11 +477,18 @@ pub struct LeafletCache {
 /// Callers MUST peek the cache first (non-blocking `get`) and only enter this
 /// region on a miss, so plain cache hits never pay the conversion cost (every
 /// scan flows through these methods).
+#[cfg(not(target_arch = "wasm32"))]
 fn in_blocking_region<T>(f: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
         Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
         _ => f(),
     }
+}
+
+/// wasm32 is single-threaded: there is no worker to convert, run inline.
+#[cfg(target_arch = "wasm32")]
+fn in_blocking_region<T>(f: impl FnOnce() -> T) -> T {
+    f()
 }
 
 macro_rules! region_cache_methods {
@@ -457,7 +542,9 @@ macro_rules! region_cache_methods {
 impl LeafletCache {
     /// Create a new cache with the given maximum byte budget.
     ///
-    /// One pool, one budget. TinyLFU eviction applies across all entry types.
+    /// One TinyLFU pool and budget for every leaflet-derived entry type. Query
+    /// planner stats views get a separate LRU pool sized from the same budget;
+    /// see [`stats_view_pool`].
     pub fn with_max_bytes(max_bytes: u64) -> Self {
         let inner = Cache::builder()
             .weigher(|_key: &CacheKey, val: &CachedEntry| {
@@ -466,7 +553,10 @@ impl LeafletCache {
             .max_capacity(max_bytes)
             .build();
 
-        Self { inner }
+        Self {
+            inner,
+            stats_views: stats_view_pool(max_bytes),
+        }
     }
 
     /// Create a new cache with the given maximum megabyte budget.
@@ -533,8 +623,18 @@ impl LeafletCache {
         match result {
             Ok(CachedEntry::DictLeaf(bytes)) => Ok(bytes),
             Ok(_) => unreachable!("DictLeaf key always maps to DictLeaf entry"),
-            Err(arc_err) => Err(io::Error::new(arc_err.kind(), arc_err.to_string())),
+            Err(arc_err) => Err(arc_io_error(arc_err)),
         }
+    }
+
+    /// Warm-on-write: seed a reverse-dict leaf the *writer* already holds.
+    ///
+    /// Key must be `cid_cache_key(cas_address_string)` — the reader keys dict
+    /// leaves on the CAS address string (`cid.to_string()`), not the CID bytes.
+    /// Value is the raw on-disk leaf bytes; the reader decodes on access.
+    pub fn insert_dict_leaf(&self, key: u128, bytes: Arc<[u8]>) {
+        self.inner
+            .insert(CacheKey::DictLeaf(key), CachedEntry::DictLeaf(bytes));
     }
 
     // ========================================================================
@@ -546,6 +646,46 @@ impl LeafletCache {
         match self.inner.get(&CacheKey::LeafDir(key)) {
             Some(CachedEntry::LeafDir(dir)) => Some(dir),
             _ => None,
+        }
+    }
+
+    /// Check if a leaf's shared memory mapping is cached (read-only, no
+    /// insertion). Key is `xxh3_128(leaf_cid.to_bytes())`, as for
+    /// [`try_get_or_load_leaf_mmap`](Self::try_get_or_load_leaf_mmap).
+    pub fn get_leaf_mmap(&self, key: u128) -> Option<Arc<memmap2::Mmap>> {
+        match self.inner.get(&CacheKey::LeafMmap(key)) {
+            Some(CachedEntry::LeafMmap(mmap)) => Some(mmap),
+            _ => None,
+        }
+    }
+
+    /// Get or load the shared memory mapping of a leaf file with
+    /// single-flight and error propagation. Key should be
+    /// `xxh3_128(leaf_cid.to_bytes())` — content-addressed, so entries are
+    /// immutable and self-invalidating on leaf rewrite. NotFound from the
+    /// loader is NOT cached (moka only caches `Ok` values), so a
+    /// remote-promotion cache-miss probe stays a cheap error path.
+    pub fn try_get_or_load_leaf_mmap<F>(
+        &self,
+        key: u128,
+        load_fn: F,
+    ) -> io::Result<Arc<memmap2::Mmap>>
+    where
+        F: FnOnce() -> io::Result<Arc<memmap2::Mmap>>,
+    {
+        // Fast path: a plain hit must not pay the block_in_place cost.
+        if let Some(mmap) = self.get_leaf_mmap(key) {
+            return Ok(mmap);
+        }
+        let result = in_blocking_region(|| {
+            self.inner.try_get_with(CacheKey::LeafMmap(key), || {
+                load_fn().map(CachedEntry::LeafMmap)
+            })
+        });
+        match result {
+            Ok(CachedEntry::LeafMmap(mmap)) => Ok(mmap),
+            Ok(_) => unreachable!("LeafMmap key always maps to LeafMmap entry"),
+            Err(arc_err) => Err(arc_io_error(arc_err)),
         }
     }
 
@@ -574,8 +714,20 @@ impl LeafletCache {
         match result {
             Ok(CachedEntry::LeafDir(dir)) => Ok(dir),
             Ok(_) => unreachable!("LeafDir key always maps to LeafDir entry"),
-            Err(arc_err) => Err(io::Error::new(arc_err.kind(), arc_err.to_string())),
+            Err(arc_err) => Err(arc_io_error(arc_err)),
         }
+    }
+
+    /// Warm-on-write: seed a decoded leaf directory the *writer* already holds.
+    ///
+    /// The incremental indexer, running co-located with the query server, has
+    /// the just-written leaf's bytes in hand; decoding + inserting the directory
+    /// here saves the reader that immediately revisits the leaf a re-decode.
+    /// Key is `cid_cache_key(leaf_cid)` — content-addressed, so this can never
+    /// serve stale data. Admission is TinyLFU-bounded like any other insert.
+    pub fn insert_leaf_dir(&self, key: u128, dir: Arc<DecodedLeafDirV3>) {
+        self.inner
+            .insert(CacheKey::LeafDir(key), CachedEntry::LeafDir(dir));
     }
 
     // ========================================================================
@@ -680,7 +832,7 @@ impl LeafletCache {
         match result {
             Ok(CachedEntry::VectorShard(shard)) => Ok(shard),
             Ok(_) => unreachable!("VectorShard key always maps to VectorShard entry"),
-            Err(arc_err) => Err(io::Error::new(arc_err.kind(), arc_err.to_string())),
+            Err(arc_err) => Err(arc_io_error(arc_err)),
         }
     }
 
@@ -708,13 +860,10 @@ impl LeafletCache {
 
     /// Get a cached query `StatsView` (read-only, no insertion).
     pub fn get_stats_view(&self, key: u128) -> Option<Arc<StatsView>> {
-        match self.inner.get(&CacheKey::StatsView(key)) {
-            Some(CachedEntry::StatsView(view)) => Some(view),
-            _ => None,
-        }
+        self.stats_views.get(&key)
     }
 
-    /// Get or build a query `StatsView` in the unified cache.
+    /// Get or build a query `StatsView`, single-flight per key.
     pub fn get_or_build_stats_view<F>(&self, key: u128, build_fn: F) -> Arc<StatsView>
     where
         F: FnOnce() -> Arc<StatsView>,
@@ -725,15 +874,7 @@ impl LeafletCache {
         }
         // Miss: run the single-flight wait/init in a blocking region so a
         // waiter promotes a replacement worker (see in_blocking_region).
-        let entry = in_blocking_region(|| {
-            self.inner.get_with(CacheKey::StatsView(key), || {
-                CachedEntry::StatsView(build_fn())
-            })
-        });
-        match entry {
-            CachedEntry::StatsView(view) => view,
-            _ => unreachable!("StatsView key always maps to StatsView entry"),
-        }
+        in_blocking_region(|| self.stats_views.get_with(key, build_fn))
     }
 
     // ========================================================================
@@ -765,6 +906,21 @@ impl LeafletCache {
         if let Some(batch) = self.get_v3_batch(&key) {
             return Ok(batch);
         }
+        // Superset fallback: a warm-on-write `ColumnSet::ALL` batch covers any
+        // narrower request. Serve it projected down rather than re-decoding —
+        // the invariant is that a cached batch may satisfy a request only when
+        // its columns ⊇ the requested columns, and ALL ⊇ everything.
+        let all_columns = super::column_types::ColumnSet::ALL.0;
+        if key.columns != all_columns {
+            let all_key = V3BatchCacheKey {
+                leaf_id: key.leaf_id,
+                leaflet_idx: key.leaflet_idx,
+                columns: all_columns,
+            };
+            if let Some(all_batch) = self.get_v3_batch(&all_key) {
+                return Ok(all_batch.project_to(super::column_types::ColumnSet(key.columns)));
+            }
+        }
         // Run the single-flight wait/init in a blocking region so a
         // waiter promotes a replacement worker (see in_blocking_region).
         let result = in_blocking_region(|| {
@@ -775,8 +931,19 @@ impl LeafletCache {
         match result {
             Ok(CachedEntry::V3Batch(batch)) => Ok(batch),
             Ok(_) => unreachable!("V3Batch key always maps to V3Batch entry"),
-            Err(arc_err) => Err(io::Error::new(arc_err.kind(), arc_err.to_string())),
+            Err(arc_err) => Err(arc_io_error(arc_err)),
         }
+    }
+
+    /// Warm-on-write: seed a decoded V3 column batch the *writer* already holds.
+    ///
+    /// Counterpart to [`Self::insert_leaf_dir`] for the column data. The key's
+    /// `columns` bitmask must match the projection a reader will request, or the
+    /// warmed entry is simply never hit (never mis-served) — so seed the common
+    /// projection(s) only. Content-addressed leaf id makes this always safe.
+    pub fn insert_v3_batch(&self, key: V3BatchCacheKey, batch: super::column_types::ColumnBatch) {
+        self.inner
+            .insert(CacheKey::V3Batch(key), CachedEntry::V3Batch(batch));
     }
 
     // ========================================================================
@@ -786,6 +953,7 @@ impl LeafletCache {
     /// Invalidate all entries (e.g., after index rebuild).
     pub fn invalidate_all(&self) {
         self.inner.invalidate_all();
+        self.stats_views.invalidate_all();
     }
 
     // Note: `entry_count()` is provided near cache construction for reuse in
@@ -960,6 +1128,56 @@ mod tests {
 
         // Different dict key → miss.
         assert!(cache.get_dict_leaf(1000).is_none());
+    }
+
+    #[test]
+    fn test_v3_batch_superset_serves_narrow_without_decode() {
+        use crate::read::column_types::{ColumnBatch, ColumnData, ColumnSet};
+        let cache = LeafletCache::with_max_bytes(10 * 1024 * 1024);
+
+        // Warm-on-write seeds a full (ALL) batch for a leaflet.
+        let all_batch = ColumnBatch {
+            row_count: 2,
+            s_id: ColumnData::Block(vec![10u64, 11].into()),
+            o_key: ColumnData::Block(vec![100u64, 101].into()),
+            p_id: ColumnData::Const(5),
+            o_type: ColumnData::Const(7),
+            o_i: ColumnData::Block(vec![0u32, 1].into()),
+            t: ColumnData::Block(vec![3u32, 4].into()),
+        };
+        let all_key = V3BatchCacheKey {
+            leaf_id: 0xABCD,
+            leaflet_idx: 2,
+            columns: ColumnSet::ALL.0,
+        };
+        cache.insert_v3_batch(all_key.clone(), all_batch);
+
+        // A narrow (CORE) read must be served from the ALL batch, projected —
+        // decode_fn panics to prove no re-decode happens.
+        let core_key = V3BatchCacheKey {
+            leaf_id: 0xABCD,
+            leaflet_idx: 2,
+            columns: ColumnSet::CORE.0,
+        };
+        let served = cache
+            .try_get_or_decode_v3_batch(core_key, || panic!("must not decode: ALL covers CORE"))
+            .expect("superset hit");
+
+        // Requested (CORE) columns carry real data; omitted ones are absent.
+        assert_eq!(served.row_count, 2);
+        assert_eq!(served.s_id.get(1), 11);
+        assert_eq!(served.o_key.get(0), 100);
+        assert_eq!(served.p_id.get(0), 5);
+        assert_eq!(served.o_type.get(0), 7);
+        assert!(served.o_i.is_absent(), "o_i not in CORE → projected away");
+        assert!(served.t.is_absent(), "t not in CORE → projected away");
+
+        // A request for columns NOT covered (here, an exact ALL request) still
+        // hits the stored ALL batch directly.
+        let full = cache
+            .try_get_or_decode_v3_batch(all_key, || panic!("must not decode: exact ALL hit"))
+            .expect("exact hit");
+        assert!(!full.t.is_absent(), "exact ALL request keeps t");
     }
 
     #[test]
@@ -1142,5 +1360,86 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert!(cache.get_stats_view(key).is_some());
+    }
+
+    /// A view whose `byte_size` is at least `bytes`.
+    fn stats_view_of_bytes(bytes: usize) -> Arc<StatsView> {
+        let mut view = StatsView::default();
+        let name = "p".repeat(200);
+        let mut i = 0u32;
+        while view.byte_size() < bytes {
+            view.properties.insert(
+                Sid::new(100, format!("{name}{i}")),
+                fluree_db_core::PropertyStatData {
+                    count: 1,
+                    ndv_values: 1,
+                    ndv_subjects: 1,
+                },
+            );
+            i += 1;
+        }
+        Arc::new(view)
+    }
+
+    /// 16 MiB of leaflet budget gives the stats view pool 1 MiB, and caps any
+    /// one view's weight at 512 KiB.
+    const POOL_TEST_BUDGET: u64 = 16 * 1024 * 1024;
+
+    #[test]
+    fn stats_view_survives_leaflet_pressure() {
+        let cache = LeafletCache::with_max_bytes(POOL_TEST_BUDGET);
+        let view = cache.get_or_build_stats_view(1, || stats_view_of_bytes(64 * 1024));
+
+        // Four times the leaflet budget in dict leaves.
+        for key in 0..64u128 {
+            cache.insert_dict_leaf(key, Arc::from(vec![0u8; 1024 * 1024]));
+        }
+        cache.inner.run_pending_tasks();
+        cache.stats_views.run_pending_tasks();
+
+        let hit = cache
+            .get_stats_view(1)
+            .expect("leaflet churn must not evict a stats view");
+        assert!(Arc::ptr_eq(&hit, &view));
+    }
+
+    #[test]
+    fn stats_view_larger_than_its_pool_is_still_cached() {
+        let cache = LeafletCache::with_max_bytes(POOL_TEST_BUDGET);
+        let view = cache.get_or_build_stats_view(1, || stats_view_of_bytes(2 * 1024 * 1024));
+        assert!(view.byte_size() > (POOL_TEST_BUDGET / STATS_VIEW_BUDGET_DIVISOR) as usize);
+        cache.stats_views.run_pending_tasks();
+
+        let hit = cache.get_or_build_stats_view(1, || {
+            unreachable!("an oversized view must stay cached, not rebuild per query")
+        });
+        assert!(Arc::ptr_eq(&hit, &view));
+    }
+
+    /// A new overlay epoch's view is the one queries want next, however often
+    /// the view it replaces was read.
+    #[test]
+    fn newest_stats_view_is_kept_over_a_frequently_read_one() {
+        let cache = LeafletCache::with_max_bytes(POOL_TEST_BUDGET);
+        for key in [1u128, 2] {
+            cache.get_or_build_stats_view(key, || stats_view_of_bytes(600 * 1024));
+            cache.stats_views.run_pending_tasks();
+        }
+        for _ in 0..32 {
+            assert!(cache.get_stats_view(1).is_some());
+            assert!(cache.get_stats_view(2).is_some());
+        }
+
+        let newest = cache.get_or_build_stats_view(3, || stats_view_of_bytes(600 * 1024));
+        cache.stats_views.run_pending_tasks();
+
+        let hit = cache
+            .get_stats_view(3)
+            .expect("the newest view must be admitted");
+        assert!(Arc::ptr_eq(&hit, &newest));
+        assert!(
+            cache.get_stats_view(1).is_none(),
+            "the least recently used view makes room"
+        );
     }
 }

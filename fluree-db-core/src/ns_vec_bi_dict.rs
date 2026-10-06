@@ -9,8 +9,9 @@
 //! - **Reverse:** `HashMap<Box<[u8]>, u64>` with key = `[ns_code BE 2B][suffix bytes]`.
 //!   One hash lookup.
 //!
-//! NS_OVERFLOW (`0xFFFF`) subjects use dedicated scalar fields and a separate
-//! Vec to avoid resizing per-namespace vectors to 65536 entries.
+//! The `NS_OVERFLOW` (`0xFFFF`) fields below were meant to keep overflow
+//! subjects out of the per-namespace vectors, but real overflow subjects use
+//! `namespaces::OVERFLOW` (0xFFFE) and take the ordinary path (#1843).
 
 use std::sync::Arc;
 
@@ -18,7 +19,7 @@ use hashbrown::HashMap;
 
 use crate::subject_id::SubjectId;
 
-/// Namespace code reserved for overflow subjects (full IRI as suffix).
+/// Does not match `namespaces::OVERFLOW` (0xFFFE); see the module doc.
 const NS_OVERFLOW: u16 = 0xFFFF;
 
 // ---------------------------------------------------------------------------
@@ -30,6 +31,9 @@ const NS_OVERFLOW: u16 = 0xFFFF;
 pub struct NsVecBiDict {
     /// Forward: `entries[ns_code][local_id - watermark - 1]`.
     entries: Vec<Vec<Arc<str>>>,
+    /// Parallel to `entries`: the commit `t` that introduced each entry,
+    /// `i64::MAX` when unknown. What [`Self::retire_seen_through`] keys on.
+    first_t: Vec<Vec<i64>>,
     /// Reverse: `[ns_code BE 2B][suffix bytes]` → sid64.
     reverse: HashMap<Box<[u8]>, u64>,
     /// Default local-id base for namespaces not present in `watermarks`.
@@ -52,6 +56,7 @@ pub struct NsVecBiDict {
     overflow_next_local_id: u64,
     /// Separate Vec for NS_OVERFLOW entries.
     overflow_entries: Vec<Arc<str>>,
+    overflow_first_t: Vec<i64>,
 }
 
 impl NsVecBiDict {
@@ -59,6 +64,7 @@ impl NsVecBiDict {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            first_t: Vec::new(),
             reverse: HashMap::new(),
             local_base: 1,
             watermarks: Vec::new(),
@@ -66,6 +72,7 @@ impl NsVecBiDict {
             overflow_watermark: 0,
             overflow_next_local_id: 0,
             overflow_entries: Vec::new(),
+            overflow_first_t: Vec::new(),
         }
     }
 
@@ -78,6 +85,7 @@ impl NsVecBiDict {
         let local_base = local_base.max(1);
         Self {
             entries: Vec::new(),
+            first_t: Vec::new(),
             reverse: HashMap::new(),
             local_base,
             watermarks: Vec::new(),
@@ -85,6 +93,7 @@ impl NsVecBiDict {
             overflow_watermark: local_base - 1,
             overflow_next_local_id: local_base,
             overflow_entries: Vec::new(),
+            overflow_first_t: Vec::new(),
         }
     }
 
@@ -96,6 +105,7 @@ impl NsVecBiDict {
         let next_local_ids: Vec<u64> = watermarks.iter().map(|&wm| wm + 1).collect();
         let entries = vec![Vec::new(); watermarks.len()];
         Self {
+            first_t: vec![Vec::new(); entries.len()],
             entries,
             reverse: HashMap::new(),
             local_base: 1,
@@ -104,6 +114,7 @@ impl NsVecBiDict {
             overflow_watermark: overflow_wm,
             overflow_next_local_id: overflow_wm + 1,
             overflow_entries: Vec::new(),
+            overflow_first_t: Vec::new(),
         }
     }
 
@@ -114,10 +125,28 @@ impl NsVecBiDict {
     /// namespace and inserts into both forward and reverse structures.
     pub fn assign_or_lookup(&mut self, ns_code: u16, suffix: &str) -> u64 {
         let key = lookup_key(ns_code, suffix);
-        if let Some(&id) = self.reverse.get(key.as_slice()) {
+        if let Some(id) = self.find_by_key(&key) {
             return id;
         }
+        self.insert_new(ns_code, suffix, key)
+    }
 
+    /// Reverse lookup by an already-encoded key (see [`lookup_key`]), so a
+    /// caller probing several dictionaries encodes the suffix once.
+    #[inline]
+    pub fn find_by_key(&self, key: &[u8]) -> Option<u64> {
+        self.reverse.get(key).copied()
+    }
+
+    /// Allocate the next local_id for `ns_code` and insert `(key, suffix)`.
+    /// The caller has established the key is absent (see [`Self::find_by_key`]).
+    pub fn insert_new(&mut self, ns_code: u16, suffix: &str, key: Vec<u8>) -> u64 {
+        self.insert_new_at(ns_code, suffix, key, i64::MAX)
+    }
+
+    /// [`Self::insert_new`] recording the commit `t` that introduces the entry.
+    pub fn insert_new_at(&mut self, ns_code: u16, suffix: &str, key: Vec<u8>, t: i64) -> u64 {
+        debug_assert!(self.find_by_key(&key).is_none());
         let local_id = if ns_code == NS_OVERFLOW {
             if self.overflow_next_local_id <= self.overflow_watermark {
                 self.overflow_next_local_id = self.overflow_watermark + 1;
@@ -135,6 +164,7 @@ impl NsVecBiDict {
             }
             if ns_idx >= self.entries.len() {
                 self.entries.resize_with(ns_idx + 1, Vec::new);
+                self.first_t.resize_with(ns_idx + 1, Vec::new);
             }
             // For newly-created namespaces (or callers that seeded with 0),
             // ensure allocation begins above the namespace watermark and respects
@@ -158,8 +188,10 @@ impl NsVecBiDict {
 
         if ns_code == NS_OVERFLOW {
             self.overflow_entries.push(Arc::clone(&interned));
+            self.overflow_first_t.push(t);
         } else {
             self.entries[ns_code as usize].push(Arc::clone(&interned));
+            self.first_t[ns_code as usize].push(t);
         }
 
         self.reverse.insert(key.into_boxed_slice(), sid64);
@@ -167,10 +199,130 @@ impl NsVecBiDict {
         sid64
     }
 
+    /// Record that the entry `sid64` was seen at commit `t`: it keeps the
+    /// earliest `t` it has been seen at, so a retire keys on the commit that
+    /// truly introduced it whatever order the flakes arrived in.
+    pub fn note_seen_at(&mut self, sid64: u64, t: i64) {
+        let sid = SubjectId::from_u64(sid64);
+        let (ns_code, local_id) = (sid.ns_code(), sid.local_id());
+        let (first_t, wm) = if ns_code == NS_OVERFLOW {
+            (&mut self.overflow_first_t, self.overflow_watermark)
+        } else {
+            let ns = ns_code as usize;
+            let wm = self.watermarks.get(ns).copied().unwrap_or(0);
+            let Some(first_t) = self.first_t.get_mut(ns) else {
+                return;
+            };
+            (first_t, wm)
+        };
+        if local_id > wm {
+            if let Some(seen) = first_t.get_mut((local_id - wm - 1) as usize) {
+                *seen = (*seen).min(t);
+            }
+        }
+    }
+
+    /// Drop every entry introduced at or before commit `t` and renumber the
+    /// rest, per namespace, contiguously above the new persisted watermarks
+    /// — what an index publish covering `t` does to a novelty dictionary.
+    /// Returns how many entries were dropped.
+    pub fn retire_seen_through(
+        &mut self,
+        t: i64,
+        new_watermarks: &[u64],
+        new_overflow_wm: u64,
+    ) -> usize {
+        let mut dropped = 0;
+        let ns_count = self.entries.len().max(new_watermarks.len());
+        self.entries.resize_with(ns_count, Vec::new);
+        self.first_t.resize_with(ns_count, Vec::new);
+        self.watermarks.resize(ns_count, 0);
+        self.next_local_ids.resize(ns_count, self.local_base);
+        // Every id moves, so the reverse map is rebuilt from the kept entries.
+        self.reverse.clear();
+        for ns in 0..ns_count {
+            let ns_code = ns as u16;
+            let wm = new_watermarks
+                .get(ns)
+                .copied()
+                .unwrap_or(self.watermarks[ns]);
+            dropped += retain_after(&mut self.entries[ns], &mut self.first_t[ns], t);
+            self.watermarks[ns] = wm;
+            let mut local_id = wm + 1;
+            for suffix in &self.entries[ns] {
+                self.reverse.insert(
+                    lookup_key(ns_code, suffix).into_boxed_slice(),
+                    SubjectId::new(ns_code, local_id).as_u64(),
+                );
+                local_id += 1;
+            }
+            self.next_local_ids[ns] = local_id;
+        }
+        dropped += retain_after(&mut self.overflow_entries, &mut self.overflow_first_t, t);
+        self.overflow_watermark = new_overflow_wm;
+        let mut local_id = new_overflow_wm + 1;
+        for suffix in &self.overflow_entries {
+            self.reverse.insert(
+                lookup_key(NS_OVERFLOW, suffix).into_boxed_slice(),
+                SubjectId::new(NS_OVERFLOW, local_id).as_u64(),
+            );
+            local_id += 1;
+        }
+        self.overflow_next_local_id = local_id;
+        dropped
+    }
+
     /// Reverse lookup: find sid64 by `(ns_code, suffix)`.
     pub fn find_subject(&self, ns_code: u16, suffix: &str) -> Option<u64> {
-        let key = lookup_key(ns_code, suffix);
-        self.reverse.get(key.as_slice()).copied()
+        self.find_by_key(&lookup_key(ns_code, suffix))
+    }
+
+    /// The local_id the next allocation in `ns_code` would take, following
+    /// the same rules as [`Self::assign_or_lookup`].
+    fn next_local_id(&self, ns_code: u16) -> u64 {
+        if ns_code == NS_OVERFLOW {
+            return self.overflow_next_local_id.max(self.overflow_watermark + 1);
+        }
+        let ns_idx = ns_code as usize;
+        let mut wm = self.watermarks.get(ns_idx).copied().unwrap_or(0);
+        if wm == 0 && self.local_base > 1 {
+            wm = self.local_base - 1;
+        }
+        let mut next = self
+            .next_local_ids
+            .get(ns_idx)
+            .copied()
+            .unwrap_or(self.local_base);
+        if next == 0 && self.local_base > 1 {
+            next = self.local_base;
+        }
+        next.max(wm + 1)
+    }
+
+    /// An empty dictionary whose allocation starts where this one's ends:
+    /// every namespace's first new local_id is `self.next_local_id(ns)`, so
+    /// ids minted in the layer never collide with ids this dictionary holds
+    /// or would mint next. The layer's internal per-namespace floor is this
+    /// dictionary's allocation frontier, not the persisted watermark; a
+    /// layered [`crate::DictNovelty`] reports the persisted watermark from
+    /// its parent.
+    pub fn layer_above(&self) -> Self {
+        let n = self.watermarks.len().max(self.next_local_ids.len());
+        let watermarks: Vec<u64> = (0..n).map(|ns| self.next_local_id(ns as u16) - 1).collect();
+        let next_local_ids: Vec<u64> = watermarks.iter().map(|&wm| wm + 1).collect();
+        let overflow_watermark = self.next_local_id(NS_OVERFLOW) - 1;
+        Self {
+            entries: vec![Vec::new(); n],
+            first_t: vec![Vec::new(); n],
+            reverse: HashMap::new(),
+            local_base: self.local_base,
+            watermarks,
+            next_local_ids,
+            overflow_watermark,
+            overflow_next_local_id: overflow_watermark + 1,
+            overflow_entries: Vec::new(),
+            overflow_first_t: Vec::new(),
+        }
     }
 
     /// Forward lookup: resolve sid64 → `(ns_code, &suffix)`.
@@ -214,6 +366,19 @@ impl NsVecBiDict {
     }
 
     /// Total entries across all namespaces.
+    /// Iterate every novel `(ns_code, suffix)` entry (persisted-watermark
+    /// entries are never stored here). Order: per-namespace insertion order,
+    /// overflow namespace last.
+    pub fn iter_entries(&self) -> impl Iterator<Item = (u16, &str)> {
+        let per_ns = self
+            .entries
+            .iter()
+            .enumerate()
+            .flat_map(|(ns, sufs)| sufs.iter().map(move |s| (ns as u16, &**s)));
+        let overflow = self.overflow_entries.iter().map(|s| (NS_OVERFLOW, &**s));
+        per_ns.chain(overflow)
+    }
+
     pub fn len(&self) -> usize {
         self.reverse.len()
     }
@@ -222,6 +387,22 @@ impl NsVecBiDict {
     pub fn is_empty(&self) -> bool {
         self.reverse.is_empty()
     }
+}
+
+/// Keep the entries introduced after `t`; returns how many were dropped.
+fn retain_after(entries: &mut Vec<Arc<str>>, first_t: &mut Vec<i64>, t: i64) -> usize {
+    let before = entries.len();
+    let mut kept = Vec::with_capacity(before);
+    let mut kept_t = Vec::with_capacity(before);
+    for (value, seen) in entries.drain(..).zip(first_t.drain(..)) {
+        if seen > t {
+            kept.push(value);
+            kept_t.push(seen);
+        }
+    }
+    *entries = kept;
+    *first_t = kept_t;
+    before - entries.len()
 }
 
 impl Default for NsVecBiDict {
@@ -236,7 +417,7 @@ impl Default for NsVecBiDict {
 
 /// Build a lookup key as `Vec<u8>`: `[ns_code BE 2 bytes][suffix UTF-8 bytes]`.
 #[inline]
-fn lookup_key(ns_code: u16, suffix: &str) -> Vec<u8> {
+pub fn lookup_key(ns_code: u16, suffix: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(2 + suffix.len());
     key.extend_from_slice(&ns_code.to_be_bytes());
     key.extend_from_slice(suffix.as_bytes());
@@ -362,6 +543,40 @@ mod tests {
     }
 
     #[test]
+    fn layer_above_allocates_past_the_parent_frontier() {
+        let mut parent = NsVecBiDict::with_watermarks(vec![0, 0, 100], 7);
+        let a = parent.assign_or_lookup(2, "a"); // 101
+        let b = parent.assign_or_lookup(2, "b"); // 102
+        let o = parent.assign_or_lookup(NS_OVERFLOW, "http://x/full"); // 8
+        let fresh_ns = parent.assign_or_lookup(9, "z"); // ns 9, local 1
+
+        let mut layer = parent.layer_above();
+        assert!(layer.is_empty());
+        let c = layer.assign_or_lookup(2, "c");
+        assert_eq!(SubjectId::from_u64(c).local_id(), 103);
+        let o2 = layer.assign_or_lookup(NS_OVERFLOW, "http://y/full");
+        assert_eq!(SubjectId::from_u64(o2).local_id(), 9);
+        let z2 = layer.assign_or_lookup(9, "z2");
+        assert_eq!(SubjectId::from_u64(z2).local_id(), 2);
+        // A namespace the parent never touched starts at 1.
+        let n = layer.assign_or_lookup(12, "n");
+        assert_eq!(SubjectId::from_u64(n).local_id(), 1);
+
+        // The layer holds only its own ids; parent ids resolve to None here.
+        for id in [a, b, o, fresh_ns] {
+            assert!(layer.resolve_subject(id).is_none());
+        }
+        assert_eq!(layer.resolve_subject(c), Some((2, "c")));
+        assert_eq!(
+            layer.resolve_subject(o2),
+            Some((NS_OVERFLOW, "http://y/full"))
+        );
+        // The parent is untouched.
+        assert_eq!(parent.len(), 4);
+        assert_eq!(parent.find_subject(2, "c"), None);
+    }
+
+    #[test]
     fn test_reverse_key_encoding_matches() {
         // Verify our lookup_key matches the format from dict_novelty::subject_reverse_key
         use crate::dict_novelty::subject_reverse_key;
@@ -369,5 +584,49 @@ mod tests {
         let boxed = subject_reverse_key(2, "Alice");
         let vec_key = lookup_key(2, "Alice");
         assert_eq!(&*boxed, vec_key.as_slice());
+    }
+
+    /// Retiring through a commit drops what it and earlier commits
+    /// introduced in every namespace and renumbers the rest above the new
+    /// watermarks, whatever order they were introduced in.
+    #[test]
+    fn retire_seen_through_drops_by_commit_per_namespace() {
+        let mut d = NsVecBiDict::with_watermarks(vec![0, 10, 5], 0);
+        d.insert_new_at(1, "a-t1", lookup_key(1, "a-t1"), 1);
+        d.insert_new_at(1, "a-t3", lookup_key(1, "a-t3"), 3);
+        d.insert_new_at(1, "a-t2", lookup_key(1, "a-t2"), 2);
+        d.insert_new_at(2, "b-t1", lookup_key(2, "b-t1"), 1);
+        d.insert_new_at(NS_OVERFLOW, "o-t3", lookup_key(NS_OVERFLOW, "o-t3"), 3);
+        let o_before = d.find_subject(NS_OVERFLOW, "o-t3").unwrap();
+        // Seen again at other commits: the earliest one counts.
+        let a3 = d.find_subject(1, "a-t3").unwrap();
+        d.note_seen_at(a3, 5);
+        let b1 = d.find_subject(2, "b-t1").unwrap();
+        d.note_seen_at(b1, 0);
+
+        let dropped = d.retire_seen_through(2, &[0, 20, 6], 4);
+        assert_eq!(dropped, 3);
+        assert_eq!(d.find_subject(1, "a-t1"), None);
+        assert_eq!(d.find_subject(1, "a-t2"), None);
+        assert_eq!(d.find_subject(2, "b-t1"), None);
+        let a3 = d.find_subject(1, "a-t3").unwrap();
+        assert_eq!(
+            SubjectId::from_u64(a3).local_id(),
+            21,
+            "renumbered above the new watermark"
+        );
+        assert_eq!(d.resolve_subject(a3), Some((1, "a-t3")));
+        assert_eq!(d.watermark_for_ns(1), 20);
+        assert_eq!(d.watermark_for_ns(2), 6);
+        assert_eq!(
+            SubjectId::from_u64(d.assign_or_lookup(1, "a-t4")).local_id(),
+            22,
+            "allocation continues above the kept entry"
+        );
+        let o = d.find_subject(NS_OVERFLOW, "o-t3").unwrap();
+        assert_ne!(o, o_before);
+        assert_eq!(SubjectId::from_u64(o).local_id(), 5);
+        assert_eq!(d.resolve_subject(o), Some((NS_OVERFLOW, "o-t3")));
+        assert_eq!(d.len(), 3);
     }
 }

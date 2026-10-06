@@ -37,6 +37,10 @@ pub struct StreamOutcome {
     pub rows: u64,
     pub fuel: Option<f64>,
     pub time: Option<String>,
+    /// Policy-enforcement state from the terminal `end` record, when the
+    /// server reported one (policy tracking requested and a non-root policy
+    /// context governed the query).
+    pub policy_enforcement: Option<fluree_db_api::PolicyEnforcement>,
     /// True when stdout closed mid-stream (e.g. piped into `head`). The caller
     /// suppresses the footer and exits 0.
     pub broken_pipe: bool,
@@ -131,6 +135,13 @@ impl<W: Write> NdjsonConsumer<W> {
                             .get("time")
                             .and_then(serde_json::Value::as_str)
                             .map(String::from);
+                        self.outcome.policy_enforcement =
+                            value.get("policy_enforcement").and_then(|v| {
+                                serde_json::from_value::<fluree_db_api::PolicyEnforcement>(
+                                    v.clone(),
+                                )
+                                .ok()
+                            });
                     }
                     "error" => {
                         self.saw_terminal = true;
@@ -365,5 +376,27 @@ mod tests {
         let outcome = res.unwrap();
         assert_eq!(outcome.fuel, Some(12.5));
         assert_eq!(outcome.time.as_deref(), Some("3.2ms"));
+    }
+
+    #[test]
+    fn end_record_carries_policy_enforcement() {
+        let (_out, res) = run(
+            &[
+                "{\"type\":\"row\",\"row\":{\"a\":{\"type\":\"literal\",\"value\":\"x\"}}}\n",
+                "{\"type\":\"end\",\"rows\":1,\"policy_enforcement\":{\"enforced\":true,\"denies_all_data\":true}}\n",
+            ],
+            false,
+        );
+        let outcome = res.unwrap();
+        let enforcement = outcome.policy_enforcement.expect("enforcement parsed");
+        assert!(enforcement.enforced);
+        assert!(enforcement.denies_all_data);
+    }
+
+    /// An older server omits the field; the consumer must not invent one.
+    #[test]
+    fn end_record_without_policy_enforcement_leaves_it_absent() {
+        let (_out, res) = run(&["{\"type\":\"end\",\"rows\":0}\n"], false);
+        assert!(res.unwrap().policy_enforcement.is_none());
     }
 }

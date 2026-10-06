@@ -1,6 +1,14 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_custom_datatype_limit.rs"]
+mod it_custom_datatype_limit;
+#[path = "it_duration_index_roundtrip.rs"]
+mod it_duration_index_roundtrip;
+#[path = "it_fwd_pack_compaction.rs"]
+mod it_fwd_pack_compaction;
+#[path = "it_index_sweep.rs"]
+mod it_index_sweep;
 #[path = "it_indexing_fuel.rs"]
 mod it_indexing_fuel;
 #[path = "it_indexing_stats.rs"]
@@ -27,3 +35,5 @@ mod it_reindex_schema;
 mod it_time_travel_indexing;
 #[path = "it_trigger_index_incremental.rs"]
 mod it_trigger_index_incremental;
+#[path = "it_typed_literal_index.rs"]
+mod it_typed_literal_index;

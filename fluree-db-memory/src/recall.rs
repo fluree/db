@@ -212,8 +212,10 @@ fn metadata_bonus(
         }
     }
 
-    // Recency bonus
-    if let Ok(created) = DateTime::parse_from_rfc3339(&mem.created_at) {
+    // Recency bonus, measured from the last update (or creation, if never
+    // updated): a re-verified memory is as current as a freshly written one.
+    let effective = mem.updated_at.as_deref().unwrap_or(&mem.created_at);
+    if let Ok(created) = DateTime::parse_from_rfc3339(effective) {
         let age = *now - created.to_utc();
         if age.num_days() < 7 {
             bonus += 2.0;
@@ -241,6 +243,7 @@ mod tests {
             artifact_refs: Vec::new(),
             branch: None,
             created_at: Utc::now().to_rfc3339(),
+            updated_at: None,
             rationale: None,
             alternatives: None,
         }

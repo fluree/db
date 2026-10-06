@@ -11,4 +11,5 @@ pub mod leaflet;
 pub mod run_record;
 pub mod run_record_v2;
 pub mod stats_wire;
+pub mod transitions;
 pub mod wire_helpers;

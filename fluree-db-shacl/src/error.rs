@@ -29,6 +29,12 @@ pub enum ShaclError {
     #[error("Database error: {0}")]
     CoreError(#[from] fluree_db_core::Error),
 
+    /// Invalid or unsupported `sh:sparql` constraint query — raised as a
+    /// validation *failure* (per SHACL, distinct from a violation) when the
+    /// owning shape fires on a focus node.
+    #[error("Invalid sh:sparql constraint {constraint}: {message}")]
+    SparqlConstraint { constraint: Sid, message: String },
+
     /// Shape references unknown shape
     #[error("Shape {referrer} references unknown shape {referenced}")]
     UnknownShapeReference { referrer: Sid, referenced: Sid },
@@ -36,15 +42,4 @@ pub enum ShaclError {
     /// Circular shape reference detected
     #[error("Circular shape reference detected involving {shape_id}")]
     CircularReference { shape_id: Sid },
-
-    /// SHACL validation failed
-    ///
-    /// Contains a summary of the validation failures.
-    #[error("SHACL validation failed: {violation_count} violation(s), {warning_count} warning(s)")]
-    ValidationFailed {
-        violation_count: usize,
-        warning_count: usize,
-        /// Detailed messages for each violation (truncated if too many)
-        details: Vec<String>,
-    },
 }

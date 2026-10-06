@@ -1,0 +1,8 @@
+{
+  "id": "native-sf01",
+  "kind": "native",
+  "fluree_home": "/Users/ajohnson/vbench/.fluree",
+  "alias": "enterprise-sf01",
+  "description": "Native materialized Fluree ledger built from the SF01 enterprise star schema (emit_ttl.py -> enterprise-sf01.ttl.zst -> imported + indexed). 35,238,778 triples. The correctness/perf baseline that virtual targets are compared against.",
+  "expected_total_triples": 35238778
+}

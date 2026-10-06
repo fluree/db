@@ -33,6 +33,20 @@
 //! everywhere, never switches. Nodes carrying an inline `@context` alongside
 //! other keys remain ordinary nodes anywhere.
 //!
+//! # Segments are documents
+//!
+//! Every chunk carries the ordinal of the **context segment** it belongs to,
+//! counting switches from 0. A segment is the unit consumers must treat as one
+//! RDF document: the nodes inside one share a `@context` and are emitted as
+//! members of a single `@graph`, and nodes on either side of a switch are
+//! emitted as separate `@graph` documents under different contexts. Bulk
+//! import uses it to scope blank-node labels, so `_:x` unifies across a
+//! segment (however the chunker cuts it) and stays distinct across the
+//! `cat a.jsonl b.jsonl` seam.
+//!
+//! It is an ordinal, not the chunk index the segment starts at, so it does not
+//! move when `chunk_size_bytes` changes.
+//!
 //! # Streaming
 //!
 //! The reader is driven by any [`BufRead`] (not a `Path`), so it streams local
@@ -59,7 +73,7 @@ use serde::de::IgnoredAny;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 
-use crate::splitter::{ChunkPayload, JsonLdPrelude, SplitError};
+use crate::splitter::{JsonLdPrelude, SplitError};
 
 /// Policy for interpreting the first non-blank line of an ndjson/jsonl source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -81,9 +95,16 @@ pub enum FirstLineContextPolicy {
 /// Streams a newline-delimited JSON-LD source as standalone JSON-LD chunks.
 pub struct NdjsonReader {
     prelude: JsonLdPrelude,
-    rx: Mutex<mpsc::Receiver<ChunkPayload>>,
+    rx: Mutex<mpsc::Receiver<NdjsonChunkPayload>>,
     reader_handle: Option<JoinHandle<Result<usize, SplitError>>>,
 }
+
+/// `(chunk_index, segment_ordinal, chunk_bytes)` — what [`NdjsonReader`] emits.
+///
+/// Deliberately NOT [`crate::splitter::ChunkPayload`]: that type is shared with
+/// the structured JSON-LD splitter, which has no notion of segments, and
+/// widening it would ripple into a reader this has nothing to do with.
+pub type NdjsonChunkPayload = (usize, u32, Vec<u8>);
 
 impl NdjsonReader {
     /// Create a reader over any byte stream (local file, S3 object range
@@ -129,7 +150,7 @@ impl NdjsonReader {
     /// Receive the next chunk, blocking until available. `Ok(None)` once all
     /// chunks have been emitted (call [`join`](Self::join) afterwards to
     /// observe any reader-thread error).
-    pub fn recv_chunk(&self) -> Result<Option<ChunkPayload>, SplitError> {
+    pub fn recv_chunk(&self) -> Result<Option<NdjsonChunkPayload>, SplitError> {
         let rx = self.rx.lock().unwrap();
         match rx.recv() {
             Ok(payload) => Ok(Some(payload)),
@@ -295,7 +316,7 @@ fn reader_thread(
     lines_consumed: usize,
     chunk_size: u64,
     policy: FirstLineContextPolicy,
-    tx: mpsc::SyncSender<ChunkPayload>,
+    tx: mpsc::SyncSender<NdjsonChunkPayload>,
 ) -> Result<usize, SplitError> {
     let mut prefix = build_prefix(&context)?;
     let suffix: &[u8] = b"]}";
@@ -307,6 +328,10 @@ fn reader_thread(
     let mut chunk_buf = seeded_buf(&prefix, chunk_size);
     let mut element_count: usize = 0;
     let mut chunk_idx: usize = 0;
+    // Which context segment the chunks being built belong to. Bumped once per
+    // switch; see the module docs for why it is an ordinal rather than the
+    // chunk index the segment starts at.
+    let mut segment: u32 = 0;
     // Continue the prelude's numbering so errors report true file lines.
     let mut line_no: usize = lines_consumed;
     let mut line_buf: Vec<u8> = Vec::new();
@@ -333,9 +358,13 @@ fn reader_thread(
         // hatch) lone contexts remain data nodes, as on line 1.
         if policy != FirstLineContextPolicy::Entity {
             if let Some(new_ctx) = lone_context_line(trimmed) {
+                // Seal the outgoing segment before the switch: a segment
+                // boundary is always a chunk boundary, so no chunk ever spans
+                // two contexts (or two documents).
                 if element_count > 0 {
-                    emit(&tx, &mut chunk_idx, &mut chunk_buf, suffix)?;
+                    emit(&tx, &mut chunk_idx, segment, &mut chunk_buf, suffix)?;
                 }
+                segment = segment.saturating_add(1);
                 tracing::warn!(
                     line = line_no,
                     "ndjson: lone {{\"@context\":…}} line replaces the shared \
@@ -350,14 +379,14 @@ fn reader_thread(
         push_node(&mut chunk_buf, &mut element_count, trimmed);
 
         if chunk_buf.len() as u64 >= chunk_size {
-            emit(&tx, &mut chunk_idx, &mut chunk_buf, suffix)?;
+            emit(&tx, &mut chunk_idx, segment, &mut chunk_buf, suffix)?;
             chunk_buf = seeded_buf(&prefix, chunk_size);
             element_count = 0;
         }
     }
 
     if element_count > 0 {
-        emit(&tx, &mut chunk_idx, &mut chunk_buf, suffix)?;
+        emit(&tx, &mut chunk_idx, segment, &mut chunk_buf, suffix)?;
     }
 
     Ok(chunk_idx)
@@ -380,14 +409,15 @@ fn push_node(chunk_buf: &mut Vec<u8>, element_count: &mut usize, node: &[u8]) {
 
 /// Seal `chunk_buf` with the suffix and send it, leaving the buffer empty.
 fn emit(
-    tx: &mpsc::SyncSender<ChunkPayload>,
+    tx: &mpsc::SyncSender<NdjsonChunkPayload>,
     chunk_idx: &mut usize,
+    segment: u32,
     chunk_buf: &mut Vec<u8>,
     suffix: &[u8],
 ) -> Result<(), SplitError> {
     chunk_buf.extend_from_slice(suffix);
     let doc = std::mem::take(chunk_buf);
-    tx.send((*chunk_idx, doc))
+    tx.send((*chunk_idx, segment, doc))
         .map_err(|_| SplitError::ChannelClosed)?;
     *chunk_idx += 1;
     Ok(())
@@ -458,11 +488,27 @@ mod tests {
         let mut reader = NdjsonReader::new_from_reader(reader_for(input), chunk_size, 4, policy)?;
         let ctx = reader.prelude().context.clone();
         let mut chunks = Vec::new();
-        while let Some((_idx, bytes)) = reader.recv_chunk()? {
+        while let Some((_idx, _segment, bytes)) = reader.recv_chunk()? {
             chunks.push(serde_json::from_slice::<JsonValue>(&bytes).unwrap());
         }
         reader.join()?;
         Ok((ctx, chunks))
+    }
+
+    /// Drive a reader to completion, returning `(segment, node_count)` per chunk.
+    fn read_segments(
+        input: &str,
+        chunk_size: u64,
+        policy: FirstLineContextPolicy,
+    ) -> Result<Vec<(u32, usize)>, SplitError> {
+        let mut reader = NdjsonReader::new_from_reader(reader_for(input), chunk_size, 4, policy)?;
+        let mut out = Vec::new();
+        while let Some((_idx, segment, bytes)) = reader.recv_chunk()? {
+            let doc: JsonValue = serde_json::from_slice(&bytes).unwrap();
+            out.push((segment, doc["@graph"].as_array().unwrap().len()));
+        }
+        reader.join()?;
+        Ok(out)
     }
 
     /// Total `@graph` nodes across all chunks.
@@ -471,6 +517,68 @@ mod tests {
             .iter()
             .map(|c| c["@graph"].as_array().unwrap().len())
             .sum()
+    }
+
+    // A `cat a.jsonl b.jsonl` seam. Everything before the second lone context
+    // is one document, everything after is another, and consumers need to be
+    // able to tell which is which.
+    #[test]
+    fn segment_ordinal_counts_context_switches() {
+        let input = "{\"@context\":{\"a\":\"http://a.example/\"}}\n\
+                     {\"@id\":\"a:1\"}\n\
+                     {\"@id\":\"a:2\"}\n\
+                     {\"@context\":{\"b\":\"http://b.example/\"}}\n\
+                     {\"@id\":\"b:1\"}\n";
+        let segments = read_segments(input, 1_000_000, FirstLineContextPolicy::Auto).unwrap();
+        assert_eq!(segments, vec![(0, 2), (1, 1)]);
+    }
+
+    // The ordinal names the segment, so it must not move when the chunker
+    // cuts differently — the whole reason it is not "the chunk index the
+    // segment started at".
+    #[test]
+    fn segment_ordinal_is_independent_of_chunk_size() {
+        let mut input = String::from("{\"@context\":{\"a\":\"http://a.example/\"}}\n");
+        for i in 0..40 {
+            input.push_str(&format!("{{\"@id\":\"a:{i}\"}}\n"));
+        }
+        input.push_str("{\"@context\":{\"b\":\"http://b.example/\"}}\n");
+        input.push_str("{\"@id\":\"b:1\"}\n");
+
+        let coarse = read_segments(&input, 1_000_000, FirstLineContextPolicy::Auto).unwrap();
+        let fine = read_segments(&input, 64, FirstLineContextPolicy::Auto).unwrap();
+        assert_eq!(
+            coarse.len(),
+            2,
+            "one chunk per segment when chunks are large"
+        );
+        assert!(
+            fine.len() > coarse.len(),
+            "small chunks must split segment 0"
+        );
+
+        let ordinals = |v: &[(u32, usize)]| -> Vec<u32> {
+            let mut o: Vec<u32> = v.iter().map(|(s, _)| *s).collect();
+            o.dedup();
+            o
+        };
+        assert_eq!(ordinals(&coarse), vec![0, 1]);
+        assert_eq!(ordinals(&fine), vec![0, 1]);
+    }
+
+    // Under `Entity` a lone context line is data, never a switch, so the file
+    // is one segment throughout.
+    #[test]
+    fn entity_policy_never_opens_a_new_segment() {
+        let input = "{\"@context\":{\"a\":\"http://a.example/\"}}\n\
+                     {\"@id\":\"http://a.example/1\"}\n\
+                     {\"@context\":{\"b\":\"http://b.example/\"}}\n\
+                     {\"@id\":\"http://b.example/1\"}\n";
+        let segments = read_segments(input, 1_000_000, FirstLineContextPolicy::Entity).unwrap();
+        assert!(
+            segments.iter().all(|(s, _)| *s == 0),
+            "Entity policy has no switches: {segments:?}"
+        );
     }
 
     #[test]

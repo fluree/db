@@ -21,6 +21,9 @@ pub type ColumnBatchStream = Pin<Box<dyn Stream<Item = Result<ColumnBatch>> + Se
 
 // Re-export from fluree-db-r2rml for convenience
 pub use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
+// The dialect-neutral plan a whole block lowers to (see `sql_lane`).
+pub use fluree_db_tabular::plan::{PushdownCapabilities, RelPlan, RelSource};
+pub use fluree_db_tabular::BatchSchema;
 
 /// Comparison operator for a pushed-down scan filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,19 +34,90 @@ pub enum ScanCmpOp {
     LtEq,
     Gt,
     GtEq,
+    /// Set membership (`?x IN (c1..cN)`), lowered from a `FILTER … IN` or a
+    /// single-var `VALUES` block. The filter's `value` is a [`ScanValue::Set`];
+    /// the provider builds an Iceberg `Expression::In`, which keeps a file iff
+    /// ANY member could lie within the file's column bounds (a superset — the
+    /// in-engine FILTER / VALUES join still enforces exact membership). Never
+    /// paired with a scalar `value`; never mapped to a scalar `ComparisonOp`.
+    In,
 }
 
 /// A literal value for a pushed-down scan filter.
 ///
-/// Intentionally limited to the types that prune safely against Iceberg column
-/// min/max bounds in the MVP (date partition pruning is the target). Decimal /
-/// float / string predicates are left to the in-engine FILTER.
+/// Limited to types that prune safely against Iceberg column min/max bounds and
+/// that the Arrow row filter can evaluate: date/int/bool, strings (lexicographic,
+/// e.g. equality on a name/code column), plus double and decimal — the last two
+/// gated by `FLUREE_ICEBERG_NUMERIC_STATS` and only ever produced from a numeric
+/// FILTER predicate (see `to_scan_value`). A missed push is never wrong: the
+/// in-engine FILTER remains the authority.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScanValue {
     Bool(bool),
     Int(i64),
     /// Days since 1970-01-01 (matches Iceberg date storage).
     Date(i32),
+    /// UTF-8 string (byte-lexicographic order matches Parquet stats + xsd:string).
+    Str(String),
+    /// An `xsd:double`/`xsd:float` value — pushed against a physically-`double`
+    /// column only (see `build_iceberg_filter`). NaN bounds never over-prune (the
+    /// Iceberg compare treats a NaN operand as incomparable → keep).
+    Double(f64),
+    /// A decimal value as its unscaled i128 + precision/scale (mirrors
+    /// `LiteralValue::Decimal`). Carries the LITERAL's scale; the column's scale
+    /// may differ and is normalized during comparison.
+    Decimal {
+        unscaled: i128,
+        precision: u8,
+        scale: i8,
+    },
+    /// A raw column value recovered by reversing a subject template (bound-subject
+    /// pushdown). The physical type is unknown here — it is resolved against the
+    /// Iceberg field type when the pushdown predicate is built, and the pushdown is
+    /// skipped for field types not yet supported. The R2RML operator still enforces
+    /// the subject equality, so a skipped or imperfect push is never wrong.
+    TemplateKey(String),
+    /// A bounded set of scalar values for a [`ScanCmpOp::In`] membership filter
+    /// (from a `FILTER … IN` or single-var `VALUES`). Every member is one of the
+    /// scalar variants above — never a nested `Set`, never a `TemplateKey`. Only
+    /// ever produced by the set-lowering emit path; it is never wrapped in an
+    /// [`ObjectConstant`] (a constant object is a single scalar term), so the
+    /// scalar-only match sites treat it defensively as "not a scalar constant".
+    Set(Vec<ScanValue>),
+    /// An `xsd:dateTime` value as microseconds since the Unix epoch, carrying
+    /// whether the source literal was timezone-AWARE (item 10). `tz = true` (an
+    /// explicit offset, e.g. `…Z`/`+05:00`) means the micros are in the UTC frame
+    /// and only push against a physically-`timestamptz` column; `tz = false` (a
+    /// naive literal) means wall-clock micros and only push against a physically
+    /// `timestamp` column. The frame is matched at pushdown-build time so the
+    /// micros are directly comparable to the Iceberg manifest bounds; a mismatch
+    /// declines the push (the in-engine FILTER stays the authority). Pruning is
+    /// MANIFEST-level only — see the row-group note in `fluree-db-iceberg`.
+    Timestamp {
+        micros: i64,
+        tz: bool,
+    },
+}
+
+/// A constant object in a triple pattern (`?s <pred> <const>`), enforced by the
+/// R2RML operator so results are correct regardless of scan pushdown.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ObjectConstant {
+    /// A literal object — loose value match (string/integer/boolean/date). Emits
+    /// a scan filter for row-group + row pruning in addition to operator enforcement.
+    Scalar(ScanValue),
+    /// A bound IRI object — exact IRI match, e.g. a reference to a parent entity
+    /// (`?s edw:geography <geo/1>`). Compared against the materialized IRI; the
+    /// column-level scan filter is not applied to these yet (a FK-key pushdown
+    /// needs subject-template reversal), so only the operator enforces them.
+    Iri(String),
+    /// A decimal / arbitrary-precision integer object — numeric (scale-insensitive)
+    /// match, so `9.99` matches a column materialized as `9.990`. Operator-enforced
+    /// only (no scan pushdown yet, which would need decimal-aware Iceberg predicates).
+    Decimal(bigdecimal::BigDecimal),
+    /// A double (xsd:double / xsd:float) object — exact f64 value match.
+    /// Operator-enforced only (no scan pushdown yet).
+    Double(f64),
 }
 
 /// A predicate pushed down to the Iceberg scan for file pruning.
@@ -57,6 +131,47 @@ pub struct ScanFilter {
     pub column: String,
     pub op: ScanCmpOp,
     pub value: ScanValue,
+}
+
+/// A scan-side top-k directive for a single-column `ORDER BY … LIMIT k` directly
+/// above a single-table R2RML scan (PR-5; ASC added in item 8, F-AUD-6). The scan
+/// reads files best-first (DESC: `upper_bound(sort_column)` descending; ASC:
+/// `lower_bound(sort_column)` ascending), keeps a running k-th bound, and stops
+/// once no unread file can beat it — reading far fewer than the whole table.
+///
+/// A pure perf optimization: the scan still streams a strict SUPERSET of the true
+/// top-k (it only skips files that provably cannot contribute), and the
+/// authoritative `SortOperator` above applies the exact (compound) order + LIMIT.
+/// Ignored by the provider unless `sort_column` resolves to a pushable scalar
+/// column of the scanned table — and, for `ascending`, unless that column is
+/// REQUIRED (non-nullable) in the Iceberg schema, since SPARQL orders unbound
+/// values FIRST under ASC and a nullable column could hide an unread top-k row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScanTopK {
+    /// The primary sort column (an R2RML-mapped table column name).
+    pub sort_column: String,
+    /// How many top rows the bound must retain — the query's `LIMIT + OFFSET`.
+    pub k: usize,
+    /// `true` for an `ASC` sort (admitted only for a required column; the provider
+    /// re-checks nullability), `false` for `DESC`.
+    pub ascending: bool,
+}
+
+/// The table state a time-pinned graph-source query reads, in the source
+/// format's own terms (an Iceberg snapshot id or commit time), as opposed to
+/// the Fluree `t` the scan methods' `as_of_t` carries.
+///
+/// A pin applies to every table of the source for the whole query, so a scan
+/// and a count cannot read different snapshots. An instant selects the latest
+/// snapshot committed at or before it; an instant before the oldest retained
+/// snapshot, or an unknown id, is an error — never the current snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceTime {
+    /// An exact snapshot by the source format's own identifier.
+    SnapshotId(i64),
+    /// The latest snapshot committed at or before this instant, epoch
+    /// milliseconds.
+    AsOfTimestampMs(i64),
 }
 
 /// Provider for compiled R2RML mappings.
@@ -105,6 +220,55 @@ pub trait R2rmlProvider: Debug + Send + Sync {
         graph_source_id: &str,
         as_of_t: Option<i64>,
     ) -> Result<Arc<CompiledR2rmlMapping>>;
+
+    /// Per-table build watermark for a materialize (twin) build: the pinned
+    /// snapshot of every table this provider has loaded for `graph_source_id`
+    /// during the current build. Returns EMPTY by default; a real Iceberg-backed
+    /// provider overrides it to report its catalog session's pins. The bulk
+    /// builder fails loud when this is empty for a non-empty table set, so a
+    /// provider that forgets to override cannot publish an unstamped twin.
+    fn build_watermark(
+        &self,
+        graph_source_id: &str,
+    ) -> std::collections::HashMap<String, TableWatermark> {
+        let _ = graph_source_id;
+        std::collections::HashMap::new()
+    }
+
+    /// MAJOR-2 (#1529 review): assert the snapshots read during a materialize build
+    /// are trustworthy — every table stayed on ONE `metadata_location`, and pinning
+    /// is actually in effect. Returns `Err(R2rmlError::BuildSnapshotIntegrity)` when a
+    /// build must be refused. Default: `Ok` — a non-Iceberg / test provider has no
+    /// moving-snapshot hazard. A real Iceberg-backed provider overrides this to
+    /// refuse when the loadTable cache is disabled (pinning is then a no-op) or when
+    /// a table yielded a second distinct `metadata_location` mid-build (the source
+    /// committed and the twin's stamped watermark would not describe its contents).
+    fn verify_build_snapshot_integrity(
+        &self,
+        graph_source_id: &str,
+    ) -> std::result::Result<(), fluree_db_r2rml::R2rmlError> {
+        let _ = graph_source_id;
+        Ok(())
+    }
+}
+
+/// The pinned snapshot of one Iceberg table at build time — the twin's per-table
+/// watermark entry (DEC-003). `metadata_location` is the authoritative pin (it
+/// uniquely identifies the table state and is always available); `snapshot_id` /
+/// `sequence_number` are the Iceberg snapshot identifiers captured from the
+/// parsed table metadata (typed `Option`, best-effort), which the delta-sync
+/// (Deliverable 3) snapshot diff needs.
+///
+/// Serializable so the twin's completion stamp can carry the watermark vector as
+/// JSON in a commit's `txn_meta`, and delta-sync can read it back.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TableWatermark {
+    /// Iceberg `metadata.json` location pinned for this table this build.
+    pub metadata_location: String,
+    /// Current snapshot id of the pinned metadata, if parsed.
+    pub snapshot_id: Option<i64>,
+    /// Sequence number of the current snapshot, if parsed.
+    pub sequence_number: Option<i64>,
 }
 
 /// Provider for scanning Iceberg tables underlying R2RML graph sources.
@@ -138,14 +302,109 @@ pub trait R2rmlTableProvider: Debug + Send + Sync {
     /// `filters` are conservative pushdown predicates (resolved to columns) for
     /// Iceberg file pruning. Implementations may ignore them (correctness is
     /// preserved by the in-engine FILTER) but honoring them skips data files.
+    /// `topk`, when set, is a single-column DESC `ORDER BY … LIMIT` directive
+    /// (PR-5): the implementation MAY read only the files that can hold the top-k
+    /// and stream a superset of them; ignoring it is always correct (the sort
+    /// above is authoritative).
     async fn scan_table(
         &self,
         graph_source_id: &str,
         table_name: &str,
         projection: &[String],
         filters: &[ScanFilter],
+        topk: Option<&ScanTopK>,
         as_of_t: Option<i64>,
     ) -> Result<ColumnBatchStream>;
+
+    /// The table's exact live row count from Iceberg manifest metadata — **when,
+    /// and only when, it provably equals a full-scan count** of the rows a bare
+    /// `COUNT(*)` would produce. Lets the fused-aggregate COUNT shortcut answer
+    /// from the manifest `record_count` sum instead of decoding every data file.
+    ///
+    /// `non_null_cols` are the columns that must be non-null for a row to be
+    /// counted (the subject-template key columns + any projected object columns).
+    /// Returns `Some(n)` only if: (1) the snapshot carries **no delete
+    /// manifests** (a merge-on-read delete would make the record_count sum an
+    /// over-count), and (2) **every** `non_null_col` is provably zero-null from
+    /// the manifest stats — an absent/unknown null count is treated as unknown,
+    /// NOT zero. Otherwise returns `Ok(None)` and the caller falls back to the
+    /// scan (which is delete/null-correct). The default is `Ok(None)`, so a
+    /// provider without manifest metadata (or a non-Iceberg source) always falls
+    /// back to the scan.
+    async fn table_row_count(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        non_null_cols: &[String],
+        as_of_t: Option<i64>,
+    ) -> Result<Option<u64>> {
+        let _ = (graph_source_id, table_name, non_null_cols, as_of_t);
+        Ok(None)
+    }
+
+    /// What this provider can execute for a whole pushed-down block over
+    /// `graph_source_id`, or `None` when the source cannot run a
+    /// [`RelPlan`] (an Iceberg source, or no source at all). Consulted once at
+    /// open by the SQL pushdown lane before it lowers anything.
+    async fn pushdown_capabilities(
+        &self,
+        graph_source_id: &str,
+    ) -> Result<Option<PushdownCapabilities>> {
+        let _ = graph_source_id;
+        Ok(None)
+    }
+
+    /// The probed column schema of one relation of `graph_source_id`, for a
+    /// provider that can execute plans (it caches the probe). The lowering
+    /// asks only for relations a typed literal has to be compared against.
+    async fn source_schema(
+        &self,
+        graph_source_id: &str,
+        source: &RelSource,
+    ) -> Result<Option<Arc<BatchSchema>>> {
+        let _ = (graph_source_id, source);
+        Ok(None)
+    }
+
+    /// Execute one pushed-down block and stream its rows. Returns the
+    /// statement actually sent (for the query log and explain output) with
+    /// the stream. Only called when [`Self::pushdown_capabilities`] was
+    /// `Some`; the default refuses.
+    async fn execute_plan(
+        &self,
+        graph_source_id: &str,
+        plan: &RelPlan,
+    ) -> Result<(String, ColumnBatchStream)> {
+        let _ = plan;
+        Err(crate::error::QueryError::Internal(format!(
+            "graph source '{graph_source_id}' cannot execute a pushed-down plan"
+        )))
+    }
+
+    /// Warm the per-query catalog session + caches for a known set of tables
+    /// CONCURRENTLY, so a following *serial* scan loop (which resolves one table
+    /// per `scan_table`) overlaps the per-table `loadTable` GETs instead of
+    /// summing them. Side-effect-only: returns nothing, and a resolution failure
+    /// here MUST be swallowed by the implementation — the real scan re-resolves
+    /// and surfaces any error — so this only ever removes latency, never changes
+    /// results or error behavior. Callers gate it on
+    /// [`super::parallel_catalog_resolution_enabled`]. The default is a no-op (a
+    /// provider without a remote catalog has nothing to warm).
+    async fn prefetch_tables(&self, graph_source_id: &str, table_names: &[String]) {
+        let _ = (graph_source_id, table_names);
+    }
+
+    /// Pin every read of `graph_source_id` in this query to `time`. Called
+    /// before execution for each time-specified source in the dataset; the
+    /// provider then selects that state in `scan_table` and `table_row_count`
+    /// alike. The default REFUSES: a provider that cannot honor a pin must not
+    /// let the query proceed against its current state.
+    fn pin_source_time(&self, graph_source_id: &str, time: SourceTime) -> Result<()> {
+        let _ = time;
+        Err(crate::error::QueryError::UnsupportedFeature(format!(
+            "graph source '{graph_source_id}' does not support time-pinned reads"
+        )))
+    }
 }
 
 // =============================================================================
@@ -194,6 +453,7 @@ impl R2rmlTableProvider for NoOpR2rmlProvider {
         _table_name: &str,
         _projection: &[String],
         _filters: &[ScanFilter],
+        _topk: Option<&ScanTopK>,
         _as_of_t: Option<i64>,
     ) -> Result<ColumnBatchStream> {
         Err(crate::error::QueryError::Internal(format!(

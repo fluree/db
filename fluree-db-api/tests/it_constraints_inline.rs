@@ -171,3 +171,168 @@ async fn inline_property_unknown_to_ledger_fails_loudly() {
         "expected explicit unresolved-IRI diagnostic, got: {msg}"
     );
 }
+
+/// Two named graphs, registered in this order, with alice's email in the
+/// second. A transaction that writes only to the second graph numbers it
+/// first among its own graphs, so enforcement must translate to the ledger's
+/// graph id to look in the right place.
+async fn seed_email_in_second_graph(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> fluree_db_api::LedgerState {
+    let ledger = genesis_ledger(fluree, ledger_id);
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(
+            r#"
+            GRAPH <http://example.org/g/a> {
+                <http://example.org/ns/x> <http://example.org/ns/other> "1" .
+            }
+            GRAPH <http://example.org/g/b> {
+                <http://example.org/ns/alice> <http://example.org/ns/email> "alice@example.org" .
+            }
+        "#,
+        )
+        .execute()
+        .await
+        .expect("seed two named graphs")
+        .ledger
+}
+
+fn email_unique() -> TxnOpts {
+    TxnOpts {
+        unique_properties: Some(vec!["http://example.org/ns/email".to_string()]),
+        ..TxnOpts::default()
+    }
+}
+
+#[tokio::test]
+async fn inline_unique_property_enforced_in_second_named_graph_sparql() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger =
+        seed_email_in_second_graph(&fluree, "test/inline-constraints/second-graph-sparql:main")
+            .await;
+    let parsed = fluree_db_sparql::parse_sparql(
+        r#"INSERT DATA { GRAPH <http://example.org/g/b> {
+            <http://example.org/ns/bob> <http://example.org/ns/email> "alice@example.org" } }"#,
+    );
+    let ast = parsed.ast.expect("SPARQL AST");
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+    let txn = fluree_db_transact::lower_sparql_update_ast(&ast, &mut ns, email_unique())
+        .expect("lower SPARQL UPDATE");
+    let err = fluree
+        .stage_owned(ledger)
+        .txn(txn)
+        .execute()
+        .await
+        .expect_err("duplicate email in the second named graph must be rejected");
+    assert!(
+        err.to_string().to_lowercase().contains("unique"),
+        "expected uniqueness violation error, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn inline_unique_property_enforced_in_second_named_graph_jsonld() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger =
+        seed_email_in_second_graph(&fluree, "test/inline-constraints/second-graph-jsonld:main")
+            .await;
+    let err = fluree
+        .update_with_opts(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "graph": "http://example.org/g/b",
+                "insert": {"@id": "ex:bob", "ex:email": "alice@example.org"}
+            }),
+            email_unique(),
+            CommitOpts::default(),
+            &test_index_cfg(),
+        )
+        .await
+        .expect_err("duplicate email in the second named graph must be rejected");
+    assert!(
+        err.to_string().to_lowercase().contains("unique"),
+        "expected uniqueness violation error, got: {err}"
+    );
+}
+
+/// `# PRAGMA unique-properties` is the SPARQL UPDATE twin of
+/// `opts.uniqueProperties`, applied wherever the update is lowered. The same
+/// duplicate without the pragma commits, so the rejection is the pragma's.
+#[tokio::test]
+async fn inline_unique_property_via_sparql_pragma() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let alias = "test/inline-constraints/sparql-pragma:main";
+    fluree.create_ledger(alias).await.expect("create ledger");
+    let insert = |pragma: &str, subject: &str| {
+        format!(
+            "{pragma}\nPREFIX ex: <http://example.org/ns/>\n\
+             INSERT DATA {{ ex:{subject} ex:email \"alice@example.org\" }}"
+        )
+    };
+    let update = |sparql: String| {
+        let fluree = &fluree;
+        async move {
+            fluree
+                .graph(alias)
+                .transact()
+                .sparql_update(&sparql)
+                .commit()
+                .await
+        }
+    };
+
+    update(insert("", "alice")).await.expect("seed alice");
+    update(insert("", "carol"))
+        .await
+        .expect("without the pragma a duplicate commits");
+    let err = update(insert("# PRAGMA unique-properties: ex:email", "bob"))
+        .await
+        .expect_err("duplicate value on a pragma-unique property must be rejected");
+    assert!(
+        err.to_string().to_lowercase().contains("unique"),
+        "expected uniqueness violation error, got: {err}"
+    );
+}
+
+/// An embedder that lowers the update itself and stages the `Txn` gets the
+/// pragma enforced too, not just the builder's `sparql_update` path.
+#[tokio::test]
+async fn inline_unique_property_via_sparql_pragma_lowered_by_caller() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let alias = "test/inline-constraints/sparql-pragma-lowered:main";
+    fluree.create_ledger(alias).await.expect("create ledger");
+    fluree
+        .graph(alias)
+        .transact()
+        .sparql_update(
+            "PREFIX ex: <http://example.org/ns/>\n\
+             INSERT DATA { ex:alice ex:email \"alice@example.org\" }",
+        )
+        .commit()
+        .await
+        .expect("seed alice");
+
+    let parsed = fluree_db_sparql::parse_sparql(
+        "# PRAGMA unique-properties: ex:email\n\
+         PREFIX ex: <http://example.org/ns/>\n\
+         INSERT DATA { ex:bob ex:email \"alice@example.org\" }",
+    );
+    let ast = parsed.ast.expect("SPARQL AST");
+    let ledger = fluree.ledger(alias).await.expect("load ledger");
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+    let txn = fluree_db_transact::lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default())
+        .expect("lower SPARQL UPDATE");
+    let err = fluree
+        .stage_owned(ledger)
+        .txn(txn)
+        .execute()
+        .await
+        .expect_err("duplicate value on a pragma-unique property must be rejected");
+    assert!(
+        err.to_string().to_lowercase().contains("unique"),
+        "expected uniqueness violation error, got: {err}"
+    );
+}

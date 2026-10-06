@@ -37,6 +37,7 @@ aws-config = { workspace = true, optional = true }
 [dev-dependencies]
 tokio = { workspace = true }
 fluree-db-query = { path = "../fluree-db-query" }
+tempfile = "3"
 testcontainers = "0.23"
 aws-sdk-s3 = { workspace = true }
 aws-sdk-dynamodb = { workspace = true }

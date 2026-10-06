@@ -68,6 +68,16 @@ pub enum TokenKind {
     /// Variable: `?name` or `$name` (stored without the sigil)
     Var(Arc<str>),
 
+    /// A SPARQL 1.2 triple-term builtin function name used in a
+    /// `BuiltInCall` position (`TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`,
+    /// `isTRIPLE`). These are contextual function-call identifiers, not
+    /// reserved keywords: the lexer emits this generic token (carrying the
+    /// uppercased canonical name) so the expression parser can resolve it
+    /// via `FunctionName::parse` and arity-validate it — without adding
+    /// five dedicated `Kw*` variants to the reserved-keyword machinery
+    /// (burn-down decision D-1, accept-then-defer).
+    TripleTermFn(Arc<str>),
+
     // =========================================================================
     // Literals
     // =========================================================================
@@ -635,6 +645,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::PrefixedNameNs(s) => write!(f, "{s}:"),
             TokenKind::PrefixedName { prefix, local } => write!(f, "{prefix}:{local}"),
             TokenKind::Var(s) => write!(f, "?{s}"),
+            TokenKind::TripleTermFn(s) => write!(f, "{s}"),
             TokenKind::String(s) => write!(f, "\"{s}\""),
             TokenKind::Integer(n) => write!(f, "{n}"),
             TokenKind::BigInteger(s) => write!(f, "{s}"),
@@ -785,6 +796,17 @@ pub fn keyword_from_str(s: &str) -> Option<TokenKind> {
         "EUCLIDEANDISTANCE" | "EUCLIDEAN_DISTANCE" | "EUCLIDIANDISTANCE" => {
             Some(TokenKind::KwEuclideanDistance)
         }
+        // SPARQL 1.2 triple-term builtins are recognized as contextual
+        // function-call identifiers, not reserved keywords: emit a generic
+        // `TripleTermFn` carrying the canonical name so the expression parser
+        // resolves + arity-validates them (D-1). Colon-prefixed forms
+        // (`subject:foo`) still lex as prefixed names — the colon branch runs
+        // before this one — so these names remain usable as prefixes.
+        "TRIPLE" => Some(TokenKind::TripleTermFn(Arc::from("TRIPLE"))),
+        "SUBJECT" => Some(TokenKind::TripleTermFn(Arc::from("SUBJECT"))),
+        "PREDICATE" => Some(TokenKind::TripleTermFn(Arc::from("PREDICATE"))),
+        "OBJECT" => Some(TokenKind::TripleTermFn(Arc::from("OBJECT"))),
+        "ISTRIPLE" => Some(TokenKind::TripleTermFn(Arc::from("ISTRIPLE"))),
         "BASE" => Some(TokenKind::KwBase),
         "PREFIX" => Some(TokenKind::KwPrefix),
         "VERSION" => Some(TokenKind::KwVersion),

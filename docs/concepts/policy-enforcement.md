@@ -104,7 +104,7 @@ Each request can supply:
 - **`policy`** — an inline JSON-LD policy array.
 - **`default-allow`** — boolean fallback for flakes no policy targets.
 
-Over JSON-LD, these go inside `opts`. Over SPARQL, they're sent as `fluree-*` headers (SPARQL has no `opts` block). When the server is configured with a default policy class, a verified bearer token's identity is auto-applied — see the [policy cookbook](../guides/cookbook-policies.md#invoking-policies-via-http) for the request shapes and the server-side `data_auth_default_policy_class` option in [Configuration](../operations/configuration.md).
+Over JSON-LD, these go inside `opts`. Over SPARQL, they're sent as [`# PRAGMA` comments](../query/sparql.md#request-options--pragma) or `fluree-*` headers; the inline `policy` document is header-only. When the server is configured with a default policy class, a verified bearer token's identity is auto-applied — see the [policy cookbook](../guides/cookbook-policies.md#invoking-policies-via-http) for the request shapes and the server-side `data_auth_default_policy_class` option in [Configuration](../operations/configuration.md).
 
 ## Query enforcement vs transaction enforcement
 
@@ -114,6 +114,8 @@ The same policy model governs both, distinguished by `f:action`:
 - **`f:modify`** — runs during transaction staging. The transaction is rejected (with `f:exMessage` if provided) if a write would touch flakes the identity isn't allowed to modify.
 
 A single policy can govern both (`"f:action": [{"@id": "f:view"}, {"@id": "f:modify"}]`). Most realistic policy sets mix view-only restrictions, modify-only restrictions, and a small number of `[f:view, f:modify]` defaults.
+
+The two are also loud in different ways. A rejected transaction is an error the caller cannot miss. A filtered query is not: it returns HTTP 200 and a result set with the disallowed flakes simply absent, indistinguishable from a query that had nothing to return. That asymmetry is the design — a per-query "rows were hidden" signal would let a caller probe for the existence of data they cannot read. A caller who needs to know whether policy governed a request can ask for it: see [Detecting that policy was applied](../security/policy-in-queries.md#detecting-that-policy-was-applied), which reports enforcement state without reporting anything about the data.
 
 ## Policies are data
 

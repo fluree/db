@@ -130,6 +130,260 @@ async fn wildcard_delete_retracts_all_distinct_list_entries() {
     );
 }
 
+/// Filtered two-pattern DELETE over subjects carrying `@list` properties,
+/// on a novelty-heavy ledger (delete-everything then re-insert, no index
+/// rebuild in between).
+///
+/// Mirrors the field-reported staging livelock: `{?s tag <doc>} {?s ?p ?o}
+/// DELETE {?s ?p ?o}` matching subjects with large `@list` vectors, where
+/// all matched data lives in novelty. List-index hydration is grouped by
+/// (graph, subject, predicate) — one range lookup per group — so this pins
+/// that the grouped path still fills `m.i` on every retraction: every list
+/// entry and scalar of the tagged subjects must be retracted, and untagged
+/// subjects must be untouched.
+#[tokio::test]
+async fn filtered_delete_retracts_tagged_subjects_with_lists_in_novelty() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = fluree
+        .create_ledger("tx/list-retract-filtered:main")
+        .await
+        .expect("create");
+
+    let list_ctx = json!({
+        "ex": "http://example.org/",
+        "ex:vector": { "@container": "@list" }
+    });
+    let make_docs = |tag: &str| {
+        let subjects: Vec<JsonValue> = (0..4)
+            .map(|i| {
+                let vector: Vec<f64> = (0..32).map(|k| (i * 100 + k) as f64 * 0.5).collect();
+                json!({
+                    "@id": format!("ex:chunk-{tag}-{i}"),
+                    "ex:sourceDocument": { "@id": format!("ex:doc-{tag}") },
+                    "ex:label": format!("chunk {i} of {tag}"),
+                    "ex:vector": vector
+                })
+            })
+            .collect();
+        json!({ "@context": list_ctx, "@graph": subjects })
+    };
+
+    // Build the novelty-heavy state: insert both docs' chunks, delete
+    // everything, then re-insert — all without an index rebuild, so every
+    // matched flake lives in the novelty overlay (assert + retract + assert).
+    let receipt = fluree
+        .insert(ledger0, &make_docs("a"))
+        .await
+        .expect("insert a");
+    let receipt = fluree
+        .insert(receipt.ledger, &make_docs("b"))
+        .await
+        .expect("insert b");
+    let receipt = fluree
+        .update(
+            receipt.ledger,
+            &json!({
+                "where":  { "@id": "?s", "?p": "?o" },
+                "delete": { "@id": "?s", "?p": "?o" }
+            }),
+        )
+        .await
+        .expect("delete everything");
+    let receipt = fluree
+        .insert(receipt.ledger, &make_docs("a"))
+        .await
+        .expect("re-insert a");
+    let receipt = fluree
+        .insert(receipt.ledger, &make_docs("b"))
+        .await
+        .expect("re-insert b");
+
+    let count_all = |ledger: fluree_db_api::LedgerState, tag: &'static str| {
+        let fluree = &fluree;
+        async move {
+            let sparql = format!(
+                "PREFIX ex: <http://example.org/> \
+                 SELECT (COUNT(*) AS ?c) WHERE {{ \
+                   ?s ex:sourceDocument ex:doc-{tag} . ?s ?p ?o }}"
+            );
+            let result = support::query_sparql(fluree, &ledger, &sparql)
+                .await
+                .expect("sparql count");
+            let jsonld = result
+                .to_jsonld_async(ledger.as_graph_db_ref(0))
+                .await
+                .expect("to_jsonld_async");
+            let arr = jsonld.as_array().expect("array result");
+            arr.first()
+                .and_then(JsonValue::as_array)
+                .and_then(|row| row.first())
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0)
+        }
+    };
+
+    // 4 subjects × (1 sourceDocument + 1 label + 32 list entries) per doc.
+    let per_doc_triples = 4 * (1 + 1 + 32);
+    assert_eq!(
+        count_all(receipt.ledger.clone(), "a").await,
+        per_doc_triples,
+        "precondition: doc-a chunks fully re-inserted into novelty"
+    );
+
+    // The reported shape: tag pattern + wildcard pattern, wildcard delete.
+    let out = fluree
+        .update(
+            receipt.ledger,
+            &json!({
+                "@context": { "ex": "http://example.org/" },
+                "where": [
+                    { "@id": "?s", "ex:sourceDocument": { "@id": "ex:doc-a" } },
+                    { "@id": "?s", "?p": "?o" }
+                ],
+                "delete": { "@id": "?s", "?p": "?o" }
+            }),
+        )
+        .await
+        .expect("filtered delete");
+
+    assert_eq!(
+        count_all(out.ledger.clone(), "a").await,
+        0,
+        "every triple of the tagged subjects must be retracted, including \
+         all @list entries — survivors mean grouped hydration failed to \
+         populate `m.i` on some retraction"
+    );
+    assert_eq!(
+        count_all(out.ledger, "b").await,
+        per_doc_triples,
+        "untagged doc-b subjects must be untouched by the filtered delete"
+    );
+}
+
+/// Indexed variant of the filtered-delete case: a binary index is published
+/// mid-history, so staging's list-meta hydration lookups route through the
+/// V3 range provider (`binary_range_eq_v3`) and its cross-call overlay
+/// translation cache, with the delete-everything + re-insert novelty stacked
+/// on top of the persisted base. Pins that cached overlay translations are
+/// (a) correct on repeated same-state lookups and (b) invalidated across the
+/// intervening commits — a stale entry would surface pre-delete flakes or
+/// miss re-inserted ones, breaking the counts below.
+#[tokio::test]
+async fn filtered_delete_with_lists_on_indexed_base_plus_novelty() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "tx/list-retract-indexed:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.expect("create");
+
+    let list_ctx = json!({
+        "ex": "http://example.org/",
+        "ex:vector": { "@container": "@list" }
+    });
+    let make_docs = |tag: &str| {
+        let subjects: Vec<JsonValue> = (0..4)
+            .map(|i| {
+                let vector: Vec<f64> = (0..32).map(|k| (i * 100 + k) as f64 * 0.5).collect();
+                json!({
+                    "@id": format!("ex:chunk-{tag}-{i}"),
+                    "ex:sourceDocument": { "@id": format!("ex:doc-{tag}") },
+                    "ex:label": format!("chunk {i} of {tag}"),
+                    "ex:vector": vector
+                })
+            })
+            .collect();
+        json!({ "@context": list_ctx, "@graph": subjects })
+    };
+
+    // Base state: both docs inserted, then persisted into a binary index.
+    let receipt = fluree
+        .insert(ledger0, &make_docs("a"))
+        .await
+        .expect("insert a");
+    fluree
+        .insert(receipt.ledger, &make_docs("b"))
+        .await
+        .expect("insert b");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let indexed = fluree.ledger(ledger_id).await.expect("reload indexed");
+
+    // Novelty on top of the index: delete everything, re-insert both docs.
+    let receipt = fluree
+        .update(
+            indexed,
+            &json!({
+                "where":  { "@id": "?s", "?p": "?o" },
+                "delete": { "@id": "?s", "?p": "?o" }
+            }),
+        )
+        .await
+        .expect("delete everything");
+    let receipt = fluree
+        .insert(receipt.ledger, &make_docs("a"))
+        .await
+        .expect("re-insert a");
+    let receipt = fluree
+        .insert(receipt.ledger, &make_docs("b"))
+        .await
+        .expect("re-insert b");
+
+    let count_all = |ledger: fluree_db_api::LedgerState, tag: &'static str| {
+        let fluree = &fluree;
+        async move {
+            let sparql = format!(
+                "PREFIX ex: <http://example.org/> \
+                 SELECT (COUNT(*) AS ?c) WHERE {{ \
+                   ?s ex:sourceDocument ex:doc-{tag} . ?s ?p ?o }}"
+            );
+            let result = support::query_sparql(fluree, &ledger, &sparql)
+                .await
+                .expect("sparql count");
+            let jsonld = result
+                .to_jsonld_async(ledger.as_graph_db_ref(0))
+                .await
+                .expect("to_jsonld_async");
+            let arr = jsonld.as_array().expect("array result");
+            arr.first()
+                .and_then(JsonValue::as_array)
+                .and_then(|row| row.first())
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0)
+        }
+    };
+
+    let per_doc_triples = 4 * (1 + 1 + 32);
+    assert_eq!(
+        count_all(receipt.ledger.clone(), "a").await,
+        per_doc_triples,
+        "precondition: doc-a re-inserted into novelty over the indexed base"
+    );
+
+    let out = fluree
+        .update(
+            receipt.ledger,
+            &json!({
+                "@context": { "ex": "http://example.org/" },
+                "where": [
+                    { "@id": "?s", "ex:sourceDocument": { "@id": "ex:doc-a" } },
+                    { "@id": "?s", "?p": "?o" }
+                ],
+                "delete": { "@id": "?s", "?p": "?o" }
+            }),
+        )
+        .await
+        .expect("filtered delete");
+
+    assert_eq!(
+        count_all(out.ledger.clone(), "a").await,
+        0,
+        "every triple of the tagged subjects must be retracted through the \
+         indexed range-provider path, including all @list entries"
+    );
+    assert_eq!(
+        count_all(out.ledger, "b").await,
+        per_doc_triples,
+        "untagged doc-b subjects must be untouched"
+    );
+}
+
 /// Companion to the three-entry case: retracting a single-entry `@list`
 /// where the asserted flake has `m.i = 0`. Pins the hydration behavior
 /// for the simplest case.

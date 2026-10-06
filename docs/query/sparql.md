@@ -85,7 +85,7 @@ WHERE {
 }
 ```
 
-See [CONSTRUCT Queries](construct.md) for details.
+A `GRAPH` block in the template writes into a named graph, and annotation syntax attaches reifiers to template triples. See [CONSTRUCT Queries](construct.md) for details.
 
 ### ASK Queries
 
@@ -356,6 +356,14 @@ WHERE {
 }
 ```
 
+**Expression errors leave the variable unbound.** Per SPARQL 1.1 §18.5, when a
+`BIND` expression raises a *value* error — arithmetic on operands that have no
+operator between them, an out-of-range comparison — the row is kept and the
+target variable is simply not bound. The query does not fail and no diagnostic
+is emitted, so an unexpectedly empty column is worth reading as "this expression
+had no answer for this row", not necessarily as missing data. Use `BOUND(?var)`
+to distinguish the two.
+
 ### VALUES
 
 Provide initial bindings:
@@ -546,10 +554,15 @@ required:
 # Returns the named graph's triples even with no FROM NAMED
 SELECT ?s ?p ?o WHERE { GRAPH <urn:probegraph> { ?s ?p ?o } }
 
-# Discovers every user-registered named graph (plus the ledger alias,
-# which addresses the default graph)
+# Discovers every user-registered named graph
 SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }
 ```
+
+An unbound `GRAPH ?g` ranges over **named graphs only**, per SPARQL 1.1: it
+binds `?g` to each user-registered named graph and never to the default
+graph. The default graph remains explicitly addressable by the ledger alias
+(`GRAPH <mydb:main> { ... }`) when named directly or bound from another
+pattern — it just isn't enumerated.
 
 Only user-registered named graphs are exposed this way; the reserved system
 graphs (`#txn-meta`, `#config`) remain addressable only via an explicit
@@ -589,6 +602,127 @@ the graphs listed.
 - `HOURS(?time)` - Hours
 - `MINUTES(?time)` - Minutes
 - `SECONDS(?time)` - Seconds
+- `TZ(?dateTime)` - Timezone as a plain string. **Always `"Z"`** — see below.
+- `TIMEZONE(?dateTime)` - Timezone as an `xsd:dayTimeDuration`. **Always `"PT0S"`.**
+
+> **Timezones are normalized, not preserved.** Fluree stores temporal values as
+> UTC instants and does not keep the offset the literal was written with, so
+> `"2010-12-21T15:38:02-08:00"` and `"2010-12-21T23:38:02Z"` are the same stored
+> value. `TZ` and `TIMEZONE` therefore report UTC for everything rather than the
+> source offset, which SPARQL 1.1 §17.4.5.8-9 would expect.
+>
+> This is deliberate: the offset is only recoverable before a value is indexed,
+> so reporting it would mean the same query returned a different answer once a
+> background reindex ran — with no write in between. A constant answer is the
+> only one that does not change underneath you.
+>
+> Ordering, comparison and range queries are unaffected; they use the normalized
+> instant. If you need a wall-clock offset, store it as its own property.
+
+### Date/Time Arithmetic
+
+Subtracting one temporal value from another yields the elapsed time as an
+`xsd:dayTimeDuration`:
+
+```sparql
+SELECT ?event ?elapsed WHERE {
+  ?event ex:start ?start ;
+         ex:end   ?end .
+  BIND(?end - ?start AS ?elapsed)     # e.g. "P1DT2H30M"^^xsd:dayTimeDuration
+}
+```
+
+Defined for three operand pairs, matching the XPath operators of the same names:
+
+**Differences** — subtracting two values of the same kind gives the elapsed time:
+
+| Expression | XPath operator | Result |
+| --- | --- | --- |
+| `?dateTime - ?dateTime` | `op:subtract-dateTimes` | `xsd:dayTimeDuration` |
+| `?date - ?date` | `op:subtract-dates` | `xsd:dayTimeDuration` |
+| `?time - ?time` | `op:subtract-times` | `xsd:dayTimeDuration` |
+
+**Shifts** — adding or subtracting a duration gives back the left operand's kind:
+
+| Expression | Result |
+| --- | --- |
+| `?dateTime ± ?dayTimeDuration` | `xsd:dateTime` |
+| `?dateTime ± ?yearMonthDuration` | `xsd:dateTime` |
+| `?date ± ?dayTimeDuration` | `xsd:date` |
+| `?date ± ?yearMonthDuration` | `xsd:date` |
+| `?time ± ?dayTimeDuration` | `xsd:time` |
+| `?dayTimeDuration ± ?dayTimeDuration` | `xsd:dayTimeDuration` |
+| `?yearMonthDuration ± ?yearMonthDuration` | `xsd:yearMonthDuration` |
+
+```sparql
+BIND(?start + "P1M"^^xsd:yearMonthDuration AS ?renewal)
+BIND(?deadline - "PT48H"^^xsd:dayTimeDuration AS ?reminder)
+```
+
+Shifting is calendar-aware, with three behaviours worth knowing:
+
+- **Month arithmetic clamps to the end of the month.** `2026-01-31 + P1M` is
+  `2026-02-28`, not March 3rd — and `2028-01-31 + P1M` is `2028-02-29`, since
+  2028 is a leap year.
+- **`xsd:time` wraps within the day**, having no date to carry into:
+  `23:00:00Z + PT2H` is `01:00:00Z`.
+- **`xsd:date ± dayTimeDuration` keeps only the date part**, so a sub-day
+  duration moves nothing: `2026-01-01 + PT5H` is still `2026-01-01`.
+
+The two duration families never mix — `?dayTimeDuration + ?yearMonthDuration` is
+a type error, because months have no fixed length. So is `?time ± ?yearMonthDuration`,
+since a time carries no months. Computed values render in the canonical form of
+their kind: a `dateTime` in UTC with a `Z`, a `date` or `time` with no timezone
+designator.
+
+
+**Semantics:**
+
+- **Signed.** `?end - ?start` is negative when the end precedes the start, e.g.
+  `-P1D`. It is an elapsed difference, not an absolute magnitude.
+- **`xsd:dateTime` is an instant.** A dateTime is UTC from the moment it is
+  parsed, so `"2026-01-01T13:00:00+03:00" - "2026-01-01T10:00:00Z"` is `PT0S` —
+  the same instant written two ways — not the three hours the wall-clock
+  readings differ by. A lexical form with no timezone is read as UTC.
+- **`xsd:date` and `xsd:time` carry no offset** (deviation, see below). Fluree
+  does not support timezone offsets: on a `date` or `time` the designator is
+  validated and discarded, not applied, so `"2026-01-01+05:00"` *is*
+  `"2026-01-01"` and `"17:00:00-06:00"` *is* `"17:00:00"`. Arithmetic therefore
+  subtracts calendar dates and wall clocks: `"2026-01-01+05:00" - "2026-01-01Z"`
+  is `PT0S` rather than the `-PT5H` XPath gives. Full statement under
+  [Timezone offsets are not supported](../reference/compatibility.md). Store an
+  offset you need to keep as its own property.
+- **Subtraction only.** `+`, `*`, `/` and `%` are not defined over temporal
+  operands, and neither are mixed pairs such as `?dateTime - ?date`. These are
+  type errors, which inside `BIND` means the variable is left **unbound** rather
+  than raising — see [Expression errors](#bind).
+
+> **Beyond the standard.** SPARQL 1.1 maps `-` only over numeric operands, and
+> the SPARQL 1.2 draft does not extend it either — a conformant processor is
+> free to answer a type error here. Fluree follows
+> [SEP-0002](https://github.com/w3c/sparql-dev/blob/main/SEP/SEP-0002/sep-0002.md),
+> the community proposal that specifies these operators, and matches its XPath
+> semantics wherever an offset is not in play — that is, for every
+> `xsd:dateTime` operand, and for `xsd:date`/`xsd:time` operands written without
+> one. Where an `xsd:date` or `xsd:time` is written with an offset, the bullet
+> above applies and the answers differ; XPath's own `op:subtract-times` example
+> (`"17:00:00-06:00" - "08:00:00+09:00"` = `P1D`) is one such case, and Fluree
+> answers `PT9H`. Queries relying on any of this are not portable to processors
+> that implement only the published spec.
+
+Also supported from SEP-0002: ordering and equality over `xsd:date`,
+`xsd:time`, `xsd:dayTimeDuration` and `xsd:yearMonthDuration` (`<`, `>`, `=`),
+and the `YEAR`/`MONTH`/`DAY` and `HOURS`/`MINUTES`/`SECONDS` accessors over
+`xsd:date` and `xsd:time`.
+
+`ADJUST()` is **not supported and not planned**. SEP-0002 adds it (SPARQL 1.1
+and the 1.2 draft define no such function), but its whole purpose is to set or
+change a value's timezone offset — the one property Fluree deliberately does not
+keep. A result whose only distinguishing feature is an offset would be discarded
+on write and reported as `Z` on read, so supporting it would suggest offsets are
+preserved when they are not. Calling it is a parse error. To render an instant
+in a particular zone, do it in the application, or store the offset as its own
+property.
 
 ### Type Conversion
 
@@ -860,7 +994,7 @@ WHERE {
 
 Time specifiers:
 - `@t:100` - Transaction number
-- `@iso:2024-01-15T10:30:00Z` - ISO 8601 datetime
+- `@time:2024-01-15T10:30:00Z` - ISO 8601 datetime
 - `@commit:bafybeig...` - Commit ContentId
 - `@t:latest` - Current/latest state
 
@@ -909,8 +1043,8 @@ PREFIX ex: <http://example.org/ns/>
 PREFIX f: <https://ns.flur.ee/db#>
 
 SELECT ?name ?t ?op
-FROM <ledger:main@iso:2024-01-01T00:00:00Z>
-TO <ledger:main@iso:2024-12-31T23:59:59Z>
+FROM <ledger:main@time:2024-01-01T00:00:00Z>
+TO <ledger:main@time:2024-12-31T23:59:59Z>
 WHERE {
   << ex:alice ex:name ?name >> f:t ?t .
   << ex:alice ex:name ?name >> f:op ?op .
@@ -956,7 +1090,7 @@ INSERT DATA {
 }
 ```
 
-Annotation tails are supported in `INSERT DATA`, `DELETE DATA`, and `INSERT { } WHERE { }` / `DELETE { } WHERE { }` templates. Per-operation reifier rules (e.g. variables are template-only; blank/anonymous reifiers are rejected in `DELETE DATA`) are tabulated in the [concept doc](../concepts/edge-annotations.md#sparql-update-rules-by-operation).
+Annotation tails are supported in `INSERT DATA`, `DELETE DATA`, and `INSERT { } WHERE { }` / `DELETE { } WHERE { }` templates, and in `CONSTRUCT` templates, where they carry reifiers into every result format (see [CONSTRUCT](construct.md#edge-annotations-in-the-template)). Per-operation reifier rules (e.g. variables are template-only; blank/anonymous reifiers are rejected in `DELETE DATA`) are tabulated in the [concept doc](../concepts/edge-annotations.md#sparql-update-rules-by-operation).
 
 ### Boundaries (rejected at parse / lowering time)
 
@@ -964,7 +1098,7 @@ Annotation tails are supported in `INSERT DATA`, `DELETE DATA`, and `INSERT { } 
 - **Simple-predicate triples only.** `?s ex:p1/ex:p2 ?o {| ... |}` (property-path) is rejected.
 - **Triple terms only as `rdf:reifies` objects**; any other use errors at parse time.
 - **No reserved predicates by hand.** The [system predicates](../reference/vocabulary.md#edge-annotation-predicates-reserved) that back annotations are rejected on every UPDATE clause; mint annotations only through the `~` / `{| |}` surface.
-- **No annotations in `CONSTRUCT` templates** (the template output form is deferred); a `CONSTRUCT` whose `WHERE` uses annotations to filter still works.
+- **`CONSTRUCT` template annotation blocks take simple predicates only**, and a template triple term cannot nest.
 - **SPARQL 1.2 triple-term functions** (`TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, and the `BIND(<<( ?s ?p ?o )>> AS ?t)` constructor) are deferred.
 
 ## SPARQL UPDATE
@@ -1064,9 +1198,31 @@ WHERE {
 
 SPARQL UPDATE `MODIFY` supports dataset scoping for named graphs:
 
-- **`WITH <iri>`**: sets the default graph for INSERT/DELETE templates that don’t use an explicit `GRAPH <iri> { ... }` block.
-- **`USING <iri>`**: scopes the default graph(s) for `WHERE` evaluation. Repeated `USING` clauses are evaluated as a **merged default graph**.
-- **`USING NAMED <iri>`**: scopes which named graphs are visible to `WHERE` `GRAPH <iri> { ... }` patterns. Repeated `USING NAMED` clauses allow multiple named graphs.
+- **`WITH <iri>`**: sets the default graph for INSERT/DELETE templates that don’t use an explicit `GRAPH <iri> { ... }` block. With no `USING` or `USING NAMED` clause, it also sets the default graph for `WHERE` evaluation. A graph that doesn’t exist reads as empty, so the `WHERE` matches nothing; it never falls back to the ledger’s default graph.
+- **`USING <iri>`**: scopes the default graph(s) for `WHERE` evaluation. Repeated `USING` clauses are evaluated as a **merged default graph**. A graph that doesn’t exist contributes nothing, so a lone `USING` of an unknown graph gives the `WHERE` an empty default graph.
+- **`USING NAMED <iri>`**: scopes which named graphs are visible to `WHERE` `GRAPH <iri> { ... }` patterns. Repeated `USING NAMED` clauses allow multiple named graphs. With `USING NAMED` and no `USING`, the `WHERE`’s default graph is empty.
+
+The ledger’s own address (`mydb`, `mydb:main` or `urn:fluree:mydb:main`, with no `#fragment` and no time pin) names the ledger’s default graph in `USING` and `WITH`. `WITH <mydb:main>` therefore reads and writes the default graph and never creates a named graph called `mydb:main`. Only these two clauses treat the address this way: a `GRAPH <iri>` block in a template or in the `WHERE`, `USING NAMED`, and an `INSERT DATA`/`DELETE DATA` quad resolve it like any other graph IRI. The reserved graphs keep their own IRIs, such as `urn:fluree:mydb:main#config`.
+
+`urn:default`, the name [`/info`](../api/endpoints.md#get-infoledger-id) lists the default graph under, names the default graph in every clause that reads a graph: `USING`, `USING NAMED`, `WITH`, and `GRAPH <urn:default>` in the `WHERE`. `WITH <urn:default>` also writes the default graph. The default graph is not a named graph, so a write that names one by it (a `GRAPH <urn:default>` template or `INSERT DATA` quad, `CREATE GRAPH`, or a `CLEAR`/`DROP`/`ADD`/`COPY`/`MOVE` operand) is refused with a `400`; leave out `GRAPH`, or write `DEFAULT` in graph management.
+
+### Graph variables in templates
+
+A `GRAPH ?g { ... }` block in an INSERT or DELETE template writes to whichever graph `?g` names in each `WHERE` solution. This rewrites every match in the graph it was found in:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+DELETE { GRAPH ?g { ?s ex:status "old" } }
+INSERT { GRAPH ?g { ?s ex:status "new" } }
+WHERE  { GRAPH ?g { ?s ex:status "old" } }
+```
+
+`DELETE WHERE { GRAPH ?g { ... } }` works the same way.
+
+- In `WHERE`, `GRAPH ?g` ranges over the ledger's user named graphs. The default graph and the reserved `#config` and `#txn-meta` graphs are not enumerated; `#config` remains readable as `GRAPH <urn:fluree:<ledger>#config>`.
+- `?g` may name a graph that does not exist yet, for example one built with `BIND(IRI(...) AS ?g)`. The commit registers it.
+- A solution that leaves `?g` unbound writes nothing for that block. A `?g` bound to a literal or a blank node is an error, as is a `?g` that names `#txn-meta`.
 
 ### Blank Nodes in INSERT
 
@@ -1110,13 +1266,34 @@ INSERT DATA {
 }
 ```
 
+### Multi-operation requests
+
+A single request may contain multiple operations separated by `;`. Operations
+execute **sequentially** — each operation's `WHERE` observes the graph-store
+state left by the previous one (SPARQL 1.1 Update §3.1) — and the whole
+request commits as **one atomic transaction**: one commit, one `t`, and a
+failure anywhere aborts the entire request with no partial effects.
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+INSERT DATA { ex:s ex:p "first" } ;
+INSERT { ?s ex:q "second" } WHERE { ?s ex:p "first" }
+```
+
+Validation (policy, SHACL, uniqueness) runs **per operation** against the
+sequential state, not once against the final state. A request that is
+transiently invalid but finally valid — say, an operation that duplicates a
+unique property value that a later operation would free up — aborts at the
+offending operation. Ordered uniqueness checking requires this; for SHACL it
+is a deliberate choice (every intermediate state must satisfy the shapes,
+like a database without deferred constraints).
+
 ### SPARQL UPDATE Restrictions
 
 Current restrictions / boundaries:
 
-- **Graph management operations**: `LOAD`, `CLEAR`, `DROP`, `CREATE`, `ADD`, `MOVE`, `COPY` are not yet supported.
-- **Template graph variables**: INSERT/DELETE templates support `GRAPH <iri> { ... }` blocks, but `GRAPH ?g { ... }` is not yet supported.
-- **DELETE WHERE + GRAPH blocks**: `GRAPH <iri> { ... }` blocks are not yet supported inside `DELETE WHERE { ... }`.
+- **Graph management operations**: `CREATE`, `CLEAR`, `DROP`, `ADD`, `MOVE` and `COPY` are supported, and `CLEAR`/`DROP` accept `GRAPH <iri>`, `DEFAULT`, `NAMED` and `ALL`. `DROP` behaves like `CLEAR`: the graph registry is additive, so a dropped graph stays registered but empty. These operations refuse the reserved `#config` and `#txn-meta` graphs. Remote `LOAD` is not supported; `LOAD SILENT` is accepted as a no-op.
 - **SERVICE**: Only local-ledger endpoints of the form `fluree:ledger:<name>[:<branch>]` are supported; arbitrary remote HTTP `SERVICE` endpoints are not supported.
 - **Property paths**: Supported in `WHERE` (subject to Fluree capability settings).
 - **Edge annotations are default-graph only**: an annotation tail (`{| ... |}`) inside an explicit `GRAPH { }` block or under a `WITH <g>` template is rejected; a blank or anonymous reifier is rejected in `DELETE DATA`. See [Edge annotations](#edge-annotations-sparql-12--rdf-12) for the full boundary list.
@@ -1147,11 +1324,54 @@ curl -X POST http://localhost:8090/v1/fluree/update \
       INSERT DATA { ex:alice ex:name "Alice" }'
 ```
 
+## Request options (`# PRAGMA`)
+
+A SPARQL request carries Fluree options in comments of the form `# PRAGMA name: value`. They are the SPARQL counterpart of a JSON-LD request's `opts` block and of the `fluree-*` [request headers](../api/headers.md#fluree-request-headers), and because they are comments, the text stays valid SPARQL for any other tool.
+
+```sparql
+# PRAGMA max-fuel: 5000
+# PRAGMA meta: fuel, time
+# PRAGMA policy-class: ex:EmployeeClass
+PREFIX ex: <http://example.org/ns/>
+
+SELECT ?name WHERE { ?person ex:name ?name }
+```
+
+| Pragma | Value | Applies to | JSON-LD `opts` | Header |
+|--------|-------|------------|----------------|--------|
+| `reasoning` | `rdfs`, `owl2ql`, `owl2rl`, `datalog`, `owl-datalog`, `none`, or a list | queries | `reasoning` | — |
+| `reasoning-max-facts`, `reasoning-max-seconds`, `reasoning-max-memory-mb` | integer | queries | `reasoningBudget` | — |
+| `include-system-facts` | `true` / `false` | queries | `includeSystemFacts` | — |
+| `union-default-graph` | `true` / `false` | queries | `unionDefaultGraph` | — |
+| `min-t` | transaction `t` | queries | `min-t` | `fluree-min-t` |
+| `meta` | `true`, `false`, or a list of `time`, `fuel`, `policy` | queries and updates | `meta` | `fluree-track-*` |
+| `max-fuel` | number | queries and updates | `max-fuel` | `fluree-max-fuel` |
+| `identity` | IRI | queries and updates | `identity` | `fluree-identity` |
+| `policy-class` | IRI list | queries and updates | `policy-class` | `fluree-policy-class` |
+| `policy-values` | one-line JSON object | queries and updates | `policy-values` | `fluree-policy-values` |
+| `default-allow` | `true` / `false` | queries and updates | `default-allow` | `fluree-default-allow` |
+| `event-time` | RFC 3339 timestamp | updates | `eventTime` | — |
+| `validation-mode` | `warn` / `reject` | updates | `validationMode` | — |
+| `unique-properties` | IRI list | updates | `uniqueProperties` | — |
+
+Rules:
+
+- **A comment whose first word is `PRAGMA` is a directive.** The name is case-insensitive, the `:` is optional, and list values are separated by commas or spaces. A pragma may sit anywhere a comment can, including after the query. When one repeats, the last wins.
+- **Errors are never silent.** An unknown name, a malformed value, or a pragma that does not apply to the request (`min-t` on an update, `event-time` on a query) fails the request with a `400` (diagnostic `F012`), rather than running it without the option it asked for.
+- **IRIs** may be written `<…>` or as a prefixed name the request declares with `PREFIX`; anything else (a DID, a URN) is taken as written.
+- **A pragma wins over the header** that names the same option, as a JSON-LD body's `opts` do, with three exceptions:
+  - **`meta` adds tracking.** The request reports what the pragma asks for and what the `fluree-track-*` headers ask for; a pragma cannot switch off tracking a header requested.
+  - **`max-fuel` is a cap.** The request runs under the smaller of the pragma and the `fluree-max-fuel` header, so a pragma can lower a limit but never raise it.
+  - **On an authenticated request, policy pragmas cannot change the headers' policy selection.** When a request carries a bearer token or a signature and its headers select policy (`fluree-identity`, `fluree-policy-class`, `fluree-policy`, `fluree-policy-values` or `fluree-default-allow`), a policy pragma may repeat that selection or narrow `default-allow` to `false`. Any other policy pragma is refused with a `403`, including one that names an option the headers left unset. This lets an application that forwards its users' SPARQL pin policy with headers. When the headers select nothing, the pragmas select.
+- **Policy pragmas are held to the caller's credential exactly as headers are.** A selection the credential does not permit is refused with a `403`. The inline policy document has no pragma; send it with the `fluree-policy` header. See [Policy in queries](../security/policy-in-queries.md#sparql-queries).
+- **In a multi-query envelope**, a SPARQL alias's pragmas act as its body `opts`, so they win over the alias's and the envelope's `opts`. The same exceptions apply: a pragma's `meta` adds to the alias's `opts.meta`, its `max-fuel` cannot raise the alias's `opts.max-fuel`, and on an authenticated request a policy pragma may only repeat the selection that the envelope and alias `opts` make.
+- **The MCP `sparql_query` tool** refuses policy and `min-t` pragmas: the connection's identity selects policy, and the tool's `t` argument pins the snapshot.
+
 ## Best Practices
 
 1. **Use PREFIX Declarations**: Makes queries readable
 2. **Automatic Pattern Optimization**: The query planner automatically reorders patterns for efficient execution using statistics-driven cardinality estimates
-3. **Flexible FILTER Placement**: Filters can be placed anywhere in the WHERE clause — the query engine automatically applies each filter as soon as all its required variables are bound
+3. **Flexible FILTER Placement**: Filters, including `FILTER EXISTS` and `FILTER NOT EXISTS`, can be placed anywhere in their group — the query engine applies each one to the whole group, as soon as every variable it reads has its final value. A variable that an `OPTIONAL` or an `UNDEF` in `VALUES` leaves unbound on some rows waits for any later pattern that fills it in
 4. **Limit Results**: Use LIMIT for large result sets
 5. **Avoid Cartesian Products**: Structure queries to avoid large joins
 

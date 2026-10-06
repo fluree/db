@@ -215,12 +215,7 @@ pub fn predicate_string_fold_operator(
                 return Ok(None);
             };
             // Persisted index rows only — defer when novelty is present.
-            if ctx
-                .overlay
-                .map(fluree_db_core::OverlayProvider::epoch)
-                .unwrap_or(0)
-                != 0
-            {
+            if crate::fast_path_common::overlay_has_novelty(ctx) {
                 return Ok(None);
             }
             let pred_sid = normalize_pred_sid(store, &predicate)?;
@@ -310,7 +305,7 @@ fn scan_string_fold(
                                 leaf_entry.sidecar_cid.as_ref(),
                                 false,
                             )
-                            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?,
+                            .map_err(|e| QueryError::from_io("leaf open", e))?,
                     );
                 }
                 let projection = if entry.o_type_const.is_some() {

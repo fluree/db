@@ -9,6 +9,7 @@ pub fn validate_min_count(values: &[FlakeValue], min: usize) -> Option<Constrain
         Some(ConstraintViolation {
             constraint: Constraint::MinCount(min),
             value: None,
+            value_index: None,
             message: format!(
                 "Expected at least {} value(s) but found {}",
                 min,
@@ -26,6 +27,7 @@ pub fn validate_max_count(values: &[FlakeValue], max: usize) -> Option<Constrain
         Some(ConstraintViolation {
             constraint: Constraint::MaxCount(max),
             value: None,
+            value_index: None,
             message: format!(
                 "Expected at most {} value(s) but found {}",
                 max,

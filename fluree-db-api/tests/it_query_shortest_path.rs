@@ -4,7 +4,9 @@
 //! Graph (ex:knows): a→b→d, a→c→d (two 2-hop paths), a→e→f→d (a 3-hop path).
 //! So the shortest a→d distance is 2 hops, reachable two ways.
 
-use crate::support::{genesis_ledger, graphdb_from_ledger, MemoryFluree};
+use crate::support::{
+    genesis_ledger, graphdb_from_ledger, rebuild_and_publish_index, MemoryFluree,
+};
 use serde_json::{json, Value as JsonValue};
 
 fn ctx() -> JsonValue {
@@ -159,4 +161,64 @@ async fn shortest_path_unknown_predicate_no_rows() {
     });
     let r = rows(&fluree, &ledger, &q).await;
     assert_eq!(r.len(), 0);
+}
+
+/// The batched frontier must merge base edges with the novelty delta: a
+/// novelty-added shortcut wins over a longer indexed path, and a retracted
+/// indexed edge stops being traversable (base-row masking).
+#[tokio::test]
+async fn shortest_path_merges_novelty_over_index() {
+    let fluree = fluree_db_api::FlureeBuilder::memory().build_memory();
+    seed_graph(&fluree, "it/sp:novelty-merge").await;
+    rebuild_and_publish_index(&fluree, "it/sp:novelty-merge").await;
+    let ledger = fluree.ledger("it/sp:novelty-merge").await.expect("reload");
+
+    // Novelty adds a direct a→d edge: shortest drops from 2 hops to 1.
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:a",
+                "ex:knows": {"@id": "ex:d"}
+            }),
+        )
+        .await
+        .expect("novelty shortcut")
+        .ledger;
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?len"],
+        "where": [
+            ["shortestPath", {"from": "ex:a", "to": "ex:d", "via": "ex:knows", "bind": "?p"}],
+            ["bind", "?len", "(size (nodes ?p))"]
+        ]
+    });
+    let r = rows(&fluree, &ledger, &q).await;
+    assert_eq!(first_i64(&r[0]), 2, "novelty shortcut: 1 hop = 2 nodes");
+
+    // Retract the shortcut and both 2-hop middles' outgoing edges: the
+    // only remaining route is the indexed 3-hop a→e→f→d.
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "delete": [
+                    {"@id": "ex:a", "ex:knows": {"@id": "ex:d"}},
+                    {"@id": "ex:b", "ex:knows": {"@id": "ex:d"}},
+                    {"@id": "ex:c", "ex:knows": {"@id": "ex:d"}}
+                ],
+                "where": []
+            }),
+        )
+        .await
+        .expect("retract edges")
+        .ledger;
+    let r = rows(&fluree, &ledger, &q).await;
+    assert_eq!(
+        first_i64(&r[0]),
+        4,
+        "retracted base edges must not traverse: 3-hop path has 4 nodes"
+    );
 }

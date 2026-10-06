@@ -106,6 +106,16 @@ pub fn memory_to_turtle_block(mem: &Memory) -> String {
     )
     .unwrap();
 
+    // mem:updatedAt (optional; present once the memory has been updated or re-verified)
+    if let Some(u) = &mem.updated_at {
+        writeln!(
+            s,
+            "    mem:updatedAt \"{}\"^^xsd:dateTime ;",
+            escape_turtle_string(u)
+        )
+        .unwrap();
+    }
+
     // Type-specific optional predicates
     if let Some(r) = &mem.rationale {
         writeln!(s, "    mem:rationale \"{}\" ;", escape_turtle_string(r)).unwrap();
@@ -378,7 +388,16 @@ fn inject_fulltext_value(val: Value) -> Value {
                     Value::String(s) => s.clone(),
                     other => other.to_string(),
                 };
-                json!({"@value": text, "@type": "@fulltext"})
+                let mut out = json!({"@value": text, "@type": "@fulltext"});
+                // Carry the attachment across. Rebuilding the value object
+                // from scratch used to drop it, so importing
+                // `mem:content "…" {| ex:source ex:hr |}` kept the text,
+                // lost the claim, and left its body behind as a node
+                // nothing points at.
+                if let Some(ann) = map.get("@annotation") {
+                    out["@annotation"] = ann.clone();
+                }
+                out
             } else {
                 // Unexpected shape — return as-is
                 Value::Object(map)
@@ -431,21 +450,12 @@ pub fn normalize_unicode_quotes(s: &str) -> String {
 
 /// Escape special characters for Turtle string literals.
 ///
-/// First normalizes Unicode smart quotes to ASCII equivalents, then escapes:
-/// `\` → `\\`, `"` → `\"`, newline → `\n`, tab → `\t`, carriage return → `\r`.
+/// First normalizes Unicode smart quotes to ASCII equivalents, then escapes
+/// in canonical N-Triples form (see [`fluree_graph_ir::syntax::escape_string`]).
 pub fn escape_turtle_string(s: &str) -> String {
     let normalized = normalize_unicode_quotes(s);
     let mut out = String::with_capacity(normalized.len());
-    for ch in normalized.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c => out.push(c),
-        }
-    }
+    fluree_graph_ir::syntax::push_string(&mut out, &normalized);
     out
 }
 
@@ -461,6 +471,27 @@ pub fn user_ttl_path(memory_dir: &Path) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fulltext_injection_keeps_an_annotation_on_the_value() {
+        // `mem:content` and `mem:rationale` are re-wrapped as `@fulltext`
+        // values on import. The rebuild used to start from an empty object,
+        // so an attachment on the literal was dropped: the text imported,
+        // the claim did not, and the claim's body stayed behind as an
+        // unreachable node.
+        let annotated = json!({
+            "@value": "the text",
+            "@annotation": {"@id": "ex:claim1", "ex:source": "hr"}
+        });
+        let out = inject_fulltext_value(annotated);
+        assert_eq!(out["@value"], "the text");
+        assert_eq!(out["@type"], "@fulltext");
+        assert_eq!(
+            out["@annotation"]["@id"], "ex:claim1",
+            "the attachment must survive the re-wrap: {out}"
+        );
+    }
+
     use super::*;
     use crate::types::{Scope, Severity};
 
@@ -475,9 +506,43 @@ mod tests {
             artifact_refs: vec!["Cargo.toml".to_string()],
             branch: Some("main".to_string()),
             created_at: "2026-02-24T10:30:00+00:00".to_string(),
+            updated_at: None,
             rationale: None,
             alternatives: None,
         }
+    }
+
+    #[test]
+    fn import_keeps_turtle_star_annotations_as_annotation_blocks() {
+        // The importer converts Turtle to JSON-LD; an RDF 1.2 reifier on a
+        // memory's edge must survive as an `@annotation` block rather than
+        // failing the whole import (the pre-fix behavior).
+        let turtle = "@prefix mem: <https://ns.flur.ee/memory#> .\n\
+                      @prefix ex: <http://example.org/> .\n\
+                      mem:fact-1 a mem:Fact ;\n\
+                        mem:content \"Rules can read claims\" ;\n\
+                        ex:supersedes mem:fact-0 ~ ex:claim1 {| ex:confidence 0.9 |} .\n";
+        let doc = parse_and_inject_fulltext(turtle)
+            .expect("Turtle-star memory file parses")
+            .expect("memory nodes present");
+        let graph = doc["@graph"].as_array().expect("@graph");
+        let fact = graph
+            .iter()
+            .find(|n| n["@id"] == "https://ns.flur.ee/memory#fact-1")
+            .expect("fact node");
+        assert_eq!(
+            fact["https://ns.flur.ee/memory#content"][0]["@type"], "@fulltext",
+            "fulltext injection still applies: {fact:#}"
+        );
+        let edge = &fact["http://example.org/supersedes"][0];
+        assert_eq!(edge["@id"], "https://ns.flur.ee/memory#fact-0");
+        assert_eq!(edge["@annotation"]["@id"], "http://example.org/claim1");
+        assert!(
+            graph
+                .iter()
+                .any(|n| n["@id"] == "http://example.org/claim1"),
+            "the claim body is a node of its own: {graph:#?}"
+        );
     }
 
     #[test]
@@ -507,6 +572,41 @@ mod tests {
 
         let block = memory_to_turtle_block(&mem);
         assert!(block.contains("mem:severity \"must\""));
+    }
+
+    #[test]
+    fn turtle_block_writes_updated_at_after_created_at() {
+        let mut mem = make_test_memory();
+        mem.updated_at = Some("2026-07-30T09:00:00+00:00".to_string());
+
+        let block = memory_to_turtle_block(&mem);
+        let created = block.find("mem:createdAt").expect("createdAt present");
+        let updated = block
+            .find("mem:updatedAt \"2026-07-30T09:00:00+00:00\"^^xsd:dateTime")
+            .expect("updatedAt present as a typed dateTime");
+        assert!(created < updated, "updatedAt follows createdAt");
+    }
+
+    #[test]
+    fn updated_at_survives_the_import_round_trip() {
+        let mut mem = make_test_memory();
+        mem.updated_at = Some("2026-07-30T09:00:00+00:00".to_string());
+
+        let ttl = format!("{TURTLE_PREFIXES}\n{}", memory_to_turtle_block(&mem));
+        let parsed = parse_and_inject_fulltext(&ttl)
+            .expect("parses")
+            .expect("has nodes");
+        let node = &parsed["@graph"][0];
+        assert!(
+            node.to_string().contains("2026-07-30T09:00:00"),
+            "updatedAt must reach the ledger import payload: {node}"
+        );
+    }
+
+    #[test]
+    fn turtle_block_omits_updated_at_when_never_updated() {
+        let block = memory_to_turtle_block(&make_test_memory());
+        assert!(!block.contains("mem:updatedAt"));
     }
 
     #[test]

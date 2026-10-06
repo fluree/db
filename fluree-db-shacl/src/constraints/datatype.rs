@@ -17,6 +17,7 @@ pub fn validate_datatype(
         Some(ConstraintViolation {
             constraint: Constraint::Datatype(expected_dt.clone()),
             value: Some(value.clone()),
+            value_index: None,
             message: format!(
                 "Expected datatype {} but found {}",
                 expected_dt.name, actual_dt.name
@@ -55,6 +56,7 @@ pub fn validate_node_kind(
         Some(ConstraintViolation {
             constraint: Constraint::NodeKind(expected_kind),
             value: Some(value.clone()),
+            value_index: None,
             message: format!("Expected node kind {expected_kind:?} but found {actual_kind:?}"),
         })
     } else {

@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "query_id": "q060",
+  "result_hash": "379801aacd17521249cd029943b8d64a63ecc454f50a07c7d81e73e819a441f7",
+  "rows": 15,
+  "head_rows": [
+    "Online\u001f28\u001fPopup",
+    "Online\u001f42\u001fStandard",
+    "Online\u001f45\u001fOutlet",
+    "Online\u001f45\u001fWarehouse",
+    "Online\u001f49\u001fFlagship",
+    "Retail\u001f29\u001fPopup",
+    "Retail\u001f31\u001fFlagship",
+    "Retail\u001f34\u001fOutlet",
+    "Retail\u001f42\u001fStandard",
+    "Retail\u001f42\u001fWarehouse",
+    "Wholesale\u001f18\u001fWarehouse",
+    "Wholesale\u001f21\u001fOutlet",
+    "Wholesale\u001f23\u001fPopup",
+    "Wholesale\u001f23\u001fStandard",
+    "Wholesale\u001f28\u001fFlagship"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KXR2ADH8TH3Q7RGT7E2D15DM",
+    "commit": "40bfb04bf"
+  }
+}

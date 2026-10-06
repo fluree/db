@@ -73,7 +73,7 @@ pub(crate) fn assemble_response(
             AliasOutcomeKind::Success { data, tally } => {
                 success_count += 1;
                 if include_meta {
-                    accumulate_fuel(&mut fuel_total, tally.as_ref());
+                    accumulate_fuel(&mut fuel_total, tally.as_deref());
                 }
 
                 let entry = data;
@@ -88,7 +88,7 @@ pub(crate) fn assemble_response(
                     });
                 }
                 if let Some(t) = tally {
-                    tracking.insert(alias.clone(), t);
+                    tracking.insert(alias.clone(), *t);
                 }
                 results.insert(alias, entry);
             }
@@ -361,12 +361,15 @@ mod tests {
             alias: "a".into(),
             kind: AliasOutcomeKind::Success {
                 data: serde_json::json!([]),
-                tally: Some(TrackingTally {
+                tally: Some(Box::new(TrackingTally {
                     time: Some("3ms".into()),
                     fuel: Some(123.0),
                     policy: None,
+                    policy_enforcement: None,
                     reasoning: None,
-                }),
+                    sql: None,
+                    sql_elided: None,
+                })),
             },
         }];
         let snap = snapshot_with(&[("ledgerA", 42)]);
@@ -391,7 +394,7 @@ mod tests {
             alias: alias.to_string(),
             kind: AliasOutcomeKind::Success {
                 data,
-                tally: Some(tally),
+                tally: Some(Box::new(tally)),
             },
         }
     }
@@ -406,7 +409,10 @@ mod tests {
                     time: Some("5ms".into()),
                     fuel: Some(12.3),
                     policy: None,
+                    policy_enforcement: None,
                     reasoning: None,
+                    sql: None,
+                    sql_elided: None,
                 },
             ),
             success_with_tally(
@@ -416,7 +422,10 @@ mod tests {
                     time: Some("3ms".into()),
                     fuel: Some(8.1),
                     policy: None,
+                    policy_enforcement: None,
                     reasoning: None,
+                    sql: None,
+                    sql_elided: None,
                 },
             ),
         ];
@@ -449,7 +458,10 @@ mod tests {
                     time: Some("5ms".into()),
                     fuel: Some(10.0),
                     policy: None,
+                    policy_enforcement: None,
                     reasoning: None,
+                    sql: None,
+                    sql_elided: None,
                 },
             ),
             success("brian", serde_json::json!([])),
@@ -472,7 +484,10 @@ mod tests {
                     time: None,
                     fuel: Some(1.0),
                     policy: None,
+                    policy_enforcement: None,
                     reasoning: None,
+                    sql: None,
+                    sql_elided: None,
                 },
             ),
             success_with_tally(
@@ -482,7 +497,10 @@ mod tests {
                     time: None,
                     fuel: Some(2.0),
                     policy: None,
+                    policy_enforcement: None,
                     reasoning: None,
+                    sql: None,
+                    sql_elided: None,
                 },
             ),
         ];

@@ -15,7 +15,7 @@ use crate::{
 use async_trait::async_trait;
 use fluree_db_api::{
     ApiError, Base64Bytes, Fluree, GovernanceOptions, GraphDb, LedgerHandle, LedgerManager,
-    PolicyContext, PushCommitsRequest, RefreshOpts, TransactError, Txn,
+    PolicyContext, PushCommitsRequest, RefreshOpts, TransactError,
 };
 use fluree_db_ledger::IndexConfig;
 use std::sync::Arc;
@@ -98,6 +98,8 @@ impl Committer for LocalCommitter {
             governance,
         } = request;
 
+        let ledger_id = fluree_db_core::LedgerId::expect_canonical(&ledger_id, "LocalTransactor")
+            .map_err(|e| execution_failure(e.into()))?;
         let ledger_handle = self
             .ledger_manager()?
             .get_or_load(&ledger_id)
@@ -113,7 +115,8 @@ impl Committer for LocalCommitter {
         // `CommitOpts` / `TrackingOptions`.
         let mut last_error: Option<ApiError> = None;
         for attempt in 1..=MAX_TXN_RETRIES {
-            let policy_ctx = build_policy_context(&ledger_handle, &governance).await?;
+            let policy_ctx =
+                build_policy_context(&self.fluree, &ledger_handle, &governance).await?;
 
             // Cypher lowers to a `Txn` here — under the write lock and re-resolved
             // each retry attempt — rather than pre-lock in the route. A conditional
@@ -131,6 +134,7 @@ impl Committer for LocalCommitter {
                         query,
                         params.as_ref(),
                         &governance,
+                        txn_opts.skolem_txn_id.clone(),
                     )
                     .await
                     .map_err(execution_failure)?,
@@ -147,13 +151,43 @@ impl Committer for LocalCommitter {
                 TransactionBody::JsonLdInsert(json) => staged.insert(json),
                 TransactionBody::JsonLdUpsert(json) => staged.upsert(json),
                 TransactionBody::JsonLdUpdate(json) => staged.update(json),
+                TransactionBody::JsonLdGraphSync { graph_iri, body } => staged.sync_graph_payload(
+                    crate::graph_sel(graph_iri),
+                    fluree_db_api::GraphPayload::JsonLd(body),
+                    false,
+                ),
+                TransactionBody::RdfGraphSync {
+                    graph_iri,
+                    text,
+                    allow_empty,
+                } => staged.sync_graph_payload(
+                    crate::graph_sel(graph_iri),
+                    fluree_db_api::GraphPayload::Rdf(text),
+                    *allow_empty,
+                ),
+                TransactionBody::GraphInsert { graph_iri, payload } => {
+                    let payload = match payload {
+                        crate::GraphBody::JsonLd(json) => fluree_db_api::GraphPayload::JsonLd(json),
+                        crate::GraphBody::Rdf(text) => fluree_db_api::GraphPayload::Rdf(text),
+                    };
+                    staged.insert_graph_payload(crate::graph_sel(graph_iri), payload)
+                }
                 TransactionBody::TurtleInsert(text) => staged.insert_turtle(text.as_str()),
                 TransactionBody::TurtleUpsert(text) | TransactionBody::TrigUpsert(text) => {
                     staged.upsert_turtle(text.as_str())
                 }
                 TransactionBody::Sparql(query) => staged.sparql_update(query.as_str()),
                 TransactionBody::Cypher { .. } => {
-                    staged.txn(cypher_txn.expect("cypher_txn is Some for a Cypher body"))
+                    match cypher_txn.expect("cypher_txn is Some for a Cypher body") {
+                        CypherWriteUnderLock::Resolved(resolved) => {
+                            let staged = staged.txn(resolved.primary);
+                            match resolved.followup {
+                                Some(followup) => staged.txn_followup(followup),
+                                None => staged,
+                            }
+                        }
+                        CypherWriteUnderLock::Sequential(input) => staged.cypher_sequential(*input),
+                    }
                 }
             };
             let mut builder = staged
@@ -166,6 +200,9 @@ impl Committer for LocalCommitter {
             if let Some(policy) = policy_ctx {
                 builder = builder.policy(policy);
             }
+            // The verified identity rides governance from the route; the
+            // SHACL override gate reads it from here, not from the policy.
+            builder = builder.server_identity(governance.server_identity.clone());
 
             match builder.execute().await {
                 Ok(result) => {
@@ -173,6 +210,7 @@ impl Committer for LocalCommitter {
                         idempotency_key,
                         commit: result.receipt,
                         tally: result.tally,
+                        cypher_return: result.cypher_return,
                     });
                 }
                 Err(e) if attempt < MAX_TXN_RETRIES && is_retryable_txn_conflict(&e) => {
@@ -310,6 +348,7 @@ impl Committer for LocalCommitter {
             ledger_id,
             commits,
             blobs,
+            merged_commits,
             governance,
         } = request;
 
@@ -319,6 +358,10 @@ impl Committer for LocalCommitter {
                 .into_iter()
                 .map(|(k, v)| (k, Base64Bytes(v)))
                 .collect(),
+            // The staged bundle carries every blob it resolved; a gap it
+            // could not resolve is not distinguished here yet.
+            missing_blobs: Vec::new(),
+            merged_commits: merged_commits.into_iter().map(Base64Bytes).collect(),
         };
 
         let response = self
@@ -355,32 +398,71 @@ impl SubmissionLookup for LocalCommitter {
 
 /// Map a transaction-pipeline error into a [`SubmissionError`], preserving
 /// the HTTP status so the caller can render an accurate response.
+///
+/// Novelty refusals keep their identity through the flattening — the server
+/// needs to tell them apart from other failures (and from each other) to
+/// answer 503 + `err:db/NoveltyAtMax` + `Retry-After` for the drainable
+/// cases and 413 + `err:db/NoveltyDeltaTooLarge` for a delta that can never
+/// fit. The split mirrors the commit check (`current + delta >= max`): a
+/// delta at or above the ceiling fails even against drained novelty. The
+/// datatype limit keeps its identity for the same reason: 422 +
+/// `err:db/DatatypeLimitExceeded`, and so does a commit reference that names
+/// no commit: 404 + `err:db/CommitNotFound`.
 pub(crate) fn execution_failure(err: ApiError) -> SubmissionError {
-    SubmissionError::Execution {
-        status: err.status_code(),
-        message: err.to_string(),
+    match &err {
+        ApiError::Transact(fluree_db_api::TransactError::NoveltyWouldExceed {
+            delta_bytes,
+            max_bytes,
+            ..
+        }) if delta_bytes >= max_bytes => SubmissionError::NoveltyDeltaTooLarge {
+            message: err.to_string(),
+        },
+        ApiError::Transact(
+            fluree_db_api::TransactError::NoveltyAtMax
+            | fluree_db_api::TransactError::NoveltyWouldExceed { .. },
+        ) => SubmissionError::NoveltyBackpressure {
+            message: err.to_string(),
+        },
+        ApiError::Transact(fluree_db_api::TransactError::DatatypeLimitExceeded { .. }) => {
+            SubmissionError::DatatypeLimitExceeded {
+                message: err.to_string(),
+            }
+        }
+        ApiError::CommitNotFound(message) => SubmissionError::CommitNotFound {
+            message: message.clone(),
+        },
+        _ => SubmissionError::Execution {
+            status: err.status_code(),
+            message: err.to_string(),
+        },
     }
 }
 
-/// Build a [`PolicyContext`] from the request's policy inputs.
+/// Build a [`PolicyContext`] from the request's policy inputs merged with
+/// the ledger's `#config` policy defaults.
 ///
-/// Returns `Ok(None)` when there are no policy inputs — the transaction
-/// runs under root. The context is built from a snapshot of the ledger
-/// this node is about to stage against, so policy enforcement reflects
-/// the same state the transaction commits onto. Building it here, rather
-/// than having the caller pre-build and pass a context, keeps the policy
-/// context bound to the executing node's state — the shape a replicated
-/// implementation needs.
+/// Returns `Ok(None)` when neither the request nor the ledger config
+/// supplies any policy input — the transaction runs under root. The
+/// context is built from a snapshot of the ledger this node is about to
+/// stage against, so policy enforcement reflects the same state the
+/// transaction commits onto. Building it here, rather than having the
+/// caller pre-build and pass a context, keeps the policy context bound to
+/// the executing node's state — the shape a replicated implementation
+/// needs.
+///
+/// Delegates to `fluree_db_api::build_transact_policy_context`, which
+/// resolves `f:policySource` (same-ledger named graphs AND cross-ledger
+/// model references) and applies config `f:policyClass` / `f:defaultAllow`
+/// defaults — so writes are governed by the same config the read path
+/// enforces via `wrap_policy`.
 pub(crate) async fn build_policy_context(
+    fluree: &Fluree,
     ledger_handle: &LedgerHandle,
     governance: &GovernanceOptions,
 ) -> Result<Option<PolicyContext>, SubmissionError> {
-    if !governance.has_any_policy_inputs() {
-        return Ok(None);
-    }
-
     let snap = ledger_handle.snapshot().await;
-    fluree_db_api::build_policy_context(
+    fluree_db_api::build_transact_policy_context(
+        fluree,
         &snap.snapshot,
         snap.novelty.as_ref(),
         Some(snap.novelty.as_ref()),
@@ -388,8 +470,15 @@ pub(crate) async fn build_policy_context(
         governance,
     )
     .await
-    .map(Some)
     .map_err(execution_failure)
+}
+
+/// A Cypher write statement resolved under the serialized commit path:
+/// either concrete `Txn`s ready to stage, or a multi-clause plan the
+/// sequential driver executes inside the builder (under the write lock).
+pub(crate) enum CypherWriteUnderLock {
+    Resolved(Box<fluree_db_api::cypher_write::ResolvedConditional>),
+    Sequential(Box<fluree_db_api::cypher_seq::CypherSeqInput>),
 }
 
 /// Lower a Cypher write statement to a `Txn` against the ledger's
@@ -404,8 +493,11 @@ pub(crate) async fn build_policy_context(
 /// policy wrap mirrors the Cypher read / SPARQL surfaces so a
 /// restricted writer's branch selection sees only policy-visible data.
 ///
-/// Returns the lowered `Txn`; the caller maps [`ApiError`] into its own
-/// failure type.
+/// Returns the resolved write (a primary `Txn` plus an optional follow-up
+/// that must commit atomically with it) or a sequential multi-clause plan
+/// (its probes run inside the builder, against the locked state, so the
+/// under-lock contract holds identically); the caller maps [`ApiError`] into
+/// its own failure type.
 pub(crate) async fn resolve_cypher_under_lock(
     fluree: &Fluree,
     ledger_handle: &LedgerHandle,
@@ -413,27 +505,45 @@ pub(crate) async fn resolve_cypher_under_lock(
     query: &str,
     params: Option<&serde_json::Map<String, serde_json::Value>>,
     governance: &GovernanceOptions,
-) -> Result<Txn, ApiError> {
+    skolem_txn_id: Option<String>,
+) -> Result<CypherWriteUnderLock, ApiError> {
+    use fluree_db_api::cypher_write::ResolvedConditional;
     let snap = ledger_handle.snapshot().await;
     let plan = fluree
-        .cypher_write_plan(query, params, ledger_id, &snap.snapshot)
+        .cypher_write_plan_with_skolem(
+            query,
+            params,
+            ledger_id,
+            &snap.snapshot,
+            skolem_txn_id.clone(),
+        )
         .await?;
     match plan {
-        fluree_db_api::cypher_write::WritePlan::Single(txn) => Ok(*txn),
+        fluree_db_api::cypher_write::WritePlan::Single(txn) => Ok(CypherWriteUnderLock::Resolved(
+            Box::new(ResolvedConditional::single(*txn)),
+        )),
         fluree_db_api::cypher_write::WritePlan::Conditional(cw) => {
             // Fresh owned state for the branch-choosing probe (cheap — the
             // snapshot is Arc-shared); `snap` stays borrowed for the resolve.
             let probe_state = ledger_handle.snapshot().await.to_ledger_state();
             let probe = GraphDb::from_ledger_state(&probe_state);
             let probe = if governance.has_any_policy_inputs() {
-                fluree.wrap_policy(probe, governance, None).await?
+                fluree.wrap_policy(probe, governance).await?
             } else {
                 probe
             };
             fluree
                 .resolve_conditional_cypher(&cw, probe, ledger_id, &snap.snapshot)
                 .await
+                .map(|r| CypherWriteUnderLock::Resolved(Box::new(r)))
         }
+        fluree_db_api::cypher_write::WritePlan::Sequential(sq) => Ok(
+            CypherWriteUnderLock::Sequential(Box::new(fluree_db_api::cypher_seq::CypherSeqInput {
+                plan: *sq,
+                governance: governance.clone(),
+                skolem_txn_id,
+            })),
+        ),
     }
 }
 

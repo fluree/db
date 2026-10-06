@@ -179,6 +179,57 @@ async fn run_history_query(
         .collect()
 }
 
+/// A reasoning mode on a history/changes query must be rejected, not silently
+/// ignored. Reasoning derives virtual facts at a single state; a from–to
+/// changes query enumerates persisted deltas, so the derived overlay would be
+/// computed against the latest state and never applied — returning results
+/// that silently omit entailments. Fail loudly instead.
+#[tokio::test]
+async fn history_range_query_rejects_reasoning() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "test/history-range-reasoning:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.expect("create");
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({"@context": ctx(), "@id": "ex:alice", "ex:name": "Alice"}),
+        )
+        .await
+        .expect("tx1");
+    assert_eq!(r1.receipt.t, 1);
+
+    let q = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}@t:1"),
+        "to":   format!("{ledger_id}@t:latest"),
+        "reasoning": "owl2rl",
+        "select": ["?v", "?t", "?op"],
+        "where": [{
+            "@id": "ex:alice",
+            "ex:name": {"@value": "?v", "@t": "?t", "@op": "?op"}
+        }],
+    });
+
+    let err = fluree
+        .query_from()
+        .jsonld(&q)
+        .execute_tracked()
+        .await
+        .expect_err("reasoning on a history/changes query must be rejected");
+    assert_eq!(
+        err.status, 400,
+        "should be a client error, got {}",
+        err.status
+    );
+    let msg = err.error.to_lowercase();
+    assert!(
+        msg.contains("reasoning") && msg.contains("history"),
+        "error should explain reasoning is unsupported in history mode, got: {}",
+        err.error
+    );
+}
+
 /// Variant for queries that select only `?v, ?t` (e.g. when `@op` is a
 /// constant filter rather than a bound variable).
 async fn run_history_query_no_op(

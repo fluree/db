@@ -44,26 +44,32 @@ mod stats;
 
 pub use attachments::{AttachmentNovelty, ForwardRow, ReverseRow};
 pub use commit::{
-    collect_dag_cids, collect_dag_cids_with_split_mode, find_common_ancestor, load_commit_by_id,
-    load_commit_envelope_by_id, trace_commit_envelopes_by_id, trace_commits_by_id, Commit,
+    collect_dag_cids, collect_first_parent_cids, collect_first_parent_cids_with_split_mode,
+    find_common_ancestor, load_commit_by_id, load_commit_envelope_by_id,
+    trace_commit_envelopes_by_id, trace_commits_by_id, trace_first_parent_commits_by_id, Commit,
     CommitEnvelope, CommonAncestor, TxnMetaEntry, TxnMetaValue, TxnSignature, MAX_TXN_META_BYTES,
     MAX_TXN_META_ENTRIES,
 };
-pub use commit_flakes::{generate_commit_flakes, stamp_graph_on_commit_flakes};
-pub use delta::compute_delta_keys;
+pub use commit_flakes::{
+    drop_forged_commit_flakes, generate_commit_flakes, is_forged_commit_flake, iso_to_epoch_ms_opt,
+    stamp_commit_flakes_dropping_forgeries, stamp_graph_on_commit_flakes,
+    warn_if_forged_commit_flakes_dropped,
+};
+pub use delta::{compute_delta_keys_and_changes, delta_keys_of, FactKey, NetChangeAccumulator};
 pub use error::{NoveltyError, Result};
 pub use fluree_db_core::commit::codec::envelope::{MAX_GRAPH_DELTA_ENTRIES, MAX_GRAPH_IRI_LENGTH};
 pub use fluree_db_core::commit::codec::format::{CommitSignature, ALGO_ED25519};
 pub use fluree_db_core::commit::codec::verify_commit_blob;
 pub use fluree_db_credential::SigningKey;
 pub use runtime_stats::{
-    assemble_fast_stats, assemble_full_stats, resolve_runtime_predicate_id, StatsAssemblyError,
-    StatsLookup,
+    assemble_fast_stats, assemble_fast_stats_with, assemble_full_stats, assemble_full_stats_with,
+    assemble_planner_stats, merge_is_identity, resolve_runtime_predicate_id, stats_merge_site,
+    NoveltyDeltaResolver, NoveltyMerge, StatsAssemblyError, StatsLookup, STATS_MERGE_TARGET,
 };
 pub use stats::current_stats;
 
 use fact_state::NoveltyFactState;
-use fluree_db_core::{Flake, GraphId, IndexType, Sid};
+use fluree_db_core::{Flake, GraphId, IndexType, Sid, CONFIG_GRAPH_ID};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
@@ -218,6 +224,50 @@ impl Segment {
             max_t,
             size,
         }
+    }
+
+    /// The flakes after `cutoff_t`, as a segment. Each of the four orders is
+    /// filtered rather than re-sorted — dropping flakes leaves the survivors
+    /// in order — so trimming a large segment at an index publish costs a
+    /// pass over it, not four sorts. `None` when nothing survives.
+    fn after(&self, cutoff_t: i64) -> Option<Segment> {
+        let mut remap: Vec<u32> = vec![u32::MAX; self.flakes.len()];
+        let mut flakes = Vec::new();
+        let mut min_t = i64::MAX;
+        let mut max_t = i64::MIN;
+        let mut size = 0usize;
+        for (i, f) in self.flakes.iter().enumerate() {
+            if f.t > cutoff_t {
+                remap[i] = flakes.len() as u32;
+                min_t = min_t.min(f.t);
+                max_t = max_t.max(f.t);
+                size += f.size_bytes();
+                flakes.push(f.clone());
+            }
+        }
+        if flakes.is_empty() {
+            return None;
+        }
+        let filter = |order: &[u32]| -> Vec<u32> {
+            order
+                .iter()
+                .filter_map(|&i| {
+                    let mapped = remap[i as usize];
+                    (mapped != u32::MAX).then_some(mapped)
+                })
+                .collect()
+        };
+        Some(Segment {
+            seg_id: NEXT_SEG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            spot: filter(&self.spot),
+            psot: filter(&self.psot),
+            post: filter(&self.post),
+            opst: filter(&self.opst),
+            flakes,
+            min_t,
+            max_t,
+            size,
+        })
     }
 
     #[inline]
@@ -475,6 +525,39 @@ pub struct Novelty {
 
     /// Epoch for cache invalidation - bumped once per commit
     pub epoch: u64,
+    /// Globally-unique content-version stamp (see
+    /// [`OverlayProvider::content_version`]): refreshed from a process-wide
+    /// counter on every content mutation, so no two novelty states with
+    /// different flake content ever share a version — across instances,
+    /// clones, and ledgers. Clones share the version until one mutates,
+    /// which is exactly right: identical content, identical key. `0` means
+    /// "empty since construction" (all empty overlays are equivalent).
+    content_version: u64,
+    /// Epoch for the RDFS schema-hierarchy cache — bumped only when a commit
+    /// asserts or retracts `rdfs:subClassOf` / `rdfs:subPropertyOf`, so the
+    /// shared hierarchy cache stays current without any work on the (vastly
+    /// more common) commits that don't touch the schema.
+    pub schema_epoch: u64,
+    /// Epoch for the compiled-SHACL cache — bumped only when a commit
+    /// asserts or retracts SHACL vocabulary (any `sh:*` predicate, or an
+    /// `rdf:type` edge to a SHACL / class type). Lets transaction
+    /// enforcement reuse the previously compiled shapes when nothing
+    /// shape-affecting changed.
+    pub shacl_epoch: u64,
+    /// Sticky: some flake in this overlay carried an RDF-list position
+    /// (`m.i`). Lets filtered-DELETE staging skip list-meta hydration when
+    /// both the index root and novelty report no list rows. Never cleared —
+    /// a trimmed overlay keeps the bit; the indexed root takes over.
+    pub has_list_meta: bool,
+
+    /// Highest `commit_t` at which the ledger config graph (`CONFIG_GRAPH_ID`)
+    /// received a write. Monotonic within a novelty window; resets to 0 when
+    /// novelty is rebuilt (e.g. reindex) — a downward reset only forces a
+    /// re-resolve, never a stale read. Used as the fail-safe invalidation key
+    /// for the resolved-config cache on `LedgerHandle`: config content at head
+    /// is fully determined by this marker, so a matching marker guarantees the
+    /// cached config is current. Stays 0 for ledgers that never write config.
+    pub config_write_t: i64,
 
     /// Edge-annotation attachment overlay (M1 — derived from the
     /// `f:reifies*` system flakes flowing through the same pipeline).
@@ -488,6 +571,11 @@ pub struct Novelty {
     fact_state: NoveltyFactState,
 }
 
+#[inline]
+fn flake_has_list_meta(flake: &Flake) -> bool {
+    flake.m.as_ref().is_some_and(|m| m.i.is_some())
+}
+
 impl Novelty {
     /// Create a new empty novelty overlay
     pub fn new(t: i64) -> Self {
@@ -497,6 +585,11 @@ impl Novelty {
             flake_count: 0,
             t,
             epoch: 0,
+            content_version: 0,
+            schema_epoch: 0,
+            shacl_epoch: 0,
+            has_list_meta: false,
+            config_write_t: 0,
             attachments: AttachmentNovelty::new(),
             fact_state: NoveltyFactState::new(),
         }
@@ -513,6 +606,16 @@ impl Novelty {
                 NoveltyError::InvalidGraph(format!("flake references unknown graph Sid: {g_sid}"))
             }),
         }
+    }
+
+    /// Stamp a fresh globally-unique content version. Pair with every
+    /// `epoch += 1`: `epoch` drives lineage-local cache invalidation, while
+    /// the content version keys cross-instance caches (see
+    /// [`OverlayProvider::content_version`]).
+    fn refresh_content_version(&mut self) {
+        // Drawn from the process-wide allocator shared by every overlay type
+        // (see `next_overlay_content_version`); `0` = empty since construction.
+        self.content_version = fluree_db_core::overlay::next_overlay_content_version();
     }
 
     /// Append a freshly built segment to a graph, growing the graphs vec.
@@ -644,6 +747,7 @@ impl Novelty {
         if merges > 0 {
             self.recompute_totals();
             self.epoch += 1;
+            self.refresh_content_version();
         }
         merges
     }
@@ -800,6 +904,13 @@ impl Novelty {
         // From here on every step is infallible.
         self.t = self.t.max(commit_t);
         self.epoch += 1; // Bump epoch once per commit
+        self.refresh_content_version();
+
+        // Advance the config-graph write marker so the resolved-config cache
+        // (see `LedgerHandle`) invalidates iff this commit touched config.
+        if checked.contains(&CONFIG_GRAPH_ID) {
+            self.config_write_t = self.config_write_t.max(commit_t);
+        }
 
         // RDF set semantics: skip assertion flakes whose fact (s, p, o, dt, m) is
         // already **currently asserted** in this graph's novelty window. This
@@ -814,6 +925,8 @@ impl Novelty {
         // reserved-predicate test is a single SID compare — negligible even on
         // ledgers that never use annotations.
         let mut accepted_reifies: Vec<Flake> = Vec::new();
+        let mut schema_touched = false;
+        let mut shacl_touched = false;
         for (flake, g_id) in routed {
             if flake.op && self.fact_state.is_asserted(g_id, &flake) {
                 deduped += 1;
@@ -822,7 +935,19 @@ impl Novelty {
             if fluree_db_core::namespaces::is_reserved_reifies_predicate(&flake.p) {
                 accepted_reifies.push(flake.clone());
             }
+            // Asserting OR retracting a hierarchy edge changes the RDFS
+            // schema — invalidate the shared hierarchy cache. Likewise any
+            // SHACL-vocabulary flake invalidates the compiled-shapes cache.
+            schema_touched |= fluree_db_core::namespaces::is_rdfs_hierarchy_predicate(&flake.p);
+            shacl_touched |= fluree_db_core::namespaces::is_shacl_affecting_flake(&flake);
+            self.has_list_meta |= flake_has_list_meta(&flake);
             per_graph.entry(g_id).or_default().push(flake);
+        }
+        if schema_touched {
+            self.schema_epoch += 1;
+        }
+        if shacl_touched {
+            self.shacl_epoch += 1;
         }
 
         // Record every kept flake (assert + retract) into the current-state
@@ -896,7 +1021,7 @@ impl Novelty {
         );
         let _guard = span.enter();
 
-        let started = std::time::Instant::now();
+        let started = fluree_db_core::clock::Instant::now();
 
         // ---- Phase 1: partition incoming flakes by graph ----
         let mut per_graph: HashMap<GraphId, Vec<Flake>> = HashMap::new();
@@ -910,6 +1035,13 @@ impl Novelty {
             total_flakes += flakes.len();
             for flake in flakes {
                 let g_id = Self::resolve_flake_g_id(&flake, reverse_graph)?;
+                if fluree_db_core::namespaces::is_rdfs_hierarchy_predicate(&flake.p) {
+                    self.schema_epoch += 1;
+                }
+                if fluree_db_core::namespaces::is_shacl_affecting_flake(&flake) {
+                    self.shacl_epoch += 1;
+                }
+                self.has_list_meta |= flake_has_list_meta(&flake);
                 per_graph.entry(g_id).or_default().push(flake);
             }
         }
@@ -917,6 +1049,7 @@ impl Novelty {
         if per_graph.is_empty() {
             self.t = max_t;
             self.epoch += 1;
+            self.refresh_content_version();
             return Ok(());
         }
 
@@ -1006,6 +1139,13 @@ impl Novelty {
             // somehow exceeds the local-index width).
             self.set_graph_segments(g_id, kept, true);
 
+            // Keep the config-graph write marker current on the bulk path too
+            // (mirrors `apply_commit`), so the resolved-config cache invalidates
+            // after a bulk import that writes config.
+            if g_id == CONFIG_GRAPH_ID {
+                self.config_write_t = self.config_write_t.max(max_t);
+            }
+
             // Update attachment overlay after the per-graph batch is committed.
             // Malformed bundles are skipped + warned + counted on
             // `attachments.observed_malformed_bundle_count` (see
@@ -1018,6 +1158,7 @@ impl Novelty {
 
         self.t = max_t;
         self.epoch += 1;
+        self.refresh_content_version();
         self.recompute_totals();
 
         tracing::debug!(
@@ -1056,15 +1197,9 @@ impl Novelty {
                     kept.push(seg); // entirely fresh
                     continue;
                 }
-                // Straddling: rebuild from survivors.
-                let survivors: Vec<Flake> = seg
-                    .flakes
-                    .iter()
-                    .filter(|f| f.t > cutoff_t)
-                    .cloned()
-                    .collect();
-                if !survivors.is_empty() {
-                    kept.push(Arc::new(Segment::build(survivors, false)));
+                // Straddling: keep the survivors, in the orders they already have.
+                if let Some(survivors) = seg.after(cutoff_t) {
+                    kept.push(Arc::new(survivors));
                 }
             }
             if kept.is_empty() {
@@ -1092,6 +1227,7 @@ impl Novelty {
         self.fact_state = fs;
 
         self.epoch += 1;
+        self.refresh_content_version();
     }
 
     /// Comparator-ordered k-way merge over one graph's segments for `index` and
@@ -1347,6 +1483,10 @@ impl OverlayProvider for Novelty {
         self.is_empty()
     }
 
+    fn content_version(&self) -> Option<u64> {
+        Some(self.content_version)
+    }
+
     fn for_each_overlay_flake(
         &self,
         g_id: GraphId,
@@ -1382,6 +1522,15 @@ impl OverlayProvider for Novelty {
             }
             _ => {}
         }
+    }
+
+    fn overlay_flake_count(&self, g_id: GraphId) -> Option<usize> {
+        Some(
+            self.graphs
+                .get(g_id as usize)
+                .and_then(Option::as_ref)
+                .map_or(0, |segs| segs.iter().map(|s| s.flakes.len()).sum()),
+        )
     }
 
     fn overlay_segments(&self, g_id: GraphId) -> Vec<fluree_db_core::OverlaySegmentMeta> {
@@ -1612,6 +1761,44 @@ mod tests {
         assert_eq!(novelty.t, 1);
         assert_eq!(novelty.epoch, 1); // Epoch bumped once
         assert!(novelty.size > 0);
+    }
+
+    #[test]
+    fn content_version_is_globally_unique_across_divergent_clones() {
+        let mut a = Novelty::new(0);
+        assert_eq!(
+            OverlayProvider::content_version(&a),
+            Some(0),
+            "empty-since-construction novelty reports version 0"
+        );
+
+        let rg = no_graphs();
+        a.apply_commit(vec![make_flake(1, 1, 100, 1, true)], 1, &rg)
+            .unwrap();
+        let v_a1 = OverlayProvider::content_version(&a).unwrap();
+        assert_ne!(v_a1, 0, "mutation stamps a fresh version");
+
+        // A clone shares the version while content is identical.
+        let mut b = a.clone();
+        assert_eq!(OverlayProvider::content_version(&b), Some(v_a1));
+
+        // Divergent mutations from the same base must never share a version
+        // (per-instance `epoch` DOES collide here: both go 1 → 2).
+        a.apply_commit(vec![make_flake(2, 1, 200, 2, true)], 2, &rg)
+            .unwrap();
+        b.apply_commit(vec![make_flake(3, 1, 300, 2, true)], 2, &rg)
+            .unwrap();
+        assert_eq!(a.epoch, b.epoch, "epochs collide across divergent clones");
+        let v_a2 = OverlayProvider::content_version(&a).unwrap();
+        let v_b2 = OverlayProvider::content_version(&b).unwrap();
+        assert_ne!(v_a2, v_b2, "content versions must not collide");
+        assert_ne!(v_a2, v_a1);
+        assert_ne!(v_b2, v_a1);
+
+        // clear_up_to changes content, so it must also refresh the version.
+        let before_clear = OverlayProvider::content_version(&a).unwrap();
+        a.clear_up_to(1);
+        assert_ne!(OverlayProvider::content_version(&a).unwrap(), before_clear);
     }
 
     #[test]
@@ -1855,6 +2042,72 @@ mod tests {
         assert_eq!(slice.len(), 3);
     }
 
+    /// [`Segment::range`]'s exclusive lower bound is the third site #1711
+    /// reached, and the only one no other test in this crate covers: the
+    /// `partition_point` skips every flake the ordering calls `<= first`, so a
+    /// sibling the comparator wrongly tied with `first` was skipped along with
+    /// it. Here `first` is the `@en` flake at list position 0 and `@fr` at the
+    /// same position is its sibling — pre-fix the seek returns `[]`.
+    ///
+    /// The two in-repo callers that pass `leftmost: false` today both build a
+    /// synthetic bound with `m: None` and `t: i64::MIN`
+    /// (`fluree-db-query`'s `predicate_walk_bounds` / `overlay_walk_bounds`),
+    /// and `t` is compared before the metadata tiebreak — so this hazard is
+    /// **latent** through today's callers rather than live. It is pinned
+    /// anyway because [`Novelty::range_flakes`] is `pub` and takes an
+    /// arbitrary `first`: the seek has to be correct on its own terms, not on
+    /// its callers'.
+    ///
+    /// Deliberately one commit, so `fact_state`'s dedup (updated only *after*
+    /// the accept loop) never sees either flake. That keeps this assertion
+    /// independent of the `FactKey` / `same_identity` route the other #1711
+    /// regression tests exercise — it fails for a different reason than they do.
+    #[test]
+    fn exclusive_seek_past_a_tagged_bound_keeps_its_sibling_tag() {
+        let tagged = |lang: &str| {
+            make_flake_with_meta(
+                1,
+                1,
+                100,
+                1,
+                true,
+                Some(FlakeMeta {
+                    lang: Some(lang.to_string()),
+                    i: Some(0),
+                }),
+            )
+        };
+        let en = tagged("en");
+        let fr = tagged("fr");
+
+        let mut novelty = Novelty::new(0);
+        novelty
+            .apply_commit(vec![en.clone(), fr.clone()], 1, &no_graphs())
+            .unwrap();
+        assert_eq!(
+            novelty.len(),
+            2,
+            "both language tags must land in the segment for the seek to be the thing under test"
+        );
+
+        let ids = novelty.slice_for_range(0, IndexType::Spot, Some(&en), None, false);
+        let langs: Vec<Option<String>> = ids
+            .iter()
+            .map(|&id| {
+                novelty
+                    .get_flake(id)
+                    .m
+                    .as_ref()
+                    .and_then(|m| m.lang.clone())
+            })
+            .collect();
+        assert_eq!(
+            langs,
+            vec![Some("fr".to_string())],
+            "seeking strictly past `@en` at list position 0 must still yield its `@fr` sibling"
+        );
+    }
+
     #[test]
     fn test_clear_up_to() {
         let mut novelty = Novelty::new(0);
@@ -2096,6 +2349,42 @@ mod tests {
             "identity must split on differing metadata values"
         );
 
+        // The three metas above all have `i: None`, so they only exercise the
+        // branch where the ordering consults `lang` unconditionally. Two tags
+        // at the SAME list position are the case that used to collapse:
+        // `FlakeMeta::cmp` compared `lang` only when neither side carried an
+        // index, so `{en, 0}` and `{fr, 0}` were `Equal` without being equal,
+        // and `same_identity` — which tests `cmp_meta(..) == Equal` — folded
+        // two distinct facts into one (#1711). Read the assertions above as
+        // covering this and you would be wrong; this is the case that pins it.
+        let at = |lang: &str, i: i32| FlakeMeta {
+            lang: Some(lang.to_string()),
+            i: Some(i),
+        };
+        let f_en0 = make_flake_with_meta(101, 200, 42, 1, true, Some(at("en", 0)));
+        let f_fr0 = make_flake_with_meta(101, 200, 42, 1, true, Some(at("fr", 0)));
+        let f_en1 = make_flake_with_meta(101, 200, 42, 1, true, Some(at("en", 1)));
+        assert_eq!(
+            cmp_meta(&f_en0, &f_fr0),
+            Ordering::Less,
+            "one list position under two tags must order, not tie"
+        );
+        assert!(
+            !same_identity(&f_en0, &f_fr0),
+            "two language tags at the same list position are two facts"
+        );
+        assert_ne!(
+            IndexType::Spot.compare(&f_en0, &f_fr0),
+            Ordering::Equal,
+            "SPOT comparator must disagree when only the language tag differs"
+        );
+        // The index still dominates the tag: position orders first.
+        assert_eq!(
+            cmp_meta(&f_fr0, &f_en1),
+            Ordering::Less,
+            "list index remains the primary discriminator"
+        );
+
         // `cmp_object` mixes value and datatype: equal value + differing
         // datatype must order. Use distinct datatype Sids on otherwise
         // identical flakes.
@@ -2164,6 +2453,61 @@ mod tests {
             before,
             "re-assert after compaction must still dedup"
         );
+    }
+
+    // ===== Config-graph write marker (resolved-config cache invalidation) =====
+
+    /// `config_write_t` must advance to `commit_t` exactly when a commit touches
+    /// `CONFIG_GRAPH_ID`, stay put on data-only commits, and never regress. This
+    /// is the fail-safe invalidation key for the resolved-config cache: a
+    /// matching marker proves config is unchanged, and a data-only write can
+    /// never spuriously invalidate (churn) nor a config write fail to (stale).
+    #[test]
+    fn config_write_marker_tracks_only_config_graph() {
+        let cfg_g = Sid::new(9, "config-graph");
+        let mut rg = HashMap::new();
+        rg.insert(cfg_g.clone(), CONFIG_GRAPH_ID);
+
+        let mut n = Novelty::new(0);
+        assert_eq!(n.config_write_t, 0, "marker starts at 0");
+
+        // Data-only commit (default graph, g = None) must not move the marker.
+        n.apply_commit(vec![make_flake(1, 1, 1, 5, true)], 5, &rg)
+            .unwrap();
+        assert_eq!(n.config_write_t, 0, "default-graph write leaves marker");
+
+        // A commit touching the config graph advances the marker to commit_t.
+        n.apply_commit(vec![make_graph_flake(2, 1, 1, 7, cfg_g.clone())], 7, &rg)
+            .unwrap();
+        assert_eq!(
+            n.config_write_t, 7,
+            "config write advances marker to commit_t"
+        );
+
+        // A later data-only commit must neither bump nor regress the marker.
+        n.apply_commit(vec![make_flake(3, 1, 1, 9, true)], 9, &rg)
+            .unwrap();
+        assert_eq!(n.config_write_t, 7, "later data-only write leaves marker");
+    }
+
+    /// The bulk (cold-load) path maintains the same marker as `apply_commit`.
+    #[test]
+    fn config_write_marker_tracks_config_graph_on_bulk() {
+        let cfg_g = Sid::new(9, "config-graph");
+        let mut rg = HashMap::new();
+        rg.insert(cfg_g.clone(), CONFIG_GRAPH_ID);
+
+        let mut n = Novelty::new(0);
+        n.bulk_apply_commits(vec![(vec![make_flake(1, 1, 1, 3, true)], 3)], &rg)
+            .unwrap();
+        assert_eq!(n.config_write_t, 0, "bulk data-only load leaves marker");
+
+        n.bulk_apply_commits(
+            vec![(vec![make_graph_flake(2, 1, 1, 8, cfg_g.clone())], 8)],
+            &rg,
+        )
+        .unwrap();
+        assert_eq!(n.config_write_t, 8, "bulk config load advances marker");
     }
 
     /// A same-`t` assert+retract of one identity must resolve to ABSENT in

@@ -11,10 +11,10 @@ use crate::query_eval::PolicyQueryExecutor;
 use crate::schema::is_schema_flake;
 use crate::types::{
     FlakePolicyEntry, PolicyDecision, PolicyRestriction, PolicySet, PolicyValue, PolicyWrapper,
-    TargetMode,
+    TargetMode, WriteFlakeInfo,
 };
 use crate::Result;
-use fluree_db_core::{FlakeValue, Sid, Tracker};
+use fluree_db_core::{FlakeValue, GraphId, Sid, Tracker};
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
@@ -30,6 +30,9 @@ struct FlakeEvalParams<'a> {
     property: &'a Sid,
     /// The flake's object value
     object: &'a FlakeValue,
+    /// The flake's operation (true = assert). View flakes are always
+    /// asserted facts; only the write path sees retracts.
+    op: bool,
     /// Classes the subject belongs to (for class policy checks)
     subject_classes: &'a [Sid],
 }
@@ -40,16 +43,23 @@ impl<'a> FlakeEvalParams<'a> {
         subject: &'a Sid,
         property: &'a Sid,
         object: &'a FlakeValue,
+        op: bool,
         subject_classes: &'a [Sid],
     ) -> Self {
         Self {
             subject,
             property,
             object,
+            op,
             subject_classes,
         }
     }
 }
+
+/// Shared (graph, t, subject) -> classes cache for runtime class-membership
+/// checks. See the `class_cache` field docs for why the graph and `t` are in
+/// the key.
+type ClassCache = Arc<RwLock<std::collections::HashMap<(GraphId, i64, Sid), Vec<Sid>>>>;
 
 /// Policy context for evaluation
 ///
@@ -61,8 +71,27 @@ pub struct PolicyContext {
     pub wrapper: PolicyWrapper,
     /// The grounded identity (always has a value, even if random)
     pub identity: Sid,
-    /// Cache of subject -> classes for runtime class membership checks
-    class_cache: Arc<RwLock<std::collections::HashMap<Sid, Vec<Sid>>>>,
+    /// Cache of (graph, t, subject) -> classes for runtime class membership
+    /// checks.
+    ///
+    /// Keyed on the graph as well as the subject: the same subject IRI can carry
+    /// different `rdf:type` values in different named graphs, and an `f:onClass`
+    /// decision made against another graph's classes is simply wrong. Keying on
+    /// `Sid` alone made the result depend on which graph populated the entry first.
+    ///
+    /// Keyed on `t` because entries are written once and never refreshed
+    /// (`populate_class_cache` skips subjects already present) while one
+    /// context can legitimately span several states: the sequential stager
+    /// hands the same context to every op of a `;`-separated update and
+    /// advances `t` between them, so an op that re-types a subject must not
+    /// let the next op read the previous classes. A stale entry does not
+    /// miss — it answers, and an `f:onClass` decision made from it is
+    /// silently wrong.
+    ///
+    /// What the key does not cover: a context must never span two ledgers.
+    /// `GraphId` is ledger-local and `Sid` namespaces are per-ledger, so an
+    /// entry borrowed from another ledger collides rather than misses.
+    class_cache: ClassCache,
 }
 
 impl PolicyContext {
@@ -166,7 +195,7 @@ impl PolicyContext {
         executor: &dyn PolicyQueryExecutor,
         tracker: &Tracker,
     ) -> Result<bool> {
-        let flake = FlakeEvalParams::new(subject, property, object, subject_classes);
+        let flake = FlakeEvalParams::new(subject, property, object, true, subject_classes);
         self.evaluate_flake_async(self.wrapper.view(), flake, executor, tracker)
             .await
     }
@@ -181,7 +210,7 @@ impl PolicyContext {
         executor: &dyn PolicyQueryExecutor,
         tracker: &Tracker,
     ) -> Result<bool> {
-        let flake = FlakeEvalParams::new(subject, property, object, subject_classes);
+        let flake = FlakeEvalParams::new(subject, property, object, true, subject_classes);
         self.evaluate_flake_async(self.wrapper.modify(), flake, executor, tracker)
             .await
     }
@@ -199,7 +228,7 @@ impl PolicyContext {
         executor: &dyn PolicyQueryExecutor,
         tracker: &Tracker,
     ) -> Result<PolicyDecision<'a>> {
-        let flake = FlakeEvalParams::new(subject, property, object, subject_classes);
+        let flake = FlakeEvalParams::new(subject, property, object, true, subject_classes);
         self.evaluate_flake_async_detailed(self.wrapper.modify(), flake, executor, tracker)
             .await
     }
@@ -217,7 +246,7 @@ impl PolicyContext {
         executor: &dyn PolicyQueryExecutor,
         tracker: &Tracker,
     ) -> Result<PolicyDecision<'a>> {
-        let flake = FlakeEvalParams::new(subject, property, object, subject_classes);
+        let flake = FlakeEvalParams::new(subject, property, object, true, subject_classes);
         self.evaluate_flake_async_detailed(self.wrapper.view(), flake, executor, tracker)
             .await
     }
@@ -292,7 +321,8 @@ impl PolicyContext {
         }
 
         // 1. Collect all candidate policy entries (property -> subject -> default order)
-        let candidate_entries = policy_set.policy_entries_for_flake(subject, property);
+        let candidate_entries =
+            policy_set.policy_entries_for_flake(subject, property, subject_classes);
 
         // Convert subject_classes to HashSet for efficient lookup
         let subject_class_set: HashSet<&Sid> = subject_classes.iter().collect();
@@ -404,7 +434,11 @@ impl PolicyContext {
         }
 
         // 1. Collect all candidate policy entries (property -> subject -> default order)
-        let candidate_entries = policy_set.policy_entries_for_flake(flake.subject, flake.property);
+        let candidate_entries = policy_set.policy_entries_for_flake(
+            flake.subject,
+            flake.property,
+            flake.subject_classes,
+        );
 
         // Convert subject_classes to HashSet for efficient lookup
         let subject_class_set: HashSet<&Sid> = flake.subject_classes.iter().collect();
@@ -468,6 +502,8 @@ impl PolicyContext {
                     PolicyValue::Query(q) => {
                         let bindings = build_policy_values_clause(
                             flake.subject,
+                            flake.object,
+                            flake.op,
                             &self.identity,
                             self.wrapper.policy_values(),
                         );
@@ -483,10 +519,24 @@ impl PolicyContext {
             return Ok(true);
         }
 
-        // No required policies: allow-overrides — the first allow (or passing
-        // f:query) grants; a targeted f:query that fails denies for its target.
-        for entry in filtered_entries {
+        // No required policies: allow-overrides — any allow (or passing
+        // f:query) grants. Every targeted entry is tried before the decision
+        // so the outcome cannot depend on restriction order; a targeted
+        // f:query that fails still blocks fall-through to Default policies.
+        let targets = |e: &FlakePolicyEntry| {
+            policy_set.restrictions[e.idx].target_mode != TargetMode::Default
+        };
+        let mut targeted_query_failed = false;
+        for entry in filtered_entries
+            .iter()
+            .filter(|e| targets(e))
+            .chain(filtered_entries.iter().filter(|e| !targets(e)))
+        {
             let restriction = &policy_set.restrictions[entry.idx];
+            let is_targeted = restriction.target_mode != TargetMode::Default;
+            if !is_targeted && targeted_query_failed {
+                break;
+            }
             tracker.policy_executed(&restriction.id);
             match &restriction.value {
                 PolicyValue::Allow => {
@@ -498,6 +548,8 @@ impl PolicyContext {
                     // Build bindings for special variables + wrapper's policy_values
                     let bindings = build_policy_values_clause(
                         flake.subject,
+                        flake.object,
+                        flake.op,
                         &self.identity,
                         self.wrapper.policy_values(),
                     );
@@ -506,17 +558,7 @@ impl PolicyContext {
                         tracker.policy_allowed(&restriction.id);
                         return Ok(true);
                     }
-                    // Query returned false.
-                    // For targeted policies (OnProperty, OnSubject, OnClass), a failing
-                    // query means access is denied for that target. For Default policies,
-                    // continue to the next policy.
-                    if matches!(
-                        restriction.target_mode,
-                        TargetMode::OnProperty | TargetMode::OnSubject | TargetMode::OnClass
-                    ) {
-                        return Ok(false);
-                    }
-                    continue;
+                    targeted_query_failed |= is_targeted;
                 }
             }
         }
@@ -547,7 +589,11 @@ impl PolicyContext {
         }
 
         // 1. Collect all candidate policy entries (property -> subject -> default order)
-        let candidate_entries = policy_set.policy_entries_for_flake(flake.subject, flake.property);
+        let candidate_entries = policy_set.policy_entries_for_flake(
+            flake.subject,
+            flake.property,
+            flake.subject_classes,
+        );
 
         // Convert subject_classes to HashSet for efficient lookup
         let subject_class_set: HashSet<&Sid> = flake.subject_classes.iter().collect();
@@ -565,7 +611,97 @@ impl PolicyContext {
             })
             .collect();
 
-        // 3. Apply required subset filtering (AFTER class filtering)
+        self.combine_applicable_async_detailed(
+            policy_set,
+            applicable_entries,
+            flake.subject,
+            flake.object,
+            flake.op,
+            executor,
+            tracker,
+        )
+        .await
+    }
+
+    /// Check if a staged write flake is allowed, with write-verb semantics
+    /// and full f:query support.
+    ///
+    /// This is the write-path counterpart of
+    /// [`allow_modify_flake_async_detailed`](Self::allow_modify_flake_async_detailed):
+    /// candidates are selected against the superset of classes that could
+    /// make any policy applicable, then each candidate is filtered by its
+    /// own semantics — legacy bare-`f:modify` policies match the subject's
+    /// pre-state classes and govern all operations; verb policies match the
+    /// subject's lifecycle, its pre∪post classes, and (for `rdf:type`
+    /// flakes) the class being asserted or retracted. See [`WriteFlakeInfo`].
+    pub async fn allow_modify_flake_write_async_detailed<'a>(
+        &'a self,
+        subject: &Sid,
+        property: &Sid,
+        object: &FlakeValue,
+        write: WriteFlakeInfo<'_>,
+        executor: &dyn PolicyQueryExecutor,
+        tracker: &Tracker,
+    ) -> Result<PolicyDecision<'a>> {
+        // Root policy bypasses all checks
+        if self.wrapper.is_root() {
+            return Ok(PolicyDecision::Allowed { restriction: None });
+        }
+
+        // Schema flakes always allowed (needed for internal operations)
+        if is_schema_flake(property, object) {
+            return Ok(PolicyDecision::Allowed { restriction: None });
+        }
+
+        let policy_set = self.wrapper.modify();
+
+        // Select candidates against the superset of classes that could make
+        // any policy applicable (union classes already contain pre-state
+        // classes; add the rdf:type object class so policies targeting a
+        // minted class are found). write_applicable() then applies each
+        // restriction's exact semantics.
+        let mut selection_classes: Vec<Sid> = write.union_classes.to_vec();
+        if let Some(obj_class) = write.type_object_class {
+            if !selection_classes.contains(obj_class) {
+                selection_classes.push(obj_class.clone());
+            }
+        }
+        let candidate_entries =
+            policy_set.policy_entries_for_flake(subject, property, &selection_classes);
+
+        let applicable_entries: Vec<FlakePolicyEntry> = candidate_entries
+            .into_iter()
+            .filter(|entry| write_applicable(&policy_set.restrictions[entry.idx], &write))
+            .collect();
+
+        self.combine_applicable_async_detailed(
+            policy_set,
+            applicable_entries,
+            subject,
+            object,
+            write.op,
+            executor,
+            tracker,
+        )
+        .await
+    }
+
+    /// Shared tail of detailed async evaluation: required-subset filtering,
+    /// deny-overrides, then required-AND or allow-overrides combining with
+    /// f:query execution. `applicable_entries` must already be filtered for
+    /// per-restriction applicability (class / verb semantics).
+    #[allow(clippy::too_many_arguments)]
+    async fn combine_applicable_async_detailed<'a>(
+        &'a self,
+        policy_set: &'a PolicySet,
+        applicable_entries: Vec<FlakePolicyEntry>,
+        subject: &Sid,
+        object: &FlakeValue,
+        op: bool,
+        executor: &dyn PolicyQueryExecutor,
+        tracker: &Tracker,
+    ) -> Result<PolicyDecision<'a>> {
+        // Apply required subset filtering (AFTER applicability filtering)
         let has_required = applicable_entries
             .iter()
             .any(|entry| policy_set.restrictions[entry.idx].required);
@@ -593,7 +729,7 @@ impl PolicyContext {
             .map(|entry| &policy_set.restrictions[entry.idx])
             .collect();
 
-        // 4. Evaluate with "Deny Overrides" semantics
+        // Evaluate with "Deny Overrides" semantics
         //
         // First pass: check for explicit Deny
         for entry in &filtered_entries {
@@ -617,7 +753,9 @@ impl PolicyContext {
                 tracker.policy_executed(&restriction.id);
                 if let PolicyValue::Query(q) = &restriction.value {
                     let bindings = build_policy_values_clause(
-                        flake.subject,
+                        subject,
+                        object,
+                        op,
                         &self.identity,
                         self.wrapper.policy_values(),
                     );
@@ -639,10 +777,24 @@ impl PolicyContext {
             });
         }
 
-        // No required policies: allow-overrides — first allow (or passing
-        // f:query) grants; a targeted f:query that fails denies for its target.
-        for entry in &filtered_entries {
+        // No required policies: allow-overrides — any allow (or passing
+        // f:query) grants. Every targeted entry is tried before the decision
+        // so the outcome cannot depend on restriction order; a targeted
+        // f:query that fails still blocks fall-through to Default policies.
+        let targets = |e: &FlakePolicyEntry| {
+            policy_set.restrictions[e.idx].target_mode != TargetMode::Default
+        };
+        let mut failed_targeted: Vec<&'a PolicyRestriction> = Vec::new();
+        for entry in filtered_entries
+            .iter()
+            .filter(|e| targets(e))
+            .chain(filtered_entries.iter().filter(|e| !targets(e)))
+        {
             let restriction = &policy_set.restrictions[entry.idx];
+            let is_targeted = restriction.target_mode != TargetMode::Default;
+            if !is_targeted && !failed_targeted.is_empty() {
+                break;
+            }
             tracker.policy_executed(&restriction.id);
             match &restriction.value {
                 PolicyValue::Allow => {
@@ -655,7 +807,9 @@ impl PolicyContext {
                 PolicyValue::Query(q) => {
                     // Build bindings for special variables + wrapper's policy_values
                     let bindings = build_policy_values_clause(
-                        flake.subject,
+                        subject,
+                        object,
+                        op,
                         &self.identity,
                         self.wrapper.policy_values(),
                     );
@@ -666,24 +820,20 @@ impl PolicyContext {
                             restriction: Some(restriction),
                         });
                     }
-                    // Query returned false.
-                    // For targeted policies, a failing query means access denied.
-                    if matches!(
-                        restriction.target_mode,
-                        TargetMode::OnProperty | TargetMode::OnSubject | TargetMode::OnClass
-                    ) {
-                        return Ok(PolicyDecision::Denied {
-                            candidates: vec![restriction],
-                        });
+                    if is_targeted {
+                        failed_targeted.push(restriction);
                     }
-                    continue;
                 }
             }
         }
 
-        // 5. Policies applied, but none allowed -> deny with candidates
+        // Policies applied, but none allowed -> deny with candidates
         Ok(PolicyDecision::Denied {
-            candidates: candidate_restrictions,
+            candidates: if failed_targeted.is_empty() {
+                candidate_restrictions
+            } else {
+                failed_targeted
+            },
         })
     }
 
@@ -712,7 +862,8 @@ impl PolicyContext {
         }
 
         let policy_set = self.wrapper.modify();
-        let candidate_entries = policy_set.policy_entries_for_flake(subject, property);
+        let candidate_entries =
+            policy_set.policy_entries_for_flake(subject, property, subject_classes);
         let subject_class_set: HashSet<&Sid> = subject_classes.iter().collect();
 
         // Filter by class applicability using per-property class_check_needed
@@ -795,19 +946,46 @@ impl PolicyContext {
         Ok((false, evaluated))
     }
 
-    /// Cache subject classes for repeated lookups
-    pub fn cache_subject_classes(&self, subject: Sid, classes: Vec<Sid>) {
+    /// Cache subject classes for repeated lookups, within one graph.
+    pub fn cache_subject_classes(&self, g_id: GraphId, t: i64, subject: Sid, classes: Vec<Sid>) {
         if let Ok(mut cache) = self.class_cache.write() {
-            cache.insert(subject, classes);
+            cache.insert((g_id, t, subject), classes);
         }
     }
 
-    /// Get cached subject classes
-    pub fn get_cached_subject_classes(&self, subject: &Sid) -> Option<Vec<Sid>> {
+    /// Whether this context already resolved classes for `subject` in `g_id`.
+    pub fn has_cached_subject_classes(&self, g_id: GraphId, t: i64, subject: &Sid) -> bool {
+        self.class_cache
+            .read()
+            .map(|c| c.contains_key(&(g_id, t, subject.clone())))
+            .unwrap_or(false)
+    }
+
+    /// Filter `subjects` down to those this context has not resolved in `g_id`,
+    /// taking the cache lock once rather than per subject.
+    pub fn retain_uncached(&self, g_id: GraphId, t: i64, subjects: &[Sid]) -> Vec<Sid> {
+        match self.class_cache.read() {
+            Ok(cache) => subjects
+                .iter()
+                .filter(|s| !cache.contains_key(&(g_id, t, (*s).clone())))
+                .cloned()
+                .collect(),
+            // Poisoned: resolve everything, same as a miss.
+            Err(_) => subjects.to_vec(),
+        }
+    }
+
+    /// Get cached subject classes for a subject in a specific graph.
+    pub fn get_cached_subject_classes(
+        &self,
+        g_id: GraphId,
+        t: i64,
+        subject: &Sid,
+    ) -> Option<Vec<Sid>> {
         self.class_cache
             .read()
             .ok()
-            .and_then(|cache| cache.get(subject).cloned())
+            .and_then(|cache| cache.get(&(g_id, t, subject.clone())).cloned())
     }
 }
 
@@ -837,20 +1015,78 @@ fn ensure_ground_identity(identity: Option<Sid>) -> Sid {
     })
 }
 
+/// Per-restriction applicability of a candidate policy to a staged write
+/// flake.
+///
+/// Legacy bare-`f:modify` policies (`verbs: None`) keep pre-state semantics:
+/// class targeting matches the subject's pre-transaction classes and every
+/// operation is governed. Verb policies (`verbs: Some`) use exact lifecycle
+/// semantics: the subject's lifecycle must be one of the policy's verbs,
+/// class targeting matches the subject's pre∪post classes, and `rdf:type`
+/// flakes match by the class they assert or retract (minting or removing
+/// membership in C is an operation ON C).
+///
+/// Class-targeted candidates are ALWAYS checked precisely here — candidate
+/// selection may over-select via the superset classes, and the view-set
+/// exclusivity shortcut (`class_check_needed == false`) is unsound for
+/// writes.
+fn write_applicable(r: &PolicyRestriction, write: &WriteFlakeInfo<'_>) -> bool {
+    match r.verbs {
+        None => {
+            if r.class_policy {
+                r.for_classes.iter().any(|c| write.pre_classes.contains(c))
+            } else {
+                true
+            }
+        }
+        Some(verbs) => {
+            if !verbs.contains(write.lifecycle) {
+                return false;
+            }
+            if r.class_policy {
+                match write.type_object_class {
+                    Some(obj_class) => r.for_classes.contains(obj_class),
+                    None => r
+                        .for_classes
+                        .iter()
+                        .any(|c| write.union_classes.contains(c)),
+                }
+            } else {
+                true
+            }
+        }
+    }
+}
+
 /// Build values clause for policy query execution.
 ///
 /// ALWAYS includes ?$identity binding to ensure it's ground.
-/// Also includes any user-provided policy_values from the wrapper.
+/// Also includes any user-provided policy_values from the wrapper, the
+/// authorized flake's object as `?$value`, and its operation as `?$op`
+/// (`"assert"` / `"retract"`).
 pub fn build_policy_values_clause(
     subject: &Sid,
+    object: &FlakeValue,
+    op: bool,
     identity: &Sid,
     wrapper_policy_values: &std::collections::HashMap<String, Sid>,
-) -> std::collections::HashMap<String, Sid> {
+) -> std::collections::HashMap<String, FlakeValue> {
     // Start with wrapper's policy values (user-provided bindings)
-    let mut values = wrapper_policy_values.clone();
-    // ?$this and ?$identity always override/supplement wrapper values
-    values.insert("?$this".to_string(), subject.clone());
-    values.insert("?$identity".to_string(), identity.clone()); // ALWAYS ground
+    let mut values: std::collections::HashMap<String, FlakeValue> = wrapper_policy_values
+        .iter()
+        .map(|(k, sid)| (k.clone(), FlakeValue::Ref(sid.clone())))
+        .collect();
+    // Special variables always override/supplement wrapper values
+    values.insert("?$this".to_string(), FlakeValue::Ref(subject.clone()));
+    values.insert(
+        "?$identity".to_string(),
+        FlakeValue::Ref(identity.clone()), // ALWAYS ground
+    );
+    values.insert("?$value".to_string(), object.clone());
+    values.insert(
+        "?$op".to_string(),
+        FlakeValue::String(if op { "assert" } else { "retract" }.to_string()),
+    );
     values
 }
 
@@ -883,6 +1119,7 @@ mod tests {
             target_mode: TargetMode::OnProperty,
             targets: [property].into_iter().collect(),
             action: PolicyAction::View,
+            verbs: None,
             value: PolicyValue::Allow,
             required: false,
             message: None,
@@ -896,6 +1133,140 @@ mod tests {
         let mut r = make_allow_restriction(id, property);
         r.value = PolicyValue::Deny;
         r
+    }
+
+    fn make_query_restriction(id: &str, property: Sid, source: &str) -> PolicyRestriction {
+        let mut r = make_allow_restriction(id, property);
+        r.value = PolicyValue::Query(crate::types::PolicyQuery {
+            source: source.to_string(),
+            language: Default::default(),
+            state: Default::default(),
+        });
+        r
+    }
+
+    /// Answers a policy query from its source text: "pass" grants, anything
+    /// else returns no rows.
+    struct SourceExecutor;
+
+    impl crate::query_eval::PolicyQueryExecutor for SourceExecutor {
+        fn evaluate_policy_query<'a>(
+            &'a self,
+            query: &'a crate::types::PolicyQuery,
+            _bindings: &'a std::collections::HashMap<String, FlakeValue>,
+        ) -> crate::query_eval::PolicyQueryFut<'a> {
+            Box::pin(async move { Ok(query.source == "pass") })
+        }
+    }
+
+    fn view_ctx(restrictions: Vec<PolicyRestriction>, property: Sid) -> PolicyContext {
+        let mut set = PolicySet::new();
+        for (idx, r) in restrictions.into_iter().enumerate() {
+            let default = r.target_mode == TargetMode::Default;
+            set.restrictions.push(r);
+            if default {
+                set.defaults.push(idx);
+            } else {
+                set.by_property
+                    .entry(property.clone())
+                    .or_default()
+                    .push(PropertyPolicyEntry {
+                        idx,
+                        class_check_needed: false,
+                    });
+            }
+        }
+        let wrapper = PolicyWrapper::new(
+            set,
+            PolicySet::new(),
+            false,
+            false,
+            std::collections::HashMap::new(),
+        );
+        PolicyContext::new(wrapper, None)
+    }
+
+    /// Two targeted f:query policies on the same target: the outcome must be
+    /// the same whichever is loaded first (allow-overrides across the whole
+    /// targeted set, not first-match-wins).
+    #[tokio::test]
+    async fn targeted_query_policies_are_order_independent() {
+        let prop = make_sid(100, "name");
+        let failing = || make_query_restriction("fail", prop.clone(), "fail");
+        let passing = || make_query_restriction("pass", prop.clone(), "pass");
+        for restrictions in [vec![failing(), passing()], vec![passing(), failing()]] {
+            let ctx = view_ctx(restrictions, prop.clone());
+            let tracker = Tracker::disabled();
+            let allowed = ctx
+                .allow_view_flake_async(
+                    &make_sid(100, "alice"),
+                    &prop,
+                    &FlakeValue::String("Alice".into()),
+                    &[],
+                    &SourceExecutor,
+                    &tracker,
+                )
+                .await
+                .unwrap();
+            assert!(
+                allowed,
+                "a passing targeted f:query must grant regardless of order"
+            );
+            let detailed = ctx
+                .allow_view_flake_async_detailed(
+                    &make_sid(100, "alice"),
+                    &prop,
+                    &FlakeValue::String("Alice".into()),
+                    &[],
+                    &SourceExecutor,
+                    &tracker,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                detailed,
+                PolicyDecision::Allowed {
+                    restriction: Some(r)
+                } if r.id == "pass"
+            ));
+        }
+    }
+
+    /// A failing targeted f:query still blocks fall-through to a Default
+    /// allow, and the denial reports the targeted policies that did not
+    /// permit.
+    #[tokio::test]
+    async fn failing_targeted_query_blocks_default_fallthrough() {
+        let prop = make_sid(100, "name");
+        let mut default_allow = make_allow_restriction("default", prop.clone());
+        default_allow.target_mode = TargetMode::Default;
+        default_allow.targets = HashSet::new();
+        let ctx = view_ctx(
+            vec![
+                make_query_restriction("fail", prop.clone(), "fail"),
+                default_allow,
+            ],
+            prop.clone(),
+        );
+        let tracker = Tracker::disabled();
+        let detailed = ctx
+            .allow_view_flake_async_detailed(
+                &make_sid(100, "alice"),
+                &prop,
+                &FlakeValue::String("Alice".into()),
+                &[],
+                &SourceExecutor,
+                &tracker,
+            )
+            .await
+            .unwrap();
+        match detailed {
+            PolicyDecision::Denied { candidates } => {
+                assert_eq!(candidates.len(), 1);
+                assert_eq!(candidates[0].id, "fail");
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
     }
 
     #[test]
@@ -942,10 +1313,22 @@ mod tests {
         let identity = make_sid(100, "bob");
         let wrapper_values = std::collections::HashMap::new();
 
-        let values = build_policy_values_clause(&subject, &identity, &wrapper_values);
+        let values = build_policy_values_clause(
+            &subject,
+            &FlakeValue::String("v".to_string()),
+            true,
+            &identity,
+            &wrapper_values,
+        );
 
-        assert_eq!(values.get("?$this"), Some(&subject));
-        assert_eq!(values.get("?$identity"), Some(&identity));
+        assert_eq!(
+            values.get("?$this"),
+            Some(&FlakeValue::Ref(subject.clone()))
+        );
+        assert_eq!(
+            values.get("?$identity"),
+            Some(&FlakeValue::Ref(identity.clone()))
+        );
     }
 
     #[test]
@@ -957,13 +1340,28 @@ mod tests {
         let mut wrapper_values = std::collections::HashMap::new();
         wrapper_values.insert("?myVar".to_string(), custom_var.clone());
 
-        let values = build_policy_values_clause(&subject, &identity, &wrapper_values);
+        let values = build_policy_values_clause(
+            &subject,
+            &FlakeValue::String("v".to_string()),
+            true,
+            &identity,
+            &wrapper_values,
+        );
 
         // Should include ?$this and ?$identity
-        assert_eq!(values.get("?$this"), Some(&subject));
-        assert_eq!(values.get("?$identity"), Some(&identity));
+        assert_eq!(
+            values.get("?$this"),
+            Some(&FlakeValue::Ref(subject.clone()))
+        );
+        assert_eq!(
+            values.get("?$identity"),
+            Some(&FlakeValue::Ref(identity.clone()))
+        );
         // Should also include wrapper's policy values
-        assert_eq!(values.get("?myVar"), Some(&custom_var));
+        assert_eq!(
+            values.get("?myVar"),
+            Some(&FlakeValue::Ref(custom_var.clone()))
+        );
     }
 
     #[test]
@@ -976,10 +1374,99 @@ mod tests {
         let mut wrapper_values = std::collections::HashMap::new();
         wrapper_values.insert("?$identity".to_string(), wrong_identity);
 
-        let values = build_policy_values_clause(&subject, &identity, &wrapper_values);
+        let values = build_policy_values_clause(
+            &subject,
+            &FlakeValue::String("v".to_string()),
+            true,
+            &identity,
+            &wrapper_values,
+        );
 
         // ?$identity should be the correct one, not the wrapper's
-        assert_eq!(values.get("?$identity"), Some(&identity));
+        assert_eq!(
+            values.get("?$identity"),
+            Some(&FlakeValue::Ref(identity.clone()))
+        );
+    }
+
+    #[test]
+    fn class_cache_keeps_graphs_apart() {
+        // The same subject IRI can be typed differently in two named graphs —
+        // exactly what `rr:graphMap` routing produces. Before the cache was keyed
+        // on the graph, the second population overwrote the first and every
+        // subsequent `f:onClass` decision for that subject used whichever graph
+        // happened to be cached last.
+        let ctx = PolicyContext::new(PolicyWrapper::root(), None);
+        let subject = make_sid(100, "alice");
+        let employee = make_sid(100, "Employee");
+        let patient = make_sid(100, "Patient");
+
+        ctx.cache_subject_classes(3, 1, subject.clone(), vec![employee.clone()]);
+        ctx.cache_subject_classes(4, 1, subject.clone(), vec![patient.clone()]);
+
+        assert_eq!(
+            ctx.get_cached_subject_classes(3, 1, &subject),
+            Some(vec![employee]),
+            "graph 3's classes were clobbered by the graph 4 population"
+        );
+        assert_eq!(
+            ctx.get_cached_subject_classes(4, 1, &subject),
+            Some(vec![patient]),
+            "graph 4 did not get its own entry"
+        );
+    }
+
+    #[test]
+    fn class_cache_miss_does_not_borrow_another_graphs_classes() {
+        // A graph with no cached entry must miss, not silently inherit another
+        // graph's classes. A miss degrades to "no classes", which is the
+        // conservative direction; borrowing is what produces a wrong decision.
+        let ctx = PolicyContext::new(PolicyWrapper::root(), None);
+        let subject = make_sid(100, "alice");
+
+        ctx.cache_subject_classes(3, 1, subject.clone(), vec![make_sid(100, "Employee")]);
+
+        assert_eq!(ctx.get_cached_subject_classes(7, 1, &subject), None);
+    }
+
+    #[test]
+    fn has_cached_subject_classes_is_keyed_on_graph_and_subject() {
+        // `populate_class_cache` uses this to skip subjects it already resolved.
+        // It must answer per (graph, subject): a hit in one graph is not a hit
+        // in another, and a different subject in the same graph is a miss.
+        let ctx = PolicyContext::new(PolicyWrapper::root(), None);
+        let alice = make_sid(100, "alice");
+        let bob = make_sid(100, "bob");
+
+        assert!(!ctx.has_cached_subject_classes(3, 1, &alice));
+
+        ctx.cache_subject_classes(3, 1, alice.clone(), vec![make_sid(100, "Employee")]);
+
+        assert!(ctx.has_cached_subject_classes(3, 1, &alice));
+        assert!(!ctx.has_cached_subject_classes(4, 1, &alice));
+        assert!(!ctx.has_cached_subject_classes(3, 1, &bob));
+    }
+
+    #[test]
+    fn retain_uncached_keeps_only_subjects_missing_from_the_graphs_cache() {
+        // The batch filter `populate_class_cache` runs under one lock must agree
+        // with the per-subject accessor: cached in this graph drops out, cached
+        // in another graph or not at all stays, order and duplicates preserved.
+        let ctx = PolicyContext::new(PolicyWrapper::root(), None);
+        let alice = make_sid(100, "alice");
+        let bob = make_sid(100, "bob");
+        let carol = make_sid(100, "carol");
+
+        ctx.cache_subject_classes(3, 1, alice.clone(), vec![make_sid(100, "Employee")]);
+        ctx.cache_subject_classes(4, 1, bob.clone(), vec![make_sid(100, "Patient")]);
+
+        let asked = vec![alice.clone(), bob.clone(), carol.clone(), bob.clone()];
+        assert_eq!(
+            ctx.retain_uncached(3, 1, &asked),
+            vec![bob.clone(), carol, bob],
+            "alice is cached in graph 3 and must be skipped; bob is cached only in graph 4"
+        );
+        assert!(ctx.retain_uncached(3, 1, &[alice]).is_empty());
     }
 
     #[test]

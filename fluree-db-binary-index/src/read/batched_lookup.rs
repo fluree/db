@@ -14,13 +14,14 @@ use super::column_types::{BinaryFilter, ColumnProjection, ColumnSet};
 use crate::format::column_block::ColumnId;
 use crate::format::run_record::RunSortOrder;
 use crate::format::run_record_v2::RunRecordV2;
+use fluree_db_core::clock::Instant;
 use fluree_db_core::o_type::OType;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::GraphId;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -52,7 +53,6 @@ pub fn batched_lookup_predicate_refs(
     sorted_subjects.sort_unstable();
     sorted_subjects.dedup();
 
-    let s_id_set: HashSet<u64> = sorted_subjects.iter().copied().collect();
     let mut out: HashMap<u64, Vec<u64>> = HashMap::new();
 
     let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Psot) else {
@@ -97,34 +97,70 @@ pub fn batched_lookup_predicate_refs(
     let subjects_with_hits = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // Heartbeat thread: emits progress even if we stall inside cursor.next_batch().
-    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
-    let hb_scanned_batches = Arc::clone(&scanned_batches);
-    let hb_scanned_rows = Arc::clone(&scanned_rows);
-    let hb_chunk_idx = Arc::clone(&current_chunk_idx);
-    let hb_hits = Arc::clone(&subjects_with_hits);
-    let hb_started = started_all;
-    let hb = std::thread::spawn(move || loop {
-        match stop_rx.recv_timeout(HEARTBEAT_INTERVAL) {
-            Ok(()) => return,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let b = hb_scanned_batches.load(std::sync::atomic::Ordering::Relaxed);
-                let r = hb_scanned_rows.load(std::sync::atomic::Ordering::Relaxed);
-                let c = hb_chunk_idx.load(std::sync::atomic::Ordering::Relaxed);
-                let h = hb_hits.load(std::sync::atomic::Ordering::Relaxed);
-                tracing::debug!(
-                    g_id,
-                    p_id,
-                    chunk_idx = c,
-                    scanned_batches = b,
-                    scanned_rows = r,
-                    subjects_with_hits = h,
-                    elapsed_ms = hb_started.elapsed().as_millis() as u64,
-                    "batched_lookup_predicate_refs: heartbeat"
-                );
+    // Telemetry only — wasm32 cannot spawn threads (`std::thread::spawn`
+    // panics there), so the heartbeat is native-only.
+    #[cfg(not(target_arch = "wasm32"))]
+    let (stop_tx, hb) = {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let hb_scanned_batches = Arc::clone(&scanned_batches);
+        let hb_scanned_rows = Arc::clone(&scanned_rows);
+        let hb_chunk_idx = Arc::clone(&current_chunk_idx);
+        let hb_hits = Arc::clone(&subjects_with_hits);
+        let hb_started = started_all;
+        let hb = std::thread::spawn(move || loop {
+            match stop_rx.recv_timeout(HEARTBEAT_INTERVAL) {
+                Ok(()) => return,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let b = hb_scanned_batches.load(std::sync::atomic::Ordering::Relaxed);
+                    let r = hb_scanned_rows.load(std::sync::atomic::Ordering::Relaxed);
+                    let c = hb_chunk_idx.load(std::sync::atomic::Ordering::Relaxed);
+                    let h = hb_hits.load(std::sync::atomic::Ordering::Relaxed);
+                    tracing::debug!(
+                        g_id,
+                        p_id,
+                        chunk_idx = c,
+                        scanned_batches = b,
+                        scanned_rows = r,
+                        subjects_with_hits = h,
+                        elapsed_ms = hb_started.elapsed().as_millis() as u64,
+                        "batched_lookup_predicate_refs: heartbeat"
+                    );
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-        }
-    });
+        });
+        (stop_tx, hb)
+    };
+
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    register_routed_wants(
+        store,
+        &branch,
+        RunSortOrder::Psot,
+        chunks.iter().map(|chunk| {
+            let (min_s, max_s) = (chunk[0], *chunk.last().unwrap());
+            (
+                RunRecordV2 {
+                    s_id: SubjectId::from_u64(min_s),
+                    o_key: 0,
+                    p_id,
+                    t: 0,
+                    o_i: 0,
+                    o_type: 0,
+                    g_id,
+                },
+                RunRecordV2 {
+                    s_id: SubjectId::from_u64(max_s),
+                    o_key: u64::MAX,
+                    p_id,
+                    t: 0,
+                    o_i: u32::MAX,
+                    o_type: u16::MAX,
+                    g_id,
+                },
+            )
+        }),
+    );
 
     for (chunk_idx, chunk) in chunks.iter().enumerate() {
         current_chunk_idx.store(chunk_idx as u64, std::sync::atomic::Ordering::Relaxed);
@@ -177,20 +213,20 @@ pub fn batched_lookup_predicate_refs(
         );
         cursor.set_to_t(to_t);
 
+        // The cursor's p_id filter pins PSOT's leading key, so s_id is
+        // non-decreasing across the returned rows — gallop the chunk's
+        // wanted ids instead of testing every row. Spillover rows for a
+        // neighboring chunk's subjects are excluded by construction.
         while let Some(batch) = cursor.next_batch()? {
             scanned_batches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             scanned_rows.fetch_add(batch.row_count as u64, std::sync::atomic::Ordering::Relaxed);
-            for i in 0..batch.row_count {
-                let s_id = batch.s_id.get(i);
-                if !s_id_set.contains(&s_id) {
-                    continue;
-                }
+            for_each_subject_run(&batch, chunk, |s_id, i, batch| {
                 let ot = batch.o_type.get_or(i, 0);
                 if ot != iri_ref {
-                    continue;
+                    return;
                 }
                 out.entry(s_id).or_default().push(batch.o_key.get(i));
-            }
+            });
             subjects_with_hits.store(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -201,8 +237,11 @@ pub fn batched_lookup_predicate_refs(
     }
 
     // Stop heartbeat.
-    let _ = stop_tx.send(());
-    let _ = hb.join();
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = stop_tx.send(());
+        let _ = hb.join();
+    }
 
     tracing::debug!(
         g_id,
@@ -247,7 +286,6 @@ pub fn batched_lookup_subject_properties(
     let mut sorted_subjects = subjects.to_vec();
     sorted_subjects.sort_unstable();
     sorted_subjects.dedup();
-    let s_id_set: HashSet<u64> = sorted_subjects.iter().copied().collect();
 
     let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Spot) else {
         return Ok(out);
@@ -268,6 +306,36 @@ pub fn batched_lookup_subject_properties(
         output: needed,
         internal: ColumnSet::EMPTY,
     };
+
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    register_routed_wants(
+        store,
+        &branch,
+        RunSortOrder::Spot,
+        chunks.iter().map(|chunk| {
+            let (min_s, max_s) = (chunk[0], *chunk.last().unwrap());
+            (
+                RunRecordV2 {
+                    s_id: SubjectId::from_u64(min_s),
+                    o_key: 0,
+                    p_id: 0,
+                    t: 0,
+                    o_i: 0,
+                    o_type: 0,
+                    g_id,
+                },
+                RunRecordV2 {
+                    s_id: SubjectId::from_u64(max_s),
+                    o_key: u64::MAX,
+                    p_id: u32::MAX,
+                    t: 0,
+                    o_i: u32::MAX,
+                    o_type: u16::MAX,
+                    g_id,
+                },
+            )
+        }),
+    );
 
     for chunk in &chunks {
         let min_s = chunk[0];
@@ -303,21 +371,102 @@ pub fn batched_lookup_subject_properties(
         );
         cursor.set_to_t(to_t);
 
+        // Batches are leaflet-granular and spill far past the wanted
+        // subjects, so testing every row is the dominant cost for small
+        // subject sets (a single-node hydration paid a full-leaflet
+        // membership scan). SPOT's primary sort key is `s_id`, so gallop
+        // instead: binary-search each wanted subject's contiguous run and
+        // copy only those rows. Spillover rows for a neighboring chunk's
+        // subjects are excluded by construction (only this chunk's ids are
+        // searched), preserving the no-double-collect invariant the
+        // per-chunk membership set used to provide.
         while let Some(batch) = cursor.next_batch()? {
-            for i in 0..batch.row_count {
-                let s_id = batch.s_id.get(i);
-                if !s_id_set.contains(&s_id) {
-                    continue;
-                }
+            for_each_subject_run(&batch, chunk, |s_id, i, batch| {
                 let p_id = batch.p_id.get_or(i, 0);
                 let o_type = batch.o_type.get_or(i, 0);
                 let o_key = batch.o_key.get(i);
                 out.entry(s_id).or_default().push((p_id, o_type, o_key));
-            }
+            });
         }
     }
 
     Ok(out)
+}
+
+/// Visit every row of `batch` whose `s_id` is in the sorted id list
+/// `wanted`, in row order, via sorted merge with galloping binary search.
+///
+/// Requires the batch's `s_id` column to be non-decreasing over the visited
+/// range — true for SPOT-order leaflets (subject is the primary sort key),
+/// including time-travel replayed ones, and for PSOT batches after the
+/// cursor's `p_id` filter pinned the leading key.
+fn for_each_subject_run(
+    batch: &super::column_types::ColumnBatch,
+    wanted: &[u64],
+    mut visit: impl FnMut(u64, usize, &super::column_types::ColumnBatch),
+) {
+    let n = batch.row_count;
+    for_each_wanted_run(&batch.s_id, 0, n, wanted, |target, i| {
+        visit(target, i, batch);
+    });
+}
+
+/// Sorted-merge core: visit every row index in `[lo, hi)` whose value in
+/// `keys` is in the sorted list `wanted`. `keys` must be non-decreasing
+/// over `[lo, hi)`.
+fn for_each_wanted_run(
+    keys: &super::column_types::ColumnData<u64>,
+    lo: usize,
+    hi: usize,
+    wanted: &[u64],
+    mut visit: impl FnMut(u64, usize),
+) {
+    let mut row = lo;
+    let mut w = 0usize;
+    while row < hi && w < wanted.len() {
+        let target = wanted[w];
+        // First row with key >= target (binary search over [row, hi)).
+        let (mut a, mut b) = (row, hi);
+        while a < b {
+            let mid = a + (b - a) / 2;
+            if keys.get(mid) < target {
+                a = mid + 1;
+            } else {
+                b = mid;
+            }
+        }
+        row = a;
+        if row >= hi {
+            break;
+        }
+        let k = keys.get(row);
+        if k > target {
+            // No rows for `target` here; skip wanted ids below `k`.
+            w += wanted[w..].partition_point(|&x| x < k);
+            continue;
+        }
+        while row < hi && keys.get(row) == target {
+            visit(target, row);
+            row += 1;
+        }
+        w += 1;
+    }
+}
+
+/// The contiguous `[start, end)` row range of `batch` whose `o_type` column
+/// equals `ot` (OPST leaflets sort by `(o_type, o_key, ...)`, so the range
+/// is well-defined and `o_key` ascends within it).
+fn o_type_run(batch: &super::column_types::ColumnBatch, ot: u16) -> (usize, usize) {
+    use super::column_types::ColumnData;
+    match &batch.o_type {
+        ColumnData::Block(arr) => {
+            let start = arr.partition_point(|&x| x < ot);
+            let end = arr.partition_point(|&x| x <= ot);
+            (start, end)
+        }
+        ColumnData::Const(c) if *c == ot => (0, batch.row_count),
+        _ => (0, 0),
+    }
 }
 
 /// Batched OPST lookup: all inbound `IRI_REF` edges pointing at each requested
@@ -345,7 +494,6 @@ pub fn batched_lookup_inbound_refs(
     let mut sorted = objects.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
-    let obj_set: HashSet<u64> = sorted.iter().copied().collect();
 
     let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Opst) else {
         return Ok(out);
@@ -369,6 +517,36 @@ pub fn batched_lookup_inbound_refs(
         output: needed,
         internal: ColumnSet::EMPTY,
     };
+
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    register_routed_wants(
+        store,
+        &branch,
+        RunSortOrder::Opst,
+        chunks.iter().map(|chunk| {
+            let (min_o, max_o) = (chunk[0], *chunk.last().unwrap());
+            (
+                RunRecordV2 {
+                    s_id: SubjectId::from_u64(0),
+                    o_key: min_o,
+                    p_id: 0,
+                    t: 0,
+                    o_i: 0,
+                    o_type: iri_ref,
+                    g_id,
+                },
+                RunRecordV2 {
+                    s_id: SubjectId::from_u64(u64::MAX),
+                    o_key: max_o,
+                    p_id: u32::MAX,
+                    t: 0,
+                    o_i: u32::MAX,
+                    o_type: iri_ref,
+                    g_id,
+                },
+            )
+        }),
+    );
 
     for chunk in &chunks {
         let min_o = chunk[0];
@@ -405,19 +583,17 @@ pub fn batched_lookup_inbound_refs(
         );
         cursor.set_to_t(to_t);
 
+        // OPST sorts by (o_type, o_key, ...): binary-search the IRI_REF
+        // o_type run (boundary leaflets can carry neighboring o_types),
+        // then gallop the chunk's wanted o_keys within it. Spillover rows
+        // for a neighboring chunk's objects are excluded by construction.
         while let Some(batch) = cursor.next_batch()? {
-            for i in 0..batch.row_count {
-                if batch.o_type.get_or(i, 0) != iri_ref {
-                    continue;
-                }
-                let o_key = batch.o_key.get(i);
-                if !obj_set.contains(&o_key) {
-                    continue;
-                }
+            let (lo, hi) = o_type_run(&batch, iri_ref);
+            for_each_wanted_run(&batch.o_key, lo, hi, chunk, |o_key, i| {
                 out.entry(o_key)
                     .or_default()
                     .push((batch.p_id.get_or(i, 0), batch.s_id.get(i)));
-            }
+            });
         }
     }
 
@@ -428,9 +604,51 @@ pub fn batched_lookup_inbound_refs(
     Ok(out)
 }
 
+/// Residency mode: record every non-resident leaf the routed key ranges will
+/// touch into the store's miss register — the probe's whole want set — before
+/// any leaf is opened, so the first miss's retry round fetches all of it
+/// concurrently instead of learning one chunk at a time (see
+/// [`crate::read::need_fetch::RetryBudget`]). No-op outside residency mode.
+#[cfg(any(target_arch = "wasm32", feature = "residency"))]
+fn register_routed_wants(
+    store: &BinaryIndexStore,
+    branch: &crate::format::branch::BranchManifest,
+    order: RunSortOrder,
+    ranges: impl Iterator<Item = (RunRecordV2, RunRecordV2)>,
+) {
+    use crate::format::run_record_v2::cmp_v2_for_order;
+    use crate::read::need_fetch::FetchKind;
+    let Some(cs) = store.content_store() else {
+        return;
+    };
+    let Some(register) = cs.miss_register() else {
+        return;
+    };
+    let cmp = cmp_v2_for_order(order);
+    for (min_key, max_key) in ranges {
+        let range = branch.find_leaves_in_range(&min_key, &max_key, cmp);
+        for entry in &branch.leaves[range] {
+            if cs.resolve_cached_bytes(&entry.leaf_cid).is_none() {
+                register.record(&entry.leaf_cid, FetchKind::IndexLeaf);
+            }
+        }
+    }
+}
+
 /// Break sorted subjects into chunks where each chunk spans at most
 /// `max_span` IDs and contains at most `max_chunk` subjects.
 fn chunk_subjects(sorted: &[u64], max_span: u64, max_chunk: usize) -> Vec<&[u64]> {
+    // Gap threshold: split only when the id gap is wide enough that the
+    // leaflets it crosses cost more to visit than a fresh cursor descent.
+    // With shared leaf mmaps and cached leaflet decodes, crossing a leaflet
+    // that holds none of the wanted ids costs ~3 µs (decode-cache hit +
+    // galloped no-op) and a descent ~4 µs; at ~1k subjects per leaflet the
+    // break-even gap is a few thousand ids. An aggressive threshold (64)
+    // measurably hurt dense-ish sets (node-emit hydration ~2x: ~8 µs
+    // descent per near-point-seek, nothing saved); no threshold at all makes a
+    // scattered BFS frontier sweep every leaflet between its members.
+    const MAX_GAP: u64 = 4096;
+
     if sorted.is_empty() {
         return Vec::new();
     }
@@ -438,8 +656,9 @@ fn chunk_subjects(sorted: &[u64], max_span: u64, max_chunk: usize) -> Vec<&[u64]
     let mut start = 0;
     for i in 1..sorted.len() {
         let span = sorted[i] - sorted[start];
+        let gap = sorted[i] - sorted[i - 1];
         let size = i - start;
-        if span > max_span || size >= max_chunk {
+        if span > max_span || gap > MAX_GAP || size >= max_chunk {
             chunks.push(&sorted[start..i]);
             start = i;
         }

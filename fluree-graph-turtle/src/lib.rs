@@ -18,22 +18,33 @@
 //! // Option 1: Parse to GraphSink
 //! let mut sink = GraphCollectorSink::new();
 //! parse(turtle, &mut sink).unwrap();
-//! let graph = sink.finish();
+//! let graph = sink.into_graph();
 //!
 //! // Option 2: Parse directly to transaction JSON
 //! let json = parse_to_json(turtle).unwrap();
 //! ```
+//!
+//! # Limits
+//!
+//! Input is bounded by [`error::MAX_INPUT_BYTES`] per parse call, and
+//! recursive constructs (property lists, collections, reified triples) by
+//! [`error::MAX_NESTING_DEPTH`] nesting levels; exceeding either produces a
+//! parse error.
 
 pub mod adapter;
 pub mod error;
 pub mod lex;
+pub mod options;
 pub mod parser;
 pub mod splitter;
 
 pub use adapter::graph_to_transaction_json;
 pub use error::{Result, TurtleError};
 pub use lex::{tokenize, Lexer, StreamingLexer, Token, TokenKind};
-pub use parser::{parse, parse_with_prefixes_base};
+pub use options::{CollectionStyle, NumericStyle, ParserOptions};
+pub use parser::{
+    parse, parse_with_options, parse_with_prefixes_base, parse_with_prefixes_base_options,
+};
 
 use fluree_graph_ir::GraphCollectorSink;
 use serde_json::Value as JsonValue;
@@ -49,8 +60,8 @@ use serde_json::Value as JsonValue;
 pub fn parse_to_json(input: &str) -> Result<JsonValue> {
     let mut sink = GraphCollectorSink::new();
     parse(input, &mut sink)?;
-    let graph = sink.finish();
-    Ok(graph_to_transaction_json(&graph))
+    let graph = sink.into_graph();
+    graph_to_transaction_json(&graph)
 }
 
 #[cfg(test)]

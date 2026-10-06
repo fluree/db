@@ -256,9 +256,13 @@ For programmatic use from Rust, transactions can also set `TxnOpts.strict_compac
 ```
 
 Blank nodes are:
-- Local to a single transaction
-- Cannot be referenced across transactions
-- Useful for temporary or anonymous data
+- Skolemized at insert time into the reserved `_:fdb-...` label space, which
+  queries return as the node's `@id`
+- Addressable afterwards via that stable `_:fdb-...` id in queries and
+  transactions (see
+  [Editing blank-node structures](../transactions/update-where-delete-insert.md#editing-blank-node-structures-stable-_fdb--ids))
+- Client-authored labels (`_:b0`) stay local to a single transaction — reusing
+  the same label later mints a new node
 
 ## Best Practices
 

@@ -1,0 +1,9 @@
+# q019 gl_large_debits
+# Intent: Range FILTER on an xsd:decimal column (H4 primary; decimal never prunes on virtual).
+# BI lineage (BI-12): "Which GL journal debits exceed $1M?"
+# Predicates verified against enterprise.ttl — FactGlJournal: glAccountName, debitAmount, postingDate.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?acct ?deb ?pd
+WHERE { ?j a edw:GlJournalEntry ; edw:glAccountName ?acct ; edw:debitAmount ?deb ; edw:postingDate ?pd .
+        FILTER(?deb > 1000000) }
+LIMIT 5000

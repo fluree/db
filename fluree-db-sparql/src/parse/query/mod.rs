@@ -6,6 +6,8 @@ mod construct;
 mod describe;
 mod modifier;
 mod pattern;
+mod pragma;
+pub use pragma::pragma_names;
 mod select;
 mod term;
 mod update;
@@ -16,6 +18,7 @@ mod tests;
 use crate::ast::path::PropertyPath;
 use crate::ast::{
     BaseDecl, GraphPattern, Pragmas, PrefixDecl, Prologue, QueryBody, SparqlAst, TriplePattern,
+    UpdateRequest, UpdateRequestOp,
 };
 use crate::diag::{DiagCode, Diagnostic, ParseOutput};
 use crate::lex::{tokenize_with_comments, TokenKind};
@@ -62,87 +65,103 @@ pub fn parse_sparql(input: &str) -> ParseOutput<SparqlAst> {
     }
 
     let mut stream = super::stream::TokenStream::new(tokens);
-    let mut parser = Parser::new(&mut stream);
+    let mut parser = Parser::with_source(&mut stream, input);
 
     match parser.parse_query() {
         Some(mut ast) => {
-            ast.pragmas = extract_pragmas(&comments);
-            ParseOutput::with_diagnostics(Some(ast), stream.take_diagnostics())
+            let (pragmas, pragma_diagnostics) = pragma::extract_pragmas(&comments, &ast);
+            ast.pragmas = pragmas;
+
+            // Trailing-token / EOF assertion: after a complete Query or
+            // Update request parses, every remaining non-EOF token is an
+            // error-severity diagnostic. Without this, anything after the
+            // parsed form was silently discarded — most damagingly a
+            // multi-operation UPDATE request (`INSERT ...; DELETE ...`),
+            // which committed only the first operation: silent data loss
+            // (issue #1438). Update requests are parsed as a full
+            // `;`-separated sequence (including a legal trailing `;`) by
+            // `parse_update_request`, so anything still unconsumed here is
+            // genuinely trailing garbage for queries and updates alike.
+            let mut unconsumed_input = false;
+            if !stream.is_eof() {
+                unconsumed_input = true;
+                stream.error_at_current("unexpected trailing tokens after the end of the query");
+            }
+
+            let mut diagnostics = stream.take_diagnostics();
+            diagnostics.extend(pragma_diagnostics);
+            // Parse-time *semantic* rejections (currently the V5 BIND-scope
+            // check) and unconsumed trailing input must prevent AST
+            // production: unlike recovered syntax errors — where returning a
+            // best-effort AST keeps diagnostics flowing for IDE/LSP use —
+            // these produce an AST that does not faithfully represent the
+            // request (V5: parsed completely but spec-invalid; trailing
+            // input: the AST covers only a prefix of the input). Callers
+            // that only check for an AST — most dangerously external users
+            // of the public `lower_sparql_update_ast` entry, which takes the
+            // AST without seeing these diagnostics — would otherwise execute
+            // it; for a multi-operation UPDATE that re-opens exactly the
+            // #1438 silent-data-loss window the guard above closes (roadmap
+            // D-4: hard errors, no diagnostic-swallowing).
+            // A pragma that cannot be applied is rejected the same way: running
+            // the request without the option it asked for (a fuel cap, a
+            // policy) would silently weaken it.
+            let semantic_reject = diagnostics.iter().any(|d| {
+                matches!(
+                    d.code,
+                    DiagCode::BindTargetAlreadyInScope | DiagCode::InvalidPragma
+                ) && d.is_error()
+            });
+            if semantic_reject || unconsumed_input {
+                ParseOutput::with_diagnostics(None, diagnostics)
+            } else {
+                ParseOutput::with_diagnostics(Some(ast), diagnostics)
+            }
         }
         None => ParseOutput::with_diagnostics(None, stream.take_diagnostics()),
     }
 }
 
-/// Extract Fluree `# PRAGMA ...` directives from the query's comments.
+/// The `# PRAGMA` options of a SPARQL request, for a host that needs them
+/// before it parses the request to run it — a fuel cap, a policy selection, a
+/// `min-t` wait.
 ///
-/// Comments are sourced from the lexer (`tokenize_with_comments`), so `#`
-/// characters inside string literals or IRIs can never be misread as
-/// directives, and the query stays valid SPARQL for standard tooling.
-/// Comparison is case-insensitive on the `PRAGMA` keyword and pragma name;
-/// the value is split on commas and whitespace. Unrecognized pragma names
-/// are ignored (they are ordinary comments).
-///
-/// Supported:
-/// - `# PRAGMA reasoning: owl2rl` (also `rdfs`, `owl2ql`, `datalog`,
-///   `owl-datalog`, `none`, or a comma-separated combination)
-/// - `# PRAGMA reasoning-max-facts: 20000000` — OWL2-RL materialization budget
-/// - `# PRAGMA reasoning-max-seconds: 300` — OWL2-RL materialization budget
-fn extract_pragmas(comments: &[String]) -> Pragmas {
-    let mut pragmas = Pragmas::default();
-
-    for comment in comments {
-        let Some(rest) = strip_keyword_ci(comment, "PRAGMA") else {
-            continue;
-        };
-
-        // `strip_keyword_ci` requires a word boundary, so plain `reasoning`
-        // never matches the `reasoning-max-*` directives.
-        if let Some(value) = strip_keyword_ci(rest, "reasoning-max-facts") {
-            // Last pragma wins; the raw value is preserved (even if empty) so
-            // lowering can reject an invalid number with a proper error.
-            pragmas.reasoning_max_facts = Some(pragma_scalar_value(value));
-        } else if let Some(value) = strip_keyword_ci(rest, "reasoning-max-seconds") {
-            pragmas.reasoning_max_seconds = Some(pragma_scalar_value(value));
-        } else if let Some(value) = strip_keyword_ci(rest, "reasoning") {
-            let value = value.trim_start().strip_prefix(':').unwrap_or(value);
-            let modes: Vec<String> = value
-                .split([',', ' ', '\t'])
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect();
-            // Last pragma wins if repeated; an empty mode list is preserved so
-            // lowering can reject `# PRAGMA reasoning:` with no value.
-            pragmas.reasoning = Some(modes);
-        }
+/// Text with no comment that could be a `# PRAGMA` returns the defaults
+/// without parsing. A request that fails to parse for any other reason also
+/// returns the defaults: it will not run, and the parse that would run it
+/// reports the error.
+pub fn request_pragmas(input: &str) -> Result<Pragmas, String> {
+    if !may_carry_pragma(input) {
+        return Ok(Pragmas::default());
     }
-
-    pragmas
+    let output = parse_sparql(input);
+    if let Some(ast) = output.ast {
+        return Ok(ast.pragmas);
+    }
+    let errors: Vec<&str> = output
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == DiagCode::InvalidPragma)
+        .map(|d| d.message.as_str())
+        .collect();
+    if errors.is_empty() {
+        Ok(Pragmas::default())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
-/// Extract a single trimmed scalar value after an optional `:`.
-fn pragma_scalar_value(value: &str) -> String {
-    let value = value.trim_start();
-    let value = value.strip_prefix(':').unwrap_or(value);
-    value.trim().to_string()
-}
-
-/// Strip a case-insensitive keyword prefix followed by a word boundary
-/// (whitespace, `:`, or end of input). Returns the remainder.
-fn strip_keyword_ci<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
-    let trimmed = input.trim_start();
-    if trimmed.len() < keyword.len() || !trimmed.is_char_boundary(keyword.len()) {
-        return None;
-    }
-    let (head, rest) = trimmed.split_at(keyword.len());
-    if !head.eq_ignore_ascii_case(keyword) {
-        return None;
-    }
-    match rest.chars().next() {
-        None => Some(rest),
-        Some(c) if c.is_whitespace() || c == ':' => Some(rest),
-        Some(_) => None,
-    }
+/// Whether some `#` in `input` is followed, past further `#`s and same-line
+/// whitespace, by `pragma` in any case. That covers every comment the parser
+/// reads as a directive, without lexing; a `#` inside a string or IRI can only
+/// cost a parse, never hide a pragma.
+fn may_carry_pragma(input: &str) -> bool {
+    input.match_indices('#').any(|(at, _)| {
+        input[at..]
+            .trim_start_matches(|c: char| c == '#' || (c.is_whitespace() && c != '\n' && c != '\r'))
+            .get(..6)
+            .is_some_and(|head| head.eq_ignore_ascii_case("pragma"))
+    })
 }
 
 /// Parse a group graph pattern from a token stream.
@@ -167,9 +186,32 @@ pub fn parse_group_graph_pattern(
         .ok_or_else(|| "Failed to parse group graph pattern".to_string())
 }
 
+/// Parse a SPARQL 1.2 triple-term value `<<( s p o )>>` from a token
+/// stream, for the expression parser's `BIND(<<( … )>> AS ?v)` /
+/// `FILTER(… <<( … )>> …)` forms. Expects the stream positioned at the
+/// opening `<<(`. Blank nodes are rejected — a triple term used in an
+/// expression is a value, not a pattern (negative `bindbnode-tripleterm`).
+/// The specific diagnostic is recorded on the shared stream; the returned
+/// error string is only the coarse Result-level fallback.
+pub fn parse_triple_term_value(
+    stream: &mut super::stream::TokenStream,
+) -> Result<crate::ast::annotation::TripleTerm, String> {
+    let mut parser = Parser::new(stream);
+    parser
+        .parse_triple_term_value(false)
+        .ok_or_else(|| "Failed to parse triple term".to_string())
+}
+
 /// The SPARQL parser.
 struct Parser<'a> {
     stream: &'a mut super::stream::TokenStream,
+    /// Raw query text, when available. Used for checks that need the
+    /// token's original lexeme (e.g. the VERSION specifier must be a
+    /// *short* quoted string — the cooked `TokenKind::String` value
+    /// cannot distinguish `"1.2"` from `"""1.2"""`). `None` for
+    /// sub-parsers spun up without source access (EXISTS groups),
+    /// which never parse a prologue.
+    source: Option<&'a str>,
     /// Monotonic counter minting unique labels for blank-node property lists
     /// (`[ :p ?o ]`). Each list desugars to a fresh labeled blank node so the
     /// node and its nested triples share one join variable.
@@ -178,32 +220,199 @@ struct Parser<'a> {
     /// object/subject term. The enclosing object-list / triples-block parser
     /// drains these into its BGP once the term that produced them is placed.
     pending_bnpl_triples: Vec<TriplePattern>,
+    /// Non-triple graph patterns produced while parsing an object/subject
+    /// term: a property path used as the verb inside a blank-node property
+    /// list (`[ :p|:q ?x ]`) emits a `GraphPattern::Path`, which cannot ride
+    /// the `pending_bnpl_triples` channel. Drained alongside the triples by
+    /// the enclosing triples-block / path-object-list parser; template
+    /// contexts (CONSTRUCT, INSERT/DELETE) reject a non-empty channel since
+    /// paths are not legal there.
+    pending_bnpl_patterns: Vec<GraphPattern>,
 }
 
 impl<'a> Parser<'a> {
     fn new(stream: &'a mut super::stream::TokenStream) -> Self {
         Self {
             stream,
+            source: None,
             bnode_counter: 0,
             pending_bnpl_triples: Vec::new(),
+            pending_bnpl_patterns: Vec::new(),
         }
     }
 
-    /// Parse a complete SPARQL query.
+    fn with_source(stream: &'a mut super::stream::TokenStream, source: &'a str) -> Self {
+        Self {
+            stream,
+            source: Some(source),
+            bnode_counter: 0,
+            pending_bnpl_triples: Vec::new(),
+            pending_bnpl_patterns: Vec::new(),
+        }
+    }
+
+    /// Run `f` one recursion level deeper, emitting a
+    /// [`DiagCode::NestingTooDeep`] diagnostic and returning `None` past the
+    /// stream's depth ceiling. Owns both sides of the depth bookkeeping for
+    /// the diagnostic-based pattern/term parsers; the `Result`-based
+    /// expression and path parsers use
+    /// [`TokenStream::with_recursion_guard`](super::stream::TokenStream::with_recursion_guard).
+    fn with_recursion_guard<T>(&mut self, f: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        if !self.stream.try_enter_recursion() {
+            let span = self.stream.current_span();
+            self.stream.add_diagnostic(Diagnostic::error(
+                DiagCode::NestingTooDeep,
+                format!(
+                    "query nesting exceeds the maximum depth of {}",
+                    super::stream::MAX_PARSE_DEPTH
+                ),
+                span,
+            ));
+            return None;
+        }
+        let result = f(self);
+        self.stream.leave_recursion();
+        result
+    }
+
+    /// Parse a complete SPARQL query or update request.
     fn parse_query(&mut self) -> Option<SparqlAst> {
         let start_span = self.stream.current_span();
 
         // Parse prologue (BASE and PREFIX declarations)
         let prologue = self.parse_prologue();
 
-        // Parse query body
-        let body = self.parse_query_body()?;
+        // Query forms are single-bodied; everything else is parsed as an
+        // update request (`Update ::= Prologue ( Update1 ( ';' Update )? )?`),
+        // which also covers the valid empty / prologue-only request.
+        match &self.stream.peek().kind {
+            TokenKind::KwSelect
+            | TokenKind::KwAsk
+            | TokenKind::KwDescribe
+            | TokenKind::KwConstruct => {
+                let body = self.parse_query_body()?;
+                let end_span = self.stream.previous_span();
+                let span = start_span.union(end_span);
+                Some(SparqlAst::new(prologue, body, span))
+            }
+            _ => self.parse_update_request(prologue, start_span),
+        }
+    }
 
-        // Calculate total span
+    /// Parse a SPARQL Update request: a `;`-separated sequence of update
+    /// operations sharing an accumulating prologue.
+    ///
+    /// Grammar: `Update ::= Prologue ( Update1 ( ';' Update )? )?` — the
+    /// recursion means (a) the operation list may be empty (an empty or
+    /// prologue-only request is a valid no-op), (b) one trailing `;` after
+    /// the last operation is legal, and (c) each `;` may be followed by
+    /// further `PREFIX`/`BASE` declarations that become visible to every
+    /// subsequent operation. Each parsed operation snapshots the prologue
+    /// in effect for it, so a later redeclaration cannot retroactively
+    /// change an earlier operation's prefix resolution.
+    ///
+    /// Cross-operation blank-node scope (SPARQL 1.1 Update §19.6 grammar
+    /// note): reusing a blank-node label from one operation's template/data
+    /// in a *different* operation of the same request is an error — each
+    /// operation mints its own fresh blank nodes, so a shared label could
+    /// not mean what it says.
+    fn parse_update_request(
+        &mut self,
+        mut prologue: Prologue,
+        start_span: SourceSpan,
+    ) -> Option<SparqlAst> {
+        let mut operations: Vec<UpdateRequestOp> = Vec::new();
+        // Blank-node labels used by previous operations' templates/data.
+        let mut prior_op_bnode_labels: std::collections::HashSet<std::sync::Arc<str>> =
+            std::collections::HashSet::new();
+
+        loop {
+            if self.stream.is_eof() {
+                break;
+            }
+            match &self.stream.peek().kind {
+                TokenKind::KwInsert
+                | TokenKind::KwDelete
+                | TokenKind::KwWith
+                | TokenKind::KwLoad
+                | TokenKind::KwClear
+                | TokenKind::KwDrop
+                | TokenKind::KwCreate
+                | TokenKind::KwAdd
+                | TokenKind::KwCopy
+                | TokenKind::KwMove => {
+                    let operation = self.parse_update_operation()?;
+
+                    // Cross-op bnode-label scope validation.
+                    let mut labels = Vec::new();
+                    update::collect_template_bnode_labels(&operation, &mut labels);
+                    let mut this_op_labels: Vec<std::sync::Arc<str>> = Vec::new();
+                    for (label, span) in labels {
+                        if prior_op_bnode_labels.contains(&label) {
+                            self.stream.add_diagnostic(Diagnostic::error(
+                                DiagCode::InvalidBlankNode,
+                                format!(
+                                    "blank node label _:{label} was already used by a previous \
+                                     operation of this request; blank node labels are scoped to \
+                                     a single operation (SPARQL 1.1 Update §19.6)"
+                                ),
+                                span,
+                            ));
+                        }
+                        this_op_labels.push(label);
+                    }
+                    prior_op_bnode_labels.extend(this_op_labels);
+
+                    operations.push(UpdateRequestOp {
+                        prologue: prologue.clone(),
+                        operation,
+                    });
+                }
+                _ => {
+                    self.stream.error_at_current(
+                        "expected query form (SELECT, CONSTRUCT, ASK, DESCRIBE) or update (INSERT, DELETE)",
+                    );
+                    return None;
+                }
+            }
+
+            if self.stream.check(&TokenKind::Semicolon) {
+                self.stream.advance(); // consume ';'
+                                       // The recursive Update may add PREFIX/BASE declarations.
+                self.accumulate_prologue(&mut prologue);
+            } else {
+                // EOF here is the normal end of the request; anything else
+                // is rejected by `parse_sparql`'s trailing-token assertion.
+                break;
+            }
+        }
+
         let end_span = self.stream.previous_span();
         let span = start_span.union(end_span);
-
+        let body = QueryBody::Update(UpdateRequest::new(operations, span));
         Some(SparqlAst::new(prologue, body, span))
+    }
+
+    /// Parse additional BASE/PREFIX declarations after a `;`, merging them
+    /// into the accumulated request prologue. A redeclared prefix replaces
+    /// the earlier binding (later declarations win for subsequent
+    /// operations); earlier operations keep their own prologue snapshot.
+    fn accumulate_prologue(&mut self, prologue: &mut Prologue) {
+        let additional = self.parse_prologue();
+        if let Some(base) = additional.base {
+            prologue.base = Some(base);
+        }
+        for decl in additional.prefixes {
+            if let Some(existing) = prologue
+                .prefixes
+                .iter_mut()
+                .find(|p| p.prefix == decl.prefix)
+            {
+                *existing = decl;
+            } else {
+                prologue.prefixes.push(decl);
+            }
+        }
     }
 
     /// Parse the prologue (BASE and PREFIX declarations).
@@ -239,9 +448,26 @@ impl<'a> Parser<'a> {
     /// parse).
     fn parse_version_decl(&mut self) {
         self.stream.advance(); // consume VERSION
-        if self.stream.consume_string().is_none() {
-            self.stream
-                .error_at_current("expected a version string after VERSION (e.g. \"1.2\")");
+        match self.stream.consume_string() {
+            None => {
+                self.stream
+                    .error_at_current("expected a version string after VERSION (e.g. \"1.2\")");
+            }
+            Some((_, span)) => {
+                // Grammar: VersionSpecifier ::= STRING_LITERAL1 |
+                // STRING_LITERAL2 — long (triple-quoted) strings are not
+                // legal here (W3C negative tests version-bad-01/02).
+                if let Some(source) = self.source {
+                    let raw = source.get(span.start..span.end).unwrap_or("");
+                    if raw.starts_with("\"\"\"") || raw.starts_with("'''") {
+                        self.stream.error_at(
+                            "VERSION requires a short quoted string (e.g. \"1.2\"); \
+                             long (triple-quoted) strings are not allowed",
+                            span,
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -285,7 +511,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse the query body (SELECT, CONSTRUCT, ASK, DESCRIBE, or UPDATE).
+    /// Parse the query body (SELECT, CONSTRUCT, ASK, or DESCRIBE).
+    ///
+    /// Update requests never reach this — `parse_query` routes every
+    /// non-query-form token stream through `parse_update_request`.
     fn parse_query_body(&mut self) -> Option<QueryBody> {
         match &self.stream.peek().kind {
             TokenKind::KwSelect => {
@@ -303,11 +532,6 @@ impl<'a> Parser<'a> {
             TokenKind::KwConstruct => {
                 let query = self.parse_construct_query()?;
                 Some(QueryBody::Construct(query))
-            }
-            // SPARQL Update operations
-            TokenKind::KwInsert | TokenKind::KwDelete | TokenKind::KwWith => {
-                let update = self.parse_update_operation()?;
-                Some(QueryBody::Update(update))
             }
             _ => {
                 if self.stream.is_eof() {

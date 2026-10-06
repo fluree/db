@@ -1,0 +1,8 @@
+# q035 grandmanager_path
+# Intent: Fixed-length sequence path (manager/manager). H8 perf probe: generic path evaluation above unfused scans (see q034; observed 18.75s dims-only on virtual-sf01).
+# BI lineage (BI-17): "Who is each employee's manager-of-manager?"
+# Predicates verified against enterprise.ttl — DimEmployee: manager (path manager/manager).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?e ?grandboss
+WHERE { ?e a edw:Employee ; edw:manager/edw:manager ?grandboss . }
+LIMIT 5000

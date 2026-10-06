@@ -53,10 +53,10 @@ Fluree supports time pinning in graph references.
 
 **Current syntax (implemented today):**
 - `<ledger>:<branch>@t:<t>` — pin to transaction time
-- `<ledger>:<branch>@iso:<rfc3339>` — pin to ISO datetime
+- `<ledger>:<branch>@time:<rfc3339>` — pin to ISO datetime
 - `<ledger>:<branch>@commit:<commit-content-id>` — pin to commit ContentId (prefix allowed)
 
-Note: you may see an `=` form in older design notes (`@t=100`, etc.). That form is **not** the supported user-facing syntax today; use the `@t:` / `@iso:` / `@commit:` forms in docs and examples.
+Note: you may see an `=` form in older design notes (`@t=100`, etc.). That form is **not** the supported user-facing syntax today; use the `@t:` / `@time:` / `@commit:` forms in docs and examples.
 
 From a user perspective:
 - The `@…` portion selects **which snapshot value** you mean for that ledger graph.
@@ -125,7 +125,8 @@ To avoid ambiguity and URL pitfalls:
   - `@` separates the time specifier
   - `#` separates a named-graph alias (fragment)
   - `:` is used inside the ledger ID as `ledger:branch`
-- **Do not use raw `@` or `#` inside ledger names, branch names, or named-graph aliases**.
+- **Ledger and branch names cannot contain `@`, `#` or `:`** (beyond the one `:` before the branch); see [naming rules](../concepts/ledgers-and-nameservice.md#naming-rules).
+- **Do not use raw `@` or `#` inside named-graph aliases**.
   - If needed, percent-encode them.
 - RFC3339 / ISO timestamps must be URL-safe:
   - Prefer UTC with `Z` (e.g., `2026-02-03T17:02:11Z`).

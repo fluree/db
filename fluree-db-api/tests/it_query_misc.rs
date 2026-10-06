@@ -861,17 +861,28 @@ async fn untyped_value_matching_parity() {
     let ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
     let commit_t = ledger2.t();
 
-    let q_typed = json!({
-        "@context": {
-            "f": "https://ns.flur.ee/db#",
-            "xsd": "http://www.w3.org/2001/XMLSchema#"
-        },
-        "from": "misc/untyped-value-matching:main#txn-meta",
-        "select": "?c",
-        "where": [{"@id": "?c", "f:t": {"@value": commit_t, "@type": "xsd:int"}}]
-    });
+    // `f:t` is an `xsd:integer`: a constant typed `xsd:integer` matches it, one
+    // typed `xsd:int` is a different term and does not (#1737).
+    let q_typed = |datatype: &str| {
+        json!({
+            "@context": {
+                "f": "https://ns.flur.ee/db#",
+                "xsd": "http://www.w3.org/2001/XMLSchema#"
+            },
+            "from": "misc/untyped-value-matching:main#txn-meta",
+            "select": "?c",
+            "where": [{"@id": "?c", "f:t": {"@value": commit_t, "@type": datatype}}]
+        })
+    };
+    let r_other_type = fluree
+        .query_connection(&q_typed("xsd:int"))
+        .await
+        .unwrap()
+        .to_jsonld(&ledger2.snapshot)
+        .unwrap();
+    assert_eq!(r_other_type.as_array().map(std::vec::Vec::len), Some(0));
     let r_typed = fluree
-        .query_connection(&q_typed)
+        .query_connection(&q_typed("xsd:integer"))
         .await
         .unwrap()
         .to_jsonld(&ledger2.snapshot)
@@ -948,17 +959,26 @@ async fn indexed_untyped_value_matching_parity() {
                 "expected range_provider after indexing"
             );
 
-            let q_typed = json!({
-                "@context": {
-                    "f": "https://ns.flur.ee/db#",
-                    "xsd": "http://www.w3.org/2001/XMLSchema#"
-                },
-                "from": "misc/untyped-value-matching-indexed:main#txn-meta",
-                "select": "?c",
-                "where": [{"@id": "?c", "f:t": {"@value": commit_t, "@type": "xsd:int"}}]
-            });
+            let q_typed = |datatype: &str| {
+                json!({
+                    "@context": {
+                        "f": "https://ns.flur.ee/db#",
+                        "xsd": "http://www.w3.org/2001/XMLSchema#"
+                    },
+                    "from": "misc/untyped-value-matching-indexed:main#txn-meta",
+                    "select": "?c",
+                    "where": [{"@id": "?c", "f:t": {"@value": commit_t, "@type": datatype}}]
+                })
+            };
+            let r_other_type = fluree
+                .query_connection(&q_typed("xsd:int"))
+                .await
+                .unwrap()
+                .to_jsonld(&indexed.snapshot)
+                .unwrap();
+            assert_eq!(r_other_type.as_array().map(std::vec::Vec::len), Some(0));
             let r_typed = fluree
-                .query_connection(&q_typed)
+                .query_connection(&q_typed("xsd:integer"))
                 .await
                 .unwrap()
                 .to_jsonld(&indexed.snapshot)

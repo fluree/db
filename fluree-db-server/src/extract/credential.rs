@@ -29,6 +29,7 @@ use axum::extract::FromRequest;
 use axum::http::header::HeaderMap;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::Request;
+use axum::RequestExt;
 use serde_json::Value as JsonValue;
 
 use crate::error::{Result, ServerError};
@@ -231,6 +232,30 @@ fn looks_like_credential_json(json: &JsonValue) -> bool {
     false
 }
 
+/// Read the full request body, honoring the `DefaultBodyLimit` layer
+/// the router installs from `config.body_limit`. `with_limited_body`
+/// applies that limit; a body exceeding it surfaces a
+/// `LengthLimitError` in the read error's source chain, which we map
+/// to 413 Payload Too Large rather than a generic 400.
+async fn read_limited_body(req: Request<axum::body::Body>) -> Result<Bytes> {
+    let req = req.with_limited_body();
+    axum::body::to_bytes(req.into_body(), usize::MAX)
+        .await
+        .map_err(|e| {
+            let mut source = std::error::Error::source(&e);
+            while let Some(current) = source {
+                if current.is::<http_body_util::LengthLimitError>() {
+                    return ServerError::Api(fluree_db_api::ApiError::http(
+                        413,
+                        "request body exceeds the configured limit",
+                    ));
+                }
+                source = current.source();
+            }
+            ServerError::bad_request(format!("Failed to read body: {e}"))
+        })
+}
+
 /// Extract and optionally verify credential from request
 #[cfg(feature = "credential")]
 async fn extract_credential(req: Request<axum::body::Body>) -> Result<MaybeCredential> {
@@ -249,10 +274,7 @@ async fn extract_credential(req: Request<axum::body::Body>) -> Result<MaybeCrede
     let is_turtle = is_turtle_content_type(content_type);
     let is_trig = is_trig_content_type(content_type);
 
-    // Read the body
-    let body = axum::body::to_bytes(req.into_body(), usize::MAX)
-        .await
-        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+    let body = read_limited_body(req).await?;
 
     let body_str = std::str::from_utf8(&body).ok();
 
@@ -356,10 +378,7 @@ async fn extract_credential(req: Request<axum::body::Body>) -> Result<MaybeCrede
     let is_turtle = is_turtle_content_type(content_type);
     let is_trig = is_trig_content_type(content_type);
 
-    // Read the body
-    let body = axum::body::to_bytes(req.into_body(), usize::MAX)
-        .await
-        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+    let body = read_limited_body(req).await?;
 
     // No credential verification - pass through as-is
     Ok(MaybeCredential {

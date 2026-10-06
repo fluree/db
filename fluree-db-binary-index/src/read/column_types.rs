@@ -139,6 +139,36 @@ impl ColumnBatch {
             + self.o_i.byte_size()
             + self.t.byte_size()
     }
+
+    /// Project a (super)batch down to `requested`, mirroring what a fresh narrow
+    /// decode of `requested` would yield: requested columns are shared by cheap
+    /// `Arc` clone, unrequested columns become `AbsentDefault` so downstream
+    /// `filter_batch`/`gather_batch` never carry or copy them (e.g. an unwanted
+    /// `t`). Used by the leaflet cache's superset fallback so a warm-on-write
+    /// `ColumnSet::ALL` batch can serve narrower reads.
+    ///
+    /// Sound only when `self` already covers `requested` (`cached ⊇ requested`);
+    /// the cache guarantees this by projecting only an `ALL` batch.
+    pub fn project_to(&self, requested: ColumnSet) -> ColumnBatch {
+        macro_rules! keep {
+            ($col:expr, $field:ident) => {
+                if requested.contains($col) {
+                    self.$field.clone()
+                } else {
+                    ColumnData::AbsentDefault
+                }
+            };
+        }
+        ColumnBatch {
+            row_count: self.row_count,
+            s_id: keep!(ColumnId::SId, s_id),
+            o_key: keep!(ColumnId::OKey, o_key),
+            p_id: keep!(ColumnId::PId, p_id),
+            o_type: keep!(ColumnId::OType, o_type),
+            o_i: keep!(ColumnId::OI, o_i),
+            t: keep!(ColumnId::T, t),
+        }
+    }
 }
 
 // ============================================================================

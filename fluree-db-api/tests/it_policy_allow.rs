@@ -788,7 +788,7 @@ async fn policy_onclass_applies_to_novelty_properties_without_type_restated() {
 
             let opts = GovernanceOptions {
                 policy: Some(policy),
-                default_allow: true,
+                default_allow: Some(true),
                 ..Default::default()
             };
 
@@ -830,4 +830,294 @@ async fn policy_onclass_applies_to_novelty_properties_without_type_restated() {
             );
         })
         .await;
+}
+
+/// RDFS entailment for policy enforcement (always on): a class policy
+/// governs instances of subclasses.
+#[tokio::test]
+async fn policy_onclass_governs_subclass_instances() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "policy/onclass-subclass:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    // Schema first (separate transaction), then data.
+    let ledger1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/", "rdfs": "http://www.w3.org/2000/01/rdf-schema#"},
+                "@id": "ex:Manager",
+                "rdfs:subClassOf": {"@id": "ex:Employee"}
+            }),
+        )
+        .await
+        .expect("schema txn");
+    let _ = fluree
+        .insert(
+            ledger1.ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+                "@graph": [
+                    {"@id": "ex:pat", "@type": "ex:Manager", "schema:name": "Pat"},
+                    {"@id": "ex:sam", "@type": "ex:Contractor", "schema:name": "Sam"}
+                ]
+            }),
+        )
+        .await
+        .expect("data txn");
+
+    // Policy allows viewing Employees only; Manager ⊑ Employee must qualify.
+    let policy = json!([
+        {
+            "@id": "ex:employeePolicy",
+            "@type": "f:AccessPolicy",
+            "f:action": "f:view",
+            "f:onClass": [{"@id": "http://example.org/ns/Employee"}],
+            "f:allow": true
+        }
+    ]);
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "from": ledger_id,
+        "opts": {"policy": policy, "default-allow": false},
+        "select": "?name",
+        "where": {"@id": "?s", "schema:name": "?name"}
+    });
+
+    let result = fluree
+        .query_connection(&query)
+        .await
+        .expect("query_connection");
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!(["Pat"])),
+        "class policy on Employee must govern Manager instances (and not Contractor)"
+    );
+}
+
+/// RDFS entailment for policy enforcement (always on): a property policy
+/// governs subproperties.
+#[tokio::test]
+async fn policy_onproperty_governs_subproperties() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "policy/onproperty-subprop:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let ledger1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/", "rdfs": "http://www.w3.org/2000/01/rdf-schema#"},
+                "@id": "ex:homePhone",
+                "rdfs:subPropertyOf": {"@id": "ex:phone"}
+            }),
+        )
+        .await
+        .expect("schema txn");
+    let _ = fluree
+        .insert(
+            ledger1.ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+                "@id": "ex:alice",
+                "schema:name": "Alice",
+                "ex:homePhone": "555-0100"
+            }),
+        )
+        .await
+        .expect("data txn");
+
+    // Deny ex:phone; homePhone ⊑ phone must be denied too.
+    let policy = json!([
+        {
+            "@id": "ex:denyPhone",
+            "@type": "f:AccessPolicy",
+            "f:action": "f:view",
+            "f:onProperty": [{"@id": "http://example.org/ns/phone"}],
+            "f:allow": false
+        },
+        {
+            "@id": "ex:allowAll",
+            "@type": "f:AccessPolicy",
+            "f:action": "f:view",
+            "f:allow": true
+        }
+    ]);
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "from": ledger_id,
+        "opts": {"policy": policy, "default-allow": false},
+        "select": "?v",
+        "where": {"@id": "ex:alice", "ex:homePhone": "?v"}
+    });
+
+    let result = fluree
+        .query_connection(&query)
+        .await
+        .expect("query_connection");
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([])),
+        "property policy on ex:phone must deny the ex:homePhone subproperty"
+    );
+}
+
+/// Cross-ledger RDFS entailment for policy: the class hierarchy lives in a
+/// model ledger (config `f:reasoningDefaults` / `f:schemaSource` with
+/// `f:ledger`); an `f:onClass ex:Employee` policy must govern Manager-typed
+/// subjects because `Manager rdfs:subClassOf Employee` is declared in M.
+#[tokio::test]
+async fn policy_onclass_governs_subclass_via_cross_ledger_schema() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Model ledger M: the ontology graph.
+    let model_id = "policy/xl-schema-model:main";
+    let model = genesis_ledger(&fluree, model_id);
+    let ontology_iri = "http://example.org/governance/ontology";
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&format!(
+            r"
+            @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+            @prefix ex:   <http://example.org/ns/> .
+            GRAPH <{ontology_iri}> {{
+                ex:Manager rdfs:subClassOf ex:Employee .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed M ontology");
+
+    // Data ledger D: config points the schema source at M; data has a
+    // Manager and an untyped-in-hierarchy Contractor.
+    let data_id = "policy/xl-schema-data:main";
+    let data = genesis_ledger(&fluree, data_id);
+    let config_iri = format!("urn:fluree:{data_id}#config");
+    let r1 = fluree
+        .stage_owned(data)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig ;
+                               f:reasoningDefaults <urn:cfg:reason> .
+                <urn:cfg:reason> f:schemaSource <urn:cfg:schema-ref> .
+                <urn:cfg:schema-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:schema-src> .
+                <urn:cfg:schema-src> f:ledger <{model_id}> ;
+                                     f:graphSelector <{ontology_iri}> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed D config");
+    let _ = fluree
+        .insert(
+            r1.ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+                "@graph": [
+                    {"@id": "ex:pat", "@type": "ex:Manager", "schema:name": "Pat"},
+                    {"@id": "ex:sam", "@type": "ex:Contractor", "schema:name": "Sam"}
+                ]
+            }),
+        )
+        .await
+        .expect("seed D data");
+
+    let policy = json!([
+        {
+            "@id": "ex:employeePolicy",
+            "@type": "f:AccessPolicy",
+            "f:action": "f:view",
+            "f:onClass": [{"@id": "http://example.org/ns/Employee"}],
+            "f:allow": true
+        }
+    ]);
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "from": data_id,
+        "opts": {"policy": policy, "default-allow": false},
+        "select": "?name",
+        "where": {"@id": "?s", "schema:name": "?name"}
+    });
+
+    let result = fluree
+        .query_connection(&query)
+        .await
+        .expect("query_connection");
+    let ledger = fluree.ledger(data_id).await.expect("ledger");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!(["Pat"])),
+        "onClass Employee must govern Manager via M's cross-ledger hierarchy"
+    );
+}
+
+/// Same-ledger twin of the cross-ledger multi-rule test: two `f:onClass`
+/// rules with `f:query` on one class, selected by identity + policy class.
+/// The policy set is rebuilt per query, so an order-dependent evaluator
+/// flips answers between identical queries with no commit in between.
+#[tokio::test]
+async fn multiple_targeted_query_rules_any_allow_grants_stably() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "policy/multi-query:main";
+    let ctx = json!({"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"});
+    fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &json!({"@context": ctx, "@graph": [
+                {"@id": "ex:acme", "@type": "ex:Supplier"},
+                {"@id": "ex:acme-rome", "@type": "ex:SupplierRecord", "ex:canonical": {"@id": "ex:acme"}},
+                {"@id": "ex:line1", "@type": "ex:Line", "ex:supplier": {"@id": "ex:acme-rome"}},
+                {"@id": "ex:line2", "@type": "ex:Line", "ex:supplier": {"@id": "ex:nobody"}},
+                {"@id": "ex:one-hop", "@type": "f:AccessPolicy", "f:action": {"@id": "f:view"},
+                 "f:onClass": [{"@id": "ex:Line"}],
+                 "f:query": "{\"where\":{\"@id\":\"?$this\",\"http://example.org/supplier\":{\"@id\":\"?$identity\"}}}"},
+                {"@id": "ex:two-hop", "@type": "f:AccessPolicy", "f:action": {"@id": "f:view"},
+                 "f:onClass": [{"@id": "ex:Line"}],
+                 "f:query": "{\"where\":{\"@id\":\"?$this\",\"http://example.org/supplier\":{\"@id\":\"?rec\",\"http://example.org/canonical\":{\"@id\":\"?$identity\"}}}}"}
+            ]}),
+        )
+        .await
+        .expect("seed");
+
+    for identity in ["http://example.org/acme", "http://example.org/acme-rome"] {
+        let opts = fluree_db_api::GovernanceOptions {
+            identity: Some(identity.into()),
+            policy_class: Some(vec!["https://ns.flur.ee/db#AccessPolicy".into()]),
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        for round in 0..16 {
+            let wrapped = fluree
+                .db_with_policy(ledger_id, &opts)
+                .await
+                .expect("db_with_policy");
+            let rows = fluree
+                .query(
+                    &wrapped,
+                    &json!({"@context": {"ex": "http://example.org/"}, "select": ["?l"],
+                            "where": {"@id": "?l", "@type": "ex:Line"}}),
+                )
+                .await
+                .expect("query")
+                .to_jsonld(&wrapped.snapshot)
+                .expect("jsonld");
+            assert_eq!(rows, json!([["ex:line1"]]), "{identity} round {round}");
+        }
+    }
 }

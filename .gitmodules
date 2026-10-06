@@ -1,3 +1,6 @@
 [submodule "testsuite-sparql/rdf-tests"]
 	path = testsuite-sparql/rdf-tests
 	url = https://github.com/w3c/rdf-tests.git
+[submodule "testsuite-shacl/data-shapes"]
+	path = testsuite-shacl/data-shapes
+	url = https://github.com/w3c/data-shapes

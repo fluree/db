@@ -68,7 +68,7 @@ ISO 8601 formatted timestamp of when the transaction was committed:
 ```bash
 # Query at specific time
 curl -X POST http://localhost:8090/v1/fluree/query \
-  -d '{"from": "mydb:main@iso:2024-01-22T10:30:00Z", ...}'
+  -d '{"from": "mydb:main@time:2024-01-22T10:30:00Z", ...}'
 ```
 
 ### Commit ID

@@ -41,19 +41,6 @@ Guide to the manifest-driven W3C compliance test suite:
 - Using Claude Code for compliance work
 - Architecture overview
 
-### [SHACL Implementation](shacl-implementation.md)
-
-How SHACL validation is wired into Fluree, for contributors adding
-constraints or fixing bugs:
-- Pipeline: compile → cache → validate
-- Crate layout (`fluree-db-shacl` / `-transact` / `-api`)
-- Shared post-stage helper and its call sites
-- Per-graph config, `f:shapesSource`, target-type resolution
-- Adding a new constraint (walkthrough)
-- Testing patterns (unit + integration + temp-revert regression trick)
-- Known gaps (`sh:uniqueLang`, `sh:qualifiedValueShape`, cross-txn cache)
-
-
 ## How to Contribute
 
 ### Ways to Contribute
@@ -144,13 +131,19 @@ More detailed explanation if needed. Wrap at 72 characters.
 Fixes #123
 ```
 
+A `Fixes #123` trailer closes the issue once the commit reaches the default branch, but it does
+not create the *linked pull request* relationship — so put the closing keyword in the **PR body**
+as well (or instead). See [Linking issues from PRs](issue-linking.md) for the three reference
+forms and how they behave on stacked PRs.
+
 ### 7. Push and Create PR
 
 ```bash
 git push origin feature/my-feature
 ```
 
-Create pull request on GitHub.
+Create pull request on GitHub. Put `Fixes #N` / `Follow-up: #N` / `Partially addresses #N` in the
+PR body so the reference direction is explicit — see [Linking issues from PRs](issue-linking.md).
 
 ### 8. Address Review Comments
 
@@ -355,9 +348,13 @@ None
 
 ## License
 
-Contributions licensed under Apache 2.0.
+Fluree DB is distributed under the [Business Source License 1.1](https://github.com/fluree/db/blob/main/LICENSE),
+which converts to Apache License 2.0 on each version's Change Date.
 
-By contributing, you agree to license your contributions under the same license.
+By contributing, you license your contributions to Fluree, PBC under the
+[Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0), and agree that
+Fluree may distribute them as part of Fluree DB under the Business Source
+License, the Apache License 2.0, and Fluree's commercial licenses.
 
 ## Recognition
 

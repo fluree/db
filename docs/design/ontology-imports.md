@@ -36,7 +36,7 @@ GRAPH <urn:fluree:myapp:main#config> {
     f:reasoningDefaults <urn:myapp:config:reasoning> .
 
   <urn:myapp:config:reasoning>
-    f:reasoningModes ( "rdfs" "owl2-rl" ) ;
+    f:reasoningModes ( "rdfs" "owl2rl" ) ;
     f:schemaSource <urn:myapp:config:schema-ref> ;
     f:followOwlImports true ;
     f:ontologyImportMap <urn:myapp:config:bfo-binding> .
@@ -69,13 +69,27 @@ An `OntologyImportBinding` has two fields:
 - `f:ontologyIri` — the IRI that appears in `owl:imports` statements.
 - `f:graphRef` — a nested `f:GraphRef` identifying the local graph.
 
-The `GraphRef` shape supported for `f:schemaSource` and
-`f:ontologyImportMap.graphRef` is the same-ledger shape:
-`f:graphSelector` naming a local named graph, `f:defaultGraph`, or a
-registered graph IRI. References are resolved at the query's effective
-`to_t` — every named graph in a Fluree ledger shares the ledger's
-monotonic `t`, so the entire closure is consistent at a single point in
-time without per-import bookkeeping.
+The `GraphRef` shape supported for `f:ontologyImportMap.graphRef` is the
+same-ledger shape: `f:graphSelector` naming a local named graph,
+`f:defaultGraph`, or a registered graph IRI. References are resolved at
+the query's effective `to_t` — every named graph in a Fluree ledger
+shares the ledger's monotonic `t`, so the entire closure is consistent
+at a single point in time without per-import bookkeeping.
+
+`f:schemaSource` additionally accepts the cross-ledger shape (`f:ledger`
+naming a model ledger plus an explicit `f:graphSelector`). Cross-ledger
+refs bypass this module entirely: `view/query.rs::
+resolve_configured_schema_bundle` dispatches them through the shared
+cross-ledger resolver (`ArtifactKind::SchemaClosure`), which projects
+the model ledger's whitelisted axioms onto the data ledger's snapshot
+at the model ledger's **current head** (as-of-now, matching
+`f:policySource` / `f:shapesSource` semantics — not the query's `to_t`).
+Both the single-ledger view path and the multi-ledger dataset path
+(where reasoning is governed by the dataset's primary view) share this
+dispatch via `apply_reasoning_to_executable`. The cross-ledger
+materializer is single-graph: combining it with `f:followOwlImports
+true` fails closed with `ApiError::OntologyImport` rather than silently
+dropping the import closure. See `cross-ledger-model-enforcement.md`.
 
 ## Resolution algorithm
 
@@ -197,17 +211,24 @@ so broken ontology references surface early. Sources of this error:
 - A resolution that would land on a reserved system graph (config or
   txn-meta), whether via direct graph-IRI match, mapping table, or
   `f:schemaSource` selector.
-- A `GraphRef` that targets a different ledger, uses `f:atT`, or carries a
-  `f:trustPolicy` / `f:rollbackGuard`. The bundle is resolved at the
-  query's single `to_t`, same-ledger scope only, and accepting these
-  fields silently would create a gap between declared intent and actual
-  behavior.
+- An `f:ontologyImportMap.graphRef` that targets a different ledger, or
+  any `GraphRef` that uses `f:atT` or carries a `f:trustPolicy` /
+  `f:rollbackGuard`. The local bundle is resolved at the query's single
+  `to_t`, and accepting these fields silently would create a gap between
+  declared intent and actual behavior. (A cross-ledger `f:schemaSource`
+  is legal on both the single-ledger and dataset query paths but never
+  reaches this module — see above.)
+- `f:followOwlImports true` combined with a cross-ledger
+  `f:schemaSource` (raised by `view/query.rs` before dispatch — the
+  cross-ledger materializer does not walk `owl:imports`).
 
 ## Wiring at query time
 
-`Fluree::query(&db, ...)` (and the dataset-query counterpart) call
-`build_executable_for_view` → `attach_schema_bundle` on every query. The
-attach step:
+`Fluree::query(&db, ...)` calls `build_executable_for_view`, and the
+dataset counterpart calls `build_executable_for_dataset` with the
+dataset's primary view; both route through the shared
+`apply_reasoning_to_executable` → `attach_schema_bundle` on every query.
+The attach step:
 
 1. Reads `db.resolved_config().reasoning`. If there is no `f:schemaSource`,
    returns immediately — the legacy default-graph path applies unchanged.

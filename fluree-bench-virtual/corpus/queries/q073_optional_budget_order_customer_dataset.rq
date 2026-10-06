@@ -1,0 +1,13 @@
+# q073 optional_budget_order_customer_dataset — promoted from A3 probe-04 (audit item 11, F-AUD-7)
+# Coverage: a top-level LIMIT above an OPTIONAL (left-outer join). Item 11 forwards
+#   the LIMIT row budget to the REQUIRED (outer) side — sound because each required
+#   row yields ≥1 output — so the driving FACT_ORDER scan stops early instead of
+#   full-scanning. This closes probe-04's measured 68,828× read amplification. Its
+#   control (no OPTIONAL) is q074. rows_only: the LIMIT truncates an unordered set.
+# Exec path: query_from() FROM <enterprise-sf01-v:main> (the deployed solo/chat shape).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?oid ?tot ?cust
+FROM <enterprise-sf01-v:main>
+WHERE { ?o a edw:Order ; edw:orderId ?oid ; edw:orderTotal ?tot .
+        OPTIONAL { ?o edw:customer ?cust . } }
+LIMIT 50

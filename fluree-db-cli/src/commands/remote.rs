@@ -20,7 +20,147 @@ pub async fn run(action: RemoteAction, dirs: &FlureeDir) -> CliResult<()> {
         RemoteAction::Remove { name } => run_remove(&store, &name).await,
         RemoteAction::List => run_list(&store).await,
         RemoteAction::Show { name } => run_show(&store, &name).await,
+        RemoteAction::Ledgers { name } => run_ledgers(&store, name.as_deref()).await,
     }
+}
+
+/// List the ledgers the configured token can access on a remote, with the
+/// serving tiers each offers.
+///
+/// Uses the storage-scope endpoints: `GET /nameservice/snapshot` for the
+/// auth-filtered catalog and `GET /storage/ns/{alias}` for the per-ledger
+/// `serving` advertisement.
+async fn run_ledgers(store: &TomlSyncConfigStore, name: Option<&str>) -> CliResult<()> {
+    let remotes = store
+        .list_remotes()
+        .await
+        .map_err(|e| CliError::Config(e.to_string()))?;
+    let remote = match name {
+        Some(n) => remotes
+            .iter()
+            .find(|r| r.name.as_str() == n)
+            .cloned()
+            .ok_or_else(|| CliError::NotFound(format!("remote '{n}' not found")))?,
+        None => match remotes.as_slice() {
+            [only] => only.clone(),
+            [] => {
+                return Err(CliError::Config(
+                    "no remotes configured. Add one with `fluree remote add <name> <url>`".into(),
+                ))
+            }
+            _ => {
+                return Err(CliError::Input(
+                    "multiple remotes configured; specify one: `fluree remote ledgers <name>`"
+                        .into(),
+                ))
+            }
+        },
+    };
+
+    let base_url = match &remote.endpoint {
+        RemoteEndpoint::Http { base_url } => base_url.clone(),
+        _ => {
+            return Err(CliError::Config(format!(
+                "remote '{}' is not an HTTP remote",
+                remote.name.as_str()
+            )));
+        }
+    };
+    let token = remote.auth.token.clone().ok_or_else(|| {
+        CliError::Config(format!(
+            "remote '{}' has no token; `fluree remote ledgers` requires a bearer token \
+             with storage scope.\n  Log in with `fluree auth login {}`.",
+            remote.name.as_str(),
+            remote.name.as_str()
+        ))
+    })?;
+
+    let client = reqwest::Client::new();
+    let snapshot: serde_json::Value = client
+        .get(format!("{base_url}/nameservice/snapshot"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| CliError::Remote(format!("snapshot request failed: {e}")))?
+        .error_for_status()
+        .map_err(|e| CliError::Remote(format!("snapshot request rejected: {e}")))?
+        .json()
+        .await
+        .map_err(|e| CliError::Remote(format!("snapshot response parse failed: {e}")))?;
+
+    let ledgers = snapshot
+        .get("ledgers")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut table = Table::new();
+    table.set_header(vec!["LEDGER", "COMMIT T", "INDEX T", "SERVING"]);
+    for record in &ledgers {
+        let Some(ledger_id) = record.get("ledger_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // Per-ledger serving tiers come from the NS record lookup.
+        let serving = client
+            .get(format!(
+                "{base_url}/storage/ns/{}",
+                urlencoding::encode(ledger_id)
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .ok()
+            .and_then(|r| r.error_for_status().ok());
+        let serving = match serving {
+            Some(resp) => resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v.get("serving").cloned())
+                .and_then(|s| {
+                    s.as_array().map(|tiers| {
+                        tiers
+                            .iter()
+                            .filter_map(|t| t.as_str())
+                            .collect::<Vec<_>>()
+                            .join("+")
+                    })
+                })
+                .unwrap_or_else(|| "-".to_string()),
+            None => "-".to_string(),
+        };
+        table.add_row(vec![
+            Cell::new(ledger_id),
+            Cell::new(
+                record
+                    .get("commit_t")
+                    .and_then(serde_json::Value::as_i64)
+                    .map_or_else(|| "-".to_string(), |t| t.to_string()),
+            ),
+            Cell::new(
+                record
+                    .get("index_t")
+                    .and_then(serde_json::Value::as_i64)
+                    .map_or_else(|| "-".to_string(), |t| t.to_string()),
+            ),
+            Cell::new(serving),
+        ]);
+    }
+
+    if ledgers.is_empty() {
+        println!(
+            "No ledgers visible on remote '{}' (token scope may be empty).",
+            remote.name.as_str()
+        );
+    } else {
+        println!("{table}");
+        println!(
+            "\n  {} track one with `fluree track add <ledger> --remote {} --mode peer`",
+            "hint:".dimmed(),
+            remote.name.as_str()
+        );
+    }
+    Ok(())
 }
 
 async fn run_add(
@@ -86,6 +226,11 @@ async fn run_add(
                     eprintln!("  Run `fluree auth login --remote {name}` to authenticate");
                 }
             }
+            if let Some(ref min) = discovered.cli_min_version {
+                if let Some(warning) = cli_min_version_warning(env!("CARGO_PKG_VERSION"), min) {
+                    eprintln!("  {} {}", "warn:".yellow().bold(), warning);
+                }
+            }
         }
         Ok(None) => {
             // No discovery endpoint or not reachable yet — that's fine
@@ -101,7 +246,17 @@ async fn run_add(
     } else if input_url.ends_with("/fluree") {
         input_url.clone()
     } else {
-        format!("{}/fluree", input_url.trim_end_matches('/'))
+        // Discovery didn't resolve a base and the input doesn't look like an
+        // API base — this is a guess, so say so instead of failing silently
+        // later with 404s on every request.
+        let guessed = format!("{}/fluree", input_url.trim_end_matches('/'));
+        eprintln!(
+            "  {} discovery unavailable — storing guessed API base '{guessed}'; \
+             if requests fail, re-add with the full API base URL \
+             (e.g. 'https://host/v1/fluree')",
+            "warn:".yellow().bold(),
+        );
+        guessed
     };
 
     let config = RemoteConfig {
@@ -124,6 +279,34 @@ async fn run_add(
 pub(crate) struct DiscoveredRemote {
     pub(crate) api_base_url: Option<String>,
     pub(crate) auth: Option<RemoteAuth>,
+    /// Oldest CLI release whose command surface matches what the stack's
+    /// docs and UI teach (the optional `cli.min_version` discovery field).
+    pub(crate) cli_min_version: Option<String>,
+}
+
+/// Warning to print when the running CLI predates the stack's advertised
+/// `cli.min_version`. Pure so it is unit-testable; lenient about versions
+/// that don't parse as `x.y.z` (no warning — never block on a malformed
+/// advertisement).
+pub(crate) fn cli_min_version_warning(current: &str, min: &str) -> Option<String> {
+    fn parse(v: &str) -> Option<Vec<u64>> {
+        // Ignore pre-release/build suffixes ("4.2.0-rc.1" → 4.2.0).
+        let core = v.trim().split(['-', '+']).next()?;
+        let parts: Vec<u64> = core
+            .split('.')
+            .map(str::parse::<u64>)
+            .collect::<Result<_, _>>()
+            .ok()?;
+        (!parts.is_empty()).then_some(parts)
+    }
+    let (cur, min_v) = (parse(current)?, parse(min)?);
+    (cur < min_v).then(|| {
+        format!(
+            "this server expects fluree {min} or newer (you have {current}); \
+             commands its docs reference may not exist in this binary — \
+             upgrade via your original install method"
+        )
+    })
 }
 
 /// Attempt to fetch `/.well-known/fluree.json` from the remote origin and parse
@@ -261,6 +444,13 @@ pub(crate) async fn discover_remote(remote_url: &str) -> Result<Option<Discovere
         }
     }
 
+    // Optional CLI compatibility advertisement (`cli.min_version`).
+    out.cli_min_version = body
+        .get("cli")
+        .and_then(|c| c.get("min_version"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
     Ok(Some(out))
 }
 
@@ -394,5 +584,34 @@ fn auth_display_short(auth: &RemoteAuth) -> &'static str {
                 "none"
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cli_min_version_warning;
+
+    #[test]
+    fn min_version_warning_fires_only_when_older() {
+        assert!(cli_min_version_warning("4.1.2", "4.1.3").is_some());
+        assert!(cli_min_version_warning("4.0.9", "4.1.3").is_some());
+        assert!(cli_min_version_warning("4.1.3", "4.1.3").is_none());
+        assert!(cli_min_version_warning("4.2.0", "4.1.3").is_none());
+        assert!(cli_min_version_warning("5.0.0", "4.9.9").is_none());
+    }
+
+    #[test]
+    fn min_version_warning_handles_prerelease_and_short_forms() {
+        // Pre-release suffix is ignored for the comparison.
+        assert!(cli_min_version_warning("4.2.0-rc.1", "4.1.3").is_none());
+        // A shorter version is older than its extension.
+        assert!(cli_min_version_warning("4.1", "4.1.3").is_some());
+    }
+
+    #[test]
+    fn min_version_warning_never_fires_on_malformed_advertisements() {
+        assert!(cli_min_version_warning("4.1.3", "not-a-version").is_none());
+        assert!(cli_min_version_warning("not-a-version", "4.1.3").is_none());
+        assert!(cli_min_version_warning("4.1.3", "").is_none());
     }
 }

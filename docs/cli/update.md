@@ -24,7 +24,7 @@ fluree update [LEDGER] [DATA] [OPTIONS]
 | `-e, --expr <EXPR>` | Inline data expression (alternative to positional) |
 | `-f, --file <FILE>` | Read data from a file |
 | `-m, --message <MSG>` | Commit message |
-| `--format <FORMAT>` | Data format: `jsonld` or `sparql` (auto-detected if omitted) |
+| `--format <FORMAT>` | Data format: `jsonld`, `sparql`, or `cypher` (auto-detected if omitted) |
 | `--remote <NAME>` | Execute against a remote server (by remote name) |
 | `--direct` | Bypass auto-routing through a local server (global flag; see note on SPARQL UPDATE below) |
 
@@ -42,6 +42,7 @@ Executes a WHERE/DELETE/INSERT transaction against a ledger. Unlike `insert` (wh
 
 - **JSON-LD** (default): transaction body with `where`, `delete`, and/or `insert` keys
 - **SPARQL UPDATE**: standard `INSERT DATA`, `DELETE DATA`, `DELETE/INSERT WHERE` syntax
+- **Cypher**: openCypher writes (`CREATE`/`MERGE`/`SET`/`REMOVE`/`DELETE`). Force with `--format cypher`, a `.cypher`/`.cyp`/`.cql` file, or a `{"cypher": "..."}` envelope. See the [Cypher reference](../query/cypher.md) and [cookbook](../guides/cookbook-cypher.md).
 
 ### SPARQL UPDATE Note
 
@@ -133,11 +134,14 @@ The format is auto-detected using this priority:
 2. **File extension** (when using `-f` or a positional file path):
    - `.json`, `.jsonld` → JSON-LD
    - `.rq`, `.ru`, `.sparql` → SPARQL UPDATE
+   - `.cypher`, `.cyp`, `.cql` → Cypher
 3. **Content sniffing**:
+   - A `{"cypher": "...", "params": {...}}` envelope → Cypher
    - Valid JSON (full parse, not just first character) → JSON-LD
+   - Starts with `MATCH `, `MERGE `, `DETACH `, or `CREATE (` → Cypher
    - Starts with `INSERT`, `DELETE`, `PREFIX`, or `BASE` → SPARQL UPDATE
 
-Override with `--format jsonld` or `--format sparql`.
+Override with `--format jsonld`, `--format sparql`, or `--format cypher`.
 
 ## Comparison with Insert and Upsert
 

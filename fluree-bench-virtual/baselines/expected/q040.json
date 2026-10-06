@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "query_id": "q040",
+  "result_hash": "2ba2a07a3a57a2f2825bf17c6a2fc3e4233e3a5ddba7c406272330be076004b7",
+  "rows": 1100,
+  "head_rows": [
+    "<http://data.fluree.dev/edw/store/1>\u001f1.00064000000e3",
+    "<http://data.fluree.dev/edw/store/1>\u001f1.00587000000e3",
+    "<http://data.fluree.dev/edw/store/1>\u001f1.03580000000e3",
+    "<http://data.fluree.dev/edw/store/1>\u001f1.04125000000e3",
+    "<http://data.fluree.dev/edw/store/1>\u001f1.04742000000e3",
+    "<http://data.fluree.dev/edw/store/1>\u001f1.05154000000e3",
+    "<http://data.fluree.dev/edw/store/1>\u001f1.05957000000e3",
+    "<http://data.fluree.dev/edw/store/1>\u001f1.08853000000e3",
+    "<http://data.fluree.dev/edw/store/1>\u001f1.09169000000e3",
+    "<http://data.fluree.dev/edw/store/1>\u001f1.09621000000e3",
+    "<http://data.fluree.dev/edw/store/1>\u001f1.09910000000e2",
+    "<http://data.fluree.dev/edw/store/1>\u001f1.10025000000e3",
+    "<http://data.fluree.dev/edw/store/1>\u001f1.15637000000e3",
+    "<http://data.fluree.dev/edw/store/1>\u001f1.17709000000e3",
+    "<http://data.fluree.dev/edw/store/1>\u001f1.18775000000e3",
+    "<http://data.fluree.dev/edw/store/1>\u001f1.19060000000e2",
+    "<http://data.fluree.dev/edw/store/1>\u001f1.21089000000e3",
+    "<http://data.fluree.dev/edw/store/1>\u001f1.24247000000e3",
+    "<http://data.fluree.dev/edw/store/1>\u001f1.24547000000e3",
+    "<http://data.fluree.dev/edw/store/1>\u001f1.28383000000e3"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}
