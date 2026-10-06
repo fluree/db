@@ -50,6 +50,7 @@ from fluree._connection import (
 )
 from fluree._params import _params
 from fluree._results import Record, Result
+from fluree._sources import MaterializeResult
 from fluree._records import (
     Branch,
     Change,
@@ -66,7 +67,7 @@ from fluree._records import (
     VerifyReport,
 )
 
-__all__ = ["Connection", "Ledger", "RowStream", "Snapshot", "Transaction", "connect"]
+__all__ = ["Connection", "GraphSource", "Ledger", "RowStream", "Snapshot", "Transaction", "connect"]
 
 T = TypeVar("T")
 
@@ -201,6 +202,26 @@ class Connection:
                 self._sync._run, query, max_fuel, timeout, c, language=language, params=params
             )
         )
+
+    async def map_iceberg(self, name: str, mapping: str | os.PathLike[str], **options: Any) -> GraphSource:
+        """Register Iceberg tables; see :meth:`fluree.Connection.map_iceberg`."""
+        return GraphSource(await _call(self._sync.map_iceberg, name, mapping, **options))
+
+    async def map_delta(self, name: str, mapping: str | os.PathLike[str], **options: Any) -> GraphSource:
+        """Register Delta tables; see :meth:`fluree.Connection.map_delta`."""
+        return GraphSource(await _call(self._sync.map_delta, name, mapping, **options))
+
+    async def map_sql(
+        self, name: str, endpoint: str, mapping: str | os.PathLike[str], **options: Any
+    ) -> GraphSource:
+        """Register SQL tables; see :meth:`fluree.Connection.map_sql`."""
+        return GraphSource(await _call(self._sync.map_sql, name, endpoint, mapping, **options))
+
+    async def graph_sources(self) -> list[GraphSource]:
+        return [GraphSource(s) for s in await _call(self._sync.graph_sources)]
+
+    async def graph_source(self, name: str) -> GraphSource:
+        return GraphSource(await _call(self._sync.graph_source, name))
 
     async def restore(self, path: str | os.PathLike[str], ledger: str) -> Ledger:
         return Ledger(self, await _call(self._sync.restore, path, ledger))
@@ -753,6 +774,81 @@ class Transaction:
 
     async def _close(self) -> None:
         await asyncio.shield(self._finish(asyncio.CancelledError))
+
+
+class GraphSource:
+    """A graph source; see :class:`fluree.GraphSource`."""
+
+    __slots__ = ("_sync",)
+
+    def __init__(self, sync: fluree.GraphSource) -> None:
+        self._sync = sync
+
+    @property
+    def id(self) -> str:
+        return self._sync.id
+
+    @property
+    def name(self) -> str:
+        return self._sync.name
+
+    @property
+    def branch(self) -> str:
+        return self._sync.branch
+
+    @property
+    def kind(self) -> str:
+        return self._sync.kind
+
+    def __repr__(self) -> str:
+        return repr(self._sync).replace("<GraphSource", "<aio.GraphSource", 1)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, GraphSource) and other.id == self.id
+
+    def __hash__(self) -> int:
+        return hash(self.id)
+
+    async def query(
+        self,
+        query: Query,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: Language | None = None,
+        max_fuel: float | None = None,
+        timeout: float | None = None,
+        **kwparameters: Any,
+    ) -> Any:
+        params = _params(parameters, kwparameters)
+        return await _query(
+            lambda c: _sync._execute(
+                self._sync._run, query, max_fuel, timeout, False, c, language=language, params=params
+            )
+        )
+
+    async def select(
+        self,
+        query: str,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        language: SelectLanguage | None = None,
+        max_fuel: float | None = None,
+        timeout: float | None = None,
+        **kwparameters: Any,
+    ) -> Result:
+        params = _params(parameters, kwparameters)
+        return await _query(
+            lambda c: _sync._execute(
+                self._sync._run, query, max_fuel, timeout, False, c,
+                language=language, params=params, select=True,
+            )
+        )
+
+    async def materialize(self, into: str, *, full: bool = False) -> MaterializeResult:
+        return await _call(self._sync.materialize, into, full=full)
+
+    async def drop(self) -> None:
+        await _call(self._sync.drop)
 
 
 _END = object()

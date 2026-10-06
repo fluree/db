@@ -31,10 +31,12 @@ fluree-db-api = { path = "../fluree-db-api", features = [
     "graphql",
 ] }
 fluree-db-core = { path = "../fluree-db-core" }
+fluree-db-nameservice = { path = "../fluree-db-nameservice" }
 fluree-db-sparql = { path = "../fluree-db-sparql" }
 fluree-vocab = { path = "../fluree-vocab" }
 pyo3 = "0.29"
 pythonize = "0.29"
+serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 

@@ -3589,10 +3589,12 @@ dependencies = [
  "bytes",
  "fluree-db-api",
  "fluree-db-core",
+ "fluree-db-nameservice",
  "fluree-db-sparql",
  "fluree-vocab",
  "pyo3",
  "pythonize",
+ "serde",
  "serde_json",
  "tokio",
 ]

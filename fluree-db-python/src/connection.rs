@@ -10,6 +10,7 @@ use crate::convert::{
 };
 use crate::cypher;
 use crate::error::{api_error, fluree_error, invalid_request, not_found};
+use crate::graph_source;
 use crate::ops;
 use crate::query::{execute, Controls};
 use crate::runtime::{block_on, enter, runtime, InRuntime};
@@ -975,6 +976,93 @@ impl Connection {
         block_on(py, self.fluree.get()?.set_default_context(&id, &context))?
             .map(drop)
             .map_err(api_error)
+    }
+
+    /// Register an Iceberg table as a graph source.
+    fn map_iceberg<'py>(
+        &self,
+        py: Python<'py>,
+        common: graph_source::Common,
+        spec: graph_source::IcebergSpec,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        graph_source::map_iceberg(py, self.fluree.get()?, common, spec)
+    }
+
+    /// Register Delta tables as a graph source.
+    fn map_delta<'py>(
+        &self,
+        py: Python<'py>,
+        common: graph_source::Common,
+        spec: graph_source::DeltaSpec,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        graph_source::map_delta(py, self.fluree.get()?, common, spec)
+    }
+
+    /// Register tables behind a Trino-protocol SQL endpoint as a graph source.
+    fn map_sql<'py>(
+        &self,
+        py: Python<'py>,
+        common: graph_source::Common,
+        spec: graph_source::SqlSpec,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        graph_source::map_sql(py, self.fluree.get()?, common, spec)
+    }
+
+    fn graph_sources<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        graph_source::list(py, self.fluree.get()?)
+    }
+
+    fn drop_graph_source(&self, py: Python<'_>, name: &str, branch: &str) -> PyResult<()> {
+        graph_source::drop(py, self.fluree.get()?, name, branch)
+    }
+
+    #[pyo3(signature = (source, into, full = false))]
+    fn materialize<'py>(
+        &self,
+        py: Python<'py>,
+        source: &str,
+        into: &str,
+        full: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        graph_source::materialize(py, self.fluree.get()?, source, &canonical(into)?, full)
+    }
+
+    /// A SPARQL (text) or JSON-LD (object) query of graph `graph` — a ledger,
+    /// or a graph source, which only this path resolves.
+    #[pyo3(signature = (graph, query, controls = None, params = None))]
+    fn query_graph<'py>(
+        &self,
+        py: Python<'py>,
+        graph: &str,
+        query: &Bound<'py, PyAny>,
+        controls: Option<Controls>,
+        params: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let query = QueryText::from_py(query, params)?;
+        let fluree = self.fluree.get()?;
+        let controls = controls.unwrap_or_default();
+        let (graph, query_ref) = (graph, &query);
+        let answer = controls.run(py, |cancel, controls| async move {
+            let handle = fluree.graph(graph);
+            let builder = handle.query().with_r2rml();
+            match query_ref {
+                QueryText::Sparql(sparql, params) => {
+                    let builder = builder
+                        .sparql(sparql)
+                        .format(FormatterConfig::sparql_json());
+                    let builder = match params {
+                        Some(params) => builder.params(params.clone()),
+                        None => builder,
+                    };
+                    execute!(controls, cancel, builder)
+                }
+                QueryText::JsonLd(json) => execute!(controls, cancel, builder.jsonld(json)),
+            }
+        })?;
+        match &query {
+            QueryText::Sparql(sparql, _) => answer.into_py(py, Some(sparql)),
+            QueryText::JsonLd(_) => answer.into_py(py, None),
+        }
     }
 
     /// Retract every fact in named graph `graph` in one commit; the dict

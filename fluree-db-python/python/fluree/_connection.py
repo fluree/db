@@ -39,7 +39,16 @@ from fluree._records import (
 )
 from fluree._results import Result, RowStream
 from fluree._terms import IRI, to_python
-from fluree.errors import ConflictError, InvalidRequestError, PermissionDeniedError
+from fluree._sources import (
+    Auth,
+    AzureServicePrincipal,
+    GraphSource,
+    Unity,
+    _auth,
+    _common,
+    _registered,
+)
+from fluree.errors import ConflictError, InvalidRequestError, NotFoundError, PermissionDeniedError
 
 MEMORY = ":memory:"
 
@@ -63,6 +72,7 @@ Format = _Literal["jsonld", "turtle", "trig"]
 ExportFormat = _Literal["turtle", "trig", "ntriples", "nquads", "jsonld"]
 Language = _Literal["sparql", "cypher", "jsonld"]
 SelectLanguage = _Literal["sparql", "cypher"]
+SqlDialect = _Literal["trino", "postgres", "mysql", "sqlite"]
 MergeStrategy = _Literal["take-both", "abort", "take-source", "take-branch"]
 RebaseStrategy = _Literal["take-both", "abort", "take-source", "take-branch", "skip"]
 RevertStrategy = _Literal["abort", "take-source", "take-branch"]
@@ -220,6 +230,151 @@ class Connection:
         if language == "sparql":
             return self._native.query_sparql_from(query, None, controls, params)
         return self._native.query_jsonld_from(query, controls)
+
+    def map_iceberg(
+        self,
+        name: str,
+        mapping: str | os.PathLike[str],
+        *,
+        table_location: str | None = None,
+        catalog_uri: str | None = None,
+        table: str | None = None,
+        warehouse: str | None = None,
+        auth: Auth | None = None,
+        vended_credentials: bool = True,
+        s3_region: str | None = None,
+        s3_endpoint: str | None = None,
+        s3_path_style: bool = False,
+        order_by: str | None = None,
+        branch: str | None = None,
+        model: str | None = None,
+        default_allow: bool | None = None,
+    ) -> GraphSource:
+        """Register Iceberg tables as graph source ``name``, mapped to RDF by
+        ``mapping`` (R2RML, as Turtle text or a path to a Turtle file).
+
+        Read one table directly from ``table_location`` — an ``s3://`` prefix,
+        or a local ``file://`` path (local paths must lie under a directory
+        named in the ``FLUREE_ICEBERG_LOCAL_ROOTS`` environment variable,
+        set before the process first reads a table) — or through a REST
+        catalog at ``catalog_uri``, where the mapping's table names
+        (or ``table``) name the tables, with ``warehouse`` and ``auth``
+        (:class:`Bearer` or :class:`OAuth2`). The catalog's vended
+        credentials are used unless ``vended_credentials`` is false;
+        otherwise S3 access uses the usual AWS environment and the
+        ``s3_*`` settings.
+
+        ``order_by`` names the column that orders a key's rows, latest
+        winning, for :meth:`GraphSource.materialize`. ``model`` names a
+        ledger whose policies and class hierarchy govern the source.
+        """
+        spec = {
+            "table_location": table_location,
+            "catalog_uri": catalog_uri,
+            "table": table,
+            "warehouse": warehouse,
+            "auth": _auth(auth),
+            "vended_credentials": vended_credentials,
+            "s3_region": s3_region,
+            "s3_endpoint": s3_endpoint,
+            "s3_path_style": s3_path_style,
+            "order_by": order_by,
+        }
+        common = _common(name, mapping, branch, model, default_allow)
+        return _registered(self, self._native.map_iceberg(common, spec))
+
+    def map_delta(
+        self,
+        name: str,
+        mapping: str | os.PathLike[str],
+        *,
+        root: str | None = None,
+        tables: Mapping[str, str] | None = None,
+        unity: Unity | None = None,
+        s3_region: str | None = None,
+        s3_endpoint: str | None = None,
+        s3_path_style: bool = False,
+        azure: AzureServicePrincipal | None = None,
+        branch: str | None = None,
+        model: str | None = None,
+        default_allow: bool | None = None,
+    ) -> GraphSource:
+        """Register Delta Lake tables as graph source ``name``, mapped to RDF
+        by ``mapping`` (R2RML, as Turtle text or a path to a Turtle file).
+
+        Each mapped ``rr:tableName`` is found beneath ``root`` (``a.b`` at
+        ``<root>/a/b``), at its location in ``tables``, or through a
+        :class:`Unity` catalog. Storage credentials come from the usual AWS or
+        Azure environment, the ``s3_*`` settings, or ``azure``; local paths
+        must lie under a directory named in ``FLUREE_ICEBERG_LOCAL_ROOTS``.
+        ``model`` and ``default_allow`` are as for :meth:`map_iceberg`.
+        """
+        spec = {
+            "root": root,
+            "tables": dict(tables or {}),
+            "unity": None if unity is None else unity._json(),
+            "s3_region": s3_region,
+            "s3_endpoint": s3_endpoint,
+            "s3_path_style": s3_path_style,
+            "azure": None if azure is None else azure._json(),
+        }
+        common = _common(name, mapping, branch, model, default_allow)
+        return _registered(self, self._native.map_delta(common, spec))
+
+    def map_sql(
+        self,
+        name: str,
+        endpoint: str,
+        mapping: str | os.PathLike[str],
+        *,
+        dialect: SqlDialect = "trino",
+        protocol: _Literal["trino", "presto"] = "trino",
+        catalog: str | None = None,
+        schema: str | None = None,
+        user: str | None = None,
+        auth: Auth | None = None,
+        session: Mapping[str, str] | None = None,
+        allow_duplicate_subjects: bool = False,
+        branch: str | None = None,
+        model: str | None = None,
+        default_allow: bool | None = None,
+    ) -> GraphSource:
+        """Register tables behind a SQL engine that speaks the Trino HTTP
+        protocol (Trino, Presto, or a bridge to another database) as graph
+        source ``name``, mapped to RDF by ``mapping``. Queries are pushed down
+        to ``endpoint`` as SQL in ``dialect``.
+
+        A mapped table whose subject key is not unique is reported with a
+        warning and refused at query time, unless
+        ``allow_duplicate_subjects``. ``model`` and ``default_allow`` are as
+        for :meth:`map_iceberg`.
+        """
+        spec = {
+            "endpoint": endpoint,
+            "dialect": dialect,
+            "protocol": protocol,
+            "catalog": catalog,
+            "schema": schema,
+            "user": user,
+            "auth": _auth(auth),
+            "session": dict(session or {}),
+            "allow_duplicate_subjects": allow_duplicate_subjects,
+        }
+        common = _common(name, mapping, branch, model, default_allow)
+        return _registered(self, self._native.map_sql(common, spec))
+
+    def graph_sources(self) -> list[GraphSource]:
+        """Every graph source, by id."""
+        return [GraphSource(self, raw) for raw in self._native.graph_sources()]
+
+    def graph_source(self, name: str) -> GraphSource:
+        """Graph source ``name`` (``"name"`` or ``"name:branch"``). Raises
+        :class:`NotFoundError` if there is none."""
+        wanted = name if ":" in name else f"{name}:main"
+        for raw in self._native.graph_sources():
+            if raw["id"] == wanted:
+                return GraphSource(self, raw)
+        raise NotFoundError(f"no graph source {wanted!r}")
 
     def restore(self, path: str | os.PathLike[str], ledger: str) -> Ledger:
         """Create ``ledger`` from a ``.flpack`` archive (see :meth:`Ledger.archive`)."""

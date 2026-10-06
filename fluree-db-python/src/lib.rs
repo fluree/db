@@ -20,6 +20,7 @@ mod connection;
 mod convert;
 mod cypher;
 mod error;
+mod graph_source;
 mod ops;
 mod query;
 mod runtime;

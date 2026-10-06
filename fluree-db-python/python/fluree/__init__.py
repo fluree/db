@@ -39,6 +39,15 @@ from fluree._records import (
 )
 from fluree._fluree import __version__
 from fluree._results import Record, Result, RowStream
+from fluree._sources import (
+    AzureServicePrincipal,
+    Bearer,
+    EnvVar,
+    GraphSource,
+    MaterializeResult,
+    OAuth2,
+    Unity,
+)
 from fluree._terms import IRI, BlankNode, LangString, Literal, Vector
 from fluree.errors import (
     ConflictError,
@@ -53,7 +62,8 @@ from fluree.errors import (
 )
 
 __all__ = [
-    "IRI",
+    "AzureServicePrincipal",
+    "Bearer",
     "BlankNode",
     "Branch",
     "Change",
@@ -61,17 +71,22 @@ __all__ = [
     "Conflict",
     "ConflictError",
     "Connection",
+    "EnvVar",
     "FlureeError",
     "FullText",
+    "GraphSource",
+    "IRI",
     "IndexStatus",
     "InvalidRequestError",
     "LangString",
     "Ledger",
     "Literal",
+    "MaterializeResult",
     "MergePreview",
     "MergeResult",
     "Node",
     "NotFoundError",
+    "OAuth2",
     "Path",
     "PermissionDeniedError",
     "QueryProfile",
@@ -89,10 +104,11 @@ __all__ = [
     "SweepResult",
     "Transaction",
     "UniqueConstraintError",
+    "Unity",
     "ValidationReport",
     "ValidationResult",
     "Vector",
     "VerifyReport",
-    "__version__",
     "connect",
+    "__version__",
 ]

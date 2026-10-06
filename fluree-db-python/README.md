@@ -209,6 +209,45 @@ people.query("""
 - `cosineSimilarity`, `dotProduct` and `euclideanDistance` score vectors;
   `dotProduct` over normalized embeddings is the fastest.
 
+## Graph sources
+
+Tables in Iceberg, Delta Lake, or a SQL engine can be queried in place, mapped
+to RDF by an [R2RML](https://www.w3.org/TR/r2rml/) mapping, without copying
+them into a ledger:
+
+```python
+from pathlib import Path
+
+people = conn.map_iceberg("people", Path("people.ttl"),
+                          table_location="s3://lake/silver/people")
+sales = conn.map_delta("sales", Path("sales.ttl"), root="s3://lake/Tables")
+crm = conn.map_sql("crm", "https://trino.example.com", Path("crm.ttl"),
+                   catalog="pg", schema="public",
+                   auth=fluree.OAuth2(token_url, client_id,
+                                      fluree.EnvVar("TRINO_SECRET")))
+
+people.select("PREFIX ex: <http://example.org/> SELECT ?name WHERE { ?p ex:name ?name }")
+```
+
+- The mapping is Turtle text or a path to a Turtle file. Give each object map
+  an `rr:datatype`: a column without one reads back as a string.
+- An Iceberg table is read directly from `table_location`, or through a REST
+  catalog (`catalog_uri=`, `warehouse=`, `auth=`). Delta tables are found under
+  `root`, at locations in `tables`, or through a `fluree.Unity` catalog. A SQL
+  source pushes queries to any Trino-protocol endpoint.
+- Secrets can be `fluree.EnvVar("NAME")`, read where the tables are read,
+  rather than stored with the source.
+- `conn.graph_sources()` lists them, `conn.graph_source(name)` finds one, and
+  `source.drop()` removes it (the tables are untouched).
+- To join a source with a ledger, name the source with `FROM NAMED` and read it
+  in a `GRAPH` block (JSON-LD: `"fromNamed"` and `["graph", ...]`):
+  `SELECT ... FROM <crm:main> FROM NAMED <people:main> WHERE { ... GRAPH <people:main> { ... } }`.
+- `people.materialize("people-copy")` copies an Iceberg source into a ledger,
+  reading only what is new on each later pass.
+- Local tables (`file://...`) must lie under a directory named in the
+  `FLUREE_ICEBERG_LOCAL_ROOTS` environment variable, set before the process
+  first reads one; they are not yet supported on Windows.
+
 ## History
 
 - `ledger.history(subject, predicate=None, from_t=1)` lists every assertion and
