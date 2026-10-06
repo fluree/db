@@ -66,7 +66,7 @@ Earlier releases stored an annotation as an `f:reifies*` bundle (`f:reifiesSubje
 
 Index roots from those releases may also carry an annotation-arena section. Readers skip it, keeping only the arena's two branch CIDs, and the next index build releases the arena's blobs as garbage.
 
-An annotated index built before links has no term dictionary, and its snapshot says so (`LedgerSnapshot::needs_link_reindex`), so a host can schedule the rebuild. Every read of its annotations fails asking for a rebuild (`fluree reindex`, or `Fluree::reindex`) rather than answering without them: link queries, export, and hydration's `@annotation` (`require_link_index`). An incremental build over it declines once its window holds a triple term — a term dictionary covering the window alone would lift that refusal — and the index build falls back to a full rebuild, which links every annotation in history.
+An annotated index built before links has no term dictionary, and its snapshot says so (`LedgerSnapshot::needs_link_reindex`), so a host can schedule the rebuild. Loading such a ledger logs a warning, `fluree info` prints one, and `ledger-info` reports `needs-link-reindex`. Every read of its annotations fails asking for a rebuild (`fluree reindex`, or `Fluree::reindex`) rather than answering without them: link queries, export, and hydration's `@annotation` (`require_link_index`). An incremental build over it declines once its window holds a triple term — a term dictionary covering the window alone would lift that refusal — and the index build falls back to a full rebuild, which links every annotation in history.
 
 ## See also
 

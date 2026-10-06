@@ -344,6 +344,13 @@ impl LedgerState {
         if snapshot.ledger_id != record.ledger_id {
             snapshot.ledger_id = record.ledger_id.clone();
         }
+        if snapshot.needs_link_reindex {
+            tracing::warn!(
+                ledger_id = %record.ledger_id,
+                "index predates RDF 1.2 triple-term links; annotation reads fail until a full \
+                 reindex (`fluree reindex <ledger>`)"
+            );
+        }
 
         // Load novelty from commits since index_t
         let head_commit_id = match &record.commit_head_id {

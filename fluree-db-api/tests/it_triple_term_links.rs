@@ -2272,8 +2272,25 @@ async fn a_release_built_pre_link_index_refuses_every_annotation_read() {
     let fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
         .build()
         .expect("build");
+    let (spans, guard) = support::span_capture::init_test_tracing();
     let ledger = fluree.ledger("ann:main").await.expect("load");
+    drop(guard);
     assert!(ledger.snapshot.needs_link_reindex);
+    assert!(
+        !spans
+            .find_events(
+                "index predates RDF 1.2 triple-term links; annotation reads fail until a full \
+                 reindex (`fluree reindex <ledger>`)"
+            )
+            .is_empty(),
+        "loading warns"
+    );
+    let info = fluree
+        .ledger_info("ann:main")
+        .execute()
+        .await
+        .expect("ledger info");
+    assert_eq!(info["ledger"]["needs-link-reindex"], json!(true), "{info}");
     let refused = |err: String| assert!(err.contains("fluree reindex"), "{err}");
 
     for format in [

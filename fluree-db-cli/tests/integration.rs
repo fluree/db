@@ -2574,6 +2574,59 @@ fn export_annotations_round_trip_in_every_format() {
 /// A reifier of a triple the ledger does not assert has no edge to carry a
 /// `~` marker: it is written as its `rdf:reifies` link (`@reifies` in
 /// JSON-LD), and re-importing it reifies the triple without asserting it.
+/// `fluree info` says when an annotated ledger's index predates triple-term
+/// links (a ledger written and indexed by 4.2.3), so annotation reads will
+/// refuse until a reindex; a current ledger says nothing.
+#[test]
+fn info_flags_an_index_that_predates_links() {
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+    let dir = TempDir::new().unwrap();
+    fluree_cmd(&dir).arg("init").assert().success();
+    copy_dir(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../fluree-db-api/tests/fixtures/prelink-annotations"),
+        &dir.path().join(".fluree/storage"),
+    );
+    fluree_cmd(&dir)
+        .args(["info", "ann"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "predates RDF 1.2 triple-term links",
+        ));
+
+    fluree_cmd(&dir)
+        .args(["create", "plain"])
+        .assert()
+        .success();
+    fluree_cmd(&dir)
+        .args([
+            "insert",
+            "plain",
+            "-e",
+            "@prefix ex: <http://example.org/> . ex:a ex:b ex:c .",
+        ])
+        .assert()
+        .success();
+    fluree_cmd(&dir).args(["index", "plain"]).assert().success();
+    fluree_cmd(&dir)
+        .args(["info", "plain"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("predates").not());
+}
+
 #[test]
 fn export_round_trips_reifications_of_unasserted_triples() {
     let src = TempDir::new().unwrap();
