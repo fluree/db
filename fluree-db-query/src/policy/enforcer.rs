@@ -84,6 +84,17 @@ impl QueryPolicyEnforcer {
         }
     }
 
+    /// Whether the view policy can hide any flake at all. Gates the lanes'
+    /// triple-term check: an uncovered predicate's term rows are hidden only
+    /// through the restrictions on the triples they name.
+    pub fn view_restricts_anything(&self) -> bool {
+        let view = self.policy.wrapper().view();
+        !(view.by_property.is_empty()
+            && view.by_class.is_empty()
+            && view.by_subject.is_empty()
+            && view.defaults.is_empty())
+    }
+
     /// Filter a batch of flakes by policy using explicit graph parameters.
     ///
     /// This is the **correct** method for dataset mode - it uses the graph's

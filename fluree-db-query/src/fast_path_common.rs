@@ -3919,11 +3919,52 @@ pub fn cursor_fast_path_for_predicate(
     match ctx.policy_enforcer.as_ref() {
         Some(enforcer) => match enforcer.classify_view_predicate(pred_sid) {
             PredicateCoverage::Covered => PredicateFastPath::Decline,
+            // A triple-term object is checked as the triple it names, whose
+            // predicate the view may cover even when this one is not.
+            PredicateCoverage::UncoveredAllow
+                if enforcer.view_restricts_anything()
+                    && predicate_may_hold_triple_terms(ctx, pred_sid) =>
+            {
+                PredicateFastPath::Decline
+            }
             PredicateCoverage::UncoveredAllow => PredicateFastPath::Allow,
             PredicateCoverage::UncoveredDeny => PredicateFastPath::Empty,
         },
         None => PredicateFastPath::Allow,
     }
+}
+
+/// Whether `pred_sid`'s objects in the active graph may include triple terms.
+/// Triple terms carry no datatype tag of their own, so an `UNKNOWN` tag, an
+/// unknown set, or novelty the stats do not see answers yes.
+fn predicate_may_hold_triple_terms(ctx: &ExecutionContext<'_>, pred_sid: &Sid) -> bool {
+    if fluree_db_core::is_rdf_reifies(pred_sid) {
+        return true;
+    }
+    let Some(store) = ctx.binary_store.as_ref() else {
+        return true;
+    };
+    let Some(p_id) = store.sid_to_p_id(pred_sid) else {
+        return true;
+    };
+    let overlay = ctx.overlay();
+    let stats_see_novelty = overlay
+        .as_any()
+        .downcast_ref::<fluree_db_novelty::Novelty>()
+        .is_some()
+        || overlay.epoch() == 0
+        || overlay.is_effectively_empty();
+    if !stats_see_novelty {
+        return true;
+    }
+    let stats_view = crate::stats_cache::cached_stats_view_for_db(
+        fluree_db_core::GraphDbRef::new(ctx.active_snapshot, ctx.binary_g_id, overlay, ctx.to_t)
+            .with_runtime_small_dicts_opt(ctx.runtime_small_dicts),
+        Some(store),
+        false,
+    );
+    crate::binary_scan::observed_datatypes(stats_view.as_deref(), ctx.binary_g_id, p_id)
+        .is_none_or(|tags| tags.contains(&fluree_db_core::ValueTypeTag::UNKNOWN))
 }
 
 /// Shared single-predicate fast-path gate: normalize `predicate` against

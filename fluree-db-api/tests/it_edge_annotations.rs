@@ -4958,8 +4958,9 @@ async fn policy_hiding_base_edge_blocks_annotation_rooted_query() {
 }
 
 /// A link `r rdf:reifies <<( s p o )>>` names its triple, so a policy hiding
-/// the triple hides the link on every route to it, not only `@reifies`:
-/// SPARQL's quoted pattern and a plain `rdf:reifies` scan.
+/// the triple hides the link on every route to it, not only `@reifies`, and so
+/// does a triple term held under any other predicate. Checked from novelty, from
+/// an index (where the scan and probe lanes run), and from novelty over one.
 #[tokio::test]
 async fn policy_hiding_base_edge_hides_its_link() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -4967,66 +4968,133 @@ async fn policy_hiding_base_edge_hides_its_link() {
     let ledger0 = genesis_ledger(&fluree, ledger_id);
     let insert = json!({
         "@context": ctx(),
-        "@id": "ex:alice",
-        "ex:worksFor": {
-            "@id": "ex:acme",
-            "@annotation": { "@id": "ex:emp-A", "ex:role": "Engineer" }
-        }
+        "@graph": [
+            {
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "@id": "ex:emp-A", "ex:role": "Engineer" }
+                }
+            },
+            {
+                "@id": "ex:doc",
+                "ex:mentions": {"@id": {"@id": "ex:bob", "ex:worksFor": {"@id": "ex:initech"}}}
+            }
+        ]
     });
     fluree.insert(ledger0, &insert).await.expect("insert");
-    let ledger = fluree.ledger(ledger_id).await.expect("reload");
 
-    let opts = fluree_db_api::GovernanceOptions {
-        policy: Some(json!([{
-            "@id": "ex:hide-worksFor",
-            "f:required": true,
-            "f:onProperty": [{"@id": "http://example.org/worksFor"}],
-            "f:action": "f:view",
-            "f:query": serde_json::to_string(&json!({
-                "where": {"@id": "?$identity", "@type": "http://example.org/NeverMatches"}
-            })).unwrap()
-        }])),
-        default_allow: Some(true),
-        ..Default::default()
-    };
-    let policy = fluree_db_api::policy_builder::build_policy_context_from_opts(
-        &ledger.snapshot,
-        ledger.novelty.as_ref(),
-        Some(ledger.novelty.as_ref()),
-        ledger.t(),
-        &opts,
-        &[0],
-    )
-    .await
-    .expect("policy context");
+    let check = |ledger: MemoryLedger, label: &'static str, links: usize, mentions: usize| {
+        let fluree = &fluree;
+        async move {
+            let opts = fluree_db_api::GovernanceOptions {
+                policy: Some(json!([{
+                    "@id": "ex:hide-worksFor",
+                    "f:required": true,
+                    "f:onProperty": [{"@id": "http://example.org/worksFor"}],
+                    "f:action": "f:view",
+                    "f:query": serde_json::to_string(&json!({
+                        "where": {"@id": "?$identity", "@type": "http://example.org/NeverMatches"}
+                    })).unwrap()
+                }])),
+                default_allow: Some(true),
+                ..Default::default()
+            };
+            let policy = fluree_db_api::policy_builder::build_policy_context_from_opts(
+                &ledger.snapshot,
+                ledger.novelty.as_ref(),
+                Some(ledger.novelty.as_ref()),
+                ledger.t(),
+                &opts,
+                &[0],
+            )
+            .await
+            .expect("policy context");
 
-    let reifies = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
-    for sparql in [
-        format!(
-            "SELECT ?person ?org WHERE {{ ?r {reifies} \
-             <<( ?person <http://example.org/worksFor> ?org )>> }}"
-        ),
-        format!("SELECT ?r ?t WHERE {{ ?r {reifies} ?t }}"),
-    ] {
-        let count = |db: fluree_db_api::GraphDb| {
-            let fluree = &fluree;
-            let ledger = &ledger;
-            let sparql = sparql.clone();
-            async move {
-                let result = fluree.query(&db, sparql.as_str()).await.expect("query");
-                let rows = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
-                rows.as_array().map_or(0, Vec::len)
+            let reifies = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
+            let works_for = "<http://example.org/worksFor>";
+            let mentions_iri = "<http://example.org/mentions>";
+            for (sparql, open) in [
+                (
+                    format!(
+                        "SELECT ?person ?org WHERE {{ ?r {reifies} \
+                         <<( ?person {works_for} ?org )>> }}"
+                    ),
+                    links,
+                ),
+                (format!("SELECT ?r ?t WHERE {{ ?r {reifies} ?t }}"), links),
+                (
+                    format!(
+                        "SELECT ?s ?o WHERE {{ << ?s {works_for} ?o >> \
+                         <http://example.org/role> ?x }}"
+                    ),
+                    1,
+                ),
+                (
+                    format!("SELECT ?s WHERE {{ ?r {reifies} ?t BIND(SUBJECT(?t) AS ?s) }}"),
+                    links,
+                ),
+                (
+                    format!(
+                        "SELECT ?s WHERE {{ <http://example.org/doc> {mentions_iri} ?t \
+                         BIND(SUBJECT(?t) AS ?s) }}"
+                    ),
+                    mentions,
+                ),
+                (
+                    format!("SELECT ?s ?o WHERE {{ ?d {mentions_iri} <<( ?s {works_for} ?o )>> }}"),
+                    mentions,
+                ),
+            ] {
+                let count = |db: fluree_db_api::GraphDb| {
+                    let sparql = sparql.clone();
+                    let ledger = &ledger;
+                    async move {
+                        let result = fluree.query(&db, sparql.as_str()).await.expect("query");
+                        let rows = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+                        rows.as_array().map_or(0, Vec::len)
+                    }
+                };
+                assert_eq!(
+                    count(support::graphdb_from_ledger(&ledger)).await,
+                    open,
+                    "[{label}] {sparql}"
+                );
+                let policed = support::graphdb_from_ledger(&ledger)
+                    .with_policy(std::sync::Arc::new(policy.clone()));
+                assert_eq!(count(policed).await, 0, "[{label}] hidden: {sparql}");
             }
-        };
-        assert_eq!(
-            count(support::graphdb_from_ledger(&ledger)).await,
-            1,
-            "{sparql}"
-        );
-        let policed =
-            support::graphdb_from_ledger(&ledger).with_policy(std::sync::Arc::new(policy.clone()));
-        assert_eq!(count(policed).await, 0, "the hidden edge's link: {sparql}");
-    }
+
+            let counted = format!("SELECT (COUNT(*) AS ?n) WHERE {{ ?d {mentions_iri} ?t }}");
+            let policed =
+                support::graphdb_from_ledger(&ledger).with_policy(std::sync::Arc::new(policy));
+            let result = fluree
+                .query(&policed, counted.as_str())
+                .await
+                .expect("count");
+            let rows = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+            assert_eq!(rows, json!([[0]]), "[{label}] {counted}");
+        }
+    };
+
+    check(
+        fluree.ledger(ledger_id).await.expect("load"),
+        "novelty",
+        1,
+        1,
+    )
+    .await;
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let indexed = fluree.ledger(ledger_id).await.expect("load");
+    check(indexed.clone(), "indexed", 1, 1).await;
+
+    let more = json!({
+        "@context": ctx(),
+        "@id": "ex:doc",
+        "ex:mentions": {"@id": {"@id": "ex:carol", "ex:worksFor": {"@id": "ex:hooli"}}}
+    });
+    let ledger = fluree.insert(indexed, &more).await.expect("insert").ledger;
+    check(ledger, "novelty over an index", 1, 2).await;
 }
 
 // =====================================================================
