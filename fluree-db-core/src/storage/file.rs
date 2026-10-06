@@ -588,8 +588,11 @@ const WAL_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2
 /// `durability` and `log` stay fixed while it is held. Fields drop in
 /// declaration order, so the key stripe is released before the root gate.
 ///
-/// It is `!Send`, so it is released on the thread that took it.
-/// Its release never waits on an async task to be polled.
+/// It is `!Send`, so a `Send` future cannot hold it across an `.await`.
+/// A `spawn_blocking` task cannot return one either.
+/// The type does not stop a `!Send` future, such as a `LocalSet` task, from
+/// holding it across an `.await`. Holders must take and release it on a
+/// blocking thread.
 struct OperationHold {
     _key_stripe: Option<KeyStripeGuard>,
     log: Option<Arc<Wal>>,
@@ -597,6 +600,17 @@ struct OperationHold {
     _root_gate: tokio::sync::OwnedRwLockReadGuard<()>,
     _not_send: std::marker::PhantomData<*const ()>,
 }
+
+// Stops compiling if `OperationHold` becomes `Send`.
+// Both impls would then apply, so the `some_item` path below is ambiguous.
+const _: fn() = || {
+    trait AmbiguousIfSend<A> {
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+    let _ = <OperationHold as AmbiguousIfSend<_>>::some_item;
+};
 
 impl FileStorage {
     /// Create a new file storage with the given base path
