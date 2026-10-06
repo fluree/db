@@ -267,6 +267,10 @@ pub enum FormatError {
     /// Fuel limit exceeded during formatting (expansion)
     #[error(transparent)]
     FuelExceeded(#[from] FuelExceededError),
+
+    /// A read the ledger's index cannot answer
+    #[error(transparent)]
+    Query(#[from] fluree_db_query::QueryError),
 }
 
 /// Result type for formatting operations

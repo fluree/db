@@ -63,6 +63,10 @@ pub struct LedgerSnapshotMetadata {
     /// the per-retract POST scan entirely.
     pub has_annotations: bool,
 
+    /// The index holds annotations but predates RDF 1.2 triple-term links,
+    /// so it cannot answer a link read until it is rebuilt from commits.
+    pub needs_link_reindex: bool,
+
     /// Whether any indexed row carries an RDF-list position. `Some(false)`
     /// lets the write path skip list-meta hydration; `None` means the root
     /// predates tracking and lists must be assumed possible. See
@@ -159,6 +163,10 @@ pub struct LedgerSnapshot {
     /// cost.
     pub has_annotations: bool,
 
+    /// The index holds annotations but predates RDF 1.2 triple-term links,
+    /// so it cannot answer a link read until it is rebuilt from commits.
+    pub needs_link_reindex: bool,
+
     /// Whether any indexed row carries an RDF-list position. `Some(false)`
     /// lets the write path skip list-meta hydration; `None` means the root
     /// predates tracking and lists must be assumed possible. See
@@ -185,6 +193,7 @@ impl Clone for LedgerSnapshot {
             range_provider: self.range_provider.clone(),
             graph_registry: self.graph_registry.clone(),
             has_annotations: self.has_annotations,
+            needs_link_reindex: self.needs_link_reindex,
             has_list_meta: self.has_list_meta,
         }
     }
@@ -240,6 +249,7 @@ impl LedgerSnapshot {
             string_watermark: 0,
             range_provider: None,
             has_annotations: false,
+            needs_link_reindex: false,
             // An empty snapshot has no indexed rows, so "no list rows" is
             // exact — everything lives in novelty, which tracks its own bit.
             has_list_meta: Some(false),
@@ -279,6 +289,7 @@ impl LedgerSnapshot {
             range_provider: None,
             graph_registry,
             has_annotations: meta.has_annotations,
+            needs_link_reindex: meta.needs_link_reindex,
             has_list_meta: meta.has_list_meta,
         })
     }
@@ -982,6 +993,7 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         string_watermark,
         graph_iris,
         has_annotations,
+        needs_link_reindex: has_annotations && !has_term_dict_section,
         has_list_meta,
     })
 }
@@ -1043,6 +1055,7 @@ mod tests {
             string_watermark: 0,
             graph_iris: vec![],
             has_annotations: false,
+            needs_link_reindex: false,
             has_list_meta: None,
         })
         .unwrap();

@@ -1764,6 +1764,7 @@ impl<'a> HydrationFormatter<'a> {
         if !self.may_hold_annotations() {
             return Ok(Vec::new());
         }
+        fluree_db_query::term_components::require_link_index(self.db.snapshot)?;
         // A list element is never reified.
         if flake.m.as_ref().is_some_and(|m| m.i.is_some()) {
             return Ok(Vec::new());
@@ -1899,6 +1900,7 @@ impl<'a> HydrationFormatter<'a> {
         if sid.namespace_code != BLANK_NODE || !self.may_hold_annotations() {
             return Ok(false);
         }
+        fluree_db_query::term_components::require_link_index(self.db.snapshot)?;
         let links = self
             .db
             .range(

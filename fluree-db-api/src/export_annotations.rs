@@ -105,6 +105,8 @@ impl<'a> AnnotationProbe<'a> {
         if !ledger.snapshot.has_annotations && !ledger.novelty.has_annotations() {
             return Ok(None);
         }
+        fluree_db_query::term_components::require_link_index(&ledger.snapshot)?;
+
         let graphs = std::iter::once(0).chain(
             ledger
                 .snapshot

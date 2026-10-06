@@ -73,6 +73,7 @@ async fn apply_index<S: Storage + Clone + 'static>(
         string_watermark: root.string_watermark,
         graph_iris: root.graph_iris,
         has_annotations: root.has_annotations,
+        needs_link_reindex: root.has_annotations && root.term_dict.is_none(),
         has_list_meta: root.has_list_meta,
     };
     let mut db = LedgerSnapshot::new_meta(meta).expect("seed graph registry from root");

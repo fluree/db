@@ -2244,6 +2244,84 @@ async fn construct_writes_triple_terms_as_reifications() {
     );
 }
 
+/// A ledger written and indexed by 4.2.3, whose annotations are `f:reifies*`
+/// bundles with no links (`tests/fixtures/prelink-annotations`). Every read of
+/// its annotations refuses with the reindex error rather than answering as if
+/// it had none; reads that never touch annotations answer.
+#[tokio::test]
+async fn a_release_built_pre_link_index_refuses_every_annotation_read() {
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).expect("mkdir");
+        for entry in std::fs::read_dir(from).expect("read fixture") {
+            let entry = entry.expect("entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("type").is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).expect("copy");
+            }
+        }
+    }
+    let tmp = tempfile::TempDir::new().expect("tmp");
+    copy_dir(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/prelink-annotations"),
+        tmp.path(),
+    );
+    let fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+    let ledger = fluree.ledger("ann:main").await.expect("load");
+    assert!(ledger.snapshot.needs_link_reindex);
+    let refused = |err: String| assert!(err.contains("fluree reindex"), "{err}");
+
+    for format in [
+        fluree_db_api::export::ExportFormat::Turtle,
+        fluree_db_api::export::ExportFormat::JsonLd,
+    ] {
+        let mut out = Vec::new();
+        let result = fluree
+            .export("ann:main")
+            .format(format)
+            .write_to(&mut out)
+            .await;
+        refused(match result {
+            Ok(_) => format!("{format:?} exported:\n{}", String::from_utf8_lossy(&out)),
+            Err(e) => e.to_string(),
+        });
+    }
+    let crawl = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": {"ex:alice": ["*"]}
+    });
+    refused(
+        match support::query_jsonld_formatted(&fluree, &ledger, &crawl).await {
+            Ok(rows) => format!("crawled: {rows}"),
+            Err(e) => e.to_string(),
+        },
+    );
+    refused(
+        support::query_sparql(
+            &fluree,
+            &ledger,
+            "PREFIX ex: <http://example.org/>\n\
+             SELECT ?role WHERE { << ex:alice ex:worksFor ex:acme >> ex:role ?role }",
+        )
+        .await
+        .expect_err("a reified pattern refuses")
+        .to_string(),
+    );
+
+    let plain = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>\nSELECT ?o WHERE { ex:bob ex:knows ?o }",
+    )
+    .await
+    .expect("a read without annotations answers");
+    assert_eq!(plain.as_array().map(Vec::len), Some(1), "{plain}");
+}
+
 /// An annotated ledger whose index predates links (simulated by dropping the
 /// root's term dictionary) refuses link reads until a full rebuild links its
 /// annotations. A new link declines the incremental build, whose term
@@ -2303,9 +2381,35 @@ async fn link_reads_refuse_an_index_built_before_links() {
         .expect("publish root");
 
     let ledger = fluree.ledger(ledger_id).await.expect("load");
+    assert!(ledger.snapshot.needs_link_reindex);
     let err = support::query_sparql(&fluree, &ledger, query)
         .await
         .expect_err("a pre-link index refuses link reads");
+    assert!(err.to_string().contains("fluree reindex"), "{err}");
+    // Export and the crawl's `@annotation` read links too; without them each
+    // would drop every annotation's attachment and report success.
+    for format in [
+        fluree_db_api::export::ExportFormat::Turtle,
+        fluree_db_api::export::ExportFormat::JsonLd,
+    ] {
+        let err = fluree
+            .export(ledger_id)
+            .format(format)
+            .write_to(&mut Vec::new())
+            .await
+            .expect_err("a pre-link index refuses export");
+        assert!(
+            err.to_string().contains("fluree reindex"),
+            "{format:?}: {err}"
+        );
+    }
+    let crawl = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": {"ex:s1": ["*"]}
+    });
+    let err = support::query_jsonld_formatted(&fluree, &ledger, &crawl)
+        .await
+        .expect_err("a pre-link index refuses the crawl's annotations");
     assert!(err.to_string().contains("fluree reindex"), "{err}");
 
     fluree

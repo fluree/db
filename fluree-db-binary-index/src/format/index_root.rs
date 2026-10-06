@@ -824,6 +824,7 @@ impl IndexRoot {
             string_watermark: self.string_watermark,
             graph_iris: self.graph_iris.clone(),
             has_annotations: self.has_annotations,
+            needs_link_reindex: self.has_annotations && self.term_dict.is_none(),
             has_list_meta: self.has_list_meta,
         })
     }
