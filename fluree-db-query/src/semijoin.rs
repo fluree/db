@@ -269,7 +269,7 @@ impl SemijoinOperator {
 
     /// Seed only a conjunction of triples (a seeded solution of it is a
     /// solution of the unseeded body), and only an outer side estimated small
-    /// against the body. Without estimates, seed: memory stays per chunk.
+    /// against the body. Without estimates, try: the first chunk decides.
     fn seeds(&self) -> bool {
         self.partial_keys_safe
             && self
@@ -278,10 +278,13 @@ impl SemijoinOperator {
     }
 
     /// Seeded keys have passed the point where an unseeded build is cheaper:
-    /// the outer estimate was low.
+    /// the outer estimate was low. Without estimates, seed only an outer side
+    /// one chunk holds.
     fn seeding_outgrown(&self) -> bool {
-        self.estimates
-            .is_some_and(|(_, inner)| self.seeded_keys as f64 * SEEDED_KEY_COST >= inner)
+        match self.estimates {
+            Some((_, inner)) => self.seeded_keys as f64 * SEEDED_KEY_COST >= inner,
+            None => !self.child_exhausted,
+        }
     }
 
     /// The current chunk's rows first; once it drains, the next chunk under a
@@ -308,7 +311,7 @@ impl SemijoinOperator {
         let mut seen: FxHashSet<CompositeGroupKey> = FxHashSet::default();
         let mut seed_rows: Vec<Vec<Binding>> = Vec::new();
         let mut rows = 0usize;
-        while seen.len() < SEEDED_BUILD_MAX_KEYS && rows < SEEDED_BUILD_MAX_ROWS {
+        while seen.len() <= SEEDED_BUILD_MAX_KEYS && rows <= SEEDED_BUILD_MAX_ROWS {
             let Some(batch) = self.child.next_batch(ctx).await? else {
                 self.child_exhausted = true;
                 break;
@@ -818,7 +821,8 @@ mod tests {
         // (outer rows, body, estimates, seeded once open, seeded keys at the end)
         for (n, body, estimates, seeded, seeded_keys) in [
             (keys, triple(), None, true, keys),
-            (3 * keys, triple(), None, true, 3 * keys),
+            // Without estimates, an outer side past one chunk builds unseeded.
+            (3 * keys, triple(), None, false, keys + 256),
             (3 * keys, triple(), few, true, 3 * keys),
             (3 * keys, triple(), Some((1e6, 1e6)), false, 0),
             // Seeding stops once its keys reach 1/16 of the body's estimate.
@@ -827,7 +831,7 @@ mod tests {
                 triple(),
                 Some((10.0, 32.0 * keys as f64)),
                 true,
-                2 * keys,
+                2 * (keys + 256),
             ),
             (2, values, None, false, 0),
         ] {

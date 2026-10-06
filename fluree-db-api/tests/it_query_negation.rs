@@ -1233,11 +1233,13 @@ async fn optional_exists_reuses_partial_keys_across_batches() {
             normalize_rows(&result.to_jsonld(&view.snapshot).unwrap()),
             expected
         );
+        // One lookup per seeded chunk of the 1,500 outer keys, or one for an
+        // unseeded build: reused across rows either way.
         let builds = spans.find_events("semijoin partial-key lookup built");
-        assert_eq!(
-            builds.len(),
-            1,
-            "indexed={indexed}: expected one reused lookup"
+        assert!(
+            (1..=2).contains(&builds.len()),
+            "indexed={indexed}: expected a reused lookup, got {}",
+            builds.len()
         );
         let probes = spans.find_events("semijoin partial-key probes");
         let projected: usize = probes
