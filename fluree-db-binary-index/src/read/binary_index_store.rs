@@ -317,6 +317,9 @@ pub struct BinaryIndexStore {
     base_t: i64,
     language_tags: Vec<String>,
     lex_sorted_string_ids: bool,
+    /// Decimal-encoding policy of the loaded root. Governs how query constants
+    /// encode so they match stored rows (inline vs NumBig arena).
+    decimal_encoding: fluree_db_core::DecimalEncoding,
     /// Ledger-fixed split mode for canonical IRI encoding.
     /// Set from the snapshot's `ns_split_mode` via `set_ns_split_mode()`.
     ns_split_mode: NsSplitMode,
@@ -395,6 +398,7 @@ impl BinaryIndexStore {
             base_t: 0,
             language_tags: Vec::new(),
             lex_sorted_string_ids: false,
+            decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,
             ns_split_mode: NsSplitMode::default(),
             ns_split_mode_set: true,
             p_sid_table: std::sync::OnceLock::new(),
@@ -578,6 +582,7 @@ impl BinaryIndexStore {
             base_t: root.base_t,
             language_tags: normalize_root_lang_tags(&root.language_tags),
             lex_sorted_string_ids: root.lex_sorted_string_ids,
+            decimal_encoding: root.decimal_encoding(),
             ns_split_mode: root.ns_split_mode,
             ns_split_mode_set: true,
             p_sid_table: std::sync::OnceLock::new(),
@@ -615,6 +620,13 @@ impl BinaryIndexStore {
     #[inline]
     pub fn lex_sorted_string_ids(&self) -> bool {
         self.lex_sorted_string_ids
+    }
+
+    /// The loaded root's decimal-encoding policy. Query constants must encode
+    /// under this policy so they match stored `(o_type, o_key)` rows.
+    #[inline]
+    pub fn decimal_encoding(&self) -> fluree_db_core::DecimalEncoding {
+        self.decimal_encoding
     }
 
     /// Get the branch manifest for a graph + sort order.
@@ -1363,6 +1375,7 @@ impl BinaryIndexStore {
             DecodeKind::Bool => Ok(FlakeValue::Boolean(o_key != 0)),
             DecodeKind::I64 => Ok(FlakeValue::Long(key.decode_i64())),
             DecodeKind::F64 => Ok(FlakeValue::Double(key.decode_f64())),
+            DecodeKind::Decimal => Ok(FlakeValue::Decimal(Box::new(key.decode_decimal()))),
             // The temporal types own their canonical form; building them from
             // the key directly is what makes an indexed value identical to the
             // same value parsed from a commit (see fluree_db_core::temporal).
@@ -2010,6 +2023,7 @@ impl BinaryIndexStore {
             OType::XSD_DOUBLE => Some(Sid::new(namespaces::XSD, xsd_names::DOUBLE)),
             OType::XSD_FLOAT => Some(Sid::new(namespaces::XSD, xsd_names::FLOAT)),
             OType::XSD_DECIMAL => Some(Sid::new(namespaces::XSD, xsd_names::DECIMAL)),
+            OType::XSD_DECIMAL_INLINE => Some(Sid::new(namespaces::XSD, xsd_names::DECIMAL)),
             OType::XSD_DATE => Some(Sid::new(namespaces::XSD, xsd_names::DATE)),
             OType::XSD_TIME => Some(Sid::new(namespaces::XSD, xsd_names::TIME)),
             OType::XSD_DATE_TIME => Some(Sid::new(namespaces::XSD, xsd_names::DATE_TIME)),

@@ -2302,6 +2302,7 @@ mod tests {
             namespace_codes: BTreeMap::new(),
             commit_derived_ns: HashMap::new(),
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
+            decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,
             predicate_sids: Vec::new(),
             uploaded_dicts: UploadedDicts {
                 dict_refs: DictRefs {

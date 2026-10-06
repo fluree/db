@@ -242,7 +242,8 @@ impl LinkSynth {
             }
             _ => {
                 let mut o_key = record.o_key;
-                if is_arena_kind(ObjKind::from_u8(record.o_kind)) {
+                let mut o_kind = ObjKind::from_u8(record.o_kind);
+                if is_arena_kind(o_kind) || o_kind == ObjKind::NUM_DEC {
                     let Some((_, form)) = FlakeValue::try_from(raw.o.clone())
                         .ok()
                         .and_then(|o| lexical_term_object(&o))
@@ -251,9 +252,14 @@ impl LinkSynth {
                     };
                     o_key = ObjKey::encode_u32_id(chunk.strings.get_or_insert(form.as_bytes()))
                         .as_u64();
+                    // Terms retain their canonical lexical decimal identity even
+                    // when the main index stores the attachment value inline.
+                    if o_kind == ObjKind::NUM_DEC {
+                        o_kind = ObjKind::NUM_BIG;
+                    }
                 }
                 SlotValue::Object(ObjectId::Raw {
-                    o_kind: record.o_kind,
+                    o_kind: o_kind.as_u8(),
                     o_key,
                     dt: record.dt,
                     lang_id: record.lang_id,
@@ -381,5 +387,66 @@ fn link_record(g_id: u16, ann: u64, link: LinkIds, handle: u64, t: u32, op: u8) 
         t,
         lang_id: 0,
         i: LIST_INDEX_NONE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_decimal_attachment_keeps_the_lexical_term_identity() {
+        let mut predicates = PredicateDict::new();
+        let p_id = predicates.get_or_insert(&format!("{}{}", fluree::DB, db::REIFIES_OBJECT));
+        let mut datatypes = super::super::global_dict::new_datatype_dict();
+        let raw = RawOp {
+            g_ns_code: 0,
+            g_name: "",
+            s_ns_code: 100,
+            s_name: "claim",
+            p_ns_code: fluree_vocab::namespaces::FLUREE_DB,
+            p_name: db::REIFIES_OBJECT,
+            dt_ns_code: fluree_vocab::namespaces::XSD,
+            dt_name: "decimal",
+            o: RawObject::DecimalStr("1.50"),
+            op: true,
+            lang: None,
+            i: None,
+        };
+        let record = RunRecord {
+            s_id: SubjectId::from_u64(0),
+            p_id,
+            o_kind: ObjKind::NUM_DEC.as_u8(),
+            o_key: ObjKey::encode_decimal(&"1.5".parse().unwrap())
+                .unwrap()
+                .as_u64(),
+            dt: DatatypeDictId::DECIMAL.as_u16(),
+            lang_id: 0,
+            g_id: 0,
+            t: 1,
+            op: 1,
+            i: LIST_INDEX_NONE,
+        };
+        let mut chunk = RebuildChunk::new();
+        let mut synth = LinkSynth::new();
+        synth.enable();
+        synth.observe(
+            &raw,
+            &record,
+            &mut predicates,
+            &mut datatypes,
+            &HashMap::new(),
+            &mut chunk,
+        );
+        assert_eq!(chunk.strings.forward_entries(), &[b"15e-1".to_vec()]);
+        let attachment = &mut chunk.attachments[0];
+        attachment.remap(&[10], &[23]).unwrap();
+        let SlotValue::Object(object) = attachment.value else {
+            panic!("expected an object attachment");
+        };
+        assert_eq!(
+            object.typed(&OTypeRegistry::new(&[])),
+            (OType::NUM_BIG_OVERFLOW.as_u16(), 23)
+        );
     }
 }

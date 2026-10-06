@@ -158,6 +158,9 @@ fn products() -> Vec<Product> {
         ("decimal_in", "150.5"),
         ("decimal_out", "220"),
         ("decimal_below", "-20.5"),
+        ("overflow_decimal_in", "150.1234567890123456789"),
+        ("overflow_decimal_out", "220.1234567890123456789"),
+        ("overflow_decimal_below", "-20.1234567890123456789"),
     ] {
         out.push(p(
             id,

@@ -1376,9 +1376,11 @@ async fn base_attachment_states(
                     }
                     // An arena handle names the value only within this graph
                     // and slot predicate; the window's ops carry the form.
-                    2 if is_lexical_term_object(OType::from_u16(o_type)) => {
+                    2 if is_lexical_term_object(OType::from_u16(o_type))
+                        || o_type == OType::XSD_DECIMAL_INLINE.as_u16() =>
+                    {
                         let value = store.decode_value_v3(o_type, o_key, p_id, g_id)?;
-                        let (_, form) = lexical_term_object(&value).ok_or_else(|| {
+                        let (term_o_type, form) = lexical_term_object(&value).ok_or_else(|| {
                             io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 format!("reifier {ann}: arena object {value:?} has no term form"),
@@ -1389,7 +1391,7 @@ async fn base_attachment_states(
                             None => strings.intern(form),
                         };
                         Some(SlotValue::Object(ObjectId::Typed {
-                            o_type,
+                            o_type: term_o_type.as_u16(),
                             o_key: u64::from(id),
                         }))
                     }
