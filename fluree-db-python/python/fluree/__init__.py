@@ -38,6 +38,7 @@ from fluree._records import (
     VerifyReport,
 )
 from fluree._fluree import __version__
+from fluree._logging import set_log_level
 from fluree._results import Record, Result, RowStream
 from fluree._sources import (
     AzureServicePrincipal,
@@ -110,5 +111,6 @@ __all__ = [
     "Vector",
     "VerifyReport",
     "connect",
+    "set_log_level",
     "__version__",
 ]

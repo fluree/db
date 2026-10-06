@@ -72,7 +72,7 @@ jobs:
           for py in "${{ steps.py310.outputs.python-path }}" "${{ steps.py314.outputs.python-path }}"; do
             rm -rf venv && "$py" -m venv venv
             bin=venv/bin; [ "$RUNNER_OS" = Windows ] && bin=venv/Scripts
-            "$bin/python" -m pip install dist/*.whl pytest pandas
+            "$bin/python" -m pip install dist/*.whl pytest pandas polars
             "$bin/python" -m pytest -q fluree-db-python/tests
           done
 

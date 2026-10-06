@@ -5,7 +5,7 @@ history, and fine-grained policy. The engine runs in your Python process — the
 is no server to start.
 
 ```sh
-pip install fluree                # or: pip install "fluree[pandas]"
+pip install fluree                # or "fluree[pandas]", "fluree[polars]"
 ```
 
 Wheels are published for Linux (x86-64 and arm64, glibc 2.28 or later),
@@ -57,6 +57,12 @@ with fluree.connect("./data") as conn:          # or fluree.connect(":memory:")
 - `sync(data, graph=None)` makes the default graph, or a named graph, hold
   exactly `data`, committing only the difference; `dry_run=True` counts what
   would change. Handy for mirroring an export from another system.
+- `insert_rows(rows, id="ex:person/{id}", type="ex:Person")` loads a pandas
+  or polars DataFrame (or a list of dicts), one node per row: columns become
+  properties, missing values (`None`, `NaN`, `NaT`) add nothing, and `refs=`
+  turns columns into links to other nodes. `upsert_rows` replaces existing
+  values, to load a changed table again. A pandas integer column with gaps is
+  a float column unless it uses the nullable `Int64` dtype.
 - Named graphs are created by writing to them (TriG, SPARQL `GRAPH`, or a
   JSON-LD node's `"@graph"`). `ledger.graphs()` lists them, and
   `ledger.drop_graph(iri)` retracts one's contents in a single commit.
@@ -109,8 +115,9 @@ frozen view that every query sees identically.
 - SPARQL `SELECT` and every Cypher query return a `Result` of `Record`s in
   the query's column order. A record unpacks like a tuple and reads by
   position, key, or attribute (`r[0]`, `r["name"]`, `r.name`); the result has
-  `keys()`, `value(key)`, `values()`, `data()` and `to_pandas()` (alias
-  `to_df()`), the Neo4j driver's vocabulary. `single()` returns the one
+  `keys()`, `value(key)`, `values()`, `data()`, `to_pandas()` (alias
+  `to_df()`) and `to_polars()`, the Neo4j driver's vocabulary. In Jupyter a
+  result shows as a table. `single()` returns the one
   record and raises unless there is exactly one; `first()` returns the first
   record, or `None`.
 - Literals are Python values (`int`, `float`, `Decimal`, `datetime`, `str`,
@@ -348,6 +355,14 @@ except fluree.ShaclViolationError as e:
     for v in e.violations:
         print(v.focus, v.path, v.message)
 ```
+
+## Logging
+
+The engine's log goes to Python's `logging` as the `fluree.engine` logger,
+each record carrying the engine module that wrote it as `record.target`.
+Warnings and errors are sent by default; `fluree.set_log_level("INFO")` (or
+`"DEBUG"`, `"TRACE"`) sends more, and `"OFF"` none. Below the level the engine
+skips the events altogether.
 
 ## asyncio
 

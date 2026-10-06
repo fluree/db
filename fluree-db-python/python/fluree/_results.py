@@ -4,6 +4,7 @@ eagerly as a :class:`Result` or streamed as a :class:`RowStream`."""
 from __future__ import annotations
 
 import functools
+import html
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any, SupportsIndex, overload
@@ -14,6 +15,7 @@ from fluree.errors import InvalidRequestError
 
 if TYPE_CHECKING:
     import pandas
+    import polars
 
     from fluree import _fluree
     from fluree._records import Commit
@@ -178,6 +180,33 @@ class Result(Sequence[Record]):
         return pandas.DataFrame.from_records(self._records, columns=self._keys)  # type: ignore[arg-type]
 
     to_df = to_pandas
+
+    def to_polars(self) -> polars.DataFrame:
+        """The records as a polars DataFrame, one column per key. Nodes and
+        relationships become object columns."""
+        import polars
+
+        return polars.DataFrame(
+            [tuple(r) for r in self._records], schema=self._keys, orient="row", strict=False
+        )
+
+    def _repr_html_(self) -> str:
+        """A table of the first records, for Jupyter and other notebooks."""
+        shown = self._records[:_HTML_ROWS]
+        head = "".join(f"<th>{html.escape(k)}</th>" for k in self._keys)
+        body = "".join(
+            "<tr>" + "".join(f"<td>{html.escape(_cell(v))}</td>" for v in r) + "</tr>" for r in shown
+        )
+        more = len(self._records) - len(shown)
+        caption = f"<p>{len(self._records)} records, {more} not shown</p>" if more else ""
+        return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>{caption}"
+
+
+_HTML_ROWS = 50
+
+
+def _cell(value: Any) -> str:
+    return "" if value is None else str(value)
 
 
 class RowStream(Iterator[Record]):

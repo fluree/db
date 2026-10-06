@@ -21,6 +21,7 @@ mod convert;
 mod cypher;
 mod error;
 mod graph_source;
+mod logging;
 mod ops;
 mod query;
 mod runtime;
@@ -38,5 +39,7 @@ fn _fluree(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<transaction::Transaction>()?;
     m.add_class::<query::Canceller>()?;
     m.add_function(wrap_pyfunction!(convert::sparql_form, m)?)?;
+    m.add_function(wrap_pyfunction!(logging::set_log_level, m)?)?;
+    logging::install();
     Ok(())
 }

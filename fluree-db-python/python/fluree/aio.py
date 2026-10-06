@@ -274,6 +274,14 @@ class Ledger:
     async def upsert(self, data: Data, *, format: Format | None = None, message: str | None = None) -> Commit:
         return await _call(self._sync.upsert, data, format=format, message=message)
 
+    async def insert_rows(self, rows: Any, **options: Any) -> Commit:
+        """See :meth:`fluree.Ledger.insert_rows`."""
+        return await _call(self._sync.insert_rows, rows, **options)
+
+    async def upsert_rows(self, rows: Any, **options: Any) -> Commit:
+        """See :meth:`fluree.Ledger.upsert_rows`."""
+        return await _call(self._sync.upsert_rows, rows, **options)
+
     async def update(
         self,
         transaction: str | dict[str, Any] | os.PathLike[str],
@@ -682,6 +690,12 @@ class Transaction:
 
     async def upsert(self, data: Data, *, format: Format | None = None) -> None:
         await self._call(self._sync.upsert, data, format=format)
+
+    async def insert_rows(self, rows: Any, **options: Any) -> None:
+        await self._call(self._sync.insert_rows, rows, **options)
+
+    async def upsert_rows(self, rows: Any, **options: Any) -> None:
+        await self._call(self._sync.upsert_rows, rows, **options)
 
     async def update(
         self,

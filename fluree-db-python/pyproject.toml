@@ -25,13 +25,14 @@ dynamic = ["version"]
 
 [project.optional-dependencies]
 pandas = ["pandas>=2"]
+polars = ["polars>=1"]
 
 [project.urls]
 Homepage = "https://flur.ee"
 Source = "https://github.com/fluree/db"
 
 [dependency-groups]
-dev = ["maturin>=1.9,<2", "pytest>=8", "mypy>=1.10", "pandas-stubs"]
+dev = ["maturin>=1.9,<2", "pytest>=8", "mypy>=1.10", "pandas-stubs", "pandas", "polars"]
 
 [tool.maturin]
 python-source = "python"

@@ -16,6 +16,7 @@ from typing import Any, Literal as _Literal, TypeVar, Union
 
 from fluree import _fluree
 from fluree._cypher import _table
+from fluree._frames import _rows_document
 from fluree._params import _cypher_params, _params, _sparql_params
 from fluree._records import (
     Branch,
@@ -466,6 +467,59 @@ class Ledger:
     def upsert(self, data: Data, *, format: Format | None = None, message: str | None = None) -> Commit:
         """Add data, replacing existing values of the properties it sets."""
         return self._transact("upsert", *_rdf_payload(data, format), message)
+
+    def insert_rows(
+        self,
+        rows: Any,
+        *,
+        id: str | None = None,
+        type: str | list[str] | None = None,
+        vocab: str | None = None,
+        columns: Mapping[str, str | None] | None = None,
+        refs: Mapping[str, str] | None = None,
+        message: str | None = None,
+    ) -> Commit:
+        """Add one node per row of ``rows``: a pandas or polars DataFrame, or
+        an iterable of dicts. Each column becomes a property of its row's
+        node; a missing value (``None``, ``NaN``, ``NaT``) adds nothing.
+
+        - ``id``: the node's IRI, as a template over the row's columns —
+          ``"ex:person/{id}"`` — whose values are percent-escaped. Without
+          one each row is a new blank node.
+        - ``type``: the class (or classes) every node gets.
+        - ``vocab``: an IRI prefix for the column names; otherwise they are
+          read against the ledger's default context, like JSON-LD keys.
+        - ``columns``: rename a column's property (full or compact IRI), or
+          drop the column with ``None``.
+        - ``refs``: properties whose value is a reference to another node,
+          each an IRI template — ``{"manager": "ex:person/{manager_id}"}``.
+
+        Values convert as in :meth:`insert`, keeping the DataFrame's types:
+        a pandas integer column with a gap is a float column, unless it has
+        the nullable ``Int64`` dtype. All rows commit together.
+        """
+        document = _rows_document(
+            rows, id=id, type=type, vocab=vocab, columns=columns, refs=refs, context=self.context
+        )
+        return self._transact("insert", "jsonld", document, message)
+
+    def upsert_rows(
+        self,
+        rows: Any,
+        *,
+        id: str | None = None,
+        type: str | list[str] | None = None,
+        vocab: str | None = None,
+        columns: Mapping[str, str | None] | None = None,
+        refs: Mapping[str, str] | None = None,
+        message: str | None = None,
+    ) -> Commit:
+        """:meth:`insert_rows`, replacing existing values of the properties
+        the rows set — to load a table again after it changed."""
+        document = _rows_document(
+            rows, id=id, type=type, vocab=vocab, columns=columns, refs=refs, context=self.context
+        )
+        return self._transact("upsert", "jsonld", document, message)
 
     def update(
         self,
@@ -1378,6 +1432,38 @@ class Transaction:
     def upsert(self, data: Data, *, format: Format | None = None) -> None:
         """Stage an upsert; see :meth:`Ledger.upsert`."""
         self._native.stage("upsert", *_rdf_payload(data, format))
+
+    def insert_rows(
+        self,
+        rows: Any,
+        *,
+        id: str | None = None,
+        type: str | list[str] | None = None,
+        vocab: str | None = None,
+        columns: Mapping[str, str | None] | None = None,
+        refs: Mapping[str, str] | None = None,
+    ) -> None:
+        """Stage :meth:`Ledger.insert_rows`."""
+        document = _rows_document(
+            rows, id=id, type=type, vocab=vocab, columns=columns, refs=refs, context=self._ledger.context
+        )
+        self._native.stage("insert", "jsonld", document)
+
+    def upsert_rows(
+        self,
+        rows: Any,
+        *,
+        id: str | None = None,
+        type: str | list[str] | None = None,
+        vocab: str | None = None,
+        columns: Mapping[str, str | None] | None = None,
+        refs: Mapping[str, str] | None = None,
+    ) -> None:
+        """Stage :meth:`Ledger.upsert_rows`."""
+        document = _rows_document(
+            rows, id=id, type=type, vocab=vocab, columns=columns, refs=refs, context=self._ledger.context
+        )
+        self._native.stage("upsert", "jsonld", document)
 
     def update(
         self,
