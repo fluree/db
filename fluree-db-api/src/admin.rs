@@ -142,6 +142,8 @@ pub struct DropNamedGraphReport {
     /// Current commit `t` for the branch after the drop. Equal to the
     /// pre-drop `t` when `committed = false`.
     pub t: i64,
+    /// The drop commit's id; `None` when `committed = false`.
+    pub commit_id: Option<ContentId>,
 }
 
 /// Options for [`Fluree::sync_named_graph`].
@@ -1025,6 +1027,7 @@ impl crate::Fluree {
             retracted,
             committed,
             t: new_t,
+            commit_id: committed.then(|| result.receipt.commit_id.clone()),
         })
     }
 
