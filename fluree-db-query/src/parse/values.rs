@@ -202,29 +202,16 @@ fn parse_triple_term(
     term: &serde_json::Map<String, JsonValue>,
     ctx: &JsonLdParseCtx,
 ) -> Result<UnresolvedValue> {
-    let invalid = || {
-        ParseError::InvalidWhere(
-            "a triple term in values is {\"@id\": s, p: o}: an IRI subject and one \
-             predicate with one object"
-                .to_string(),
-        )
-    };
-    let subject = term
-        .get("@id")
-        .and_then(JsonValue::as_str)
-        .ok_or_else(invalid)?;
-    let mut properties = term.iter().filter(|(k, _)| k.as_str() != "@id");
-    let (Some((predicate, object)), None) = (properties.next(), properties.next()) else {
-        return Err(invalid());
-    };
-    let object = match object {
-        JsonValue::Array(items) if items.len() == 1 => &items[0],
-        JsonValue::Array(_) => return Err(invalid()),
-        other => other,
-    };
-    let object = parse_values_cell(object, ctx)?;
+    let invalid = |msg: &str| ParseError::InvalidWhere(format!("triple term in values: {msg}"));
+    let parts = fluree_graph_json_ld::triple_term::triple_term_parts(term).map_err(invalid)?;
+    let subject = parts
+        .subject
+        .as_str()
+        .ok_or_else(|| invalid("its subject must be an IRI"))?;
+    let predicate = parts.predicate;
+    let object = parse_values_cell(parts.object, ctx)?;
     if matches!(object, UnresolvedValue::Unbound) {
-        return Err(invalid());
+        return Err(invalid("its object must be a constant"));
     }
     Ok(UnresolvedValue::TripleTerm {
         subject: Arc::from(ctx.expand_vocab(subject)?.0),

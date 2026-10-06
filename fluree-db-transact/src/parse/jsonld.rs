@@ -1734,14 +1734,10 @@ fn parse_expanded_triple_term_with_ctx(
     ctx: &mut TemplateParseCtx<'_>,
 ) -> Result<ParsedValue> {
     let invalid = |msg: &str| TransactError::Parse(format!("triple term: {msg}"));
-    let s = match term.get("@id") {
-        Some(id) => parse_expanded_id_with_ctx(id, ctx)?,
-        None => return Err(invalid("@id must name the subject")),
-    };
-    let mut pairs = term.iter().filter(|(k, _)| !k.starts_with('@'));
-    let (Some((key, values)), None) = (pairs.next(), pairs.next()) else {
-        return Err(invalid("it must describe exactly one triple"));
-    };
+    let parts = fluree_graph_json_ld::triple_term::triple_term_parts(term).map_err(invalid)?;
+    let s = parse_expanded_id_with_ctx(parts.subject, ctx)?;
+    let key = parts.predicate;
+    let values = parts.object;
     let p = if key.starts_with('?') {
         TemplateTerm::Var(ctx.vars.get_or_insert(key))
     } else {

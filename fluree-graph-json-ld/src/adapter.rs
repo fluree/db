@@ -302,31 +302,14 @@ fn process_triple_term<S: GraphSink>(
     if !sink.supports_triple_terms() {
         return Err(invalid("this destination does not hold triple-term values"));
     }
-    let subject = match term.get("@id").and_then(Value::as_str) {
+    let parts = crate::triple_term::triple_term_parts(term).map_err(invalid)?;
+    let subject = match parts.subject.as_str() {
         Some(id) if id.starts_with("_:") => sink.term_blank(Some(strip_blank_prefix(id))),
         Some(id) => sink.term_iri(id),
         None => return Err(invalid("@id must name the subject")),
     };
-    let mut pairs = term.iter().filter(|(k, _)| !k.starts_with('@'));
-    let (Some((predicate, values)), None) = (pairs.next(), pairs.next()) else {
-        return Err(invalid("it must describe exactly one triple"));
-    };
-    let value = match values {
-        Value::Array(items) if items.len() == 1 => &items[0],
-        Value::Array(_) => return Err(invalid("it must describe exactly one triple")),
-        value => value,
-    };
-    // A node with properties would assert them.
-    let reference_or_value = match value {
-        Value::Object(o) => o.contains_key("@value") || (o.len() == 1 && o.contains_key("@id")),
-        _ => true,
-    };
-    if !reference_or_value {
-        return Err(invalid(
-            "its object must be a reference, a value or a triple term",
-        ));
-    }
-    let ProcessedValue::Single(object) = process_value(value, sink)? else {
+    let predicate = parts.predicate;
+    let ProcessedValue::Single(object) = process_value(parts.object, sink)? else {
         return Err(invalid("its object must be a reference or a value"));
     };
     let predicate = sink.term_iri(predicate);
