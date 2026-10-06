@@ -1129,7 +1129,8 @@ Register remote connections on the `FlureeBuilder`:
 let fluree = FlureeBuilder::file("./data")
     .remote_connection("acme", "https://acme-fluree.example.com", Some(token))
     .remote_connection("partner", "https://partner.example.com", None)
-    .build()?;
+    .build_async()
+    .await?;
 ```
 
 Each call registers a named connection. The name is used in SPARQL queries:

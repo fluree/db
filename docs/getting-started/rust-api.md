@@ -85,7 +85,7 @@ async fn main() -> Result<()> {
 ```
 
 `build_async()` replays the storage's write-ahead log without blocking the async runtime.
-`build()` builds the same instance from synchronous code, replaying the log on the calling thread.
+`build()` builds the same instance from synchronous code that has entered a Tokio runtime (for example with `Runtime::enter`), replaying the log on the calling thread.
 
 ### Bulk import (high throughput)
 
@@ -771,7 +771,8 @@ To **disable** caching (e.g., for a CLI tool that runs once and exits):
 ```rust
 let fluree = FlureeBuilder::file("./data")
     .without_ledger_caching()
-    .build()?;
+    .build_async()
+    .await?;
 ```
 
 #### Disconnecting Ledgers
