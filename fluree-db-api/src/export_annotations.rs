@@ -9,7 +9,7 @@
 
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
-use fluree_db_core::{EdgeKey, FlakeValue, GraphId, Sid};
+use fluree_db_core::{EdgeKey, FlakeValue, GraphId, Sid, TripleTermValue};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::marker::PhantomData;
@@ -127,33 +127,41 @@ impl<'a> AnnotationProbe<'a> {
                 RangeOptions::new().with_to_t(as_of_t),
             )
             .await?;
+            // Moved, not cloned: the map holds each term's parts.
+            let graph_links = links.entry(g_id).or_default();
             for flake in flakes {
-                let FlakeValue::TripleTerm(term) = &flake.o else {
+                let FlakeValue::TripleTerm(term) = flake.o else {
                     continue;
                 };
-                let edge = term_edge(term);
-                let reifiers = links.entry(g_id).or_default().entry(edge).or_default();
+                let TripleTermValue { s, p, o, dt, lang } = *term;
+                let edge = EdgeKey {
+                    g: None,
+                    s,
+                    p,
+                    o,
+                    dt,
+                    lang,
+                    list_i: None,
+                };
+                let reifiers = graph_links.entry(edge).or_default();
                 if !reifiers.contains(&flake.s) {
                     reifiers.push(flake.s);
                 }
             }
         }
         for (&g_id, graph_links) in &mut links {
-            let mut by_subject_predicate: HashMap<(Sid, Sid), Vec<EdgeKey>> = HashMap::new();
-            for edge in graph_links.keys() {
-                by_subject_predicate
-                    .entry((edge.s.clone(), edge.p.clone()))
-                    .or_default()
-                    .push(edge.clone());
-            }
-            for ((s, p), edges) in by_subject_predicate {
+            // One lookup per (subject, predicate), grouped over borrowed keys.
+            let mut edges: Vec<&EdgeKey> = graph_links.keys().collect();
+            edges.sort_unstable_by(|a, b| (&a.s, &a.p).cmp(&(&b.s, &b.p)));
+            let mut missing: Vec<EdgeKey> = Vec::new();
+            for group in edges.chunk_by(|a, b| a.s == b.s && a.p == b.p) {
                 let asserted: HashSet<EdgeKey> = range_with_overlay(
                     &ledger.snapshot,
                     g_id,
                     ledger.novelty.as_ref(),
                     IndexType::Spot,
                     RangeTest::Eq,
-                    RangeMatch::subject_predicate(s, p),
+                    RangeMatch::subject_predicate(group[0].s.clone(), group[0].p.clone()),
                     RangeOptions::new().with_to_t(as_of_t),
                 )
                 .await?
@@ -164,12 +172,16 @@ impl<'a> AnnotationProbe<'a> {
                     ..EdgeKey::from_flake(flake)
                 })
                 .collect();
-                for edge in edges {
-                    if !asserted.contains(&edge) {
-                        for reifier in graph_links.remove(&edge).unwrap_or_default() {
-                            unasserted.insert((g_id, reifier, edge.clone()));
-                        }
-                    }
+                missing.extend(
+                    group
+                        .iter()
+                        .filter(|edge| !asserted.contains(**edge))
+                        .map(|edge| (*edge).clone()),
+                );
+            }
+            for edge in missing {
+                for reifier in graph_links.remove(&edge).unwrap_or_default() {
+                    unasserted.insert((g_id, reifier, edge.clone()));
                 }
             }
         }
