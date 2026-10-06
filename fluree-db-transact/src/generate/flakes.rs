@@ -144,6 +144,17 @@ impl<'a> FlakeGenerator<'a> {
         }
     }
 
+    /// The IRI `sid` encodes in this transaction's namespace table: the
+    /// ledger's codes and every code the transaction allocated.
+    pub(crate) fn iri_of(&self, sid: &Sid) -> Option<String> {
+        if fluree_vocab::namespaces::is_full_iri(sid.namespace_code) {
+            return Some(sid.name.to_string());
+        }
+        self.ns_registry
+            .get_prefix(sid.namespace_code)
+            .map(|prefix| format!("{prefix}{}", sid.name))
+    }
+
     /// Set the WHERE dataset's alias names and the canonical IRI each resolves
     /// to (see [`DataSet::with_named_graph_alias`](fluree_db_query::DataSet)).
     pub fn set_graph_aliases(&mut self, aliases: HashMap<Arc<str>, Arc<str>>) {

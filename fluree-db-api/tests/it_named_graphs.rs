@@ -5303,3 +5303,154 @@ async fn update_where_dataset_references_resolve_in_the_transactions_ledger() {
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
+
+/// A `?g` bound to the ledger's own address before `GRAPH ?g` names the
+/// ledger's default graph in an update's WHERE, as `GRAPH <address>` does: a
+/// JSON-LD top-level `values`, a `where` `["values", …]`, and the SPARQL
+/// `VALUES` twin, in either spelling of the address, each delete the default
+/// graph's match and leave `G1` alone. The top-level `values` cell is encoded
+/// with a namespace code the update allocates (no `urn:fluree:` IRI is stored
+/// yet), which the WHERE still reads.
+#[tokio::test]
+async fn an_update_reads_a_graph_variable_bound_to_the_ledger_address() {
+    const G1: &str = "http://example.org/g1";
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ctx = json!({"ex": "http://example.org/"});
+    let forms = [
+        "JSON-LD top-level values",
+        "JSON-LD where values",
+        "SPARQL VALUES",
+        "SPARQL VALUES, short id",
+    ];
+    let mut failures = Vec::new();
+    for (i, form) in forms.into_iter().enumerate() {
+        let ledger_id = format!("addrg{i}:main");
+        let urn = format!("urn:fluree:{ledger_id}");
+        let ledger = fluree
+            .stage_owned(genesis_ledger(&fluree, &ledger_id))
+            .upsert_turtle(&format!(
+                "@prefix ex: <http://example.org/> .\n\
+                 ex:a ex:v \"default\" .\n\
+                 GRAPH <{G1}> {{ ex:b ex:v \"g1\" . }}\n"
+            ))
+            .execute()
+            .await
+            .expect("seed")
+            .ledger;
+        let jsonld = |body: serde_json::Value| {
+            let (fluree, ledger) = (&fluree, ledger.clone());
+            async move {
+                fluree
+                    .stage_owned(ledger)
+                    .update(&body)
+                    .execute()
+                    .await
+                    .map(|r| r.ledger)
+                    .map_err(|e| e.to_string())
+            }
+        };
+        let sparql = |binding: String| {
+            let (fluree, ledger) = (&fluree, ledger.clone());
+            async move {
+                run_sparql_update_result(
+                    fluree,
+                    ledger,
+                    &format!(
+                        "PREFIX ex: <http://example.org/> \
+                         DELETE {{ ?s ex:v ?o }} WHERE {{ {binding} GRAPH ?g {{ ?s ex:v ?o }} }}"
+                    ),
+                )
+                .await
+                .map(|r| r.ledger)
+                .map_err(|e| e.to_string())
+            }
+        };
+        let staged = match form {
+            "JSON-LD top-level values" => {
+                jsonld(json!({
+                    "@context": ctx,
+                    "values": ["?g", [{"@id": urn}]],
+                    "where": [["graph", "?g", {"@id": "?s", "ex:v": "?o"}]],
+                    "delete": {"@id": "?s", "ex:v": "?o"}
+                }))
+                .await
+            }
+            "JSON-LD where values" => {
+                jsonld(json!({
+                    "@context": ctx,
+                    "where": [
+                        ["values", ["?g", [{"@id": urn}]]],
+                        ["graph", "?g", {"@id": "?s", "ex:v": "?o"}]
+                    ],
+                    "delete": {"@id": "?s", "ex:v": "?o"}
+                }))
+                .await
+            }
+            "SPARQL VALUES" => sparql(format!("VALUES ?g {{ <{urn}> }}")).await,
+            _ => sparql(format!("VALUES ?g {{ <addrg{i}> }}")).await,
+        };
+        let ledger = match staged {
+            Ok(ledger) => ledger,
+            Err(e) => {
+                failures.push(format!("{form}: {e}"));
+                continue;
+            }
+        };
+        let read = |query: String| {
+            let (fluree, ledger) = (&fluree, &ledger);
+            async move {
+                crate::support::query_sparql(fluree, ledger, &query)
+                    .await
+                    .unwrap_or_else(|e| panic!("{query}: {e}"))
+                    .to_jsonld(&ledger.snapshot)
+                    .expect("jsonld")
+            }
+        };
+        let default =
+            read("PREFIX ex: <http://example.org/> SELECT ?o WHERE { ?s ex:v ?o }".to_string())
+                .await;
+        let g1 = read(format!(
+            "PREFIX ex: <http://example.org/> SELECT ?o WHERE {{ GRAPH <{G1}> {{ ?s ex:v ?o }} }}"
+        ))
+        .await;
+        if default != json!([]) || g1 != json!([["g1"]]) {
+            failures.push(format!("{form}: default {default}, g1 {g1}"));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// A top-level `values` IRI in a namespace the ledger does not have yet still
+/// writes as that IRI: a template inserting it reads back by the IRI.
+#[tokio::test]
+async fn a_top_level_values_iri_in_a_new_namespace_writes_and_reads_as_itself() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree
+        .stage_owned(genesis_ledger(&fluree, "values-new-ns:main"))
+        .upsert_turtle("@prefix ex: <http://example.org/> .\nex:a ex:v \"default\" .\n")
+        .execute()
+        .await
+        .expect("seed")
+        .ledger;
+    let ledger = fluree
+        .stage_owned(ledger)
+        .update(&json!({
+            "@context": {"ex": "http://example.org/"},
+            "values": [["?s", "?o"], [[{"@id": "urn:brandnew:x"}, "v"]]],
+            "insert": {"@id": "?s", "ex:p": "?o"}
+        }))
+        .execute()
+        .await
+        .expect("insert through values")
+        .ledger;
+    let rows = crate::support::query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/> SELECT ?o WHERE { <urn:brandnew:x> ex:p ?o }",
+    )
+    .await
+    .expect("query")
+    .to_jsonld(&ledger.snapshot)
+    .expect("jsonld");
+    assert_eq!(rows, json!([["v"]]));
+}

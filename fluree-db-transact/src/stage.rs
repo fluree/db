@@ -2864,7 +2864,7 @@ async fn stream_where_into_accumulator(
 
     // If VALUES clause present, prepend it as first pattern (seeds the join)
     if let Some(inline_values) = &txn.values {
-        let values_pattern = inline_values_to_pattern(inline_values)?;
+        let values_pattern = inline_values_to_pattern(inline_values, ledger, generator)?;
         query_patterns.insert(0, values_pattern);
     }
 
@@ -3523,15 +3523,43 @@ fn template_term_to_binding(term: &TemplateTerm) -> Result<Binding> {
     }
 }
 
-/// Convert InlineValues to Pattern::Values
-fn inline_values_to_pattern(values: &InlineValues) -> Result<Pattern> {
-    let vars = values.vars.clone();
+/// An update's top-level `values` as the VALUES pattern that seeds its WHERE.
+///
+/// The cells were encoded with the transaction's namespace table, which can
+/// hold codes the ledger's snapshot, the table the WHERE decodes with, does
+/// not have yet. Such a cell carries its IRI too (`IriMatch`), so the WHERE
+/// reads the IRI (a `GRAPH ?g` names its graph by it) while a template still
+/// writes the transaction's own encoding.
+fn inline_values_to_pattern(
+    values: &InlineValues,
+    ledger: &LedgerState,
+    generator: &FlakeGenerator<'_>,
+) -> Result<Pattern> {
+    let cell = |term: &TemplateTerm| match term {
+        TemplateTerm::Sid(sid) if ledger.snapshot.decode_sid(sid).is_none() => {
+            let iri = generator.iri_of(sid).ok_or_else(|| {
+                TransactError::InvalidTerm(format!(
+                    "VALUES IRI with unknown namespace code {}",
+                    sid.namespace_code
+                ))
+            })?;
+            Ok(Binding::IriMatch {
+                iri: iri.into(),
+                primary_sid: sid.clone(),
+                ledger_alias: ledger.snapshot.ledger_id.as_str().into(),
+            })
+        }
+        other => template_term_to_binding(other),
+    };
     let rows: Result<Vec<Vec<Binding>>> = values
         .rows
         .iter()
-        .map(|row| row.iter().map(template_term_to_binding).collect())
+        .map(|row| row.iter().map(cell).collect())
         .collect();
-    Ok(Pattern::Values { vars, rows: rows? })
+    Ok(Pattern::Values {
+        vars: values.vars.clone(),
+        rows: rows?,
+    })
 }
 
 /// Generate deletions for Upsert transactions
