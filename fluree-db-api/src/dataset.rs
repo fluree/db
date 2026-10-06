@@ -723,13 +723,6 @@ impl DatasetSpec {
         let qc_opts = GovernanceOptions::from_json(json)?;
         Ok((spec, qc_opts))
     }
-
-    /// The default-graph sources a JSON-LD `from` value names: a string, an
-    /// object naming one source by `@id` (or else `id`), or an array of
-    /// either. Errors if the value cannot be read.
-    pub fn default_graph_sources(from: &JsonValue) -> Result<Vec<GraphSource>, DatasetParseError> {
-        parse_graph_sources(from, "from")
-    }
 }
 
 /// Parsed query-connection options (policy/identity-related).
@@ -1017,19 +1010,25 @@ fn parse_named_graph_object(
                 "fromNamed entry '{alias}' must be an object"
             ))
         })?;
-        let raw_identifier = entry
-            .get("@id")
-            .or_else(|| entry.get("id"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                DatasetParseError::InvalidGraphSource(format!(
-                    "fromNamed entry '{alias}' must have an '@id' string field"
-                ))
-            })?;
+        let raw_identifier = source_object_id(entry).ok_or_else(|| {
+            DatasetParseError::InvalidGraphSource(format!(
+                "fromNamed entry '{alias}' must have an '@id' string field"
+            ))
+        })?;
         let source = parse_object_source(entry, raw_identifier)?.with_alias(alias.clone());
         sources.push(source);
     }
     Ok(sources)
+}
+
+/// The text a JSON-LD source object names its source by: its `@id`, or else
+/// its `id`. `None` when that key is missing or holds no string, which the
+/// parser refuses. Every reader of a source object goes through this, so none
+/// reads a different source than the parser does.
+pub(crate) fn source_object_id(obj: &serde_json::Map<String, JsonValue>) -> Option<&str> {
+    obj.get("@id")
+        .or_else(|| obj.get("id"))
+        .and_then(JsonValue::as_str)
 }
 
 /// The object form's `"at"` key takes the same grammar as the CLI's `--at` and
@@ -1115,15 +1114,11 @@ fn parse_single_graph_source(
     match val {
         JsonValue::String(s) => GraphSource::parse(s),
         JsonValue::Object(obj) => {
-            let raw_identifier = obj
-                .get("@id")
-                .or_else(|| obj.get("id"))
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    DatasetParseError::InvalidGraphSource(format!(
-                        "'{field_name}' object must have '@id' or 'id' string field"
-                    ))
-                })?;
+            let raw_identifier = source_object_id(obj).ok_or_else(|| {
+                DatasetParseError::InvalidGraphSource(format!(
+                    "'{field_name}' object must have '@id' or 'id' string field"
+                ))
+            })?;
             let mut source = parse_object_source(obj, raw_identifier)?;
             if let Some(alias_val) = obj.get("alias") {
                 let alias = alias_val.as_str().ok_or_else(|| {

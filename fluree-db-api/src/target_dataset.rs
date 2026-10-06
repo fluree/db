@@ -10,6 +10,7 @@
 //! whose key precedence it follows: `opts` before the top level, `from` before
 //! `ledger`, `fromNamed` before `from-named`.
 
+use crate::dataset::source_object_id;
 use crate::{ApiError, Result};
 use fluree_db_core::{
     DatasetRef, GraphId, GraphIri, GraphSel, LedgerId, LedgerRef, MemberRef, TargetError,
@@ -210,7 +211,8 @@ pub fn jsonld_names_dataset(query: &JsonValue) -> bool {
 /// The lane a JSON-LD query needs, read from its dataset keys as the engine's
 /// parser reads them. A lone `from` naming a whole ledger at head (an address
 /// with no graph and no time, as a string or as an object with nothing but
-/// its `@id`) runs on that ledger's view; any other dataset (named graphs,
+/// its id, [`source_object_id`]) runs on that ledger's view; any other
+/// dataset (named graphs,
 /// several sources, a graph, a time, a history range, a source that is no
 /// ledger address) needs the dataset lane.
 pub fn jsonld_lane(query: &JsonValue) -> JsonLdLane {
@@ -227,10 +229,8 @@ pub fn jsonld_lane(query: &JsonValue) -> JsonLdLane {
     let lone_ledger = match from {
         JsonValue::String(s) => names_whole_ledger(s),
         JsonValue::Object(o) => {
-            o.keys().all(|k| k == "@id")
-                && o.get("@id")
-                    .and_then(JsonValue::as_str)
-                    .is_some_and(names_whole_ledger)
+            o.keys().all(|k| k == "@id" || k == "id")
+                && source_object_id(o).is_some_and(names_whole_ledger)
         }
         _ => false,
     };
@@ -258,7 +258,7 @@ pub fn jsonld_view_ledger(query: &JsonValue) -> Option<String> {
     }
     match dataset_keys(obj).from?.get(obj)? {
         JsonValue::String(s) => Some(s.clone()),
-        JsonValue::Object(o) => o.get("@id")?.as_str().map(str::to_string),
+        JsonValue::Object(o) => source_object_id(o).map(str::to_string),
         _ => None,
     }
 }
@@ -297,7 +297,7 @@ fn source_texts<'a>(value: &'a JsonValue, named: bool, out: &mut Vec<&'a str>) {
                 source_texts(item, named, out);
             }
         }
-        JsonValue::Object(obj) => match obj.get("@id").and_then(JsonValue::as_str) {
+        JsonValue::Object(obj) => match source_object_id(obj) {
             Some(id) => out.push(id),
             // `fromNamed` object form: aliases mapped to sources.
             None if named => {
@@ -443,7 +443,9 @@ impl Sources<'_> {
                 .map(|item| self.normalize(item))
                 .collect::<Result<Vec<_>>>()
                 .map(JsonValue::Array),
-            JsonValue::Object(obj) => match obj.get("@id").and_then(JsonValue::as_str) {
+            // The object names its source as the parser reads it: `@id`, or
+            // else `id`.
+            JsonValue::Object(obj) => match source_object_id(obj) {
                 Some(id) => {
                     let Some(scoped) = self.source(id)? else {
                         return Ok(value.clone());
@@ -451,7 +453,7 @@ impl Sources<'_> {
                     if scoped.own_address {
                         return Ok(value.clone());
                     }
-                    // The object names a graph of this ledger by its `@id`.
+                    // The object names a graph of this ledger by its id.
                     if obj.contains_key("graph") || obj.contains_key("@graph") {
                         return Err(ApiError::invalid_query(format!(
                             "'{id}' names a graph of this ledger, so it takes no \"graph\" of \
@@ -459,6 +461,7 @@ impl Sources<'_> {
                         )));
                     }
                     let mut src = obj.clone();
+                    src.remove("id");
                     src.insert(
                         "@id".to_string(),
                         JsonValue::String(self.target.to_string()),
@@ -480,7 +483,11 @@ impl Sources<'_> {
                     })
                     .collect::<Result<Map<_, _>>>()
                     .map(JsonValue::Object),
-                None => Ok(value.clone()),
+                // A `from` object that names no source is the parser's error,
+                // refused here so no execution path reads past it.
+                None => Err(ApiError::invalid_query(
+                    "a 'from' object must name its source with an '@id' or 'id' string field",
+                )),
             },
             other => Ok(other.clone()),
         }
@@ -673,5 +680,51 @@ mod tests {
                     .unwrap_err();
             assert!(err.to_string().contains("takes no"), "{key}: {err}");
         }
+    }
+
+    /// A source object names its source as the dataset parser reads it:
+    /// `@id`, or else `id`. A single `from` naming the target that way reads
+    /// it (on the target's view when nothing else is named), one naming
+    /// another ledger that way is refused, and an object that names no source
+    /// is refused rather than passed on.
+    #[test]
+    fn a_source_object_is_read_by_the_parsers_id_keys() {
+        let target = id("books:main");
+        let lookup = graphs(&[]);
+        let lookup: GraphLookup<'_> = &lookup;
+        for (from, reads_target) in [
+            (json!({"id": "books:main"}), true),
+            (json!({"id": "books"}), true),
+            (json!({"@id": "books:main", "id": "other:main"}), true),
+            (json!({"id": "other:main"}), false),
+            (json!({"id": "other:main", "t": 1}), false),
+            (json!({"id": "books:main", "@id": "other:main"}), false),
+            (json!({}), false),
+            (json!({"graph": "txn-meta"}), false),
+            (json!({"@id": 5, "id": "books:main"}), false),
+        ] {
+            let mut q = json!({"from": from});
+            let got = resolve_jsonld_dataset_in_target(
+                &mut q,
+                &target,
+                Some(lookup),
+                SingleFrom::TargetOnly,
+            );
+            assert_eq!(got.is_ok(), reads_target, "{from}: {got:?}");
+            if reads_target {
+                assert_eq!(got.unwrap().lane, JsonLdLane::View, "{from}");
+            }
+        }
+        // A `from` array reads the same keys: another ledger named by `id`
+        // stays for the dataset lane to load, and is reported.
+        let mut q = json!({"from": [{"id": "other"}]});
+        let out =
+            resolve_jsonld_dataset_in_target(&mut q, &target, Some(lookup), SingleFrom::TargetOnly)
+                .expect("an array may name another ledger");
+        assert!(out.names_other_ledger);
+        assert_eq!(
+            jsonld_dataset_ledger(&json!({"from": [{"id": "other"}]})).as_deref(),
+            Some("other")
+        );
     }
 }
