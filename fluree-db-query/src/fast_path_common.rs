@@ -3936,13 +3936,14 @@ pub fn cursor_fast_path_for_predicate(
 
 /// Whether `pred_sid`'s objects in the active graph may include triple terms.
 /// Triple terms carry no datatype tag of their own, so an `UNKNOWN` tag, an
-/// unknown set, or novelty the stats do not see answers yes.
+/// unknown set, or novelty the stats do not see answers yes. Without a store
+/// no lane reads raw rows, so there is nothing to decline.
 fn predicate_may_hold_triple_terms(ctx: &ExecutionContext<'_>, pred_sid: &Sid) -> bool {
     if fluree_db_core::is_rdf_reifies(pred_sid) {
         return true;
     }
     let Some(store) = ctx.binary_store.as_ref() else {
-        return true;
+        return false;
     };
     let Some(p_id) = store.sid_to_p_id(pred_sid) else {
         return true;
@@ -4405,6 +4406,12 @@ mod tests {
         assert_eq!(
             cursor_fast_path_for_predicate(&ctx_allow, &name),
             PredicateFastPath::Allow
+        );
+        // Links' triple terms are checked as the triples they name, which
+        // the view may cover: never a raw read under a restricting policy.
+        assert_eq!(
+            cursor_fast_path_for_predicate(&ctx_allow, fluree_db_core::rdf_reifies_sid()),
+            PredicateFastPath::Decline
         );
         // Uncovered predicate + default-deny => short-circuit to Empty.
         let ctx_deny = make_ctx(false);
