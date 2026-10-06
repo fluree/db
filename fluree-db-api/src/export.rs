@@ -340,6 +340,14 @@ impl<'a> ExportResolver<'a> {
                         self.decode_string_novelty(ot.decode_kind(), o_key)
                     }
                     DecodeKind::IriRef => self.decode_iri_ref_novelty(o_key),
+                    // A provisional handle names a term only novelty holds.
+                    DecodeKind::TripleTermDict => {
+                        fluree_db_core::triple_term::novelty_term_index(o_key)
+                            .zip(self.dict_novelty.filter(|dn| dn.is_initialized()))
+                            .and_then(|(index, dn)| dn.terms.resolve(index))
+                            .map(|term| FlakeValue::TripleTerm(Box::new(term.clone())))
+                            .ok_or(e)
+                    }
                     _ => Err(e),
                 }
             }
@@ -448,57 +456,65 @@ impl<'a> AnnotationContext<'a> {
     fn is_reifies_row(&self, p_id: u32) -> bool {
         self.reifies_p_ids.contains(&p_id)
     }
+}
 
-    /// Whether a link row gives way to the `~ <r>` marker on its asserted
-    /// edge. A link whose triple is not asserted has no edge to carry it,
-    /// so it is written as a row.
-    fn link_becomes_marker(
-        &self,
-        resolver: &ExportResolver<'_>,
-        s_id: u64,
-        (o_type, o_key, p_id): (u16, u64, u32),
-        g_id: GraphId,
-    ) -> io::Result<bool> {
-        if !self.probe.has_unasserted() {
-            return Ok(true);
-        }
-        let FlakeValue::TripleTerm(term) = resolver.decode_value(o_type, o_key, p_id, g_id)? else {
-            return Ok(true);
-        };
-        let reifier = resolver.resolve_subject_sid(s_id)?;
-        Ok(!self.probe.link_is_unasserted(g_id, &reifier, &term))
+/// A batch's annotation reads, row-aligned: each base edge's live reifiers,
+/// and for each link row whether it gives way to the `~ <r>` marker on its
+/// asserted edge. A link whose triple is not asserted has no edge to carry
+/// it, so it is written as a row.
+#[derive(Default)]
+struct BatchAnnotations {
+    reifiers: Vec<Vec<Sid>>,
+    markers: Vec<bool>,
+}
+
+impl BatchAnnotations {
+    fn reifiers(&self, row: usize) -> &[Sid] {
+        self.reifiers.get(row).map_or(&[], Vec::as_slice)
+    }
+
+    fn is_marker(&self, row: usize) -> bool {
+        self.markers.get(row).copied().unwrap_or(false)
     }
 }
 
-/// Live reifiers for every row of `batch`, row-aligned.
+/// Read `batch`'s annotations ([`BatchAnnotations`]).
 ///
-/// Returns an empty vec when the export is not emitting annotation syntax;
-/// callers treat a missing entry as "no reifiers", so no writer needs a
-/// branch on the mode.
+/// Returns empty annotations when the export is not emitting annotation
+/// syntax; callers treat a missing entry as "no reifiers", so no writer needs
+/// a branch on the mode.
 ///
 /// This re-decodes each row's subject, predicate and object to build its
 /// `EdgeKey` — work the row writer then does again. That duplication is
 /// deliberate path separation: it happens only for ledgers that carry
 /// annotations, and it keeps the row writers' existing loop untouched for
 /// every ledger that does not.
-async fn batch_reifiers(
+async fn batch_annotations(
     resolver: &ExportResolver<'_>,
     ann: Option<&AnnotationContext<'_>>,
     batch: &ColumnBatch,
     g_id: GraphId,
-) -> io::Result<Vec<Vec<Sid>>> {
+) -> io::Result<BatchAnnotations> {
     let Some(ann) = ann else {
-        return Ok(Vec::new());
+        return Ok(BatchAnnotations::default());
     };
+    let mut markers = vec![false; batch.row_count];
     let mut edges: Vec<EdgeKey> = Vec::new();
     let mut edge_row: Vec<usize> = Vec::new();
-    for row in 0..batch.row_count {
+    for (row, marker) in markers.iter_mut().enumerate() {
         let p_id = batch.p_id.get_or(row, 0);
         let o_type = batch.o_type.get_or(row, 0);
-        if ann.is_reifies_row(p_id) || ann.is_link_row(p_id, o_type) {
+        let o_key = batch.o_key.get(row);
+        if ann.is_link_row(p_id, o_type) {
+            *marker = match resolver.decode_value(o_type, o_key, p_id, g_id)? {
+                FlakeValue::TripleTerm(term) => !ann.probe.link_is_unasserted(g_id, &term).await?,
+                _ => true,
+            };
             continue;
         }
-        let o_key = batch.o_key.get(row);
+        if ann.is_reifies_row(p_id) {
+            continue;
+        }
         let Some(p) = resolver.resolve_predicate_sid(p_id) else {
             continue;
         };
@@ -536,18 +552,15 @@ async fn batch_reifiers(
         });
         edge_row.push(row);
     }
-    let per_edge = ann.probe.live_reifiers(g_id, &edges);
-    let mut out = vec![Vec::new(); batch.row_count];
-    for (i, row) in edge_row.into_iter().enumerate() {
-        out[row] = per_edge[i].clone();
+    let per_edge = ann
+        .probe
+        .live_reifiers(g_id, &edges, resolver.store, resolver.dict_novelty)
+        .await?;
+    let mut reifiers = vec![Vec::new(); batch.row_count];
+    for (row, edge_reifiers) in edge_row.into_iter().zip(per_edge) {
+        reifiers[row] = edge_reifiers;
     }
-    Ok(out)
-}
-
-/// Reifiers for one row, or the empty slice.
-#[inline]
-fn row_reifiers(reifiers: &[Vec<Sid>], row: usize) -> &[Sid] {
-    reifiers.get(row).map_or(&[], Vec::as_slice)
+    Ok(BatchAnnotations { reifiers, markers })
 }
 
 /// IRI → prefixed name compression for Turtle/TriG (and JSON-LD compact IRIs).
@@ -594,11 +607,11 @@ pub async fn export_graph_turtle<W: Write>(
     // to rather than appended after the stream, so a subject never opens twice
     // (see `UntranslatedBySubject`).
     let (untranslated, untranslated_reifiers) =
-        resolve_untranslated(ann.as_ref(), untranslated, config.g_id).await?;
+        resolve_untranslated(&resolver, ann.as_ref(), untranslated, config.g_id).await?;
     let mut untranslated = UntranslatedBySubject::new(store, untranslated);
 
     while let Some(batch) = cursor.next_batch()? {
-        let reifiers = batch_reifiers(&resolver, ann.as_ref(), &batch, config.g_id).await?;
+        let reifiers = batch_annotations(&resolver, ann.as_ref(), &batch, config.g_id).await?;
         write_turtle_batch(
             &resolver,
             ann.as_ref(),
@@ -656,6 +669,7 @@ pub async fn export_graph_turtle<W: Write>(
 /// reifier in one probe call. Suppressed links are noted in scope, as the
 /// translated writers note theirs, so the unresolved count stays honest.
 async fn resolve_untranslated(
+    resolver: &ExportResolver<'_>,
     ann: Option<&AnnotationContext<'_>>,
     rows: Vec<Flake>,
     g_id: GraphId,
@@ -667,10 +681,12 @@ async fn resolve_untranslated(
     let mut base: Vec<Flake> = Vec::with_capacity(rows.len());
     for f in rows {
         if fluree_db_core::is_rdf_reifies(&f.p) {
-            let unasserted = matches!(&f.o, FlakeValue::TripleTerm(term)
-                if ann.probe.link_is_unasserted(g_id, &f.s, term));
+            let unasserted = match &f.o {
+                FlakeValue::TripleTerm(term) => ann.probe.link_is_unasserted(g_id, term).await?,
+                _ => false,
+            };
             if !unasserted {
-                ann.probe.note_link_sid(f.s.clone());
+                ann.probe.note_link_sid(&f.s);
                 continue;
             }
         }
@@ -680,7 +696,10 @@ async fn resolve_untranslated(
         base.push(f);
     }
     let keys: Vec<EdgeKey> = base.iter().map(EdgeKey::from_flake).collect();
-    let live = ann.probe.live_reifiers(g_id, &keys);
+    let live = ann
+        .probe
+        .live_reifiers(g_id, &keys, resolver.store, resolver.dict_novelty)
+        .await?;
     let mut map: HashMap<EdgeKey, Vec<Sid>> = HashMap::new();
     for (key, reifiers) in keys.into_iter().zip(live) {
         if !reifiers.is_empty() {
@@ -703,7 +722,7 @@ fn untranslated_reifiers_for<'m>(map: &'m HashMap<EdgeKey, Vec<Sid>>, flake: &Fl
 fn write_turtle_batch<W: Write>(
     resolver: &ExportResolver,
     ann: Option<&AnnotationContext<'_>>,
-    reifiers: &[Vec<Sid>],
+    reifiers: &BatchAnnotations,
     untranslated_reifiers: &HashMap<EdgeKey, Vec<Sid>>,
     batch: &ColumnBatch,
     g_id: GraphId,
@@ -721,9 +740,7 @@ fn write_turtle_batch<W: Write>(
         // Annotation syntax replaces each link with the `~ <r>` marker
         // emitted below; a legacy `f:reifies*` bundle is read as its link.
         if let Some(ann) = ann {
-            if ann.is_link_row(p_id, o_type)
-                && ann.link_becomes_marker(resolver, s_id, (o_type, o_key, p_id), g_id)?
-            {
+            if ann.is_link_row(p_id, o_type) && reifiers.is_marker(row) {
                 ann.probe.note_link_in_scope(resolver, s_id);
                 continue;
             }
@@ -791,7 +808,7 @@ fn write_turtle_batch<W: Write>(
         // a random seek per reifier, out of scan order, at the exact moment
         // the base edge is written.
         if let Some(ann) = ann {
-            for reifier in row_reifiers(reifiers, row) {
+            for reifier in reifiers.reifiers(row) {
                 let Some(iri) = resolver.store.sid_to_iri(reifier) else {
                     continue;
                 };
@@ -905,25 +922,18 @@ pub async fn export_graph_jsonld<W: Write>(
     let mut current_props: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
     let mut first_node = true;
     let (untranslated, untranslated_reifiers) =
-        resolve_untranslated(ann.as_ref(), untranslated, config.g_id).await?;
+        resolve_untranslated(&resolver, ann.as_ref(), untranslated, config.g_id).await?;
     let mut untranslated = UntranslatedBySubject::new(store, untranslated);
 
     while let Some(batch) = cursor.next_batch()? {
-        let reifiers = batch_reifiers(&resolver, ann.as_ref(), &batch, config.g_id).await?;
+        let reifiers = batch_annotations(&resolver, ann.as_ref(), &batch, config.g_id).await?;
         for row in 0..batch.row_count {
             let s_id = batch.s_id.get(row);
             let p_id = batch.p_id.get_or(row, 0);
             let o_type = batch.o_type.get_or(row, 0);
             let o_key = batch.o_key.get(row);
             if let Some(ann) = ann.as_ref() {
-                if ann.is_link_row(p_id, o_type)
-                    && ann.link_becomes_marker(
-                        &resolver,
-                        s_id,
-                        (o_type, o_key, p_id),
-                        config.g_id,
-                    )?
-                {
+                if ann.is_link_row(p_id, o_type) && reifiers.is_marker(row) {
                     ann.probe.note_link_in_scope(&resolver, s_id);
                     continue;
                 }
@@ -961,7 +971,7 @@ pub async fn export_graph_jsonld<W: Write>(
                             &resolver,
                             ann,
                             &jval,
-                            row_reifiers(&reifiers, row),
+                            reifiers.reifiers(row),
                             prefixes,
                         ),
                         None => vec![jval],
@@ -1613,7 +1623,7 @@ pub async fn export_graph_ntriples<W: Write>(
     let resolver = ExportResolver::new(store, config.dict_novelty, &ephemeral_preds);
     let ann = AnnotationContext::new(&resolver, config);
     let (untranslated, untranslated_reifiers) =
-        resolve_untranslated(ann.as_ref(), untranslated, config.g_id).await?;
+        resolve_untranslated(&resolver, ann.as_ref(), untranslated, config.g_id).await?;
 
     let mut stats = ExportStats::default();
     let graph_term = config.graph_iri.as_deref().map(|iri| {
@@ -1625,7 +1635,7 @@ pub async fn export_graph_ntriples<W: Write>(
     });
 
     while let Some(batch) = cursor.next_batch()? {
-        let reifiers = batch_reifiers(&resolver, ann.as_ref(), &batch, config.g_id).await?;
+        let reifiers = batch_annotations(&resolver, ann.as_ref(), &batch, config.g_id).await?;
         write_batch(
             &resolver,
             ann.as_ref(),
@@ -1664,7 +1674,7 @@ pub async fn export_graph_ntriples<W: Write>(
 fn write_batch<W: Write>(
     resolver: &ExportResolver,
     ann: Option<&AnnotationContext<'_>>,
-    reifiers: &[Vec<Sid>],
+    reifiers: &BatchAnnotations,
     batch: &ColumnBatch,
     g_id: GraphId,
     graph_term: Option<&str>,
@@ -1677,9 +1687,7 @@ fn write_batch<W: Write>(
         let o_type = batch.o_type.get_or(row, 0);
         let o_key = batch.o_key.get(row);
         if let Some(ann) = ann {
-            if ann.is_link_row(p_id, o_type)
-                && ann.link_becomes_marker(resolver, s_id, (o_type, o_key, p_id), g_id)?
-            {
+            if ann.is_link_row(p_id, o_type) && reifiers.is_marker(row) {
                 ann.probe.note_link_in_scope(resolver, s_id);
                 continue;
             }
@@ -1732,7 +1740,7 @@ fn write_batch<W: Write>(
         // spelling is a triple term as the object of `rdf:reifies`, which
         // Fluree's Turtle and N-Quads readers both accept.
         if let Some(ann) = ann {
-            for reifier in row_reifiers(reifiers, row) {
+            for reifier in reifiers.reifiers(row) {
                 let Some(r_iri) = resolver.store.sid_to_iri(reifier) else {
                     continue;
                 };

@@ -4616,7 +4616,7 @@ pub(crate) fn term_object_key(
 /// provisional handle dictionary novelty gives a term the index has not
 /// interned. A term neither holds is `NotFound`: no link names it, so the
 /// pattern cannot match.
-pub(crate) fn compose_term_handle(
+pub fn compose_term_handle(
     term: &fluree_db_core::TripleTermValue,
     store: &BinaryIndexStore,
     dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,

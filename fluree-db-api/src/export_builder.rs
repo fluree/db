@@ -31,6 +31,7 @@ pub struct ExportBuilder<'a> {
     graph_iri: Option<String>,
     context_override: Option<serde_json::Value>,
     time_spec: Option<TimeSpec>,
+    preload_max_links: u64,
 }
 
 impl<'a> ExportBuilder<'a> {
@@ -45,7 +46,15 @@ impl<'a> ExportBuilder<'a> {
             graph_iri: None,
             context_override: None,
             time_spec: None,
+            preload_max_links: crate::export_annotations::PRELOAD_MAX_LINKS,
         }
+    }
+
+    /// Read links up front only when the index counts at most `n`.
+    #[cfg(test)]
+    pub(crate) fn preload_max_links(mut self, n: u64) -> Self {
+        self.preload_max_links = n;
+        self
     }
 
     /// Set the output format (default: `Turtle`).
@@ -260,13 +269,13 @@ impl<'a> ExportBuilder<'a> {
         let overlay: &dyn fluree_db_core::OverlayProvider = ledger.novelty.as_ref();
         let dict_novelty = &ledger.dict_novelty;
 
-        // Edge → reifier lookup, read once for the whole export. `None` on a
+        // Edge → reifier lookup for the whole export. `None` on a
         // ledger that has never carried an annotation — and on
         // `raw_reifies()`, which writes the links as triples.
         let annotations = if self.raw_reifies && !matches!(self.format, ExportFormat::JsonLd) {
             None
         } else {
-            AnnotationProbe::for_ledger(&ledger, to_t).await?
+            AnnotationProbe::for_ledger(&ledger, to_t, self.preload_max_links).await?
         };
         // `EdgeKey.g` for a graph being scanned. Computed per graph rather
         // than per row, and not at all when nothing will probe it.
