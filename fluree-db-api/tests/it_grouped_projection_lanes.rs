@@ -21,9 +21,11 @@
 //! reads: each such query must decline the fast path its WHERE and grouping
 //! would otherwise take, and answer with the VALUES applied.
 //!
-//! A JSON-LD per-group list of IRIs is encoded on this ledger: the JSON-LD
-//! formatters, DOM and streaming, must materialize an encoded binding inside
-//! a per-group list.
+//! A JSON-LD projection of a per-group list next to the key and the count is
+//! also a canary pair for the two count fast paths, which output the key and
+//! the count only. The list's IRIs are encoded on this ledger, so the same
+//! queries pin that the JSON-LD formatters, DOM and streaming, materialize an
+//! encoded binding inside a per-group list.
 //!
 //! Own binary: it toggles the process-global fast-path kill switch.
 
@@ -126,6 +128,79 @@ async fn run_jsonld(
     let streamed: Value = serde_json::from_str(&streamed).expect("streamed JSON");
     assert_eq!(dom, streamed, "DOM and streaming JSON-LD differ\n{query}");
     dom
+}
+
+/// A JSON-LD routing pair for a count fast path: the key-and-count query it
+/// must answer, and the same query projecting a per-group list it must
+/// decline (it answered `null` for the list, or failed with "Projected
+/// variable not in child schema"). Each query carries its hand-derived rows.
+struct JsonLdPair {
+    site: &'static str,
+    key_only: (Value, Value),
+    with_list: (Value, Value),
+}
+
+fn jsonld_list_pairs() -> Vec<JsonLdPair> {
+    let ctx = json!({"ex": "http://example.org/"});
+    vec![
+        JsonLdPair {
+            site: "group_by_object_count_topk",
+            key_only: (
+                json!({
+                    "@context": ctx,
+                    "select": ["?a", "(as (count ?e) ?n)"],
+                    "where": {"@id": "?e", "ex:area": "?a"},
+                    "groupBy": "?a", "orderBy": "(desc ?n)", "limit": 2
+                }),
+                json!([["Net", 3], ["Local", 2]]),
+            ),
+            with_list: (
+                json!({
+                    "@context": ctx,
+                    "select": ["?a", "?e", "(as (count ?e) ?n)"],
+                    "where": {"@id": "?e", "ex:area": "?a"},
+                    "groupBy": "?a", "orderBy": "(desc ?n)", "limit": 2
+                }),
+                json!([
+                    ["Net", ["ex:e1", "ex:e2", "ex:e3"], 3],
+                    ["Local", ["ex:e4", "ex:e5"], 2]
+                ]),
+            ),
+        },
+        JsonLdPair {
+            site: "COUNT by predicate (directory)",
+            key_only: (
+                json!({
+                    "@context": ctx,
+                    "select": ["?p", "(as (count ?o) ?n)"],
+                    "where": {"@id": "?s", "?p": "?o"},
+                    "groupBy": "?p"
+                }),
+                json!([["ex:age", 4], ["ex:area", 6], ["ex:kind", 6]]),
+            ),
+            with_list: (
+                json!({
+                    "@context": ctx,
+                    "select": ["?p", "?s", "(as (count ?o) ?n)"],
+                    "where": {"@id": "?s", "?p": "?o"},
+                    "groupBy": "?p"
+                }),
+                json!([
+                    ["ex:age", ["ex:e1", "ex:e2", "ex:e4", "ex:e6"], 4],
+                    [
+                        "ex:area",
+                        ["ex:e1", "ex:e2", "ex:e3", "ex:e4", "ex:e5", "ex:e6"],
+                        6
+                    ],
+                    [
+                        "ex:kind",
+                        ["ex:e1", "ex:e2", "ex:e3", "ex:e4", "ex:e5", "ex:e6"],
+                        6
+                    ]
+                ]),
+            ),
+        },
+    ]
 }
 
 /// A fast path's routing pair: the stamp `site` its operator records when it
@@ -350,6 +425,26 @@ async fn grouped_select_expression_on_an_indexed_ledger_in_both_lanes() {
             }
         }
     }
+    let jsonld_pairs = jsonld_list_pairs();
+    for pair in &jsonld_pairs {
+        for ((query, _), must_fire) in [(&pair.key_only, true), (&pair.with_list, false)] {
+            let before = store.find_events("fast-path outcome").len();
+            run_jsonld(&fluree, &db, &ledger, query).await;
+            let sites = proceeded(before);
+            if sites.iter().any(|s| s == pair.site) != must_fire {
+                misrouted.push(format!(
+                    "`{}` must {}proceed [proceeded: {sites:?}]\n{query}",
+                    pair.site,
+                    if must_fire { "" } else { "not " }
+                ));
+            }
+            if !must_fire && !generic_only(&sites) {
+                misrouted.push(format!(
+                    "no fast path may answer [proceeded: {sites:?}]\n{query}"
+                ));
+            }
+        }
+    }
     for (site, body, _) in &values_cases {
         let before = store.find_events("fast-path outcome").len();
         run(&fluree, &db, &ledger, body).await;
@@ -364,9 +459,10 @@ async fn grouped_select_expression_on_an_indexed_ledger_in_both_lanes() {
     drop(tracing_guard);
     assert!(misrouted.is_empty(), "\n{}", misrouted.join("\n\n"));
 
-    // A per-group list of IRIs.
+    // A per-group list of IRIs with no fast path in reach: the formatters'
+    // case alone.
     let ctx = json!({"ex": "http://example.org/"});
-    let jsonld_cases = vec![(
+    let mut jsonld_cases = vec![(
         json!({
             "@context": ctx,
             "select": ["?a", "?e"],
@@ -379,6 +475,10 @@ async fn grouped_select_expression_on_an_indexed_ledger_in_both_lanes() {
             ["Remote", ["ex:e6"]]
         ]),
     )];
+    for pair in &jsonld_pairs {
+        jsonld_cases.push(pair.key_only.clone());
+        jsonld_cases.push(pair.with_list.clone());
+    }
 
     for disabled in [false, true] {
         set_fast_paths_disabled(disabled);

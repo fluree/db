@@ -760,6 +760,15 @@ fn detect_predicate_group_by_object_count_topk(
     if ob.var != agg.output_var || ob.direction != crate::sort::SortDirection::Descending {
         return None;
     }
+    // The operator outputs the key and the count only: a projection of
+    // anything else (a JSON-LD per-group list of the subjects) declines.
+    let select_vars = query.output.projected_vars()?;
+    if select_vars
+        .iter()
+        .any(|v| *v != o_var && *v != agg.output_var)
+    {
+        return None;
+    }
     Some((pred, s_var, o_var, agg.output_var, limit))
 }
 
@@ -1770,6 +1779,15 @@ fn detect_stats_count_by_predicate(query: &Query) -> Option<(VarId, VarId)> {
 
     // No post-aggregation binds (for simplicity)
     if !binds.is_empty() {
+        return None;
+    }
+    // The operator outputs the predicate and the count only: a projection of
+    // anything else (a JSON-LD per-group list) declines.
+    let select_vars = query.output.projected_vars()?;
+    if select_vars
+        .iter()
+        .any(|v| *v != *p_var && *v != agg.output_var)
+    {
         return None;
     }
 
