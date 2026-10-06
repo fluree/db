@@ -515,6 +515,43 @@ fn lower_values_cell<E: IriEncoder>(cell: &UnresolvedValue, encoder: &E) -> Resu
                 .ok_or_else(|| ParseError::UnknownNamespace(iri.to_string()))?;
             Ok(Binding::sid(sid))
         }
+        UnresolvedValue::TripleTerm {
+            subject,
+            predicate,
+            object,
+        } => {
+            let encode = |iri: &str| {
+                encoder
+                    .encode_iri(iri)
+                    .ok_or_else(|| ParseError::UnknownNamespace(iri.to_string()))
+            };
+            let (o, dt, lang) = match lower_values_cell(object, encoder)? {
+                Binding::Sid { sid, .. } => (
+                    FlakeValue::Ref(sid),
+                    fluree_db_core::edge::id_datatype_sid(),
+                    None,
+                ),
+                Binding::Lit { val, dtc, .. } => {
+                    let lang = dtc.lang_tag().map(str::to_string);
+                    (val, dtc.datatype().clone(), lang)
+                }
+                _ => {
+                    return Err(ParseError::InvalidWhere(
+                        "a triple term's object in values must be a constant".to_string(),
+                    ))
+                }
+            };
+            Ok(Binding::lit(
+                FlakeValue::TripleTerm(Box::new(fluree_db_core::TripleTermValue {
+                    s: encode(subject)?,
+                    p: encode(predicate)?,
+                    o,
+                    dt,
+                    lang,
+                })),
+                fluree_db_core::triple_term_datatype_sid().clone(),
+            ))
+        }
         UnresolvedValue::Literal { value, dtc } => {
             // Build initial FlakeValue from the literal
             let initial_fv = match value {

@@ -178,11 +178,15 @@ fn parse_values_cell(cell: &JsonValue, ctx: &JsonLdParseCtx) -> Result<Unresolve
 ///
 /// Supports:
 /// - `{"@id": "..."}` - IRI binding
+/// - `{"@id": {"@id": s, p: o}}` - Triple term
 /// - `{"@value": ..., "@type": ..., "@language": ...}` - Typed literal
 fn parse_jsonld_object(
     map: &serde_json::Map<String, JsonValue>,
     ctx: &JsonLdParseCtx,
 ) -> Result<UnresolvedValue> {
+    if let Some(JsonValue::Object(term)) = map.get("@id") {
+        return parse_triple_term(term, ctx);
+    }
     // Handle @id shorthand
     if let Some(id_val) = map.get("@id") {
         return parse_iri_binding(id_val, ctx);
@@ -190,6 +194,43 @@ fn parse_jsonld_object(
 
     // Handle @value with @type and @language
     parse_typed_literal(map, ctx)
+}
+
+/// Parse the `{"@id": s, p: o}` inside a triple-term cell: one predicate with
+/// one object, which may itself be a triple term.
+fn parse_triple_term(
+    term: &serde_json::Map<String, JsonValue>,
+    ctx: &JsonLdParseCtx,
+) -> Result<UnresolvedValue> {
+    let invalid = || {
+        ParseError::InvalidWhere(
+            "a triple term in values is {\"@id\": s, p: o}: an IRI subject and one \
+             predicate with one object"
+                .to_string(),
+        )
+    };
+    let subject = term
+        .get("@id")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(invalid)?;
+    let mut properties = term.iter().filter(|(k, _)| k.as_str() != "@id");
+    let (Some((predicate, object)), None) = (properties.next(), properties.next()) else {
+        return Err(invalid());
+    };
+    let object = match object {
+        JsonValue::Array(items) if items.len() == 1 => &items[0],
+        JsonValue::Array(_) => return Err(invalid()),
+        other => other,
+    };
+    let object = parse_values_cell(object, ctx)?;
+    if matches!(object, UnresolvedValue::Unbound) {
+        return Err(invalid());
+    }
+    Ok(UnresolvedValue::TripleTerm {
+        subject: Arc::from(ctx.expand_vocab(subject)?.0),
+        predicate: Arc::from(ctx.expand_vocab(predicate)?.0),
+        object: Box::new(object),
+    })
 }
 
 /// Parse IRI binding from `{"@id": "..."}`

@@ -61,6 +61,13 @@ pub enum UnresolvedValue {
         /// Datatype IRI or language tag constraint
         dtc: Option<UnresolvedDatatypeConstraint>,
     },
+    /// A triple term, `{"@id": {"@id": s, p: o}}`: subject and predicate
+    /// IRIs, and an object that is an IRI, a literal or a nested term.
+    TripleTerm {
+        subject: Arc<str>,
+        predicate: Arc<str>,
+        object: Box<UnresolvedValue>,
+    },
     /// An already-resolved binding, passed through resolution verbatim.
     /// Never produced by any parser — the Cypher sequential write driver
     /// seeds row tables (bindings extracted from a prior query result)

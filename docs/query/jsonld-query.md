@@ -1181,6 +1181,8 @@ As in RDF 1.2, `@reifies` matches the reifier's link only, so it also finds reif
 }
 ```
 
+The same shape, with constant components, is a triple term in a `values` cell: `"values": ["?t", [{ "@id": { "@id": "ex:alice", "ex:knows": { "@id": "ex:bob" } } }]]`.
+
 See [Triple terms as values](../concepts/edge-annotations.md#triple-terms-as-values).
 
 **Subject expansion output:**

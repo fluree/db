@@ -2776,6 +2776,42 @@ async fn assert_term_values(
     .await
     .expect("JSON-LD constant term");
     assert_eq!(got, json!([]), "[{label}] another term does not match");
+
+    // A term as a JSON-LD `values` cell, twin of SPARQL's `VALUES ?t { <<( … )>> }`.
+    let values = |predicate: &str, term: JsonValue| {
+        json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": ["?d"],
+            "values": ["?t", [{"@id": term}]],
+            "where": {"@id": "?d", predicate: "?t"}
+        })
+    };
+    for (predicate, term, expected) in [
+        (
+            "ex:mentions",
+            json!({"@id": "ex:s", "ex:p": {"@id": "ex:o"}}),
+            docs,
+        ),
+        (
+            "ex:quotes",
+            json!({"@id": "ex:s", "ex:says": {"@value": "chat", "@language": "fr"}}),
+            1,
+        ),
+        (
+            "ex:mentions",
+            json!({"@id": "ex:s", "ex:p": {"@id": "ex:other"}}),
+            0,
+        ),
+    ] {
+        let got = support::query_jsonld_formatted(fluree, ledger, &values(predicate, term.clone()))
+            .await
+            .unwrap_or_else(|e| panic!("[{label}] JSON-LD values term {term}: {e}"));
+        assert_eq!(
+            got.as_array().map(Vec::len),
+            Some(expected),
+            "[{label}] JSON-LD values term {term}: {got}"
+        );
+    }
 }
 
 /// A triple term is a value under any predicate, not only as a link's
