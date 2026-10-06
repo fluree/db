@@ -175,15 +175,12 @@ impl<'a> Validator<'a> {
             &query.modifiers,
             &mut self.diagnostics,
         );
-        // The post-query VALUES clause shares the Values pattern arm
-        // (duplicate-variable check).
-        if let Some(values) = &query.values {
-            self.validate_graph_pattern(values);
-        }
+        self.validate_trailing_values(query.values.as_deref());
     }
 
     fn validate_construct(&mut self, query: &ConstructQuery) {
         self.validate_query_where(&query.where_clause.pattern);
+        self.validate_trailing_values(query.values.as_deref());
         // Template triples don't need ground validation (they use WHERE variables)
         // A grouping CONSTRUCT's HAVING and ORDER BY get the SELECT checks
         // that apply without a projection.
@@ -196,6 +193,7 @@ impl<'a> Validator<'a> {
 
     fn validate_ask(&mut self, query: &AskQuery) {
         self.validate_query_where(&query.where_clause.pattern);
+        self.validate_trailing_values(query.values.as_deref());
         projection::check_nested_aggregates(
             &crate::ast::query::SelectVariables::Explicit(Vec::new()),
             &query.modifiers,
@@ -206,6 +204,15 @@ impl<'a> Validator<'a> {
     fn validate_describe(&mut self, query: &DescribeQuery) {
         if let Some(where_clause) = &query.where_clause {
             self.validate_query_where(&where_clause.pattern);
+        }
+        self.validate_trailing_values(query.values.as_deref());
+    }
+
+    /// A query's trailing VALUES clause shares the Values pattern arm
+    /// (duplicate-variable check).
+    fn validate_trailing_values(&mut self, values: Option<&GraphPattern>) {
+        if let Some(values) = values {
+            self.validate_graph_pattern(values);
         }
     }
 

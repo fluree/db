@@ -15,8 +15,8 @@ use fluree_db_query::ir::{
 };
 use fluree_db_query::parse::encode::IriEncoder;
 
-use super::select::{BaseModifiers, LoweredSelectLevel};
-use super::{LowerError, LoweringContext, Result};
+use super::select::BaseModifiers;
+use super::{post_values_then, LowerError, LoweringContext, Result};
 
 impl<E: IriEncoder> LoweringContext<'_, E> {
     /// Lower a CONSTRUCT query to a Query.
@@ -56,8 +56,14 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             variables: SelectVariables::Explicit(Vec::new()),
             span: construct.span,
         };
-        let level = self.lower_select_level(&select, &construct.modifiers, &mut patterns, None)?;
-        patterns.extend(LoweredSelectLevel::bind_patterns(level.binds));
+        let values = self.lower_trailing_values(construct.values.as_deref(), &mut patterns)?;
+        let level = self.lower_select_level(
+            &select,
+            &construct.modifiers,
+            &mut patterns,
+            values.as_ref(),
+        )?;
+        let post_values = post_values_then(values, level.binds, &mut patterns);
         let BaseModifiers {
             limit,
             offset,
@@ -104,7 +110,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             order_binds,
             limit,
             offset,
-            post_values: None,
+            post_values,
             include_system_facts: false,
             union_default_graph: None,
             cypher_vocab: None,

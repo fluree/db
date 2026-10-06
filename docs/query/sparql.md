@@ -99,6 +99,8 @@ ASK {
 }
 ```
 
+ASK is `true` when a solution remains after its solution modifiers and a trailing `VALUES` clause: `GROUP BY` / `HAVING` count the groups that pass, `OFFSET 1` needs a second solution, and `LIMIT 0` is always `false`. `ORDER BY` cannot change the answer.
+
 ### DESCRIBE Queries
 
 Return RDF description of resources:

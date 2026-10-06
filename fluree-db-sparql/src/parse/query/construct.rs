@@ -12,6 +12,7 @@ impl super::Parser<'_> {
     /// Grammar:
     ///   CONSTRUCT ConstructTemplate DatasetClause* WhereClause SolutionModifier
     ///   | CONSTRUCT DatasetClause* WHERE '{' TriplesTemplate? '}' SolutionModifier
+    /// then the query's ValuesClause.
     pub(super) fn parse_construct_query(&mut self) -> Option<ConstructQuery> {
         let start = self.stream.current_span();
 
@@ -36,6 +37,7 @@ impl super::Parser<'_> {
 
             // Parse solution modifiers
             let modifiers = self.parse_solution_modifiers();
+            let values = self.parse_trailing_values();
 
             let span = start.union(self.stream.previous_span());
 
@@ -44,6 +46,7 @@ impl super::Parser<'_> {
                 dataset,
                 where_clause,
                 modifiers,
+                values,
                 span,
             })
         } else {
@@ -64,6 +67,7 @@ impl super::Parser<'_> {
 
             // Parse solution modifiers
             let modifiers = self.parse_solution_modifiers();
+            let values = self.parse_trailing_values();
 
             let span = start.union(self.stream.previous_span());
 
@@ -72,6 +76,7 @@ impl super::Parser<'_> {
                 dataset,
                 where_clause,
                 modifiers,
+                values,
                 span,
             })
         }

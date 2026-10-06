@@ -212,6 +212,8 @@ Single-pattern shorthand (object instead of array):
 
 Returns `true` if at least one solution exists, `false` otherwise. Internally, `LIMIT 1` is applied for efficiency.
 
+`values`, `offset` and `limit` apply as they do to `select`: `ask` is `true` when a solution remains after them (`"offset": 1` needs a second solution, `"limit": 0` is always `false`).
+
 `groupBy` and `having` group the solutions first: `ask` is then `true` when at least one group passes `having`:
 
 ```json

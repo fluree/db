@@ -60,6 +60,7 @@ mod term;
 pub use error::{LowerError, Result};
 
 use crate::ast::query::{QueryBody, SelectVariables, SparqlAst};
+use crate::ast::GraphPattern;
 
 use fluree_db_query::ir::Pattern;
 use fluree_db_query::ir::{PostValues, Query, QueryOutput, ReasoningConfig};
@@ -147,6 +148,29 @@ pub fn lower_sparql_with_source<E: IriEncoder>(
     }
 
     result
+}
+
+/// The `Query::post_values` of a level whose trailing VALUES clause
+/// ([`LoweringContext::lower_trailing_values`]) is `values`: the join after
+/// the WHERE tree, then the level's generated `binds`, so they read the VALUES
+/// variables (as in a sub-SELECT). Without a trailing VALUES, the binds end
+/// the WHERE.
+fn post_values_then(
+    values: Option<Pattern>,
+    binds: Vec<(VarId, fluree_db_query::ir::Expression)>,
+    patterns: &mut Vec<Pattern>,
+) -> Option<PostValues> {
+    match values {
+        Some(Pattern::Values { vars, rows }) => Some(PostValues {
+            vars,
+            rows,
+            then: binds,
+        }),
+        _ => {
+            patterns.extend(select::LoweredSelectLevel::bind_patterns(binds));
+            None
+        }
+    }
 }
 
 /// Prefix → namespace map from the prologue (namespaces base-resolved).
@@ -521,23 +545,8 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                 // Lower SELECT clause to get selected variables
                 let select = self.lower_select_clause(&select_query.select)?;
 
-                // Lower post-query VALUES clause.  Stored in `post_values` (not
-                // in `patterns`) so the WHERE-clause planner cannot reorder it
-                // relative to OPTIONAL/UNION.  Applied after the WHERE tree,
-                // followed by the binds this level generates.
-                let values = if let Some(ref values_pattern) = select_query.values {
-                    let mut values_ir = self.lower_graph_pattern(values_pattern)?;
-                    // lower_graph_pattern returns a Vec; post-query VALUES is always exactly one Pattern::Values.
-                    if values_ir.len() == 1 && matches!(values_ir[0], Pattern::Values { .. }) {
-                        Some(values_ir.remove(0))
-                    } else {
-                        // Fallback: shouldn't happen, but keep patterns inline.
-                        patterns.extend(values_ir);
-                        None
-                    }
-                } else {
-                    None
-                };
+                let values =
+                    self.lower_trailing_values(select_query.values.as_deref(), &mut patterns)?;
 
                 // Solution modifiers (LIMIT/OFFSET/ORDER BY/DISTINCT/GROUP BY/
                 // HAVING/aggregates) and SELECT expressions (e.g.
@@ -554,20 +563,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     &mut patterns,
                     values.as_ref(),
                 )?;
-                // The generated binds run after the trailing VALUES, so they
-                // read its variables (as in a sub-SELECT); without one, they
-                // end the WHERE.
-                let post_values = match values {
-                    Some(Pattern::Values { vars, rows }) => Some(PostValues {
-                        vars,
-                        rows,
-                        then: level.binds,
-                    }),
-                    _ => {
-                        patterns.extend(select::LoweredSelectLevel::bind_patterns(level.binds));
-                        None
-                    }
-                };
+                let post_values = post_values_then(values, level.binds, &mut patterns);
                 let star_projection = level.star_projection;
                 let grouping = level.grouping;
                 let BaseModifiers {
@@ -627,6 +623,29 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
             QueryBody::Ask(ask_query) => self.lower_ask(ask_query),
             QueryBody::Describe(describe_query) => self.lower_describe(describe_query),
             QueryBody::Update(_) => Err(LowerError::unsupported_form("UPDATE", self.ast.span)),
+        }
+    }
+
+    /// Lower a query form's trailing VALUES clause (`ValuesClause`, after the
+    /// solution modifiers). It is returned rather than appended to `patterns`
+    /// so that it lands in `Query::post_values`, where the WHERE planner
+    /// cannot reorder it relative to OPTIONAL/UNION; see [`post_values_then`].
+    fn lower_trailing_values(
+        &mut self,
+        values: Option<&GraphPattern>,
+        patterns: &mut Vec<Pattern>,
+    ) -> Result<Option<Pattern>> {
+        let Some(values) = values else {
+            return Ok(None);
+        };
+        let mut values_ir = self.lower_graph_pattern(values)?;
+        // A trailing VALUES clause always lowers to exactly one Pattern::Values.
+        if values_ir.len() == 1 && matches!(values_ir[0], Pattern::Values { .. }) {
+            Ok(Some(values_ir.remove(0)))
+        } else {
+            // Fallback: shouldn't happen, but keep patterns inline.
+            patterns.extend(values_ir);
+            Ok(None)
         }
     }
 
@@ -2272,6 +2291,57 @@ mod tests {
         assert!(matches!(query.output, QueryOutput::Ask));
         // Patterns: Triple + Filter
         assert!(query.patterns.len() >= 2);
+    }
+
+    #[test]
+    fn test_ask_keeps_offset_and_caps_limit() {
+        // ASK is whether a solution remains after OFFSET and LIMIT: OFFSET
+        // applies, and the limit is at most 1 (`LIMIT 0` stays 0).
+        for (modifiers, limit, offset) in [
+            ("", Some(1), None),
+            ("OFFSET 3", Some(1), Some(3)),
+            ("LIMIT 0", Some(0), None),
+            ("LIMIT 5 OFFSET 2", Some(1), Some(2)),
+        ] {
+            let query = lower_query(&format!(
+                "PREFIX ex: <http://example.org/> ASK {{ ?s ex:name ?n }} {modifiers}"
+            ))
+            .unwrap();
+            assert_eq!((query.limit, query.offset), (limit, offset), "{modifiers}");
+        }
+    }
+
+    #[test]
+    fn test_trailing_values_after_every_query_form() {
+        // `Query ::= Prologue ( SelectQuery | ConstructQuery | DescribeQuery |
+        // AskQuery ) ValuesClause`: ASK and CONSTRUCT carry it as
+        // `post_values`, as SELECT does.
+        for sparql in [
+            "ASK { ?s ex:name ?n } VALUES ?n { \"Alice\" }",
+            "CONSTRUCT { ?s ex:p ?n } WHERE { ?s ex:name ?n } VALUES ?n { \"Alice\" }",
+            "CONSTRUCT WHERE { ?s ex:name ?n } VALUES ?n { \"Alice\" }",
+        ] {
+            let query = lower_query(&format!("PREFIX ex: <http://example.org/> {sparql}"))
+                .unwrap_or_else(|e| panic!("{e:?}: {sparql}"));
+            let post_values = query.post_values.as_ref().expect(sparql);
+            assert_eq!(post_values.rows.len(), 1, "{sparql}");
+        }
+        // DESCRIBE joins it inside its target subquery.
+        let query =
+            lower_query("PREFIX ex: <http://example.org/> DESCRIBE ?s VALUES ?s { ex:a ex:b }")
+                .unwrap();
+        assert!(matches!(query.output, QueryOutput::Construct(_)));
+        let Pattern::Subquery(sq) = &query.patterns[0] else {
+            panic!(
+                "expected the describe target subquery: {:?}",
+                query.patterns
+            );
+        };
+        assert!(
+            matches!(&sq.patterns[..], [Pattern::Values { rows, .. }] if rows.len() == 2),
+            "{:?}",
+            sq.patterns
+        );
     }
 
     // =========================================================================

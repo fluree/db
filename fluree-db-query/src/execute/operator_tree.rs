@@ -2423,9 +2423,7 @@ fn build_operator_tree_folds(
 /// `fluree-db-sparql`, the `"ask"` branch of the JSON-LD parser). `OFFSET`
 /// does weaken it — it counts rows off the front, so `OFFSET 5` over six
 /// duplicates is non-empty while its deduped form is empty — and is excluded.
-/// Neither surface can currently attach an offset to an ASK (SPARQL lowering
-/// discards the modifier, the JSON-LD `"ask"` branch never parses options),
-/// so the guard exists for programmatically built IR.
+/// Both surfaces attach one (SPARQL `ASK … OFFSET n`, JSON-LD `"offset"`).
 fn result_is_multiplicity_blind(query: &Query) -> bool {
     match &query.output {
         QueryOutput::Construct(template) => {

@@ -261,9 +261,12 @@ fn parse_query_ast_internal(
         query.options.group_by = options::parse_group_by(obj)?;
         query.options.having = having;
         query.options.aggregates = having_aggregates;
+        parse_top_level_values(obj, &ctx, &mut query)?;
         where_clause::resolve_atoms_outside_where(&mut query, &ctx);
-        // LIMIT 1 for efficiency — only need to know if any solution exists
-        query.options.limit = Some(1);
+        // `ask` is true when a solution remains after `offset` and `limit`
+        // (`limit: 0` is false); one is enough, so the limit is at most 1.
+        query.options.offset = options::parse_offset(obj)?;
+        query.options.limit = Some(options::parse_limit(obj)?.map_or(1, |limit| limit.min(1)));
         // ASK returns before `parse_options` runs, so opts that the
         // executor cares about have to be parsed inline. Currently
         // just `includeSystemFacts`; extend here as more land.
@@ -314,14 +317,7 @@ fn parse_query_ast_internal(
         }
     }
 
-    // Parse top-level VALUES (optional) - mirrors the `:values` initial solution seed.
-    if let Some(values_val) = obj.get("values") {
-        if !values_val.is_null() {
-            let values_pat = values::parse_values_clause(values_val, &ctx)?;
-            // Place VALUES first so it seeds the pipeline before WHERE patterns.
-            query.patterns.insert(0, values_pat);
-        }
-    }
+    parse_top_level_values(obj, &ctx, &mut query)?;
 
     // Parse where clause.
     //
@@ -585,11 +581,30 @@ fn parse_construct_query(
 
     query.construct_template = Some(ast::UnresolvedConstructTemplate::new(template_patterns));
 
+    parse_top_level_values(obj, ctx, &mut query)?;
+
     // Parse query options (limit, offset, orderBy, etc.)
     // Note: groupBy with CONSTRUCT will error at format time (Binding::Grouped unsupported)
     query.options = options::parse_options(obj, filter_data::parse_filter_expr)?;
 
     Ok((query, SelectMode::Construct))
+}
+
+/// Parse a query's top-level `values` (optional), the initial solution seed
+/// (mirrors `:values`), for every query form: `select`, `ask` and `construct`.
+fn parse_top_level_values(
+    obj: &serde_json::Map<String, JsonValue>,
+    ctx: &JsonLdParseCtx,
+    query: &mut UnresolvedQuery,
+) -> Result<()> {
+    if let Some(values_val) = obj.get("values") {
+        if !values_val.is_null() {
+            let values_pat = values::parse_values_clause(values_val, ctx)?;
+            // Place VALUES first so it seeds the pipeline before WHERE patterns.
+            query.patterns.insert(0, values_pat);
+        }
+    }
+    Ok(())
 }
 
 /// Parse a CONSTRUCT template (explicit form)
