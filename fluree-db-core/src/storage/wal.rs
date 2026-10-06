@@ -756,6 +756,17 @@ fn writeback(file: &File, fsyncs: &AtomicU64) -> io::Result<()> {
     Ok(())
 }
 
+/// Open a written file to hand it to the drive. Windows flushes a file only
+/// through a handle with write access (`FlushFileBuffers`); a Unix
+/// descriptor flushes either way.
+fn open_to_flush(path: &Path) -> io::Result<File> {
+    if cfg!(windows) {
+        std::fs::OpenOptions::new().write(true).open(path)
+    } else {
+        File::open(path)
+    }
+}
+
 /// The Linux batch commit: flush the filesystem holding `base` and wait.
 #[cfg(target_os = "linux")]
 fn syncfs(base: &Path, fsyncs: &AtomicU64) -> io::Result<()> {
@@ -787,7 +798,7 @@ pub(super) fn flush_keys(base: &Path, keys: &[String], fsyncs: &AtomicU64) -> io
     let mut any_file = false;
     for key in unique {
         let path = base.join(key);
-        match File::open(&path) {
+        match open_to_flush(&path) {
             Ok(file) => {
                 writeback(&file, fsyncs)?;
                 barrier = Some(file);
