@@ -1728,6 +1728,8 @@ fn filter_tolerates_unbound(expr: &crate::ir::Expression) -> bool {
 fn pattern_filters_tolerate_unbound(p: &Pattern) -> bool {
     match p {
         Pattern::Filter(expr) => filter_tolerates_unbound(expr),
+        // An unbound variable is free inside EXISTS, not an error.
+        Pattern::Exists(_) => true,
         Pattern::DefaultGraphSource { patterns } => {
             patterns.iter().any(pattern_filters_tolerate_unbound)
         }
@@ -1755,8 +1757,9 @@ fn pattern_filters_tolerate_unbound(p: &Pattern) -> bool {
 /// bound-subject shapes stay EXCLUDED pending their own differential evidence.
 ///
 /// The edge-annotation expansion (a Cypher relationship binding) yields the
-/// annotation's `rdf:reifies` link and its term components: a pure relation
-/// between the term and its components, so its per-seed evaluation is a pure
+/// annotation's `rdf:reifies` link, its term components and an existence check
+/// on the base edge: a pure relation between the term and its components, and
+/// a check over the row's own bindings, so its per-seed evaluation is a pure
 /// restriction by the correlation tuple too. Under a default-graph union the
 /// chain is wrapped in `Pattern::DefaultGraphSource`, admitted recursively here
 /// and excluded at the `build_batch` dataset gate.
@@ -1768,6 +1771,9 @@ fn inner_pattern_is_hash_join_safe(p: &Pattern) -> bool {
         // ~25ms/row of replanning that turned a 21k-row UNWIND reindex query
         // into minutes of CPU.
         Pattern::TermComponents(_) => true,
+        // The expansion's existence check on the base edge: like a triple, it
+        // reads only the row's own bindings.
+        Pattern::Exists(inner) => inner.iter().all(|p| matches!(p, Pattern::Triple(_))),
         Pattern::R2rml(rp) => {
             batched_optional_r2rml_enabled()
                 && (r2rml_leaf_is_hash_join_safe(rp)
@@ -2940,6 +2946,20 @@ mod tests {
                 object: Component::Var(VarId(2)),
             }
         )));
+        let edge = Pattern::Triple(TriplePattern::new(
+            Ref::Var(VarId(1)),
+            Ref::Var(VarId(3)),
+            Term::Var(VarId(2)),
+        ));
+        assert!(inner_pattern_is_hash_join_safe(&Pattern::Exists(vec![
+            edge.clone()
+        ])));
+        assert!(!inner_pattern_is_hash_join_safe(&Pattern::Exists(vec![
+            Pattern::Optional(vec![edge.clone()])
+        ])));
+        assert!(pattern_filters_tolerate_unbound(&Pattern::Exists(vec![
+            edge
+        ])));
     }
 
     // PR-4b: the batched-OPTIONAL admission for R2RML inners is NARROW — only a

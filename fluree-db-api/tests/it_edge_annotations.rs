@@ -5097,6 +5097,57 @@ async fn policy_hiding_base_edge_hides_its_link() {
     check(ledger, "novelty over an index", 1, 2).await;
 }
 
+/// An annotation inside OPTIONAL (a Cypher relationship binding's shape) takes
+/// the batched hash-join lane: its expansion ends in an existence check on the
+/// base edge, which reads only the row's bindings. That check still excludes a
+/// reifier of an unasserted triple.
+#[tokio::test]
+async fn optional_annotation_takes_the_batched_lane() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:optional-batched";
+    fluree
+        .upsert_turtle(
+            genesis_ledger(&fluree, ledger_id),
+            "VERSION \"1.2\"\n@prefix ex: <http://example.org/> .\n\
+             ex:a a ex:P . ex:e a ex:P . ex:f a ex:P .\n\
+             ex:a ex:knows ex:b {| ex:since 2020 |} .\n\
+             ex:a ex:knows ex:c .\n\
+             << ex:a ex:knows ex:d >> ex:since 1999 .\n\
+             ex:e ex:knows ex:a {| ex:since 2021 |} .\n",
+        )
+        .await
+        .expect("seed");
+    let query = "PREFIX ex: <http://example.org/>\n\
+                 SELECT ?x ?y ?s WHERE { ?x a ex:P \
+                 OPTIONAL { ?x ex:knows ?y {| ex:since ?s |} } }";
+    for phase in ["novelty", "indexed"] {
+        if phase == "indexed" {
+            support::rebuild_and_publish_index(&fluree, ledger_id).await;
+        }
+        let ledger = fluree.ledger(ledger_id).await.expect("load");
+        let (spans, guard) = support::span_capture::init_test_tracing();
+        let rows = support::query_sparql_formatted(&fluree, &ledger, query)
+            .await
+            .expect("query");
+        drop(guard);
+        assert!(
+            !spans
+                .find_events("optional batched hash-join complete")
+                .is_empty(),
+            "[{phase}] the batched lane"
+        );
+        assert_eq!(
+            support::normalize_rows(&rows),
+            support::normalize_rows(&json!([
+                ["ex:a", "ex:b", 2020],
+                ["ex:e", "ex:a", 2021],
+                ["ex:f", null, null]
+            ])),
+            "[{phase}]"
+        );
+    }
+}
+
 // =====================================================================
 // #1467 — reification-aware COPY/MOVE/ADD re-homing (named-source cases)
 // =====================================================================
