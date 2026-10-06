@@ -80,7 +80,7 @@ impl Opened {
     pub async fn open(source: &Source, dirs: &FlureeDir) -> CliResult<Self> {
         match &source.kind {
             SourceKind::Ledger(alias) => {
-                let fluree = context::build_fluree(dirs)?;
+                let fluree = context::build_fluree(dirs).await?;
                 let ledger_id = context::to_ledger_id(alias)?;
                 if !fluree.ledger_exists(&ledger_id).await? {
                     return Err(CliError::NotFound(format!(

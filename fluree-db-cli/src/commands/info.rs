@@ -36,7 +36,7 @@ pub async fn run(
             Err(CliError::NotFound(_)) => {
                 // Ledger not found — try graph source lookup
                 let alias = context::resolve_ledger(ledger, dirs)?;
-                let fluree = context::build_fluree(dirs)?;
+                let fluree = context::build_fluree(dirs).await?;
                 let gs_id = context::to_ledger_id(&alias)?;
                 if let Some(gs) = fluree.nameservice().lookup_graph_source(&gs_id).await? {
                     if graph.is_some() {

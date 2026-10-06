@@ -190,7 +190,7 @@ Graph sources are created and registered via the `fluree-db-api` Rust API, which
 ```rust
 use fluree_db_api::{FlureeBuilder, R2rmlCreateConfig};
 
-let fluree = FlureeBuilder::default().build().await?;
+let fluree = FlureeBuilder::file("/path/to/data").build_async().await?;
 
 let config = R2rmlCreateConfig::new_direct(
     "execution-log",
