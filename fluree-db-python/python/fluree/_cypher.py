@@ -9,7 +9,7 @@ from typing import Any
 from fluree._graph import Node, Path, Relationship
 from fluree._records import _jsonld_term, _node
 from fluree._results import Result, _record_type
-from fluree._terms import _datetime
+from fluree._terms import _datetime, _iso
 from fluree.errors import InvalidRequestError
 
 
@@ -42,7 +42,7 @@ def _decode(cell: tuple[Any, ...], nodes: dict[Any, Node]) -> Any:
             return _dt.date.fromisoformat(iso[:10])
         if which == "datetime":
             return _datetime(iso)
-        return _dt.time.fromisoformat(iso.removesuffix("Z"))
+        return _dt.time.fromisoformat(_iso(iso.removesuffix("Z")))
     if kind == "list":
         return [_decode(c, nodes) for c in cell[1]]
     if kind == "map":

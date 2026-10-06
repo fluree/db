@@ -59,6 +59,16 @@ def test_a_value_matches_itself(ledger, prop):
     assert ledger.query(jsonld) == ["ex:s"]
 
 
+def test_nanosecond_commit_times_parse_on_every_python():
+    # Commit times carry nanoseconds where the clock has them (Linux), and
+    # Python 3.10 parses at most six fraction digits.
+    from fluree._terms import _datetime, _time
+
+    assert _datetime("2026-10-06T03:28:09.391602587+00:00") == dt.datetime(2026, 10, 6, 3, 28, 9, 391602, tzinfo=UTC)
+    assert _datetime("2026-10-06T03:28:09.5Z") == dt.datetime(2026, 10, 6, 3, 28, 9, 500000, tzinfo=UTC)
+    assert _time("03:28:09.123456789") == dt.time(3, 28, 9, 123456)
+
+
 def test_nan_reads_back_as_nan(ledger):
     ledger.insert({"@context": CTX, "@id": "ex:s", "ex:nan": float("nan")})
     assert math.isnan(read(ledger, "nan"))

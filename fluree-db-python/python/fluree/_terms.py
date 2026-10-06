@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
@@ -125,17 +126,25 @@ def _boolean(lexical: str) -> bool:
     raise ValueError(lexical)
 
 
-def _datetime(lexical: str) -> _dt.datetime:
-    # fromisoformat only accepts a "Z" suffix from Python 3.11.
+_FRACTION = re.compile(r"\.(\d+)")
+
+
+def _iso(lexical: str) -> str:
+    """`lexical` in the form every supported Python's `fromisoformat` accepts.
+
+    Before 3.11 it takes no "Z" suffix and only a 3- or 6-digit fraction; the
+    engine writes up to 9 digits, cut here to microseconds as 3.11 does."""
     if lexical.endswith("Z"):
         lexical = lexical[:-1] + "+00:00"
-    return _dt.datetime.fromisoformat(lexical)
+    return _FRACTION.sub(lambda m: "." + m[1][:6].ljust(6, "0"), lexical, count=1)
+
+
+def _datetime(lexical: str) -> _dt.datetime:
+    return _dt.datetime.fromisoformat(_iso(lexical))
 
 
 def _time(lexical: str) -> _dt.time:
-    if lexical.endswith("Z"):
-        lexical = lexical[:-1] + "+00:00"
-    return _dt.time.fromisoformat(lexical)
+    return _dt.time.fromisoformat(_iso(lexical))
 
 
 def _decimal(lexical: str) -> Decimal:
