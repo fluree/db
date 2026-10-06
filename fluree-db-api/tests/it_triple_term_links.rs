@@ -12,6 +12,7 @@
 use crate::support;
 use fluree_db_api::{FlureeBuilder, LedgerState};
 use serde_json::{json, Value as JsonValue};
+use std::sync::Arc;
 
 const CLAIMS: &str = r#"VERSION "1.2"
 @prefix ex: <http://example.org/> .
@@ -2854,6 +2855,98 @@ async fn assert_term_values(
             "[{label}] JSON-LD values term {term}: {got}"
         );
     }
+}
+
+/// Decomposing many terms streams them a batch at a time and charges the
+/// dictionary reads it caches to the query budget.
+#[tokio::test]
+async fn term_components_stream_in_batches_within_the_budget() {
+    use fluree_db_core::QueryCancellation;
+    use fluree_db_query::{
+        binding::Batch,
+        context::ExecutionContext,
+        error::QueryError,
+        ir::{Component, TermComponentsPattern},
+        operator::Operator,
+        seed::BatchSeedOperator,
+        term_components::TermComponentsOperator,
+        VarRegistry,
+    };
+
+    const TERMS: usize = 2_500;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/triple-term-links:stream";
+    let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
+    for i in 0..TERMS {
+        ttl.push_str(&format!(
+            "ex:doc{i} ex:mentions <<( ex:s{i} ex:p ex:o )>> .\n"
+        ));
+    }
+    fluree
+        .upsert_turtle(support::genesis_ledger(&fluree, ledger_id), &ttl)
+        .await
+        .expect("seed");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    let store = ledger
+        .binary_store
+        .as_ref()
+        .unwrap()
+        .0
+        .clone()
+        .downcast::<fluree_db_binary_index::BinaryIndexStore>()
+        .unwrap();
+
+    let mut vars = VarRegistry::new();
+    let term = vars.get_or_insert("?t");
+    let subject = vars.get_or_insert("?s");
+    let pattern = TermComponentsPattern {
+        term,
+        subject: Component::Var(subject),
+        predicate: Component::Node(ledger.snapshot.encode_iri("http://example.org/p").unwrap()),
+        object: Component::Any,
+    };
+    let operator = || {
+        TermComponentsOperator::new(
+            Box::new(BatchSeedOperator::from_batch(Batch::empty_schema_with_len(
+                1,
+            ))),
+            pattern.clone(),
+        )
+    };
+
+    let cancellation = QueryCancellation::new();
+    cancellation.set_memory_limit(usize::MAX);
+    let ctx = ExecutionContext::new(&ledger.snapshot, &vars)
+        .with_binary_store(Arc::clone(&store), 0)
+        .with_batch_size(4)
+        .with_cancellation(cancellation);
+    let mut op = operator();
+    op.open(&ctx).await.unwrap();
+    let mut rows = 0;
+    while let Some(batch) = op.next_batch(&ctx).await.unwrap() {
+        assert!(batch.len() <= 4, "a batch holds {} rows", batch.len());
+        if rows == 0 {
+            assert!(ctx.mem_used() > 0, "the cached dictionary read is charged");
+        }
+        rows += batch.len();
+    }
+    assert_eq!(rows, TERMS);
+    op.close();
+
+    let cancellation = QueryCancellation::new();
+    cancellation.set_memory_limit(4 * 1024);
+    let ctx = ExecutionContext::new(&ledger.snapshot, &vars)
+        .with_binary_store(store, 0)
+        .with_batch_size(4)
+        .with_cancellation(cancellation);
+    let mut op = operator();
+    op.open(&ctx).await.unwrap();
+    let err = op.next_batch(&ctx).await.expect_err("past the budget");
+    assert!(
+        matches!(err, QueryError::MemoryBudgetExceeded { .. }),
+        "{err:?}"
+    );
 }
 
 /// A triple term is not a literal to the indexed literal count either.

@@ -16,7 +16,9 @@
 //! the graph, time, policy and novelty checks.
 //!
 //! Terms the index has not interned yet appear only in novelty's links; they
-//! are collected once per open and offered alongside the dictionary's.
+//! are collected once, when a row first needs them, and offered alongside the
+//! dictionary's. Output is emitted a batch at a time, resuming mid-row, and
+//! the dictionary reads a batch caches are charged to the query budget.
 
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
@@ -58,6 +60,27 @@ struct NoveltyTerm {
     encoded: Option<(u64, TermKey)>,
 }
 
+/// Dictionary terms read for one lookup, shared by the rows that ask for it.
+type Found = Arc<Vec<(TermKey, u64)>>;
+
+/// One input row's candidates, consumed across `next_batch` calls.
+struct RowCursor {
+    row: Vec<Binding>,
+    t: i64,
+    /// The bound term's own candidate.
+    single: Option<Candidate>,
+    found: Option<Found>,
+    found_pos: usize,
+    /// Novelty's terms follow the dictionary's for an unbound term.
+    with_novelty: bool,
+    novelty_pos: usize,
+}
+
+/// Query-budget bytes for `n` cached dictionary terms.
+fn found_bytes(n: usize) -> usize {
+    n * std::mem::size_of::<(TermKey, u64)>()
+}
+
 pub struct TermComponentsOperator {
     child: BoxedOperator,
     pattern: TermComponentsPattern,
@@ -67,7 +90,17 @@ pub struct TermComponentsOperator {
     store: Option<Arc<BinaryIndexStore>>,
     constants: Option<EncodedConstants>,
     reifies_p_id: u32,
-    novelty_terms: Vec<NoveltyTerm>,
+    /// Collected when a row first needs them.
+    novelty_terms: Option<Vec<NoveltyTerm>>,
+    novelty_bytes: usize,
+    input: Option<Batch>,
+    input_row: usize,
+    cursor: Option<RowCursor>,
+    /// Distinct prefixes, objects and predicates are read once per input batch.
+    by_prefix: HashMap<(u64, Option<u32>), Found>,
+    by_predicate: HashMap<Option<u32>, Found>,
+    by_object: HashMap<(u16, u64, Option<u32>), Found>,
+    cache_bytes: usize,
 }
 
 impl TermComponentsOperator {
@@ -88,8 +121,260 @@ impl TermComponentsOperator {
             store: None,
             constants: None,
             reifies_p_id: 0,
-            novelty_terms: Vec::new(),
+            novelty_terms: None,
+            novelty_bytes: 0,
+            input: None,
+            input_row: 0,
+            cursor: None,
+            by_prefix: HashMap::new(),
+            by_predicate: HashMap::new(),
+            by_object: HashMap::new(),
+            cache_bytes: 0,
         }
+    }
+
+    fn clear_caches(&mut self, ctx: &ExecutionContext<'_>) {
+        self.by_prefix.clear();
+        self.by_predicate.clear();
+        self.by_object.clear();
+        ctx.release(self.cache_bytes);
+        self.cache_bytes = 0;
+    }
+
+    /// Charge a dictionary read the batch caches.
+    fn cache(&mut self, found: Vec<(TermKey, u64)>, ctx: &ExecutionContext<'_>) -> Result<Found> {
+        let bytes = found_bytes(found.len());
+        ctx.record_alloc(bytes);
+        self.cache_bytes += bytes;
+        ctx.checkpoint()?;
+        Ok(Arc::new(found))
+    }
+
+    fn ensure_novelty_terms(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
+        if self.novelty_terms.is_none() {
+            let terms = self.collect_novelty_terms(ctx)?;
+            self.novelty_bytes = terms.len()
+                * (std::mem::size_of::<NoveltyTerm>() + std::mem::size_of::<TripleTermValue>());
+            ctx.record_alloc(self.novelty_bytes);
+            ctx.checkpoint()?;
+            self.novelty_terms = Some(terms);
+        }
+        Ok(())
+    }
+
+    /// The next input row with candidates, as a cursor; `None` once the
+    /// child is exhausted. A new input batch drops the previous one's caches.
+    async fn next_row(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<RowCursor>> {
+        loop {
+            if self
+                .input
+                .as_ref()
+                .is_none_or(|input| self.input_row >= input.len())
+            {
+                self.clear_caches(ctx);
+                self.input = None;
+                match self.child.next_batch(ctx).await? {
+                    Some(batch) if !batch.is_empty() => {
+                        self.input = Some(batch);
+                        self.input_row = 0;
+                    }
+                    Some(_) => continue,
+                    None => return Ok(None),
+                }
+            }
+            let row_idx = self.input_row;
+            self.input_row += 1;
+            let input = self.input.as_ref().expect("input batch");
+            let row: Vec<Binding> = (0..self.schema.len())
+                .map(|col| {
+                    if col < self.child_width {
+                        input.get_by_col(row_idx, col).clone()
+                    } else {
+                        Binding::Unbound
+                    }
+                })
+                .collect();
+            if let Some(cursor) = self.row_cursor(row, ctx)? {
+                return Ok(Some(cursor));
+            }
+        }
+    }
+
+    /// Where `row`'s candidates come from; `None` when it has none.
+    fn row_cursor(
+        &mut self,
+        row: Vec<Binding>,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<Option<RowCursor>> {
+        let cursor = |row, t, single, found| RowCursor {
+            row,
+            t,
+            single,
+            found,
+            found_pos: 0,
+            with_novelty: false,
+            novelty_pos: 0,
+        };
+        match self.value(&row, self.pattern.term).cloned() {
+            Some(Binding::EncodedLit {
+                o_kind, o_key, t, ..
+            }) if o_kind == ObjKind::TRIPLE_TERM.as_u8() => {
+                let Some(store) = &self.store else {
+                    return Ok(None);
+                };
+                let key = crate::binary_scan::term_key_for_handle(
+                    o_key,
+                    store,
+                    ctx.dict_novelty.as_ref(),
+                )
+                .map_err(|e| QueryError::from_io("resolve_term_key", e))?;
+                // A provisional handle whose components no dictionary
+                // encodes is offered as its novelty term.
+                let candidate = match key {
+                    Some(key) => Candidate::Encoded { handle: o_key, key },
+                    None => match novelty_term_index(o_key)
+                        .zip(ctx.dict_novelty.as_ref())
+                        .and_then(|(index, dn)| dn.terms.resolve(index))
+                    {
+                        Some(term) => Candidate::Materialized(Box::new(term.clone())),
+                        None => {
+                            return Err(QueryError::Internal(format!(
+                                "triple-term handle {o_key:#x} has no dictionary entry"
+                            )))
+                        }
+                    },
+                };
+                Ok(Some(cursor(row, t, Some(candidate), None)))
+            }
+            Some(Binding::Lit {
+                val: FlakeValue::TripleTerm(term),
+                ..
+            }) => Ok(Some(cursor(
+                row,
+                0,
+                Some(Candidate::Materialized(term)),
+                None,
+            ))),
+            // Bound to something that is not a term.
+            Some(_) => Ok(None),
+            None => {
+                let found = match self.store.clone() {
+                    Some(store) => self.dictionary_candidates(&row, &store, ctx)?,
+                    None => None,
+                };
+                self.ensure_novelty_terms(ctx)?;
+                let mut cursor = cursor(row, 0, None, found);
+                cursor.with_novelty = true;
+                Ok(Some(cursor))
+            }
+        }
+    }
+
+    /// The dictionary terms an unbound term can be: by the subject anchor,
+    /// else the object anchor, else every term of the predicate (or of all).
+    fn dictionary_candidates(
+        &mut self,
+        row: &[Binding],
+        store: &BinaryIndexStore,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<Option<Found>> {
+        let Some(terms) = store.term_dict() else {
+            return Ok(None);
+        };
+        let p_id = self.fixed_predicate(row, store);
+        match self.anchor_subject(row, store, ctx)? {
+            Some(Ok(s_id)) => {
+                if let Some(found) = self.by_prefix.get(&(s_id, p_id)) {
+                    return Ok(Some(Arc::clone(found)));
+                }
+                let found = terms
+                    .terms_with_subject(s_id, p_id)
+                    .map_err(|e| QueryError::from_io("term components: subject", e))?;
+                let found = self.cache(found, ctx)?;
+                self.by_prefix.insert((s_id, p_id), Arc::clone(&found));
+                return Ok(Some(found));
+            }
+            // No interned subject: only novelty can match.
+            Some(Err(())) => return Ok(None),
+            None => {}
+        }
+        match self.anchor_object(row, store, ctx)? {
+            Some(Err(())) => return Ok(None),
+            Some(Ok((o_type, o_key))) => {
+                if let Some(found) = self.by_object.get(&(o_type, o_key, p_id)) {
+                    return Ok(Some(Arc::clone(found)));
+                }
+                let found = terms
+                    .terms_with_object(o_type, o_key, p_id)
+                    .map_err(|e| QueryError::from_io("term components: object", e))?;
+                stamp_fast_path(
+                    OBJECT_SITE,
+                    match found {
+                        Some(_) => FastPathOutcome::Proceed,
+                        None => FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
+                    },
+                );
+                // A dictionary without the object tree falls to the scan.
+                if let Some(found) = found {
+                    let found = self.cache(found, ctx)?;
+                    self.by_object
+                        .insert((o_type, o_key, p_id), Arc::clone(&found));
+                    return Ok(Some(found));
+                }
+            }
+            None => {}
+        }
+        if let Some(found) = self.by_predicate.get(&p_id) {
+            return Ok(Some(Arc::clone(found)));
+        }
+        let predicates: Vec<u32> = match p_id {
+            Some(p) => vec![p],
+            None => terms.predicates().collect(),
+        };
+        let mut all = Vec::new();
+        for p in predicates {
+            all.extend(
+                terms
+                    .terms_of_predicate(p)
+                    .map_err(|e| QueryError::from_io("term components: scan", e))?,
+            );
+            ctx.checkpoint()?;
+        }
+        let found = self.cache(all, ctx)?;
+        self.by_predicate.insert(p_id, Arc::clone(&found));
+        Ok(Some(found))
+    }
+
+    /// The cursor's next candidate: the bound term, then the dictionary's,
+    /// then novelty's that can match the row's subject anchor.
+    fn next_candidate(&self, cursor: &mut RowCursor) -> Option<Candidate> {
+        if let Some(candidate) = cursor.single.take() {
+            return Some(candidate);
+        }
+        if let Some((key, handle)) = cursor
+            .found
+            .as_ref()
+            .and_then(|found| found.get(cursor.found_pos))
+        {
+            cursor.found_pos += 1;
+            return Some(Candidate::Encoded {
+                handle: *handle,
+                key: *key,
+            });
+        }
+        if cursor.with_novelty {
+            let terms = self.novelty_terms.as_deref().unwrap_or(&[]);
+            while let Some(nt) = terms.get(cursor.novelty_pos) {
+                cursor.novelty_pos += 1;
+                if self.novelty_anchor_matches(&cursor.row, nt) {
+                    return Some(match nt.encoded {
+                        Some((handle, key)) => Candidate::Encoded { handle, key },
+                        None => Candidate::Materialized(nt.term.clone()),
+                    });
+                }
+            }
+        }
+        None
     }
 
     /// The terms novelty holds that the dictionary does not: those of any
@@ -556,7 +841,6 @@ impl Operator for TermComponentsOperator {
                 ))
                 .unwrap_or(0);
         }
-        self.novelty_terms = self.collect_novelty_terms(ctx)?;
         self.state = OperatorState::Open;
         Ok(())
     }
@@ -565,207 +849,52 @@ impl Operator for TermComponentsOperator {
         if self.state != OperatorState::Open {
             return Ok(None);
         }
+        let limit = ctx.batch_size.max(1);
+        let mut columns: Vec<Vec<Binding>> = vec![Vec::new(); self.schema.len()];
+        let mut produced = 0usize;
+        let mut visited = 0usize;
         loop {
-            let input = match self.child.next_batch(ctx).await? {
-                Some(b) if !b.is_empty() => b,
-                Some(_) => continue,
-                None => {
-                    self.state = OperatorState::Exhausted;
-                    return Ok(None);
-                }
-            };
-            let mut columns: Vec<Vec<Binding>> = vec![Vec::new(); self.schema.len()];
-            // Distinct prefixes and predicates are read once per batch.
-            let mut by_prefix: HashMap<(u64, Option<u32>), Arc<Vec<(TermKey, u64)>>> =
-                HashMap::new();
-            let mut by_predicate: HashMap<Option<u32>, Arc<Vec<(TermKey, u64)>>> = HashMap::new();
-            let mut by_object: HashMap<(u16, u64, Option<u32>), Arc<Vec<(TermKey, u64)>>> =
-                HashMap::new();
-            for row_idx in 0..input.len() {
-                let mut row: Vec<Binding> = (0..self.schema.len())
-                    .map(|col| {
-                        if col < self.child_width {
-                            input.get_by_col(row_idx, col).clone()
-                        } else {
-                            Binding::Unbound
-                        }
-                    })
-                    .collect();
-                let (candidates, t): (Vec<Candidate>, i64) = match self
-                    .value(&row, self.pattern.term)
-                    .cloned()
-                {
-                    Some(Binding::EncodedLit {
-                        o_kind, o_key, t, ..
-                    }) if o_kind == ObjKind::TRIPLE_TERM.as_u8() => {
-                        let Some(store) = &self.store else {
-                            continue;
-                        };
-                        let key = crate::binary_scan::term_key_for_handle(
-                            o_key,
-                            store,
-                            ctx.dict_novelty.as_ref(),
-                        )
-                        .map_err(|e| QueryError::from_io("resolve_term_key", e))?;
-                        // A provisional handle whose components no dictionary
-                        // encodes is offered as its novelty term.
-                        let candidate = match key {
-                            Some(key) => Candidate::Encoded { handle: o_key, key },
-                            None => match novelty_term_index(o_key)
-                                .zip(ctx.dict_novelty.as_ref())
-                                .and_then(|(index, dn)| dn.terms.resolve(index))
-                            {
-                                Some(term) => Candidate::Materialized(Box::new(term.clone())),
-                                None => {
-                                    return Err(QueryError::Internal(format!(
-                                        "triple-term handle {o_key:#x} has no dictionary entry"
-                                    )))
-                                }
-                            },
-                        };
-                        (vec![candidate], t)
-                    }
-                    Some(Binding::Lit {
-                        val: FlakeValue::TripleTerm(term),
-                        ..
-                    }) => (vec![Candidate::Materialized(term)], 0),
-                    // Bound to something that is not a term.
-                    Some(_) => continue,
+            let mut cursor = match self.cursor.take() {
+                Some(cursor) => cursor,
+                None => match self.next_row(ctx).await? {
+                    Some(cursor) => cursor,
                     None => {
-                        let mut candidates = Vec::new();
-                        if let Some(store) = self.store.clone() {
-                            if let Some(terms) = store.term_dict() {
-                                let p_id = self.fixed_predicate(&row, &store);
-                                let found = match self.anchor_subject(&row, &store, ctx)? {
-                                    Some(Ok(s_id)) => match by_prefix.get(&(s_id, p_id)) {
-                                        Some(found) => Some(Arc::clone(found)),
-                                        None => {
-                                            let found = Arc::new(
-                                                terms.terms_with_subject(s_id, p_id).map_err(
-                                                    |e| {
-                                                        QueryError::from_io(
-                                                            "term components: subject",
-                                                            e,
-                                                        )
-                                                    },
-                                                )?,
-                                            );
-                                            by_prefix.insert((s_id, p_id), Arc::clone(&found));
-                                            Some(found)
-                                        }
-                                    },
-                                    // No interned subject: only novelty can match.
-                                    Some(Err(())) => None,
-                                    None => {
-                                        let by_obj = match self.anchor_object(&row, &store, ctx)? {
-                                            Some(Err(())) => Some(Arc::new(Vec::new())),
-                                            Some(Ok((o_type, o_key))) => {
-                                                match by_object.get(&(o_type, o_key, p_id)) {
-                                                    Some(found) => Some(Arc::clone(found)),
-                                                    None => {
-                                                        let found = terms
-                                                            .terms_with_object(o_type, o_key, p_id)
-                                                            .map_err(|e| {
-                                                                QueryError::from_io(
-                                                                    "term components: object",
-                                                                    e,
-                                                                )
-                                                            })?;
-                                                        stamp_fast_path(
-                                                            OBJECT_SITE,
-                                                            match found {
-                                                                Some(_) => FastPathOutcome::Proceed,
-                                                                None => FastPathOutcome::Fallback(
-                                                                    FastPathFallback::GateDeclined,
-                                                                ),
-                                                            },
-                                                        );
-                                                        found.map(|found| {
-                                                            let found = Arc::new(found);
-                                                            by_object.insert(
-                                                                (o_type, o_key, p_id),
-                                                                Arc::clone(&found),
-                                                            );
-                                                            found
-                                                        })
-                                                    }
-                                                }
-                                            }
-                                            None => None,
-                                        };
-                                        match by_obj {
-                                            Some(found) => Some(found),
-                                            // No object anchor, or a dictionary
-                                            // without the object tree: scan.
-                                            None => match by_predicate.get(&p_id) {
-                                                Some(found) => Some(Arc::clone(found)),
-                                                None => {
-                                                    let predicates: Vec<u32> = match p_id {
-                                                        Some(p) => vec![p],
-                                                        None => terms.predicates().collect(),
-                                                    };
-                                                    let mut all = Vec::new();
-                                                    for p in predicates {
-                                                        all.extend(
-                                                            terms.terms_of_predicate(p).map_err(
-                                                                |e| {
-                                                                    QueryError::from_io(
-                                                                        "term components: scan",
-                                                                        e,
-                                                                    )
-                                                                },
-                                                            )?,
-                                                        );
-                                                    }
-                                                    let found = Arc::new(all);
-                                                    by_predicate.insert(p_id, Arc::clone(&found));
-                                                    Some(found)
-                                                }
-                                            },
-                                        }
-                                    }
-                                };
-                                if let Some(found) = found {
-                                    candidates.extend(found.iter().map(|(key, handle)| {
-                                        Candidate::Encoded {
-                                            handle: *handle,
-                                            key: *key,
-                                        }
-                                    }));
-                                }
-                            }
-                        }
-                        candidates.extend(
-                            self.novelty_terms
-                                .iter()
-                                .filter(|nt| self.novelty_anchor_matches(&row, nt))
-                                .map(|nt| match nt.encoded {
-                                    Some((handle, key)) => Candidate::Encoded { handle, key },
-                                    None => Candidate::Materialized(nt.term.clone()),
-                                }),
-                        );
-                        (candidates, 0)
+                        self.state = OperatorState::Exhausted;
+                        self.clear_caches(ctx);
+                        return Ok((produced > 0)
+                            .then(|| Batch::new(Arc::clone(&self.schema), columns))
+                            .transpose()?);
                     }
-                };
-                for candidate in &candidates {
-                    let mut out = row.clone();
-                    if self.apply(candidate, t, &mut out, ctx)? {
-                        for (col, value) in out.into_iter().enumerate() {
-                            columns[col].push(value);
-                        }
+                },
+            };
+            while let Some(candidate) = self.next_candidate(&mut cursor) {
+                visited += 1;
+                if visited.is_multiple_of(1024) {
+                    ctx.checkpoint()?;
+                }
+                let mut out = cursor.row.clone();
+                if self.apply(&candidate, cursor.t, &mut out, ctx)? {
+                    for (col, value) in out.into_iter().enumerate() {
+                        columns[col].push(value);
+                    }
+                    produced += 1;
+                    if produced >= limit {
+                        self.cursor = Some(cursor);
+                        return Ok(Some(Batch::new(Arc::clone(&self.schema), columns)?));
                     }
                 }
-                row.clear();
             }
-            if columns.first().is_some_and(Vec::is_empty) {
-                continue;
-            }
-            return Ok(Some(Batch::new(Arc::clone(&self.schema), columns)?));
         }
     }
 
     fn close(&mut self) {
         self.child.close();
+        self.input = None;
+        self.cursor = None;
+        self.by_prefix.clear();
+        self.by_predicate.clear();
+        self.by_object.clear();
+        self.novelty_terms = None;
         self.state = OperatorState::Closed;
     }
 
