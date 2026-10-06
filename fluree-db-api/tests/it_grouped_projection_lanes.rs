@@ -459,9 +459,10 @@ async fn grouped_select_expression_on_an_indexed_ledger_in_both_lanes() {
             let sites = proceeded(&store, before);
             if served(&store, before, pair.site) != must_fire {
                 misrouted.push(format!(
-                    "`{}` must {}proceed [proceeded: {sites:?}]\n{body}",
+                    "`{}` must {}serve it [proceeded: {sites:?}; declined at open: {:?}]\n{body}",
                     pair.site,
-                    if must_fire { "" } else { "not " }
+                    if must_fire { "" } else { "not " },
+                    stamped(&store, before, "fallback")
                 ));
             }
             if !must_fire && !generic_only(&sites) {
@@ -479,9 +480,10 @@ async fn grouped_select_expression_on_an_indexed_ledger_in_both_lanes() {
             let sites = proceeded(&store, before);
             if served(&store, before, pair.site) != must_fire {
                 misrouted.push(format!(
-                    "`{}` must {}proceed [proceeded: {sites:?}]\n{query}",
+                    "`{}` must {}serve it [proceeded: {sites:?}; declined at open: {:?}]\n{query}",
                     pair.site,
-                    if must_fire { "" } else { "not " }
+                    if must_fire { "" } else { "not " },
+                    stamped(&store, before, "fallback")
                 ));
             }
             if !must_fire && !generic_only(&sites) {
@@ -763,8 +765,10 @@ async fn overflow_integers_through_grouping() {
         let fired = served(&store, before, "group_by_object_count_topk");
         if fired != must_fire || (!must_fire && !generic_only(&sites)) {
             misrouted.push(format!(
-                "`group_by_object_count_topk` must {}proceed [proceeded: {sites:?}]\n{query}",
-                if must_fire { "" } else { "not " }
+                "`group_by_object_count_topk` must {}serve it [proceeded: {sites:?}; declined at \
+                 open: {:?}]\n{query}",
+                if must_fire { "" } else { "not " },
+                stamped(&store, before, "fallback")
             ));
         }
     }
