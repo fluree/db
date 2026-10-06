@@ -410,11 +410,12 @@ fn lower_return<E: IriEncoder>(
         projection.group_keys
     };
 
-    // An ORDER BY on a property of an output node: aggregate first, then join
-    // the property and sort (see `reads_output_properties`).
+    // An ORDER BY on a property of an output node, or on an expression: aggregate
+    // first, then join the property or compute the key, and sort (see
+    // `reads_after_aggregation`).
     if !projection.aggregates.is_empty()
         && !projection.saw_star
-        && reads_output_properties(&projection.vars, &post, None, &ordering)
+        && reads_after_aggregation(&projection.vars, &post, None, &ordering)
     {
         let grouping = Grouping::assemble(
             group_keys,
@@ -455,26 +456,29 @@ fn lower_return<E: IriEncoder>(
 /// Whether an aggregating `WITH` or `RETURN` lowers as two levels: the
 /// aggregation, then a stage that joins `post` (the patterns its `WHERE` and
 /// `ORDER BY` lowered: property accessors, and binds for expression sort keys)
-/// and then filters and sorts. It does when `post` reads a property of an
-/// output node (`p.age` with `p` projected): that read has to see the node's
-/// values after aggregation. Joined before it, as one level would, a property
-/// with k values repeats every row of the group k times, and `count`, `sum`
-/// and `collect` see each row k times. The two levels are what
-/// `WITH p, count(f) AS c WITH p, c WHERE p.age > 30` already lowers to.
+/// and then filters and sorts. It does when `post` holds anything, provided
+/// the second stage can see every read:
+/// - a property of an output node (`p.age` with `p` projected) has to be read
+///   after aggregation. Joined before it, as one level would, a property with
+///   k values repeats every row of the group k times, and `count`, `sum` and
+///   `collect` see each row k times;
+/// - an expression sort key (`ORDER BY c + 1`) reads the aggregation's
+///   outputs, which one level does not have before grouping.
 ///
-/// `false` when `post` reads no output node's property (one level, as before),
-/// or when the second stage could not see a read of `post`, `filter` or the
-/// sort keys: only the aggregation's `outputs` and `post`'s own bindings are in
-/// scope there. One level then rejects those reads at plan time, as Cypher's
-/// scope rule does.
-fn reads_output_properties(
+/// The two levels are what `WITH p, count(f) AS c WITH p, c WHERE p.age > 30`
+/// already lowers to.
+///
+/// `false` when `post` is empty (one level, as before), or when the second
+/// stage could not see a read of `post`, `filter` or the sort keys: only the
+/// aggregation's `outputs` and `post`'s own bindings are in scope there. One
+/// level then rejects those reads at plan time, as Cypher's scope rule does.
+fn reads_after_aggregation(
     outputs: &[VarId],
     post: &[Pattern],
     filter: Option<&fluree_db_query::ir::Expression>,
     ordering: &[SortSpec],
 ) -> bool {
     let mut visible: std::collections::HashSet<VarId> = outputs.iter().copied().collect();
-    let mut reads_property = false;
     for p in post {
         match p {
             // A property accessor (`resolve_property_accessor`):
@@ -490,7 +494,6 @@ fn reads_output_properties(
                     return false;
                 }
                 visible.insert(value);
-                reads_property = true;
             }
             Pattern::Bind { var, expr } => {
                 if !expr.row_reads().iter().all(|v| visible.contains(v)) {
@@ -501,7 +504,7 @@ fn reads_output_properties(
             _ => return false,
         }
     }
-    reads_property
+    !post.is_empty()
         && filter.is_none_or(|f| f.row_reads().iter().all(|v| visible.contains(v)))
         && ordering.iter().all(|spec| visible.contains(&spec.var))
 }
@@ -1324,7 +1327,7 @@ fn lower_with<E: IriEncoder>(
 
     if has_aggregates
         && !projection.saw_star
-        && reads_output_properties(&projection.vars, &post, lowered_where.as_ref(), &ordering)
+        && reads_after_aggregation(&projection.vars, &post, lowered_where.as_ref(), &ordering)
     {
         // Two levels: the aggregation, then the property joins, the WHERE as
         // a filter, the sort and the slice, as a second `WITH` would.

@@ -1255,7 +1255,8 @@ async fn seed_people(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
 /// After an aggregating `WITH` or `RETURN`, a property of a node the clause
 /// projects is readable in the `WITH`'s `WHERE` and in either clause's
 /// `ORDER BY`: it is read after the aggregation, as a following `WITH p, c
-/// WHERE p.age > 30` would read it. A composite alias (`count(f) + 0 AS c`) is
+/// WHERE p.age > 30` would read it. So is an expression sort key over an
+/// aggregate (`ORDER BY c + 1`). A composite alias (`count(f) + 0 AS c`) is
 /// visible to the `WITH`'s `WHERE`, and the variables of an `exists { … }`
 /// there are its own, not the aggregated `f`.
 #[tokio::test]
@@ -1299,6 +1300,20 @@ async fn cypher_reads_a_key_nodes_property_after_grouping() {
         (
             "MATCH (p:P)-[:knows]->(f) WITH p, count(f) + 0 AS c WHERE c > 1 RETURN p.age, c",
             json!([[40, 2], [50, 3]]),
+        ),
+        (
+            "MATCH (p:P)-[:knows]->(f) WITH p, count(f) AS c ORDER BY c + 1 DESC LIMIT 2 \
+             RETURN p.age, c",
+            json!([[50, 3], [40, 2]]),
+        ),
+        (
+            "MATCH (p:P)-[:knows]->(f) WITH p, count(f) AS c ORDER BY -c LIMIT 1 \
+             RETURN p.age, c",
+            json!([[50, 3]]),
+        ),
+        (
+            "MATCH (p:P)-[:knows]->(f) RETURN p.age AS a, count(f) AS c ORDER BY c + 1 LIMIT 1",
+            json!([[25, 1]]),
         ),
         (
             "MATCH (p:P)-[:knows]->(f) WITH p, count(f) AS c \
