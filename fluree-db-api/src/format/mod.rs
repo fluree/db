@@ -65,25 +65,11 @@ mod typed;
 pub(crate) fn triple_term_components(
     term: &fluree_db_core::TripleTermValue,
 ) -> [fluree_db_query::binding::Binding; 3] {
-    use fluree_db_core::{DatatypeConstraint, FlakeValue};
     use fluree_db_query::binding::Binding;
-    let object = match &term.o {
-        FlakeValue::Ref(sid) => Binding::sid(sid.clone()),
-        other => Binding::Lit {
-            val: other.clone(),
-            dtc: match &term.lang {
-                Some(lang) => DatatypeConstraint::LangTag(std::sync::Arc::from(lang.as_str())),
-                None => DatatypeConstraint::Explicit(term.dt.clone()),
-            },
-            t: None,
-            op: None,
-            p_id: None,
-        },
-    };
     [
         Binding::sid(term.s.clone()),
         Binding::sid(term.p.clone()),
-        object,
+        Binding::term_object(term),
     ]
 }
 

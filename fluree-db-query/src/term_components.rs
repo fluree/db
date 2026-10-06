@@ -626,7 +626,7 @@ impl TermComponentsOperator {
                 (Component::Var(_), Candidate::Materialized(term)) => match position {
                     0 => Binding::sid(term.s.clone()),
                     1 => Binding::sid(term.p.clone()),
-                    _ => crate::eval::rdf::materialized_term_object(term),
+                    _ => Binding::term_object(term),
                 },
             };
             let Component::Var(v) = component else {

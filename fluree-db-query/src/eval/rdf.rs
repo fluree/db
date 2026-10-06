@@ -671,27 +671,8 @@ pub(crate) fn term_component_binding<R: RowAccess>(
     Ok(Some(match func {
         Function::TripleSubject => Binding::sid(term.s),
         Function::TriplePredicate => Binding::sid(term.p),
-        _ => materialized_term_object(&term),
+        _ => Binding::term_object(&term),
     }))
-}
-
-/// A materialized term's object with its datatype or language tag, which
-/// `OBJECT()` must keep: `"chat"@fr` is not `"chat"`, `"5"^^xsd:int` is not
-/// `5`.
-pub(crate) fn materialized_term_object(term: &fluree_db_core::TripleTermValue) -> Binding {
-    match &term.o {
-        fluree_db_core::FlakeValue::Ref(sid) => Binding::sid(sid.clone()),
-        other => Binding::Lit {
-            val: other.clone(),
-            dtc: match &term.lang {
-                Some(lang) => fluree_db_core::DatatypeConstraint::LangTag(Arc::from(lang.as_str())),
-                None => fluree_db_core::DatatypeConstraint::Explicit(term.dt.clone()),
-            },
-            t: None,
-            op: None,
-            p_id: None,
-        },
-    }
 }
 
 /// One accessor: the component's binding converted exactly as a bound
