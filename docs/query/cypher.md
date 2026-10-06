@@ -365,8 +365,13 @@ ORDER BY / SKIP / LIMIT
   composite aliases included (`WITH p, count(f) + 0 AS c WHERE c > 1`).
   After an aggregating `WITH` or `RETURN`, its `WHERE` and `ORDER BY` can
   read a property of a node it projects (`WITH p, count(f) AS c WHERE
-  p.age > 30`); a node it does not project is out of scope there, and
-  reading its property is an error. Nested WITHs nest Subqueries. A
+  p.age > 30`, `ORDER BY p.age + 1`). The property is read after the
+  aggregation, as a following `WITH p, c WHERE p.age > 30` would read it,
+  so the aggregates are the same whatever the property holds; a property
+  with several values gives the row once per value that passes, as in a
+  `MATCH … WHERE`. A node the clause does not project is out of scope
+  there, and reading its property is an error. Nested WITHs nest
+  Subqueries. A
   `collect()` projected by a `WITH` carries forward as a real list to the next
   stage (`WITH p, collect(f) AS fs … RETURN size(fs)` / `UNWIND fs …`); only
   `ORDER BY` directly on a collected list is rejected (sorting a list value is

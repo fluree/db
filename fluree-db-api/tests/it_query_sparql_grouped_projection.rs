@@ -1187,12 +1187,11 @@ async fn seed_people(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
 }
 
 /// After an aggregating `WITH` or `RETURN`, a property of a node the clause
-/// projects (a grouping key) is readable in the `WITH`'s `WHERE` and in either
-/// clause's `ORDER BY`: the key node is the same in every row of its group, so
-/// the property has one value per group (lowered as a `SAMPLE` of it). A
-/// composite alias (`count(f) + 0 AS c`) is visible to the `WITH`'s `WHERE`,
-/// and the variables of an `exists { … }` there are its own, not the
-/// aggregated `f`.
+/// projects is readable in the `WITH`'s `WHERE` and in either clause's
+/// `ORDER BY`: it is read after the aggregation, as a following `WITH p, c
+/// WHERE p.age > 30` would read it. A composite alias (`count(f) + 0 AS c`) is
+/// visible to the `WITH`'s `WHERE`, and the variables of an `exists { … }`
+/// there are its own, not the aggregated `f`.
 #[tokio::test]
 async fn cypher_reads_a_key_nodes_property_after_grouping() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -1265,6 +1264,149 @@ async fn cypher_reads_a_key_nodes_property_after_grouping() {
         let data = cj["results"][0]["data"].as_array().expect("rows");
         assert_eq!(data.len(), 1, "{query}: {cj}");
         assert_eq!(data[0]["row"][1], json!(count), "{query}: {cj}");
+    }
+}
+
+/// People with names and scores, typed `ex:P`; Alice has two ages (40 and 41).
+async fn seed_people_two_ages(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@graph": [
+                    {
+                        "@id": "ex:alice", "@type": "ex:P", "ex:name": "Alice",
+                        "ex:age": [40, 41], "ex:score": 1,
+                        "ex:knows": [{"@id": "ex:bob"}, {"@id": "ex:carol"}]
+                    },
+                    {
+                        "@id": "ex:bob", "@type": "ex:P", "ex:name": "Bob", "ex:age": 25,
+                        "ex:score": 10, "ex:knows": {"@id": "ex:carol"}
+                    },
+                    {"@id": "ex:carol", "@type": "ex:P", "ex:name": "Carol", "ex:age": 35, "ex:score": 100},
+                    {
+                        "@id": "ex:dave", "@type": "ex:P", "ex:name": "Dave", "ex:age": 50,
+                        "ex:score": 1000,
+                        "ex:knows": [{"@id": "ex:alice"}, {"@id": "ex:bob"}, {"@id": "ex:carol"}]
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger
+}
+
+/// A property of an output node, read in an aggregating `WITH`'s `WHERE` or
+/// in an aggregating `WITH`'s or `RETURN`'s `ORDER BY`, is read after the
+/// aggregation, so a property with several values does not change what the
+/// aggregates see. Read before it (an accessor joined in the aggregation's
+/// body), Alice's two ages doubled her group: `count` 4, `sum` 220, `collect`
+/// with every friend twice. Alice (40 and 41) knows Bob (score 10) and Carol
+/// (100); Dave (50) knows Alice (1), Bob and Carol.
+///
+/// The second stage reads every value of the property, as a following `WITH`
+/// does, so a filter that both of Alice's ages pass keeps her row twice, each
+/// with the same aggregates, exactly as `MATCH (p:P) WHERE p.age > 30` returns
+/// her twice.
+#[tokio::test]
+async fn cypher_output_node_properties_are_read_after_aggregation() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people_two_ages(&fluree, "grouped-projection/cypher-two-ages:main").await;
+    let db = cypher_db(&ledger);
+    let cypher = |query: &'static str| {
+        let (fluree, db) = (&fluree, &db);
+        async move {
+            let rows = fluree
+                .query_cypher(db, query)
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{query}"))
+                .to_jsonld_async(db.as_graph_db_ref())
+                .await
+                .expect("jsonld");
+            // `collect` order is unspecified: sort each list cell.
+            let rows: Vec<JsonValue> = rows
+                .as_array()
+                .expect("rows")
+                .iter()
+                .map(|row| {
+                    let cells = row.as_array().expect("row").iter().map(|cell| match cell {
+                        JsonValue::Array(list) => {
+                            let mut list = list.clone();
+                            list.sort_by_key(std::string::ToString::to_string);
+                            JsonValue::Array(list)
+                        }
+                        other => other.clone(),
+                    });
+                    JsonValue::Array(cells.collect())
+                })
+                .collect();
+            normalize_rows(&JsonValue::Array(rows))
+        }
+    };
+    const M: &str = "MATCH (p:P)-[:knows]->(f) ";
+    for (rest, expected) in [
+        (
+            "WITH p, count(f) AS c WHERE p.age > 40 RETURN p.name, c",
+            json!([["Alice", 2], ["Dave", 3]]),
+        ),
+        (
+            "WITH p, count(f) AS c, sum(f.score) AS s WHERE p.age > 40 RETURN p.name, c, s",
+            json!([["Alice", 2, 110], ["Dave", 3, 111]]),
+        ),
+        (
+            "WITH p, collect(f.name) AS fs WHERE p.age > 40 RETURN p.name, fs",
+            json!([
+                ["Alice", ["Bob", "Carol"]],
+                ["Dave", ["Alice", "Bob", "Carol"]]
+            ]),
+        ),
+        (
+            "WITH p AS q, count(f) AS c WHERE c >= 1 AND q.age > 40 RETURN q.name, c",
+            json!([["Alice", 2], ["Dave", 3]]),
+        ),
+        (
+            "WITH p, count(f) AS c, sum(f.score) AS s, collect(f.name) AS fs \
+             ORDER BY p.age DESC SKIP 1 LIMIT 1 RETURN p.name, c, s, fs",
+            json!([["Alice", 2, 110, ["Bob", "Carol"]]]),
+        ),
+        (
+            "WITH p, count(f) AS c ORDER BY p.age + 1 DESC SKIP 1 LIMIT 1 RETURN p.name, c",
+            json!([["Alice", 2]]),
+        ),
+        (
+            "RETURN p.name AS n, count(f) AS c, sum(f.score) AS s, collect(f.name) AS fs, p \
+             ORDER BY p.age DESC SKIP 1 LIMIT 1",
+            json!([[
+                "Alice",
+                2,
+                110,
+                ["Bob", "Carol"],
+                "http://example.org/alice"
+            ]]),
+        ),
+        (
+            "WITH p, count(f) AS c WHERE p.age > 30 RETURN p.name, c",
+            json!([["Alice", 2], ["Alice", 2], ["Dave", 3]]),
+        ),
+        (
+            "WITH p, count(f) AS c WITH p, c WHERE p.age > 30 RETURN p.name, c",
+            json!([["Alice", 2], ["Alice", 2], ["Dave", 3]]),
+        ),
+    ] {
+        let query: &'static str = Box::leak(format!("{M}{rest}").into_boxed_str());
+        assert_eq!(cypher(query).await, normalize_rows(&expected), "{query}");
+    }
+
+    // A node the clause does not project is out of scope after it.
+    for rest in [
+        "WITH p, count(f) AS c WHERE f.age > 30 RETURN p.name, c",
+        "WITH p, count(f) AS c ORDER BY f.age RETURN p.name, c",
+    ] {
+        let query = format!("{M}{rest}");
+        assert!(fluree.query_cypher(&db, &query).await.is_err(), "{query}");
     }
 }
 

@@ -389,9 +389,9 @@ fn lower_return<E: IriEncoder>(
             QueryOutput::wildcard()
         }
     } else if r.distinct {
-        QueryOutput::select_distinct(projection.vars)
+        QueryOutput::select_distinct(projection.vars.clone())
     } else {
-        QueryOutput::select_all(projection.vars)
+        QueryOutput::select_all(projection.vars.clone())
     };
 
     let limit = const_usize(&r.limit)?;
@@ -399,7 +399,8 @@ fn lower_return<E: IriEncoder>(
 
     let order_by = align_order_by_with_projection(&r.items, &r.order_by);
     reject_order_by_on_list(ctx, &order_by, &projection.list_outputs)?;
-    let mut ordering = lower_order_by(ctx, &order_by, patterns)?;
+    let mut post = Vec::new();
+    let ordering = lower_order_by(ctx, &order_by, &mut post)?;
 
     // GROUP BY keys are only meaningful when aggregates exist; if not,
     // pass an empty list so Grouping::assemble produces None.
@@ -408,17 +409,37 @@ fn lower_return<E: IriEncoder>(
     } else {
         projection.group_keys
     };
-    let mut aggregates = projection.aggregates;
-    if !aggregates.is_empty() {
-        sample_key_properties(
-            ctx,
-            &group_keys,
-            &mut aggregates,
+
+    // An ORDER BY on a property of an output node: aggregate first, then join
+    // the property and sort (see `reads_output_properties`).
+    if !projection.aggregates.is_empty()
+        && !projection.saw_star
+        && reads_output_properties(&projection.vars, &post, None, &ordering)
+    {
+        let grouping = Grouping::assemble(
+            group_keys,
+            projection.aggregates,
+            projection.post_binds,
             None,
-            &mut ordering,
-            patterns,
-        );
+        )
+        .map_err(|e| LowerError::generic(e.to_string()))?;
+        let mut aggregation = SubqueryPattern::new(projection.vars, std::mem::take(patterns));
+        if let Some(g) = grouping {
+            aggregation = aggregation.with_grouping(g);
+        }
+        patterns.push(Pattern::Subquery(aggregation));
+        patterns.extend(post);
+        return Ok((
+            output,
+            ordering,
+            limit,
+            offset,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
     }
+    extend_aux(patterns, post);
 
     Ok((
         output,
@@ -426,60 +447,86 @@ fn lower_return<E: IriEncoder>(
         limit,
         offset,
         group_keys,
-        aggregates,
+        projection.aggregates,
         projection.post_binds,
     ))
 }
 
-/// After an aggregating `WITH` or `RETURN`, a property read of a node the
-/// grouping keys on (`p.age` with `p` a key, in the `WITH`'s `WHERE` or either
-/// clause's `ORDER BY`) is lowered as an accessor triple in the body before
-/// grouping, so it reads a variable that is not a key. Every solution of a
-/// group has the same key node, so a single-valued property has one value per
-/// group: rewrite those reads to `SAMPLE`, which is then exact (the SPARQL
-/// rewrite, [`fluree_db_query::ir::sample_ungrouped_reads`], restricted to
-/// accessors of key nodes). A property of a node the clause does not project
-/// is left alone and stays a plan error: that node is out of scope there.
-fn sample_key_properties<E: IriEncoder>(
-    ctx: &mut LoweringContext<'_, E>,
-    keys: &[VarId],
-    aggregates: &mut Vec<AggregateSpec>,
-    having: Option<&mut fluree_db_query::ir::Expression>,
-    ordering: &mut [SortSpec],
-    patterns: &[Pattern],
-) {
-    // The accessor triples `resolve_property_accessor` emitted for key nodes:
-    // `OPTIONAL { ?key <p> ?#__prop_key_p }`.
-    let key_properties: std::collections::HashSet<VarId> = patterns
-        .iter()
-        .filter_map(|p| match p {
-            Pattern::Optional(inner) => match inner.as_slice() {
-                [Pattern::Triple(tp)] => {
-                    let (node, value) = (tp.s.as_var()?, tp.o.as_var()?);
-                    (keys.contains(&node)
-                        && ctx
-                            .vars
-                            .try_name(value)
-                            .is_some_and(|name| name.starts_with("?#__prop_")))
-                    .then_some(value)
+/// Whether an aggregating `WITH` or `RETURN` lowers as two levels: the
+/// aggregation, then a stage that joins `post` (the patterns its `WHERE` and
+/// `ORDER BY` lowered: property accessors, and binds for expression sort keys)
+/// and then filters and sorts. It does when `post` reads a property of an
+/// output node (`p.age` with `p` projected): that read has to see the node's
+/// values after aggregation. Joined before it, as one level would, a property
+/// with k values repeats every row of the group k times, and `count`, `sum`
+/// and `collect` see each row k times. The two levels are what
+/// `WITH p, count(f) AS c WITH p, c WHERE p.age > 30` already lowers to.
+///
+/// `false` when `post` reads no output node's property (one level, as before),
+/// or when the second stage could not see a read of `post`, `filter` or the
+/// sort keys: only the aggregation's `outputs` and `post`'s own bindings are in
+/// scope there. One level then rejects those reads at plan time, as Cypher's
+/// scope rule does.
+fn reads_output_properties(
+    outputs: &[VarId],
+    post: &[Pattern],
+    filter: Option<&fluree_db_query::ir::Expression>,
+    ordering: &[SortSpec],
+) -> bool {
+    let mut visible: std::collections::HashSet<VarId> = outputs.iter().copied().collect();
+    let mut reads_property = false;
+    for p in post {
+        match p {
+            // A property accessor (`resolve_property_accessor`):
+            // `OPTIONAL { ?node <p> ?#__prop_node_p }`.
+            Pattern::Optional(inner) => {
+                let [Pattern::Triple(tp)] = inner.as_slice() else {
+                    return false;
+                };
+                let (Some(node), Some(value)) = (tp.s.as_var(), tp.o.as_var()) else {
+                    return false;
+                };
+                if !visible.contains(&node) {
+                    return false;
                 }
+                visible.insert(value);
+                reads_property = true;
+            }
+            Pattern::Bind { var, expr } => {
+                if !expr.row_reads().iter().all(|v| visible.contains(v)) {
+                    return false;
+                }
+                visible.insert(*var);
+            }
+            _ => return false,
+        }
+    }
+    reads_property
+        && filter.is_none_or(|f| f.row_reads().iter().all(|v| visible.contains(v)))
+        && ordering.iter().all(|spec| visible.contains(&spec.var))
+}
+
+/// Append the auxiliary patterns a `WHERE` or `ORDER BY` lowered, skipping a
+/// property accessor the body already joins (the clause-local dedup
+/// `resolve_property_accessor` does within one list).
+fn extend_aux(patterns: &mut Vec<Pattern>, aux: impl IntoIterator<Item = Pattern>) {
+    fn accessor(p: &Pattern) -> Option<(VarId, VarId)> {
+        match p {
+            Pattern::Optional(inner) => match inner.as_slice() {
+                [Pattern::Triple(tp)] => Some((tp.s.as_var()?, tp.o.as_var()?)),
                 _ => None,
             },
             _ => None,
-        })
-        .collect();
-    if key_properties.is_empty() {
-        return;
+        }
     }
-    fluree_db_query::ir::sample_ungrouped_reads(
-        keys,
-        aggregates,
-        having,
-        &mut [],
-        ordering,
-        || key_properties,
-        &mut |_| ctx.fresh_synth(),
-    );
+    for p in aux {
+        if let Some(key) = accessor(&p) {
+            if patterns.iter().any(|q| accessor(q) == Some(key)) {
+                continue;
+            }
+        }
+        patterns.push(p);
+    }
 }
 
 /// Shared state used while lowering a projection list (RETURN, WITH).
@@ -631,56 +678,6 @@ impl ProjectionState {
         self.post_binds.push((output_var, lowered));
         self.vars.push(output_var);
         Ok(())
-    }
-
-    /// Returns the set of VarIds produced by aggregate stages. Used
-    /// by the WITH lowering to decide whether a WHERE expression
-    /// references aggregate outputs (= HAVING) or only pre-aggregation
-    /// bindings (= pre-aggregation Filter).
-    fn aggregate_output_vars(&self) -> std::collections::HashSet<VarId> {
-        self.aggregates.iter().map(|a| a.output_var).collect()
-    }
-}
-
-/// True if `expr` references any of the given VarIds.
-fn expression_references_any(
-    expr: &fluree_db_query::ir::Expression,
-    vars: &std::collections::HashSet<VarId>,
-) -> bool {
-    use fluree_db_query::ir::Expression;
-    match expr {
-        Expression::Var(v) => vars.contains(v),
-        Expression::Const(_) => false,
-        Expression::Call { args, .. } => args.iter().any(|a| expression_references_any(a, vars)),
-        Expression::Map(entries) => entries
-            .iter()
-            .any(|(_, v)| expression_references_any(v, vars)),
-        Expression::ListComprehension {
-            list, filter, map, ..
-        } => {
-            expression_references_any(list, vars)
-                || filter
-                    .as_deref()
-                    .is_some_and(|f| expression_references_any(f, vars))
-                || map
-                    .as_deref()
-                    .is_some_and(|m| expression_references_any(m, vars))
-        }
-        Expression::Reduce {
-            init, list, body, ..
-        } => {
-            expression_references_any(init, vars)
-                || expression_references_any(list, vars)
-                || expression_references_any(body, vars)
-        }
-        Expression::ListPredicate {
-            list, predicate, ..
-        } => expression_references_any(list, vars) || expression_references_any(predicate, vars),
-        Expression::Member { target, .. } => expression_references_any(target, vars),
-        Expression::PatternComprehension { projection, .. } => {
-            expression_references_any(projection, vars)
-        }
-        Expression::Exists { .. } | Expression::Resolved(_) => false,
     }
 }
 
@@ -1301,29 +1298,17 @@ fn lower_with<E: IriEncoder>(
     // as a Filter, which ran before aggregation and made any
     // reference to an aggregate output variable (e.g. `WHERE c > 0`
     // after `count(*) AS c`) silently match zero rows.
-    let having = if let Some(where_expr) = &w.where_clause {
-        // Auxiliary triples (property accessors) emitted by the
-        // WHERE expression go into the subquery body before any
-        // Filter — they bind the values the WHERE needs to read.
-        let lowered = lower_expr(ctx, where_expr, &mut inner_patterns)?;
-        let agg_outputs = projection.aggregate_output_vars();
-        let references_aggregate =
-            !agg_outputs.is_empty() && expression_references_any(&lowered, &agg_outputs);
-        if !projection.aggregates.is_empty() && references_aggregate {
-            Some(lowered)
-        } else if projection.aggregates.is_empty() {
-            inner_patterns.push(Pattern::Filter(lowered));
-            None
-        } else {
-            // Aggregates exist but the WHERE doesn't reference any
-            // aggregate output — keep it as HAVING too. Pre-grouping
-            // filters belong in a MATCH WHERE clause that runs before
-            // the WITH, not after.
-            Some(lowered)
-        }
-    } else {
-        None
+    //
+    // The WHERE's auxiliary patterns (property accessors) and the ORDER BY's
+    // (accessors, and binds for expression keys) are lowered into `post` and
+    // placed below: in the body, or, when they read a property of an output
+    // node of an aggregating WITH, in a stage after the aggregation.
+    let mut post: Vec<Pattern> = Vec::new();
+    let lowered_where = match &w.where_clause {
+        Some(where_expr) => Some(lower_expr(ctx, where_expr, &mut post)?),
+        None => None,
     };
+    let where_aux = post.len();
 
     let group_keys = if projection.aggregates.is_empty() {
         Vec::new()
@@ -1331,28 +1316,74 @@ fn lower_with<E: IriEncoder>(
         projection.group_keys
     };
 
-    // ORDER BY may also reference property accessors; emit any
-    // resulting auxiliary triples into the subquery body before we
-    // hand patterns to SubqueryPattern. Align accessor/var keys that match an
-    // aliased projection item to that alias (so they survive grouping).
+    // Align accessor/var keys that match an aliased projection item to that
+    // alias (so they survive grouping).
     let order_by = align_order_by_with_projection(&w.items, &w.order_by);
     reject_order_by_on_list(ctx, &order_by, &list_outputs)?;
-    let mut ordering = lower_order_by(ctx, &order_by, &mut inner_patterns)?;
+    let ordering = lower_order_by(ctx, &order_by, &mut post)?;
 
-    let mut aggregates = projection.aggregates;
-    let mut having = having;
-    if !aggregates.is_empty() {
-        sample_key_properties(
-            ctx,
-            &group_keys,
-            &mut aggregates,
-            having.as_mut(),
-            &mut ordering,
-            &inner_patterns,
-        );
-    }
-    let grouping = Grouping::assemble(group_keys, aggregates, projection.post_binds, having)
+    if has_aggregates
+        && !projection.saw_star
+        && reads_output_properties(&projection.vars, &post, lowered_where.as_ref(), &ordering)
+    {
+        // Two levels: the aggregation, then the property joins, the WHERE as
+        // a filter, the sort and the slice, as a second `WITH` would.
+        let grouping = Grouping::assemble(
+            group_keys,
+            projection.aggregates,
+            projection.post_binds,
+            None,
+        )
         .map_err(|e| LowerError::generic(e.to_string()))?;
+        let mut aggregation = SubqueryPattern::new(projection.vars.clone(), inner_patterns);
+        if let Some(g) = grouping {
+            aggregation = aggregation.with_grouping(g);
+        }
+        let mut stage = vec![Pattern::Subquery(aggregation)];
+        stage.extend(post);
+        if let Some(filter) = lowered_where {
+            stage.push(Pattern::Filter(filter));
+        }
+        let mut sq = SubqueryPattern::new(
+            augment_select_with_sort_vars(projection.vars, &ordering),
+            stage,
+        );
+        if !ordering.is_empty() {
+            sq = sq.with_ordering(ordering);
+        }
+        if let Some(limit) = const_usize(&w.limit)? {
+            sq = sq.with_limit(limit);
+        }
+        if let Some(offset) = const_usize(&w.skip)? {
+            sq = sq.with_offset(offset);
+        }
+        if w.distinct {
+            sq = sq.with_distinct();
+        }
+        return Ok(sq);
+    }
+
+    // One level. With aggregates the WHERE is HAVING; without, a Filter over
+    // the body, after the patterns it reads.
+    let having = if has_aggregates {
+        extend_aux(&mut inner_patterns, post);
+        lowered_where
+    } else {
+        let order_aux = post.split_off(where_aux);
+        extend_aux(&mut inner_patterns, post);
+        if let Some(filter) = lowered_where {
+            inner_patterns.push(Pattern::Filter(filter));
+        }
+        extend_aux(&mut inner_patterns, order_aux);
+        None
+    };
+    let grouping = Grouping::assemble(
+        group_keys,
+        projection.aggregates,
+        projection.post_binds,
+        having,
+    )
+    .map_err(|e| LowerError::generic(e.to_string()))?;
 
     // SubqueryOperator runs Project BEFORE Sort. Sort keys not in
     // `select` are dropped before the sort can see them, silently
