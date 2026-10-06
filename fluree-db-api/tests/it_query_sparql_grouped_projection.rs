@@ -1481,6 +1481,58 @@ async fn cypher_output_node_properties_are_read_after_aggregation() {
         assert_eq!(cypher(query).await, normalize_rows(&expected), "{query}");
     }
 
+    // The second stage reads every value of the property, as `MATCH … WHERE`
+    // and an explicit following `WITH` do. An unsliced sort on Alice's two
+    // ages lists her row once per age, `DISTINCT` keeps both copies (the sort
+    // key is projected with them), and a later aggregate counts each copy.
+    // A read inside an aggregate's argument is still joined before grouping,
+    // so Alice's two ages repeat her group's rows for every aggregate of the
+    // clause (`count(f)` is 4). These pin today's per-value model in row
+    // order: a change to it (one row per record, as openCypher has no
+    // multi-valued properties) flips them on purpose.
+    for (rest, expected) in [
+        (
+            "WITH p, count(f) AS c ORDER BY p.age RETURN p.name, c",
+            json!([["Bob", 1], ["Alice", 2], ["Alice", 2], ["Dave", 3]]),
+        ),
+        (
+            "WITH DISTINCT p, count(f) AS c ORDER BY p.age RETURN p.name, c",
+            json!([["Bob", 1], ["Alice", 2], ["Alice", 2], ["Dave", 3]]),
+        ),
+        (
+            "RETURN p.name AS n, count(f) AS c, p ORDER BY p.age DESC",
+            json!([
+                ["Dave", 3, "http://example.org/dave"],
+                ["Alice", 2, "http://example.org/alice"],
+                ["Alice", 2, "http://example.org/alice"],
+                ["Bob", 1, "http://example.org/bob"]
+            ]),
+        ),
+        (
+            "WITH p, count(f) AS c WHERE p.age > 30 RETURN count(*) AS n",
+            json!([[3]]),
+        ),
+        (
+            "WITH p, count(f) AS c WHERE p.age > 30 RETURN sum(c) AS s",
+            json!([[7]]),
+        ),
+        (
+            "WITH p, count(f) AS c, collect(p.age) AS ages \
+             RETURN p.name, c, size(ages) AS k ORDER BY c",
+            json!([["Bob", 1, 1], ["Dave", 3, 3], ["Alice", 4, 4]]),
+        ),
+    ] {
+        let query = format!("{M}{rest}");
+        let rows = fluree
+            .query_cypher(&db, &query)
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{query}"))
+            .to_jsonld_async(db.as_graph_db_ref())
+            .await
+            .expect("jsonld");
+        assert_eq!(rows, expected, "{query}");
+    }
+
     // A node the clause does not project is out of scope after it.
     for rest in [
         "WITH p, count(f) AS c WHERE f.age > 30 RETURN p.name, c",

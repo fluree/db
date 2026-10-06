@@ -365,17 +365,27 @@ ORDER BY / SKIP / LIMIT
   composite aliases included (`WITH p, count(f) + 0 AS c WHERE c > 1`).
   After an aggregating `WITH` or `RETURN`, its `WHERE` and `ORDER BY` can
   read a property of a node it projects (`WITH p, count(f) AS c WHERE
-  p.age > 30`, `ORDER BY p.age + 1`). The property is read after the
+  p.age > 30`, `ORDER BY p.age + 1`) or sort on an expression over its
+  aggregates (`ORDER BY c + 1`). The property is read after the
   aggregation, as a following `WITH p, c WHERE p.age > 30` would read it,
-  so the aggregates are the same whatever the property holds; a property
-  with several values gives the row once per value that passes, as in a
-  `MATCH … WHERE`. A node the clause does not project is out of scope
-  there, and reading its property is an error. Nested WITHs nest
-  Subqueries. A
+  so a read in `WHERE` or `ORDER BY` does not change the clause's
+  aggregates. A node the clause does not project is out of scope there,
+  and reading its property is an error. Nested WITHs nest Subqueries. A
   `collect()` projected by a `WITH` carries forward as a real list to the next
   stage (`WITH p, collect(f) AS fs … RETURN size(fs)` / `UNWIND fs …`); only
   `ORDER BY` directly on a collected list is rejected (sorting a list value is
   unsupported in v1).
+- **Properties with several values.** A property read joins every value of
+  the property, as `MATCH (p) WHERE p.age > 30` does. So in `WHERE` it
+  gives the row once per value that passes; in `ORDER BY` it gives the row
+  once per value, and `DISTINCT` keeps those copies (the sort key is
+  projected with them); and an aggregate in a later clause counts every
+  copy (`… WHERE p.age > 30 RETURN count(*)` counts a node with two passing
+  ages twice). A read inside an aggregate's argument (`avg(n.age)`,
+  `collect(p.age)`) is joined before grouping, so a property with several
+  values repeats the group's rows for every aggregate of that clause:
+  `WITH p, count(f) AS c, collect(p.age) AS ages` counts each friend once
+  per age. Properties with a single value are unaffected.
 - `CALL [(a, b) | (*)] { … }` — a read-only subquery clause in the pipeline.
   The scope clause `(a, b)` imports those outer variables (the subquery is
   correlated on them), `(*)` imports the whole visible outer scope, and
