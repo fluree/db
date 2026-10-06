@@ -2980,7 +2980,7 @@ async fn stream_where_into_accumulator(
         // Per-batch shape: project → materialize in place → generate →
         // hydrate (retractions only) → push. Batch drops at end of iter.
         let batch = batch.project_owned(template_vars);
-        let batch = materialize_encoded_bindings_for_txn(ledger, batch)?;
+        let batch = materialize_encoded_bindings_for_txn(ledger, base_db.g_id, batch)?;
 
         // Per-batch `delete_gen` span. Nested under `where_exec`. Fields:
         // `template_count` (stable per txn), `retraction_count` (per-batch
@@ -3087,7 +3087,14 @@ fn lower_sparql_where_patterns(
 ///   `Encoded*` variant. Already-concrete columns are left untouched (no
 ///   per-binding clone, no Vec reallocation). Only columns that need it pay
 ///   for in-place rewriting.
-fn materialize_encoded_bindings_for_txn(ledger: &LedgerState, batch: Batch) -> Result<Batch> {
+///
+/// `g_id` is the WHERE's default graph. NUM_BIG arena handles are numbered per
+/// graph, so decoding a `USING <g>` row through graph 0 reads another value.
+fn materialize_encoded_bindings_for_txn(
+    ledger: &LedgerState,
+    g_id: GraphId,
+    batch: Batch,
+) -> Result<Batch> {
     if batch.is_empty() {
         return Ok(batch);
     }
@@ -3100,7 +3107,7 @@ fn materialize_encoded_bindings_for_txn(ledger: &LedgerState, batch: Batch) -> R
         return Ok(batch);
     };
 
-    let gv = fluree_db_binary_index::BinaryGraphView::new(Arc::clone(&store), 0);
+    let gv = fluree_db_binary_index::BinaryGraphView::new(Arc::clone(&store), g_id);
 
     let (schema, mut columns, len) = batch.into_parts();
 

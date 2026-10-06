@@ -1278,6 +1278,26 @@ const XSD_DECIMAL: &str = "http://www.w3.org/2001/XMLSchema#decimal";
 async fn indexed_overflow_numerics(
     ledger_id: &'static str,
 ) -> (MemoryFluree, fluree_db_api::LedgerState) {
+    indexed_trig(
+        ledger_id,
+        format!(
+            r"
+            @prefix ex: <http://example.org/> .
+            ex:acct ex:serial {OVERFLOW_INT} ;
+                    ex:price {OVERFLOW_DEC} .
+            GRAPH <http://example.org/g> {{
+                ex:named ex:serial {OVERFLOW_INT} .
+            }}
+            "
+        ),
+    )
+    .await
+}
+
+async fn indexed_trig(
+    ledger_id: &'static str,
+    trig: String,
+) -> (MemoryFluree, fluree_db_api::LedgerState) {
     let fluree = FlureeBuilder::memory()
         .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
         .build_memory();
@@ -1292,16 +1312,6 @@ async fn indexed_overflow_numerics(
     local
         .run_until(async move {
             let ledger = genesis_ledger(&fluree, ledger_id);
-            let trig = format!(
-                r"
-                @prefix ex: <http://example.org/> .
-                ex:acct ex:serial {OVERFLOW_INT} ;
-                        ex:price {OVERFLOW_DEC} .
-                GRAPH <http://example.org/g> {{
-                    ex:named ex:serial {OVERFLOW_INT} .
-                }}
-                "
-            );
             let result = fluree
                 .stage_owned(ledger)
                 .upsert_turtle(&trig)
@@ -1467,6 +1477,110 @@ async fn indexed_overflow_integer_renders_xsd_integer_through_graph_and_order_by
 }
 
 #[tokio::test]
+async fn indexed_overflow_integer_keeps_xsd_integer_through_insert_where() {
+    let (fluree, ledger) = indexed_overflow_numerics("decimal/bigint-txn:main").await;
+    let ledger = run_sparql_update(
+        &fluree,
+        ledger,
+        "PREFIX ex: <http://example.org/>
+         INSERT { ex:acct ex:copy ?o } WHERE { ex:acct ex:serial ?o }",
+    )
+    .await
+    .ledger;
+    let json = sparql_results(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/> SELECT ?o WHERE { ex:acct ex:copy ?o }",
+    )
+    .await;
+    assert_eq!(binding_values(&json, "o"), vec![OVERFLOW_INT]);
+    assert_eq!(
+        binding_datatypes(&json, "o"),
+        vec![XSD_INTEGER],
+        "INSERT…WHERE copies an indexed overflow integer"
+    );
+}
+
+/// Both graphs hold one `ex:v` value at arena handle 0, so a WHERE scoped to
+/// `<g>` that decodes through the default graph copies the wrong number.
+async fn indexed_per_graph_overflow_values(
+    ledger_id: &'static str,
+) -> (MemoryFluree, fluree_db_api::LedgerState) {
+    indexed_trig(
+        ledger_id,
+        format!(
+            r"
+            @prefix ex: <http://example.org/> .
+            ex:a ex:v {OVERFLOW_INT} .
+            GRAPH <http://example.org/g> {{
+                ex:b ex:v {OVERFLOW_DEC} .
+            }}
+            "
+        ),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn insert_where_using_named_graph_copies_that_graphs_overflow_value() {
+    let (fluree, ledger) = indexed_per_graph_overflow_values("decimal/bigint-using:main").await;
+    let ledger = run_sparql_update(
+        &fluree,
+        ledger,
+        "PREFIX ex: <http://example.org/>
+         INSERT { ex:z ex:copy ?o ; ex:from ?s }
+         USING <http://example.org/g>
+         WHERE { ?s ex:v ?o }",
+    )
+    .await
+    .ledger;
+    let json = sparql_results(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT ?s ?o WHERE { ex:z ex:copy ?o ; ex:from ?s }",
+    )
+    .await;
+    assert_eq!(binding_values(&json, "s"), vec!["http://example.org/b"]);
+    assert_eq!(
+        binding_values(&json, "o"),
+        vec![OVERFLOW_DEC],
+        "USING <g> must decode ?o through <g>'s arena: {json}"
+    );
+    assert_eq!(binding_datatypes(&json, "o"), vec![XSD_DECIMAL]);
+}
+
+#[tokio::test]
+async fn jsonld_update_from_named_graph_copies_that_graphs_overflow_value() {
+    let (fluree, ledger) =
+        indexed_per_graph_overflow_values("decimal/bigint-jsonld-from:main").await;
+    let update = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": "http://example.org/g",
+        "where": {"@id": "?s", "ex:v": "?o"},
+        "insert": {"@id": "ex:z", "ex:copy": "?o", "ex:from": {"@id": "?s"}}
+    });
+    let ledger = fluree
+        .update(ledger, &update)
+        .await
+        .expect("JSON-LD update")
+        .ledger;
+    let json = sparql_results(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT ?s ?o WHERE { ex:z ex:copy ?o ; ex:from ?s }",
+    )
+    .await;
+    assert_eq!(binding_values(&json, "s"), vec!["http://example.org/b"]);
+    assert_eq!(
+        binding_values(&json, "o"),
+        vec![OVERFLOW_DEC],
+        "from <g> must decode ?o through <g>'s arena: {json}"
+    );
+}
+
+#[tokio::test]
 async fn jsonld_indexed_overflow_integer_datatype_and_distinct() {
     let (fluree, ledger) = indexed_overflow_numerics("decimal/bigint-jsonld:main").await;
     let ctx = serde_json::json!({
@@ -1507,4 +1621,24 @@ async fn jsonld_indexed_overflow_integer_datatype_and_distinct() {
         Some(1),
         "selectDistinct must merge the scanned and VALUES copies: {rows}"
     );
+}
+
+#[tokio::test]
+async fn jsonld_indexed_overflow_integer_group_by() {
+    let (fluree, ledger) = indexed_overflow_numerics("decimal/bigint-jsonld-group:main").await;
+    let query = serde_json::json!({
+        "@context": {"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
+        "select": ["?o", "(count ?o)"],
+        "where": [["union",
+            {"@id": "ex:acct", "ex:serial": "?o"},
+            [["values", ["?o", [{"@value": OVERFLOW_INT, "@type": "xsd:integer"}]]]]
+        ]],
+        "groupBy": "?o"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("groupBy query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(rows, serde_json::json!([[OVERFLOW_INT, 2]]), "groupBy");
 }
