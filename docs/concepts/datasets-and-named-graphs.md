@@ -104,6 +104,8 @@ A query with **no** dataset clause at all is unaffected — it reads the endpoin
 
 On the **connection-scoped** route this also removes a sharper edge: previously a `fromNamed`-only body had one of its entries chosen as the default graph, so a pattern outside `["graph", ...]` silently read one arbitrarily-selected graph's triples and returned them with a `200`.
 
+A JSON-LD `from` that names just the ledger (no graph, no time, no `fromNamed`) is not a dataset clause: the query runs on that ledger as if it named none, so `["graph", "?g", ...]` ranges over the ledger's graphs and `["graph", "urn:default", ...]` reads its default graph. Its SPARQL twin, on the ledger's own endpoint, has no `FROM`. A SPARQL `FROM`, by contrast, is a dataset clause, so `GRAPH` addresses only the named graphs the query lists: under `FROM <mydb:main>`, `GRAPH <urn:default>` and `GRAPH ?g` match nothing. To read the default graph by name under a dataset clause, list it: `FROM NAMED <urn:default>` on the ledger's own endpoint, or `FROM NAMED <mydb:main#urn:default>` anywhere. How a `FROM` naming a whole ledger should expose its graphs is tracked in [#1975](https://github.com/fluree/db/issues/1975).
+
 ### Txn metadata named graph (`#txn-meta`)
 
 The `txn-meta` graph contains per-commit metadata stored as triples. This is useful for auditing and operational metadata (machine address, internal user id, job id, etc.).
