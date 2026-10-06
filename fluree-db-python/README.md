@@ -57,6 +57,9 @@ with fluree.connect("./data") as conn:          # or fluree.connect(":memory:")
 - `sync(data, graph=None)` makes the default graph, or a named graph, hold
   exactly `data`, committing only the difference; `dry_run=True` counts what
   would change. Handy for mirroring an export from another system.
+- Named graphs are created by writing to them (TriG, SPARQL `GRAPH`, or a
+  JSON-LD node's `"@graph"`). `ledger.graphs()` lists them, and
+  `ledger.drop_graph(iri)` retracts one's contents in a single commit.
 
 A property value in a JSON-LD dict may be any value a query returns, and
 reads back as it went in: a `fluree.IRI` or `BlankNode` is a reference to that

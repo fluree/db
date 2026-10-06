@@ -48,8 +48,20 @@ pub(crate) fn to_jsonld(obj: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
     convert(obj, Values::Rdf)
 }
 
-/// The keywords whose entries hold values or nodes rather than plain data.
-const VALUE_KEYWORDS: [&str; 6] = ["@list", "@set", "@graph", "@included", "@reverse", "@nest"];
+/// The keywords whose entries hold values or nodes rather than plain data:
+/// JSON-LD's containers, and Fluree's edge annotations (`@annotation`, its
+/// alias `@edge`) and the edge an annotation `@reifies`.
+const VALUE_KEYWORDS: [&str; 9] = [
+    "@list",
+    "@set",
+    "@graph",
+    "@included",
+    "@reverse",
+    "@nest",
+    "@annotation",
+    "@edge",
+    "@reifies",
+];
 
 fn convert(obj: &Bound<'_, PyAny>, values: Values) -> PyResult<JsonValue> {
     let py = obj.py();

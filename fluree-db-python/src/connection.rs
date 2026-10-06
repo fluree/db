@@ -977,6 +977,29 @@ impl Connection {
             .map_err(api_error)
     }
 
+    /// Retract every fact in named graph `graph` in one commit; the dict
+    /// `fluree.Commit` is built from (`id` `None` when it held nothing).
+    fn drop_graph<'py>(
+        &self,
+        py: Python<'py>,
+        ledger: &str,
+        graph: &str,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let id = canonical(ledger)?;
+        let report =
+            block_on(py, self.fluree.get()?.drop_named_graph(&id, graph))?.map_err(api_error)?;
+        let commit = PyDict::new(py);
+        commit.set_item("t", report.t)?;
+        commit.set_item("id", report.commit_id.as_ref().map(ToString::to_string))?;
+        commit.set_item(
+            "digest",
+            report.commit_id.as_ref().map(ContentId::digest_hex),
+        )?;
+        commit.set_item("asserts", 0)?;
+        commit.set_item("retracts", report.retracted)?;
+        Ok(commit)
+    }
+
     fn info<'py>(&self, py: Python<'py>, ledger: &str) -> PyResult<Bound<'py, PyAny>> {
         let id = canonical(ledger)?;
         let info =

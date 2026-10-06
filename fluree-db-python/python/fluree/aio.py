@@ -502,6 +502,12 @@ class Ledger:
     async def info(self) -> dict[str, Any]:
         return await _call(self._sync.info)
 
+    async def graphs(self) -> list[fluree.IRI]:
+        return await _call(self._sync.graphs)
+
+    async def drop_graph(self, graph: str) -> Commit:
+        return await _call(self._sync.drop_graph, graph)
+
 
 def _source(source: str | Ledger) -> str | fluree.Ledger:
     return source._sync if isinstance(source, Ledger) else source

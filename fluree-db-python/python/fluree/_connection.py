@@ -893,6 +893,25 @@ class Ledger:
         """Ledger metadata and statistics."""
         return self._connection._native.info(self._id)
 
+    def graphs(self) -> list[IRI]:
+        """The IRIs of the ledger's named graphs, in the order they were first
+        written to. The default graph and Fluree's own graphs (commit
+        metadata, configuration) are left out.
+
+        A graph is created by writing to it — TriG, SPARQL ``GRAPH``, or a
+        JSON-LD node's ``"@graph"`` — and queried with SPARQL ``GRAPH`` or
+        JSON-LD ``["graph", iri, pattern]``."""
+        system = {"urn:default", f"urn:fluree:{self._id}#txn-meta", self._config_graph}
+        named = self.info()["ledger"]["named-graphs"]
+        return [IRI(g["iri"]) for g in named if g["iri"] not in system]
+
+    def drop_graph(self, graph: str) -> Commit:
+        """Retract everything in named graph ``graph`` (its full IRI) in one
+        commit. History keeps it, and the graph can be written to again. The
+        default graph and Fluree's own graphs cannot be dropped."""
+        self._require_unrestricted("drop_graph")
+        return Commit(**self._connection._native.drop_graph(self._id, graph))
+
     def set_full_text(
         self, properties: Iterable[str], *, language: str = "en", reindex: bool = True
     ) -> None:

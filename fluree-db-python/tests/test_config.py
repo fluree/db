@@ -72,3 +72,26 @@ def test_connect_needs_exactly_one_target(tmp_path):
 def test_bad_config_is_a_value_error():
     with pytest.raises(ValueError):
         fluree.connect(config={"@graph": [{"@type": "Nonsense"}]})
+
+
+def test_a_wrong_key_is_an_error_not_a_crash(tmp_path):
+    with fluree.connect(config=config(tmp_path, AES256Key=KEY)) as conn:
+        conn.create("secrets").insert({"@context": {"ex": EX}, "@id": "ex:alice", "ex:secret": "s"})
+    other = base64.b64encode(bytes(range(1, 33))).decode()
+    with pytest.raises(fluree.FlureeError, match="(?i)decrypt|encrypt"):
+        with fluree.connect(config=config(tmp_path, AES256Key=other)) as conn:
+            conn.ledger("secrets").query(f"SELECT ?v WHERE {{ <{EX}alice> <{EX}secret> ?v }}")
+
+
+def test_maintenance_on_an_encrypted_ledger(tmp_path):
+    data = tmp_path / "data"
+    with fluree.connect(config=config(data, AES256Key=KEY)) as conn:
+        ledger = conn.create("secrets")
+        ledger.insert({"@context": {"ex": EX}, "@id": "ex:alice", "ex:secret": "hunter2-plaintext"})
+        assert ledger.reindex() == 1
+        assert ledger.verify().healthy
+        assert "hunter2-plaintext" in ledger.export(format="ntriples")
+        ledger.archive(tmp_path / "secrets.flpack")
+        restored = conn.restore(tmp_path / "secrets.flpack", "copy")
+        assert restored.query(f"SELECT ?v WHERE {{ <{EX}alice> <{EX}secret> ?v }}").value("v") == ["hunter2-plaintext"]
+    assert b"hunter2-plaintext" not in all_bytes(data)
