@@ -237,6 +237,8 @@ pub async fn build_index_for_record_with_tracker(
                     result.fuel = tally_fuel(&tracker);
                     return Ok(result);
                 }
+                // A full rebuild resolves the same commit and fails the same way.
+                Err(e) if !e.is_retryable() => return Err(e),
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
