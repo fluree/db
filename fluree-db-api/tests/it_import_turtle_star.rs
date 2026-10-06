@@ -177,13 +177,16 @@ async fn knows_claims(
         .collect()
 }
 
-/// N-Quads has only the `rdf:reifies <<( … )>>` spelling. The importer
-/// regroups labeled statements into TriG blocks, so the claim follows its
+/// N-Quads has only the `rdf:reifies <<( … )>>` spelling, so an annotated
+/// triple is the triple plus its reifier's link. The importer regroups
+/// labeled statements into TriG blocks, so the claim follows its
 /// statement's graph label.
 #[tokio::test]
 async fn imported_nquads_claims_land_in_their_statement_graph() {
-    const NQUADS: &str = r#"_:r1 <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <http://example.org/alice> <http://example.org/knows> <http://example.org/bob> )>> .
+    const NQUADS: &str = r#"<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .
+_:r1 <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <http://example.org/alice> <http://example.org/knows> <http://example.org/bob> )>> .
 _:r1 <http://example.org/confidence> "0.9" .
+<http://example.org/alice> <http://example.org/knows> <http://example.org/carol> <http://example.org/graphs/claims> .
 _:r2 <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <http://example.org/alice> <http://example.org/knows> <http://example.org/carol> )>> <http://example.org/graphs/claims> .
 _:r2 <http://example.org/confidence> "0.5" <http://example.org/graphs/claims> .
 "#;
@@ -216,8 +219,8 @@ async fn imported_trig_with_a_version_directive_keeps_its_prefixes() {
     );
 }
 
-/// The imported `f:reifies*` flakes under `graph`, across every reifier.
-async fn reifies_flakes_in(
+/// The imported `rdf:reifies` links under `graph`, across every reifier.
+async fn links_in(
     fluree: &fluree_db_api::Fluree,
     alias: &str,
     graph: &str,
@@ -232,24 +235,19 @@ async fn reifies_flakes_in(
         &ledger.snapshot,
         g_id,
         ledger.novelty.as_ref(),
-        fluree_db_core::comparator::IndexType::Spot,
+        fluree_db_core::comparator::IndexType::Psot,
         fluree_db_core::range::RangeTest::Eq,
-        fluree_db_core::range::RangeMatch::new(),
+        fluree_db_core::range::RangeMatch::predicate(fluree_db_core::rdf_reifies_sid().clone()),
         fluree_db_core::range::RangeOptions::new().with_to_t(ledger.t()),
     )
     .await
     .expect("scan named graph")
-    .into_iter()
-    .filter(|f| fluree_db_core::is_reserved_reifies_predicate(&f.p))
-    .collect()
 }
 
-/// TriG import writes the bundle into the named graph whether or not it
-/// carries `f:reifiesGraph`, so a graph-scoped annotation query cannot tell
-/// the two apart. The edge identity can: the bundle must decode to the
-/// block's graph, and deleting that edge must cascade to it.
+/// TriG import writes a GRAPH block's link into that graph, naming the
+/// block's edge; deleting the edge leaves the link, as RDF 1.2 does.
 #[tokio::test]
-async fn imported_trig_star_bundle_carries_its_graph_and_cascades() {
+async fn imported_trig_star_link_lands_in_its_graph_and_outlives_its_edge() {
     let alias = "it/import-trig-star:graph-anchored";
     let trig = format!(
         "@prefix ex: <http://example.org/> .\n\
@@ -257,19 +255,15 @@ async fn imported_trig_star_bundle_carries_its_graph_and_cascades() {
     );
     let (fluree, ledger) = import_dir(&[("claims.trig", &trig)], alias).await;
 
-    let graph_sid = ledger.snapshot.encode_iri(CLAIMS_GRAPH).expect("graph sid");
-    let mut bundle = reifies_flakes_in(&fluree, alias, CLAIMS_GRAPH).await;
-    // Index-decoded flakes carry `g: None`; stamp the scanned graph the way
-    // the cascade in `stage()` does before decoding.
-    for f in &mut bundle {
-        f.g = Some(graph_sid.clone());
-    }
-    let key = fluree_db_core::edge::EdgeKey::from_reifies_facts(&bundle)
-        .unwrap_or_else(|e| panic!("imported bundle must decode: {e:?}; {bundle:#?}"));
-    assert_eq!(
-        key.g,
-        Some(graph_sid),
-        "imported bundle must be anchored to its GRAPH block"
+    let alice = ledger
+        .snapshot
+        .encode_iri("http://example.org/alice")
+        .expect("alice sid");
+    let links = links_in(&fluree, alias, CLAIMS_GRAPH).await;
+    assert_eq!(links.len(), 1, "{links:#?}");
+    assert!(
+        matches!(&links[0].o, fluree_db_core::FlakeValue::TripleTerm(term) if term.s == alice),
+        "the link names the block's edge: {links:#?}"
     );
 
     fluree
@@ -283,11 +277,9 @@ async fn imported_trig_star_bundle_carries_its_graph_and_cascades() {
         .await
         .expect("delete the imported base edge");
 
-    let remaining = reifies_flakes_in(&fluree, alias, CLAIMS_GRAPH).await;
-    assert!(
-        remaining.is_empty(),
-        "the claim's bundle must not outlive the edge it reifies: {remaining:#?}"
-    );
+    // RDF 1.2: deleting a triple leaves its reifier's link.
+    let remaining = links_in(&fluree, alias, CLAIMS_GRAPH).await;
+    assert_eq!(remaining.len(), 1, "{remaining:#?}");
 }
 
 /// A multi-chunk import: a fixture large enough to be cut up, with star

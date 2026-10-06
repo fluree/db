@@ -313,6 +313,38 @@ async fn trig_with_only_graph_blocks_is_accepted() {
     );
 }
 
+/// A `{ … }` default-graph block (its last statement without a `.`) lands
+/// in the default graph, and a named graph block's escaped local name is
+/// unescaped.
+#[tokio::test]
+async fn trig_insert_takes_default_blocks_and_escaped_local_names() {
+    let fluree = memory();
+    let trig = "@prefix ex: <http://example.org/> .\n\
+                { ex:alice ex:name \"Alice\" }\n\
+                <http://example.org/g1> { ex:alice ex:knows ex:b\\-ob . }\n";
+    let result = fluree
+        .insert_turtle(
+            genesis_ledger(&fluree, "it/trig-insert-default-block:main"),
+            trig,
+        )
+        .await
+        .expect("default block and escaped local name");
+    let db = GraphDb::from_ledger_state(&result.ledger);
+    assert_eq!(
+        select(
+            &fluree,
+            &db,
+            "PREFIX ex: <http://example.org/>\nSELECT ?s ?p ?o WHERE { ?s ?p ?o }",
+        )
+        .await,
+        vec![row(&["ex:alice", "ex:name", "Alice"])]
+    );
+    assert_eq!(
+        knows_in(&fluree, &db, G1).await,
+        vec![row(&["ex:alice", "ex:b-ob"])]
+    );
+}
+
 /// Insert adds to a named graph; upsert replaces. Same document, so this pins
 /// that the TriG path runs with the caller's transaction type.
 #[tokio::test]

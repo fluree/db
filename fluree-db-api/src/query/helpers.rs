@@ -289,17 +289,17 @@ pub(crate) fn lower_cypher_ast_to_ir(
 /// value-only bound relationship variables' per-hop OPTIONAL annotation
 /// probe. Three tiers, each conservative (`true`) when it can't decide:
 ///
-/// 1. Dictionary: `f:reifiesSubject` never entered the dictionary — no
+/// 1. Dictionary: `rdf:reifies` never entered the dictionary — no
 ///    annotation was ever written; certain `false`.
-/// 2. Index stats: per-property counts show `f:reifiesSubject` facts.
-/// 3. Overlay: one PSOT walk answering "any `f:reifiesSubject` flake in
+/// 2. Index stats: per-property counts show `rdf:reifies` links.
+/// 3. Overlay: one PSOT walk answering "any `rdf:reifies` link in
 ///    novelty?", cached process-wide on `content_version` — callers that
 ///    can't supply the overlay stay conservative.
 fn reified_edges_possible(
     snapshot: &LedgerSnapshot,
     overlay: Option<(&dyn OverlayProvider, u16)>,
 ) -> bool {
-    let Some(reifies_sid) = snapshot.encode_iri(fluree_vocab::reifies_iris::SUBJECT) else {
+    let Some(reifies_sid) = snapshot.encode_iri(fluree_vocab::rdf::REIFIES) else {
         return false;
     };
     if index_has_reified_edges(snapshot, &reifies_sid) {

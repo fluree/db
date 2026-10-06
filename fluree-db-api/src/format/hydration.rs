@@ -56,7 +56,7 @@ use fluree_db_query::ir::{
     Column, ForwardItem, HydrationSpec, NestedModifiers, NestedOrderKey, NestedSelectSpec, Root,
 };
 use fluree_db_query::QueryPolicyEnforcer;
-use fluree_vocab::namespaces::{BLANK_NODE, FLUREE_DB, JSON_LD};
+use fluree_vocab::namespaces::{BLANK_NODE, JSON_LD};
 use fluree_vocab::rdf::{self, TYPE as RDF_TYPE_IRI};
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -865,21 +865,8 @@ impl<'a> DatasetCtx<'a> {
     /// resolve cross-ledger refs.
     fn formatter_for(&'a self, idx: usize) -> HydrationFormatter<'a> {
         let view = &self.views[idx];
-        // Mirror `HydrationFormatter::new`: cache one arena reader and the
-        // overlay's `Novelty` downcast per view so annotation lookups share
-        // branch/leaf caches and skip repeated dynamic dispatch.
-        let arena_reader = match (
-            view.db.snapshot.annotation_index.as_ref(),
-            view.db.snapshot.content_store.as_ref(),
-        ) {
-            (Some(root), Some(store)) => Some(
-                fluree_db_binary_index::annotation_arena::AnnotationArenaReader::new(
-                    root,
-                    store.as_ref(),
-                ),
-            ),
-            _ => None,
-        };
+        // Mirror `HydrationFormatter::new`: cache the overlay's `Novelty`
+        // downcast per view.
         let novelty = view
             .db
             .overlay
@@ -892,7 +879,6 @@ impl<'a> DatasetCtx<'a> {
             normalize_arrays: self.normalize_arrays,
             policy: view.policy.as_ref(),
             tracker: self.tracker,
-            arena_reader,
             novelty,
             dataset: Some(self),
             active_idx: idx,
@@ -1118,29 +1104,10 @@ struct HydrationFormatter<'a> {
     policy: Option<&'a PolicyContext>,
     /// Optional execution tracker for fuel/policy tracking.
     tracker: Option<&'a Tracker>,
-    /// Single arena reader reused across every annotation lookup in
-    /// this response. Constructed once on `new()` when the snapshot
-    /// satisfies `has_arena_reader()`. Holds the loaded forward /
-    /// reverse branches plus a per-CID leaf cache, so successive
-    /// edge lookups amortize the CAS reads. `None` falls back to the
-    /// scan path in `inject_annotations`.
-    arena_reader: Option<
-        fluree_db_binary_index::annotation_arena::AnnotationArenaReader<
-            'a,
-            dyn fluree_db_core::storage::ContentStore,
-        >,
-    >,
     /// Cached downcast of `db.overlay` to the concrete
-    /// `fluree_db_novelty::Novelty` type. Computed once on `new()`
-    /// and reused across every annotation-hydration call site —
-    /// previously each call did its own
-    /// `as_any().downcast_ref::<Novelty>()` (three times per
-    /// ref-valued property: in the gate, in
-    /// `arena_lookup_annotations`, and twice in
-    /// `is_live_annotation_subject`). `None` means the overlay
-    /// isn't the concrete `Novelty` type (test fakes / future
-    /// overlays); callers fall back to the scan path the same way
-    /// they did before.
+    /// `fluree_db_novelty::Novelty` type, for the annotation gate. `None`
+    /// means the overlay isn't the concrete `Novelty` type (test fakes /
+    /// future overlays), which never skips an annotation lookup.
     novelty: Option<&'a fluree_db_novelty::Novelty>,
     /// Dataset context for cross-ledger reference resolution.
     ///
@@ -1166,22 +1133,6 @@ impl<'a> HydrationFormatter<'a> {
         policy: Option<&'a PolicyContext>,
         tracker: Option<&'a Tracker>,
     ) -> Self {
-        // Cache one arena reader for the whole response so successive
-        // edge lookups share branch + leaf caches. Constructed only
-        // when both `annotation_index` and `content_store` are set on
-        // the snapshot — otherwise the scan path runs.
-        let arena_reader = match (
-            db.snapshot.annotation_index.as_ref(),
-            db.snapshot.content_store.as_ref(),
-        ) {
-            (Some(root), Some(store)) => Some(
-                fluree_db_binary_index::annotation_arena::AnnotationArenaReader::new(
-                    root,
-                    store.as_ref(),
-                ),
-            ),
-            _ => None,
-        };
         // Cache the overlay's `Novelty` downcast once. The overlay
         // pointer is fixed for the lifetime of the formatter (one
         // hydration response), so doing the dynamic dispatch up
@@ -1198,7 +1149,6 @@ impl<'a> HydrationFormatter<'a> {
             normalize_arrays: config.normalize_arrays,
             policy,
             tracker,
-            arena_reader,
             novelty,
             dataset: None,
             active_idx: 0,
@@ -1287,12 +1237,11 @@ impl<'a> HydrationFormatter<'a> {
             //
             // The check runs **before** `fetch_subject_properties`
             // so it sees the unfiltered annotation membership — a
-            // policy that allows `ex:role` but denies `f:reifies*`
-            // would strip the discriminator from the rendered flake
-            // set, and we'd lose the signal. Going through the
-            // overlay (and arena, when present) sidesteps the
-            // policy filter entirely; annotation membership is a
-            // structural property of the snapshot, not user data.
+            // policy that allows `ex:role` but hides the link would
+            // strip the discriminator from the rendered flake set, and
+            // we'd lose the signal. The membership probe sidesteps the
+            // policy filter; annotation membership is a structural
+            // property of the snapshot, not user data.
             //
             // Only fires at the top of the expansion (`depth.current
             // == 0`) — recursive ref expansion keeps the existing
@@ -1359,20 +1308,9 @@ impl<'a> HydrationFormatter<'a> {
 
             // Format each predicate
             for (pred, mut pred_flakes) in by_pred {
-                // System-fact filter (M1b): the seven `f:reifies*`
-                // predicates encode an annotation's reified edge. They
-                // are system-controlled — never user-data — and must
-                // not leak through wildcard subject hydration. Direct
-                // user mention in queries is already blocked by the
-                // parser firewall in `fluree-db-query::parse`; this
-                // filter closes the wildcard-projection path.
-                //
-                // Explicitly-listed levels can still reach these via
-                // a `Pattern::Triple` lookup at the planner layer
-                // (which is what the `Pattern::EdgeAnnotation` /
-                // `AnnotationTarget` IR expansion does), but those
-                // patterns don't go through hydration.
-                if fluree_db_core::is_reserved_reifies_predicate(&pred) {
+                // The legacy `f:reifies*` bundle predicates are an internal
+                // encoding of annotations, hidden here as from wildcard scans.
+                if fluree_db_core::is_scan_hidden_predicate(&pred) {
                     continue;
                 }
 
@@ -1667,6 +1605,7 @@ impl<'a> HydrationFormatter<'a> {
         let mut values = Vec::new();
         for flake in pred_ctx.flakes {
             match &flake.o {
+                FlakeValue::TripleTerm(term) => values.push(self.format_triple_term(term)?),
                 FlakeValue::Ref(ref_sid) => {
                     if is_rdf_type {
                         // @type special case: compact IRI string, not {"@id": ...}
@@ -1803,13 +1742,18 @@ impl<'a> HydrationFormatter<'a> {
     }
 
     /// Look up the rendered annotation bodies attached to `flake`'s
-    /// base edge. Returns an empty vec when the ledger has no
-    /// annotations or when the edge has none.
+    /// base edge: the bodies of the reifiers whose `rdf:reifies` link
+    /// names it. Returns an empty vec when the ledger has no annotations
+    /// or when the edge has none.
     ///
     /// Used as the probe step by both the Ref arm (via
     /// `inject_annotations`) and the literal arm (which needs to
     /// decide whether to promote a scalar render to a value-object
     /// shape before injecting).
+    ///
+    /// The link probe bypasses view policy, as membership does: the
+    /// base edge is already visible, and each body renders through
+    /// `format_subject`, which applies policy.
     async fn lookup_annotation_bodies<'b>(
         &'b self,
         flake: &'b Flake,
@@ -1817,34 +1761,21 @@ impl<'a> HydrationFormatter<'a> {
         visited: &'b mut HashSet<Sid>,
         cache: &'b mut HydrationCaches,
     ) -> Result<Vec<JsonValue>> {
-        // Zero-cost gate for non-annotation ledgers — mirrors the
-        // cascade fast-path in `fluree_db_transact::stage` so a
-        // hydration query like `select: {"?s": ["*"]}` doesn't pay
-        // a POST scan per ref value when the ledger has never seen
-        // an `f:reifies*` flake. Two signals:
-        //
-        // - `snapshot.has_annotations`: sticky bit on `IndexRoot`,
-        //   set at indexer time when any of the seven reserved
-        //   `f:reifies*` predicate SIDs first appears in the
-        //   predicate dictionary. Zero historical exposure on
-        //   ledgers that never used annotations.
-        // - `novelty.attachments.has_annotations()`: in-memory
-        //   overlay sticky bit, flipped on the first observed
-        //   `f:reifies*` bundle.
-        //
-        // Both must be false to skip safely. We only consult the
-        // overlay when it downcasts cleanly to the concrete
-        // `Novelty` type — for unknown overlay implementations
-        // (test fakes, future variants), keep the scan fallback so
-        // we don't silently miss attachments.
-        if !self.db.snapshot.has_annotations {
-            let novelty_clean = self.novelty.map(|n| !n.attachments.has_annotations());
-            if matches!(novelty_clean, Some(true)) {
-                return Ok(Vec::new());
-            }
+        if !self.may_hold_annotations() {
+            return Ok(Vec::new());
         }
-
-        let edge_key = fluree_db_core::edge::EdgeKey::from_flake(flake);
+        fluree_db_query::term_components::require_link_index(self.db.snapshot)?;
+        // A list element is never reified.
+        if flake.m.as_ref().is_some_and(|m| m.i.is_some()) {
+            return Ok(Vec::new());
+        }
+        let term = FlakeValue::TripleTerm(Box::new(fluree_db_core::TripleTermValue {
+            s: flake.s.clone(),
+            p: flake.p.clone(),
+            o: flake.o.clone(),
+            dt: flake.dt.clone(),
+            lang: flake.m.as_ref().and_then(|m| m.lang.clone()),
+        }));
 
         // Span name preserved across the refactor (was emitted by the
         // pre-refactor `inject_annotations`). External tooling
@@ -1854,130 +1785,44 @@ impl<'a> HydrationFormatter<'a> {
         use tracing::Instrument;
         let span = tracing::debug_span!(
             "inject_annotations",
-            edge_in_named_graph = edge_key.g.is_some(),
-            path = tracing::field::Empty,
+            edge_in_named_graph = flake.g.is_some(),
             annotation_count = tracing::field::Empty,
         );
         async {
-            // Arena-backed fast path.
-            if self.arena_reader.is_some() {
-                if let Some(mut ann_sids) = self.arena_lookup_annotations(&edge_key).await? {
-                    tracing::Span::current().record("path", "arena");
-                    tracing::Span::current().record("annotation_count", ann_sids.len());
-                    if ann_sids.is_empty() {
-                        return Ok(Vec::new());
-                    }
-                    // Sort by Sid for stable, path-independent output
-                    // order. `merge_live_annotations` already returns
-                    // BTreeMap-sorted today, but pinning the sort here
-                    // keeps arena/scan parity if that helper ever
-                    // changes its collection order.
-                    ann_sids.sort();
-                    return self
-                        .render_annotation_bodies(&ann_sids, depth, visited, cache)
-                        .await;
-                }
-            }
-            tracing::Span::current().record("path", "scan");
-
-            // Scan fallback: POST(f:reifiesSubject, edge.s) → candidate
-            // annotations whose subject points at our base subject. Each
-            // candidate's bundle is decoded and compared against the
-            // base flake's EdgeKey (full structural equality including
-            // `lang` and `dt`) before its body is formatted.
-            let f_reifies_subject = Sid::new(FLUREE_DB, fluree_vocab::db::REIFIES_SUBJECT);
-            let candidate_flakes = self
+            let links = self
                 .db
                 .range(
                     IndexType::Post,
                     RangeTest::Eq,
-                    RangeMatch::predicate_object(
-                        f_reifies_subject,
-                        FlakeValue::Ref(edge_key.s.clone()),
-                    ),
+                    RangeMatch::predicate_object(fluree_db_core::rdf_reifies_sid().clone(), term),
                 )
                 .await
                 .map_err(|e| {
-                    FormatError::InvalidBinding(format!(
-                        "annotation lookup (f:reifiesSubject scan) failed: {e}"
-                    ))
+                    FormatError::InvalidBinding(format!("annotation link lookup failed: {e}"))
                 })?;
-
-            if candidate_flakes.is_empty() {
-                return Ok(Vec::new());
-            }
-
-            // First pass: dedupe candidates and filter to those whose
-            // decoded bundle structurally matches `edge_key`. POST
-            // iteration is sorted by `s`, but we sort the matched set
-            // explicitly so the output order is path-independent and
-            // matches the arena fast path (see #3 in the edge-
-            // annotations review).
-            let mut matched_anns: Vec<Sid> = Vec::new();
-            let mut seen: HashSet<Sid> = HashSet::new();
-            for cand in &candidate_flakes {
-                let ann_sid = &cand.s;
-                if !seen.insert(ann_sid.clone()) {
-                    continue;
-                }
-
-                // Structural bundle decode bypasses view policy by
-                // design — same justification as
-                // `is_live_annotation_subject`. The `f:reifies*`
-                // flakes are system-controlled discriminators, not
-                // user data; running them through the policy filter
-                // here would let a policy that incidentally hides
-                // FLUREE_DB-namespace predicates collapse the
-                // bundle decode and drop the annotation entirely,
-                // even when the annotation body would have been
-                // policy-visible. Reaching the body still goes
-                // through `format_subject` below, which applies
-                // policy normally — so user-data visibility is
-                // unchanged.
-                let bundle: Vec<Flake> = self
-                    .db
-                    .range(
-                        IndexType::Spot,
-                        RangeTest::Eq,
-                        RangeMatch::subject(ann_sid.clone()),
-                    )
-                    .await
-                    .map_err(|e| {
-                        FormatError::InvalidBinding(format!(
-                            "annotation bundle scan (SPOT s=ann) failed: {e}"
-                        ))
-                    })?
-                    .into_iter()
-                    .filter(|f| fluree_db_core::is_reserved_reifies_predicate(&f.p))
-                    .collect();
-                if bundle.is_empty() {
-                    continue;
-                }
-
-                let cand_edge = match fluree_db_core::edge::EdgeKey::from_reifies_facts(&bundle) {
-                    Ok(k) => k,
-                    Err(_) => continue,
-                };
-                if cand_edge != edge_key {
-                    continue;
-                }
-
-                matched_anns.push(ann_sid.clone());
-            }
-            matched_anns.sort();
-
-            tracing::Span::current().record("annotation_count", matched_anns.len());
-            self.render_annotation_bodies(&matched_anns, depth, visited, cache)
+            let mut reifiers: Vec<Sid> = links.into_iter().map(|f| f.s).collect();
+            reifiers.sort();
+            reifiers.dedup();
+            tracing::Span::current().record("annotation_count", reifiers.len());
+            self.render_annotation_bodies(&reifiers, depth, visited, cache)
                 .await
         }
         .instrument(span)
         .await
     }
 
-    /// Render the annotation bodies for a list of resolved annotation
-    /// SIDs (arena-fast-path output). Shared with the scan fallback's
-    /// body-rendering loop above through the same wildcard select
-    /// spec.
+    /// False only when neither the index nor novelty has ever held an
+    /// annotation, so hydration of an unannotated ledger pays no probe.
+    fn may_hold_annotations(&self) -> bool {
+        self.db.snapshot.has_annotations
+            || self
+                .novelty
+                .is_none_or(fluree_db_novelty::Novelty::has_annotations)
+    }
+
+    /// Render the annotation bodies of `ann_sids` through a wildcard
+    /// select spec, without the reifiers' `rdf:reifies` links: a link is
+    /// the attachment the body hangs from, not part of it.
     async fn render_annotation_bodies<'b>(
         &'b self,
         ann_sids: &[Sid],
@@ -1989,13 +1834,15 @@ impl<'a> HydrationFormatter<'a> {
             refinements: HashMap::new(),
             reverse: HashMap::new(),
         };
+        let link_key = self.format_predicate_key(fluree_db_core::rdf_reifies_sid())?;
         let mut bodies: Vec<JsonValue> = Vec::with_capacity(ann_sids.len());
         for ann_sid in ann_sids {
             let mut body = self
                 .format_subject(ann_sid, None, &ann_level, depth.descend(), visited, cache)
                 .await?;
-            if ann_sid.namespace_code == BLANK_NODE {
-                if let Some(map) = body.as_object_mut() {
+            if let Some(map) = body.as_object_mut() {
+                map.remove(&link_key);
+                if ann_sid.namespace_code == BLANK_NODE {
                     map.remove("@id");
                 }
             }
@@ -2045,115 +1892,30 @@ impl<'a> HydrationFormatter<'a> {
         Ok(JsonValue::Object(wrapper))
     }
 
-    /// Returns `true` iff `sid` is a currently-asserted annotation
-    /// subject. Consults the arena reader (when present) and the
-    /// novelty overlay's `AttachmentNovelty` reverse map. Bypasses
-    /// view policy by design — annotation membership is a structural
-    /// snapshot property, and the wildcard-hide rule must hold even
-    /// when policy denies the discriminating `f:reifies*` flakes.
-    ///
-    /// Returns `false` for non-blank-node SIDs without a lookup
-    /// (every caller already gates on `BLANK_NODE`, but the check
-    /// is cheap and keeps the helper safe to use elsewhere).
+    /// Returns `true` iff `sid` is a blank node with a live `rdf:reifies`
+    /// link. Bypasses view policy by design — annotation membership is a
+    /// structural snapshot property, and the wildcard-hide rule must hold
+    /// even when policy denies the link.
     async fn is_live_annotation_subject(&self, sid: &Sid) -> Result<bool> {
-        if sid.namespace_code != BLANK_NODE {
+        if sid.namespace_code != BLANK_NODE || !self.may_hold_annotations() {
             return Ok(false);
         }
-        // Overlay-side: AttachmentNovelty's reverse map answers
-        // "does this ann SID have any live target?" without policy.
-        let novelty_events: Vec<(fluree_db_core::edge::EdgeKey, i64, bool)> = self
-            .novelty
-            .map(|n| n.attachments.collect_reverse_events(sid))
-            .unwrap_or_default();
-        if let Some(reader) = self.arena_reader.as_ref() {
-            let live = reader
-                .current_targets_merged(sid, &novelty_events, self.db.t)
-                .await
-                .map_err(|e| {
-                    FormatError::InvalidBinding(format!("annotation membership lookup failed: {e}"))
-                })?;
-            return Ok(!live.is_empty());
-        }
-        // No arena: try the overlay's current_targets_for first
-        // (the merge helper's edge-cancellation logic over the live
-        // events).
-        let novelty_says_live = self
-            .novelty
-            .is_some_and(|n| n.attachments.current_targets_for(sid).next().is_some());
-        if novelty_says_live {
-            return Ok(true);
-        }
-
-        // Fall back to an indexed-base SPOT probe. Without this, a
-        // ledger whose annotation flakes have rolled into the base
-        // index but never had an arena sealed (M2a scan-fallback
-        // ledgers, or any snapshot opened without a content_store)
-        // would leak the anonymous annotation SID as a top-level
-        // wildcard row — the discriminator (`f:reifiesSubject` on
-        // the SID) is in base storage but neither the arena reader
-        // nor the overlay has it. SPOT(s = sid) is the same shape
-        // `fetch_subject_properties` uses and survives the
-        // blank-node-subject quirk in practice (verified by the
-        // scan-fallback hydration path at `lookup_annotation_bodies`).
-        let f_reifies_subject = Sid::new(FLUREE_DB, fluree_vocab::db::REIFIES_SUBJECT);
-        let flakes = self
+        fluree_db_query::term_components::require_link_index(self.db.snapshot)?;
+        let links = self
             .db
             .range(
                 IndexType::Spot,
                 RangeTest::Eq,
-                RangeMatch::subject(sid.clone()),
+                RangeMatch::subject_predicate(
+                    sid.clone(),
+                    fluree_db_core::rdf_reifies_sid().clone(),
+                ),
             )
             .await
             .map_err(|e| {
-                FormatError::InvalidBinding(format!("annotation membership SPOT probe failed: {e}"))
+                FormatError::InvalidBinding(format!("annotation membership probe failed: {e}"))
             })?;
-        Ok(flakes.iter().any(|f| f.p == f_reifies_subject))
-    }
-
-    /// Arena-backed annotation lookup. Returns `Some(sids)` when the
-    /// arena reader resolved the query, `None` when a precondition
-    /// failed (no cached reader, or the overlay is not the expected
-    /// concrete novelty type) — caller falls back to the M2a scan
-    /// path.
-    ///
-    /// Reuses the formatter's cached `arena_reader` so successive
-    /// edge lookups in the same response amortize branch + leaf
-    /// loads.
-    async fn arena_lookup_annotations(
-        &self,
-        edge_key: &fluree_db_core::edge::EdgeKey,
-    ) -> Result<Option<Vec<Sid>>> {
-        use tracing::Instrument;
-        let span = tracing::debug_span!(
-            "annotation_arena_lookup",
-            live_count = tracing::field::Empty,
-        );
-        async {
-            let Some(reader) = self.arena_reader.as_ref() else {
-                return Ok(None);
-            };
-            // The overlay must be the concrete `Novelty` type so we
-            // can reach `AttachmentNovelty`. If it isn't (test fakes,
-            // future overlay variants), bail to the scan path —
-            // proceeding with an empty novelty event slice would let
-            // the arena report stale indexed attachments while the
-            // overlay still holds unobserved retracts. Downcast was
-            // cached at formatter construction; no per-call dispatch.
-            let Some(novelty) = self.novelty else {
-                return Ok(None);
-            };
-            let novelty_events = novelty.attachments.collect_forward_events(edge_key);
-            let live = reader
-                .current_annotations_merged(edge_key, &novelty_events, self.db.t)
-                .await
-                .map_err(|e| {
-                    FormatError::InvalidBinding(format!("annotation arena lookup failed: {e}"))
-                })?;
-            tracing::Span::current().record("live_count", live.len());
-            Ok(Some(live))
-        }
-        .instrument(span)
-        .await
+        Ok(!links.is_empty())
     }
 
     /// Format reverse property values
@@ -2187,6 +1949,34 @@ impl<'a> HydrationFormatter<'a> {
     }
 
     /// Format a literal flake value
+    /// A triple term as a JSON-LD-star embedded node; a literal object
+    /// renders as this formatter renders that literal anywhere else.
+    fn format_triple_term(&self, term: &fluree_db_core::TripleTermValue) -> Result<JsonValue> {
+        super::triple_term_node(term, self.compactor, |_| match &term.o {
+            FlakeValue::TripleTerm(inner) => self.format_triple_term(inner),
+            _ => {
+                let meta = term.lang.clone().map(|lang| fluree_db_core::FlakeMeta {
+                    lang: Some(lang),
+                    i: None,
+                });
+                let object = Flake::new(
+                    term.s.clone(),
+                    term.p.clone(),
+                    term.o.clone(),
+                    term.dt.clone(),
+                    0,
+                    true,
+                    meta,
+                );
+                if self.typed {
+                    self.format_typed_literal_value(&object)
+                } else {
+                    self.format_literal_value(&object)
+                }
+            }
+        })
+    }
+
     fn format_literal_value(&self, flake: &Flake) -> Result<JsonValue> {
         let dt_full = self.compactor.decode_sid(&flake.dt)?;
         let dt_compact = self.compactor.compact_sid(&flake.dt)?;
@@ -2267,6 +2057,7 @@ impl<'a> HydrationFormatter<'a> {
                 FlakeValue::DayTimeDuration(v) => Ok(JsonValue::String(v.to_string())),
                 FlakeValue::Duration(v) => Ok(JsonValue::String(v.to_string())),
                 FlakeValue::GeoPoint(v) => Ok(JsonValue::String(v.to_string())),
+                FlakeValue::TripleTerm(_) => Ok(JsonValue::String(flake.o.to_string())),
             };
         }
 
@@ -2311,6 +2102,7 @@ impl<'a> HydrationFormatter<'a> {
             FlakeValue::DayTimeDuration(v) => JsonValue::String(v.to_string()),
             FlakeValue::Duration(v) => JsonValue::String(v.to_string()),
             FlakeValue::GeoPoint(v) => JsonValue::String(v.to_string()),
+            FlakeValue::TripleTerm(_) => JsonValue::String(flake.o.to_string()),
         };
 
         Ok(json!({
@@ -2408,6 +2200,7 @@ impl<'a> HydrationFormatter<'a> {
             FlakeValue::DayTimeDuration(v) => json!(v.to_string()),
             FlakeValue::Duration(v) => json!(v.to_string()),
             FlakeValue::GeoPoint(v) => json!(v.to_string()),
+            FlakeValue::TripleTerm(_) => json!(flake.o.to_string()),
         };
 
         Ok(json!({
@@ -2535,6 +2328,7 @@ impl<'a> HydrationFormatter<'a> {
             FlakeValue::DayTimeDuration(v) => Ok(JsonValue::String(v.to_string())),
             FlakeValue::Duration(v) => Ok(JsonValue::String(v.to_string())),
             FlakeValue::GeoPoint(v) => Ok(JsonValue::String(v.to_string())),
+            FlakeValue::TripleTerm(_) => Ok(JsonValue::String(flake.o.to_string())),
         }
     }
 

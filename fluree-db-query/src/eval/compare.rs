@@ -511,6 +511,35 @@ fn cmp_values_inner(
     }
 }
 
+fn triple_term(v: &ComparableValue) -> Option<&fluree_db_core::TripleTermValue> {
+    match v {
+        ComparableValue::TypedLiteral {
+            val: FlakeValue::TripleTerm(term),
+            ..
+        } => Some(term),
+        _ => None,
+    }
+}
+
+/// A triple term's object as a comparable value, with its datatype or tag.
+fn term_object(term: &fluree_db_core::TripleTermValue) -> Option<ComparableValue> {
+    use fluree_db_core::DatatypeConstraint;
+    match &term.o {
+        FlakeValue::Ref(sid) => Some(ComparableValue::Sid(sid.clone())),
+        FlakeValue::TripleTerm(_) => Some(ComparableValue::TypedLiteral {
+            val: term.o.clone(),
+            dtc: None,
+        }),
+        o => {
+            let dtc = match &term.lang {
+                Some(tag) => DatatypeConstraint::LangTag(std::sync::Arc::from(tag.as_str())),
+                None => DatatypeConstraint::Explicit(term.dt.clone()),
+            };
+            super::lit_to_comparable(o, &dtc, None)
+        }
+    }
+}
+
 /// Outcome of RDFterm-equal (`=` / `!=`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EqOutcome {
@@ -623,6 +652,22 @@ pub(crate) fn rdf_term_equal_in(
 /// operator mapping. Returns a three-valued outcome so an incomparable pair is
 /// a type error (excluding the row) rather than silently `false`/`true`.
 pub(crate) fn rdf_term_equal(a: &ComparableValue, b: &ComparableValue) -> EqOutcome {
+    // Two triple terms are equal when their subjects and predicates are the
+    // same terms and their objects are equal (SPARQL 1.2); a triple term
+    // equals nothing else.
+    match (triple_term(a), triple_term(b)) {
+        (Some(ta), Some(tb)) => {
+            if ta.s != tb.s || ta.p != tb.p {
+                return EqOutcome::Ne;
+            }
+            return match (term_object(ta), term_object(tb)) {
+                (Some(oa), Some(ob)) => rdf_term_equal(&oa, &ob),
+                _ => EqOutcome::TypeError,
+            };
+        }
+        (Some(_), None) | (None, Some(_)) => return EqOutcome::Ne,
+        (None, None) => {}
+    }
     // XPath op:numeric-equal (F&O §4.2.3): NaN is not equal to anything,
     // including itself — `NaN = NaN` is false and `NaN != NaN` is true. The
     // numeric fast path below bottoms out in `numeric_cmp`'s bit-level total

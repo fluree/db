@@ -2245,3 +2245,83 @@ async fn sparql_stored_lang_equality_with_post_index_novelty() {
         "LANG() must see the novelty literal's tag"
     );
 }
+
+// =============================================================================
+// A BIND into a variable an earlier pattern bound is an equality check
+// =============================================================================
+
+/// The bind's expression waits on the last pattern (`ex:val`, the largest
+/// predicate), so the planner holds it back past the `ex:name` join; that
+/// join must keep `?a` although nothing else reads it, or the check binds
+/// afresh and the count becomes a cross product (6 here).
+#[tokio::test]
+async fn jsonld_bind_into_a_bound_variable_checks_it_when_only_counted() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "exprsem/bind-check:jsonld");
+    let tx = json!({
+        "@context": ctx(),
+        "@graph": [
+            { "@id": "ex:alice", "ex:age": 30, "ex:name": "Alice" },
+            { "@id": "ex:bob", "ex:age": 25, "ex:name": "Bob" },
+            { "@id": "ex:t1", "ex:val": 30 },
+            { "@id": "ex:t2", "ex:val": 40 },
+            { "@id": "ex:t3", "ex:val": 50 }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &tx).await.expect("insert").ledger;
+    let where_ = json!([
+        { "@id": "?s", "ex:age": "?a" },
+        { "@id": "?s", "ex:name": "?n" },
+        { "@id": "?t", "ex:val": "?v" },
+        ["bind", "?a", "?v"]
+    ]);
+    let counted = json!({ "@context": ctx(), "select": ["(count ?s)"], "where": where_ });
+    assert_eq!(jsonld_rows(&fluree, &ledger, &counted).await, json!([[1]]));
+    let listed = json!({ "@context": ctx(), "select": ["?s"], "where": where_ });
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &listed).await,
+        json!([["ex:alice"]])
+    );
+}
+
+/// Indexed decimals are keyed by a handle into their own predicate's arena,
+/// so the check must compare decoded values: against a constant, and against
+/// a decimal another predicate stored under a different handle.
+#[tokio::test]
+async fn bind_into_a_bound_variable_compares_indexed_decimals_by_value() {
+    let tx = json!({
+        "@context": ctx(),
+        "@graph": [
+            { "@id": "ex:acct", "ex:balance": { "@value": "1.50", "@type": "xsd:decimal" } },
+            { "@id": "ex:other", "ex:balance": { "@value": "2.5", "@type": "xsd:decimal" } },
+            { "@id": "ex:cap", "ex:limit": { "@value": "9", "@type": "xsd:decimal" } },
+            { "@id": "ex:floor", "ex:limit": { "@value": "1.5", "@type": "xsd:decimal" } }
+        ]
+    });
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_indexed(&fluree, "exprsem/bind-check:decimal", &tx).await;
+
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            "PREFIX ex: <http://example.org/ns/> \
+             SELECT ?s WHERE { BIND(1.5 AS ?o) ?s ex:balance ?o }",
+        )
+        .await,
+        json!([["ex:acct"]])
+    );
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?s", "?t"],
+        "where": [
+            { "@id": "?s", "ex:balance": "?a" },
+            { "@id": "?t", "ex:limit": "?v" },
+            ["bind", "?a", "?v"]
+        ]
+    });
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q).await,
+        json!([["ex:acct", "ex:floor"]])
+    );
+}

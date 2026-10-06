@@ -21,7 +21,7 @@ use crate::run_index::runs::run_writer::{
 };
 use crate::run_index::runs::spool::{
     link_chunk_run_files_to_flat, remap_commit_to_runs_with_op, remap_sorted_commit_v2_to_runs,
-    MmapStringRemap, MmapSubjectRemap, SortedCommitMergeReaderV2, SubjectRemap,
+    MmapStringRemap, MmapSubjectRemap, SortedCommitMergeReaderV2, SubjectRemap, TermRemapCtx,
 };
 use crate::run_index::runs::streaming_reader::{MergeSource, StreamingRunReader};
 use crate::stats::{stats_record_from_v2, SpotClassStats, DT_REF_ID};
@@ -105,6 +105,9 @@ pub struct CommitInput {
     pub lang_remap: Vec<u16>,
     /// Optional rdf:type sidecar used to rebuild the subject→class bitset table.
     pub types_map_path: Option<PathBuf>,
+    /// Triple-term table `(path, record_count)` for the chunk's reification
+    /// links, if it has any (see `SortedCommitInfo::term_table`).
+    pub term_table: Option<(PathBuf, u64)>,
 }
 
 /// Configuration for the V3 build-from-commits pipeline.
@@ -137,6 +140,11 @@ pub struct BuildConfig {
     pub build_progress: Option<Arc<AtomicU64>>,
     /// Shared stage marker for external progress reporting.
     pub stage_marker: Option<Arc<AtomicU8>>,
+    /// Build-wide triple-term interner. Chunks with a term table resolve
+    /// their link records through it; `None` disables link interning (a
+    /// term-carrying chunk then fails the build rather than emitting
+    /// dangling handles).
+    pub term_builder: Option<Arc<std::sync::Mutex<fluree_db_binary_index::dict::TermDictBuilder>>>,
 }
 
 /// Result of the V3 build pipeline.
@@ -1162,6 +1170,7 @@ pub fn build_indexes_from_commits(
         let mut handles = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
             let commits_ref = commits;
+            let config_ref = config;
             let next_chunk = Arc::clone(&next_chunk);
             let run_dir = config.run_dir.clone();
             let remap_progress = config.remap_progress.clone();
@@ -1192,6 +1201,7 @@ pub fn build_indexes_from_commits(
 
                         let s_remap = MmapSubjectRemap::open(&commit.subject_remap_path)?;
                         let str_remap = MmapStringRemap::open(&commit.string_remap_path)?;
+                        let term_ctx = term_ctx_for(commit, config_ref)?;
                         let mut writer = MultiOrderRunWriter::new(MultiOrderConfig {
                             total_budget_bytes: per_thread_budget_bytes,
                             orders: RunSortOrder::secondary_orders().to_vec(),
@@ -1205,6 +1215,7 @@ pub fn build_indexes_from_commits(
                             &str_remap,
                             &commit.lang_remap,
                             target_g_id,
+                            term_ctx.as_ref(),
                             &mut writer,
                             worker_hook.as_mut(),
                             remap_progress.as_deref(),
@@ -1251,8 +1262,8 @@ pub fn build_indexes_from_commits(
         // commits, so cross-chunk duplicates were counted once per copy;
         // discount the copies the SPOT merge collapsed. HLL sketches are
         // duplicate-insensitive and need no correction.
-        for (&(p_id, o_type), &n) in &merge_duplicates {
-            target_hook.discount_import_duplicates(config.g_id, p_id, o_type, n);
+        for (&(p_id, o_type, inner), &n) in &merge_duplicates {
+            target_hook.discount_import_duplicates(config.g_id, p_id, o_type, inner, n);
         }
         tracing::info!(
             elapsed_ms = stats_merge_start.elapsed().as_millis(),
@@ -1347,12 +1358,16 @@ pub fn build_indexes_from_commits(
     ))
 }
 
+/// Cross-chunk duplicate copies the SPOT merge collapsed, keyed `(p_id,
+/// o_type, inner predicate)`; the inner predicate is a triple-term row's and
+/// 0 for every other row.
+type DuplicateTally = FxHashMap<(u32, u16, u32), u64>;
+
 struct SpotBuild {
     result: IndexBuildResult,
     class_stats: Option<SpotClassStats>,
-    /// Cross-chunk duplicate copies the SPOT merge collapsed, keyed
-    /// `(p_id, o_type)` so the id-stats hook can discount them.
-    merge_duplicates: FxHashMap<(u32, u16), u64>,
+    /// Cross-chunk duplicate copies the SPOT merge collapsed.
+    merge_duplicates: DuplicateTally,
 }
 
 fn build_spot_index_from_commits(
@@ -1407,12 +1422,12 @@ fn build_spot_index_from_commits(
 
     let mut class_stats_collector =
         rdf_type_p_id.map(|p_id| SpotClassStatsCollector::new(p_id, class_membership));
-    let mut merge_duplicates: FxHashMap<(u32, u16), u64> = FxHashMap::default();
+    let mut merge_duplicates: DuplicateTally = FxHashMap::default();
 
     let total_rows = if commits.len() <= fd_plan.spot_fan_in {
         // Flat merge: one long-lived reader per chunk, all open at once.
         // The common case, and byte-for-byte the pre-budget behavior.
-        let streams = open_spot_commit_readers(commits, g_id)?;
+        let streams = open_spot_commit_readers(commits, g_id, config)?;
         let mut merge = KWayMerge::new(streams, cmp_v2_spot)?;
         pump_spot_merge(
             &mut merge,
@@ -1444,7 +1459,7 @@ fn build_spot_index_from_commits(
 
         let mut intermediates = Vec::with_capacity(commits.len().div_ceil(fd_plan.spot_fan_in));
         for (i, group) in commits.chunks(fd_plan.spot_fan_in).enumerate() {
-            let streams = open_spot_commit_readers(group, g_id)?;
+            let streams = open_spot_commit_readers(group, g_id, config)?;
             let mut merge = KWayMerge::new(streams, cmp_v2_spot)?;
             let out_path = pass_dir.join(format!("merged_{i:06}.frn"));
             // Carry op bytes through verbatim (with-op intermediates), so
@@ -1529,12 +1544,14 @@ fn index_build_err_to_io(e: IndexBuildError) -> io::Error {
 fn open_spot_commit_readers(
     commits: &[CommitInput],
     g_id: u16,
+    config: &BuildConfig,
 ) -> io::Result<Vec<SortedCommitMergeReaderV2<MmapSubjectRemap, MmapStringRemap>>> {
     commits
         .iter()
         .map(|commit| {
             let s_remap = MmapSubjectRemap::open(&commit.subject_remap_path)?;
             let str_remap = MmapStringRemap::open(&commit.string_remap_path)?;
+            let term_ctx = term_ctx_for(commit, config)?.map(Arc::new);
             SortedCommitMergeReaderV2::open(
                 &commit.commit_path,
                 commit.record_count,
@@ -1542,9 +1559,25 @@ fn open_spot_commit_readers(
                 str_remap,
                 commit.lang_remap.clone(),
                 g_id,
+                term_ctx,
             )
         })
         .collect()
+}
+
+/// The term-remap context for a chunk, loaded when the chunk has a term
+/// table and the build interns terms.
+fn term_ctx_for(commit: &CommitInput, config: &BuildConfig) -> io::Result<Option<TermRemapCtx>> {
+    match (&commit.term_table, &config.term_builder) {
+        (Some((path, count)), Some(builder)) => {
+            Ok(Some(TermRemapCtx::load(path, *count, Arc::clone(builder))?))
+        }
+        (Some(_), None) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "chunk carries a triple-term table but the build has no term interner",
+        )),
+        (None, _) => Ok(None),
+    }
 }
 
 /// Drain a SPOT merge into the leaf writer (and class-stats collector),
@@ -1564,7 +1597,7 @@ fn pump_spot_merge<T, F>(
     g_id: u16,
     mut class_stats_collector: Option<&mut SpotClassStatsCollector>,
     progress: Option<&AtomicU64>,
-    duplicates: &mut FxHashMap<(u32, u16), u64>,
+    duplicates: &mut DuplicateTally,
 ) -> io::Result<u64>
 where
     T: MergeSource,
@@ -1582,7 +1615,16 @@ where
         let pop_dropped = dropped - dropped_seen;
         dropped_seen = dropped;
         if pop_dropped > 0 {
-            *duplicates.entry((record.p_id, record.o_type)).or_insert(0) += pop_dropped;
+            let inner = if fluree_db_core::o_type::OType::from_u16(record.o_type)
+                == fluree_db_core::o_type::OType::TRIPLE_TERM
+            {
+                fluree_db_core::triple_term::term_handle_p_id(record.o_key)
+            } else {
+                0
+            };
+            *duplicates
+                .entry((record.p_id, record.o_type, inner))
+                .or_insert(0) += pop_dropped;
         }
         if op == 0 {
             continue;
@@ -1819,6 +1861,7 @@ mod tests {
             string_remap_path: str_remap_path,
             lang_remap: vec![],
             types_map_path: None,
+            term_table: None,
         }];
 
         let config = BuildConfig {
@@ -1834,6 +1877,7 @@ mod tests {
             remap_progress: None,
             build_progress: None,
             stage_marker: None,
+            term_builder: None,
         };
 
         let (result, _spot_class_stats) =
@@ -1938,6 +1982,7 @@ mod tests {
                 string_remap_path: str_path,
                 lang_remap: vec![],
                 types_map_path: None,
+                term_table: None,
             });
         }
 
@@ -1955,6 +2000,7 @@ mod tests {
                 remap_progress: None,
                 build_progress: None,
                 stage_marker: None,
+                term_builder: None,
             };
             std::fs::create_dir_all(&config.run_dir).unwrap();
             build_spot_index_from_commits(&commits, &config, None, None, plan)
@@ -2063,6 +2109,7 @@ mod tests {
                 string_remap_path: str_path,
                 lang_remap: vec![],
                 types_map_path: None,
+                term_table: None,
             });
         }
 
@@ -2090,6 +2137,7 @@ mod tests {
                 remap_progress: None,
                 build_progress: None,
                 stage_marker: None,
+                term_builder: None,
             };
             std::fs::create_dir_all(&config.run_dir).unwrap();
             build_spot_index_from_commits(&commits, &config, Some(TYPE_P), Some(membership), plan)
@@ -2170,6 +2218,7 @@ mod tests {
                 string_remap_path: str0,
                 lang_remap: vec![],
                 types_map_path: Some(types0),
+                term_table: None,
             },
             CommitInput {
                 commit_path: dir.path().join("unused1.fsv2"),
@@ -2178,6 +2227,7 @@ mod tests {
                 string_remap_path: str1,
                 lang_remap: vec![],
                 types_map_path: Some(types1),
+                term_table: None,
             },
         ];
 
@@ -2241,6 +2291,7 @@ mod tests {
                     string_remap_path: str0,
                     lang_remap: vec![],
                     types_map_path: Some(types0),
+                    term_table: None,
                 },
                 CommitInput {
                     commit_path: dir.path().join("unused1.fsv2"),
@@ -2249,6 +2300,7 @@ mod tests {
                     string_remap_path: str1,
                     lang_remap: vec![],
                     types_map_path: Some(types1),
+                    term_table: None,
                 },
             ];
 

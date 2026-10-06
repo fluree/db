@@ -1473,7 +1473,7 @@ mod annotations_and_graphs {
     }
 
     /// `?r rdf:reifies <<( s p o )>>` in a template is the same attachment as
-    /// the `~ ?r` spelling.
+    /// the `~ ?r` spelling, without the triple the annotation tail asserts.
     #[tokio::test]
     async fn reifies_spelling_matches_annotation_tail() {
         let (fluree, ledger) = annotated().await;
@@ -1490,10 +1490,13 @@ mod annotations_and_graphs {
             &format!("CONSTRUCT {{ ?r rdf:reifies <<( ?s ex:worksFor ?o )>> }} {where_clause}"),
         )
         .await;
-        assert_eq!(
-            sorted_lines(&render(&tail, &ledger, FormatterConfig::ntriples())),
-            sorted_lines(&render(&reifies, &ledger, FormatterConfig::ntriples()))
-        );
+        let tail = render(&tail, &ledger, FormatterConfig::ntriples());
+        let reifies = render(&reifies, &ledger, FormatterConfig::ntriples());
+        let (links, triples): (Vec<&str>, Vec<&str>) = sorted_lines(&tail)
+            .into_iter()
+            .partition(|line| line.contains("22-rdf-syntax-ns#reifies>"));
+        assert!(!triples.is_empty(), "the tail asserts its triples");
+        assert_eq!(links, sorted_lines(&reifies));
     }
 
     /// SPARQL and JSON-LD share the template IR: an annotated edge in either

@@ -515,13 +515,17 @@ struct SchemaNames {
 /// Render a class/predicate SID back to the identifier a Cypher user would
 /// write: term overrides reversed, `@vocab` prefix stripped, otherwise the
 /// full IRI. `None` for Fluree system vocabulary (commit metadata,
-/// edge-annotation reifiers, …) — not part of the user's property graph.
+/// edge-annotation reifiers, …) and for `rdf:reifies`, the link an
+/// annotation's reifier holds — not part of the user's property graph.
 fn display_name(
     sid: &Sid,
     snapshot: &LedgerSnapshot,
     vocab: Option<&str>,
     overrides: &HashMap<String, String>,
 ) -> Option<String> {
+    if fluree_db_core::is_rdf_reifies(sid) {
+        return None;
+    }
     let prefix = snapshot.namespaces().get(&sid.namespace_code)?;
     let iri = format!("{}{}", prefix, sid.name);
     if iri.starts_with("https://ns.flur.ee/") {

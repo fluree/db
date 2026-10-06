@@ -439,19 +439,13 @@ impl DictTreeReader {
             return Ok(Vec::new());
         }
 
-        // Find the first leaf that might contain start_key.
-        let start_leaf = match self.branch.find_leaf(start_key) {
-            Some(idx) => idx,
-            None => {
-                // start_key is before the first leaf or after the last.
-                // If the first leaf's first_key >= start_key, it might have matches.
-                if self.branch.leaves[0].first_key.as_slice() >= start_key {
-                    0
-                } else {
-                    return Ok(Vec::new());
-                }
-            }
-        };
+        // The first leaf that can hold a key >= start_key: leaves are sorted
+        // and disjoint, so it is the first whose last key is not below it. A
+        // start key in the gap between two leaves begins at the later one.
+        let start_leaf = self
+            .branch
+            .leaves
+            .partition_point(|leaf| leaf.last_key.as_slice() < start_key);
 
         let mut results = Vec::new();
 
@@ -847,6 +841,37 @@ mod tests {
         }
 
         DictTreeReader::from_memory(result.branch, leaf_map)
+    }
+
+    /// A range whose start key sorts between two leaves (after one leaf's
+    /// last key, before the next one's first) begins at the later leaf.
+    #[test]
+    fn range_scan_starting_between_leaves_reads_the_next_leaf() {
+        let entries: Vec<ReverseEntry> = (0..64u64)
+            .map(|i| ReverseEntry {
+                key: format!("k{:04}", i * 2).into_bytes(),
+                id: i,
+            })
+            .collect();
+        let result = builder::build_reverse_tree(entries, 64).unwrap();
+        assert!(result.branch.leaves.len() > 2);
+        let gap_after = result.branch.leaves[0].last_key.clone();
+        let next_first = result.branch.leaves[1].first_key.clone();
+        let mut leaf_map = HashMap::new();
+        for (leaf_artifact, branch_leaf) in result.leaves.iter().zip(result.branch.leaves.iter()) {
+            leaf_map.insert(branch_leaf.address.clone(), leaf_artifact.bytes.clone());
+        }
+        let reader = DictTreeReader::from_memory(result.branch, leaf_map);
+
+        // Odd numbers are absent, so "last key + 1" lies in the gap.
+        let mut start = gap_after.clone();
+        *start.last_mut().unwrap() += 1;
+        assert!(
+            start.as_slice() > gap_after.as_slice() && start.as_slice() < next_first.as_slice()
+        );
+        let got = reader.reverse_range_scan(&start, b"k9999").unwrap();
+        assert_eq!(got.first().map(|(k, _)| k.clone()), Some(next_first));
+        assert_eq!(got.len() as u64, 64 - got[0].1);
     }
 
     /// Content store whose blobs live in files it hands out through

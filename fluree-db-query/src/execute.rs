@@ -48,9 +48,9 @@ pub use runner::ExecutableQuery;
 
 // Re-export internal helpers for use in lib.rs
 pub use where_plan::build_where_operators_seeded;
-pub(crate) use where_plan::collect_var_stats;
-pub use where_plan::expand_edge_annotation_patterns;
+
 pub(crate) use where_plan::{analyze_property_join_plan, collect_inner_join_block};
+pub use where_plan::{expand_edge_annotation_patterns, expand_edge_annotation_patterns_for};
 
 // Re-export operator tree builder and runner for custom execution pipelines
 pub use operator_tree::{build_operator_tree, fast_paths_disabled, set_fast_paths_disabled};
@@ -352,10 +352,16 @@ mod tests {
         let a = ObjectBounds {
             lower: Some((FlakeValue::Long(10), false)),
             upper: Some((FlakeValue::Long(100), true)),
+            term_predicate: None,
+            term_subject: None,
+            term_object: None,
         };
         let b = ObjectBounds {
             lower: Some((FlakeValue::Long(20), true)),
             upper: Some((FlakeValue::Long(80), false)),
+            term_predicate: None,
+            term_subject: None,
+            term_object: None,
         };
 
         let merged = merge_object_bounds(&a, &b);

@@ -21,8 +21,7 @@ use std::io;
 use super::branch::{BranchLeafEntry, DictBranch};
 use super::builder::LeafArtifact;
 use super::pack_builder::{
-    build_string_forward_packs, build_subject_forward_packs_for_ns, PackArtifact,
-    DEFAULT_TARGET_PACK_BYTES, DEFAULT_TARGET_PAGE_BYTES,
+    build_string_forward_packs, PackArtifact, DEFAULT_TARGET_PACK_BYTES, DEFAULT_TARGET_PAGE_BYTES,
 };
 use super::reverse_leaf::{encode_reverse_leaf, ReverseEntry, ReverseLeaf};
 use crate::format::wire_helpers::PackBranchEntry;
@@ -102,6 +101,22 @@ pub fn build_incremental_subject_packs_for_ns(
     existing_refs: &[PackBranchEntry],
     new_entries: &[(u64, &[u8])],
 ) -> io::Result<IncrementalPackResult> {
+    build_incremental_packs_for_stream(
+        crate::dict::forward_pack::KIND_SUBJECT_FWD,
+        ns_code,
+        existing_refs,
+        new_entries,
+    )
+}
+
+/// Append packs of `kind` for one id stream: the subject dictionary's
+/// per-namespace streams and the term dictionary's per-predicate streams.
+pub fn build_incremental_packs_for_stream(
+    kind: u8,
+    ns_code: u16,
+    existing_refs: &[PackBranchEntry],
+    new_entries: &[(u64, &[u8])],
+) -> io::Result<IncrementalPackResult> {
     if new_entries.is_empty() {
         return Ok(IncrementalPackResult {
             new_packs: Vec::new(),
@@ -109,7 +124,8 @@ pub fn build_incremental_subject_packs_for_ns(
         });
     }
 
-    let result = build_subject_forward_packs_for_ns(
+    let result = crate::dict::pack_builder::build_forward_packs_for_stream(
+        kind,
         ns_code,
         new_entries,
         DEFAULT_TARGET_PAGE_BYTES,
@@ -1041,5 +1057,22 @@ mod tests {
             rewritten < total * 4,
             "rewrote {rewritten} bytes for {total} bytes of data"
         );
+    }
+}
+
+#[cfg(test)]
+mod stream_kind_tests {
+    use super::*;
+    use crate::dict::forward_pack::{ForwardPack, KIND_TERM_FWD};
+
+    #[test]
+    fn stream_packs_carry_the_requested_kind() {
+        let entries: Vec<(u64, &[u8])> = vec![(0, b"aaaa"), (1, b"bbbb")];
+        let result = build_incremental_packs_for_stream(KIND_TERM_FWD, 7, &[], &entries).unwrap();
+        assert_eq!(result.new_packs.len(), 1);
+        let pack = ForwardPack::from_bytes(&result.new_packs[0].bytes).unwrap();
+        assert_eq!(pack.header().kind, KIND_TERM_FWD);
+        assert_eq!(pack.header().ns_code, 7);
+        assert_eq!(result.all_pack_refs.len(), 1);
     }
 }

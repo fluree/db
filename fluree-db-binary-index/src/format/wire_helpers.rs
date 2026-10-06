@@ -122,6 +122,27 @@ pub struct DictRefs {
     pub string_reverse: DictTreeRefs,
 }
 
+/// Triple-term dictionary references (ledger-global).
+///
+/// Forward packs are grouped by inner predicate id and keyed by the
+/// per-predicate sequence (the low half of a handle); the reverse tree maps
+/// encoded `TermKey` bytes to the full handle. `watermarks` holds the highest
+/// sequence allocated per predicate so later allocation can continue above it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TermDictRefs {
+    /// `(inner p_id, packs sorted by first_id)`, sorted by p_id.
+    pub forward_packs: Vec<(u32, Vec<PackBranchEntry>)>,
+    /// Reverse tree: `TermKey` bytes → handle.
+    pub reverse: DictTreeRefs,
+    /// `(inner p_id, highest seq allocated)`, sorted by p_id.
+    pub watermarks: Vec<(u32, u32)>,
+    /// Distinct terms in the dictionary.
+    pub term_count: u64,
+    /// Reverse tree in object-first order (`TermKey::to_object_first_bytes`)
+    /// → handle. `None` for a dictionary written before it existed.
+    pub object_reverse: Option<DictTreeRefs>,
+}
+
 /// Per-graph specialty arena refs (numbig, vectors, spatial).
 ///
 /// One entry per graph that has any specialty arenas.
@@ -390,6 +411,105 @@ pub(crate) fn read_dict_pack_refs(data: &[u8], pos: &mut usize) -> io::Result<Di
     })
 }
 
+/// Wire-format version of the term-dictionary section. Version 1 has no
+/// object reverse tree.
+const TERM_DICT_REFS_VERSION: u8 = 2;
+
+/// Write triple-term dictionary refs.
+///
+/// Wire format:
+/// ```text
+/// [version: u8 = 2]
+/// [p_count: u32 LE]
+///   For each: [p_id: u32] [pack_count: u16]
+///     For each: [first_id: u64] [last_id: u64] [pack_cid: len_prefixed]
+/// [reverse tree refs]
+/// [wm_count: u32 LE]  For each: [p_id: u32] [watermark: u32]
+/// [term_count: u64 LE]
+/// [has_object_reverse: u8] [object reverse tree refs, when 1]
+/// ```
+pub(crate) fn write_term_dict_refs(buf: &mut Vec<u8>, refs: &TermDictRefs) {
+    buf.push(TERM_DICT_REFS_VERSION);
+    let mut sorted = refs.forward_packs.clone();
+    sorted.sort_by_key(|(p_id, _)| *p_id);
+    buf.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
+    for (p_id, packs) in &sorted {
+        buf.extend_from_slice(&p_id.to_le_bytes());
+        buf.extend_from_slice(&pack_count_u16(packs.len(), "term").to_le_bytes());
+        for entry in packs {
+            buf.extend_from_slice(&entry.first_id.to_le_bytes());
+            buf.extend_from_slice(&entry.last_id.to_le_bytes());
+            write_cid(buf, &entry.pack_cid);
+        }
+    }
+    write_dict_tree_refs(buf, &refs.reverse);
+    let mut wms = refs.watermarks.clone();
+    wms.sort_by_key(|(p_id, _)| *p_id);
+    buf.extend_from_slice(&(wms.len() as u32).to_le_bytes());
+    for (p_id, wm) in &wms {
+        buf.extend_from_slice(&p_id.to_le_bytes());
+        buf.extend_from_slice(&wm.to_le_bytes());
+    }
+    buf.extend_from_slice(&refs.term_count.to_le_bytes());
+    match &refs.object_reverse {
+        Some(tree) => {
+            buf.push(1);
+            write_dict_tree_refs(buf, tree);
+        }
+        None => buf.push(0),
+    }
+}
+
+/// Read triple-term dictionary refs written by [`write_term_dict_refs`].
+pub(crate) fn read_term_dict_refs(data: &[u8], pos: &mut usize) -> io::Result<TermDictRefs> {
+    let version = read_u8_at(data, pos)?;
+    if !(1..=TERM_DICT_REFS_VERSION).contains(&version) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("term dict refs: unsupported version {version}"),
+        ));
+    }
+    let p_count = read_u32_at(data, pos)? as usize;
+    let mut forward_packs = Vec::with_capacity(p_count);
+    for _ in 0..p_count {
+        let p_id = read_u32_at(data, pos)?;
+        let pack_count = read_u16_at(data, pos)? as usize;
+        let mut packs = Vec::with_capacity(pack_count);
+        for _ in 0..pack_count {
+            let first_id = read_u64_at(data, pos)?;
+            let last_id = read_u64_at(data, pos)?;
+            let pack_cid = read_cid(data, pos)?;
+            packs.push(PackBranchEntry {
+                first_id,
+                last_id,
+                pack_cid,
+            });
+        }
+        forward_packs.push((p_id, packs));
+    }
+    let reverse = read_dict_tree_refs(data, pos)?;
+    let wm_count = read_u32_at(data, pos)? as usize;
+    let mut watermarks = Vec::with_capacity(wm_count);
+    for _ in 0..wm_count {
+        let p_id = read_u32_at(data, pos)?;
+        let wm = read_u32_at(data, pos)?;
+        watermarks.push((p_id, wm));
+    }
+    let term_count = read_u64_at(data, pos)?;
+    let object_reverse = if version >= 2 && read_u8_at(data, pos)? != 0 {
+        Some(read_dict_tree_refs(data, pos)?)
+    } else {
+        None
+    };
+    Ok(TermDictRefs {
+        forward_packs,
+        reverse,
+        watermarks,
+        term_count,
+        object_reverse,
+    })
+}
+
 /// Write dict tree refs: branch CID + leaf_count:u32 + leaf CIDs.
 pub(crate) fn write_dict_tree_refs(buf: &mut Vec<u8>, tree: &DictTreeRefs) {
     write_cid(buf, &tree.branch);
@@ -408,6 +528,38 @@ pub(crate) fn read_dict_tree_refs(data: &[u8], pos: &mut usize) -> io::Result<Di
         leaves.push(read_cid(data, pos)?);
     }
     Ok(DictTreeRefs { branch, leaves })
+}
+
+#[cfg(test)]
+mod term_dict_wire_tests {
+    use super::*;
+
+    /// A version-1 section (no object tree) still decodes, as a dictionary
+    /// without one.
+    #[test]
+    fn a_version_one_term_dict_reads_without_an_object_tree() {
+        let cid = ContentId::new(fluree_db_core::ContentKind::Commit, b"x");
+        let refs = TermDictRefs {
+            forward_packs: Vec::new(),
+            reverse: DictTreeRefs {
+                branch: cid.clone(),
+                leaves: vec![cid],
+            },
+            watermarks: vec![(1, 2)],
+            term_count: 3,
+            object_reverse: None,
+        };
+        let mut v2 = Vec::new();
+        write_term_dict_refs(&mut v2, &refs);
+        let mut v1 = v2[..v2.len() - 1].to_vec();
+        v1[0] = 1;
+        let mut pos = 0;
+        assert_eq!(read_term_dict_refs(&v1, &mut pos).unwrap(), refs);
+        assert_eq!(pos, v1.len());
+        let mut pos = 0;
+        assert_eq!(read_term_dict_refs(&v2, &mut pos).unwrap(), refs);
+        assert_eq!(pos, v2.len());
+    }
 }
 
 #[cfg(test)]

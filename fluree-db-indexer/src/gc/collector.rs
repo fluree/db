@@ -100,8 +100,8 @@ struct NodePartition {
 /// those earlier states, reviving a CID an already-consumed manifest named.
 /// Checked directly against `all_cas_ids()` rather than expanded, since a
 /// resurrected CID this pass must not delete is exactly one still directly
-/// reachable from a surviving root — nothing behind a named-graph or
-/// annotation branch manifest changes that.
+/// reachable from a surviving root — nothing behind a branch manifest
+/// changes that.
 fn retained_refs(
     index_chain: &[IndexChainEntry],
     first_released: usize,
@@ -2335,8 +2335,8 @@ mod tests {
             db_stats: None,
             db_schema: None,
             sketch_ref: None,
-            attachment_events: None,
             prev_index,
+            term_dict: None,
         }
     }
 

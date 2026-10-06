@@ -1025,7 +1025,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             | TokenKind::Double(_) => self.parse_literal(),
             TokenKind::KwTrue | TokenKind::KwFalse => self.parse_literal(),
             TokenKind::ReifiedTripleStart => self.parse_reified_triple(),
-            TokenKind::TripleTermStart => Err(self.triple_term_deferred_error()),
+            TokenKind::TripleTermStart => self.parse_triple_term_value(),
             _ => Err(TurtleError::parse(
                 self.current().start as usize,
                 format!("expected object, found {}", self.current().kind),
@@ -1282,8 +1282,6 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     // annotation blocks `s p o {| … |}` / `s p o ~ reifier {| … |}`.
     //
     // Deliberately rejected with specific deferred errors:
-    // - `<<( … )>>` triple terms as values (no Fluree representation yet;
-    //   the triple-term-as-value epic owns this),
     // - star constructs nested inside an annotation body
     //   (annotation-of-annotation — mirrors the JSON-LD `@annotation`
     //   lowering's v1 deferral),
@@ -1294,23 +1292,38 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     fn triple_term_deferred_error(&self) -> TurtleError {
         TurtleError::parse(
             self.current().start as usize,
-            "RDF 1.2 triple terms as values ('<<( … )>>') are deferred in Turtle \
-             ingest except as the object of rdf:reifies; the supported forms are \
-             'r rdf:reifies <<( s p o )>>', reified triples '<< s p o >>' with \
-             optional '~ reifier', and annotation blocks '{| … |}'",
+            "a triple term ('<<( … )>>') is a value and cannot be a subject",
         )
     }
 
-    /// `r rdf:reifies <<( s p o )>>` — the RDF 1.2 spelling every asserting
+    /// `<<( ttSubject predicate ttObject )>>` as a value; the `<<(` token is
+    /// current.
+    fn parse_triple_term_value(&mut self) -> Result<TermId> {
+        if !self.sink.supports_triple_terms() {
+            return Err(TurtleError::parse(
+                self.current().start as usize,
+                "triple terms ('<<( … )>>') as values are not supported on this ingest path",
+            ));
+        }
+        self.with_nesting(|p| {
+            p.expect(&TokenKind::TripleTermStart)?;
+            let subject = p.parse_tt_subject()?;
+            let predicate = p.parse_predicate()?;
+            let object = p.parse_tt_object()?;
+            p.expect(&TokenKind::TripleTermEnd)?;
+            Ok(p.sink.term_triple(subject, predicate, object)?)
+        })
+    }
+
+    /// `r rdf:reifies <<( s p o )>>` — the RDF 1.2 spelling every reifying
     /// form desugars to, and the only star construct N-Triples/N-Quads have.
     /// The `<<(` token is current and `subject` is the reifier. Emits exactly
-    /// what `<< s p o ~ r >>` emits (base triple asserted, then the reifier
-    /// attachment), so both spellings produce one on-disk shape.
+    /// what `<< s p o ~ r >>` emits: the reifier attachment, without
+    /// asserting `s p o`.
     ///
     /// Grammar: `tripleTerm ::= '<<(' ttSubject predicate ttObject ')>>'`,
     /// `ttSubject ::= iri | BlankNode`, `ttObject ::= iri | BlankNode |
-    /// literal | tripleTerm`. A nested triple term in object position is a
-    /// value with no Fluree representation and keeps the deferred error.
+    /// literal | tripleTerm`.
     fn parse_reifies_triple_term(&mut self, reifier: TermId) -> Result<()> {
         self.with_nesting(|p| {
             p.check_star_allowed("triple term ('<<( … )>>')")?;
@@ -1319,7 +1332,6 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             let predicate = p.parse_predicate()?;
             let object = p.parse_tt_object()?;
             p.expect(&TokenKind::TripleTermEnd)?;
-            p.sink_emit_triple(subject, predicate, object)?;
             p.sink_emit_reified_triple(subject, predicate, object, reifier)
         })?;
         // An annotation tail here would reify the `rdf:reifies` triple
@@ -1372,7 +1384,6 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                     self.current().kind
                 ),
             )),
-            TokenKind::TripleTermStart => Err(self.triple_term_deferred_error()),
             _ => self.parse_object(),
         }
     }
@@ -1451,11 +1462,8 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
             p.expect(&TokenKind::ReifiedTripleEnd)?;
 
-            // Fluree's edge-annotation model reifies an asserted edge: emit the
-            // base triple, then the reifier attachment (documented divergence
-            // from RDF 1.2's non-asserting `<< >>`; see the roadmap's construct
-            // inventory).
-            p.sink_emit_triple(subject, predicate, object)?;
+            // A reified triple does not assert `s p o` (RDF 1.2); only the
+            // annotation syntax does.
             p.sink_emit_reified_triple(subject, predicate, object, reifier)?;
 
             Ok(reifier)
@@ -1519,7 +1527,6 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                     self.current().kind
                 ),
             )),
-            TokenKind::TripleTermStart => Err(self.triple_term_deferred_error()),
             TokenKind::ReifiedTripleStart => self.parse_reified_triple(),
             _ => self.parse_object(),
         }
@@ -1673,7 +1680,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 /// Unescape local name escape sequences (`\x` → `x`).
 ///
 /// Only called when `\` is detected in the local part (extremely rare).
-fn unescape_pn_local(local: &str) -> String {
+pub fn unescape_pn_local(local: &str) -> String {
     let mut result = String::with_capacity(local.len());
     let mut chars = local.chars();
     while let Some(c) = chars.next() {
@@ -2353,16 +2360,14 @@ mod tests {
 
     #[test]
     fn star_reified_triple_subject_position() {
-        // data-1 shape: assert base, mint anon reifier, reifier gets props.
+        // data-1 shape: mint anon reifier, reifier gets props; the reified
+        // triple is not asserted.
         let sink = parse_star(&format!("{P}<<:a :b :c>> :q :z ."));
         assert_eq!(sink.reified.len(), 1);
         let (s, p, o, r) = &sink.reified[0];
         assert_eq!((s, p, o), (&iri("a"), &iri("b"), &iri("c")));
         assert!(matches!(r, RecTerm::Blank(_)), "anon reifier: {r:?}");
-        // Base triple asserted + reifier property triple.
-        assert!(sink.triples.contains(&(iri("a"), iri("b"), iri("c"))));
-        assert!(sink.triples.contains(&(r.clone(), iri("q"), iri("z"))));
-        assert_eq!(sink.triples.len(), 2);
+        assert_eq!(sink.triples, vec![(r.clone(), iri("q"), iri("z"))]);
     }
 
     #[test]
@@ -2477,8 +2482,8 @@ mod tests {
         let (s, p, o, r) = &sink.reified[0];
         assert_eq!((s, p, o), (&iri("a"), &iri("b"), &iri("c")));
         assert_eq!(r, &iri("r"));
-        // Base triple asserted; no ordinary `rdf:reifies` triple emitted.
-        assert_eq!(sink.triples, vec![(iri("a"), iri("b"), iri("c"))]);
+        // Neither the triple nor an ordinary `rdf:reifies` triple emitted.
+        assert!(sink.triples.is_empty(), "{:?}", sink.triples);
     }
 
     #[test]
@@ -2501,23 +2506,36 @@ mod tests {
     fn star_rdf_reifies_matches_tilde_spelling() {
         let prefix = format!("{P}PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n");
         let a = parse_star(&format!("{prefix}:r rdf:reifies <<( :a :b :c )>> ."));
-        let b = parse_star(&format!("{prefix}:a :b :c ~ :r ."));
+        let b = parse_star(&format!("{prefix}<< :a :b :c ~ :r >> ."));
+        let annotated = parse_star(&format!("{prefix}:a :b :c ~ :r ."));
         assert_eq!(a.reified, b.reified);
         assert_eq!(a.triples, b.triples);
+        assert_eq!(a.reified, annotated.reified);
+        // Only the annotation syntax asserts the triple.
+        assert!(a.triples.is_empty());
+        assert_eq!(annotated.triples, vec![(iri("a"), iri("b"), iri("c"))]);
     }
 
     #[test]
-    fn star_rdf_reifies_nested_triple_term_still_deferred() {
-        let mut sink = StarSink::default();
-        let err = parse(
+    fn nested_triple_terms_parse() {
+        let mut sink = GraphCollectorSink::new();
+        parse(
             &format!(
                 "{P}PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
-                 :r rdf:reifies <<( :s :p <<( :x :y 1 )>> )>> ."
+                 :r rdf:reifies <<( :s :p <<( :x :y 1 )>> )>> .\n\
+                 :d :q <<( :s :p <<( :x :y :z )>> )>> ."
             ),
             &mut sink,
         )
-        .expect_err("nested triple term is a value with no representation");
-        assert!(err.to_string().contains("deferred"), "{err}");
+        .expect("nested triple terms parse");
+        let graph = sink.into_graph();
+        let reified = &graph.reifications()[0].triple;
+        // `:s :p <<( :x :y 1 )>>` is the reified triple.
+        assert!(matches!(&reified.o, Term::TripleTerm(_)));
+        assert!(graph.triples().iter().any(|t| matches!(
+            &t.o,
+            Term::TripleTerm(outer) if matches!(&outer[2], Term::TripleTerm(_))
+        )));
     }
 
     #[test]
@@ -2561,34 +2579,36 @@ mod tests {
     }
 
     #[test]
-    fn star_triple_term_under_other_predicate_still_deferred() {
-        // `<<( )>>` is only a value under rdf:reifies; `:q <<( … )>>` (the
-        // W3C data-0-tripleterms shape) keeps the deferred error.
-        let mut sink = StarSink::default();
-        let err = parse(&format!("{P}:a :q <<( :a :b :c )>> ."), &mut sink)
-            .expect_err("triple term under a non-reifies predicate");
-        assert!(err.to_string().contains("triple terms as values"), "{err}");
-    }
-
-    #[test]
-    fn star_triple_term_rejected_with_deferred_error() {
-        let mut sink = StarSink::default();
-        let err = parse(&format!("{P}:x1 :left <<( :a :b 123 )>> ."), &mut sink)
-            .expect_err("triple terms as values must be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("triple terms as values"), "{msg}");
-        assert!(msg.contains("deferred"), "{msg}");
-    }
-
-    #[test]
-    fn star_triple_term_in_reified_triple_rejected() {
-        let mut sink = StarSink::default();
-        let err = parse(
-            &format!("{P}:f :g << :s :p <<(:x2 :y3 123 )>> >> ."),
+    fn triple_term_value_parses_as_an_object() {
+        // The W3C data-0-tripleterms shape: `<<( )>>` as an ordinary value,
+        // here and as a reified triple's object.
+        let mut sink = GraphCollectorSink::new();
+        parse(
+            &format!("{P}:a :q <<( :a :b :c )>> .\n:f :g << :s :p <<( :x :y 123 )>> >> ."),
             &mut sink,
         )
-        .expect_err("nested triple term must be rejected");
-        assert!(err.to_string().contains("triple terms as values"));
+        .expect("triple-term values parse");
+        let graph = sink.into_graph();
+        let iri_term = |suffix: &str| Term::iri(format!("http://example/{suffix}"));
+        let term = |s: &str, p: &str, o: Term| Term::triple(iri_term(s), iri_term(p), o);
+        assert!(graph
+            .triples()
+            .iter()
+            .any(|t| t.o == term("a", "b", iri_term("c"))));
+        let reified = &graph.reifications()[0].triple;
+        assert!(matches!(&reified.o, Term::TripleTerm(t) if t[0] == iri_term("x")));
+    }
+
+    #[test]
+    fn triple_term_value_needs_a_sink_that_holds_one() {
+        let mut sink = StarSink::default();
+        let err = parse(&format!("{P}:a :q <<( :a :b :c )>> ."), &mut sink)
+            .expect_err("this sink holds no triple terms");
+        assert!(
+            err.to_string()
+                .contains("not supported on this ingest path"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2671,19 +2691,19 @@ mod tests {
 
     #[test]
     fn star_bare_reified_triple_statement() {
-        // `<< s p o >> .` with no predicate-object list: asserts the base
-        // triple and attaches a fresh anonymous reifier, nothing more.
-        let sink = parse_star(&format!("{P}:s :p :o .\n<<:s :p :o>> ."));
+        // `<< s p o >> .` with no predicate-object list attaches a fresh
+        // anonymous reifier, nothing more.
+        let sink = parse_star(&format!("{P}<<:s :p :o>> ."));
         assert_eq!(sink.reified.len(), 1);
         assert!(matches!(sink.reified[0].3, RecTerm::Blank(_)));
-        assert_eq!(sink.triples.len(), 2, "{:?}", sink.triples);
+        assert!(sink.triples.is_empty(), "{:?}", sink.triples);
     }
 
     #[test]
     fn star_collector_sink_records_reifications() {
         // The collector (the Turtle→JSON-LD path behind upsert, graph sync
-        // and memory import) accepts every asserting star form and keeps
-        // the reifier attachments alongside the triples.
+        // and memory import) accepts every star form and keeps the reifier
+        // attachments alongside the triples.
         let mut sink = GraphCollectorSink::new();
         parse(
             &format!(
@@ -2714,9 +2734,9 @@ mod tests {
             anon.iter().all(|t| matches!(t, Term::BlankNode(_))),
             "{anon:?}"
         );
-        // Every base triple is asserted exactly once; body triples about
-        // the reifiers are ordinary triples.
-        assert_eq!(graph.len(), 5, "{:?}", graph.triples());
+        // The two annotated triples are asserted, the reified one is not;
+        // body triples about the reifiers are ordinary triples.
+        assert_eq!(graph.len(), 4, "{:?}", graph.triples());
     }
 
     #[test]

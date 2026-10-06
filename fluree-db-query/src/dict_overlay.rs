@@ -567,6 +567,9 @@ impl DictOverlay {
             FlakeValue::Vector(v) => Ok(self.assign_vector_handle(v)),
 
             FlakeValue::GeoPoint(bits) => Ok((ObjKind::GEO_POINT, ObjKey::from_u64(bits.as_u64()))),
+            FlakeValue::TripleTerm(_) => Err(io::Error::other(
+                "triple-term objects are interned by the index build, not the dictionary overlay",
+            )),
         }
     }
 

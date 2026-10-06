@@ -201,9 +201,6 @@ returns — see [Edge annotations](../concepts/edge-annotations.md).
 
 ## Gotchas
 
-- **Annotations are default-graph only.** A tail inside an explicit `GRAPH { }`
-  block or under `WITH <g>` is rejected — use the JSON-LD `@annotation` surface
-  to annotate an edge inside a named graph.
 - **Simple-predicate edges only.** A tail on a property-path edge
   (`?s ex:p1/ex:p2 ?o {| … |}`) is rejected.
 - **No annotations in `CONSTRUCT` templates** (output form deferred); a

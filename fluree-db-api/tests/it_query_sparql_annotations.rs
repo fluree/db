@@ -254,13 +254,37 @@ async fn sparql_insert_data_with_named_blank_reifier_round_trips() {
     assert_eq!(bindings[0]["since"]["value"].as_str(), Some("2024"));
 }
 
+/// The triples `ex:ann1` reifies, as `subject predicate object` local names.
+async fn ann1_triples(fluree: &MemoryFluree, ledger: &MemoryLedger) -> Vec<String> {
+    let query = r"
+        PREFIX ex: <http://example.org/>
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+        SELECT ?s ?p ?o WHERE { ex:ann1 rdf:reifies <<( ?s ?p ?o )>> } ORDER BY ?s ?p ?o
+    ";
+    let json = support::query_sparql(fluree, ledger, query)
+        .await
+        .expect("query")
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json");
+    let local = |v: &serde_json::Value| {
+        v["value"]
+            .as_str()
+            .and_then(|iri| iri.rsplit('/').next())
+            .unwrap_or_default()
+            .to_string()
+    };
+    json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|b| format!("{} {} {}", local(&b["s"]), local(&b["p"]), local(&b["o"])))
+        .collect()
+}
+
 #[tokio::test]
-async fn sparql_same_id_reifying_two_edges_in_one_txn_is_rejected() {
-    // Single-txn multi-target: one explicit `@id` reifying two edges
-    // that share a subject. The `f:reifiesSubject` slot dedupes (same
-    // subject) so a subject-flake *count* sees one — but the predicate
-    // and object slots diverge, so the net bundle is multi-target. The
-    // net-bundle decode catches it; a plain count would not.
+async fn sparql_same_id_reifying_two_edges_in_one_txn_names_both() {
+    // A reifier may reify several triples (RDF 1.2): one explicit id on two
+    // edges in one transaction links it to both.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "it/sparql-ann-update/multi-target-one-txn");
     let update = r#"
@@ -271,25 +295,23 @@ async fn sparql_same_id_reifying_two_edges_in_one_txn_is_rejected() {
         }
     "#;
     let txn = lower_update(&ledger0, update);
-    let err = fluree
+    let ledger = fluree
         .stage_owned(ledger0)
         .txn(txn)
         .execute()
         .await
-        .expect_err("one annotation id reifying two edges in one txn must be rejected");
-    let msg = format!("{err:?} {err}");
-    assert!(
-        msg.contains("multi-target") || msg.contains("reify exactly one edge"),
-        "expected multi-target rejection, got: {msg}"
+        .expect("one annotation id on two edges")
+        .ledger;
+    assert_eq!(
+        ann1_triples(&fluree, &ledger).await,
+        ["alice knows bob", "alice worksFor acme"]
     );
 }
 
 #[tokio::test]
-async fn sparql_reattaching_id_to_different_edge_across_txns_is_rejected() {
-    // Cross-txn re-point with no retract: the prior attachment lives in
-    // snapshot/novelty, not in this txn's flake set, so a count over the
-    // current txn alone sees a single subject assert and passes. The
-    // net-bundle check folds the prior state in and rejects.
+async fn sparql_attaching_id_to_a_second_edge_across_txns_names_both() {
+    // Attaching an annotated id to a second edge in a later transaction, with
+    // no retract, adds a link; the first one stays.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "it/sparql-ann-update/repoint-across-txn");
 
@@ -306,23 +328,21 @@ async fn sparql_reattaching_id_to_different_edge_across_txns_is_rejected() {
         .expect("first attach")
         .ledger;
 
-    let repoint = r#"
+    let second = r#"
         PREFIX ex: <http://example.org/>
         INSERT DATA { ex:carol ex:worksFor ex:dave ~ ex:ann1 {| ex:role "Manager" |} . }
     "#;
-    let t2 = lower_update(&ledger1, repoint);
-    let err = fluree
+    let t2 = lower_update(&ledger1, second);
+    let ledger2 = fluree
         .stage_owned(ledger1)
         .txn(t2)
         .execute()
         .await
-        .expect_err(
-            "re-pointing an annotation id to a different edge across txns must be rejected",
-        );
-    let msg = format!("{err:?} {err}");
-    assert!(
-        msg.contains("multi-target") || msg.contains("reify exactly one edge"),
-        "expected multi-target rejection, got: {msg}"
+        .expect("second attach")
+        .ledger;
+    assert_eq!(
+        ann1_triples(&fluree, &ledger2).await,
+        ["alice worksFor acme", "carol worksFor dave"]
     );
 }
 
@@ -526,40 +546,66 @@ async fn sparql_reifies_hidden_in_annotation_block_body_is_rejected() {
     );
 }
 
+/// The rows `select` returns over `ledger_id`'s current state.
+async fn select_rows(fluree: &MemoryFluree, ledger_id: &str, select: &str) -> Vec<JsonValue> {
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    support::query_sparql(fluree, &ledger, select)
+        .await
+        .expect("query")
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json")["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .clone()
+}
+
+/// Annotation tails write into the graph their triple is written to, inside
+/// a `GRAPH` block and under `WITH` alike.
 #[tokio::test]
-async fn sparql_with_scoped_annotation_template_is_rejected() {
-    // `WITH <g>` re-homes default-position template triples into <g> after
-    // annotation expansion, but v1 expansion omits f:reifiesGraph (the edge
-    // identity is default-graph). Allowing it would mint graph-tagged
-    // reifications carrying a default-graph edge identity — a broken edge
-    // that never hydrates or cascades. Reject until graph-aware expansion
-    // lands. Annotation tails inside explicit GRAPH blocks are rejected
-    // separately by the quad-pattern expansion.
-    let ledger0 = {
-        let fluree = FlureeBuilder::memory().build_memory();
-        genesis_ledger(&fluree, "it/sparql-ann-update/with-scoped-rej")
-    };
-    let update = r#"
-        PREFIX ex: <http://example.org/>
-        WITH <http://example.org/g>
-        INSERT { ?person ex:worksFor ex:acme {| ex:role "Engineer" |} }
-        WHERE  { ?person a ex:Person }
-    "#;
-    let parsed = fluree_db_sparql::parse_sparql(update);
-    assert!(
-        !parsed.has_errors(),
-        "parse should succeed: {:?}",
-        parsed.diagnostics
-    );
-    let ast = parsed.ast.unwrap();
-    let mut ns = NamespaceRegistry::from_db(&ledger0.snapshot);
-    let err = fluree_db_transact::lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default())
-        .expect_err("annotation tail on a WITH-scoped template must be rejected");
-    let msg = format!("{err:?} {err}");
-    assert!(
-        msg.contains("WITH-scoped"),
-        "expected WITH-scoped annotation rejection, got: {msg}"
-    );
+async fn sparql_update_annotations_land_in_named_graphs() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/sparql-ann-update/named-graphs";
+    fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    for update in [
+        r"PREFIX ex: <http://example.org/>
+          INSERT DATA {
+            GRAPH <http://example.org/g> { ex:a ex:knows ex:b {| ex:src ex:x |} }
+            GRAPH <http://example.org/g2> { ex:alice a ex:Person }
+          }",
+        r#"PREFIX ex: <http://example.org/>
+           WITH <http://example.org/g2>
+           INSERT { ?person ex:worksFor ex:acme {| ex:role "Engineer" |} }
+           WHERE  { ?person a ex:Person }"#,
+    ] {
+        fluree
+            .graph(ledger_id)
+            .transact()
+            .sparql_update(update)
+            .commit()
+            .await
+            .expect("update");
+    }
+    let src = select_rows(
+        &fluree,
+        ledger_id,
+        "PREFIX ex: <http://example.org/>
+         SELECT ?src WHERE { GRAPH <http://example.org/g> { ex:a ex:knows ex:b {| ex:src ?src |} } }",
+    )
+    .await;
+    assert_eq!(src.len(), 1, "{src:?}");
+    let role = select_rows(
+        &fluree,
+        ledger_id,
+        "PREFIX ex: <http://example.org/>
+         SELECT ?role WHERE { GRAPH <http://example.org/g2> \
+         { ex:alice ex:worksFor ex:acme {| ex:role ?role |} } }",
+    )
+    .await;
+    assert_eq!(role.len(), 1, "{role:?}");
+    assert_eq!(role[0]["role"]["value"], "Engineer");
 }
 
 #[tokio::test]
@@ -956,38 +1002,62 @@ async fn sparql_quoted_triple_with_annotation_tail_is_rejected() {
     );
 }
 
+/// A reified triple in SPARQL UPDATE stands for its reifier and does not
+/// assert its triple (RDF 1.2), in subject and object position alike, and an
+/// annotation tail on the triple it is part of still applies.
 #[tokio::test]
-async fn sparql_update_quoted_triple_with_annotation_tail_does_not_panic() {
-    // Mirrors the read-side test but exercises the UPDATE path.
-    // `<<:s :p :o>> ~ {| :ann :v |}` used to hit
-    // `unreachable!()` inside `expand_annotated_triples` because
-    // a QuotedTriple subject reached `subject_to_object`. The
-    // expansion path must reject this explicitly with an
-    // `UnsupportedFeature` error before that helper is called.
-    let ledger0 = {
-        let fluree = FlureeBuilder::memory().build_memory();
-        genesis_ledger(&fluree, "it/sparql-ann-update/quoted-triple-tail")
-    };
-    let update = r"
-        PREFIX ex: <http://example.org/>
-        INSERT DATA {
-          << ex:alice ex:worksFor ex:acme >> ex:ann ex:v {| ex:role ex:eng |} .
-        }
-    ";
-    let parsed = fluree_db_sparql::parse_sparql(update);
-    if parsed.has_errors() {
-        // Parser may already reject this shape; that's also acceptable
-        // — the point of the test is "no panic in the lowering path".
-        return;
-    }
-    let ast = parsed.ast.unwrap();
-    let mut ns = NamespaceRegistry::from_db(&ledger0.snapshot);
-    let err = fluree_db_transact::lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default())
-        .expect_err("quoted-triple subject + annotation tail must be rejected");
-    let msg = format!("{err:?} {err}");
+async fn sparql_update_reified_triples_do_not_assert_their_triple() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/sparql-ann-update/reified-triples";
+    fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(
+            r"PREFIX ex: <http://example.org/>
+              INSERT DATA {
+                << ex:alice ex:worksFor ex:acme ~ ex:claim >> ex:source ex:hr {| ex:seenBy ex:bob |} .
+                ex:doc ex:cites << ex:x ex:y ex:z >> .
+              }",
+        )
+        .commit()
+        .await
+        .expect("INSERT DATA with reified triples");
+
+    let rows = |select: &'static str| select_rows(&fluree, ledger_id, select);
     assert!(
-        msg.contains("quoted-triple") || msg.contains("annotation tail"),
-        "expected UnsupportedFeature on quoted-triple + tail, got: {msg}"
+        rows("PREFIX ex: <http://example.org/> SELECT ?o WHERE { ex:alice ex:worksFor ?o }")
+            .await
+            .is_empty(),
+        "the reified triple is not asserted"
+    );
+    let claim = rows(
+        "PREFIX ex: <http://example.org/>
+         SELECT ?r ?s WHERE { << ex:alice ex:worksFor ex:acme ~ ?r >> ex:source ?s }",
+    )
+    .await;
+    assert_eq!(claim.len(), 1, "{claim:?}");
+    assert_eq!(claim[0]["r"]["value"], "http://example.org/claim");
+    let seen = rows(
+        "PREFIX ex: <http://example.org/>
+         SELECT ?w WHERE { ex:claim ex:source ex:hr {| ex:seenBy ?w |} }",
+    )
+    .await;
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let cited = rows(
+        "PREFIX ex: <http://example.org/>
+         PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+         SELECT ?r WHERE { ex:doc ex:cites ?r . ?r rdf:reifies <<( ex:x ex:y ex:z )>> }",
+    )
+    .await;
+    assert_eq!(cited.len(), 1, "{cited:?}");
+    assert!(
+        rows("PREFIX ex: <http://example.org/> SELECT ?z WHERE { ex:x ex:y ?z }")
+            .await
+            .is_empty()
     );
 }
 

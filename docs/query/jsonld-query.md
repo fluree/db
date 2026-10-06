@@ -328,12 +328,13 @@ a subject:
 
 Variable-predicate scans return every stored triple, including data written
 with the Fluree vocabulary (`https://ns.flur.ee/db#`, e.g. stored
-`f:AccessPolicy` definitions). The one exception is the seven `f:reifies*`
-predicates — the internal storage encoding of edge annotations. They are
-system-written (user transactions cannot assert them), redundant with the
-edge and annotation content already in the results, and therefore hidden from
-variable-predicate scans. Pass `"opts": {"includeSystemFacts": true}` (in
-SPARQL, `# PRAGMA include-system-facts: true`) to surface them for debugging or
+`f:AccessPolicy` definitions) and an annotation's `rdf:reifies` link. The one
+exception is the seven `f:reifies*` predicates, which ledgers written by
+earlier releases used to store edge annotations. They are system-written
+(user transactions cannot assert them), redundant with the `rdf:reifies`
+links derived from them, and therefore hidden from variable-predicate scans.
+Pass `"opts": {"includeSystemFacts": true}` (in SPARQL,
+`# PRAGMA include-system-facts: true`) to surface them for debugging or
 inspection. Commit metadata (`f:t`, `f:address`,
 …) lives in the ledger's txn-meta graph, not the default graph, so it never
 appears in default-graph scans either way.
@@ -613,9 +614,9 @@ Apply conditions to filter results:
 
 **Comparing against IRIs:**
 
-An unquoted prefixed name or `<...>` IRI is an IRI operand wherever RDF terms
-are compared — `=`, `!=`, `in`, `not-in`, `sameTerm` — and compares by
-identity, so `(= ?p ex:knows)` matches the predicate `ex:knows` — never the
+An unquoted prefixed name or `<...>` IRI is an IRI operand wherever an
+operator reads RDF terms — `=`, `!=`, `in`, `not-in`, `sameTerm`, and `triple`
+— and compares by identity, so `(= ?p ex:knows)` matches the predicate `ex:knows` — never the
 string `"ex:knows"`. In every other position it is the string it has always
 been:
 
@@ -1115,7 +1116,7 @@ Edge annotations attach metadata to a specific `(subject, predicate, object)` ed
 - **Inline form** with `@annotation` — match an edge and pull metadata about it.
 - **Annotation-rooted form** with `@reifies` — match metadata first, find the edges it reifies.
 
-`@edge` is an alias for `@annotation`; the two are interchangeable. For how to *write* annotations (`@annotation` on insert), the storage model, the cardinality contract, and worked output, see the [Edge annotations](../concepts/edge-annotations.md) concept doc. Note `@reifies` is a **query-side** construct only — user-authored `@reifies` on an insert/update is rejected; write with `@annotation` instead.
+`@edge` is an alias for `@annotation`; the two are interchangeable. For how to *write* annotations (`@annotation` on insert), the storage model, the cardinality contract, and worked output, see the [Edge annotations](../concepts/edge-annotations.md) concept doc.
 
 **Inline form (`@annotation`):**
 
@@ -1165,7 +1166,24 @@ Filter by annotation metadata first, then surface the reified edge.
 }
 ```
 
-The base edge identified by `@reifies` is also matched as an ordinary triple, so the visibility check is automatic — if the edge is currently retracted or hidden by policy, the row drops.
+As in RDF 1.2, `@reifies` matches the reifier's link only, so it also finds reifiers of triples that are not asserted. To require the edge, add it as an ordinary pattern, or query with `@annotation`.
+
+**Triple terms as values:** a value whose `@id` is a node describing one triple matches a stored triple term, by its components when they are variables:
+
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "select": ["?doc", "?o"],
+  "where": {
+    "@id": "?doc",
+    "ex:mentions": { "@id": { "@id": "ex:alice", "ex:knows": "?o" } }
+  }
+}
+```
+
+The same shape, with constant components, is a triple term in a `values` cell: `"values": ["?t", [{ "@id": { "@id": "ex:alice", "ex:knows": { "@id": "ex:bob" } } }]]`.
+
+See [Triple terms as values](../concepts/edge-annotations.md#triple-terms-as-values).
 
 **Subject expansion output:**
 
@@ -1280,6 +1298,31 @@ Function names are case-insensitive. See [Vector Search](../indexing-and-search/
 - `(isIRI ?x)` - Is an IRI
 - `(isBlank ?x)` - Is a blank node
 - `(isLiteral ?x)` - Is a literal
+- `(isTriple ?x)` - Is a triple term
+
+### Triple-Term Functions
+
+The RDF 1.2 functions over triple terms, the JSON-LD names for SPARQL's
+`TRIPLE`, `SUBJECT`, `PREDICATE` and `OBJECT`. A reifier's `rdf:reifies` value
+is a triple term:
+
+- `(triple ex:alice ex:knows ex:bob)` - The triple term `<<( ex:alice ex:knows ex:bob )>>`
+- `(subject ?t)`, `(predicate ?t)`, `(object ?t)` - A triple term's components
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/",
+    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+  },
+  "select": ["?r", "?s", "?o"],
+  "where": [
+    { "@id": "?r", "rdf:reifies": "?t" },
+    ["filter", "(sameTerm (predicate ?t) ex:knows)"],
+    ["bind", "?s", "(subject ?t)", "?o", "(object ?t)"]
+  ]
+}
+```
 
 ## Query Modifiers
 

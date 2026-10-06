@@ -745,14 +745,13 @@ impl Fluree {
     }
 
     /// Explain may show query structure, but a scoped caller must not learn
-    /// unrestricted cardinalities (including annotation-derived counts).
+    /// unrestricted cardinalities.
     /// Keep the normal snapshot on the root path; only governed explains clone.
     async fn prepare_explain_view(&self, db: &GraphDb) -> Result<GraphDb> {
         let mut view = self.wrap_policy_defaults(db.clone()).await?;
         if !view.is_root() {
             let snapshot = std::sync::Arc::make_mut(&mut view.snapshot);
             snapshot.stats = None;
-            snapshot.annotation_index = None;
         }
         Ok(view)
     }

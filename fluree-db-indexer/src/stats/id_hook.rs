@@ -157,7 +157,8 @@ pub struct StatsRecord {
 /// Construct a `StatsRecord` from a V2 `RunRecordV2` + op byte.
 ///
 /// Maps `OType` to the legacy fields needed by `IdStatsHook::on_record`:
-/// - `o_kind`: 0x05 (REF_ID) for `OType::IRI_REF`, 0 otherwise (only REF detection matters)
+/// - `o_kind`: 0x05 (REF_ID) for `OType::IRI_REF`, TRIPLE_TERM for a term
+///   handle, 0 otherwise
 /// - `dt`: derived from `OType` category (approximate but consistent)
 /// - `o_hash`: uses `value_hash_v2(o_type, o_key)` (V2-compatible domain separation)
 /// - `lang_id`: extracted from `OType` if langString, 0 otherwise
@@ -169,11 +170,14 @@ pub fn stats_record_from_v2(
 
     let ot = OType::from_u16(rec.o_type);
 
-    // Map OType to legacy o_kind (only REF_ID detection matters for class tracking).
+    // Map OType to legacy o_kind: only REF_ID (class tracking) and
+    // TRIPLE_TERM (link counts) are special-cased.
     let o_kind = if ot == OType::IRI_REF {
         0x05 // ObjKind::REF_ID
+    } else if ot == OType::TRIPLE_TERM {
+        fluree_db_core::value_id::ObjKind::TRIPLE_TERM.as_u8()
     } else {
-        0 // doesn't matter for stats — only REF_ID is special-cased
+        0
     };
 
     // Map OType to approximate ValueTypeTag for datatype counting.
@@ -269,6 +273,9 @@ pub struct IdStatsResult {
     pub graphs: Vec<GraphStatsEntry>,
     /// Total flake count across all graphs.
     pub total_flakes: u64,
+    /// Live rows whose object is a triple term, ledger-wide, as `(p_id, the
+    /// term's inner predicate, count)`; zero counts dropped, sorted.
+    pub term_rows: Vec<(u32, u32, u64)>,
 }
 
 /// ID-based stats hook for import/index paths where GlobalDicts are available.
@@ -338,6 +345,9 @@ pub struct IdStatsHook {
     /// Used at finalize-time to derive per-class language distributions by
     /// cross-referencing with subject_classes.
     subject_prop_langs: HashMap<(GraphId, u64), HashMap<u32, HashMap<u16, i64>>>,
+    /// Rows whose object is a triple term: (p_id, the term's inner predicate)
+    /// → signed delta count. The inner predicate is the handle's high half.
+    term_rows: HashMap<(u32, u32), i64>,
 }
 
 impl IdStatsHook {
@@ -391,6 +401,12 @@ impl IdStatsHook {
     /// Enable/disable tracking of reference target-class edges.
     pub fn set_track_ref_targets(&mut self, enabled: bool) {
         self.track_ref_targets = enabled;
+    }
+
+    /// Seed the triple-term row count for `(p_id, inner_p_id)` from a base
+    /// index, before records move it.
+    pub fn seed_term_rows(&mut self, p_id: u32, inner_p_id: u32, count: u64) {
+        *self.term_rows.entry((p_id, inner_p_id)).or_insert(0) += count as i64;
     }
 
     /// Process a single record with resolved IDs.
@@ -456,6 +472,11 @@ impl IdStatsHook {
         *hll.datatypes.entry(rec.dt.as_u8()).or_insert(0) += delta;
         // Historical tag set: every record's tag, regardless of op or delta.
         hll.note_historical_tag(rec.dt.as_u8());
+
+        if rec.o_kind == fluree_db_core::value_id::ObjKind::TRIPLE_TERM.as_u8() {
+            let inner = fluree_db_core::triple_term::term_handle_p_id(rec.o_key);
+            *self.term_rows.entry((rec.p_id, inner)).or_insert(0) += delta;
+        }
 
         // Track class membership and class→property attribution (graph-scoped).
         if let Some(rdf_type_pid) = self.rdf_type_p_id {
@@ -541,8 +562,23 @@ impl IdStatsHook {
     /// hooks never track class detail (rdf:type p_id unset), so class maps
     /// need no correction; the set-view class stats come from the
     /// `SpotClassStatsCollector` on the already-deduplicated merge output.
-    pub fn discount_import_duplicates(&mut self, g_id: GraphId, p_id: u32, o_type: u16, n: u64) {
+    ///
+    /// `inner_p_id` is a triple-term row's inner predicate (ignored for other
+    /// rows).
+    pub fn discount_import_duplicates(
+        &mut self,
+        g_id: GraphId,
+        p_id: u32,
+        o_type: u16,
+        inner_p_id: u32,
+        n: u64,
+    ) {
         let delta = n as i64;
+        if fluree_db_core::o_type::OType::from_u16(o_type)
+            == fluree_db_core::o_type::OType::TRIPLE_TERM
+        {
+            *self.term_rows.entry((p_id, inner_p_id)).or_insert(0) -= delta;
+        }
         self.flake_count = self.flake_count.saturating_sub(n as usize);
         *self.graph_flakes.entry(g_id).or_insert(0) -= delta;
         let hll = self
@@ -580,6 +616,9 @@ impl IdStatsHook {
         }
         for (key, delta) in other.class_counts {
             *self.class_counts.entry(key).or_insert(0) += delta;
+        }
+        for (key, delta) in other.term_rows {
+            *self.term_rows.entry(key).or_insert(0) += delta;
         }
         if !self.hll_only {
             for (key, class_map) in other.subject_class_deltas {
@@ -764,9 +803,18 @@ impl IdStatsHook {
             .map(|(_, &delta)| delta.max(0) as u64)
             .sum();
 
+        let mut term_rows: Vec<(u32, u32, u64)> = self
+            .term_rows
+            .iter()
+            .filter(|(_, &n)| n > 0)
+            .map(|(&(p_id, inner), &n)| (p_id, inner, n as u64))
+            .collect();
+        term_rows.sort_unstable();
+
         IdStatsResult {
             graphs,
             total_flakes,
+            term_rows,
         }
     }
 
@@ -1082,7 +1130,7 @@ mod tests {
 
         // The merge collapsed one copy. record() uses ValueTypeTag::INTEGER,
         // which OType::XSD_INTEGER maps back to.
-        hook.discount_import_duplicates(0, 1, OType::XSD_INTEGER.as_u16(), 1);
+        hook.discount_import_duplicates(0, 1, OType::XSD_INTEGER.as_u16(), 0, 1);
 
         assert_eq!(property_count(&hook), 1);
         assert_eq!(hook.graph_flakes_mut()[&0], 1);
@@ -1103,5 +1151,62 @@ mod tests {
         hook.on_record(&record(true, 2));
         hook.on_record(&record(false, 3));
         assert_eq!(property_count(&hook), 1);
+    }
+
+    /// Link rows count per inner predicate (the handle's high half) with the
+    /// same signed deltas as property counts, through merge, the import
+    /// duplicate discount and a base seed.
+    #[test]
+    fn triple_term_rows_count_live_links_per_inner_predicate() {
+        use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
+        use fluree_db_core::o_type::OType;
+        use fluree_db_core::subject_id::SubjectId;
+        use fluree_db_core::triple_term::term_handle;
+
+        let link = |g_id: GraphId, inner: u32, seq: u32, op: u8| {
+            let rec = RunRecordV2 {
+                s_id: SubjectId(10 + u64::from(seq)),
+                o_key: term_handle(inner, seq),
+                p_id: 3,
+                t: 1,
+                o_i: u32::MAX,
+                o_type: OType::TRIPLE_TERM.as_u16(),
+                g_id,
+            };
+            stats_record_from_v2(&rec, op)
+        };
+        let rows = |hook: IdStatsHook| hook.finalize().term_rows;
+
+        let mut hook = IdStatsHook::new();
+        hook.on_record(&link(0, 7, 0, 1));
+        hook.on_record(&link(2, 7, 1, 1));
+        hook.on_record(&link(0, 9, 0, 1));
+        hook.on_record(&link(0, 9, 0, 0));
+        hook.on_record(&record(true, 1));
+        let mut other = IdStatsHook::new();
+        other.on_record(&link(0, 7, 2, 1));
+        hook.merge_from(other);
+        hook.discount_import_duplicates(0, 3, OType::TRIPLE_TERM.as_u16(), 7, 1);
+        assert_eq!(rows(hook), vec![(3, 7, 2)]);
+
+        let mut seeded = IdStatsHook::new();
+        seeded.seed_term_rows(3, 9, 4);
+        seeded.on_record_with_base_presence(&link(0, 9, 0, 0), true);
+        seeded.on_record_with_base_presence(&link(0, 9, 5, 1), true);
+        assert_eq!(rows(seeded), vec![(3, 9, 3)]);
+
+        let entries = crate::stats::link_stat_entries(&[(3, 7, 2), (4, 7, 5)], Some(3), |p| {
+            (100, format!("p{p}"))
+        });
+        assert_eq!(
+            entries,
+            vec![fluree_db_core::LinkStatEntry {
+                sid: (100, "p7".to_string()),
+                count: 2
+            }]
+        );
+        assert!(
+            crate::stats::link_stat_entries(&[(3, 7, 2)], None, |_| (0, String::new())).is_empty()
+        );
     }
 }

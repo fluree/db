@@ -191,6 +191,14 @@ fn write_value(
             push_json_string(out, iri.as_ref());
             out.push('}');
         }
+        Binding::Lit {
+            val: FlakeValue::TripleTerm(term),
+            ..
+        } => {
+            let node =
+                super::triple_term_node(term, compactor, |o| format_binding(result, o, compactor))?;
+            push_value(out, &node)?;
+        }
         Binding::Lit { val, dtc, .. } => write_lit(out, val, dtc, compactor)?,
         Binding::Grouped(values) => {
             out.push('[');
@@ -388,6 +396,11 @@ pub(crate) fn format_binding(
         // Raw IRI string (from graph source, not in namespace table)
         Binding::Iri(iri) => Ok(json!({"@id": iri.as_ref()})),
 
+        Binding::Lit {
+            val: FlakeValue::TripleTerm(term),
+            ..
+        } => super::triple_term_node(term, compactor, |o| format_binding(result, o, compactor)),
+
         // Literal value - always include @type (except language-tagged)
         Binding::Lit { val, dtc, .. } => {
             let dt_iri = compactor.compact_sid(dtc.datatype())?;
@@ -516,6 +529,7 @@ pub(crate) fn format_binding(
                     "@value": v.to_string(),
                     "@type": dt_iri
                 })),
+                FlakeValue::TripleTerm(_) => unreachable!("rendered as an embedded node"),
             }
         }
 

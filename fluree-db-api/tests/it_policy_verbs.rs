@@ -862,3 +862,66 @@ async fn scaffolder_write_profile_grants_class_ownership_only() {
         "Lead write profile must NOT edit a Person"
     );
 }
+
+/// Removing a reifier outright is a delete although its derived
+/// `rdf:reifies` link outlives the transaction: no transaction writes a link,
+/// so it must not count toward the subject persisting.
+#[tokio::test]
+async fn removing_a_reifier_is_a_delete_despite_its_link() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "verbs_delete_reifier");
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:alice",
+                "@type": "ex:Person",
+                "ex:knows": {
+                    "@id": "ex:bob",
+                    "@annotation": {
+                        "@id": "ex:claim1",
+                        "@type": "ex:Claim",
+                        "ex:source": {"@id": "ex:hr"}
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let policies = json!([
+        view_all(),
+        {
+            "@id": "ex:personEditors",
+            "f:onClass": [{"@id": "http://example.org/ns/Person"}],
+            "f:action": "f:update",
+            "f:allow": true
+        },
+        {
+            "@id": "ex:claimReapers",
+            "f:onClass": [{"@id": "http://example.org/ns/Claim"}],
+            "f:action": "f:delete",
+            "f:allow": true
+        }
+    ]);
+    let ctx = policy_ctx(&ledger, policies).await;
+
+    // The base edge's retract cascades the attachment; the body goes
+    // explicitly.
+    let remove = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "where": {"@id": "ex:claim1", "?p": "?o"},
+        "delete": [
+            {"@id": "ex:claim1", "?p": "?o"},
+            {"@id": "ex:alice", "ex:knows": {"@id": "ex:bob"}}
+        ]
+    });
+    let result = try_txn(&fluree, ledger, TxnType::Update, &remove, &ctx).await;
+    assert!(
+        result.is_ok(),
+        "a delete grant must permit removing the reifier: {result:?}"
+    );
+}

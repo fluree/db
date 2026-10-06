@@ -151,6 +151,35 @@ pub fn eval_str<R: RowAccess>(
     }))
 }
 
+/// `LANG` of a binding, read from its tag without materializing the value.
+fn lang_of_binding(
+    binding: Option<&Binding>,
+    ctx: Option<&ExecutionContext<'_>>,
+    strict: bool,
+) -> Result<Option<ComparableValue>> {
+    let tag = match binding {
+        Some(Binding::Lit { dtc, .. }) => dtc
+            .lang_tag()
+            .map(std::string::ToString::to_string)
+            .unwrap_or_default(),
+        Some(Binding::EncodedLit { lang_id, .. }) => {
+            if let Some(store) = ctx.and_then(|c| c.binary_store.as_deref()) {
+                store
+                    .decode_meta(*lang_id, i32::MIN)
+                    .and_then(|m| m.lang)
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            }
+        }
+        // SPARQL §17.4.2.2: LANG of a non-literal (IRI/ref, bnode) or an
+        // unbound variable is a type error → no value.
+        _ if strict => return Ok(None),
+        _ => String::new(),
+    };
+    Ok(Some(ComparableValue::String(Arc::from(tag))))
+}
+
 /// `strict` selects the SPARQL behavior for non-literal arguments: a type
 /// error, evaluated as "no value" (`Ok(None)`) so a FILTER excludes the row
 /// and a project-expression/BIND leaves the variable unbound (§17.2/§18.5).
@@ -166,27 +195,20 @@ pub fn eval_lang<R: RowAccess>(
     // Fast path: a bare variable reads the binding's language tag directly,
     // without materializing the value.
     if let Expression::Var(var_id) = &args[0] {
-        let tag = match row.get(*var_id) {
-            Some(Binding::Lit { dtc, .. }) => dtc
-                .lang_tag()
-                .map(std::string::ToString::to_string)
-                .unwrap_or_default(),
-            Some(Binding::EncodedLit { lang_id, .. }) => {
-                if let Some(store) = ctx.and_then(|c| c.binary_store.as_deref()) {
-                    store
-                        .decode_meta(*lang_id, i32::MIN)
-                        .and_then(|m| m.lang)
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                }
-            }
-            // SPARQL §17.4.2.2: LANG of a non-literal (IRI/ref, bnode) or an
-            // unbound variable is a type error → no value.
-            _ if strict => return Ok(None),
-            _ => String::new(),
-        };
-        return Ok(Some(ComparableValue::String(Arc::from(tag))));
+        return lang_of_binding(row.get(*var_id), ctx, strict);
+    }
+    // A term accessor binds its component the way a variable is bound.
+    if let Expression::Call {
+        func:
+            func @ (crate::ir::Function::TripleSubject
+            | crate::ir::Function::TriplePredicate
+            | crate::ir::Function::TripleObject),
+        args: inner,
+    } = &args[0]
+    {
+        if let Some(binding) = crate::eval::rdf::term_component_binding(func, inner, row, ctx)? {
+            return lang_of_binding(Some(&binding), ctx, strict);
+        }
     }
     // General case: evaluate the argument expression and read the tag off the
     // resulting value (only lang-tagged strings carry one).

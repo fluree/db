@@ -172,6 +172,14 @@ fn inline_ops_need_t(ops: &[InlineOperator]) -> bool {
 // BinaryScanOperator
 // ============================================================================
 
+/// Encoded form of the inner-subject and inner-object bounds on a term
+/// variable (see `ObjectBounds::term_subject` / `term_object`).
+#[derive(Debug, Clone, Copy)]
+struct TermKeyFilter {
+    s_id: Option<u64>,
+    o: Option<(u16, u64)>,
+}
+
 /// Scan operator: streams leaflets from `BinaryCursor`, eagerly decoding
 /// `ColumnBatch` rows into `Binding::Sid` / `Binding::Lit` values.
 pub struct BinaryScanOperator {
@@ -194,6 +202,10 @@ pub struct BinaryScanOperator {
     /// Novelty-only predicate overrides keyed by ephemeral p_id, populated
     /// during overlay translation (ephemeral ids sit above the persisted range).
     p_sids_ephemeral: HashMap<u32, Sid>,
+    /// p_ids a variable-predicate scan hides (see `is_internal_predicate`).
+    /// Empty for a bound predicate, under `include_system_facts`, and on
+    /// ledgers without legacy annotation bundles.
+    hidden_p_ids: Vec<u32>,
     /// Cached s_id → Sid for amortized IRI resolution.
     sid_cache: HashMap<u64, Sid>,
     /// Whether predicate is a variable (for internal predicate filtering).
@@ -216,6 +228,21 @@ pub struct BinaryScanOperator {
     #[expect(dead_code)]
     index_hint: Option<IndexType>,
     object_bounds: Option<ObjectBounds>,
+    /// Set at open when a term-predicate bound became the POST seek range:
+    /// the inclusive `o_key` interval every emitted row must fall in. The
+    /// seek keys only narrow the leaflets read, so rows are checked against
+    /// it in encoded form, without a decode.
+    term_o_key_range: Option<(u64, u64)>,
+    /// Set at open when the bounds constrain a term's inner subject or
+    /// object and the store encodes them: every emitted term handle's
+    /// dictionary key must match, checked without decoding the term.
+    term_key_filter: Option<TermKeyFilter>,
+    /// An `rdf:reifies` scan with a variable object yields only triple-term
+    /// rows: the predicate is the link, and the write path admits no other
+    /// object, so this only ever drops rows written before that rule.
+    /// Checked on the encoded object type; it also narrows a POST seek to
+    /// the term segment.
+    term_only: bool,
     /// Bound object value, if the triple pattern's object is a constant.
     bound_o: Option<FlakeValue>,
     /// `bound_o` as its persisted `(o_type, o_key)` when it is an IRI the
@@ -739,6 +766,7 @@ impl BinaryScanOperator {
             pending_cursors: VecDeque::new(),
             p_sids: Vec::new().into(),
             p_sids_ephemeral: HashMap::new(),
+            hidden_p_ids: Vec::new(),
             sid_cache: HashMap::new(),
             p_is_var,
             include_system_facts: false,
@@ -747,6 +775,9 @@ impl BinaryScanOperator {
             emit,
             index_hint,
             object_bounds,
+            term_o_key_range: None,
+            term_key_filter: None,
+            term_only: false,
             bound_o: None,
             bound_o_encoded: None,
             check_s_eq_o,
@@ -821,7 +852,7 @@ impl BinaryScanOperator {
             // for debug / inspection workflows.
             if self.p_is_var
                 && !self.include_system_facts
-                && fluree_db_core::is_reserved_reifies_predicate(&flake.p)
+                && fluree_db_core::is_scan_hidden_predicate(&flake.p)
             {
                 continue;
             }
@@ -851,6 +882,10 @@ impl BinaryScanOperator {
                     FlakeValue::Ref(o) if *o == flake.p => {}
                     _ => continue,
                 }
+            }
+
+            if self.term_only && !matches!(flake.o, FlakeValue::TripleTerm(_)) {
+                continue;
             }
 
             // Datatype / language constraint checks (range fallback path).
@@ -1193,40 +1228,22 @@ impl BinaryScanOperator {
             .unwrap_or_else(|| Sid::new(0, ""))
     }
 
-    /// Filter: skip `f:reifies*` system predicates when predicate is a
-    /// variable.
+    /// Filter: skip the legacy `f:reifies*` bundle predicates when the
+    /// predicate is a variable.
     ///
-    /// The seven edge-annotation bundle predicates are hidden in
-    /// **every** graph context: the annotation bundle is emitted in the
-    /// reified edge's graph, so a per-graph `?p` scan would otherwise
-    /// leak the bundle into the user's results. They are the internal
-    /// encoding of `@annotation` — user transactions cannot write them,
-    /// so surfacing them would break export/re-import round-trips.
+    /// They are the internal encoding of annotations written before
+    /// `rdf:reifies` links, hidden in **every** graph context since a bundle
+    /// lives in its reified edge's graph. User transactions cannot write
+    /// them, so surfacing them would break export/re-import round-trips.
     ///
     /// Other Fluree-namespace predicates are NOT filtered: system
     /// metadata lives in its own graphs (txn-meta at `g_id == 1`,
     /// config at `g_id == 2`), and `f:`-vocabulary data users author in
     /// the default graph (e.g. `f:AccessPolicy` definitions) must stay
-    /// visible to wildcard scans. A default-graph namespace-wide hide
-    /// existed historically, from the era when commit metadata was
-    /// stored in the main graph.
+    /// visible to wildcard scans.
     #[inline]
     fn is_internal_predicate(&self, p_id: u32) -> bool {
-        if !self.p_is_var {
-            return false;
-        }
-        // Opt-in escape for debug / inspection workflows.
-        if self.include_system_facts {
-            return false;
-        }
-        let sid = match self.p_sids_ephemeral.get(&p_id) {
-            Some(sid) => sid,
-            None => match self.p_sids.get(p_id as usize) {
-                Some(sid) => sid,
-                None => return false,
-            },
-        };
-        fluree_db_core::is_reserved_reifies_predicate(sid)
+        !self.hidden_p_ids.is_empty() && self.hidden_p_ids.contains(&p_id)
     }
 
     /// Enforce within-pattern repeated-variable constraints.
@@ -1340,7 +1357,7 @@ impl BinaryScanOperator {
     /// can drop or transform a row after the cursor yields it, and there are no
     /// overlay-only fallback rows. Each clause below maps to exactly one
     /// `continue`/drop site in `batch_to_bindings`:
-    /// - bound predicate (`!p_is_var`) → `is_internal_predicate` never skips
+    /// - no hidden predicates (`hidden_p_ids`) → `is_internal_predicate` never skips
     /// - no encoded pre-filters, datatype constraint, repeated-var checks,
     ///   bound object, object bounds, or unresolved-bound-subject IRI check
     /// - no inline ops (which may carry FILTER/BIND that drop rows)
@@ -1352,7 +1369,7 @@ impl BinaryScanOperator {
     /// returns `Ok(None)` and the caller falls back to the streaming drain.
     fn count_only_eligible(&self) -> bool {
         matches!(self.mode, crate::temporal_mode::TemporalMode::Current)
-            && !self.p_is_var
+            && self.hidden_p_ids.is_empty()
             && self.inline_ops.is_empty()
             && self.encoded_pre_filters.is_empty()
             && self.object_bounds.is_none()
@@ -1465,8 +1482,38 @@ impl BinaryScanOperator {
                     continue;
                 }
             }
+            if self.term_only && o_type != OType::TRIPLE_TERM.as_u16() {
+                continue;
+            }
+            if let Some((lo, hi)) = self.term_o_key_range {
+                if o_key < lo || o_key > hi {
+                    continue;
+                }
+            }
+            if let Some(f) = self.term_key_filter {
+                // Only a term can satisfy a term-component bound.
+                if o_type != OType::TRIPLE_TERM.as_u16() {
+                    continue;
+                }
+                let Some(key) = term_key_for_handle(o_key, &store_arc, dict_novelty_arc.as_ref())
+                    .map_err(|e| QueryError::from_io("resolve_term_key", e))?
+                else {
+                    continue;
+                };
+                if f.s_id.is_some_and(|s| s != key.s_id)
+                    || f.o
+                        .is_some_and(|(ot, ok)| ot != key.o_type.as_u16() || ok != key.o_key)
+                {
+                    continue;
+                }
+            }
+            let bounds_need_value = self.object_bounds.as_ref().is_some_and(|b| {
+                b.has_value_bounds()
+                    || (b.term_predicate.is_some() && self.term_o_key_range.is_none())
+                    || (b.has_term_component_bounds() && self.term_key_filter.is_none())
+            });
             let needs_o_decode = (self.bound_o.is_some() && self.bound_o_encoded.is_none())
-                || self.object_bounds.is_some()
+                || bounds_need_value
                 || (!late_materialize && self.o_var_pos.is_some());
             // BinaryGraphView::decode_value is novelty-aware: dict-backed types
             // (IriRef, StringDict, JsonArena) automatically route through
@@ -1497,7 +1544,7 @@ impl BinaryScanOperator {
                 }
             }
 
-            if let Some(bounds) = &self.object_bounds {
+            if let Some(bounds) = self.object_bounds.as_ref().filter(|_| bounds_need_value) {
                 let Some(val) = decoded_o.as_ref() else {
                     return Err(QueryError::Internal(
                         "object bounds require object decoding".to_string(),
@@ -1709,7 +1756,7 @@ impl BinaryScanOperator {
     ///   unconditional), and on the scan filter's match set never exceeding
     ///   the comparator's equal-value run. Subject/predicate brackets compare
     ///   `Sid`s only and need none of that reasoning. Reference objects use
-    ///   that same exact Sid ordering in `bounded_ref_object_walk` below.
+    ///   that same exact Sid ordering in `bounded_object_walk` below.
     ///
     /// The walk order is a property of the bracketed term, NOT of `self.index`:
     /// the *set* of novelty flakes for a subject is the same however it is
@@ -1768,15 +1815,33 @@ impl BinaryScanOperator {
     /// Reference values form an exact, contiguous run in OPST order, or
     /// within one predicate in POST order. Keep every datatype, subject,
     /// timestamp and metadata value in that run so a base assertion never
-    /// loses its cancelling overlay op.
+    /// loses its cancelling overlay op. A triple term orders by its base
+    /// subject and predicate first, so the terms sharing those form a run that
+    /// holds every flake the scan's handle compare can match.
     /// Literal objects keep the existing whole-graph fallback: their scan
     /// match semantics can exceed a single comparator equality class.
-    fn bounded_ref_object_walk(
+    fn bounded_object_walk(
         object: Option<&FlakeValue>,
         predicate: Option<&Sid>,
     ) -> Option<BoundedOverlayWalk> {
-        let FlakeValue::Ref(sid) = object? else {
-            return None;
+        let (lo, hi) = match object? {
+            FlakeValue::Ref(sid) => (FlakeValue::Ref(sid.clone()), FlakeValue::Ref(sid.clone())),
+            FlakeValue::TripleTerm(term) => {
+                let bound = |o: FlakeValue, dt: Sid| {
+                    FlakeValue::TripleTerm(Box::new(fluree_db_core::TripleTermValue {
+                        s: term.s.clone(),
+                        p: term.p.clone(),
+                        o,
+                        dt,
+                        lang: None,
+                    }))
+                };
+                (
+                    bound(FlakeValue::min(), Sid::min()),
+                    bound(FlakeValue::max(), Sid::max()),
+                )
+            }
+            _ => return None,
         };
         Some(BoundedOverlayWalk {
             // POST leads with predicate, then object value/datatype; OPST
@@ -1790,7 +1855,7 @@ impl BinaryScanOperator {
             first: Flake::new(
                 Sid::min(),
                 predicate.cloned().unwrap_or_else(Sid::min),
-                FlakeValue::Ref(sid.clone()),
+                lo,
                 Sid::min(),
                 i64::MIN,
                 false,
@@ -1799,7 +1864,7 @@ impl BinaryScanOperator {
             rhs: Flake::new(
                 Sid::max(),
                 predicate.cloned().unwrap_or_else(Sid::max),
-                FlakeValue::Ref(sid.clone()),
+                hi,
                 Sid::max(),
                 i64::MAX,
                 true,
@@ -2058,6 +2123,9 @@ impl Operator for BinaryScanOperator {
             return Err(QueryError::OperatorAlreadyOpened);
         }
 
+        if matches!(&self.pattern.p, Ref::Sid(p) if fluree_db_core::is_rdf_reifies(p)) {
+            crate::term_components::require_indexed_links(ctx)?;
+        }
         // Resolve store and g_id from context.
         self.store = ctx.binary_store.clone();
         self.g_id = ctx.binary_g_id;
@@ -2121,6 +2189,11 @@ impl Operator for BinaryScanOperator {
         let store_ref = store.as_ref();
         // Persisted p_id → Sid table, built once per store instance.
         self.p_sids = Arc::clone(store_ref.p_sid_table());
+        self.hidden_p_ids.clear();
+        if self.p_is_var && !self.include_system_facts {
+            self.hidden_p_ids
+                .extend_from_slice(store_ref.scan_hidden_p_ids());
+        }
 
         // Extract bound terms in snapshot namespace space and build the persisted-ID filter
         // by translating through full IRIs into store namespace space.
@@ -2128,6 +2201,8 @@ impl Operator for BinaryScanOperator {
             Self::extract_bound_terms_snapshot(ctx.active_snapshot, &self.pattern);
         self.bound_o = o_val;
         self.bound_o_encoded = None;
+        self.term_only =
+            self.bound_o.is_none() && p_sid.as_ref().is_some_and(fluree_db_core::is_rdf_reifies);
         let mut filter = Self::build_filter_from_snapshot_sids(
             ctx.active_snapshot,
             &self.pattern,
@@ -2468,8 +2543,28 @@ impl Operator for BinaryScanOperator {
         let mut range_min_okey: Option<u64> = None;
         let mut range_max_okey: Option<u64> = None;
         let mut range_o_type: Option<u16> = None;
+        let mut term_o_key_range: Option<(u64, u64)> = None;
         if order == RunSortOrder::Post && filter.p_id.is_some() && self.bound_o.is_none() {
+            if self.term_only && filter.o_type.is_none() {
+                filter.o_type = Some(OType::TRIPLE_TERM.as_u16());
+            }
             if let Some(bounds) = self.object_bounds.as_ref() {
+                // A term-predicate bound is one contiguous handle interval:
+                // handles are `(inner p_id << 32) | seq`.
+                if let Some(sid) = bounds.term_predicate.as_ref() {
+                    if let Some(p) = store_ref
+                        .sid_to_iri(sid)
+                        .and_then(|iri| store_ref.find_predicate_id(&iri))
+                    {
+                        let (lo, hi) = fluree_db_core::triple_term::term_handle_range(p);
+                        let ot = OType::TRIPLE_TERM.as_u16();
+                        range_o_type = Some(ot);
+                        range_min_okey = Some(lo);
+                        range_max_okey = Some(hi);
+                        filter.o_type = Some(ot);
+                        term_o_key_range = Some((lo, hi));
+                    }
+                }
                 let supports_range = |ot: OType| -> bool {
                     matches!(
                         ot,
@@ -2552,6 +2647,28 @@ impl Operator for BinaryScanOperator {
         // Create cursor. If any of (s_id, p_id, o_type, o_key) are bound OR we have a
         // temporal object-key range (POST + bounds), construct a narrow min/max key range
         // so we can seek into the branch manifest rather than scanning all leaves.
+        self.term_o_key_range = term_o_key_range;
+
+        // Inner-subject / inner-object bounds on a term variable: encode
+        // them once here and compare each handle's dictionary key in the
+        // row loop. A component the dictionaries do not hold names no
+        // interned term, so no base row can match; only novelty remains.
+        self.term_key_filter = None;
+        if let Some(bounds) = self
+            .object_bounds
+            .as_ref()
+            .filter(|b| b.has_term_component_bounds())
+        {
+            match encode_term_key_filter(bounds, store_ref, ctx.dict_novelty.as_ref()) {
+                Ok(f) => self.term_key_filter = Some(f),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await;
+                }
+                // Unencodable: the row loop decodes and checks the term.
+                Err(_) => {}
+            }
+        }
+
         let use_range = |filter: &BinaryFilter| {
             filter.s_id.is_some()
                 || filter.p_id.is_some()
@@ -2644,7 +2761,7 @@ impl Operator for BinaryScanOperator {
             // subject, use both predicate and reference object when available:
             // translating a whole predicate discards the selective object bound.
             let bounded = if s_sid.is_none() {
-                Self::bounded_ref_object_walk(self.bound_o.as_ref(), p_sid.as_ref())
+                Self::bounded_object_walk(self.bound_o.as_ref(), p_sid.as_ref())
             } else {
                 None
             }
@@ -2874,6 +2991,12 @@ impl Operator for BinaryScanOperator {
             // Record novelty-only predicates so that ephemeral p_ids from
             // overlay ops can be decoded back to Sids during row binding.
             for (sid, ep_id) in &translated.ephemeral_preds {
+                if self.p_is_var
+                    && !self.include_system_facts
+                    && fluree_db_core::is_scan_hidden_predicate(sid)
+                {
+                    self.hidden_p_ids.push(*ep_id);
+                }
                 self.p_sids_ephemeral.insert(*ep_id, sid.clone());
             }
 
@@ -3074,8 +3197,10 @@ impl Operator for BinaryScanOperator {
             return Ok(None);
         }
         if !self.count_only_eligible() {
+            stamp_scan_count_drain(false);
             return Ok(None);
         }
+        stamp_scan_count_drain(true);
 
         // Residency mode: handle a store's ContentStore + retry budget for
         // the drain/fetch/retry arm in the cursor loop below.
@@ -3130,6 +3255,7 @@ impl Operator for BinaryScanOperator {
         self.sid_cache.clear();
         self.p_sids = Vec::new().into();
         self.p_sids_ephemeral.clear();
+        self.hidden_p_ids.clear();
         self.unresolved_bound_subject_iri = None;
         self.state = OperatorState::Closed;
     }
@@ -3656,6 +3782,8 @@ pub(crate) fn translate_one_flake_v3_pub(
     }
 
     // Object value → (o_type, o_key), using flake.dt + lang for proper OType.
+    // A term novelty derived has no handle until the index interns it; it is
+    // an ordinary novelty-only value, so it takes the raw-flake lane.
     let (o_type, o_key) = value_to_otype_okey(
         &flake.o,
         &flake.dt,
@@ -3663,7 +3791,16 @@ pub(crate) fn translate_one_flake_v3_pub(
         store,
         dict_novelty,
         Some((g_id, p_id)),
-    )?;
+    )
+    .map_err(|e| match (&flake.o, e.kind()) {
+        (fluree_db_core::FlakeValue::TripleTerm(_), std::io::ErrorKind::NotFound) => {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "triple term not interned (novelty-only); use raw flake path",
+            )
+        }
+        _ => e,
+    })?;
 
     // List index
     let o_i = flake
@@ -3685,7 +3822,7 @@ pub(crate) fn translate_one_flake_v3_pub(
 }
 
 /// Resolve a subject Sid to s_id using persisted dict then DictNovelty.
-fn resolve_subject_v3(
+pub(crate) fn resolve_subject_v3(
     sid: &Sid,
     store: &BinaryIndexStore,
     dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
@@ -3768,7 +3905,7 @@ fn string_not_found_error(value: &str) -> std::io::Error {
 /// - langString: OType must embed the lang_id, not use XSD_STRING
 /// - numeric subtypes: xsd:int vs xsd:integer can share the same FlakeValue::Long
 /// - string subtypes: xsd:anyURI vs xsd:string share FlakeValue::String
-fn value_to_otype_okey(
+pub(crate) fn value_to_otype_okey(
     val: &FlakeValue,
     dt_sid: &Sid,
     lang: Option<&str>,
@@ -3958,6 +4095,7 @@ fn value_to_otype_okey(
             find_numbig_okey(val, store, numbig_ctx)
         }
         FlakeValue::Decimal(_) => find_numbig_okey(val, store, numbig_ctx),
+        FlakeValue::TripleTerm(term) => compose_term_handle(term, store, dict_novelty),
         // Not handled: Vector (arena + HNSW identity; raw-merge is the
         // intended lane).
         _ => Err(std::io::Error::new(
@@ -4180,6 +4318,21 @@ fn datatype_sid_for_untyped_value(
         },
         _ => None,
     }
+}
+
+/// Routing stamp for `drain_count`: `proceed` when it counts the cursor
+/// without binding rows, `fallback:gate_declined` when a per-row check
+/// (`count_only_eligible`) sends `COUNT(*)` to the streaming drain.
+fn stamp_scan_count_drain(counts: bool) {
+    use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
+    stamp_fast_path(
+        "scan-count-drain",
+        if counts {
+            FastPathOutcome::Proceed
+        } else {
+            FastPathOutcome::Fallback(FastPathFallback::GateDeclined)
+        },
+    );
 }
 
 /// Routing stamp for a bare-number object: `proceed` when the scan seeks its
@@ -4407,6 +4560,152 @@ fn otype_from_dt_sid(dt_sid: &Sid, store: &BinaryIndexStore) -> Option<OType> {
     Some(OType::customer_datatype(dt_id))
 }
 
+/// The inner-subject / inner-object bounds of a term variable in encoded
+/// form. `NotFound` when a component is absent from the dictionaries (no
+/// interned term can carry it); any other error leaves the bounds to the
+/// decoded check.
+fn encode_term_key_filter(
+    bounds: &fluree_db_core::ObjectBounds,
+    store: &BinaryIndexStore,
+    dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
+) -> std::io::Result<TermKeyFilter> {
+    let s_id = match bounds.term_subject.as_ref() {
+        Some(sid) => Some(resolve_subject_v3(sid, store, dict_novelty)?),
+        None => None,
+    };
+    let o = match bounds.term_object.as_ref() {
+        Some((value, dtc)) => {
+            let (dt, lang) = match dtc {
+                DatatypeConstraint::Explicit(dt) => (dt.clone(), None),
+                DatatypeConstraint::LangTag(tag) => (
+                    Sid::new(namespaces::RDF, rdf_names::LANG_STRING),
+                    Some(tag.as_ref()),
+                ),
+            };
+            let (ot, key) = term_object_key(value, &dt, lang, store, dict_novelty)?;
+            Some((ot.as_u16(), key))
+        }
+        None => None,
+    };
+    Ok(TermKeyFilter { s_id, o })
+}
+
+/// A term's object as a term key holds it. A decimal, big-integer or vector
+/// object is keyed by the persisted string id of its canonical form; a form
+/// the index never interned names no indexed term, so it is `NotFound`.
+pub(crate) fn term_object_key(
+    value: &FlakeValue,
+    dt: &Sid,
+    lang: Option<&str>,
+    store: &BinaryIndexStore,
+    dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
+) -> std::io::Result<(OType, u64)> {
+    let Some((o_type, form)) = fluree_db_core::triple_term::lexical_term_object(value) else {
+        return value_to_otype_okey(value, dt, lang, store, dict_novelty, None);
+    };
+    match store.find_string_id(&form)? {
+        Some(id) => Ok((o_type, u64::from(id))),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "term object form is not interned",
+        )),
+    }
+}
+
+/// A constant triple term's handle: the term dictionary's, else the
+/// provisional handle dictionary novelty gives a term the index has not
+/// interned. A term neither holds is `NotFound`: no link names it, so the
+/// pattern cannot match.
+pub fn compose_term_handle(
+    term: &fluree_db_core::TripleTermValue,
+    store: &BinaryIndexStore,
+    dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
+) -> std::io::Result<(OType, u64)> {
+    use std::io::{Error, ErrorKind};
+    match persisted_term_handle(term, store, dict_novelty) {
+        Ok(Some(handle)) => return Ok((OType::TRIPLE_TERM, handle)),
+        Ok(None) => {}
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::Unsupported) => {}
+        Err(e) => return Err(e),
+    }
+    // A provisional handle's key names its nested term's handle, so a term
+    // whose nested term has none stays materialized too.
+    if let FlakeValue::TripleTerm(inner) = &term.o {
+        compose_term_handle(inner, store, dict_novelty)?;
+    }
+    let provisional = dict_novelty
+        .filter(|dn| dn.is_initialized())
+        .and_then(|dn| dn.terms.find(term))
+        .zip(store.sid_to_p_id(&term.p))
+        .map(|(index, p_id)| fluree_db_core::triple_term::novelty_term_handle(p_id, index));
+    match provisional {
+        Some(handle) => Ok((OType::TRIPLE_TERM, handle)),
+        None => Err(Error::new(
+            ErrorKind::NotFound,
+            "triple term is not interned",
+        )),
+    }
+}
+
+/// The handle the persisted term dictionary holds for `term`.
+fn persisted_term_handle(
+    term: &fluree_db_core::TripleTermValue,
+    store: &BinaryIndexStore,
+    dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
+) -> std::io::Result<Option<u64>> {
+    let Some(p_id) = store.sid_to_p_id(&term.p) else {
+        return Ok(None);
+    };
+    let s_id = resolve_subject_v3(&term.s, store, dict_novelty)?;
+    let (o_type, o_key) =
+        term_object_key(&term.o, &term.dt, term.lang.as_deref(), store, dict_novelty)?;
+    store.find_term_handle(&fluree_db_core::triple_term::TermKey {
+        s_id,
+        p_id,
+        o_type,
+        o_key,
+    })
+}
+
+/// The encoded base edge behind any term handle: the dictionary's key, or for
+/// a provisional handle the key its novelty term encodes to. `None` when
+/// neither dictionary can name it.
+pub(crate) fn term_key_for_handle(
+    handle: u64,
+    store: &BinaryIndexStore,
+    dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
+) -> std::io::Result<Option<fluree_db_core::triple_term::TermKey>> {
+    use fluree_db_core::triple_term::{novelty_term_index, term_handle_p_id, TermKey};
+    let Some(index) = novelty_term_index(handle) else {
+        return store.resolve_term_key(handle);
+    };
+    let Some(term) = dict_novelty.and_then(|dn| dn.terms.resolve(index)) else {
+        return Ok(None);
+    };
+    let encoded = resolve_subject_v3(&term.s, store, dict_novelty).and_then(|s_id| {
+        term_object_key(&term.o, &term.dt, term.lang.as_deref(), store, dict_novelty).map(
+            |(o_type, o_key)| TermKey {
+                s_id,
+                p_id: term_handle_p_id(handle),
+                o_type,
+                o_key,
+            },
+        )
+    });
+    match encoded {
+        Ok(key) => Ok(Some(key)),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Simplified FlakeValue → (OType, o_key) translation for fast-path operators.
 ///
 /// Uses default OType for each value variant (no dt_sid/lang context needed).
@@ -4423,6 +4722,7 @@ pub(crate) fn value_to_otype_okey_simple(
         FlakeValue::Null => Ok((OType::NULL, 0)),
         FlakeValue::Boolean(b) => Ok((OType::XSD_BOOLEAN, *b as u64)),
         FlakeValue::Long(n) => Ok((OType::XSD_INTEGER, ObjKey::encode_i64(*n).as_u64())),
+        FlakeValue::TripleTerm(term) => compose_term_handle(term, store, None),
         FlakeValue::Double(d) => {
             // Encoding failures are NOT NotFound: the value could still exist in
             // the base index under a representation we can't compute, so callers
@@ -4698,7 +4998,7 @@ mod bounded_overlay_walk_tests {
             }
             novelty.apply_commit(flakes, t, &graphs).expect("commit");
         }
-        let bound = BinaryScanOperator::bounded_ref_object_walk(Some(&target), None)
+        let bound = BinaryScanOperator::bounded_object_walk(Some(&target), None)
             .expect("reference bracket");
         assert_eq!(bound.index, IndexType::Opst);
         let events = |flakes: Vec<Flake>| {
@@ -4721,8 +5021,7 @@ mod bounded_overlay_walk_tests {
         // datatype range. This must be the intersection, not either whole run.
         for predicate in [sid(102, "p0"), sid(102, "p3"), sid(102, "absent")] {
             let bound =
-                BinaryScanOperator::bounded_ref_object_walk(Some(&target), Some(&predicate))
-                    .unwrap();
+                BinaryScanOperator::bounded_object_walk(Some(&target), Some(&predicate)).unwrap();
             assert_eq!(bound.index, IndexType::Post);
             for to_t in [1, 2, 3, 6, i64::MAX] {
                 let expected = walk(&novelty, None, to_t)
@@ -4733,8 +5032,67 @@ mod bounded_overlay_walk_tests {
             }
         }
         let missing = FlakeValue::Ref(sid(100, "absent"));
-        let bound = BinaryScanOperator::bounded_ref_object_walk(Some(&missing), None).unwrap();
+        let bound = BinaryScanOperator::bounded_object_walk(Some(&missing), None).unwrap();
         assert!(walk(&novelty, Some(&bound), i64::MAX).is_empty());
+    }
+
+    /// A term object's window is the run of terms sharing its base subject
+    /// and predicate: every flake on the target term, nothing from another
+    /// base edge.
+    #[test]
+    fn term_object_window_holds_the_terms_of_its_base_edge() {
+        let mut novelty = Novelty::new(0);
+        let graphs = HashMap::new();
+        let term = |s: &str, p: &str, o: i64| {
+            FlakeValue::TripleTerm(Box::new(fluree_db_core::TripleTermValue {
+                s: sid(100, s),
+                p: sid(100, p),
+                o: FlakeValue::Long(o),
+                dt: sid(2, "integer"),
+                lang: None,
+            }))
+        };
+        let reifies = sid(3, "reifies");
+        let target = term("a", "p", 1);
+        let objects = [
+            target.clone(),
+            term("a", "p", 2),
+            term("a", "q", 1),
+            term("b", "p", 1),
+            FlakeValue::Ref(sid(100, "a")),
+        ];
+        for t in 1..=4 {
+            let flakes = (0..20)
+                .map(|i| {
+                    Flake::new(
+                        sid(101, &format!("r{i}")),
+                        reifies.clone(),
+                        objects[i % objects.len()].clone(),
+                        sid(103, "tripleTerm"),
+                        t,
+                        t % 2 == 1,
+                        None,
+                    )
+                })
+                .collect();
+            novelty.apply_commit(flakes, t, &graphs).expect("commit");
+        }
+        let bound = BinaryScanOperator::bounded_object_walk(Some(&target), Some(&reifies))
+            .expect("term bracket");
+        assert_eq!(bound.index, IndexType::Post);
+        let in_run = |f: &Flake| match &f.o {
+            FlakeValue::TripleTerm(t) => t.s == sid(100, "a") && t.p == sid(100, "p"),
+            _ => false,
+        };
+        for to_t in [1, 2, 4] {
+            let all = walk(&novelty, None, to_t);
+            let window = sorted(walk(&novelty, Some(&bound), to_t));
+            assert_eq!(
+                window,
+                sorted(all.iter().filter(|f| in_run(f)).cloned().collect())
+            );
+            assert!(window.iter().any(|f| f.o == target));
+        }
     }
 
     #[test]
@@ -4745,9 +5103,9 @@ mod bounded_overlay_walk_tests {
             FlakeValue::Double(f64::NAN),
             FlakeValue::String("5".into()),
         ] {
-            assert!(BinaryScanOperator::bounded_ref_object_walk(Some(&value), None).is_none());
+            assert!(BinaryScanOperator::bounded_object_walk(Some(&value), None).is_none());
         }
-        assert!(BinaryScanOperator::bounded_ref_object_walk(None, None).is_none());
+        assert!(BinaryScanOperator::bounded_object_walk(None, None).is_none());
     }
 
     /// The bracket must not be sensitive to a bound object: on SPOT with a bound
@@ -5305,9 +5663,9 @@ mod tests {
 
         let object = FlakeValue::Ref(Sid::new(7, "target"));
         for predicate in [None, Some(&p)] {
-            let walk = BinaryScanOperator::bounded_ref_object_walk(Some(&object), predicate)
+            let walk = BinaryScanOperator::bounded_object_walk(Some(&object), predicate)
                 .expect("reference must produce a bracketed walk");
-            assert_pinned("bounded_ref_object_walk", &walk.rhs);
+            assert_pinned("bounded_object_walk", &walk.rhs);
         }
     }
 }

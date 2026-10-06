@@ -285,3 +285,38 @@ async fn sparql_rule_head_with_annotation_or_graph_rejected() {
         );
     }
 }
+
+#[tokio::test]
+async fn sparql_rule_head_with_triple_term_rejected() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/sparql-head-term");
+    let rule_data = json!({
+        "@context": { "f": "https://ns.flur.ee/db#" },
+        "@id": "http://example.org/termHead",
+        "f:rule": {
+            "@type": "https://ns.flur.ee/db#sparql",
+            "@value": "PREFIX ex: <http://example.org/> \
+                       CONSTRUCT { ?x ex:derived <<( ?x ex:a ?y )>> } WHERE { ?x ex:a ?y }"
+        }
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+    let data = json!({
+        "@context": { "ex": "http://example.org/" },
+        "@graph": [ {"@id": "ex:thing", "ex:a": 1} ]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+    let q = json!({
+        "@context": { "ex": "http://example.org/" },
+        "select": "?x",
+        "where": {"@id": "?x", "ex:derived": "?y"},
+        "reasoning": "datalog"
+    });
+    let err = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .expect_err("a rule head cannot write a triple term");
+    let message = err.to_string();
+    assert!(
+        message.contains("termHead") && message.contains("triple term"),
+        "{message}"
+    );
+}

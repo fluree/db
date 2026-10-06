@@ -10,7 +10,7 @@
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{CompareOp, Function, Grouping, Pattern, SubqueryPattern};
 use crate::var_registry::VarId;
-use fluree_db_core::{FlakeValue, PropertyStatData, StatsView};
+use fluree_db_core::{FlakeValue, PropertyStatData, Sid, StatsView};
 use std::collections::{HashMap, HashSet};
 
 // =============================================================================
@@ -859,6 +859,9 @@ pub fn extract_object_bounds_for_var(
     filter: &Expression,
     object_var: VarId,
 ) -> Option<ObjectBounds> {
+    if let Some(bounds) = term_component_constraint(filter, object_var) {
+        return Some(bounds);
+    }
     // Only proceed if filter is range-safe
     let constraints = extract_range_constraints(filter)?;
 
@@ -879,6 +882,66 @@ pub fn extract_object_bounds_for_var(
 // =============================================================================
 // Generalized Selectivity Scoring for All Pattern Types
 // =============================================================================
+
+/// A constant on one component of a triple-term variable — `PREDICATE(?t) =
+/// <p>`, `sameTerm(SUBJECT(?t), <s>)`, `sameTerm(OBJECT(?t), "v"^^dt)` —
+/// in either operand order, as bounds the scan enforces on the handle: the
+/// predicate as one handle interval, the subject and object against the
+/// handle's dictionary key. An object literal must come as a resolved
+/// binding under `sameTerm`, which carries its datatype or tag; a plain
+/// `=` on a literal is value equality and stays a filter.
+fn term_component_constraint(filter: &Expression, object_var: VarId) -> Option<ObjectBounds> {
+    let Expression::Call { func, args } = filter else {
+        return None;
+    };
+    let same_term = match func {
+        Function::SameTerm => true,
+        Function::Eq => false,
+        _ => return None,
+    };
+    if args.len() != 2 {
+        return None;
+    }
+    let accessor = |e: &Expression| match e {
+        Expression::Call { func, args }
+            if args.len() == 1 && args[0] == Expression::Var(object_var) =>
+        {
+            match func {
+                Function::TripleSubject | Function::TriplePredicate | Function::TripleObject => {
+                    Some(func.clone())
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let (func, constant) = accessor(&args[0])
+        .map(|f| (f, &args[1]))
+        .or_else(|| accessor(&args[1]).map(|f| (f, &args[0])))?;
+    match (func, constant) {
+        (Function::TriplePredicate, Expression::Const(FlakeValue::Ref(sid))) => {
+            Some(ObjectBounds::term_predicate(sid.clone()))
+        }
+        (Function::TripleSubject, Expression::Const(FlakeValue::Ref(sid))) => {
+            Some(ObjectBounds::term_subject(sid.clone()))
+        }
+        (Function::TripleObject, Expression::Const(FlakeValue::Ref(sid))) => {
+            Some(ObjectBounds::term_object(
+                FlakeValue::Ref(sid.clone()),
+                fluree_db_core::DatatypeConstraint::Explicit(
+                    fluree_db_core::edge::id_datatype_sid(),
+                ),
+            ))
+        }
+        (Function::TripleObject, Expression::Resolved(b)) if same_term => match b.as_ref() {
+            crate::binding::Binding::Lit { val, dtc, .. } => {
+                Some(ObjectBounds::term_object(val.clone(), dtc.clone()))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
 
 /// Cardinality estimate for a generalized pattern.
 ///
@@ -1097,6 +1160,26 @@ pub fn estimate_pattern(
             row_count: estimate_branch_cardinality(patterns, stats),
         },
 
+        // A bound term is one dictionary decode; a bound subject or object is
+        // a reverse-tree prefix range. Otherwise the link scan should bind the
+        // term first, so this ranks after any real scan.
+        Pattern::TermComponents(tc) => {
+            let anchors = |c: &crate::ir::Component| match c {
+                crate::ir::Component::Var(v) => bound_vars.contains(v),
+                crate::ir::Component::Node(_) | crate::ir::Component::Literal(..) => true,
+                crate::ir::Component::Any => false,
+            };
+            let anchored = anchors(&tc.subject) || anchors(&tc.object);
+            let row_count = if bound_vars.contains(&tc.term) {
+                HIGHLY_SELECTIVE
+            } else if anchored {
+                MODERATELY_SELECTIVE
+            } else {
+                FULL_SCAN
+            };
+            PatternEstimate::Source { row_count }
+        }
+
         Pattern::PropertyPath(pp) => {
             // Anchored at a bound endpoint => a bounded closure from a fixed node,
             // not a full predicate scan. Estimating it as a world scan made reorder
@@ -1145,104 +1228,18 @@ pub fn estimate_pattern(
             row_count: DEFAULT_SERVICE_ROW_COUNT,
         },
 
-        // Edge-annotation patterns (M0): treated as a `Source` with the
-        // wrapped edge's cardinality as a first approximation. Real
-        // cost-based selection between edge-first and annotation-first
-        // scans arrives in M3 alongside `AnnotationStats`.
-        Pattern::EdgeAnnotation { edge, .. } | Pattern::AnnotationTarget { edge, .. } => {
-            PatternEstimate::Source {
-                row_count: estimate_triple_row_count(edge, bound_vars, stats),
-            }
-        }
+        // Edge-annotation patterns expand before planning; estimated by the
+        // wrapped edge's cardinality as a first approximation.
+        Pattern::EdgeAnnotation { edge, .. } => PatternEstimate::Source {
+            row_count: estimate_triple_row_count(edge, bound_vars, stats),
+        },
 
         // DefaultGraphSource wraps an expanded edge-annotation chain and
-        // runs it once per default-graph source. The chain has its own
-        // cardinality model (one reifier per matching base edge); anything
-        // the chain recognizer rejects falls back to the branch model.
+        // runs it once per default-graph source.
         Pattern::DefaultGraphSource { patterns, .. } => PatternEstimate::Source {
-            row_count: estimate_annotation_chain_cardinality(patterns, bound_vars, stats)
-                .unwrap_or_else(|| estimate_branch_cardinality_from(patterns, bound_vars, stats)),
+            row_count: estimate_branch_cardinality_from(patterns, bound_vars, stats),
         },
     }
-}
-
-/// The two entry points of an expanded edge-annotation chain, costed with
-/// `bound_vars` already bound: rows the base-edge scan yields (edge-first)
-/// and rows the cheaper of the `f:reifiesSubject` / `f:reifiesObject`
-/// lookups yields (reifier-first). `f:reifiesPredicate` is left out on
-/// purpose: its bound-object estimate divides the arena evenly across
-/// predicates, which put `TREATS` at 31k reifiers when it has 1.1M and
-/// made the lane choice sweep 952k edges per reifier probe the wrong way
-/// round; the endpoint lookups only get small when a binding makes them
-/// small. `None` when `patterns` is not a recognized chain. Shared by the
-/// wrapper's cardinality estimate and by the delegate's lane choice.
-pub(crate) fn annotation_chain_entry_rows(
-    patterns: &[Pattern],
-    bound_vars: &HashSet<VarId>,
-    stats: Option<&StatsView>,
-) -> Option<(f64, f64)> {
-    let shape = crate::annotation_edge_probe::recognize_annotation_edge(patterns)?;
-    let triple_rows = |p: &Pattern| match p {
-        Pattern::Triple(tp) => Some(estimate_triple_row_count(tp, bound_vars, stats)),
-        _ => None,
-    };
-    let edge_first = triple_rows(&shape.base)?;
-    let reifier_first = [&patterns[1], &patterns[3]]
-        .into_iter()
-        .filter_map(triple_rows)
-        .fold(f64::INFINITY, f64::min);
-    Some((edge_first, reifier_first))
-}
-
-/// Reifier candidates the chain's cheapest `f:reifies*` lookup yields with
-/// the child's variables bound — the rows a per-reifier chain must point-check
-/// before the body runs. Unlike [`annotation_chain_entry_rows`] this includes
-/// `f:reifiesPredicate`: its uniform per-predicate estimate is too coarse to
-/// size the wrapper's OUTPUT by, but as a lane entry it is exactly the POST
-/// range a predicate-only chain drives from, and it is never larger than the
-/// truth by more than the endpoint lookups already are.
-pub(crate) fn annotation_chain_probe_rows(
-    patterns: &[Pattern],
-    bound_vars: &HashSet<VarId>,
-    stats: Option<&StatsView>,
-) -> Option<f64> {
-    crate::annotation_edge_probe::recognize_annotation_edge(patterns)?;
-    let rows = patterns[1..=3]
-        .iter()
-        .filter_map(|p| match p {
-            Pattern::Triple(tp) => Some(estimate_triple_row_count(tp, bound_vars, stats)),
-            _ => None,
-        })
-        .fold(f64::INFINITY, f64::min);
-    rows.is_finite().then_some(rows)
-}
-
-/// Cardinality of an expanded edge-annotation chain — `[base edge, three
-/// `f:reifies*` triples, body…]`, the only shape `Pattern::DefaultGraphSource`
-/// wraps. The generic branch model multiplies the chain's triples in
-/// standalone-selectivity order with no regard for connectivity, so
-/// `<< ?s :P ?o >>` came out as reifiesPredicate × base edge (3,846 × 102,555
-/// ≈ 4e8 on StarBench P11) and the wrapper sorted behind its own 6.5M-row
-/// body triple, which then drove the chain once per row. The chain binds one
-/// reifier per matching base edge, so its cardinality is the cheaper of its
-/// two entry points — the base edge, or the most selective `f:reifies*`
-/// lookup — times the body's expansion with the edge and reifier bound.
-pub(crate) fn estimate_annotation_chain_cardinality(
-    patterns: &[Pattern],
-    bound_vars: &HashSet<VarId>,
-    stats: Option<&StatsView>,
-) -> Option<f64> {
-    let shape = crate::annotation_edge_probe::recognize_annotation_edge(patterns)?;
-    let (edge_first, reifier_first) = annotation_chain_entry_rows(patterns, bound_vars, stats)?;
-    let reifiers = edge_first.min(reifier_first).max(HIGHLY_SELECTIVE);
-    if shape.body.is_empty() {
-        return Some(reifiers);
-    }
-    let mut bound = bound_vars.clone();
-    bound.extend(shape.base.produced_vars());
-    bound.insert(shape.ann_var);
-    let body = estimate_branch_cardinality_from(&shape.body, &bound, stats);
-    Some((reifiers * body).max(HIGHLY_SELECTIVE))
 }
 
 /// Estimate cardinality for a sequence of patterns (UNION branch or subquery body).
@@ -1437,6 +1434,97 @@ struct RankedPattern {
     /// left-join ordering barrier (see [`left_join_order_barriers`]). Empty
     /// unless an OPTIONAL in the group shares a not-yet-certain variable with it.
     after_indices: Vec<usize>,
+    /// The inner predicate a sibling filter pins on this link triple's term
+    /// (see [`link_triple_pin`]).
+    link_pin: Option<Sid>,
+}
+
+impl RankedPattern {
+    fn estimate(&self, bound_vars: &HashSet<VarId>, stats: Option<&StatsView>) -> PatternEstimate {
+        estimate_pinned(&self.pattern, self.link_pin.as_ref(), bound_vars, stats)
+    }
+}
+
+/// [`estimate_pattern`], except that a link scan `?r rdf:reifies ?t` whose
+/// term a filter pins to inner predicate `pin` reads only that predicate's
+/// handle interval: its live links, not every link.
+fn estimate_pinned(
+    pattern: &Pattern,
+    pin: Option<&Sid>,
+    bound_vars: &HashSet<VarId>,
+    stats: Option<&StatsView>,
+) -> PatternEstimate {
+    if let (Some(pin), Some(stats), Pattern::Triple(tp)) = (pin, stats, pattern) {
+        if classify_pattern(tp, bound_vars) == PatternType::PropertyScan {
+            if let Some(links) = stats.link_count(pin) {
+                return PatternEstimate::Source {
+                    row_count: links as f64,
+                };
+            }
+        }
+    }
+    estimate_pattern(pattern, bound_vars, stats)
+}
+
+/// The inner predicates a group's filters pin on its term variables.
+pub fn link_pins(patterns: &[Pattern]) -> HashMap<VarId, Sid> {
+    patterns
+        .iter()
+        .filter_map(|p| match p {
+            Pattern::Filter(expr) => term_predicate_pin(expr),
+            _ => None,
+        })
+        .collect()
+}
+
+/// [`estimate_pattern`] for a pattern of a group whose filters pin `pins`.
+pub fn estimate_in_group(
+    pattern: &Pattern,
+    pins: &HashMap<VarId, Sid>,
+    bound_vars: &HashSet<VarId>,
+    stats: Option<&StatsView>,
+) -> PatternEstimate {
+    estimate_pinned(
+        pattern,
+        link_triple_pin(pattern, pins).as_ref(),
+        bound_vars,
+        stats,
+    )
+}
+
+/// The inner predicate `sameTerm(PREDICATE(?t), <p>)` pins on term variable
+/// `?t`, as the link lowering writes it.
+fn term_predicate_pin(filter: &Expression) -> Option<(VarId, Sid)> {
+    let Expression::Call { args, .. } = filter else {
+        return None;
+    };
+    let var = args.iter().find_map(|arg| match arg {
+        Expression::Call {
+            func: Function::TriplePredicate,
+            args,
+        } => match args.as_slice() {
+            [Expression::Var(v)] => Some(*v),
+            _ => None,
+        },
+        _ => None,
+    })?;
+    term_component_constraint(filter, var)?
+        .term_predicate
+        .map(|p| (var, p))
+}
+
+/// The pinned inner predicate of a link triple `?r rdf:reifies ?t`.
+fn link_triple_pin(pattern: &Pattern, pins: &HashMap<VarId, Sid>) -> Option<Sid> {
+    let Pattern::Triple(tp) = pattern else {
+        return None;
+    };
+    let Ref::Sid(p) = &tp.p else {
+        return None;
+    };
+    if !fluree_db_core::is_rdf_reifies(p) {
+        return None;
+    }
+    pins.get(&tp.o.as_var()?).cloned()
 }
 
 /// A deferred pattern (FILTER/BIND) with pre-computed input variables.
@@ -1643,16 +1731,13 @@ pub(crate) fn must_bind_vars(pattern: &Pattern, bind_targets: BindTargets) -> Ha
             edge,
             annotation,
             body,
-        }
-        | Pattern::AnnotationTarget {
-            annotation,
-            edge,
-            body,
+            term,
         } => {
             let mut vars: HashSet<VarId> = edge.produced_vars().into_iter().collect();
             if let Ref::Var(v) = annotation {
                 vars.insert(*v);
             }
+            vars.insert(*term);
             vars.extend(all(body));
             vars
         }
@@ -1724,7 +1809,7 @@ fn left_join_introduced_vars(pattern: &Pattern, out: &mut HashSet<VarId>) {
             let body = must_bind_vars(pattern, BindTargets::Bound);
             out.extend(sq.select.iter().copied().filter(|v| !body.contains(v)));
         }
-        Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
+        Pattern::EdgeAnnotation { body, .. } => {
             for p in body {
                 left_join_introduced_vars(p, out);
             }
@@ -1941,6 +2026,7 @@ pub fn reorder_patterns_with_seed(
     }
 
     let mut bound_vars = seed.schema.clone();
+    let link_pins = link_pins(patterns);
 
     // PIPELINE outputs of UNCORRELATED sibling subqueries (Cypher WITH-pipeline
     // producers). A pattern consuming one of these must be placed AFTER the
@@ -2154,21 +2240,25 @@ pub fn reorder_patterns_with_seed(
             }
         }
 
-        match estimate_pattern(pattern, &bound_vars, stats) {
+        let link_pin = link_triple_pin(pattern, &link_pins);
+        match estimate_pinned(pattern, link_pin.as_ref(), &bound_vars, stats) {
             PatternEstimate::Source { .. } => sources.push(RankedPattern {
                 orig_index: i,
                 pattern: pattern.clone(),
                 after_indices: barriers[i].clone(),
+                link_pin,
             }),
             PatternEstimate::Reducer { .. } => reducers.push(RankedPattern {
                 orig_index: i,
                 pattern: pattern.clone(),
                 after_indices: barriers[i].clone(),
+                link_pin,
             }),
             PatternEstimate::Expander { .. } => expanders.push(RankedPattern {
                 orig_index: i,
                 pattern: pattern.clone(),
                 after_indices: barriers[i].clone(),
+                link_pin,
             }),
             PatternEstimate::Deferred => {
                 let mut required_vars: HashSet<VarId> =
@@ -2409,8 +2499,8 @@ fn try_place_reducer(
         .enumerate()
         .filter(|(_, rp)| pattern_shares_variables(&rp.pattern, bound_vars))
         .min_by(|(_, a), (_, b)| {
-            let ca = estimate_pattern(&a.pattern, bound_vars, stats);
-            let cb = estimate_pattern(&b.pattern, bound_vars, stats);
+            let ca = a.estimate(bound_vars, stats);
+            let cb = b.estimate(bound_vars, stats);
             ca.multiplier()
                 .partial_cmp(&cb.multiplier())
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -2607,8 +2697,8 @@ fn rank_seed_candidates(
         | Pattern::S2Search(_) => 0_u8,
         _ => 1_u8,
     };
-    let ci = estimate_pattern(&remaining[i].pattern, bound_vars, stats);
-    let cj = estimate_pattern(&remaining[j].pattern, bound_vars, stats);
+    let ci = remaining[i].estimate(bound_vars, stats);
+    let cj = remaining[j].estimate(bound_vars, stats);
 
     // 1. Search sources seed first — but only before anything is bound.
     let by_search = if has_bound {
@@ -2852,8 +2942,8 @@ fn try_place_expander(
         .enumerate()
         .filter(|(_, rp)| pattern_shares_variables(&rp.pattern, bound_vars))
         .min_by(|(_, a), (_, b)| {
-            let ca = estimate_pattern(&a.pattern, bound_vars, stats);
-            let cb = estimate_pattern(&b.pattern, bound_vars, stats);
+            let ca = a.estimate(bound_vars, stats);
+            let cb = b.estimate(bound_vars, stats);
             ca.multiplier()
                 .partial_cmp(&cb.multiplier())
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -3756,16 +3846,19 @@ mod tests {
                 orig_index: 0,
                 pattern: Pattern::Triple(make_pattern(product, "vendor", vendor)),
                 after_indices: Vec::new(),
+                link_pin: None,
             },
             RankedPattern {
                 orig_index: 1,
                 pattern: Pattern::Triple(make_pattern(product, "numeric", numeric)),
                 after_indices: Vec::new(),
+                link_pin: None,
             },
             RankedPattern {
                 orig_index: 2,
                 pattern: Pattern::Triple(make_pattern(VarId(3), "reviewer", vendor)),
                 after_indices: Vec::new(),
+                link_pin: None,
             },
         ];
         let bound = HashSet::from([product]);
@@ -4286,89 +4379,6 @@ mod tests {
             Some("http://example.org/z"),
             "expected stats-driven ordering to pick the most selective predicate first; got ordered[0]={:?}",
             ordered[0]
-        );
-    }
-
-    #[test]
-    fn estimate_uses_merged_annotation_stats_for_reifies_predicates() {
-        // After `StatsView::merge_annotation_stats` runs with per-slot
-        // NDVs, the planner's classifier should produce arena-aligned
-        // BoundObject estimates: `count / ndv_values` for the matching
-        // slot's NDV, not the conservative fallback.
-
-        use fluree_db_core::AnnotationStats;
-        use fluree_vocab::db as p;
-        use fluree_vocab::namespaces::FLUREE_DB;
-
-        let mut stats = StatsView::default();
-        let ann = AnnotationStats {
-            forward_rows: 1_000,
-            reverse_rows: 1_000,
-            distinct_edges: 200,
-            distinct_annotations: 800,
-            live_attachment_pairs: 800,
-            distinct_reified_subjects: 50,
-            distinct_reified_predicates: 4,
-            distinct_reified_objects: 200,
-            ..Default::default()
-        };
-        let mut ns = std::collections::HashMap::new();
-        ns.insert(FLUREE_DB, "https://ns.flur.ee/db#".to_string());
-        stats.merge_annotation_stats(&ann, &ns);
-
-        // PropertyScan: `?ann f:reifiesObject ?o` — total annotations.
-        let scan = TriplePattern::new(
-            Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_OBJECT)),
-            Term::Var(VarId(1)),
-        );
-        let scan_est = estimate_triple_row_count(&scan, &HashSet::new(), Some(&stats));
-        assert_eq!(
-            scan_est, 800.0,
-            "PropertyScan should equal annotation count"
-        );
-
-        // BoundObject: `?ann f:reifiesObject <some_object>`. With per-
-        // slot NDV the estimate is `800 / 200 = 4` — annotations per
-        // pinned object.
-        let bound_o = TriplePattern::new(
-            Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_OBJECT)),
-            Term::Sid(Sid::new(7, "obj1")),
-        );
-        let bound_o_est = estimate_triple_row_count(&bound_o, &HashSet::new(), Some(&stats));
-        assert_eq!(
-            bound_o_est, 4.0,
-            "BoundObject on reifiesObject should be distinct_annotations / distinct_reified_objects"
-        );
-
-        // BoundSubject: a known annotation subject probing its slot.
-        let mut bound_subj_ctx = HashSet::new();
-        bound_subj_ctx.insert(VarId(0));
-        let bound_s = TriplePattern::new(
-            Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_SUBJECT)),
-            Term::Var(VarId(2)),
-        );
-        let bound_s_est = estimate_triple_row_count(&bound_s, &bound_subj_ctx, Some(&stats));
-        assert_eq!(
-            bound_s_est, 1.0,
-            "BoundSubject on reifiesSubject should be ~1 row per known annotation"
-        );
-
-        // BoundObject on reifiesPredicate: 800 / 4 = 200 annotations
-        // per pinned predicate. Larger than reifiesObject's
-        // selectivity here, which is realistic — predicates are
-        // typically a small set even at scale.
-        let bound_p = TriplePattern::new(
-            Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_PREDICATE)),
-            Term::Sid(Sid::new(7, "worksFor")),
-        );
-        let bound_p_est = estimate_triple_row_count(&bound_p, &HashSet::new(), Some(&stats));
-        assert_eq!(
-            bound_p_est, 200.0,
-            "BoundObject on reifiesPredicate should be distinct_annotations / distinct_reified_predicates"
         );
     }
 
@@ -6813,91 +6823,6 @@ mod tests {
     }
 
     #[test]
-    fn annotation_wrapper_estimate_is_one_reifier_per_edge() {
-        // StarBench P11: the wrapper's cardinality must not multiply the
-        // reifiesPredicate lookup by the base edge (3,846 × 102,555 ≈ 4e8),
-        // which sorted the wrapper behind its own 6.5M-row body triple so
-        // that triple drove the chain once per row.
-        use fluree_vocab::db::{REIFIES_OBJECT, REIFIES_PREDICATE, REIFIES_SUBJECT};
-        let (s, o, ann, x) = (VarId(0), VarId(1), VarId(2), VarId(3));
-        let fsid = |name| Ref::Sid(Sid::new(fluree_vocab::namespaces::FLUREE_DB, name));
-        let chain = vec![
-            Pattern::Triple(make_pattern(s, "TREATS", o)),
-            Pattern::Triple(TriplePattern::new(
-                Ref::Var(ann),
-                fsid(REIFIES_SUBJECT),
-                Term::Var(s),
-            )),
-            Pattern::Triple(TriplePattern::new(
-                Ref::Var(ann),
-                fsid(REIFIES_PREDICATE),
-                Term::Sid(Sid::new(100, "TREATS")),
-            )),
-            Pattern::Triple(TriplePattern::new(
-                Ref::Var(ann),
-                fsid(REIFIES_OBJECT),
-                Term::Var(o),
-            )),
-        ];
-        let body = Pattern::Triple(make_pattern(ann, "derives_from", x));
-        let mut stats = stats_with(&[
-            ("TREATS", 102_555, 6_000),
-            ("derives_from", 6_500_000, 300_000),
-        ]);
-        for (name, ndv_values) in [
-            (REIFIES_SUBJECT, 34_000),
-            (REIFIES_PREDICATE, 78),
-            (REIFIES_OBJECT, 32_000),
-        ] {
-            stats.properties.insert(
-                Sid::new(fluree_vocab::namespaces::FLUREE_DB, name),
-                PropertyStatData {
-                    count: 300_000,
-                    ndv_values,
-                    ndv_subjects: 300_000,
-                },
-            );
-        }
-        let row_count = |patterns: Vec<Pattern>| match estimate_pattern(
-            &Pattern::DefaultGraphSource { patterns },
-            &HashSet::new(),
-            Some(&stats),
-        ) {
-            PatternEstimate::Source { row_count } => row_count,
-            other => panic!("wrapper must be a Source: {other:?}"),
-        };
-
-        // Bare chain: the base edge (102,555 TREATS rows) bounds the reifier
-        // count — the endpoint lookups estimate the whole 300k arena and the
-        // reifiesPredicate lookup is deliberately not consulted (its uniform
-        // per-predicate split said 3,846 where the slice has 98,641).
-        let bare = row_count(chain.clone());
-        assert!(
-            (100_000.0..110_000.0).contains(&bare),
-            "bare chain ≈ 102,555 reifiers, got {bare}"
-        );
-        // With the body nested: reifiers × ~22 derives_from rows each, still
-        // well under the 6.5M-row body triple on its own.
-        let mut with_body = chain.clone();
-        with_body.push(body.clone());
-        let nested = row_count(with_body);
-        assert!(
-            (2_000_000.0..2_500_000.0).contains(&nested),
-            "chain × body ≈ 2.26M, got {nested}"
-        );
-        // And the wrapper drives its body triple, not the other way round.
-        let ordered = reorder_patterns(
-            &[Pattern::DefaultGraphSource { patterns: chain }, body],
-            Some(&stats),
-            &HashSet::new(),
-        );
-        assert!(
-            matches!(&ordered[0], Pattern::DefaultGraphSource { .. }),
-            "the annotation wrapper must seed before its 6.5M-row body triple: {ordered:?}"
-        );
-    }
-
-    #[test]
     fn producer_then_consumer_order_not_regressed() {
         // IC9 shape: the WITH producer seeds, then its consumer (`HAS_CREATOR`,
         // which references `friend`) drains immediately after.
@@ -7214,5 +7139,63 @@ mod tests {
         // producer estimate does not apply, so it is not a trustworthy seed.
         let sq = SubqueryPattern::new(vec![VarId(0)], unanchored_body()).with_distinct();
         assert!(!subquery_output_estimate_is_bounded(&sq));
+    }
+
+    /// S7's shape: a link scan whose term a filter pins to a rare inner
+    /// predicate drives the join once the stats count that predicate's live
+    /// links; ranked at every link, it loses to a smaller scan.
+    #[test]
+    fn a_pinned_link_scan_is_ranked_by_its_inner_predicates_links() {
+        let (source, ty, ann, term) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let reifies = fluree_db_core::rdf_reifies_sid().clone();
+        let part_of = Sid::new(100, "PART_OF");
+        let patterns = vec![
+            triple(source, "type", ty),
+            triple(ann, "derives_from", source),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(ann),
+                Ref::Sid(reifies.clone()),
+                Term::Var(term),
+            )),
+            Pattern::Filter(Expression::Call {
+                func: Function::SameTerm,
+                args: vec![
+                    Expression::Call {
+                        func: Function::TriplePredicate,
+                        args: vec![Expression::Var(term)],
+                    },
+                    Expression::Const(FlakeValue::Ref(part_of.clone())),
+                ],
+            }),
+        ];
+        let mut stats = stats_with(&[("type", 600_000, 100), ("derives_from", 3_000_000, 1_000)]);
+        stats.properties.insert(
+            reifies.clone(),
+            PropertyStatData {
+                count: 2_000_000,
+                ndv_values: 2_000_000,
+                ndv_subjects: 2_000_000,
+            },
+        );
+        let first =
+            |stats: &StatsView| match &reorder_patterns(&patterns, Some(stats), &HashSet::new())[0]
+            {
+                Pattern::Triple(tp) => tp.p.clone(),
+                other => panic!("{other:?}"),
+            };
+        assert_eq!(first(&stats), Ref::Sid(Sid::new(100, "type")));
+
+        stats.links = Some(HashMap::from([(part_of.clone(), 120_000)]));
+        assert_eq!(first(&stats), Ref::Sid(reifies));
+        let pins = link_pins(&patterns);
+        assert_eq!(
+            estimate_in_group(&patterns[2], &pins, &HashSet::new(), Some(&stats)).row_count(),
+            120_000.0
+        );
+        // Once the reifier is bound the scan is a probe, pinned or not.
+        assert!(
+            estimate_in_group(&patterns[2], &pins, &HashSet::from([ann]), Some(&stats)).row_count()
+                < 10.0
+        );
     }
 }

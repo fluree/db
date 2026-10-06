@@ -175,6 +175,11 @@ fn terms_match(
             false
         }
         (RdfTerm::Iri(e), RdfTerm::Iri(a)) => e == a,
+        (RdfTerm::Triple(e), RdfTerm::Triple(a)) => {
+            terms_match(&e.subject, &a.subject, bnode_map)
+                && terms_match(&e.predicate, &a.predicate, bnode_map)
+                && terms_match(&e.object, &a.object, bnode_map)
+        }
         _ => false, // Type mismatch
     }
 }
@@ -320,9 +325,7 @@ fn are_graphs_isomorphic(expected: &[Triple], actual: &[Triple]) -> bool {
     // Fast path: no blank nodes in either graph — just sort and compare.
     let has_bnodes = |triples: &[Triple]| {
         triples.iter().any(|t| {
-            matches!(t.subject, RdfTerm::BlankNode(_))
-                || matches!(t.predicate, RdfTerm::BlankNode(_))
-                || matches!(t.object, RdfTerm::BlankNode(_))
+            t.subject.has_blank_node() || t.predicate.has_blank_node() || t.object.has_blank_node()
         })
     };
 
@@ -353,6 +356,7 @@ fn rdf_term_sort_key(a: &RdfTerm, b: &RdfTerm) -> std::cmp::Ordering {
             RdfTerm::BlankNode(_) => 0,
             RdfTerm::Iri(_) => 1,
             RdfTerm::Literal { .. } => 2,
+            RdfTerm::Triple(_) => 3,
         }
     };
     discriminant(a).cmp(&discriminant(b)).then_with(|| {
@@ -371,6 +375,7 @@ fn rdf_term_sort_key(a: &RdfTerm, b: &RdfTerm) -> std::cmp::Ordering {
                     language: bl,
                 },
             ) => av.cmp(bv).then_with(|| ad.cmp(bd)).then_with(|| al.cmp(bl)),
+            (RdfTerm::Triple(a), RdfTerm::Triple(b)) => triple_sort_key(a, b),
             _ => std::cmp::Ordering::Equal, // different discriminants already handled
         }
     })

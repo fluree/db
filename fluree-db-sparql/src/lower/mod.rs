@@ -242,10 +242,8 @@ pub fn resolve_dataset_clause(ast: &SparqlAst) -> Result<Option<ResolvedDatasetC
 ///
 /// Patterns built via the IR-level `expand_edge_annotation_patterns`
 /// pass also produce `f:reifies*` triples, but that pass runs at
-/// execution time on top of `Pattern::EdgeAnnotation` /
-/// `Pattern::AnnotationTarget`, *after* this firewall. SPARQL has no
-/// surface that produces those container variants today, so any
-/// `f:reifies*` triple visible here came from user input.
+/// execution time on top of `Pattern::EdgeAnnotation`, *after* this
+/// firewall, so any `f:reifies*` triple visible here came from user input.
 fn reject_direct_reifies_in_patterns(patterns: &[Pattern]) -> Result<()> {
     use fluree_db_query::ir::triple::Ref;
     use fluree_vocab::reifies_iris;
@@ -320,6 +318,13 @@ fn reject_direct_reifies_in_patterns(patterns: &[Pattern]) -> Result<()> {
                         return Err(reject_predicate_string(format!("{reserved}")));
                     }
                 }
+                Pattern::TermComponents(tc) => {
+                    if let fluree_db_query::ir::Component::Node(p) = &tc.predicate {
+                        if fluree_db_core::is_reserved_reifies_predicate(p) {
+                            return Err(reject_predicate_string(format!("{p}")));
+                        }
+                    }
+                }
                 // ShortestPath also carries a predicate Sid; apply the same
                 // firewall (no SPARQL surface produces it today, but stay safe).
                 // The wildcard form (`predicate: None`) excludes `f:reifies*`
@@ -343,7 +348,7 @@ fn reject_direct_reifies_in_patterns(patterns: &[Pattern]) -> Result<()> {
                 Pattern::Graph { patterns, .. } => walk(patterns)?,
                 Pattern::Service(sp) => walk(&sp.patterns)?,
                 Pattern::Subquery(sq) => walk(&sq.patterns)?,
-                Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
+                Pattern::EdgeAnnotation { body, .. } => {
                     walk(body)?;
                 }
                 Pattern::DefaultGraphSource { patterns } => walk(patterns)?,
@@ -4589,34 +4594,33 @@ mod tests {
         }
     }
 
+    /// The link `?ann rdf:reifies <<( s p o )>>` of a fully constant edge.
+    fn is_constant_link(p: &Pattern) -> bool {
+        matches!(
+            p,
+            Pattern::Triple(tp)
+                if matches!(&tp.p, Ref::Sid(sid) if fluree_db_core::is_rdf_reifies(sid))
+                    && matches!(&tp.o, Term::Value(fluree_db_core::FlakeValue::TripleTerm(_)))
+        )
+    }
+
     #[test]
-    fn m43_rdf_reifies_lowers_to_annotation_target_with_empty_body() {
+    fn m43_rdf_reifies_lowers_to_the_link() {
         let query = lower_query(
             "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
              PREFIX ex: <http://example.org/>
              SELECT * WHERE { ?ann rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> . }",
         )
         .unwrap();
-        // The pattern list contains exactly one AnnotationTarget. Sibling
-        // triples about ?ann (none in this query) would join via the
-        // standard executor — the AnnotationTarget itself carries no body.
-        let n = query
-            .patterns
-            .iter()
-            .filter(|p| matches!(p, Pattern::AnnotationTarget { .. }))
-            .count();
-        assert_eq!(n, 1, "expected exactly one AnnotationTarget IR pattern");
-        for p in &query.patterns {
-            if let Pattern::AnnotationTarget { body, .. } = p {
-                assert!(body.is_empty(), "M4.3 emits empty body");
-            }
-        }
+        // A constant edge composes to its term: one link triple, nothing else.
+        assert_eq!(query.patterns.len(), 1, "{:?}", query.patterns);
+        assert!(is_constant_link(&query.patterns[0]), "{:?}", query.patterns);
     }
 
     #[test]
     fn m43_sibling_triples_about_reifier_stay_in_outer_scope() {
-        // ?ann ex:role "Engineer" must remain a regular Pattern::Triple
-        // alongside the AnnotationTarget — NOT folded into body.
+        // ?ann ex:role "Engineer" stays a regular Pattern::Triple beside the
+        // link.
         let query = lower_query(
             "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
              PREFIX ex: <http://example.org/>
@@ -4626,24 +4630,15 @@ mod tests {
              }",
         )
         .unwrap();
-        let n_target = query
-            .patterns
-            .iter()
-            .filter(|p| matches!(p, Pattern::AnnotationTarget { .. }))
-            .count();
-        let n_triple = query
-            .patterns
-            .iter()
-            .filter(|p| matches!(p, Pattern::Triple(_)))
-            .count();
-        assert_eq!(n_target, 1);
-        assert_eq!(n_triple, 1, "sibling stays as outer Pattern::Triple");
-        // And the body of AnnotationTarget is empty.
-        for p in &query.patterns {
-            if let Pattern::AnnotationTarget { body, .. } = p {
-                assert!(body.is_empty());
-            }
-        }
+        assert_eq!(query.patterns.len(), 2, "{:?}", query.patterns);
+        assert_eq!(
+            query
+                .patterns
+                .iter()
+                .filter(|p| is_constant_link(p))
+                .count(),
+            1
+        );
     }
 
     #[test]

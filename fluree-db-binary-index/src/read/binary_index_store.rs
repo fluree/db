@@ -31,6 +31,7 @@ use parking_lot::RwLock;
 use crate::dict::forward_pack::{KIND_STRING_FWD, KIND_SUBJECT_FWD};
 use crate::dict::global_dict::{LanguageTagDict, PredicateDict};
 use crate::dict::pack_reader::ForwardPackReader;
+use crate::dict::term_dict::TermDictReader;
 use crate::dict::DictTreeReader;
 use crate::format::branch::{read_branch_from_bytes, BranchManifest};
 use crate::format::index_root::{IndexRoot, OTypeTableEntry};
@@ -61,6 +62,8 @@ pub(crate) struct DictionarySet {
     /// String forward pack reader (all string IDs in one stream).
     pub(crate) string_forward_packs: ForwardPackReader,
     pub(crate) string_reverse_tree: Option<Arc<DictTreeReader>>,
+    /// Triple-term dictionary; `None` when the root carries no term section.
+    pub(crate) term_dict: Option<TermDictReader>,
     // Kept for: DictOverlay watermark computation (query overlay resolution).
     // Use when: DictOverlay is wired into V3 query execution for overlay transactions.
     #[expect(dead_code)]
@@ -324,6 +327,7 @@ pub struct BinaryIndexStore {
     /// configuration (`set_ns_split_mode`, namespace augmentation), which
     /// cannot occur once the store is behind `Arc`.
     p_sid_table: std::sync::OnceLock<Arc<[Sid]>>,
+    scan_hidden_p_ids: std::sync::OnceLock<Box<[u32]>>,
     /// Conclusive per-`(graph, predicate)` decimal-only proofs. Index contents
     /// are immutable per store, so a proof holds for the store's lifetime.
     decimal_only_proofs: RwLock<HashMap<(GraphId, u32), bool>>,
@@ -367,6 +371,7 @@ impl BinaryIndexStore {
                 subject_reverse_tree: None,
                 string_forward_packs: ForwardPackReader::empty(),
                 string_reverse_tree: None,
+                term_dict: None,
                 subject_count: 0,
                 string_count: 0,
                 namespace_codes: Arc::new(HashMap::new()),
@@ -393,6 +398,7 @@ impl BinaryIndexStore {
             ns_split_mode: NsSplitMode::default(),
             ns_split_mode_set: true,
             p_sid_table: std::sync::OnceLock::new(),
+            scan_hidden_p_ids: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
         }
     }
@@ -575,6 +581,7 @@ impl BinaryIndexStore {
             ns_split_mode: root.ns_split_mode,
             ns_split_mode_set: true,
             p_sid_table: std::sync::OnceLock::new(),
+            scan_hidden_p_ids: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
         })
     }
@@ -1517,6 +1524,7 @@ impl BinaryIndexStore {
             DecodeKind::SpatialArena => Err(io::Error::other(
                 "spatial arena decode not yet implemented in V6",
             )),
+            DecodeKind::TripleTermDict => self.decode_triple_term(o_key),
         }
     }
 
@@ -1891,6 +1899,19 @@ impl BinaryIndexStore {
         })
     }
 
+    /// Persisted p_ids of the predicates wildcard scans hide
+    /// ([`fluree_db_core::is_scan_hidden_predicate`]). Empty unless the
+    /// ledger's history holds legacy annotation bundles, so a
+    /// variable-predicate scan of any other ledger checks no row.
+    pub fn scan_hidden_p_ids(&self) -> &[u32] {
+        self.scan_hidden_p_ids.get_or_init(|| {
+            fluree_vocab::reifies_iris::ALL
+                .iter()
+                .filter_map(|iri| self.find_predicate_id(iri))
+                .collect()
+        })
+    }
+
     /// Lookup a predicate IRI → p_id.
     pub fn find_predicate_id(&self, iri: &str) -> Option<u32> {
         self.dicts.predicate_reverse.get(iri).copied()
@@ -2022,6 +2043,7 @@ impl BinaryIndexStore {
             OType::VECTOR => Some(Sid::new(namespaces::FLUREE_DB, "embeddingVector")),
             OType::FULLTEXT => Some(Sid::new(namespaces::FLUREE_DB, "fullText")),
             OType::GEO_POINT => Some(Sid::new(namespaces::OGC_GEO, geo_names::WKT_LITERAL)),
+            OType::TRIPLE_TERM => Some(fluree_db_core::triple_term_datatype_sid().clone()),
 
             // Types without a stable datatype (or not representable as typed literals)
             // return None so callers can either skip constraints or use a safe fallback.
@@ -2054,11 +2076,16 @@ impl BinaryIndexStore {
     /// site that turns a decoded `EncodedLit` into a typed term must resolve
     /// its datatype here; one that reads `dt_sids()` directly reports overflow
     /// integers as `xsd:decimal` and keys them apart from decoded copies of
-    /// the same value (issue #1329).
+    /// the same value (issue #1329). A triple-term `EncodedLit` carries no
+    /// `dt_id` either.
     ///
     /// [`resolve_datatype_sid_for_value`]: Self::resolve_datatype_sid_for_value
     pub fn resolve_dt_id_sid_for_value(&self, dt_id: u16, val: &FlakeValue) -> Option<Sid> {
         val.overflow_numeric_datatype_sid()
+            .or_else(|| {
+                val.is_triple_term()
+                    .then(|| fluree_db_core::triple_term_datatype_sid().clone())
+            })
             .or_else(|| self.dt_sids().get(dt_id as usize).cloned())
     }
 
@@ -2251,6 +2278,107 @@ impl BinaryIndexStore {
         Some(proven)
     }
 
+    /// True when the index carries a triple-term dictionary.
+    pub fn has_term_dict(&self) -> bool {
+        self.dicts.term_dict.is_some()
+    }
+
+    /// The triple-term dictionary, if the index carries one.
+    pub fn term_dict(&self) -> Option<&TermDictReader> {
+        self.dicts.term_dict.as_ref()
+    }
+
+    /// The `OType::TRIPLE_TERM` handle for an encoded base edge, if interned.
+    pub fn find_term_handle(
+        &self,
+        key: &fluree_db_core::triple_term::TermKey,
+    ) -> io::Result<Option<u64>> {
+        match &self.dicts.term_dict {
+            Some(td) => td.find_handle(key),
+            None => Ok(None),
+        }
+    }
+
+    /// The encoded base edge behind a triple-term handle.
+    pub fn resolve_term_key(
+        &self,
+        handle: u64,
+    ) -> io::Result<Option<fluree_db_core::triple_term::TermKey>> {
+        match &self.dicts.term_dict {
+            Some(td) => td.resolve(handle),
+            None => Ok(None),
+        }
+    }
+
+    /// A term key's object. Every kind the main index keys graph-wide decodes
+    /// as it does there; a decimal, big-integer or vector object is keyed by
+    /// the string id of its canonical form instead of an arena handle.
+    pub fn decode_term_object(
+        &self,
+        key: &fluree_db_core::triple_term::TermKey,
+    ) -> io::Result<FlakeValue> {
+        use fluree_db_core::triple_term::{is_lexical_term_object, parse_lexical_term_object};
+        if !is_lexical_term_object(key.o_type) {
+            return self.decode_value_v3(
+                key.o_type.as_u16(),
+                key.o_key,
+                key.p_id,
+                fluree_db_core::DEFAULT_GRAPH_ID,
+            );
+        }
+        let form = self.resolve_string_value(key.o_key as u32)?;
+        parse_lexical_term_object(key.o_type, &form).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "term object form {form:?} is not a {:#06x} value",
+                    key.o_type.as_u16()
+                ),
+            )
+        })
+    }
+
+    /// Materialize a triple-term handle: the base edge's subject, predicate
+    /// and object as SIDs and a value, with the object's datatype and tag.
+    fn decode_triple_term(&self, handle: u64) -> io::Result<FlakeValue> {
+        let key = self.resolve_term_key(handle)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("triple-term handle {handle:#x} not in the term dictionary"),
+            )
+        })?;
+        let (ns, suffix) = self.resolve_subject_parts(key.s_id)?;
+        let p = self.predicate_sid(key.p_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "triple-term handle {handle:#x}: unknown predicate id {}",
+                    key.p_id
+                ),
+            )
+        })?;
+        let o_type = key.o_type.as_u16();
+        let o = self.decode_term_object(&key)?;
+        let dt = self
+            .resolve_datatype_sid_for_value(o_type, &o)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("triple-term handle {handle:#x}: no datatype for o_type {o_type:#06x}"),
+                )
+            })?;
+        let lang = self.resolve_lang_tag(o_type).map(str::to_string);
+        Ok(FlakeValue::TripleTerm(Box::new(
+            fluree_db_core::TripleTermValue {
+                s: Sid::new(ns, suffix),
+                p,
+                o,
+                dt,
+                lang,
+            },
+        )))
+    }
+
     pub fn find_subject_id_by_parts(&self, ns_code: u16, suffix: &str) -> io::Result<Option<u64>> {
         match &self.dicts.subject_reverse_tree {
             Some(tree) => {
@@ -2259,6 +2387,23 @@ impl BinaryIndexStore {
                 tree.reverse_lookup(&key)
             }
             None => Ok(None),
+        }
+    }
+
+    /// [`Self::find_subject_id_by_parts`] for many subjects, reading each
+    /// reverse-tree leaf once.
+    pub fn find_subject_ids_by_parts(&self, parts: &[(u16, &str)]) -> io::Result<Vec<Option<u64>>> {
+        match &self.dicts.subject_reverse_tree {
+            Some(tree) => {
+                let keys: Vec<Vec<u8>> = parts
+                    .iter()
+                    .map(|&(ns_code, suffix)| {
+                        crate::dict::reverse_leaf::subject_reverse_key(ns_code, suffix.as_bytes())
+                    })
+                    .collect();
+                tree.reverse_lookup_many(keys.iter().map(Vec::as_slice))
+            }
+            None => Ok(vec![None; parts.len()]),
         }
     }
 
@@ -2545,16 +2690,16 @@ impl BinaryIndexStore {
         Ok(0)
     }
 
-    /// Pre-warm forward-dictionary pages (string + subject packs) into the OS
-    /// page cache, up to `budget_bytes` total across all packs. Returns the
-    /// number of bytes touched.
+    /// Pre-warm forward-dictionary pages (string, subject, then triple-term
+    /// packs) into the OS page cache, up to `budget_bytes` total across all
+    /// packs. Returns the number of bytes touched.
     ///
     /// The index root and reverse-dict tree readers are already resident after
     /// [`load_from_root_v6`](Self::load_from_root_v6); this targets the forward
     /// packs, which are opened lazily and otherwise load on the first query
     /// that resolves an IRI/string ID. String packs are warmed first (broadest
-    /// query impact), then per-namespace subject packs. Warming stops once the
-    /// budget is exhausted.
+    /// query impact), then per-namespace subject packs, then triple-term packs.
+    /// Warming stops once the budget is exhausted.
     ///
     /// Blocking (page faults / sequential reads) — call from a blocking context
     /// such as `tokio::task::spawn_blocking`, never on the hot async path.
@@ -2565,6 +2710,11 @@ impl BinaryIndexStore {
                 break;
             }
             warmed += reader.prewarm(budget_bytes - warmed);
+        }
+        if let Some(terms) = &self.dicts.term_dict {
+            if warmed < budget_bytes {
+                warmed += terms.prewarm(budget_bytes - warmed);
+            }
         }
         warmed
     }
@@ -2845,6 +2995,26 @@ impl BinaryGraphView {
         self.namespace_codes_fallback.clone()
     }
 
+    /// A provisional triple-term handle's term, from dictionary novelty;
+    /// `None` for an indexed handle.
+    fn novelty_term(
+        dn: &fluree_db_core::dict_novelty::DictNovelty,
+        handle: u64,
+    ) -> Option<io::Result<FlakeValue>> {
+        let index = fluree_db_core::triple_term::novelty_term_index(handle)?;
+        Some(
+            dn.terms
+                .resolve(index)
+                .map(|term| FlakeValue::TripleTerm(Box::new(term.clone())))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("provisional triple-term handle {handle:#x} not in novelty"),
+                    )
+                }),
+        )
+    }
+
     /// Decode a value from `(o_type, o_key)`. Novelty-aware when `dict_novelty`
     /// is set: dict-backed types (IriRef, StringDict, JsonArena) route through
     /// watermark checks; all other types delegate directly to the store.
@@ -2867,6 +3037,11 @@ impl BinaryGraphView {
                     DecodeKind::JsonArena => {
                         if let Some(s) = self.resolve_novel_string(dn, o_key as u32) {
                             return Ok(FlakeValue::Json(s));
+                        }
+                    }
+                    DecodeKind::TripleTermDict => {
+                        if let Some(term) = Self::novelty_term(dn, o_key) {
+                            return term;
                         }
                     }
                     DecodeKind::Duration => {
@@ -2928,6 +3103,10 @@ impl BinaryGraphView {
                 } else if o_kind == ObjKind::JSON_ID.as_u8() {
                     if let Some(s) = self.resolve_novel_string(dn, o_key as u32) {
                         return Ok(FlakeValue::Json(s));
+                    }
+                } else if o_kind == ObjKind::TRIPLE_TERM.as_u8() {
+                    if let Some(term) = Self::novelty_term(dn, o_key) {
+                        return term;
                     }
                 }
             }
@@ -3236,6 +3415,21 @@ async fn build_dictionary_set(
     let string_reverse_us = phase.elapsed().as_micros() as u64;
     let phase = Instant::now();
 
+    // Triple-term dictionary (optional section).
+    let term_dict = match &root.term_dict {
+        Some(refs) => Some(
+            TermDictReader::from_refs_reusing(
+                Arc::clone(&cs),
+                cache_dir,
+                refs,
+                leaflet_cache,
+                prev.and_then(|p| p.term_dict.as_ref()),
+            )
+            .await?,
+        ),
+        None => None,
+    };
+
     // Namespace codes: shared with the previous store when it already holds
     // every entry of the root's table. Codes are never reassigned within a
     // ledger, and the previous store's extras (codes the snapshot augmented
@@ -3338,6 +3532,7 @@ async fn build_dictionary_set(
         subject_reverse_tree,
         string_forward_packs,
         string_reverse_tree,
+        term_dict,
         subject_count,
         string_count: root.string_watermark,
         namespace_codes,
@@ -3593,10 +3788,19 @@ impl ContentStoreRangeFetcher {
             Ok(Some(buf))
         }
 
+        let kind = || {
+            id.content_kind().map_or_else(
+                || "unknown".to_string(),
+                |k| format!("{k:?}").to_lowercase(),
+            )
+        };
         // Try local path first — positional read.
         if let Some(local_path) = self.cs.resolve_local_path(id) {
             match read_range_from_file(&local_path, range.clone())? {
-                Some(buf) => return Ok(buf),
+                Some(buf) => {
+                    fluree_db_core::io_stats::record(kind, "local-range", buf.len());
+                    return Ok(buf);
+                }
                 None => {
                     tracing::debug!(
                         path = %local_path.display(),
@@ -3611,6 +3815,7 @@ impl ContentStoreRangeFetcher {
         if self.cs.permits_plaintext_cache() {
             let cache_path = self.cache_dir.join(id.to_string());
             if let Some(buf) = read_range_from_file(&cache_path, range.clone())? {
+                fluree_db_core::io_stats::record(kind, "cache-range", buf.len());
                 return Ok(buf);
             }
         }

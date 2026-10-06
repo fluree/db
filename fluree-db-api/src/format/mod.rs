@@ -59,6 +59,42 @@ pub(crate) mod sparql;
 mod sparql_xml;
 mod typed;
 
+/// A triple term's subject, predicate and object as the bindings a formatter
+/// renders: nodes, or an object literal with its datatype or language tag (a
+/// nested term among them, which the formatter renders recursively).
+pub(crate) fn triple_term_components(
+    term: &fluree_db_core::TripleTermValue,
+) -> [fluree_db_query::binding::Binding; 3] {
+    use fluree_db_query::binding::Binding;
+    [
+        Binding::sid(term.s.clone()),
+        Binding::sid(term.p.clone()),
+        Binding::term_object(term),
+    ]
+}
+
+/// A triple term as a JSON-LD-star embedded node, `{"@id": {"@id": s, p: o}}`
+/// (JSON-LD 1.1 has no triple terms). `object` renders a literal object, or a
+/// nested term, as the calling formatter renders that value anywhere else.
+pub(crate) fn triple_term_node(
+    term: &fluree_db_core::TripleTermValue,
+    compactor: &IriCompactor,
+    object: impl FnOnce(&fluree_db_query::binding::Binding) -> Result<JsonValue>,
+) -> Result<JsonValue> {
+    let [_, _, o] = triple_term_components(term);
+    let o = match &term.o {
+        fluree_db_core::FlakeValue::Ref(sid) => json!({ "@id": compactor.compact_id_sid(sid)? }),
+        _ => object(&o)?,
+    };
+    let mut node = serde_json::Map::with_capacity(2);
+    node.insert(
+        "@id".to_string(),
+        JsonValue::String(compactor.compact_id_sid(&term.s)?),
+    );
+    node.insert(compactor.compact_sid(&term.p)?, o);
+    Ok(json!({ "@id": node }))
+}
+
 /// Registry-name predicate: does this variable name belong to a
 /// non-projected internal / non-distinguished variable that should be
 /// hidden from `SELECT *` wildcard output?
@@ -217,6 +253,10 @@ pub enum FormatError {
     /// Fuel limit exceeded during formatting (expansion)
     #[error(transparent)]
     FuelExceeded(#[from] FuelExceededError),
+
+    /// A read the ledger's index cannot answer
+    #[error(transparent)]
+    Query(#[from] fluree_db_query::QueryError),
 }
 
 /// Result type for formatting operations

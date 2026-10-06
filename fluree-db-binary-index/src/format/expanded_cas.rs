@@ -6,8 +6,8 @@
 //! the root's branch manifests:
 //!
 //! - **Named-graph branches** (`FBR3`) routing to leaf + sidecar CIDs.
-//! - **Annotation forward / reverse branches** (`EAFB1` / `EARB1`)
-//!   routing to annotation leaf CIDs.
+//! - **Legacy annotation-arena branches**, which old roots still name and
+//!   whose leaves stay reachable until a build releases them.
 //!
 //! This module owns the single async expansion path so callers stay in
 //! lockstep when new branch-shaped artifacts are added to the root.
@@ -47,16 +47,15 @@ use std::collections::HashSet;
 
 use fluree_db_core::content_id::ContentId;
 use fluree_db_core::storage::ContentStore;
-use fluree_db_core::{AnnotationIndexRoot, Error, Result};
+use fluree_db_core::{Error, Result};
 
-use crate::annotation_arena::format::{AnnotationForwardBranch, AnnotationReverseBranch};
 use crate::format::branch::read_branch_from_bytes;
-use crate::format::index_root::IndexRoot;
+use crate::format::index_root::{IndexRoot, LegacyAnnotationArena};
 
 /// Strict expansion: returns the complete reachable CAS set or an error.
 ///
 /// Starts from `root.all_cas_ids()` and additionally fetches every
-/// named-graph branch + annotation arena branch from `store`, decoding
+/// named-graph branch + legacy arena branch from `store`, decoding
 /// each manifest to discover the leaf (and named-graph sidecar) CIDs
 /// they route to. The first read or decode failure short-circuits and
 /// returns `Err` — partial sets are never returned.
@@ -123,9 +122,10 @@ impl ChainCasIds {
             }
         }
 
-        if let Some(ref annotation_index) = root.annotation_index {
-            self.expand_annotation_arena(store, annotation_index)
-                .await?;
+        if let Some(ref arena) = root.legacy_annotation_arena {
+            for branch_cid in arena.branches() {
+                self.expand_legacy_arena_branch(store, branch_cid).await?;
+            }
         }
 
         Ok(())
@@ -170,42 +170,21 @@ impl ChainCasIds {
         Ok(())
     }
 
-    /// Annotation arena: forward + reverse branches → leaf CIDs.
-    async fn expand_annotation_arena(
+    /// Legacy annotation-arena branch → leaf CIDs.
+    async fn expand_legacy_arena_branch(
         &mut self,
         store: &dyn ContentStore,
-        annotation_index: &AnnotationIndexRoot,
+        branch_cid: &ContentId,
     ) -> Result<()> {
-        let forward_cid = &annotation_index.forward_branch_cid;
-        if let Some(bytes) = self
-            .read_unexpanded_manifest(store, forward_cid, "annotation forward branch")
+        let Some(bytes) = self
+            .read_unexpanded_manifest(store, branch_cid, "legacy annotation arena branch")
             .await?
-        {
-            let branch = AnnotationForwardBranch::decode(&bytes).map_err(|e| {
-                Error::invalid_index(format!(
-                    "failed to decode annotation forward branch {forward_cid} during CID expansion: {e}"
-                ))
-            })?;
-            self.ids
-                .extend(branch.leaves.iter().map(|entry| entry.leaf_cid.clone()));
-            self.expanded_manifests.insert(forward_cid.clone());
-        }
-
-        let reverse_cid = &annotation_index.reverse_branch_cid;
-        if let Some(bytes) = self
-            .read_unexpanded_manifest(store, reverse_cid, "annotation reverse branch")
-            .await?
-        {
-            let branch = AnnotationReverseBranch::decode(&bytes).map_err(|e| {
-                Error::invalid_index(format!(
-                    "failed to decode annotation reverse branch {reverse_cid} during CID expansion: {e}"
-                ))
-            })?;
-            self.ids
-                .extend(branch.leaves.iter().map(|entry| entry.leaf_cid.clone()));
-            self.expanded_manifests.insert(reverse_cid.clone());
-        }
-
+        else {
+            return Ok(());
+        };
+        self.ids
+            .extend(decode_legacy_arena_branch(branch_cid, &bytes)?);
+        self.expanded_manifests.insert(branch_cid.clone());
         Ok(())
     }
 
@@ -274,61 +253,87 @@ pub async fn collect_root_cas_ids_expanded_tolerant(
         }
     }
 
-    if let Some(ref ann) = root.annotation_index {
-        match store.get(&ann.forward_branch_cid).await {
-            Ok(bytes) => match AnnotationForwardBranch::decode(&bytes) {
-                Ok(branch) => {
-                    for entry in &branch.leaves {
-                        ids.insert(entry.leaf_cid.clone());
-                    }
-                }
+    if let Some(ref arena) = root.legacy_annotation_arena {
+        for branch_cid in arena.branches() {
+            let leaves = match store.get(branch_cid).await {
+                Ok(bytes) => decode_legacy_arena_branch(branch_cid, &bytes),
+                Err(e) => Err(e),
+            };
+            match leaves {
+                Ok(leaves) => ids.extend(leaves),
                 Err(e) => tracing::warn!(
-                    branch_cid = %ann.forward_branch_cid,
+                    branch_cid = %branch_cid,
                     error = %e,
-                    "failed to decode annotation forward branch during CID expansion, skipping"
+                    "failed to expand legacy annotation arena branch, skipping"
                 ),
-            },
-            Err(e) => tracing::warn!(
-                branch_cid = %ann.forward_branch_cid,
-                error = %e,
-                "failed to read annotation forward branch during CID expansion, skipping"
-            ),
-        }
-
-        match store.get(&ann.reverse_branch_cid).await {
-            Ok(bytes) => match AnnotationReverseBranch::decode(&bytes) {
-                Ok(branch) => {
-                    for entry in &branch.leaves {
-                        ids.insert(entry.leaf_cid.clone());
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    branch_cid = %ann.reverse_branch_cid,
-                    error = %e,
-                    "failed to decode annotation reverse branch during CID expansion, skipping"
-                ),
-            },
-            Err(e) => tracing::warn!(
-                branch_cid = %ann.reverse_branch_cid,
-                error = %e,
-                "failed to read annotation reverse branch during CID expansion, skipping"
-            ),
+            }
         }
     }
 
     ids
 }
 
+/// Every blob of a legacy annotation arena: both branches and their leaves.
+/// A build over a root that names one releases these, since the root it
+/// writes does not.
+pub async fn legacy_annotation_arena_cids(
+    store: &dyn ContentStore,
+    arena: &LegacyAnnotationArena,
+) -> Result<Vec<ContentId>> {
+    let mut ids = Vec::new();
+    for branch_cid in arena.branches() {
+        let bytes = store.get(branch_cid).await.map_err(|e| {
+            Error::invalid_index(format!(
+                "failed to read legacy annotation arena branch {branch_cid}: {e}"
+            ))
+        })?;
+        ids.extend(decode_legacy_arena_branch(branch_cid, &bytes)?);
+        ids.push(branch_cid.clone());
+    }
+    Ok(ids)
+}
+
+/// The leaf CIDs a legacy arena branch routes to. Both branch kinds frame a
+/// CBOR body behind the same 12-byte header (length at bytes 8..12) and name
+/// each leaf `leaf_cid`.
+fn decode_legacy_arena_branch(branch_cid: &ContentId, bytes: &[u8]) -> Result<Vec<ContentId>> {
+    #[derive(serde::Deserialize)]
+    struct Branch {
+        leaves: Vec<Leaf>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Leaf {
+        leaf_cid: ContentId,
+    }
+    let invalid = |e: &dyn std::fmt::Display| {
+        Error::invalid_index(format!(
+            "failed to decode legacy annotation arena branch {branch_cid}: {e}"
+        ))
+    };
+    let body = bytes
+        .get(8..12)
+        .map(|len| u32::from_le_bytes(len.try_into().unwrap()) as usize)
+        .and_then(|len| bytes.get(12..12 + len))
+        .ok_or_else(|| invalid(&"truncated"))?;
+    let branch: Branch = ciborium::de::from_reader(body).map_err(|e| invalid(&e))?;
+    Ok(branch
+        .leaves
+        .into_iter()
+        .map(|leaf| leaf.leaf_cid)
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::annotation_arena::format::{
-        AnnotationForwardBranch, AnnotationForwardBranchEntry, AnnotationForwardLeaf,
-        AnnotationReverseBranch, AnnotationReverseBranchEntry, AnnotationReverseLeaf,
-    };
+    use crate::format::branch::{build_branch_bytes, LeafEntry};
+    use crate::format::index_root::NamedGraphRouting;
+    use crate::format::run_record::{RunSortOrder, LIST_INDEX_NONE};
+    use crate::format::run_record_v2::RunRecordV2;
     use crate::format::wire_helpers::{DictPackRefs, DictRefs, DictTreeRefs};
     use fluree_db_core::storage::MemoryContentStore;
-    use fluree_db_core::{AnnotationStats, ContentKind, EdgeKey, FlakeValue, Sid};
+    use fluree_db_core::subject_id::SubjectId;
+    use fluree_db_core::ContentKind;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
 
@@ -381,18 +386,6 @@ mod tests {
         ContentId::new(kind, seed)
     }
 
-    fn sample_edge() -> EdgeKey {
-        EdgeKey {
-            g: None,
-            s: Sid::new(1, "s"),
-            p: Sid::new(1, "p"),
-            o: FlakeValue::Ref(Sid::new(1, "o")),
-            dt: Sid::new(0, "http://www.w3.org/2001/XMLSchema#anyURI"),
-            lang: None,
-            list_i: None,
-        }
-    }
-
     fn minimal_root() -> IndexRoot {
         let dummy_cid = ContentId::new(ContentKind::IndexLeaf, b"dummy");
         let dummy_tree = DictTreeRefs {
@@ -432,156 +425,127 @@ mod tests {
             garbage: None,
             sketch_ref: None,
             has_annotations: false,
-            annotation_index: None,
-            had_annotation_arena: false,
+            legacy_annotation_arena: None,
+            term_dict: None,
             has_list_meta: None,
             o_type_table: IndexRoot::build_o_type_table(&[], &[]),
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
         }
     }
 
-    /// Build a root carrying an annotation arena that points to two real
-    /// branch blobs (forward + reverse) each routing to a single leaf.
-    /// Returns (root, fwd_leaf_cid, rev_leaf_cid).
-    async fn build_root_with_arena(store: &dyn ContentStore) -> (IndexRoot, ContentId, ContentId) {
-        // Write empty leaves to CAS so the branch entries point somewhere
-        // real. Their content doesn't matter — the helper only walks
-        // branches, not leaves.
-        let fwd_leaf_bytes = AnnotationForwardLeaf::default().encode();
-        let fwd_leaf_cid = store
-            .put(ContentKind::AnnotationForwardLeaf, &fwd_leaf_bytes)
+    /// A legacy arena branch as its encoder wrote it: a 12-byte header, then
+    /// CBOR whose entries carry fields beyond `leaf_cid`.
+    fn legacy_branch_bytes(magic: &[u8; 4], leaf_cid: &ContentId) -> Vec<u8> {
+        #[derive(serde::Serialize)]
+        struct Entry<'a> {
+            first_ann: &'a str,
+            row_count: u64,
+            leaf_cid: &'a ContentId,
+        }
+        #[derive(serde::Serialize)]
+        struct Branch<'a> {
+            leaves: Vec<Entry<'a>>,
+        }
+        let mut body = Vec::new();
+        ciborium::ser::into_writer(
+            &Branch {
+                leaves: vec![Entry {
+                    first_ann: "a",
+                    row_count: 1,
+                    leaf_cid,
+                }],
+            },
+            &mut body,
+        )
+        .unwrap();
+        let mut bytes = magic.to_vec();
+        bytes.extend_from_slice(&[1, 0, 0, 0]);
+        bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        bytes
+    }
+
+    /// A root that still names a legacy arena, with both branches and their
+    /// leaves in `store`. Returns the root and every arena blob.
+    async fn root_with_legacy_arena(store: &dyn ContentStore) -> (IndexRoot, Vec<ContentId>) {
+        let fwd_leaf = store
+            .put(ContentKind::AnnotationForwardLeaf, b"fwd-leaf")
             .await
             .unwrap();
-
-        let rev_leaf_bytes = AnnotationReverseLeaf::default().encode();
-        let rev_leaf_cid = store
-            .put(ContentKind::AnnotationReverseLeaf, &rev_leaf_bytes)
+        let rev_leaf = store
+            .put(ContentKind::AnnotationReverseLeaf, b"rev-leaf")
             .await
             .unwrap();
-
-        let fwd_branch = AnnotationForwardBranch {
-            leaves: vec![AnnotationForwardBranchEntry {
-                first_edge: sample_edge(),
-                first_ann: Sid::new(2, "a"),
-                last_edge: sample_edge(),
-                last_ann: Sid::new(2, "a"),
-                row_count: 0,
-                leaf_cid: fwd_leaf_cid.clone(),
-            }],
-        };
-        let fwd_branch_cid = store
-            .put(ContentKind::AnnotationForwardBranch, &fwd_branch.encode())
+        let fwd_branch = store
+            .put(
+                ContentKind::AnnotationForwardBranch,
+                &legacy_branch_bytes(b"EAFB", &fwd_leaf),
+            )
             .await
             .unwrap();
-
-        let rev_branch = AnnotationReverseBranch {
-            leaves: vec![AnnotationReverseBranchEntry {
-                first_ann: Sid::new(2, "a"),
-                first_edge: sample_edge(),
-                last_ann: Sid::new(2, "a"),
-                last_edge: sample_edge(),
-                row_count: 0,
-                leaf_cid: rev_leaf_cid.clone(),
-            }],
-        };
-        let rev_branch_cid = store
-            .put(ContentKind::AnnotationReverseBranch, &rev_branch.encode())
+        let rev_branch = store
+            .put(
+                ContentKind::AnnotationReverseBranch,
+                &legacy_branch_bytes(b"EARB", &rev_leaf),
+            )
             .await
             .unwrap();
-
         let mut root = minimal_root();
         root.has_annotations = true;
-        root.annotation_index = Some(AnnotationIndexRoot {
-            version: 1,
-            max_t: 0,
-            forward_branch_cid: fwd_branch_cid,
-            reverse_branch_cid: rev_branch_cid,
-            stats: AnnotationStats::default(),
+        root.legacy_annotation_arena = Some(LegacyAnnotationArena {
+            forward_branch_cid: fwd_branch.clone(),
+            reverse_branch_cid: rev_branch.clone(),
         });
-        (root, fwd_leaf_cid, rev_leaf_cid)
+        (root, vec![fwd_leaf, rev_leaf, fwd_branch, rev_branch])
     }
 
     #[tokio::test]
-    async fn expands_annotation_branches_to_leaves() {
+    async fn expands_legacy_arena_branches_to_leaves() {
         let store = MemoryContentStore::new();
-        let (root, fwd_leaf_cid, rev_leaf_cid) = build_root_with_arena(&store).await;
+        let (root, arena_blobs) = root_with_legacy_arena(&store).await;
 
-        let ids = collect_root_cas_ids_expanded(&store, &root).await.unwrap();
-
-        // Annotation branch CIDs appear via all_cas_ids().
-        let ann = root.annotation_index.as_ref().unwrap();
-        assert!(
-            ids.contains(&ann.forward_branch_cid),
-            "annotation forward branch CID missing"
-        );
-        assert!(
-            ids.contains(&ann.reverse_branch_cid),
-            "annotation reverse branch CID missing"
-        );
-        // Leaves added by branch expansion.
-        assert!(
-            ids.contains(&fwd_leaf_cid),
-            "forward leaf CID missing — annotation branch was not expanded"
-        );
-        assert!(
-            ids.contains(&rev_leaf_cid),
-            "reverse leaf CID missing — annotation branch was not expanded"
-        );
+        let strict = collect_root_cas_ids_expanded(&store, &root).await.unwrap();
+        let tolerant = collect_root_cas_ids_expanded_tolerant(&store, &root).await;
+        let mut released =
+            legacy_annotation_arena_cids(&store, root.legacy_annotation_arena.as_ref().unwrap())
+                .await
+                .unwrap();
+        released.sort();
+        let mut expected = arena_blobs.clone();
+        expected.sort();
+        assert_eq!(released, expected, "a build releases every arena blob");
+        for blob in &arena_blobs {
+            assert!(strict.contains(blob), "strict expansion missed {blob}");
+            assert!(tolerant.contains(blob), "tolerant expansion missed {blob}");
+        }
     }
 
-    /// Roots that carry a manifest over unchanged must not make the chain
-    /// re-read it. This is what keeps a sweep's planning cost proportional to
-    /// the distinct manifests rather than to the length of the chain.
+    /// A build over a root with a legacy arena writes a root without it, so
+    /// the garbage diff between the two releases the whole arena.
     #[tokio::test]
-    async fn a_chain_reads_a_carried_over_manifest_once() {
-        let store = GetCountingStore::new();
-        let (root, fwd_leaf_cid, rev_leaf_cid) = build_root_with_arena(&store).await;
+    async fn the_garbage_diff_releases_a_legacy_arena() {
+        let store = MemoryContentStore::new();
+        let (prev_root, arena_blobs) = root_with_legacy_arena(&store).await;
+        let mut new_root = prev_root.clone();
+        new_root.legacy_annotation_arena = None;
 
-        // What an incremental build that touched nothing in the arena
-        // publishes: a new root pointing at the previous arena's branches.
-        let mut later_root = root.clone();
-        later_root.index_t = root.index_t + 1;
-
-        let mut chain_ids = ChainCasIds::new();
-        chain_ids.add_root(&store, &root).await.unwrap();
-        chain_ids.add_root(&store, &later_root).await.unwrap();
-        let ids = chain_ids.into_ids();
-
-        let ann = root.annotation_index.as_ref().unwrap();
-        assert_eq!(
-            store.get_count(&ann.forward_branch_cid),
-            1,
-            "annotation forward branch re-read for a root that carried it over"
-        );
-        assert_eq!(
-            store.get_count(&ann.reverse_branch_cid),
-            1,
-            "annotation reverse branch re-read for a root that carried it over"
-        );
-
-        // The leaves behind the skipped read are still live: they entered the
-        // set when the first root expanded that manifest.
-        assert!(
-            ids.contains(&fwd_leaf_cid),
-            "forward leaf missing after the second root skipped its manifest"
-        );
-        assert!(
-            ids.contains(&rev_leaf_cid),
-            "reverse leaf missing after the second root skipped its manifest"
-        );
+        let prev_ids = collect_root_cas_ids_expanded(&store, &prev_root)
+            .await
+            .unwrap();
+        let new_ids = collect_root_cas_ids_expanded(&store, &new_root)
+            .await
+            .unwrap();
+        let replaced: HashSet<_> = prev_ids.difference(&new_ids).cloned().collect();
+        assert_eq!(replaced, arena_blobs.into_iter().collect::<HashSet<_>>());
     }
 
     #[tokio::test]
-    async fn strict_errors_on_missing_annotation_branch() {
+    async fn strict_errors_on_missing_legacy_arena_branch() {
         let store = MemoryContentStore::new();
         let mut root = minimal_root();
-        root.has_annotations = true;
-        root.annotation_index = Some(AnnotationIndexRoot {
-            version: 1,
-            max_t: 0,
+        root.legacy_annotation_arena = Some(LegacyAnnotationArena {
             forward_branch_cid: cid(ContentKind::AnnotationForwardBranch, b"missing-fwd"),
             reverse_branch_cid: cid(ContentKind::AnnotationReverseBranch, b"missing-rev"),
-            stats: AnnotationStats::default(),
         });
 
         // Strict: must surface the read failure rather than return a
@@ -590,126 +554,80 @@ mod tests {
             .await
             .expect_err("strict mode should error on missing branch");
         assert!(
-            err.to_string().contains("annotation forward branch"),
+            err.to_string().contains("legacy annotation arena branch"),
             "error should identify the missing branch: {err}"
         );
     }
 
     #[tokio::test]
-    async fn tolerant_expansion_swallows_missing_annotation_branch() {
+    async fn tolerant_expansion_swallows_missing_legacy_arena_branch() {
         let store = MemoryContentStore::new();
         let mut root = minimal_root();
-        root.has_annotations = true;
-        root.annotation_index = Some(AnnotationIndexRoot {
-            version: 1,
-            max_t: 0,
+        let arena = LegacyAnnotationArena {
             forward_branch_cid: cid(ContentKind::AnnotationForwardBranch, b"missing-fwd"),
             reverse_branch_cid: cid(ContentKind::AnnotationReverseBranch, b"missing-rev"),
-            stats: AnnotationStats::default(),
-        });
+        };
+        root.legacy_annotation_arena = Some(arena.clone());
 
         let ids = collect_root_cas_ids_expanded_tolerant(&store, &root).await;
         // Still contains the direct branch CIDs from all_cas_ids().
-        let ann = root.annotation_index.as_ref().unwrap();
-        assert!(ids.contains(&ann.forward_branch_cid));
-        assert!(ids.contains(&ann.reverse_branch_cid));
+        assert!(arena.branches().all(|branch| ids.contains(branch)));
     }
 
+    /// Roots that carry a manifest over unchanged must not make the chain
+    /// re-read it. This is what keeps a sweep's planning cost proportional to
+    /// the distinct manifests rather than to the length of the chain.
     #[tokio::test]
-    async fn diff_produces_replaced_annotation_leaves() {
-        let store = MemoryContentStore::new();
-        let (prev_root, prev_fwd_leaf, prev_rev_leaf) = build_root_with_arena(&store).await;
-        let (new_root, new_fwd_leaf, new_rev_leaf) = build_root_with_arena(&store).await;
-
-        // Leaves are content-addressed empty blobs, so the new and prev
-        // build pull the *same* leaf CIDs from CAS — assert that and
-        // then build a synthetic new root whose annotation branches are
-        // genuinely fresh, to exercise the diff.
-        assert_eq!(prev_fwd_leaf, new_fwd_leaf);
-        assert_eq!(prev_rev_leaf, new_rev_leaf);
-
-        // Build a "new" root by writing distinct leaf bytes so leaf CIDs differ.
-        let fwd_leaf2 = AnnotationForwardLeaf {
-            rows: vec![crate::annotation_arena::format::AnnotationForwardRow {
-                edge: sample_edge(),
-                ann: Sid::new(2, "a"),
-                t: 1,
-                op: true,
-            }],
+    async fn a_chain_reads_a_carried_over_manifest_once() {
+        let store = GetCountingStore::new();
+        let leaf_cid = store.put(ContentKind::IndexLeaf, b"leaf").await.unwrap();
+        let key = RunRecordV2 {
+            s_id: SubjectId(1),
+            o_key: 0,
+            p_id: 1,
+            t: 1,
+            o_i: LIST_INDEX_NONE,
+            o_type: 0,
+            g_id: 2,
         };
-        let fwd_leaf2_cid = store
-            .put(ContentKind::AnnotationForwardLeaf, &fwd_leaf2.encode())
-            .await
-            .unwrap();
-        let rev_leaf2 = AnnotationReverseLeaf {
-            rows: vec![crate::annotation_arena::format::AnnotationReverseRow {
-                ann: Sid::new(2, "a"),
-                edge: sample_edge(),
-                t: 1,
-                op: true,
-            }],
-        };
-        let rev_leaf2_cid = store
-            .put(ContentKind::AnnotationReverseLeaf, &rev_leaf2.encode())
-            .await
-            .unwrap();
-
-        let fwd_branch2 = AnnotationForwardBranch {
-            leaves: vec![AnnotationForwardBranchEntry {
-                first_edge: sample_edge(),
-                first_ann: Sid::new(2, "a"),
-                last_edge: sample_edge(),
-                last_ann: Sid::new(2, "a"),
+        let branch = build_branch_bytes(
+            RunSortOrder::Spot,
+            2,
+            &[LeafEntry {
+                first_key: key,
+                last_key: key,
                 row_count: 1,
-                leaf_cid: fwd_leaf2_cid.clone(),
+                leaf_cid: leaf_cid.clone(),
+                sidecar_cid: None,
             }],
-        };
-        let fwd_branch2_cid = store
-            .put(ContentKind::AnnotationForwardBranch, &fwd_branch2.encode())
-            .await
-            .unwrap();
-        let rev_branch2 = AnnotationReverseBranch {
-            leaves: vec![AnnotationReverseBranchEntry {
-                first_ann: Sid::new(2, "a"),
-                first_edge: sample_edge(),
-                last_ann: Sid::new(2, "a"),
-                last_edge: sample_edge(),
-                row_count: 1,
-                leaf_cid: rev_leaf2_cid.clone(),
-            }],
-        };
-        let rev_branch2_cid = store
-            .put(ContentKind::AnnotationReverseBranch, &rev_branch2.encode())
-            .await
-            .unwrap();
-
-        let mut new_root = new_root;
-        new_root.annotation_index = Some(AnnotationIndexRoot {
-            version: 1,
-            max_t: 1,
-            forward_branch_cid: fwd_branch2_cid,
-            reverse_branch_cid: rev_branch2_cid,
-            stats: AnnotationStats::default(),
-        });
-
-        let prev_ids = collect_root_cas_ids_expanded(&store, &prev_root)
-            .await
-            .unwrap();
-        let new_ids = collect_root_cas_ids_expanded(&store, &new_root)
-            .await
-            .unwrap();
-
-        let replaced: HashSet<_> = prev_ids.difference(&new_ids).cloned().collect();
-
-        // The previous arena's leaves should appear in the diff. Without
-        // branch expansion they would silently leak.
-        assert!(
-            replaced.contains(&prev_fwd_leaf),
-            "prev forward leaf missing from garbage diff"
         );
+        let branch_cid = store.put(ContentKind::IndexBranch, &branch).await.unwrap();
+        let mut root = minimal_root();
+        root.named_graphs = vec![NamedGraphRouting {
+            g_id: 2,
+            orders: vec![(RunSortOrder::Spot, branch_cid.clone())],
+        }];
+
+        // What an incremental build that touched nothing in the graph
+        // publishes: a new root pointing at the previous branch.
+        let mut later_root = root.clone();
+        later_root.index_t = root.index_t + 1;
+
+        let mut chain_ids = ChainCasIds::new();
+        chain_ids.add_root(&store, &root).await.unwrap();
+        chain_ids.add_root(&store, &later_root).await.unwrap();
+        let ids = chain_ids.into_ids();
+
+        assert_eq!(
+            store.get_count(&branch_cid),
+            1,
+            "branch re-read for a root that carried it over"
+        );
+        // The leaf behind the skipped read is still live: it entered the set
+        // when the first root expanded that manifest.
         assert!(
-            replaced.contains(&prev_rev_leaf),
-            "prev reverse leaf missing from garbage diff"
+            ids.contains(&leaf_cid),
+            "leaf missing after the second root skipped its manifest"
         );
     }
 }

@@ -6,9 +6,9 @@ Edge annotations let you attach properties to a *relationship* — the connectio
 ex:alice ──[ ex:worksFor: { role: "Engineer", since: 2024-01-01, confidence: 0.97 } ]──▶ ex:acme
 ```
 
-Annotations are first-class RDF data: properties on the annotation subject are stored as ordinary triples and participate in policy, history, indexing, and query like everything else. The only thing that's special is the *attachment*: a sidecar relation that records which annotation subject belongs to which edge. The fact indexes (and queries that don't ask for annotations) are unchanged.
+Annotations are first-class RDF data, stored as RDF 1.2 defines them: the annotation subject's `rdf:reifies` link to the triple it describes, `ex:claim1 rdf:reifies <<( ex:alice ex:knows ex:bob )>>`, plus its properties as ordinary triples. All of it participates in policy, history, indexing, and query like everything else. The fact indexes (and queries that don't ask for annotations) are unchanged.
 
-For the storage-internals view — how the attachment sidecar is laid out, how the `f:reifies*` bundle encodes an edge, and how the index root carries the annotation arena — see the [Edge annotations design doc](../design/edge-annotations.md).
+For the storage-internals view — how the link is written, indexed through the term dictionary, and kept consistent with its edge — see the [Edge annotations design doc](../design/edge-annotations.md).
 
 ## When to use edge annotations
 
@@ -25,11 +25,11 @@ If a fact is naturally about a *node* (Alice's birthdate, Acme's industry), put 
 
 | Surface | How | Notes |
 |---|---|---|
-| **JSON-LD insert / upsert / update** | `@annotation` (or alias `@edge`) on a value object | Most ergonomic. Covers literal-valued edges (with explicit `@type` / `@language`), parallel annotations, named reifiers, body cascades, and **named-graph edges** (an annotation on an edge inside a named graph is written into that same graph, keeping the edge's graph identity). `@reifies` is a query-side construct, **not** an insert form (user-authored `@reifies` on a write is rejected). |
-| **SPARQL 1.2 UPDATE** | `INSERT DATA { :s :p :o {\| ... \|} }`, `~ <reifier>`, optional `INSERT { } WHERE { }` templates | Use this when integrating with SPARQL pipelines or when porting from RDF 1.2 / SPARQL-star. **Default graph only:** an annotation tail inside an explicit `GRAPH { }` block, or under a `WITH <g>` template, is rejected — use the JSON-LD surface or TriG-star for named-graph edge annotations. See [SPARQL 1.2 surface](#sparql-12--rdf-12-surface) below for the per-operation rules. |
-| **Turtle / N-Triples / TriG / N-Quads ingest** (`insert`, `upsert`, bulk `import`, graph sync (`fluree sync`, `/sync`), memory import; TriG via `insert` / `upsert` / `import` / `fluree sync` / `/sync`) | RDF 1.2 asserting forms: `:s :p :o ~ <reifier> {\| ... \|}`, `<< :s :p :o ~ :r >>` in subject or object position, and the canonical `:r rdf:reifies <<( :s :p :o )>>` (the only star spelling N-Triples and N-Quads have) — in the default graph and inside TriG `GRAPH { }` blocks alike | Same on-disk bundle as `@annotation`. An annotation inside a `GRAPH { }` block, or on an N-Quads statement with a graph label, is written into that graph with the edge's graph identity, exactly as JSON-LD `@graph` + `@annotation` does. Every form asserts the base edge (Fluree reifies asserted edges, so `<< s p o >>` and `rdf:reifies <<( s p o )>>` are asserting here). Rejected with a specific error: `<<( ... )>>` anywhere other than the object of `rdf:reifies`, nested triple terms, star constructs inside an annotation body, annotations on collections, and annotations in a TriG `<#txn-meta>` block. Paths that convert to JSON-LD first (`upsert`, `graph sync`, memory import) also reject an annotation on an `rdf:type` edge. See [Turtle ingest](../transactions/turtle.md#edge-annotations-rdf-12--turtle-star). |
+| **JSON-LD insert / upsert / update** | `@annotation` (or alias `@edge`) on a value object | Most ergonomic. Covers literal-valued edges (with explicit `@type` / `@language`), parallel annotations, named reifiers, and **named-graph edges** (an annotation on an edge inside a named graph is written into that same graph, keeping the edge's graph identity). A node's `@reifies` (`{"@id": s, p: o}`, or an array of them) makes the node a reifier of that triple **without asserting it**, as `r rdf:reifies <<( s p o )>>` does. |
+| **SPARQL 1.2 UPDATE** | `INSERT DATA { :s :p :o {\| ... \|} }`, `~ <reifier>`, optional `INSERT { } WHERE { }` templates | Use this when integrating with SPARQL pipelines or when porting from RDF 1.2 / SPARQL-star. Works inside `GRAPH { }` blocks and under `WITH <g>`; `<< :s :p :o ~ :r >>` reifies without asserting. See [SPARQL 1.2 surface](#sparql-12--rdf-12-surface) below for the per-operation rules. |
+| **Turtle / N-Triples / TriG / N-Quads ingest** (`insert`, `upsert`, bulk `import`, graph sync (`fluree sync`, `/sync`), memory import; TriG via `insert` / `upsert` / `import` / `fluree sync` / `/sync`) | RDF 1.2 forms: the annotation syntax `:s :p :o ~ <reifier> {\| ... \|}`, `<< :s :p :o ~ :r >>` in subject or object position, and the canonical `:r rdf:reifies <<( :s :p :o )>>` (the only star spelling N-Triples and N-Quads have) — in the default graph and inside TriG `GRAPH { }` blocks alike | Same stored link as `@annotation`. An annotation inside a `GRAPH { }` block, or on an N-Quads statement with a graph label, is written into that graph with the edge's graph identity, exactly as JSON-LD `@graph` + `@annotation` does. As in RDF 1.2, only the annotation syntax asserts the triple: `<< s p o >>` and `rdf:reifies <<( s p o )>>` reify it without asserting it, so N-Triples and N-Quads state an annotated triple as the triple plus its reifier's link. Rejected with a specific error: `<<( ... )>>` as a subject, star constructs inside an annotation body, annotations on collections, and annotations in a TriG `<#txn-meta>` block. Paths that convert to JSON-LD first (`upsert`, `graph sync`, memory import) also reject an annotation on an `rdf:type` edge. See [Turtle ingest](../transactions/turtle.md#edge-annotations-rdf-12--turtle-star). |
 
-Annotations are backed by a set of [reserved system predicates](../reference/vocabulary.md#edge-annotation-predicates-reserved) that application writes can't author by hand — mint annotations through `@annotation` / `@edge` (JSON-LD) or the RDF 1.2 forms (`~`, `{| |}`, `<< >>`, `rdf:reifies <<( )>>`) in SPARQL UPDATE and Turtle. (Bulk import is an administrative bootstrap path that may ingest already-lowered annotation bundles without up-front validation; see the [storage-internals design doc](../design/edge-annotations.md) for how malformed bundles are handled.)
+Mint annotations through `@annotation` / `@edge` (JSON-LD) or the RDF 1.2 forms (`~`, `{| |}`, `<< >>`, `rdf:reifies <<( )>>`) in SPARQL UPDATE and Turtle. The [`f:reifies*` predicates](../reference/vocabulary.md#edge-annotation-predicates-reserved) earlier releases stored annotations under are reserved, and the write surfaces reject them; bulk import reads them, as an export written before links carries them, and stores each annotation's link instead.
 
 ## The surface
 
@@ -141,7 +141,7 @@ A few rules that keep the annotation's identity in sync with the base flake:
 - **Language-tagged literals are language-pinned.** Two annotations on `"chat"@fr` and `"chat"@en` are independent; selector-form retracts and hydration both match on language.
 - **Hydration promotes annotated literals to value-object form.** A subject expansion (`select: {"?s": ["*"]}`) renders unannotated `ex:name "Alice"` as the scalar `"Alice"`, but renders the annotated form as `{"@value": "Alice", "@annotation": {...}}` so the annotation has somewhere to attach.
 
-The deferred shapes from "Current limits" below (list occurrences, multi-triple reifiers, triple terms as object values) still apply on the literal path.
+The deferred shape from "Current limits" below (list occurrences) still applies on the literal path.
 
 ### Querying inline: edge first, metadata second
 
@@ -185,7 +185,7 @@ When you start from the metadata — "find every employment with `role = Enginee
 }
 ```
 
-`@reifies` is the same idea as `rdf:reifies` in RDF 1.2 — given an annotation subject, walk to the edge it reifies. Fluree resolves it through the reverse attachment index, so it's cheap regardless of how many annotations exist in the ledger.
+`@reifies` is the same idea as `rdf:reifies` in RDF 1.2 — given an annotation subject, walk to the edge it reifies. Fluree reads it, as it reads SPARQL's `?r rdf:reifies <<( s p o )>>` and `<< s p o ~ ?r >>`, from the reifier's `rdf:reifies` link, whose object is a triple term the index resolves through its term dictionary, so it's cheap regardless of how many annotations exist in the ledger. A policy that hides an edge hides its link too: the link is visible only when the triple it names would be.
 
 ### Subject expansion
 
@@ -282,27 +282,29 @@ Querying without binding the annotation (`?person ex:worksFor ?org`) returns one
 
 ## Anonymous vs explicit annotation IDs
 
-The two forms have deliberately different lifecycle behavior. The default is conservative: anonymous annotations behave like LPG edge properties; explicit-IRI annotations behave like ordinary RDF resources.
+The two forms differ in visibility: an anonymous annotation is an edge property you reach through its edge, while an explicit-IRI annotation is an ordinary RDF resource.
 
 | | Anonymous (no `@id`) | Explicit `@id` |
 |---|---|---|
 | Visible in `select: "*"` | No — hidden from wildcard subject expansion | Yes |
 | Visible in graph crawl | Only via `@annotation` projection | Yes, like any subject |
-| Retract base edge → owned facts cascade | Yes (the annotation is intrinsic to the edge) | No, by default — explicit IRIs are not deleted surprisingly |
+| Retract base edge → link and body removed | Only in LPG mode | Only in LPG mode |
+| Re-assert a retracted edge → earlier claims return | Yes, outside LPG mode; remove them through `@reifies` or `<< s p o ~ ?r >>` | Yes, outside LPG mode; delete the reifier's triples |
 
 The anonymous-hide rule means a user wildcard query against Alice doesn't suddenly start returning a sea of internal annotation SIDs once you adopt edge metadata. Annotations participate in queries that ask for them and stay out of the way otherwise.
 
-The explicit-ID-doesn't-cascade rule protects user-named resources from accidental deletion when an edge gets retracted. Opt out via *LPG mode* (below) when you actually want property-graph "delete the relationship deletes its properties" semantics.
-
 ## Retraction semantics
+
+A transaction retracts the triples it names and nothing else, as RDF 1.2 defines it: deleting a triple does not delete the statements of a reifier that reifies it. A reifier's link (`r rdf:reifies <<( s p o )>>`) is a triple of its own, so it outlives the edge, and so does its body. Two read surfaces then disagree, on purpose:
+
+- The **annotation syntax** (`s p o {| … |}`, `~`, JSON-LD `@annotation`, a Cypher relationship) asserts its triple, so it stops matching a claim once the edge is gone.
+- The **reified-triple form** (`<< s p o ~ ?r >>`, `?r rdf:reifies <<( … )>>`, JSON-LD `@reifies`) reads the link alone and still finds it.
+
+Opt into the property-graph lifecycle with [LPG mode](#lpg-mode-opt-in-per-transaction) when deleting an edge should delete its claims.
 
 ### Which spelling does what
 
-Two independent rules meet here, and the combination surprises people.
-
-**1. The annotation form asserts the base triple, so deleting it retracts the base edge.** Both `s p o ~ :r {| … |}` and the bare `s p o ~ :r` expand to the base triple *plus* the reification: RDF 1.2 Turtle §2.11.1 defines the syntax as one that both reifies **and asserts** a triple, and SPARQL 1.2 Update §3.1.2 admits the same production into `DELETE DATA`. So `DELETE DATA { :alice :knows :bob ~ :claim1 {| … |} }` is a base-edge retraction. This is what the specs require — a store that kept the edge here would be the one diverging.
-
-**2. Retracting a base edge cascades to every reifier attached to it**, including reifiers the delete never named. This rule is Fluree's own. Neither RDF 1.2 nor SPARQL 1.2 entails it, and SPARQL 1.2 Update §3.1.2 Example 6 makes the converse point — deleting a *reifying* triple leaves the asserted triple in place. Fluree cascades because an edge's claims should not outlive the edge it describes. It is stated here so that a reader who checks the spec, finds Fluree retracting more than was named, and concludes there is a second bug, knows it is deliberate.
+**The annotation form asserts the base triple, so deleting it retracts the base edge.** Both `s p o ~ :r {| … |}` and the bare `s p o ~ :r` expand to the base triple *plus* the reification: RDF 1.2 Turtle §2.11.1 defines the syntax as one that both reifies **and asserts** a triple, and SPARQL 1.2 Update §3.1.2 admits the same production into `DELETE DATA`. So `DELETE DATA { :alice :knows :bob ~ :claim1 {| … |} }` retracts the edge, `:claim1`'s link and its body.
 
 Seeded with one edge and two independent claims about it:
 
@@ -311,51 +313,33 @@ Seeded with one edge and two independent claims about it:
 :alice :knows :bob ~ :claim2 {| :confidence 0.6 ; :source :sourceB |} .
 ```
 
-| you write | edge | `:claim1` body | `:claim2` body | still attached |
-| --- | --- | --- | --- | --- |
-| `DELETE DATA { :alice :knows :bob ~ :claim1 {\| :confidence 0.8 ; :source :sourceA \|} }` | **gone** | gone | survives | none |
-| `DELETE DATA { :alice :knows :bob ~ :claim1 }` | **gone** | **survives** | **survives** | none |
-| `DELETE WHERE { :alice :knows :bob ~ ?c {\| :confidence ?f \|} }` | **gone** | `:source` only | `:source` only | none |
-| `DELETE DATA { :alice :knows :bob }` | **gone** | survives | survives | none |
-| `upsert` restating the edge with a different object | object replaced | survives | survives | none |
-| `DELETE DATA { :claim1 :confidence 0.8 ; :source :sourceA }` | survives | gone | survives | `:claim2` |
-| JSON-LD `delete` with `"@annotation": {"@id": ":claim1"}` | survives | survives | survives | `:claim2` |
-| `DELETE DATA { :alice :knows :bob {\| … \|} }` | *refused* — an anonymous block has no addressable identity to delete | | | |
+| you write | edge | `:claim1` body | `:claim2` body | still linked | annotation syntax matches |
+| --- | --- | --- | --- | --- | --- |
+| `DELETE DATA { :alice :knows :bob ~ :claim1 {\| :confidence 0.8 ; :source :sourceA \|} }` | **gone** | gone | survives | `:claim2` | none |
+| `DELETE DATA { :alice :knows :bob ~ :claim1 }` | **gone** | survives | survives | `:claim2` | none |
+| `DELETE WHERE { :alice :knows :bob ~ ?c {\| :confidence ?f \|} }` | **gone** | `:source` only | `:source` only | none | none |
+| `DELETE DATA { :alice :knows :bob }` | **gone** | survives | survives | both | none |
+| `upsert` restating `:claim1` on a different object | object replaced | survives | survives | `:claim2` | none |
+| `DELETE DATA { :claim1 :confidence 0.8 ; :source :sourceA }` | survives | gone | survives | both | `:claim2` |
+| JSON-LD `delete` with `"@annotation": {"@id": ":claim1"}` | survives | survives | survives | `:claim2` | `:claim2` |
+| `DELETE DATA { :alice :knows :bob {\| … \|} }` | *refused* — an anonymous block has no addressable identity to delete | | | | |
 
 Three rows deserve calling out:
 
-- **`~ :claim1` with no body block is the sharpest edge in the table.** It reads like "detach claim1" and does close to the opposite: the edge goes, *both* claims are detached, and *both* bodies are left standing — well-formed RDF about reifiers that no longer reify anything.
-- **A variable reifier matches every claim on the edge.** `~ ?c {| :confidence ?f |}` strips the body properties the block names from *all* of them. The result is not "claim1 withdrawn" but "every claim partially gutted, and the edge gone".
-- **The cascade is not delete-specific.** An `upsert` that changes the object retracts the old edge and fires the identical cascade, with no delete written anywhere.
+- **`~ :claim1` with no body block deletes the edge.** It reads like "detach claim1", but the annotation form asserts the triple, so the delete retracts it too, and the annotation syntax stops matching `:claim2` as well.
+- **A variable reifier matches every claim on the edge.** `~ ?c {| :confidence ?f |}` retracts the link and the body properties the block names, from *all* of them, and the edge with them.
+- **An `upsert` that changes the object retracts the old edge** with no delete written anywhere, and the claims left on it stop matching the annotation syntax.
 
 So:
 
-- To **withdraw one claim**, retract its body facts — `DELETE DATA { :claim1 :confidence 0.8 ; :source :sourceA }`. The edge and every other claim stay put, and the now-empty attachment is retired for you.
-- To **detach one claim but keep its body** as ordinary RDF, use the JSON-LD `@annotation` delete. It is the only spelling that means exactly that.
-- To **remove the edge and everything about it**, delete the base edge and set `opts.lpgEdgeLifecycle: true` (see LPG mode below) so the bodies go too.
+- To **withdraw one claim** and keep the edge, retract its link with the JSON-LD `@annotation` delete; retract its body as well if it should go.
+- To **remove the edge and everything about it**, delete the edge in [LPG mode](#lpg-mode-opt-in-per-transaction).
 
-### RDF mode (default)
-
-Retracting a base edge removes the attachment and any owned facts on **anonymous** annotations. Explicit-IRI annotations keep their non-attachment facts — only the attachment row is retracted.
-
-```json
-{
-  "delete": {
-    "@id": "ex:alice",
-    "ex:worksFor": { "@id": "ex:acme" }
-  }
-}
-```
-
-After this:
-- Anonymous `_:annN` subjects attached to the edge: gone (attachment + body).
-- Explicit `ex:employment/alice-acme-2024`: attachment retracted, but `ex:role`, `ex:since`, etc. are still in the graph as ordinary RDF.
-
-History preserves both events — query at the pre-retract `t` and the annotation comes back, unchanged.
+History preserves every event — query at the pre-retract `t` and the annotation comes back, unchanged.
 
 ### LPG mode (opt-in per transaction)
 
-For property-graph relationship lifecycle — "deleting the relationship deletes the relationship's properties" — set `lpgEdgeLifecycle: true` in transaction options:
+For property-graph relationship lifecycle — "deleting the relationship deletes the relationship's properties" — set `lpgEdgeLifecycle: true` in transaction options. Cypher `DELETE` sets it.
 
 ```json
 {
@@ -367,7 +351,7 @@ For property-graph relationship lifecycle — "deleting the relationship deletes
 }
 ```
 
-Now explicit-IRI annotations cascade their owned metadata too.
+Retracting the edge now retracts every link naming it, and a reifier left with no link loses its body, whether it is anonymous or has an explicit `@id`.
 
 ### Updating annotation properties
 
@@ -395,7 +379,7 @@ In LPG mode, an empty block mints a fresh annotation subject — a property-less
 
 ## SPARQL 1.2 / RDF 1.2 surface
 
-`@annotation` lowers to the same on-disk model as the RDF 1.2 annotation tail. The equivalent **write** forms below produce identical storage; pick whichever is ergonomic for your input. (`@reifies` / `rdf:reifies` are **query-side** constructs — see [Querying annotation-rooted](#querying-annotation-rooted-metadata-first-edge-second) — and are rejected on the write side.)
+`@annotation` lowers to the same on-disk model as the RDF 1.2 annotation tail. The equivalent **write** forms below produce identical storage; pick whichever is ergonomic for your input. Each asserts the triple and links its reifier to it; `@reifies` and `rdf:reifies <<( … )>>` write the link alone (see [Reifiers of unasserted triples](#reifiers-of-unasserted-triples)).
 
 ### Equivalent forms
 
@@ -444,7 +428,7 @@ Notes:
 
 - An `annotationBlock` without a preceding `~` mints a fresh anonymous reifier.
 - A bare `~` (no identifier) is equivalent to `~` + a fresh blank node — useful when you want a reifier variable bound in WHERE but don't care about its IRI.
-- `tripleTerm` (the parenthesized `<<( s p o )>>` form) is accepted **only** as the object of `rdf:reifies`. Other uses error at parse time.
+- `tripleTerm` (the parenthesized `<<( s p o )>>` form) is a value in object position: a reifier's triple under `rdf:reifies`, a stored value under any other predicate, or another triple term's object (see [Triple terms as values](#triple-terms-as-values)). As a subject it errors at parse time.
 - Property-path triples cannot carry an annotation tail. `?s ex:p1/ex:p2 ?o {| ... |}` is rejected — write a simple-predicate triple instead.
 
 ### SPARQL UPDATE rules by operation
@@ -519,25 +503,42 @@ Per SPARQL §4.1.4, a blank-node label in a `WHERE` clause is a **non-distinguis
 
 Anonymous annotation blocks (`{| |}` without `~`) lower to a fresh non-distinguished variable internally (the formatter hides it from `SELECT *` so query output stays clean).
 
-#### One annotation, one edge (single-target invariant)
+#### One annotation, several edges
 
-An annotation subject reifies **exactly one live edge**. A single edge can carry many parallel annotations, but a given annotation `@id` cannot point at two different edges at once. Asserting an attachment that would leave one annotation reifying two edges is rejected at stage time with an `InvariantViolation`. To move an explicit-IRI annotation from one edge to another, retract the old attachment and assert the new one in the same transaction — the retract + assert nets to a single live edge and is accepted. (This keeps the reverse lookup, retract cascade, and by-id cleanup unambiguous. Bulk import does not enforce this up front — see the import caveat above.)
+As in RDF 1.2, an annotation subject may reify several triples: a given `@id` on two edges is linked to both, and its properties describe each. To move an explicit-IRI annotation from one edge to another, retract the old attachment and assert the new one; a JSON-LD upsert of the annotation does that for you.
 
-#### Lifecycle coupling
+#### Reifiers of unasserted triples
 
-Fluree's annotation is *lifecycle-coupled* to an asserted edge: the annotation describes a triple that's currently in the graph. RDF 1.2 also allows reifiers for unasserted propositions ("X claims Alice works for Acme without us asserting it"). That mode is **not supported in v1** — see *Current limits* below.
+A reifier may describe a triple that is not in the graph ("X claims Alice works for Acme", without asserting it). Write one with a reified triple — Turtle `<< :alice :worksFor :acme ~ :claim >> :source :x`, `:claim rdf:reifies <<( :alice :worksFor :acme )>>`, or JSON-LD:
+
+```json
+{
+  "@id": "ex:claim",
+  "ex:source": {"@id": "ex:x"},
+  "@reifies": {"@id": "ex:alice", "ex:worksFor": {"@id": "ex:acme"}}
+}
+```
+
+Reified-triple patterns (`<< :alice :worksFor ?o ~ ?r >>`, `?r rdf:reifies <<( … )>>`, JSON-LD `@reifies`) find such a reifier; the annotation syntax (`:alice :worksFor ?o {| … |}`, JSON-LD `@annotation`, a Cypher relationship) matches only asserted triples, as RDF 1.2 defines it. Export writes the reifier as its link (`@reifies` in JSON-LD), so it round-trips.
+
+#### Triple terms as values
+
+A triple term is also an ordinary value under any predicate. `ex:doc ex:mentions <<( ex:s ex:p ex:o )>>` stores the term itself: it neither asserts `ex:s ex:p ex:o` nor reifies it, so `?r rdf:reifies ?t` does not find `ex:doc`. Every write surface takes one in object position:
+
+- Turtle, TriG, N-Triples and N-Quads: `<<( s p o )>>`.
+- SPARQL UPDATE: `INSERT DATA`, `DELETE DATA`, `DELETE WHERE` and templates.
+- JSON-LD: the triple's node as the value's `@id`, `"ex:mentions": {"@id": {"@id": "ex:s", "ex:p": {"@id": "ex:o"}}}`.
+
+A query matches one as a constant (`?d ex:mentions <<( ex:s ex:p ex:o )>>`, or a `VALUES` row) or by its components (`?d ex:mentions <<( ex:s ?p ?o )>>`; in JSON-LD, `{"@id": {"@id": "ex:s", "ex:p": "?o"}}`), and `SUBJECT`, `PREDICATE` and `OBJECT` take a bound one apart (JSON-LD names them `subject`, `predicate` and `object`; see [JSON-LD query](../query/jsonld-query.md#triple-term-functions)). Results, CONSTRUCT output and exports write it back in the same forms (see [Output formats](../query/output-formats.md#triple-terms)), so it round-trips.
+
+A triple term's object may itself be a triple term — `<<( ex:alice ex:says <<( ex:s ex:p ex:o )>> )>>` — on every surface above, and a triple whose object is a triple term can be annotated like any other. `sameTerm` compares two triple terms as terms; `=` compares them as values, so `<<( :a :b 123 )>> = <<( :a :b 123.0 )>>` holds while `sameTerm` does not.
 
 ### Deferred SPARQL shapes (rejected at parse time)
 
 These produce a clear error with a span pointing at the offending construct:
 
-- **Triple terms outside `rdf:reifies`.** `ex:doc ex:mentions <<( :s :p :o )>>` is rejected. Use a separate annotation subject with `rdf:reifies` if you need to refer to a triple.
-- **Nested triple terms.** `<<( :s :p <<( :a :b :c )>> )>>` is rejected.
-- **Multi-triple reifiers.** One reifier identifier reifying more than one triple term in the same scope is rejected. A reifier corresponds to one edge occurrence.
 - **Annotation on a property-path triple.** `?s ex:p1/ex:p2 ?o {| ... |}` is rejected — the grammar only attaches annotations to simple-predicate triples.
-- **Annotation tail inside an explicit `GRAPH { }` block.** `INSERT DATA { GRAPH <g> { :s :p :o {| ... |} } }` is rejected. SPARQL UPDATE annotations are **default-graph only** in v1 — the SPARQL surface doesn't carry the enclosing graph's identity into the stored annotation. Use the JSON-LD `@annotation` surface or a TriG `GRAPH { }` block to annotate an edge inside a named graph.
-- **Annotation tail under a `WITH <g>` template.** `WITH <g> INSERT { :s :p :o {| ... |} } WHERE { ... }` is rejected for the same reason: the annotation would land in `<g>` without recording that graph as the edge's identity, yielding a default-graph edge identity in a named graph. Again, use the JSON-LD surface for named-graph edge annotations.
-- **Property paths and nested triple terms in a `CONSTRUCT` template's annotation.** A template annotation block (`{| ... |}`) takes simple predicates only, and a template triple term (`?r rdf:reifies <<( ... )>>`) cannot nest.
+- **Property paths in a `CONSTRUCT` template's annotation.** A template annotation block (`{| ... |}`) takes simple predicates only.
 
 Annotations on literal-valued objects (plain, typed, and language-tagged) are supported on **both** the JSON-LD and SPARQL UPDATE write surfaces — the SPARQL path records the language tag for language-tagged objects so the stored annotation matches the base edge.
 
@@ -555,7 +556,7 @@ SELECT ?age ?t ?op WHERE {
 
 This binds `?t` to the transaction time and `?op` to the assert/retract flag of the matched flake. It is **not** edge annotations and is unrelated to the RDF 1.2 reifier surface above.
 
-The legacy reading is selected only by the predicate: a reifier-less `<< s p o >>` whose predicate is `f:t` or `f:op`. Any other predicate, or a `~ reifier`, gives the bare form its RDF 1.2 *reified triple* reading — `<< :s :p :o ~ ?r >> .` and `<< :s :p :o >> ?q ?z` denote the reifier node, exactly as `?r rdf:reifies <<( :s :p :o )>>` does. This applies to query `WHERE` patterns and Turtle ingest; SPARQL UPDATE templates still take only the annotation-tail spelling (`:s :p :o ~ :r {| ... |}`).
+The legacy reading is selected only by the predicate: a reifier-less `<< s p o >>` whose predicate is `f:t` or `f:op`. Any other predicate, or a `~ reifier`, gives the bare form its RDF 1.2 *reified triple* reading — `<< :s :p :o ~ ?r >> .` and `<< :s :p :o >> ?q ?z` denote the reifier node, exactly as `?r rdf:reifies <<( :s :p :o )>>` does. This applies to query `WHERE` patterns, Turtle ingest and SPARQL UPDATE alike.
 
 The bare-quoted-triple form combined with an annotation tail (`<< :s :p :o >> :pred :obj {| ... |}`) is rejected at parse time — the two surfaces don't compose.
 
@@ -564,24 +565,18 @@ The bare-quoted-triple form combined with an annotation tail (`<< :s :p :o >> :p
 Today's surface covers the common LPG / RDF-star use cases. The following are not yet supported and produce a clear validation error rather than silent partial behavior:
 
 - **Annotations on list-occurrence triples.** `@list` membership is in scope as a future extension; the on-disk format already reserves space for it. Today, annotating a list element is rejected at parse time.
-- **Reifiers for unasserted triples.** `@reifies` must point at an asserted edge. Pure-proposition reification (claims about triples that are not in the graph) is deferred.
-- **Reifiers for multiple triples.** One annotation subject corresponds to one edge. Reifying several unrelated triples from a single annotation isn't allowed.
-- **Triple terms as values.** `ex:doc ex:mentions <<( ex:s ex:p ex:o )>>` is not a representable value on any surface (JSON-LD, SPARQL, Turtle): the only accepted position for `<<( ... )>>` is the object of `rdf:reifies`, where it names an edge rather than storing a triple. Binding a whole triple to a variable (`BIND(<<( ?s ?p ?o )>> AS ?t)`, `VALUES ?t { <<( ... )>> }`) and returning one in a result set are the same gap. Use a separate annotation subject.
-- **SPARQL 1.2 triple-term functions and constructor.** `TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, and the `BIND(<<( ?s ?p ?o )>> AS ?t)` triple-term constructor parse (with arity checks) but fail at lowering with a `not_implemented` error — they presuppose triple terms as first-class values, which v1's LPG model does not represent.
-- **SPARQL UPDATE annotations inside named graphs.** Annotation tails under `GRAPH { }` / `WITH <g>` in SPARQL UPDATE are rejected; write named-graph annotations with JSON-LD `@annotation` or TriG-star.
-- **Unasserted reified triples.** RDF 1.2's `<< s p o >>` and `r rdf:reifies <<( s p o )>>` do not assert `s p o`; Fluree's do (the reifier is lifecycle-coupled to a live edge). A W3C test that depends on a reifier existing for a triple that is *not* in the graph therefore diverges.
 
 The mandated SPARQL 1.2 `VERSION "1.2"` prologue declaration is **accepted** (lex-and-skipped): the RDF 1.2 surface runs ungated, so a conformant 1.2 client that emits the declaration parses normally.
 
 ## Storage and indexing — the short version
 
-- A ledger with no annotations creates no annotation artifacts. The annotation arena is `Option<...>` on the index root and is omitted entirely when unused.
-- Plain triple queries take exactly the same plan they did before annotations existed; the planner only routes through the attachment indexes when the query mentions `@annotation`, `@reifies`, or RDF-star quoted triples.
+- An annotation is its `rdf:reifies` link plus its properties; a ledger with no annotations stores none and pays nothing for them.
+- Plain triple queries take exactly the same plan they did before annotations existed; the planner only reads links when the query mentions `@annotation`, `@reifies`, `rdf:reifies` or a reified triple.
 - Annotation properties are stored as ordinary RDF facts. Time travel, policy, history, export, and reasoning all work on them without special cases.
-- Retraction cascade has a fast path: when both the index root and current novelty know the ledger has no annotations, base-edge retracts skip the attachment lookup entirely.
-- Branch fork, pack/sync, and ledger drop all walk annotation arena artifacts as part of the index reachability set, so annotated ledgers round-trip cleanly across these operations.
+- The LPG-mode retraction cascade has a fast path: when both the index root and current novelty know the ledger has no annotations, base-edge retracts skip the link lookup entirely.
+- An index built by an earlier Fluree version holds annotations in the `f:reifies*` form and no links, so on an annotated ledger annotation queries fail with an error asking for a rebuild until it is reindexed (`fluree reindex <ledger>`). The next index build after a new annotation is written is a full rebuild, which links them all.
 
-For the index format, sidecar layout, sort orders, and garbage-collection treatment, see the [Edge annotations design doc](../design/edge-annotations.md).
+For the term dictionary and the transaction-time rules, see the [Edge annotations design doc](../design/edge-annotations.md).
 
 ## Property-graph (LPG) model
 
@@ -597,7 +592,7 @@ Edge annotations are the storage primitive for the labeled-property-graph shape:
 ## See also
 
 - [Cypher](../query/cypher.md) — the property-graph front-end; Cypher relationships map onto edge annotations.
-- [Edge annotations design](../design/edge-annotations.md) — storage internals (EdgeKey, sidecar arena, sticky-bit state machine, GC reachability).
-- [Datasets and named graphs](datasets-and-named-graphs.md) — annotations work in named graphs (via the JSON-LD `@annotation` surface) as well as the default graph; the SPARQL UPDATE surface is default-graph only.
+- [Edge annotations design](../design/edge-annotations.md) — storage internals (the link, the term dictionary, cascade, ledgers written before links).
+- [Datasets and named graphs](datasets-and-named-graphs.md) — annotations work in named graphs as well as the default graph, on every write surface.
 - [Time travel](time-travel.md) — annotation events live in history like every other fact.
 - [Policy enforcement](policy-enforcement.md) — annotation properties pass through normal policy checks.

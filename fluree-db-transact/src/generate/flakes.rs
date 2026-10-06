@@ -4,7 +4,7 @@
 //! with variable bindings into concrete flakes.
 
 use crate::error::{Result, TransactError};
-use crate::ir::{TemplateGraph, TemplateTerm, TripleTemplate};
+use crate::ir::{TemplateGraph, TemplateTerm, TemplateTripleTerm, TripleTemplate};
 use crate::namespace::NamespaceRegistry;
 use fluree_db_core::{Flake, FlakeMeta, FlakeValue, Sid};
 use fluree_db_query::{Batch, Binding, VarId};
@@ -236,6 +236,17 @@ impl<'a> FlakeGenerator<'a> {
         // they hit the index. Bails out the whole transaction.
         validate_value_dt_pair(&o, &dt)?;
 
+        // `rdf:reifies` takes a triple term on every write path. The surface
+        // checks see literal predicates; a predicate variable is resolved only
+        // here. Retracting a legacy row stays possible.
+        if op && fluree_db_core::is_rdf_reifies(&p) && !matches!(o, FlakeValue::TripleTerm(_)) {
+            return Err(TransactError::InvalidTerm(
+                "'rdf:reifies' takes a triple term as its object; write the reified \
+                 triple (`<< s p o >>` or `~ <reifier>`)"
+                    .to_string(),
+            ));
+        }
+
         // Create metadata if language tag or list_index is present
         let meta_lang = template_lang.or(bound_lang);
         let meta = FlakeMeta::from_parts(meta_lang.as_deref(), template.list_index);
@@ -355,9 +366,7 @@ impl<'a> FlakeGenerator<'a> {
                         Binding::EncodedPid { .. } => Err(TransactError::InvalidTerm(
                             "Subject must be a Sid; EncodedPid cannot be used as subject".to_string(),
                         )),
-                        Binding::Iri(_) => Err(TransactError::InvalidTerm(
-                            "Raw IRI from graph source cannot be used as subject for flake generation".to_string(),
-                        )),
+                        Binding::Iri(iri) => self.raw_iri_sid(iri).map(Some),
                     }
                 } else {
                     Ok(None)
@@ -370,6 +379,9 @@ impl<'a> FlakeGenerator<'a> {
             }
             TemplateTerm::Value(_) => Err(TransactError::InvalidTerm(
                 "Subject cannot be a literal value".to_string(),
+            )),
+            TemplateTerm::TripleTerm(_) => Err(TransactError::InvalidTerm(
+                "Subject cannot be a triple term".to_string(),
             )),
         }
     }
@@ -410,9 +422,7 @@ impl<'a> FlakeGenerator<'a> {
                         Binding::EncodedPid { .. } => Err(TransactError::InvalidTerm(
                             "Predicate must be a Sid; EncodedPid must be materialized before flake generation".to_string(),
                         )),
-                        Binding::Iri(_) => Err(TransactError::InvalidTerm(
-                            "Raw IRI from graph source cannot be used as predicate for flake generation".to_string(),
-                        )),
+                        Binding::Iri(iri) => self.raw_iri_sid(iri).map(Some),
                     }
                 } else {
                     Ok(None)
@@ -423,6 +433,9 @@ impl<'a> FlakeGenerator<'a> {
             )),
             TemplateTerm::Value(_) => Err(TransactError::InvalidTerm(
                 "Predicate cannot be a literal value".to_string(),
+            )),
+            TemplateTerm::TripleTerm(_) => Err(TransactError::InvalidTerm(
+                "Predicate cannot be a triple term".to_string(),
             )),
         }
     }
@@ -453,9 +466,10 @@ impl<'a> FlakeGenerator<'a> {
                         Binding::Sid { sid, .. } => {
                             Ok((Some(FlakeValue::Ref(sid.clone())), Some(DT_ID.clone())))
                         }
-                        Binding::IriMatch { primary_sid, .. } => {
-                            Ok((Some(FlakeValue::Ref(primary_sid.clone())), Some(DT_ID.clone())))
-                        }
+                        Binding::IriMatch { primary_sid, .. } => Ok((
+                            Some(FlakeValue::Ref(primary_sid.clone())),
+                            Some(DT_ID.clone()),
+                        )),
                         Binding::Lit { val, dtc, .. } => {
                             Ok((Some(val.clone()), Some(dtc.datatype().clone())))
                         }
@@ -472,11 +486,15 @@ impl<'a> FlakeGenerator<'a> {
                         Binding::Grouped(_) => Err(TransactError::InvalidTerm(
                             "Object cannot be a grouped value (GROUP BY output)".to_string(),
                         )),
-                        Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => Err(TransactError::InvalidTerm(
+                        Binding::Path { .. }
+                        | Binding::Rel(_)
+                        | Binding::List(_)
+                        | Binding::Map(_) => Err(TransactError::InvalidTerm(
                             "Object cannot be a path or list value".to_string(),
                         )),
-                        Binding::Iri(_) => Err(TransactError::InvalidTerm(
-                            "Raw IRI from graph source cannot be used as object for flake generation".to_string(),
+                        Binding::Iri(iri) => Ok((
+                            Some(FlakeValue::Ref(self.raw_iri_sid(iri)?)),
+                            Some(DT_ID.clone()),
                         )),
                     }
                 } else {
@@ -488,7 +506,61 @@ impl<'a> FlakeGenerator<'a> {
                 let sid = self.skolemize_blank_node(label, solution);
                 Ok((Some(FlakeValue::Ref(sid)), Some(DT_ID.clone())))
             }
+            TemplateTerm::TripleTerm(term) => {
+                Ok(match self.resolve_triple_term(term, bindings, row)? {
+                    Some(t) => (
+                        Some(FlakeValue::TripleTerm(Box::new(t))),
+                        Some(fluree_db_core::triple_term_datatype_sid().clone()),
+                    ),
+                    None => (None, None),
+                })
+            }
         }
+    }
+
+    /// A raw IRI binding — a `GRAPH ?g` name, or a graph source's IRI — as a
+    /// node. A raw blank-node label names no stored node.
+    fn raw_iri_sid(&mut self, iri: &str) -> Result<Sid> {
+        if iri.starts_with("_:") {
+            return Err(TransactError::InvalidTerm(format!(
+                "a blank node from a graph source ({iri}) cannot be written"
+            )));
+        }
+        Ok(self.ns_registry.sid_for_iri(iri))
+    }
+
+    /// A triple term's positions, resolved as a flake's own are; `None` when
+    /// one is unbound.
+    fn resolve_triple_term(
+        &mut self,
+        term: &TemplateTripleTerm,
+        bindings: &Batch,
+        row: usize,
+    ) -> Result<Option<fluree_db_core::TripleTermValue>> {
+        let s = self.resolve_subject(&term.s, bindings, row)?;
+        let p = self.resolve_predicate(&term.p, bindings, row)?;
+        let explicit_dt = term
+            .dtc
+            .as_ref()
+            .map(fluree_db_core::DatatypeConstraint::datatype);
+        let (o, dt) = self.resolve_object(&term.o, explicit_dt, bindings, row)?;
+        let lang = match (&term.dtc, &term.o) {
+            (Some(dtc), _) => dtc.lang_tag().map(str::to_string),
+            (None, TemplateTerm::Var(v)) => match bindings.get(row, *v) {
+                Some(Binding::Lit { dtc, .. }) => dtc.lang_tag().map(str::to_string),
+                _ => None,
+            },
+            _ => None,
+        };
+        let (Some(s), Some(p), Some(o), Some(dt)) = (s, p, o, dt) else {
+            return Ok(None);
+        };
+        let dt = if lang.is_some() {
+            DT_LANG_STRING.clone()
+        } else {
+            dt
+        };
+        Ok(Some(fluree_db_core::TripleTermValue { s, p, o, dt, lang }))
     }
 
     /// Skolemize a blank node to a Sid.
@@ -541,30 +613,21 @@ pub(crate) fn validate_value_dt_pair(val: &FlakeValue, dt: &Sid) -> Result<()> {
             "rdf:JSON must pair only with FlakeValue::Json (got {val:?})"
         )));
     }
+    if (dt == fluree_db_core::triple_term_datatype_sid())
+        != matches!(val, FlakeValue::TripleTerm(_))
+    {
+        return Err(TransactError::FlakeGeneration(format!(
+            "f:tripleTerm must pair only with a triple term (got {val:?})"
+        )));
+    }
     Ok(())
 }
 
-/// Shared core of the two `emit_reified_triple` impls (`FlakeSink` /
-/// `ImportSink`) and of TriG bulk import: a resolved reifier attachment →
-/// validated → the `EdgeKey::to_reifies_facts_jsonld_compatible` bundle,
-/// so the bit-identical-bundles guarantee (Turtle-star ≡ JSON-LD
-/// `@annotation` at the flake level; cascade retracts cancel either
-/// surface) cannot drift between those callers — each keeps only its own
-/// error channel and emission (Vec-extend vs commit-writer/spool).
-/// Transactional TriG (`convert_named_graphs_to_templates` in
-/// `fluree-db-api`) is a second builder emitting templates; its parity is
-/// pinned by `trig_star_in_graph_block_matches_jsonld_named_graph_annotation`.
-///
-/// `g` is `None` for the Turtle sinks (default graph) and the block's graph
-/// for TriG import; list-occurrence annotations are deferred in v1 →
-/// `list_i = None`.
-///
-/// The validation is the same late hard guard as `build_flake` /
-/// `push_triple`: a bad (value, dt) pair must fail the whole ingest, not
-/// silently drop or corrupt the bundle. The base triple hit the same
-/// guard already, so this only fires on shapes the base emission also
-/// rejected.
-pub(crate) fn reified_triple_bundle(
+/// The RDF 1.2 link `ann rdf:reifies <<( s p o )>>` for a reified triple, in
+/// the triple's graph (`None` for the default graph). Shared by the Turtle
+/// sinks and TriG bulk import. The object pair gets the same late guard as
+/// `build_flake`, so a bad (value, datatype) pair fails the ingest.
+pub(crate) fn reified_triple_link(
     g: Option<Sid>,
     s: Sid,
     p: Sid,
@@ -572,20 +635,23 @@ pub(crate) fn reified_triple_bundle(
     dtc: &fluree_db_core::DatatypeConstraint,
     ann: &Sid,
     t: i64,
-) -> Result<Vec<Flake>> {
+) -> Result<Flake> {
     let dt = dtc.datatype().clone();
-    let lang = dtc.lang_tag().map(std::string::ToString::to_string);
     validate_value_dt_pair(&o, &dt)?;
-    let key = fluree_db_core::edge::EdgeKey {
-        g,
+    let term = fluree_db_core::TripleTermValue {
         s,
         p,
         o,
         dt,
-        lang,
-        list_i: None,
+        lang: dtc.lang_tag().map(str::to_string),
     };
-    Ok(key.to_reifies_facts_jsonld_compatible(ann, t, true))
+    let reifies = fluree_db_core::rdf_reifies_sid().clone();
+    let value = FlakeValue::TripleTerm(Box::new(term));
+    let dt = fluree_db_core::triple_term_datatype_sid().clone();
+    Ok(match g {
+        Some(g) => Flake::new_in_graph(g, ann.clone(), reifies, value, dt, t, true, None),
+        None => Flake::new(ann.clone(), reifies, value, dt, t, true, None),
+    })
 }
 
 /// Infer datatype from a FlakeValue
@@ -617,6 +683,7 @@ pub fn infer_datatype(val: &FlakeValue) -> Sid {
         FlakeValue::DayTimeDuration(_) => DT_DAY_TIME_DURATION.clone(),
         FlakeValue::Duration(_) => DT_DURATION.clone(),
         FlakeValue::GeoPoint(_) => DT_WKT_LITERAL.clone(),
+        FlakeValue::TripleTerm(_) => fluree_db_core::triple_term_datatype_sid().clone(),
         // Null isn't a standard RDF literal; treat as xsd:string for now (MVP).
         FlakeValue::Null => DT_STRING.clone(),
     }
@@ -689,6 +756,58 @@ mod tests {
         assert_eq!(flakes.len(), 1);
         // Check that the blank node was skolemized
         assert!(flakes[0].s.name.contains("b1"));
+    }
+
+    #[test]
+    fn triple_term_template_resolves_per_solution() {
+        let mut registry = NamespaceRegistry::new();
+        let mut generator = FlakeGenerator::new(1, &mut registry, "txn1".to_string());
+        let (r, s, o) = (VarId(0), VarId(1), VarId(2));
+        let schema: Arc<[VarId]> = Arc::new([r, s, o]);
+        let sid = |name: &str| Binding::sid(Sid::new(1, name));
+        let batch = Batch::new(
+            schema,
+            vec![
+                vec![sid("ex:r1"), sid("ex:r2")],
+                vec![sid("ex:alice"), sid("ex:bob")],
+                vec![
+                    sid("ex:bob"),
+                    Binding::Lit {
+                        val: FlakeValue::String("salut".into()),
+                        dtc: DatatypeConstraint::LangTag("fr".into()),
+                        t: None,
+                        op: None,
+                        p_id: None,
+                    },
+                ],
+            ],
+        )
+        .unwrap();
+        let templates = vec![TripleTemplate::new(
+            TemplateTerm::Var(r),
+            TemplateTerm::Sid(Sid::new(2, "reifies")),
+            TemplateTerm::TripleTerm(Box::new(TemplateTripleTerm {
+                s: TemplateTerm::Var(s),
+                p: TemplateTerm::Sid(Sid::new(1, "ex:says")),
+                o: TemplateTerm::Var(o),
+                dtc: None,
+            })),
+        )];
+
+        let flakes = generator.generate_assertions(&templates, &batch).unwrap();
+
+        assert_eq!(flakes.len(), 2);
+        let term = |i: usize| match &flakes[i].o {
+            FlakeValue::TripleTerm(t) => t.as_ref().clone(),
+            other => panic!("not a triple term: {other:?}"),
+        };
+        assert_eq!(flakes[0].dt, *fluree_db_core::triple_term_datatype_sid());
+        assert_eq!(term(0).s, Sid::new(1, "ex:alice"));
+        assert_eq!(term(0).o, FlakeValue::Ref(Sid::new(1, "ex:bob")));
+        assert_eq!(term(0).dt, *DT_ID);
+        assert_eq!(term(1).o, FlakeValue::String("salut".into()));
+        assert_eq!(term(1).dt, *DT_LANG_STRING);
+        assert_eq!(term(1).lang.as_deref(), Some("fr"));
     }
 
     #[test]

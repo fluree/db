@@ -1,123 +1,103 @@
 //! Where `fluree export` gets "which reifiers point at this edge".
 //!
 //! RDF 1.2 annotation syntax names the reifier at the base edge
-//! (`s p o ~ <r>`), so serializing it needs the **forward** direction of the
-//! edge-annotation index: `EdgeKey -> ann_sid`. That direction exists on disk
-//! as the annotation arena's forward branch, and in memory as the attachment
-//! overlay for anything committed since the last index build. This module
-//! picks between them once per export and answers a whole `ColumnBatch` at a
-//! time.
-//!
-//! ## Why not read the `f:reifies*` flakes the scan is already passing
-//!
-//! They are the durable encoding, and export sees every one of them. But they
-//! are keyed by *reifier* subject, and the scan is in SPOT order: a reifier
-//! whose IRI sorts after its base edge's subject arrives too late to influence
-//! the line already written. Reconstructing the mapping from the scan alone
-//! therefore means either buffering the whole graph or a second full pass.
-//! The arena probe is `O(edges·log edges + covered leaves)` and needs neither.
+//! (`s p o ~ <r>`), so serializing it needs the edge → reifier direction of
+//! the `rdf:reifies` links. The scan is in SPOT order, and a reifier whose IRI
+//! sorts after its base edge's subject arrives too late to mark the line
+//! already written, so each batch's edges look their links up as the batch
+//! is written, and each link row checks whether its triple is asserted. Only
+//! the reifier bookkeeping lasts the whole export, at a word per annotation.
 
-use fluree_db_binary_index::annotation_arena::AnnotationArenaReader;
-use fluree_db_core::storage::ContentStore;
-use fluree_db_core::{AnnotationIndexRoot, EdgeKey, Sid};
-use fluree_db_novelty::AttachmentNovelty;
+use fluree_db_binary_index::BinaryIndexStore;
+use fluree_db_core::comparator::IndexType;
+use fluree_db_core::dict_novelty::DictNovelty;
+use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
+use fluree_db_core::{EdgeKey, FlakeValue, GraphId, Sid, TripleTermValue};
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use crate::{ApiError, LedgerState, Result};
+use crate::{LedgerState, Result};
 
-/// Forward annotation lookup for the duration of one export.
+/// Edge → reifier lookups for the duration of one export.
 ///
-/// Constructed once by [`Self::for_ledger`]; borrowed by every per-graph
-/// writer. Holds no state of its own beyond the two sources — the arena
-/// reader, which caches branches and hot leaves, is built per probe call
-/// because the writers each own their own scan.
 /// Only `ExportBuilder` constructs one; the type is public because it appears
 /// on the public `ExportConfig`. An external caller building an `ExportConfig`
-/// by hand passes `annotations: None` and gets the pre-RDF-1.2 behaviour.
+/// by hand passes `annotations: None` and gets the links as ordinary triples.
 pub struct AnnotationProbe<'a> {
-    /// Sealed on-disk arena: authoritative for `t <= its max_t`.
-    arena: Option<(&'a AnnotationIndexRoot, &'a Arc<dyn ContentStore>)>,
-    /// One reader for the whole export, built from `arena` once.
-    ///
-    /// The reader memoises the forward branch and every forward leaf it
-    /// touches. It used to be constructed inside `live_reifiers`, which runs
-    /// once per `ColumnBatch`, so those caches were rebuilt and thrown away
-    /// for every batch of the export and each batch re-fetched the same
-    /// branch. The source is chosen once per export, so the reader can be.
-    reader: Option<AnnotationArenaReader<'a, dyn ContentStore>>,
-    /// Attachment events committed since the last index build.
-    novelty: Option<&'a AttachmentNovelty>,
-    /// Bundles recovered by scanning the base index, for a ledger whose arena
-    /// was never sealed. Resolved once at export start; empty otherwise.
-    scanned: HashMap<EdgeKey, Vec<Sid>>,
+    ledger: &'a LedgerState,
     as_of_t: i64,
-    /// Reifiers named by a `~ <r>` marker somewhere in this export.
-    named: Mutex<HashSet<Sid>>,
-    /// Reifiers whose `f:reifies*` bundle the scan passed — i.e. whose own
-    /// subject is inside the exported selection, so their properties are in
-    /// the file. Populated from the rows the writers suppress, which costs
-    /// nothing extra: they are already being visited and discarded.
-    in_scope: Mutex<HashSet<Sid>>,
+    /// Every live link, read up front when the index counts few enough;
+    /// otherwise each batch probes its own edges and links.
+    preloaded: Option<Preloaded>,
+    /// Reifiers named by a `~ <r>` marker somewhere in this export, by
+    /// [`reifier_key`].
+    named: Mutex<HashSet<u64>>,
+    /// Reifiers whose link the scan passed — i.e. whose own subject is inside
+    /// the exported selection, so their properties are in the file. Populated
+    /// from the rows the writers suppress, which costs nothing extra: they are
+    /// already being visited and discarded.
+    in_scope: Mutex<HashSet<u64>>,
+}
+
+/// Links up to this many are read up front: lookups then cost a hash probe,
+/// at a few hundred bytes per link. Past it, per-batch probes keep memory
+/// to the batch.
+pub(crate) const PRELOAD_MAX_LINKS: u64 = 1_000_000;
+
+/// The live links at the export's `t`, read once.
+struct Preloaded {
+    /// Links whose triple is asserted, per graph, by the edge they name (its
+    /// `g` cleared). Each becomes a marker on its edge.
+    links: HashMap<GraphId, HashMap<EdgeKey, Vec<Sid>>>,
+    /// Edges, per graph, that live links name but the graph does not assert:
+    /// no edge carries their marker, so the links are written as rows.
+    unasserted: HashSet<(GraphId, EdgeKey)>,
+}
+
+/// A reifier as the bookkeeping sets hold it: a hash, so they cost a word per
+/// annotation rather than an IRI.
+fn reifier_key(sid: &Sid) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    sid.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl<'a> AnnotationProbe<'a> {
-    fn new(
-        arena: Option<(&'a AnnotationIndexRoot, &'a Arc<dyn ContentStore>)>,
-        novelty: Option<&'a AttachmentNovelty>,
-        as_of_t: i64,
-    ) -> Self {
-        Self {
-            arena,
-            reader: arena.map(|(root, store)| AnnotationArenaReader::new(root, store.as_ref())),
-            novelty,
-            scanned: HashMap::new(),
-            as_of_t,
-            named: Mutex::new(HashSet::new()),
-            in_scope: Mutex::new(HashSet::new()),
-        }
-    }
-
     /// Record that a `~ <r>` marker (or its per-format equivalent) was
     /// emitted for `reifier`.
     pub(crate) fn note_reifier_named(&self, reifier: &Sid) {
         if let Ok(mut named) = self.named.lock() {
-            if !named.contains(reifier) {
-                named.insert(reifier.clone());
-            }
+            named.insert(reifier_key(reifier));
         }
     }
 
-    /// Record that the scan passed `s_id`'s `f:reifies*` bundle, so that
-    /// reifier's own triples are inside this export.
-    ///
-    /// Takes the raw subject id and resolves it only on first sight of each
-    /// reifier — a bundle is up to seven rows, and resolving all of them
-    /// would allocate seven times per annotation for one set entry.
-    pub(crate) fn note_bundle_in_scope(&self, resolver: &dyn ReifierSubject, s_id: u64) {
+    /// Record that the scan passed `s_id`'s link, so that reifier's own
+    /// triples are inside this export.
+    pub(crate) fn note_link_in_scope(&self, resolver: &dyn ReifierSubject, s_id: u64) {
         let Ok(sid) = resolver.reifier_sid(s_id) else {
             return;
         };
-        self.note_bundle_sid(sid);
+        self.note_link_sid(&sid);
     }
 
-    /// As [`Self::note_bundle_in_scope`], for callers that already hold the
+    /// As [`Self::note_link_in_scope`], for callers that already hold the
     /// reifier's `Sid`.
     ///
     /// Untranslated overlay rows carry a fully-decoded subject, so they need
     /// no resolver round-trip. They still have to be *counted*: suppressing a
-    /// bundle without noting it turns a visible leak into an annotation that
-    /// vanishes with no marker, no bundle and no number.
-    pub(crate) fn note_bundle_sid(&self, sid: Sid) {
+    /// link without noting it turns a visible leak into an annotation that
+    /// vanishes with no marker, no link and no number.
+    pub(crate) fn note_link_sid(&self, sid: &Sid) {
         if let Ok(mut in_scope) = self.in_scope.lock() {
-            in_scope.insert(sid);
+            in_scope.insert(reifier_key(sid));
         }
     }
 
     /// Reifiers named in the output whose own description is not in it.
     ///
-    /// Read once, after every graph of an export has been written: a bundle
+    /// Read once, after every graph of an export has been written: a link
     /// can legitimately be emitted in a later graph than the marker, so the
     /// answer is only meaningful for the file as a whole.
     pub(crate) fn out_of_scope_count(&self) -> u64 {
@@ -127,18 +107,10 @@ impl<'a> AnnotationProbe<'a> {
         named.difference(&in_scope).count() as u64
     }
 
-    /// Bundles the export suppressed whose reifier it never named.
-    ///
-    /// The complement of [`Self::out_of_scope_count`], and the one that means
-    /// data loss: the `f:reifies*` rows were dropped from the output because
-    /// annotation syntax was going to replace them, and then no marker was
-    /// emitted. Today this is reachable for annotations inside a named graph —
-    /// the PSOT scan that seals the arena, and that this module falls back to,
-    /// returns nothing for a named graph, so neither forward source knows
-    /// about them. The rows are in the ledger and SPARQL reads them; only
-    /// these two lookups are blind. Reporting it is what keeps that gap from
-    /// being a silent truncation, and `--raw-reifies` gets the bundles out
-    /// verbatim in the meantime.
+    /// Links the export suppressed whose reifier it never named: the link
+    /// rows were dropped because annotation syntax was going to replace them,
+    /// and then no marker was emitted. Reported so that gap can never be a
+    /// silent truncation.
     pub(crate) fn unresolved_count(&self) -> u64 {
         let (Ok(named), Ok(in_scope)) = (self.named.lock(), self.in_scope.lock()) else {
             return 0;
@@ -146,193 +118,268 @@ impl<'a> AnnotationProbe<'a> {
         in_scope.difference(&named).count() as u64
     }
 
-    /// Choose an annotation source for `ledger`, or establish that it has none.
-    ///
-    /// `Ok(None)` is the hard-guarantee case from the truth table in
-    /// `fluree_db_core::annotation_index`: no `f:reifies*` flake has ever been
-    /// observed, on either the indexed side or the overlay. The caller keeps
-    /// its existing scan untouched, so a ledger without annotations pays one
-    /// boolean read for all of this.
-    ///
-    /// `has_annotations = true` with no arena sealed is the state every
-    /// `fluree index` pass leaves an annotated ledger in, and a bulk import
-    /// before its auto-seal pass. There is no forward index to probe, so the
-    /// bundles are recovered from the base index instead: a PSOT scan of the
-    /// seven `f:reifies*` predicates, `O(annotations)` rather than
-    /// `O(dataset)`, reusing the routine and the canonical
-    /// `EdgeKey::from_reifies_facts` decode the arena's own seal pass uses.
-    ///
-    /// Emitting nothing there was never an option — it would turn #1859's
-    /// loud defect into a quiet one, on the ledgers most likely to carry
-    /// annotations. Refusing was, until it turned out that `fluree reindex`
-    /// cannot clear the state (the sticky `had_annotation_arena` bit blocks
-    /// the re-bootstrap), which would have made the refusal a dead end on
-    /// ledgers every other reader serves through its own scan fallback.
-    pub(crate) async fn for_ledger(ledger: &'a LedgerState, as_of_t: i64) -> Result<Option<Self>> {
-        let snapshot = &ledger.snapshot;
-        let attachments = &ledger.novelty.attachments;
-        let novelty = attachments.has_annotations().then_some(attachments);
-
-        if !snapshot.has_annotations {
-            // Indexed side guarantees zero attachments. The overlay may still
-            // hold some: a ledger that has never been indexed keeps its entire
-            // history there, and so does one indexed before its first
-            // annotation was written.
-            return Ok(novelty.map(|novelty| Self::new(None, Some(novelty), as_of_t)));
+    /// A probe of `ledger`'s links as of `as_of_t`, or `Ok(None)` when
+    /// neither the index nor novelty has ever held an annotation, so a ledger
+    /// without annotations pays two boolean reads. Nothing is read up front:
+    /// the writers probe each batch's edges and links.
+    pub(crate) async fn for_ledger(
+        ledger: &'a LedgerState,
+        as_of_t: i64,
+        preload_max_links: u64,
+    ) -> Result<Option<Self>> {
+        if !ledger.snapshot.has_annotations && !ledger.novelty.has_annotations() {
+            return Ok(None);
         }
-
-        // Kill switch: take the base-index scan even when an arena is
-        // sealed. The two sources should agree; this is how you find out
-        // when they do not, without rebuilding an index.
-        if force_base_index_scan() {
-            let mut probe = Self::new(None, novelty, as_of_t);
-            probe.scanned = scan_bundles(ledger, as_of_t).await;
-            return Ok(Some(probe));
+        fluree_db_query::term_components::require_link_index(&ledger.snapshot)?;
+        let mut probe = Self {
+            ledger,
+            as_of_t,
+            preloaded: None,
+            named: Mutex::new(HashSet::new()),
+            in_scope: Mutex::new(HashSet::new()),
+        };
+        // Unknown counts on an index mean an index of unknown size; without
+        // one, the links are novelty's, which `preload` counts as it reads.
+        let indexed_links = match ledger.snapshot.stats.as_ref() {
+            Some(stats) => stats
+                .links
+                .as_ref()
+                .map(|links| links.iter().map(|l| l.count).sum::<u64>()),
+            None => Some(0),
+        };
+        if indexed_links.is_some_and(|n| n <= preload_max_links) {
+            probe.preloaded = probe
+                .preload(preload_max_links)
+                .await
+                .map_err(|e| crate::ApiError::internal(e.to_string()))?;
         }
-        match (&snapshot.annotation_index, &snapshot.content_store) {
-            (Some(root), Some(store)) => Ok(Some(Self::new(Some((root, store)), novelty, as_of_t))),
-            (Some(_), None) => Err(ApiError::internal(
-                "ledger has a sealed annotation arena but no content store to read it from",
-            )),
-            (None, _) => {
-                let mut probe = Self::new(None, novelty, as_of_t);
-                probe.scanned = scan_bundles(ledger, as_of_t).await;
-                Ok(Some(probe))
-            }
-        }
+        Ok(Some(probe))
     }
 
-    /// Bundles the base-index scan recovered for `edge`.
-    #[inline]
-    fn scanned_for(&self, edge: &EdgeKey) -> Vec<Sid> {
-        self.scanned.get(edge).cloned().unwrap_or_default()
-    }
-
-    /// Live reifiers for each edge, index-aligned with `edges`.
-    ///
-    /// Entry `i` is empty when `edges[i]` carries no annotation whose latest
-    /// event at or before `as_of_t` is an assert.
-    pub(crate) async fn live_reifiers(&self, edges: &[EdgeKey]) -> io::Result<Vec<Vec<Sid>>> {
-        if edges.is_empty() {
-            return Ok(Vec::new());
-        }
-        match (self.arena, self.novelty) {
-            (None, None) => Ok(edges.iter().map(|e| self.scanned_for(e)).collect()),
-
-            // Sealed arena, nothing pending: one sorted merge-scan for the
-            // whole batch. `current_annotations_batch` is arena-only by
-            // contract, which is exactly what an empty overlay makes correct.
-            (Some(_), None) => {
-                let reader = self
-                    .reader
-                    .as_ref()
-                    .expect("reader is built whenever arena is");
-                reader
-                    .current_annotations_batch(edges, self.as_of_t)
-                    .await
-                    .map_err(|e| io::Error::other(format!("annotation arena probe: {e}")))
+    /// Read every live link, telling markers from rows by one lookup per
+    /// `(graph, subject, predicate)`; `None` once more than `max_links` are
+    /// read, novelty's included.
+    async fn preload(&self, max_links: u64) -> io::Result<Option<Preloaded>> {
+        let mut read: u64 = 0;
+        let graphs = std::iter::once(0).chain(
+            self.ledger
+                .snapshot
+                .graph_registry
+                .iter_entries()
+                .map(|(g_id, _)| g_id),
+        );
+        let mut links: HashMap<GraphId, HashMap<EdgeKey, Vec<Sid>>> = HashMap::new();
+        let mut unasserted: HashSet<(GraphId, EdgeKey)> = HashSet::new();
+        for g_id in graphs {
+            let flakes = self
+                .range(
+                    g_id,
+                    IndexType::Psot,
+                    RangeMatch::predicate(fluree_db_core::rdf_reifies_sid().clone()),
+                )
+                .await?;
+            read += flakes.len() as u64;
+            if read > max_links {
+                return Ok(None);
             }
-
-            // Attachments committed since the arena was sealed. The batched
-            // read cannot see a novelty *retract* of an indexed attachment, so
-            // each edge merges its own event stream instead. Slower, and
-            // confined to ledgers with pending annotation novelty.
-            (Some(_), Some(novelty)) => {
-                let reader = self
-                    .reader
-                    .as_ref()
-                    .expect("reader is built whenever arena is");
-                let mut out = Vec::with_capacity(edges.len());
-                for edge in edges {
-                    let events = novelty.collect_forward_events(edge);
-                    out.push(
-                        reader
-                            .current_annotations_merged(edge, &events, self.as_of_t)
-                            .await
-                            .map_err(|e| {
-                                io::Error::other(format!("annotation arena merge: {e}"))
-                            })?,
-                    );
+            // Moved, not cloned: the map holds each term's parts.
+            let graph_links = links.entry(g_id).or_default();
+            for flake in flakes {
+                let FlakeValue::TripleTerm(term) = flake.o else {
+                    continue;
+                };
+                let TripleTermValue { s, p, o, dt, lang } = *term;
+                let edge = EdgeKey {
+                    g: None,
+                    s,
+                    p,
+                    o,
+                    dt,
+                    lang,
+                    list_i: None,
+                };
+                let reifiers = graph_links.entry(edge).or_default();
+                if !reifiers.contains(&flake.s) {
+                    reifiers.push(flake.s);
                 }
-                Ok(out)
             }
+        }
+        for (&g_id, graph_links) in &mut links {
+            // One lookup per (subject, predicate), grouped over borrowed keys.
+            let mut edges: Vec<&EdgeKey> = graph_links.keys().collect();
+            edges.sort_unstable_by(|a, b| (&a.s, &a.p).cmp(&(&b.s, &b.p)));
+            let mut missing: Vec<EdgeKey> = Vec::new();
+            for group in edges.chunk_by(|a, b| a.s == b.s && a.p == b.p) {
+                let asserted: HashSet<EdgeKey> = self
+                    .range(
+                        g_id,
+                        IndexType::Spot,
+                        RangeMatch::subject_predicate(group[0].s.clone(), group[0].p.clone()),
+                    )
+                    .await?
+                    .iter()
+                    .map(|flake| EdgeKey {
+                        g: None,
+                        list_i: None,
+                        ..EdgeKey::from_flake(flake)
+                    })
+                    .collect();
+                missing.extend(
+                    group
+                        .iter()
+                        .filter(|edge| !asserted.contains(**edge))
+                        .map(|edge| (*edge).clone()),
+                );
+            }
+            for edge in missing {
+                graph_links.remove(&edge);
+                unasserted.insert((g_id, edge));
+            }
+        }
+        for reifiers in links.values_mut().flat_map(HashMap::values_mut) {
+            reifiers.sort();
+        }
+        Ok(Some(Preloaded { links, unasserted }))
+    }
 
-            // No arena: the overlay is the whole history. An in-memory
-            // `BTreeMap` lookup per edge, no I/O.
-            (None, Some(novelty)) => Ok(edges
+    async fn range(
+        &self,
+        g_id: GraphId,
+        index: IndexType,
+        rm: RangeMatch,
+    ) -> io::Result<Vec<fluree_db_core::Flake>> {
+        range_with_overlay(
+            &self.ledger.snapshot,
+            g_id,
+            self.ledger.novelty.as_ref(),
+            index,
+            RangeTest::Eq,
+            rm,
+            RangeOptions::new().with_to_t(self.as_of_t),
+        )
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    /// Whether graph `g_id` does not assert the triple `term` names, so a
+    /// link to it is written as a row rather than replaced by a marker.
+    pub(crate) async fn link_is_unasserted(
+        &self,
+        g_id: GraphId,
+        term: &TripleTermValue,
+    ) -> io::Result<bool> {
+        let edge = term_edge(term);
+        if let Some(preloaded) = &self.preloaded {
+            return Ok(preloaded.unasserted.contains(&(g_id, edge)));
+        }
+        let rows = self
+            .range(
+                g_id,
+                IndexType::Spot,
+                RangeMatch::subject_predicate(term.s.clone(), term.p.clone()),
+            )
+            .await?;
+        Ok(!rows.iter().any(|flake| {
+            EdgeKey {
+                g: None,
+                list_i: None,
+                ..EdgeKey::from_flake(flake)
+            } == edge
+        }))
+    }
+
+    /// Live reifiers for each edge of graph `g_id`, index-aligned with
+    /// `edges` and sorted; entry `i` is empty when `edges[i]` carries no
+    /// annotation. An edge no term dictionary names has no link, so only an
+    /// annotated edge pays a link lookup.
+    pub(crate) async fn live_reifiers(
+        &self,
+        g_id: GraphId,
+        edges: &[EdgeKey],
+        store: &BinaryIndexStore,
+        dict_novelty: Option<&Arc<DictNovelty>>,
+    ) -> io::Result<Vec<Vec<Sid>>> {
+        if let Some(preloaded) = &self.preloaded {
+            let links = preloaded.links.get(&g_id);
+            return Ok(edges
                 .iter()
                 .map(|edge| {
-                    let mut out = self.scanned_for(edge);
-                    for ann in novelty.current_annotations_for_at(edge, self.as_of_t) {
-                        if !out.contains(&ann) {
-                            out.push(ann);
-                        }
-                    }
-                    out
+                    let key = EdgeKey {
+                        g: None,
+                        ..edge.clone()
+                    };
+                    links
+                        .and_then(|links| links.get(&key))
+                        .cloned()
+                        .unwrap_or_default()
                 })
-                .collect()),
+                .collect());
         }
+        let mut out = Vec::with_capacity(edges.len());
+        for edge in edges {
+            let term = TripleTermValue {
+                s: edge.s.clone(),
+                p: edge.p.clone(),
+                o: edge.o.clone(),
+                dt: edge.dt.clone(),
+                lang: edge.lang.clone(),
+            };
+            if !may_be_linked(&term, store, dict_novelty)? {
+                out.push(Vec::new());
+                continue;
+            }
+            let links = self
+                .range(
+                    g_id,
+                    IndexType::Post,
+                    RangeMatch::predicate_object(
+                        fluree_db_core::rdf_reifies_sid().clone(),
+                        FlakeValue::TripleTerm(Box::new(term)),
+                    ),
+                )
+                .await?;
+            let mut reifiers: Vec<Sid> = links.into_iter().map(|flake| flake.s).collect();
+            reifiers.sort();
+            reifiers.dedup();
+            out.push(reifiers);
+        }
+        Ok(out)
     }
 }
 
-/// Whether `FLUREE_EXPORT_ANNOTATION_SCAN` asks for the base-index scan in
-/// place of a sealed arena.
-///
-/// Reads the *value*, not merely the presence. This flag is positively
-/// named, so `=0` has to mean off — it previously tested `.is_ok()`, which
-/// made `FLUREE_EXPORT_ANNOTATION_SCAN=0` *enable* the scan and silently
-/// trade a correct arena read for the fallback. The `FLUREE_DISABLE_*` flags
-/// in this tree are presence-only and named so that presence-only is
-/// correct; this one is not one of those. Matches
-/// `indexer_attachment_provider::force_annotation_bootstrap`, the other
-/// positively-named flag in the crate.
-fn force_base_index_scan() -> bool {
-    env_flag_enabled(
-        std::env::var("FLUREE_EXPORT_ANNOTATION_SCAN")
-            .ok()
-            .as_deref(),
-    )
-}
-
-/// The parse behind [`force_base_index_scan`], separated from the read so it
-/// can be tested without mutating a process-global.
-fn env_flag_enabled(value: Option<&str>) -> bool {
-    matches!(value, Some(v) if v == "1" || v.eq_ignore_ascii_case("true"))
-}
-
-/// Recover `EdgeKey -> reifiers` from the base index for an unsealed ledger.
-///
-/// Best effort by design: the underlying scan reports its own failures as "no
-/// coverage", and an export that emits no annotation marker is a better
-/// outcome than one that fails outright on a ledger every other reader can
-/// serve.
-#[cfg(not(target_arch = "wasm32"))]
-async fn scan_bundles(ledger: &LedgerState, as_of_t: i64) -> HashMap<EdgeKey, Vec<Sid>> {
-    let events = crate::indexer_attachment_provider::scan_base_index_for_attachment_events_in(
-        &ledger.snapshot,
-        ledger.novelty.as_ref(),
-        as_of_t,
-        &ledger.snapshot.ledger_id,
-    )
-    .await;
-    let mut out: HashMap<EdgeKey, Vec<Sid>> = HashMap::new();
-    for (edge, ann, t, op) in events.unwrap_or_default() {
-        // The scan already drops retracted rows; `t` still has to be honoured
-        // so a time-travel export does not show an annotation written later.
-        if !op || t > as_of_t {
-            continue;
+/// Whether any link can name `term`: a dictionary holds it. A term neither
+/// the index nor dictionary novelty names has never been written, so its edge
+/// has no link; without initialized dictionary novelty, assume it may.
+fn may_be_linked(
+    term: &TripleTermValue,
+    store: &BinaryIndexStore,
+    dict_novelty: Option<&Arc<DictNovelty>>,
+) -> io::Result<bool> {
+    match fluree_db_query::binary_scan::compose_term_handle(term, store, dict_novelty) {
+        Ok(_) => Ok(true),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(dict_novelty.is_none_or(|dn| !dn.is_initialized() || dn.terms.find(term).is_some()))
         }
-        let slot = out.entry(edge).or_default();
-        if !slot.contains(&ann) {
-            slot.push(ann);
-        }
+        Err(e) => Err(e),
     }
-    out
 }
 
-#[cfg(target_arch = "wasm32")]
-async fn scan_bundles(_ledger: &LedgerState, _as_of_t: i64) -> HashMap<EdgeKey, Vec<Sid>> {
-    HashMap::new()
+/// The edge a triple term names, keyed as the probe keys it.
+fn term_edge(term: &fluree_db_core::TripleTermValue) -> EdgeKey {
+    EdgeKey {
+        g: None,
+        s: term.s.clone(),
+        p: term.p.clone(),
+        o: term.o.clone(),
+        dt: term.dt.clone(),
+        lang: term.lang.clone(),
+        list_i: None,
+    }
 }
 
 /// Resolves a subject id to the `Sid` a reifier was stored under.
@@ -344,23 +391,100 @@ pub(crate) trait ReifierSubject {
 }
 
 #[cfg(test)]
-mod env_flag_tests {
-    use super::env_flag_enabled;
+mod tests {
+    use crate::export::ExportFormat;
+    use crate::{FlureeBuilder, ReindexOptions};
 
-    /// A positively-named flag has to read its value. `=0` meaning "on" is
-    /// the defect this guards, and the docs promise `=1` means force.
-    #[test]
-    fn only_affirmative_values_enable_the_scan() {
-        assert!(env_flag_enabled(Some("1")));
-        assert!(env_flag_enabled(Some("true")));
-        assert!(env_flag_enabled(Some("TRUE")));
+    /// The preload bound counts novelty's links, which index stats do not.
+    #[tokio::test]
+    async fn preload_bound_counts_novelty_links() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let id = "export/preload-bound:main";
+        let ledger = fluree.create_ledger(id).await.unwrap();
+        let ledger = fluree
+            .upsert_turtle(
+                ledger,
+                "VERSION \"1.2\"\n@prefix ex: <http://example.org/> .\n\
+                 ex:alice ex:worksFor ex:acme ~ ex:claim1 {| ex:role \"Engineer\" |} .\n",
+            )
+            .await
+            .unwrap()
+            .ledger;
+        for (max, preloaded) in [(0, false), (1, true)] {
+            let probe = super::AnnotationProbe::for_ledger(&ledger, ledger.t(), max)
+                .await
+                .unwrap()
+                .expect("an annotated ledger");
+            assert_eq!(probe.preloaded.is_some(), preloaded, "max_links={max}");
+        }
+    }
 
-        assert!(!env_flag_enabled(Some("0")), "`=0` must not enable it");
-        assert!(!env_flag_enabled(Some("false")));
-        assert!(
-            !env_flag_enabled(Some("")),
-            "set-but-empty is not an opt-in"
-        );
-        assert!(!env_flag_enabled(None), "unset is off");
+    /// Per-batch probes write exactly what the up-front read writes, in every
+    /// format, over indexed links and novelty ones; a term only novelty holds
+    /// decodes through dictionary novelty.
+    #[tokio::test]
+    async fn per_batch_probes_match_the_preloaded_links() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let id = "export/probe-modes:main";
+        let ledger = fluree.create_ledger(id).await.unwrap();
+        let ledger = fluree
+            .upsert_turtle(
+                ledger,
+                "VERSION \"1.2\"\n@prefix ex: <http://example.org/> .\n\
+                 ex:alice ex:worksFor ex:acme {| ex:role \"Engineer\" |} .\n\
+                 ex:bob ex:knows ex:carol ~ ex:claim1 {| ex:confidence 0.9 |} .\n\
+                 ex:bob ex:knows ex:carol ~ ex:claim2 {| ex:confidence 0.5 |} .\n\
+                 ex:bob ex:says \"chat\"@fr ~ ex:claim3 {| ex:src ex:hr |} .\n\
+                 << ex:dave ex:knows ex:erin ~ ex:claim4 >> ex:confidence 0.1 .\n",
+            )
+            .await
+            .unwrap()
+            .ledger;
+        drop(ledger);
+        fluree.reindex(id, ReindexOptions::default()).await.unwrap();
+        let ledger = fluree.ledger(id).await.unwrap();
+        fluree
+            .upsert_turtle(
+                ledger,
+                "VERSION \"1.2\"\n@prefix ex: <http://example.org/> .\n\
+                 ex:frank ex:knows ex:alice ~ ex:claim5 {| ex:confidence 0.7 |} .\n\
+                 << ex:gina ex:knows ex:hal ~ ex:claim6 >> ex:confidence 0.2 .\n\
+                 ex:doc ex:mentions <<( ex:ivy ex:knows ex:jo )>> .\n",
+            )
+            .await
+            .unwrap();
+
+        for format in [
+            ExportFormat::Turtle,
+            ExportFormat::JsonLd,
+            ExportFormat::NTriples,
+        ] {
+            let mut outputs = Vec::new();
+            for limit in [u64::MAX, 0] {
+                let mut out = Vec::new();
+                fluree
+                    .export(id)
+                    .format(format)
+                    .preload_max_links(limit)
+                    .write_to(&mut out)
+                    .await
+                    .unwrap();
+                outputs.push(String::from_utf8(out).unwrap());
+            }
+            assert_eq!(outputs[0], outputs[1], "{format:?}");
+            assert!(
+                outputs[0].contains("ivy"),
+                "{format:?} writes a novelty term value"
+            );
+            if matches!(format, ExportFormat::Turtle) {
+                for marker in ["claim1", "claim2", "claim3", "claim5"] {
+                    assert!(
+                        outputs[0].contains(&format!("~ <http://example.org/{marker}>")),
+                        "{format:?} marks {marker}:\n{}",
+                        outputs[0]
+                    );
+                }
+            }
+        }
     }
 }

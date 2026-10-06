@@ -63,16 +63,6 @@
         "small": 5.0,
         "medium": 3.0
       },
-      "annotation_hydration": {
-        "tiny": 10.0,
-        "small": 5.0,
-        "medium": 5.0
-      },
-      "annotation_planner": {
-        "tiny": 10.0,
-        "small": 5.0,
-        "medium": 5.0
-      },
       "annotation_varlength_probe": {
         "tiny": 10.0,
         "small": 5.0,
@@ -89,6 +79,11 @@
         "medium": 3.0
       },
       "query_hot_negation_count": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 3.0
+      },
+      "query_hot_annotation_links": {
         "tiny": 10.0,
         "small": 5.0,
         "medium": 3.0

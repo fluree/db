@@ -97,8 +97,7 @@ fn walk_patterns(
                 patterns: inner, ..
             }
             | Pattern::DefaultGraphSource { patterns: inner }
-            | Pattern::EdgeAnnotation { body: inner, .. }
-            | Pattern::AnnotationTarget { body: inner, .. } => {
+            | Pattern::EdgeAnnotation { body: inner, .. } => {
                 walk_patterns(inner, snapshot, rule, origin)?;
             }
             // Graph-source patterns read data from outside the ledger's own
@@ -114,6 +113,8 @@ fn walk_patterns(
             // rule against. The protection that matters is the exhaustive
             // match itself — a surface that starts producing one has to come
             // back here first.
+            // Reads the ledger's own term dictionary.
+            Pattern::TermComponents(_) => {}
             Pattern::R2rml(_) => return Err(non_local(rule, "an R2RML graph source")),
             Pattern::Service(_) => {
                 return Err(reject(
@@ -548,8 +549,7 @@ fn collect_positions(
                     literal_capable.insert(*v);
                 }
             }
-            Pattern::EdgeAnnotation { edge, body, .. }
-            | Pattern::AnnotationTarget { edge, body, .. } => {
+            Pattern::EdgeAnnotation { edge, body, .. } => {
                 collect_positions(
                     std::slice::from_ref(&Pattern::Triple(edge.clone())),
                     iri_position,

@@ -214,8 +214,8 @@ visible or when it is safe against power loss; that is each backend's contract:
 | `S3Storage` | Atomic (object PUT). | Acknowledged after replication. |
 
 `FileStorage` also narrows durability by `ContentKind`: kinds for which
-`ContentKind::is_derived()` is true (index nodes, dictionaries, sketches,
-annotation arenas) are written `PageCache` in either mode, because they are
+`ContentKind::is_derived()` is true (index nodes, dictionaries, sketches) are
+written `PageCache` in either mode, because they are
 rebuildable from the commit chain and are written at much higher volume than
 commits. Source-of-truth kinds — `Commit`, `Txn`, `LedgerConfig`,
 `GraphSourceMapping` — follow the instance setting. The match is exhaustive, so

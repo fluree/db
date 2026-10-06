@@ -100,20 +100,42 @@ pub(super) fn instantiate_construct_graph(
         Ref::Var(v) => Ok(terms_slot(template, *v)),
         constant => terms.constant_ref(constant, position).map(Slot::Const),
     };
-    // Each pattern's slots, graph, and the reifiers attached to it.
+    let object_slot = |terms: &mut TermResolver<'_>, pattern: &fluree_db_query::TriplePattern| {
+        Ok::<_, FormatError>(match &pattern.o {
+            Term::Var(v) => terms_slot(template, *v),
+            constant => Slot::Const(terms.constant_object(constant, pattern.dtc.as_ref())?),
+        })
+    };
+    let mut term_slots = Vec::with_capacity(template.term_templates().len());
+    for pattern in template.term_templates() {
+        term_slots.push([
+            slot_of(&mut terms, &pattern.s, Position::Subject)?,
+            slot_of(&mut terms, &pattern.p, Position::Predicate)?,
+            object_slot(&mut terms, pattern)?,
+        ]);
+    }
+    // Each pattern's slots, graph, the reifiers attached to it, and the
+    // components of a constant triple-term object.
     let mut patterns = Vec::with_capacity(template.patterns().len());
     for (i, pattern) in template.patterns().iter().enumerate() {
         let s = slot_of(&mut terms, &pattern.s, Position::Subject)?;
         let p = slot_of(&mut terms, &pattern.p, Position::Predicate)?;
-        let o = match &pattern.o {
-            Term::Var(v) => terms_slot(template, *v),
-            constant => Slot::Const(terms.constant_object(constant, pattern.dtc.as_ref())?),
+        let o = object_slot(&mut terms, pattern)?;
+        let const_term = match &pattern.o {
+            Term::Value(FlakeValue::TripleTerm(term)) => terms.term_components(term)?,
+            _ => None,
         };
         let graph = match template.graph(i) {
             Some(g) => Some(slot_of(&mut terms, g, Position::Graph)?),
             None => None,
         };
-        patterns.push(([s, p, o], graph, Vec::new()));
+        patterns.push((
+            [s, p, o],
+            graph,
+            Vec::new(),
+            const_term,
+            template.is_asserted(i),
+        ));
     }
     for r in template.reifications() {
         let reifier = slot_of(&mut terms, &r.reifier, Position::Subject)?;
@@ -134,11 +156,18 @@ pub(super) fn instantiate_construct_graph(
     // row's blanks.
     let mut row_bnodes: HashMap<VarId, BlankId> = HashMap::new();
     let mut reifiers: Vec<IrTerm> = Vec::new();
+    // This row's triple terms, by term template; `None` where a component
+    // is unbound.
+    let mut row_terms: Vec<Option<IrTerm>> = Vec::with_capacity(term_slots.len());
 
     for batch in &result.batches {
         for row in 0..batch.len() {
             row_bnodes.clear();
-            let mut resolve = |slot: &Slot, position| -> Result<Option<IrTerm>> {
+            let mut resolve_in = |terms: &mut TermResolver<'_>,
+                                  row_terms: &[Option<IrTerm>],
+                                  slot: &Slot,
+                                  position|
+             -> Result<Option<IrTerm>> {
                 Ok(match slot {
                     Slot::Const(term) => term.clone(),
                     Slot::Blank(v) => Some(IrTerm::BlankNode(row_blank(
@@ -150,13 +179,64 @@ pub(super) fn instantiate_construct_graph(
                         Some(binding) => terms.binding(binding, position)?,
                         None => None,
                     },
+                    Slot::Term(i) => row_terms[*i].clone(),
                 })
             };
-            'pattern: for (slots, graph_slot, reifier_slots) in &patterns {
+            row_terms.clear();
+            for slots in &term_slots {
+                let mut parts: [Option<IrTerm>; 3] = [None, None, None];
+                for (part, (slot, position)) in parts.iter_mut().zip(slots.iter().zip(POSITIONS)) {
+                    *part = resolve_in(&mut terms, &row_terms, slot, position)?;
+                }
+                row_terms.push(match parts {
+                    [Some(s), Some(p), Some(o)] => Some(IrTerm::triple(s, p, o)),
+                    _ => None,
+                });
+            }
+            let mut resolve = |terms: &mut TermResolver<'_>, slot: &Slot, position| {
+                resolve_in(terms, &row_terms, slot, position)
+            };
+            'pattern: for (slots, graph_slot, reifier_slots, const_term, asserted) in &patterns {
+                // `?r rdf:reifies ?t` with a triple term bound to ?t (or a
+                // constant one) writes what `?r rdf:reifies <<( s p o )>>`
+                // does: ?r's reification of the term's triple, which it does
+                // not assert. A reified-only pattern is the triple a reifier
+                // reifies, whatever its predicate.
+                let components = match &slots[2] {
+                    _ if !*asserted => None,
+                    Slot::Var(v) => batch
+                        .get(row, *v)
+                        .map(|b| terms.triple_term(b))
+                        .transpose()?
+                        .flatten(),
+                    _ => const_term.clone(),
+                };
+                if let Some(components) = components {
+                    let (Some(reifier), Some(p)) = (
+                        resolve(&mut terms, &slots[0], Position::Subject)?,
+                        resolve(&mut terms, &slots[1], Position::Predicate)?,
+                    ) else {
+                        continue 'pattern;
+                    };
+                    if matches!(&p, IrTerm::Iri(iri) if &**iri == rdf::REIFIES) {
+                        let graph = match graph_slot {
+                            Some(slot) => match resolve(&mut terms, slot, Position::Graph)? {
+                                Some(name) => Some(name),
+                                None => continue 'pattern,
+                            },
+                            None => None,
+                        };
+                        let [ts, tp, to] = components;
+                        dataset
+                            .graph_mut(graph.as_ref())
+                            .add_reification(ts, tp, to, reifier);
+                        continue 'pattern;
+                    }
+                }
                 let mut triple: [Option<IrTerm>; 3] = [None, None, None];
                 for (i, (slot, position)) in slots.iter().zip(POSITIONS).enumerate() {
                     // Skip if any term is unbound (incomplete triple)
-                    let Some(term) = resolve(slot, position)? else {
+                    let Some(term) = resolve(&mut terms, slot, position)? else {
                         continue 'pattern;
                     };
                     triple[i] = Some(term);
@@ -169,7 +249,7 @@ pub(super) fn instantiate_construct_graph(
                     continue;
                 }
                 let graph = match graph_slot {
-                    Some(slot) => match resolve(slot, Position::Graph)? {
+                    Some(slot) => match resolve(&mut terms, slot, Position::Graph)? {
                         Some(name) => Some(name),
                         // An unbound graph name writes nothing.
                         None => continue 'pattern,
@@ -179,7 +259,7 @@ pub(super) fn instantiate_construct_graph(
                 // Reifiers bound on this row; an unbound one attaches nothing.
                 reifiers.clear();
                 for slot in reifier_slots {
-                    if let Some(r) = resolve(slot, Position::Subject)? {
+                    if let Some(r) = resolve(&mut terms, slot, Position::Subject)? {
                         reifiers.push(r);
                     }
                 }
@@ -187,7 +267,9 @@ pub(super) fn instantiate_construct_graph(
                 for r in reifiers.drain(..) {
                     g.add_reification(s.clone(), p.clone(), o.clone(), r);
                 }
-                g.add(Triple::new(s, p, o));
+                if *asserted {
+                    g.add(Triple::new(s, p, o));
+                }
             }
         }
     }
@@ -196,16 +278,20 @@ pub(super) fn instantiate_construct_graph(
 }
 
 /// A template position: a constant resolved up front, a variable bound per
-/// row, or a template blank node minted per row.
+/// row, a template blank node minted per row, or a triple term built per row
+/// from a term template (an index into `term_templates`).
 enum Slot {
     Const(Option<IrTerm>),
     Var(VarId),
     Blank(VarId),
+    Term(usize),
 }
 
 fn terms_slot(template: &ConstructTemplate, v: VarId) -> Slot {
     if template.bnode_vars.contains(&v) {
         Slot::Blank(v)
+    } else if let Some(i) = template.term_template_of(v) {
+        Slot::Term(i)
     } else {
         Slot::Var(v)
     }
@@ -350,7 +436,96 @@ impl TermResolver<'_> {
         }
     }
 
+    /// A binding's triple term as the IR terms of its subject, predicate and
+    /// object (see [`Self::term_components`]).
+    fn triple_term(&mut self, binding: &Binding) -> Result<Option<[IrTerm; 3]>> {
+        if binding.is_encoded() {
+            let materialized = super::materialize::materialize_binding(self.result, binding)?;
+            return self.triple_term(&materialized);
+        }
+        let Binding::Lit {
+            val: FlakeValue::TripleTerm(term),
+            ..
+        } = binding
+        else {
+            return Ok(None);
+        };
+        self.term_components(term)
+    }
+
+    /// A triple term as the IR terms of its subject, predicate and object (a
+    /// nested term object among them).
+    fn term_components(
+        &mut self,
+        term: &fluree_db_core::TripleTermValue,
+    ) -> Result<Option<[IrTerm; 3]>> {
+        let [s, p, o] = super::triple_term_components(term);
+        let s = self.binding(&s, Position::Subject)?;
+        let p = self.binding(&p, Position::Predicate)?;
+        let o = self.binding(&o, Position::Object)?;
+        Ok(match (s, p, o) {
+            (Some(s), Some(p), Some(o)) => Some([s, p, o]),
+            _ => None,
+        })
+    }
+
+    /// A triple term in N-Triples syntax with full IRIs: the lexical form of a
+    /// triple term the graph IR cannot carry as a term.
+    fn triple_term_text(&mut self, term: &fluree_db_core::TripleTermValue) -> Result<String> {
+        let mut out = String::from("<<( ");
+        for component in super::triple_term_components(term) {
+            match &component {
+                Binding::Sid { sid, .. } => {
+                    let iri = self.sid_iri(sid)?;
+                    if iri.starts_with("_:") {
+                        out.push_str(&iri);
+                    } else {
+                        out.push('<');
+                        out.push_str(&iri);
+                        out.push('>');
+                    }
+                }
+                Binding::Lit {
+                    val: FlakeValue::TripleTerm(inner),
+                    ..
+                } => out.push_str(&self.triple_term_text(inner)?),
+                Binding::Lit { val, dtc, .. } => {
+                    let lexical = match val {
+                        FlakeValue::String(s) | FlakeValue::Json(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    out.push_str(&serde_json::to_string(&lexical).unwrap_or_default());
+                    match dtc.lang_tag() {
+                        Some(tag) => {
+                            out.push('@');
+                            out.push_str(tag);
+                        }
+                        None => {
+                            out.push_str("^^<");
+                            out.push_str(&self.sid_iri(dtc.datatype())?);
+                            out.push('>');
+                        }
+                    }
+                }
+                _ => {}
+            }
+            out.push(' ');
+        }
+        out.push_str(")>>");
+        Ok(out)
+    }
+
     fn literal(&mut self, val: &FlakeValue, dtc: &DatatypeConstraint) -> Result<Option<IrTerm>> {
+        if let FlakeValue::TripleTerm(term) = val {
+            if let Some([s, p, o]) = self.term_components(term)? {
+                return Ok(Some(IrTerm::triple(s, p, o)));
+            }
+            return Ok(Some(IrTerm::Literal {
+                value: LiteralValue::String(Arc::from(self.triple_term_text(term)?)),
+                datatype: self.datatype(dtc.datatype())?,
+                language: None,
+            }));
+        }
         let (datatype, language) = match (val, dtc.lang_tag()) {
             (FlakeValue::String(_), Some(tag)) => {
                 (Datatype::rdf_lang_string(), Some(Arc::from(tag)))
@@ -411,6 +586,7 @@ fn literal_value(val: &FlakeValue) -> Result<Option<LiteralValue>> {
         FlakeValue::DayTimeDuration(v) => LiteralValue::String(Arc::from(v.to_string())),
         FlakeValue::Duration(v) => LiteralValue::String(Arc::from(v.to_string())),
         FlakeValue::GeoPoint(v) => LiteralValue::String(Arc::from(v.to_string())),
+        FlakeValue::TripleTerm(_) => LiteralValue::String(Arc::from(val.to_string())),
     }))
 }
 
@@ -438,6 +614,9 @@ fn flake_value_to_ir_term(val: &FlakeValue) -> Result<Option<IrTerm>> {
         FlakeValue::GeoPoint(_) => Datatype::from_iri(geo::WKT_LITERAL),
         FlakeValue::Vector(_) | FlakeValue::Null | FlakeValue::Ref(_) => {
             return literal_value(val).map(|_| None)
+        }
+        FlakeValue::TripleTerm(_) => {
+            Datatype::from_iri(format!("{}tripleTerm", fluree_vocab::fluree::DB))
         }
     };
     Ok(literal_value(val)?.map(|value| IrTerm::Literal {

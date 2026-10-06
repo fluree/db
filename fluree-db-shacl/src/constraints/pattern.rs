@@ -30,7 +30,10 @@ fn pattern_lexical_form(value: &FlakeValue) -> Option<String> {
         FlakeValue::Duration(v) => Some(v.original().to_string()),
         FlakeValue::Json(s) => Some(s.clone()),
         FlakeValue::GeoPoint(v) => Some(v.to_string()),
-        FlakeValue::Ref(_) | FlakeValue::Vector(_) | FlakeValue::Null => None,
+        FlakeValue::Ref(_)
+        | FlakeValue::Vector(_)
+        | FlakeValue::TripleTerm(_)
+        | FlakeValue::Null => None,
     }
 }
 

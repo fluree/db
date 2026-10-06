@@ -192,13 +192,6 @@ pub(crate) fn cached_stats_view_for_db(
         if !view.class_coverage_trustworthy {
             view.source = None;
         }
-        // Overlay arena-derived stats for `f:reifies*` predicates so the
-        // join planner gets tight selectivity estimates on snapshots
-        // with a built annotation index. See
-        // `StatsView::merge_annotation_stats` for the synthesis rules.
-        if let Some(ann) = db.snapshot.annotation_index.as_ref() {
-            view.merge_annotation_stats(&ann.stats, db.snapshot.namespaces());
-        }
         tracing::debug!(
             stats_view_build_ms = started.elapsed().as_secs_f64() * 1000.0,
             classes = view.classes.len(),
@@ -215,28 +208,15 @@ pub(crate) fn cached_stats_view_for_db(
     // always have different epoch values. Limitation: if an overlay is replaced by a
     // wholly new instance (e.g. after ledger reload), epoch resets to 0, but in that
     // case snapshot.t will also differ, so the key remains unique.
-    //
-    // We also fold in the annotation arena's identity (`forward_branch_cid` +
-    // `reverse_branch_cid`) so a reindex/rebuild that swaps the arena at the
-    // same `snapshot.t` produces a fresh cache slot — `merge_annotation_stats`
-    // depends on these contents, and CIDs are content-addressed so they
-    // rotate on any rebuild.
-    let arena_key = db
-        .snapshot
-        .annotation_index
-        .as_ref()
-        .map(|a| format!("{}:{}", a.forward_branch_cid, a.reverse_branch_cid))
-        .unwrap_or_else(|| "none".to_string());
     let cache_key = xxh3_128(
         format!(
-            "stats-view:{}:{}:{}:{}:{}:{}:{}",
+            "stats-view:{}:{}:{}:{}:{}:{}",
             db.snapshot.ledger_id,
             db.snapshot.t,
             db.t,
             db.overlay.epoch(),
             u8::from(db.runtime_small_dicts.is_some() || binary_store.is_some()),
             u8::from(allow_semantic_elision),
-            arena_key,
         )
         .as_bytes(),
     );
@@ -423,6 +403,7 @@ mod tests {
             classes: None,
             graphs: None,
             historical_since_t: None,
+            links: None,
         }));
 
         let mut novelty = Novelty::new(1);
@@ -615,6 +596,7 @@ mod tests {
                 classes: None,
                 graphs: None,
                 historical_since_t: since,
+                links: None,
             }));
             snapshot
         };

@@ -2,8 +2,11 @@
 //!
 //! Replaces per-row correlated subquery evaluation with a build-probe approach:
 //!
-//! 1. **Build phase** (`open`): Execute inner patterns once (uncorrelated), collect
-//!    distinct key tuples (the correlation variables) into a `HashSet`.
+//! 1. **Build phase** (`open`): Execute inner patterns once, collect distinct key
+//!    tuples (the correlation variables) into a `HashSet`. When the outer side
+//!    is small against the inner relation, the build is instead seeded by the
+//!    outer keys, one bounded chunk of outer rows at a time, so the cost
+//!    follows the outer side rather than the whole inner relation.
 //! 2. **Probe phase** (`next_batch`): For each outer row, extract key var values and
 //!    probe the set. EXISTS keeps matches; NOT EXISTS keeps non-matches.
 //!
@@ -22,17 +25,30 @@ use crate::group_aggregate::{CompositeGroupKey, GroupKeyOwned};
 use crate::ir::Pattern;
 use crate::object_binding::{equality_norm, EqualityNorm};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
-use crate::seed::{EmptyOperator, SeedOperator};
+use crate::seed::{BatchSeedOperator, EmptyOperator, SeedOperator};
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::StatsView;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// Avoid retaining every one of the exponentially many binding masks. Further
 /// masks use the existing seeded evaluation; cached masks remain reusable.
 const MAX_PARTIAL_KEY_SETS: usize = 4;
+
+/// Distinct outer keys per seeded build; a larger outer side is seeded one
+/// chunk of this many keys at a time.
+const SEEDED_BUILD_MAX_KEYS: usize = 1024;
+
+/// Bound on the outer rows buffered per chunk, whatever their keys.
+const SEEDED_BUILD_MAX_ROWS: usize = 64 * 1024;
+
+/// A seeded key costs an index lookup where the unseeded build costs a scan
+/// row: seeding wins while the outer side is under this fraction of the
+/// inner relation.
+const SEEDED_KEY_COST: f64 = 16.0;
 
 /// Approximate retained key storage, shared by the base and projected sets.
 /// Counts the tuple and its cells; excludes table slack and shared payloads.
@@ -62,6 +78,21 @@ pub struct SemijoinOperator {
     partial_keys_safe: bool,
     /// Key positions (not batch columns) -> projected, normalized inner keys.
     partial_key_sets: FxHashMap<Vec<usize>, FxHashSet<CompositeGroupKey>>,
+    /// The current chunk's outer rows, which `key_set` was seeded for.
+    buffered: VecDeque<Batch>,
+    /// Query-budget bytes charged for `buffered`, released as it drains.
+    buffered_bytes: usize,
+    /// Query-budget bytes charged for a seeded `key_set`, released per chunk.
+    key_set_bytes: usize,
+    /// The child returned `None` while buffering.
+    child_exhausted: bool,
+    /// Builds are seeded per chunk of outer rows; otherwise one unseeded build
+    /// precedes opening the child, so the two never hold memory together.
+    seeded: bool,
+    /// Outer keys seeded so far, across chunks.
+    seeded_keys: usize,
+    /// Planner estimates of the outer and inner row counts, when stats exist.
+    estimates: Option<(f64, f64)>,
     /// Column indices of key_vars within child.schema(), computed in `open()`.
     key_col_indices: Vec<usize>,
     /// Stats for nested query building.
@@ -98,6 +129,13 @@ impl SemijoinOperator {
             key_set: FxHashSet::default(),
             partial_keys_safe,
             partial_key_sets: FxHashMap::default(),
+            buffered: VecDeque::new(),
+            buffered_bytes: 0,
+            key_set_bytes: 0,
+            child_exhausted: false,
+            seeded: false,
+            seeded_keys: 0,
+            estimates: None,
             norm: None,
             key_col_indices: Vec::new(),
             stats,
@@ -157,6 +195,9 @@ impl SemijoinOperator {
                 ));
             }
             ctx.record_alloc((projected.len() - charged_rows) * entry_bytes);
+            if self.seeded {
+                self.key_set_bytes += projected.len() * entry_bytes;
+            }
             ctx.checkpoint()?;
             tracing::debug!(
                 bound_keys = positions.len(),
@@ -218,38 +259,128 @@ impl SemijoinOperator {
     }
 }
 
-/// Composite key over the columns `cols` of one row.
-fn row_key(
-    batch: &Batch,
-    row_idx: usize,
-    cols: &[usize],
-    norm: &Option<EqualityNorm>,
-) -> CompositeGroupKey {
-    CompositeGroupKey::normalized(cols.iter().map(|&ci| batch.get_by_col(row_idx, ci)), norm)
-}
-
-#[async_trait]
-impl Operator for SemijoinOperator {
-    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
-        vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
-    }
-    fn schema(&self) -> &[VarId] {
-        &self.schema
+impl SemijoinOperator {
+    /// Planner estimates of the outer side's and the inner body's row counts,
+    /// which choose between seeded and unseeded builds.
+    pub fn with_estimates(mut self, outer_rows: f64, inner_rows: f64) -> Self {
+        self.estimates = Some((outer_rows, inner_rows));
+        self
     }
 
-    async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        if self.state != OperatorState::Created {
-            return Err(QueryError::Internal(
-                "SemijoinOperator::open() called in invalid state".into(),
-            ));
-        }
-        if self.norm.is_none() {
-            self.norm = equality_norm(ctx);
-        }
+    /// Seed only a conjunction of triples (a seeded solution of it is a
+    /// solution of the unseeded body), and only an outer side estimated small
+    /// against the body. Without estimates, try: the first chunk decides.
+    fn seeds(&self) -> bool {
+        self.partial_keys_safe
+            && self
+                .estimates
+                .is_none_or(|(outer, inner)| outer * SEEDED_KEY_COST < inner)
+    }
 
-        // Build phase: execute inner patterns once, collect distinct key tuples.
+    /// Seeded keys have passed the point where an unseeded build is cheaper:
+    /// the outer estimate was low. Without estimates, seed only an outer side
+    /// one chunk holds.
+    fn seeding_outgrown(&self) -> bool {
+        match self.estimates {
+            Some((_, inner)) => self.seeded_keys as f64 * SEEDED_KEY_COST >= inner,
+            None => !self.child_exhausted,
+        }
+    }
+
+    /// The current chunk's rows first; once it drains, the next chunk under a
+    /// seeded build, otherwise the child's.
+    async fn next_child_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+        if self.buffered.is_empty() && self.seeded && !self.child_exhausted {
+            self.load_chunk(ctx).await?;
+        }
+        if let Some(batch) = self.buffered.pop_front() {
+            let bytes = batch_bytes(&batch).min(self.buffered_bytes);
+            ctx.release(bytes);
+            self.buffered_bytes -= bytes;
+            return Ok(Some(batch));
+        }
+        if self.child_exhausted || self.seeded {
+            return Ok(None);
+        }
+        self.child.next_batch(ctx).await
+    }
+
+    /// Buffer the next chunk of outer rows and seed `key_set` with its keys,
+    /// or, once seeding is outgrown, build unseeded and stop chunking.
+    async fn load_chunk(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
+        let mut seen: FxHashSet<CompositeGroupKey> = FxHashSet::default();
+        let mut seed_rows: Vec<Vec<Binding>> = Vec::new();
+        let mut rows = 0usize;
+        while seen.len() <= SEEDED_BUILD_MAX_KEYS && rows <= SEEDED_BUILD_MAX_ROWS {
+            let Some(batch) = self.child.next_batch(ctx).await? else {
+                self.child_exhausted = true;
+                break;
+            };
+            for row_idx in 0..batch.len() {
+                // An unbound key seeds as a free variable, so the build holds
+                // every inner solution the row could match. A poisoned row
+                // keeps its seeded per-row evaluation.
+                if self
+                    .key_col_indices
+                    .iter()
+                    .any(|&ci| matches!(batch.get_by_col(row_idx, ci), Binding::Poisoned))
+                {
+                    continue;
+                }
+                let key = row_key(&batch, row_idx, &self.key_col_indices, &self.norm);
+                if seen.insert(key) {
+                    seed_rows.push(
+                        self.key_col_indices
+                            .iter()
+                            .map(|&ci| batch.get_by_col(row_idx, ci).clone())
+                            .collect(),
+                    );
+                }
+            }
+            rows += batch.len();
+            let bytes = batch_bytes(&batch);
+            ctx.record_alloc(bytes);
+            self.buffered_bytes += bytes;
+            ctx.checkpoint()?;
+            self.buffered.push_back(batch);
+        }
+        drop(seen);
+        if self.buffered.is_empty() {
+            return Ok(());
+        }
+        self.key_set.clear();
+        self.partial_key_sets.clear();
+        ctx.release(self.key_set_bytes);
+        self.key_set_bytes = 0;
+        self.seeded_keys += seed_rows.len();
+        if self.seeding_outgrown() {
+            self.seeded = false;
+            tracing::debug!(seeded_keys = self.seeded_keys, "semijoin build unseeded");
+            return self.build(ctx, None).await;
+        }
+        let schema: Arc<[VarId]> = Arc::from(self.key_vars.clone().into_boxed_slice());
+        let columns = (0..self.key_vars.len())
+            .map(|col| seed_rows.iter().map(|r| r[col].clone()).collect())
+            .collect();
+        drop(seed_rows);
+        let before = ctx.mem_used();
+        self.build(ctx, Some(Batch::new(schema, columns)?)).await?;
+        self.key_set_bytes = ctx.mem_used().saturating_sub(before);
+        Ok(())
+    }
+
+    /// Execute the inner patterns, seeded by `seed` when given, into `key_set`.
+    async fn build(&mut self, ctx: &ExecutionContext<'_>, seed: Option<Batch>) -> Result<()> {
+        tracing::debug!(
+            seeded = seed.is_some(),
+            seed_keys = seed.as_ref().map_or(0, Batch::len),
+            "semijoin build"
+        );
         #[allow(clippy::box_default)]
-        let seed: BoxedOperator = Box::new(EmptyOperator::new());
+        let seed: BoxedOperator = match seed {
+            Some(batch) => Box::new(BatchSeedOperator::from_batch(batch)),
+            None => Box::new(EmptyOperator::new()),
+        };
         let mut inner_op = build_where_operators_seeded(
             Some(seed),
             &self.inner_patterns,
@@ -291,7 +422,43 @@ impl Operator for SemijoinOperator {
         .await;
         // Also close the inner plan when its build exceeds the budget.
         inner_op.close();
-        build_result?;
+        build_result
+    }
+}
+
+/// Query-budget estimate for a buffered outer batch.
+fn batch_bytes(batch: &Batch) -> usize {
+    batch.len() * batch.schema().len() * crate::context::BINDING_EST_BYTES
+}
+
+/// Composite key over the columns `cols` of one row.
+fn row_key(
+    batch: &Batch,
+    row_idx: usize,
+    cols: &[usize],
+    norm: &Option<EqualityNorm>,
+) -> CompositeGroupKey {
+    CompositeGroupKey::normalized(cols.iter().map(|&ci| batch.get_by_col(row_idx, ci)), norm)
+}
+
+#[async_trait]
+impl Operator for SemijoinOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
+    }
+    fn schema(&self) -> &[VarId] {
+        &self.schema
+    }
+
+    async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
+        if self.state != OperatorState::Created {
+            return Err(QueryError::Internal(
+                "SemijoinOperator::open() called in invalid state".into(),
+            ));
+        }
+        if self.norm.is_none() {
+            self.norm = equality_norm(ctx);
+        }
 
         // Compute key column indices for the child (outer) schema.
         let child_schema = self.child.schema().to_vec();
@@ -305,7 +472,17 @@ impl Operator for SemijoinOperator {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        self.child.open(ctx).await?;
+        self.seeded = self.seeds();
+        if self.seeded {
+            self.child.open(ctx).await?;
+            self.load_chunk(ctx).await?;
+        } else {
+            // Build before opening the child, so state the child holds once
+            // open (a hash table, OPTIONAL buckets) never coexists with it.
+            self.build(ctx, None).await?;
+            self.child.open(ctx).await?;
+        }
+
         self.state = OperatorState::Open;
         Ok(())
     }
@@ -316,7 +493,7 @@ impl Operator for SemijoinOperator {
         }
 
         loop {
-            let input_batch = match self.child.next_batch(ctx).await? {
+            let input_batch = match self.next_child_batch(ctx).await? {
                 Some(b) if !b.is_empty() => b,
                 Some(_) => continue,
                 None => {
@@ -336,6 +513,9 @@ impl Operator for SemijoinOperator {
         self.child.close();
         self.key_set.clear();
         self.partial_key_sets.clear();
+        self.buffered.clear();
+        self.buffered_bytes = 0;
+        self.key_set_bytes = 0;
         self.state = OperatorState::Closed;
     }
 
@@ -345,7 +525,7 @@ impl Operator for SemijoinOperator {
         }
         let mut count: u64 = 0;
         loop {
-            match self.child.next_batch(ctx).await? {
+            match self.next_child_batch(ctx).await? {
                 Some(batch) if !batch.is_empty() => {
                     let keep = self.keep_mask(ctx, &batch).await?;
                     let kept = keep.iter().filter(|&&k| k).count() as u64;
@@ -569,6 +749,150 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, QueryError::Cancelled { .. }), "{err:?}");
         assert!(op.partial_key_sets.is_empty());
+    }
+
+    /// An outer side delivered in batches of `size` rows, recording the query
+    /// memory in use when it is opened.
+    struct Batches {
+        batches: VecDeque<Batch>,
+        schema: Arc<[VarId]>,
+        mem_at_open: Arc<std::sync::Mutex<Option<usize>>>,
+    }
+
+    impl Batches {
+        fn new(rows: Vec<Vec<Binding>>, size: usize) -> Self {
+            let schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1), VarId(2)]);
+            Self {
+                batches: rows
+                    .chunks(size)
+                    .map(|chunk| batch(chunk.to_vec()))
+                    .collect(),
+                schema,
+                mem_at_open: Arc::default(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Operator for Batches {
+        fn schema(&self) -> &[VarId] {
+            &self.schema
+        }
+        async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
+            *self.mem_at_open.lock().unwrap() = Some(ctx.mem_used());
+            Ok(())
+        }
+        async fn next_batch(&mut self, _: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+            Ok(self.batches.pop_front())
+        }
+        fn close(&mut self) {}
+    }
+
+    /// A conjunction of triples seeds its build from the outer keys (unbound
+    /// keys included), a chunk at a time, unless the outer side is estimated
+    /// large against the body or seeded keys outgrow that estimate; another
+    /// body shape builds the whole body before the outer side is read.
+    #[tokio::test]
+    async fn build_is_seeded_per_chunk_for_a_small_outer_side_over_triples() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let rows = |n: u64| {
+            (0..n)
+                .map(|i| {
+                    vec![
+                        Binding::encoded_sid(i),
+                        Binding::encoded_sid(1),
+                        if i % 2 == 0 {
+                            Binding::Unbound
+                        } else {
+                            Binding::encoded_sid(2)
+                        },
+                    ]
+                })
+                .collect::<Vec<_>>()
+        };
+        let values = Pattern::Values {
+            vars: vec![VarId(0), VarId(1), VarId(2)],
+            rows: vec![],
+        };
+        let keys = SEEDED_BUILD_MAX_KEYS as u64;
+        let few = Some((10.0, 1e6));
+        // (outer rows, body, estimates, seeded once open, seeded keys at the end)
+        for (n, body, estimates, seeded, seeded_keys) in [
+            (keys, triple(), None, true, keys),
+            // Without estimates, an outer side past one chunk builds unseeded.
+            (3 * keys, triple(), None, false, keys + 256),
+            (3 * keys, triple(), few, true, 3 * keys),
+            (3 * keys, triple(), Some((1e6, 1e6)), false, 0),
+            // Seeding stops once its keys reach 1/16 of the body's estimate.
+            (
+                3 * keys,
+                triple(),
+                Some((10.0, 32.0 * keys as f64)),
+                true,
+                2 * (keys + 256),
+            ),
+            (2, values, None, false, 0),
+        ] {
+            let mut op = SemijoinOperator::new(
+                Box::new(Batches::new(rows(n), 256)),
+                vec![body],
+                vec![VarId(0), VarId(1), VarId(2)],
+                false,
+                None,
+                PlanningContext::current(),
+            );
+            op.estimates = estimates;
+            op.open(&ctx).await.unwrap();
+            assert_eq!(op.seeded, seeded, "{n} keys, {estimates:?}");
+            let mut replayed = 0;
+            while let Some(batch) = op.next_child_batch(&ctx).await.unwrap() {
+                replayed += batch.len();
+            }
+            assert_eq!(replayed as u64, n, "every outer row is replayed");
+            assert_eq!(
+                op.seeded_keys as u64, seeded_keys,
+                "{n} keys, {estimates:?}"
+            );
+            assert_eq!(op.buffered_bytes, 0);
+            op.close();
+        }
+    }
+
+    /// An unseeded build runs before the outer side is opened, so the two
+    /// never hold memory at once.
+    #[tokio::test]
+    async fn unseeded_build_precedes_opening_the_outer_side() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let cancellation = QueryCancellation::new();
+        cancellation.set_memory_limit(usize::MAX);
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancellation);
+        let child = Batches::new(
+            vec![vec![
+                Binding::encoded_sid(1),
+                Binding::encoded_sid(2),
+                Binding::Unbound,
+            ]],
+            1,
+        );
+        let mem_at_open = Arc::clone(&child.mem_at_open);
+        let mut op = SemijoinOperator::new(
+            Box::new(child),
+            vec![Pattern::Values {
+                vars: vec![VarId(0), VarId(1)],
+                rows: vec![vec![Binding::encoded_sid(1), Binding::encoded_sid(2)]],
+            }],
+            vec![VarId(0), VarId(1)],
+            false,
+            None,
+            PlanningContext::current(),
+        );
+        op.open(&ctx).await.unwrap();
+        assert!(!op.seeded);
+        assert_eq!(*mem_at_open.lock().unwrap(), Some(key_entry_bytes(2)));
+        assert_eq!(op.next_batch(&ctx).await.unwrap().unwrap().len(), 1);
     }
 
     #[tokio::test]

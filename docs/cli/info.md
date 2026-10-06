@@ -29,6 +29,7 @@ For ledgers, displays:
 - Ledger ID, branch, and type
 - Current transaction number (t)
 - Commit and index details
+- A warning when the ledger holds edge annotations and its index was built by a release before RDF 1.2 triple-term links: those annotations cannot be read until [`fluree reindex`](reindex.md). The `ledger-info` JSON carries `"needs-link-reindex": true` in its `ledger` block for the same case.
 
 For graph sources (Iceberg, R2RML, BM25, etc.), displays:
 - Name, branch, and type

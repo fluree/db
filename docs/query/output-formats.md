@@ -351,6 +351,32 @@ All formats use the same representation:
 {"type": "uri", "value": "http://example.org/ns/alice"}
 ```
 
+### Triple Terms
+
+A triple term (a stored value, an `rdf:reifies` object, or the result of `TRIPLE(...)`) is written in SPARQL
+JSON as a `triple` term
+([SPARQL 1.2 Query Results JSON Format](https://www.w3.org/TR/sparql12-results-json/)):
+
+```json
+{"type": "triple", "value": {
+  "subject": {"type": "uri", "value": "http://example.org/ns/alice"},
+  "predicate": {"type": "uri", "value": "http://example.org/ns/knows"},
+  "object": {"type": "uri", "value": "http://example.org/ns/bob"}}}
+```
+
+SPARQL XML uses the matching `<triple>` element, with `<subject>`, `<predicate>` and `<object>`
+children. JSON-LD 1.1 has no triple terms. JSON-LD and Typed JSON write one as an embedded
+node, the form of the JSON-LD-star community group report:
+
+```json
+{"@id": {"@id": "ex:alice", "ex:knows": {"@id": "ex:bob"}}}
+```
+
+TSV and CSV write `<<( s p o )>>`. In a CONSTRUCT result, Turtle, TriG, N-Triples and N-Quads
+write `<<( s p o )>>` and JSON-LD the embedded node; RDF/XML has no syntax for a triple term and
+refuses such a result. JSON-LD writes take the same embedded node as a value (see
+[Edge annotations](../concepts/edge-annotations.md#triple-terms-as-values)).
+
 ## Rust API
 
 Use `FormatterConfig` to control output format via the query builder API:

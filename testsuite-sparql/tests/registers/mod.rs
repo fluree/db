@@ -378,74 +378,15 @@ pub const SPARQL12_CODEPOINT_ESCAPES: &[&str] = &[];
 
 pub const SPARQL12_SYNTAX_TRIPLE_TERMS_NEGATIVE: &[&str] = &[];
 
-// SPARQL 1.2 triple-term syntax is fully accepted (accept-then-defer,
-// decision D-1): reifier forms (buckets A/D) by PR-W2A; the
-// TRIPLE/SUBJECT/PREDICATE/OBJECT/isTRIPLE builtins (bucket B) and bare
-// `<<( )>>` triple-term values (bucket C) by PR-W2BC. All parse + validate;
-// evaluation is deferred to the first-class-triple-term epic (ROADMAP §2/§4,
-// docs/audit/burn-down/sparql12-wave2-triple-terms.md §1.2/§1.3), so the
-// sibling SPARQL12_EVAL_TRIPLE_TERMS register still stands.
+// SPARQL 1.2 triple-term syntax is fully accepted: reifier forms, the
+// TRIPLE/SUBJECT/PREDICATE/OBJECT/isTRIPLE builtins and `<<( )>>` triple-term
+// values. What still fails to evaluate is in SPARQL12_EVAL_TRIPLE_TERMS.
 pub const SPARQL12_SYNTAX_TRIPLE_TERMS_POSITIVE: &[&str] = &[];
 
-// Blocked on Turtle-star data loading and engine triple-term support —
-// audit §4.3 / Phase D. Re-baseline this whole register after Turtle-star
-// ingest (PR-W15) lands: the residual blockers are wave-2 query syntax /
-// triple-term functions / CONSTRUCT projection / result serialization,
-// scoped by the Option-1 first-class-triple-term epic (ROADMAP §2).
 // Each test appears in EXACTLY ONE reason cluster (PR-1454 review found 10
 // entries double-counted across clusters); attribution below re-verified
 // empirically by unregistering and reading the harness's failure reasons.
-pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
-    // data load: qt:data uses `<<( … )>>` triple-term VALUES, rejected by
-    // ingest with the specific deferred error — Option-1 epic (10)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-tripleterms-1j",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-tripleterms-1x",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-8",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-9",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-10",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-11",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#op-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#op-2",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-2",
-    // data load: blocked on TriG GRAPH-block parsing, orthogonal to star
-    // (D-8) — "expected subject, found 'GRAPH'" (5)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-2",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-2",
-    // results not isomorphic: the star data now LOADS (the collector sink
-    // accepts `<< >>` / `{| |}` / `~`), but Fluree's model asserts the base
-    // triple of every `<< s p o >>` and binds reifiers, not triple terms —
-    // RDF 1.2's non-asserting reified triples and `?t` triple-term bindings
-    // are the Option-1 epic (8)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-2",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-3",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-7",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-2",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-8-nomatch",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-reifiedtriples-1j",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-reifiedtriples-1x",
-    // SPARQL lowering: "RDF-star quoted triples in this position lowering is
-    // not yet implemented" (CONSTRUCT templates) (2)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-3",
-    // D-4 CONSTRUCT annotation projection: lowering returns "CONSTRUCT
-    // projection of edge-annotation metadata is not supported in v1" (1)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-4",
-    // results not isomorphic: the expected graph (`r rdf:reifies <<( … )>>`)
-    // now parses, but CONSTRUCT emits the annotation body without the
-    // reifier's attachment — D-4 annotation projection (1)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-5",
-    // SPARQL lowering: triple-term values in VALUES data not implemented (1)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-2",
-    // update-3: the `{| |}` INSERT DATA executes, but the expected post-update
-    // TriG-star graph carries reifier semantics the harness comparison does
-    // not model (expected 2 triples, got 0 in the default graph) (1)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-3",
-];
+pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[];
 
 pub const SPARQL12_EXPRESSION: &[&str] = &[
     // not-not: the D-EBV fix makes !!?v unbind for the language-tagged,
@@ -608,24 +549,131 @@ pub const RDF11_TURTLE: &[&str] = &[
     "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-syntax-ln-dots",
 ];
 
-pub const RDF12_TURTLE_SYNTAX: &[&str] = &[
-    // triple terms as values (`<<( s p o )>>` anywhere but the object of
-    // `rdf:reifies`, and nested triple terms) are deferred: the graph IR has
-    // no triple-term Term, so ingest rejects them with the specific error (5)
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#turtle12-3",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#turtle12-7",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#turtle12-8",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#nt-ttl12-3",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#nt-ttl12-nested-1",
-];
+pub const RDF12_TURTLE_SYNTAX: &[&str] = &[];
 
 pub const RDF12_TURTLE_EVAL: &[&str] = &[
-    // action rejected: nested triple terms (`<<( s p <<( … )>> )>>`) are
-    // deferred (2)
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-tt-03",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-tt-04",
     // action rejected: annotation-of-annotation (a `{| |}` or `<< >>` inside an
     // annotation body) is the deferred v1 shape, mirroring JSON-LD (2)
     "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-annotation-04",
     "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-reified-triples-annotation-01",
+];
+
+pub const RDF12_NTRIPLES: &[&str] = &[
+    // N-Triples is read by the Turtle parser (the `.nt` ingest path), which
+    // accepts these as Turtle: relative IRIs, directives, `,` object lists,
+    // numeric and long-string shorthands, `<< >>` reified triples and
+    // annotations (21)
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-uri-06",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-uri-07",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-uri-08",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-uri-09",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-prefix-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-base-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-struct-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-string-02",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-string-03",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-string-04",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-string-05",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-num-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-num-02",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-num-03",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-triples/syntax#ntriples12-bad-09",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-triples/syntax#ntriples12-bad-iri-1",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-triples/syntax#ntriples12-bad-reified-1",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-triples/syntax#ntriples12-bad-reified-2",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-triples/syntax#ntriples12-bad-reified-3",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-triples/syntax#ntriples12-bnode-bad-annotated-syntax-1",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-triples/syntax#ntriples12-bnode-bad-annotated-syntax-2",
+    // ill-formed literals the Turtle grammar admits: an explicit
+    // `^^rdf:langString` / `^^rdf:dirLangString`, and an over-long BCP 47
+    // primary subtag (3)
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-triples/syntax#ntriples-langdir-bad-3",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-triples/syntax#ntriples-langdir-bad-4",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-triples/syntax#ntriples-langdir-bad-5",
+];
+
+pub const RDF12_NQUADS: &[&str] = &[
+    // blank-node graph labels are refused on import (6)
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nq-syntax-bnode-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nq-syntax-bnode-02",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nq-syntax-bnode-03",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nq-syntax-bnode-04",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nq-syntax-bnode-05",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nq-syntax-bnode-06",
+    // `nquads_to_trig` hands each line to the Turtle parser, which accepts
+    // these as Turtle: a relative graph IRI, a directive, numeric and
+    // long-string shorthands (9)
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nq-syntax-bad-uri-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nt-syntax-bad-prefix-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nt-syntax-bad-string-02",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nt-syntax-bad-string-03",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nt-syntax-bad-string-04",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nt-syntax-bad-string-05",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nt-syntax-bad-num-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nt-syntax-bad-num-02",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl#nt-syntax-bad-num-03",
+];
+
+pub const RDF12_TRIG: &[&str] = &[
+    // the named-graph block parser (`parse_trig_phase1`, behind TriG insert
+    // and import) has no `[ … ]` property lists, `[]`, collections, repeated
+    // `;` or bare `<< … >> .` statements; default-graph content goes through
+    // the full Turtle parser and has all of them (32)
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#sole_blankNodePropertyList",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#blankNodePropertyList_as_subject",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#blankNodePropertyList_with_multiple_triples",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#nested_blankNodePropertyLists",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#blankNodePropertyList_containing_collection",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#blankNodePropertyList_as_object",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#blankNodePropertyList_as_object_containing_objectList",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#blankNodePropertyList_as_object_containing_objectList_of_two_objects",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#predicateObjectList_with_blankNodePropertyList_as_object",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#anonymous_blank_node_subject",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#anonymous_blank_node_object",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#collection_subject",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#collection_object",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#nested_collection",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#empty_collection",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#first",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#last",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#repeated_semis_at_end",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#repeated_semis_not_at_end",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-subm-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-subm-05",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-subm-06",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-subm-08",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-subm-09",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-subm-10",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-subm-14",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-trig/eval#trig12-annotation-02",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-trig/syntax#trig12-4",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-trig/syntax#trig12-ann-2",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-trig/syntax#trig12-bnode-3",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-trig/syntax#trig12-inside-1",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-trig/syntax#trig12-inside-2",
+    // blank-node graph labels (`_:g { }`, `[] { }`) are refused (6)
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#labeled_blank_node_graph",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#alternating_bnode_graphs",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#anonymous_blank_node_graph",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-syntax-minimal-whitespace-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-kw-graph-06",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-kw-graph-07",
+    // numeric literals are canonicalized on ingest; the expected graphs keep
+    // the source lexical form (as in RDF11_TURTLE) (7)
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#bareword_double",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#double_lower_case_e",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#positive_numeric",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#numeric_with_leading_0",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-subm-11",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-subm-19",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-subm-20",
+    // lexer, as in RDF11_TURTLE: `\u` escapes in IRIREF that decode to
+    // forbidden characters are accepted (3); PN_LOCAL with interior dots (1)
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-eval-bad-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-eval-bad-02",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-eval-bad-03",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-syntax-ln-dots",
+    // annotation-of-annotation, deferred as in RDF12_TURTLE_EVAL (2)
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-trig/eval#trig12-annotation-04",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-trig/eval#trig12-reified-triples-annotation-01",
 ];

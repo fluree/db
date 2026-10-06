@@ -941,12 +941,10 @@ impl super::Parser<'_> {
     /// Parse a single triple term `<<( s p o )>>` after the opening
     /// `TripleTermStart` token has been verified by the caller.
     ///
-    /// Strict v1 rules:
-    /// - Triple-term subject must be an IRI, blank node, or variable
-    ///   (no nested triple terms).
+    /// - Triple-term subject must be an IRI, blank node, or variable.
     /// - Triple-term predicate must be a simple predicate (no paths).
-    /// - Triple-term object must be an ordinary term (no nested triple
-    ///   terms, no annotation tails).
+    /// - Triple-term object is a term or another triple term, with no
+    ///   annotation tail.
     fn parse_triple_term(&mut self) -> Option<TripleTerm> {
         let start = self.stream.current_span();
         if !self.stream.match_token(&TokenKind::TripleTermStart) {
@@ -957,27 +955,18 @@ impl super::Parser<'_> {
 
         self.reject_collection_in_quoted_context()?;
         let subject = self.parse_subject()?;
-        // The `rdf:reifies` object stays strict per v1 (pr-w2a): its inner
-        // subject may not be a nested triple term or reified triple. Now
-        // that `parse_subject` accepts `<<(` as a value, guard both variants
-        // (bare triple-term values in general BGP positions may nest — that
-        // is the separate `parse_triple_term_value` path).
+        // `ttSubject` is an IRI, blank node or variable (`parse_subject`
+        // also accepts the reified-triple and triple-term forms).
         if matches!(
             subject,
             SubjectTerm::QuotedTriple(_) | SubjectTerm::TripleTerm(_)
         ) {
             self.stream
-                .error_at_current("nested triple terms are not supported in v1");
+                .error_at_current("a triple term's subject cannot be a triple term");
             return None;
         }
         let predicate = self.parse_simple_predicate()?;
 
-        // Reject nested triple terms in object position.
-        if self.stream.check(&TokenKind::TripleTermStart) {
-            self.stream
-                .error_at_current("nested triple terms are not supported in v1");
-            return None;
-        }
         // Reified triples are not grammatical inside a triple term
         // either (`ttObject` has no `ReifiedTriple` production).
         if self.stream.check(&TokenKind::TripleStart) {

@@ -7,9 +7,10 @@ use std::sync::Arc;
 
 use crate::ast::annotation::{AnnotationVerb, ReifierId};
 use crate::ast::query::{ConstructQuery, ConstructTemplate};
-use crate::ast::{GraphName, SubjectTerm, Term};
+use crate::ast::term::QuotedTriple;
+use crate::ast::{GraphName, SubjectTerm, Term, TripleTerm};
 
-use fluree_db_query::ir::triple::{Ref, TriplePattern};
+use fluree_db_query::ir::triple::{Ref, Term as IrTerm, TriplePattern};
 use fluree_db_query::ir::{
     ConstructTemplate as QueryConstructTemplate, Pattern, Query, QueryOutput,
 };
@@ -38,12 +39,15 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         // constants, so this prefix uniquely marks template blank nodes. The
         // WHERE clause never binds them, so the output path mints a fresh blank
         // node per solution for each (see `ConstructTemplate::bnode_vars`).
+        //
+        // The shorthand's template is its WHERE clause, where an anonymous
+        // reifier (`{| |}`, a bare `~`) is a blank node too.
         construct_template.bnode_vars = construct_template
             .var_iter()
             .filter(|&v| {
-                self.vars
-                    .try_name(v)
-                    .is_some_and(|name| name.starts_with("_:"))
+                self.vars.try_name(v).is_some_and(|name| {
+                    name.starts_with("_:") || super::annotation::is_anonymous_reifier(name)
+                })
             })
             .collect();
 
@@ -102,30 +106,23 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 Some(GraphName::Var(v)) => Some(self.lower_var_ref(v)),
                 None => None,
             };
-            let s = self.lower_subject(&tp.subject)?;
+            let s = match &tp.subject {
+                SubjectTerm::QuotedTriple(qt) => {
+                    self.construct_reified_triple(qt, &graph, &mut out)?
+                }
+                other => self.lower_subject(other)?,
+            };
             let p = self.lower_predicate(&tp.predicate)?;
 
             // `?r rdf:reifies <<( s p o )>>`: the triple term is the reified
-            // triple and `?r` its reifier.
+            // triple, not asserted, and `?r` its reifier.
             if let Term::TripleTerm(term) = &tp.object {
-                if p != reifies || tp.annotation.is_some() {
-                    return Err(LowerError::not_implemented(
-                        "a triple term in a CONSTRUCT template is only supported as the \
-                         object of rdf:reifies",
-                        tp.span,
-                    ));
+                if p == reifies && tp.annotation.is_none() {
+                    let reified = self.construct_term_pattern(term, &mut out)?;
+                    let triple = out.push_reified_pattern(reified, graph.clone());
+                    out.push_reification(triple, s);
+                    continue;
                 }
-                let mut siblings = Vec::new();
-                let reified = self.lower_triple_term(term, &mut siblings)?;
-                if !siblings.is_empty() {
-                    return Err(LowerError::not_implemented(
-                        "nested triple terms in a CONSTRUCT template",
-                        tp.span,
-                    ));
-                }
-                let triple = out.push_pattern(reified, graph.clone());
-                out.push_reification(triple, s);
-                continue;
             }
 
             // Carry the declared datatype into the template.
@@ -137,7 +134,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             // is absent, so `"2024-01-01"^^xsd:date` in a rule head stored
             // `xsd:string`: `DATATYPE()` said string and `YEAR()` was unbound,
             // while the identical head written in JSON-LD stored a real date.
-            let (o, dtc) = self.lower_object_with_constraint(&tp.object)?;
+            let (o, dtc) = self.construct_object(&tp.object, &graph, &mut out)?;
             let edge = out.push_pattern(TriplePattern { s, p, o, dtc }, graph.clone());
             let Some(annotation) = &tp.annotation else {
                 continue;
@@ -161,7 +158,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                         ));
                     };
                     let p = self.lower_predicate(pred)?;
-                    let (o, dtc) = self.lower_object_with_constraint(&entry.object)?;
+                    let (o, dtc) = self.construct_object(&entry.object, &graph, &mut out)?;
                     out.push_pattern(
                         TriplePattern {
                             s: reifier.clone(),
@@ -175,6 +172,70 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             }
         }
         Ok(out)
+    }
+
+    /// A template's reified triple `<< s p o ~ r? >>`: its reifier (a fresh
+    /// blank node per solution when it names none), which reifies `s p o`
+    /// without asserting it.
+    fn construct_reified_triple(
+        &mut self,
+        qt: &QuotedTriple,
+        graph: &Option<Ref>,
+        out: &mut QueryConstructTemplate,
+    ) -> Result<Ref> {
+        let reifier = match qt.reifier.as_ref().and_then(|r| r.id.as_ref()) {
+            Some(ReifierId::BlankNode(b)) => {
+                self.lower_subject(&SubjectTerm::BlankNode(b.clone()))?
+            }
+            None => Ref::Var(self.fresh_blank_node_var()),
+            other => self.lower_reifier_id(other)?,
+        };
+        let s = match &*qt.subject {
+            SubjectTerm::QuotedTriple(inner) => self.construct_reified_triple(inner, graph, out)?,
+            other => self.lower_subject(other)?,
+        };
+        let p = self.lower_predicate(&qt.predicate)?;
+        let (o, dtc) = self.construct_object(&qt.object, graph, out)?;
+        let triple = out.push_reified_pattern(TriplePattern { s, p, o, dtc }, graph.clone());
+        out.push_reification(triple, reifier.clone());
+        Ok(reifier)
+    }
+
+    /// A template object, with a reified triple standing for its reifier.
+    fn construct_object(
+        &mut self,
+        object: &Term,
+        graph: &Option<Ref>,
+        out: &mut QueryConstructTemplate,
+    ) -> Result<(IrTerm, Option<fluree_db_core::DatatypeConstraint>)> {
+        match object {
+            Term::QuotedTriple(qt) => Ok((
+                IrTerm::from(self.construct_reified_triple(qt, graph, out)?),
+                None,
+            )),
+            Term::TripleTerm(tt) => {
+                let pattern = self.construct_term_pattern(tt, out)?;
+                let var = self
+                    .vars
+                    .get_or_insert(&format!("?#__tt_{}", self.vars.len()));
+                out.push_term_template(var, pattern);
+                Ok((IrTerm::Var(var), None))
+            }
+            other => self.lower_object_with_constraint(other),
+        }
+    }
+
+    /// A template triple term's triple; a nested term becomes a term
+    /// template first.
+    fn construct_term_pattern(
+        &mut self,
+        term: &TripleTerm,
+        out: &mut QueryConstructTemplate,
+    ) -> Result<TriplePattern> {
+        let s = self.lower_subject(&term.subject)?;
+        let p = self.lower_predicate(&term.predicate)?;
+        let (o, dtc) = self.construct_object(&term.object, &None, out)?;
+        Ok(TriplePattern { s, p, o, dtc })
     }
 
     /// Extract the CONSTRUCT WHERE shorthand's template from the lowered WHERE
@@ -205,11 +266,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     edge,
                     annotation,
                     body,
-                }
-                | Pattern::AnnotationTarget {
-                    edge,
-                    annotation,
-                    body,
+                    ..
                 } => {
                     let triple = out.push_pattern(edge.clone(), None);
                     out.push_reification(triple, annotation.clone());
@@ -221,6 +278,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 | Pattern::Unwind { .. }
                 | Pattern::Values { .. }
                 | Pattern::PropertyPath(_)
+                | Pattern::TermComponents(_)
                 | Pattern::ShortestPath(_)
                 | Pattern::Subquery(_)
                 | Pattern::IndexSearch(_)

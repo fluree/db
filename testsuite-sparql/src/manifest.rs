@@ -333,7 +333,7 @@ fn term_to_string(term: &Term) -> Option<String> {
     match term {
         Term::Iri(iri) => Some(iri.to_string()),
         Term::Literal { value, .. } => Some(value.lexical()),
-        Term::BlankNode(_) => None,
+        Term::BlankNode(_) | Term::TripleTerm(_) => None,
     }
 }
 

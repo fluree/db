@@ -22,7 +22,7 @@ fluree export [LEDGER] [OPTIONS]
 | `--all-graphs` | Export the default graph plus every named graph (dataset export). Requires `--format trig` or `--format nquads`. The ledger's system graphs are excluded — see `--system-graphs`. |
 | `--system-graphs` | Also emit the ledger's system graphs (`#txn-meta`, `#config`) under `--all-graphs`. Diagnostic only. |
 | `--graph <IRI>` | Export a specific named graph by IRI. Mutually exclusive with `--all-graphs`. |
-| `--raw-reifies` | Emit edge annotations as raw `f:reifies*` system triples instead of RDF 1.2 annotation syntax (pre-4.2 output). |
+| `--raw-reifies` | Write each edge annotation as its stored link, `r rdf:reifies <<( s p o )>>`, instead of annotation syntax on the base edge. JSON-LD keeps `@annotation`. |
 | `--context <JSON>` | JSON-LD context for prefix declarations. Overrides the ledger's default context. |
 | `--context-file <FILE>` | Read context from a JSON file. Overrides the ledger's default context. |
 | `--at <TIME>` | Export data as of a specific point in time. `t:<N>` (transaction number), `t:latest` or `latest`, `time:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), or `commit:<hex-prefix>`. A bare transaction number, ISO-8601 timestamp or commit prefix also works; a commit prefix must be at least 6 characters in either spelling; a bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. If omitted, exports at the latest committed time (including data committed but not yet persisted to index). |
@@ -61,9 +61,9 @@ Every ledger has two system graphs, `urn:fluree:<ledger>:main#txn-meta` (commit 
 
 ### Edge annotations (RDF 1.2)
 
-An edge annotation attaches a reifier to one specific triple: `ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.8 |}`. Fluree stores that as seven reserved `f:reifies*` system facts plus the reifier's own properties. Export used to emit those system facts verbatim — output no other RDF 1.2 tool understands, and which Fluree's own insert and update surfaces reject as system-controlled predicates.
+An edge annotation attaches a reifier to one specific triple: `ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.8 |}`. Fluree stores that as the RDF 1.2 link `ex:claim1 rdf:reifies <<( ex:alice ex:knows ex:bob )>>` plus the reifier's own properties.
 
-Export now emits annotation syntax by default:
+Export emits annotation syntax by default:
 
 | Format | Output |
 |---|---|
@@ -80,18 +80,16 @@ ex:claim1
     ex:confidence "0.8"^^xsd:decimal .
 ```
 
-`--raw-reifies` restores the pre-4.2 output. That output only re-imports through `fluree create --from`; the insert and update surfaces reject hand-written `f:reifies*` triples.
+`--raw-reifies` writes the links as triples instead — `ex:claim1 rdf:reifies <<( ex:alice ex:knows ex:bob )>> .` in every RDF format — which also re-imports identically.
 
-A ledger that has never carried an annotation pays nothing for any of this: export reads one flag on the snapshot and runs the scan it always ran.
+A ledger that has never carried an annotation pays nothing for any of this: export reads one flag on the snapshot and runs the scan it always ran. One that has reads its links once, up front, so the markers can be written as the scan reaches each base edge.
 
-**Known limit.** Annotations written *inside a named graph* are resolved correctly when export reads them from the sealed annotation arena or from the novelty overlay. They are dropped when export falls back to the **base-index scan**, which is blind to them — the fallback taken by a ledger whose index reports annotations but for which no arena was sealed. SPARQL reads them in every case. Export says so rather than dropping them quietly:
+Export reports a link it suppressed for annotation syntax without writing the matching `~ <r>` marker, rather than dropping it quietly:
 
 ```
   warning: 1 edge annotations could not be resolved and are NOT in the output;
-           re-run with --raw-reifies to emit them as f:reifies* triples
+           re-run with --raw-reifies to emit them as rdf:reifies triples
 ```
-
-`FLUREE_EXPORT_ANNOTATION_SCAN=1` forces the base-index scan in place of the sealed annotation arena — how to compare the two sources without rebuilding an index. They agree except on annotations inside a named graph, which the arena resolves and the scan cannot see; forcing the scan on such a ledger produces the warning above.
 
 ### Prefixes / Context
 

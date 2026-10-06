@@ -26,7 +26,6 @@
 
 pub mod address;
 pub mod address_path;
-pub mod annotation_index;
 pub mod cancellation;
 pub mod clock;
 pub mod coerce;
@@ -55,8 +54,10 @@ pub mod graph_registry;
 pub mod ids;
 pub mod index_schema;
 pub mod index_stats;
+pub mod io_stats;
 pub mod ledger_config;
 pub mod ledger_id;
+pub mod link;
 pub mod namespaces;
 pub mod nonempty;
 pub mod ns_encoding;
@@ -83,6 +84,7 @@ pub mod sysmem;
 pub mod task;
 pub mod temporal;
 pub mod tracking;
+pub mod triple_term;
 pub mod value;
 pub mod value_id;
 pub mod vec_bi_dict;
@@ -94,7 +96,6 @@ pub mod wasm_cache;
 
 // Re-export main types
 pub use address::{extract_identifier, extract_path, parse_fluree_address, ParsedFlureeAddress};
-pub use annotation_index::{AnnotationIndexRoot, AnnotationStats};
 pub use cancellation::{QueryCancellation, QueryCancellationReason};
 pub use coerce::{coerce_json_value, coerce_value, CoercionError, CoercionResult};
 pub use commit::{
@@ -121,7 +122,7 @@ pub use content_kind::{
 pub use datatype_constraint::DatatypeConstraint;
 pub use db::{load_ledger_snapshot, LedgerSnapshot, LedgerSnapshotMetadata};
 pub use dict_novelty::DictNovelty;
-pub use edge::{id_datatype_sid, xsd_string_datatype_sid, EdgeKey, EdgeKeyDecodeError};
+pub use edge::{id_datatype_sid, xsd_string_datatype_sid, EdgeKey};
 pub use error::{Error, Result};
 pub use flake::{normalize_lang_tag, Flake, FlakeMeta};
 pub use graph_db_ref::GraphDbRef;
@@ -136,7 +137,7 @@ pub use ids::{
 pub use index_schema::{IndexSchema, SchemaPredicateInfo, SchemaPredicates};
 pub use index_stats::{
     ClassPropertyUsage, ClassRefCount, ClassStatEntry, GraphPropertyStatEntry, GraphStatsEntry,
-    IndexStats, PropertyStatEntry,
+    IndexStats, LinkStatEntry, PropertyStatEntry,
 };
 pub use ledger_id::{
     format_ledger_id, normalize_ledger_id, parse_ledger_id_with_time, parse_time_travel_spec,
@@ -145,15 +146,16 @@ pub use ledger_id::{
     ParsedLedgerId, COMMIT_PREFIX_MIN_LEN, DEFAULT_BRANCH, LEDGER_URN_PREFIX, TIME_TRAVEL_TAGS,
 };
 pub use namespaces::{
-    default_namespace_codes, is_owl_class_class, is_owl_datatype_property_class,
-    is_owl_equivalent_class, is_owl_equivalent_property, is_owl_functional_property,
-    is_owl_imports, is_owl_inverse_functional_property, is_owl_inverse_of,
-    is_owl_object_property_class, is_owl_ontology_class, is_owl_same_as, is_owl_symmetric_property,
-    is_owl_transitive_property, is_rdf_first, is_rdf_nil, is_rdf_property_class, is_rdf_rest,
-    is_rdf_type, is_rdfs_domain, is_rdfs_range, is_rdfs_subclass_of, is_rdfs_subproperty_of,
-    is_reifies_datatype, is_reifies_graph, is_reifies_lang, is_reifies_list_index,
-    is_reifies_object, is_reifies_predicate, is_reifies_subject, is_reserved_reifies_predicate,
-    is_schema_class, is_schema_predicate, reifies_predicate_sids,
+    default_namespace_codes, is_annotation_predicate, is_owl_class_class,
+    is_owl_datatype_property_class, is_owl_equivalent_class, is_owl_equivalent_property,
+    is_owl_functional_property, is_owl_imports, is_owl_inverse_functional_property,
+    is_owl_inverse_of, is_owl_object_property_class, is_owl_ontology_class, is_owl_same_as,
+    is_owl_symmetric_property, is_owl_transitive_property, is_rdf_first, is_rdf_nil,
+    is_rdf_property_class, is_rdf_reifies, is_rdf_rest, is_rdf_type, is_rdfs_domain, is_rdfs_range,
+    is_rdfs_subclass_of, is_rdfs_subproperty_of, is_reifies_datatype, is_reifies_graph,
+    is_reifies_lang, is_reifies_list_index, is_reifies_object, is_reifies_predicate,
+    is_reifies_subject, is_reserved_reifies_predicate, is_scan_hidden_predicate, is_schema_class,
+    is_schema_predicate, rdf_reifies_sid, reifies_predicate_sids, triple_term_datatype_sid,
 };
 pub use nonempty::NonEmpty;
 pub use ns_encoding::{
@@ -221,7 +223,7 @@ pub use tracking::{
 };
 pub use value::{
     parse_decimal, parse_decimal_string, parse_double, parse_integer, parse_integer_string,
-    FlakeValue, GeoPointBits,
+    FlakeValue, GeoPointBits, TripleTermValue,
 };
 pub use value_id::{ObjKey, ObjKeyError, ObjKind, ObjPair, ValueTypeTag};
 pub use verified_identity::VerifiedIdentity;

@@ -457,7 +457,7 @@ ex:dataset-import-2024-01-22 a ex:DatasetImport ;
 
 ## Edge annotations (RDF 1.2 / Turtle-star)
 
-The Turtle parser (which also reads N-Triples) accepts the RDF 1.2 *asserting* forms on every Turtle write path — `insert`, `upsert`, bulk `import`, `fluree graph sync`, and the memory importer. All of them produce the same on-disk `f:reifies*` bundle that the JSON-LD `@annotation` and SPARQL 1.2 `{| |}` surfaces write, so cascade retracts, hydration, and the annotation arena treat every surface as one, and the annotations are queryable from every query surface:
+The Turtle parser (which also reads N-Triples) accepts the RDF 1.2 reifying forms on every Turtle write path — `insert`, `upsert`, bulk `import`, `fluree graph sync`, and the memory importer. All of them store the same `rdf:reifies` link that the JSON-LD `@annotation` and SPARQL 1.2 `{| |}` surfaces write, so retractions and hydration treat every surface as one, and the annotations are queryable from every query surface:
 
 ```turtle
 @prefix ex:  <http://example.org/> .
@@ -482,8 +482,8 @@ ex:emp1 rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> .
 
 Two rules to know:
 
-- **The reified triple is asserted.** RDF 1.2 says `<< s p o >>` and `r rdf:reifies <<( s p o )>>` do *not* put `s p o` in the graph; Fluree's annotations describe a live edge, so ingest asserts the base triple as well and attaches the reifier to it. The reifier's own triples (the annotation body) are ordinary RDF about the reifier. Each anonymous `<< s p o >>` / `{| |}` occurrence mints a fresh reifier — two textual occurrences are two annotations.
-- **`<<( ... )>>` is accepted only as the object of `rdf:reifies`.** As a plain value (`ex:doc ex:mentions <<( ... )>>`), nested inside another triple term, or inside an annotation body, it is rejected with a specific "deferred" error rather than silently dropped.
+- **Only the annotation syntax asserts the triple.** As RDF 1.2 defines them, `s p o ~ r` and `s p o {| … |}` put `s p o` in the graph and attach the reifier to it, while `<< s p o >>` and `r rdf:reifies <<( s p o )>>` attach the reifier without asserting `s p o`. The reifier's own triples (the annotation body) are ordinary RDF about the reifier. Each anonymous `<< s p o >>` / `{| |}` occurrence mints a fresh reifier — two textual occurrences are two annotations.
+- **`<<( ... )>>` is a value.** Under `rdf:reifies` it is a reifier's triple; under any other predicate (`ex:doc ex:mentions <<( ... )>>`) it is stored as a value, without asserting or reifying its triple (see [Triple terms as values](../concepts/edge-annotations.md#triple-terms-as-values)). A triple term's object may be another triple term. As a subject, or inside an annotation body, it is rejected with a specific error rather than silently dropped.
 
 TriG and N-Quads accept the same forms inside `GRAPH { }` blocks (and on N-Quads statements with a graph label). The annotation is written into that graph and carries the edge's graph identity, exactly as JSON-LD `@graph` + `@annotation` does:
 
@@ -527,7 +527,6 @@ Rejected with a clear parse or stage error, never silently dropped:
 - the parenthesized triple term `<<( :s :p :o )>>` anywhere other than the object of `rdf:reifies` (RDF 1.2 triple terms as values are not representable yet), and a triple term nested inside another;
 - an annotation block nested inside an annotation body (`{| :q :v {| … |} |}`), and an annotation tail on an `rdf:reifies <<( … )>>` statement (it would annotate the reification itself);
 - an annotation on a collection object (`( :a :b ) {| … |}`);
-- one named reifier on two different triples — a reifier denotes exactly one edge (see [the single-target invariant](../concepts/edge-annotations.md#one-annotation-one-edge-single-target-invariant));
 - an annotation on an `rdf:type` edge (`:s a :C {| … |}`) on the paths that convert Turtle to JSON-LD first (`upsert`, `graph sync`, memory import) — JSON-LD has no place to hang an annotation on a `@type` value. `insert` and SPARQL UPDATE accept it;
 - TriG: annotations in a `<#txn-meta>` block — its triples become commit metadata, not edges.
 
@@ -602,6 +601,8 @@ GRAPH <http://example.org/graphs/inventory> {
         schema:warehouse "secondary" .
 }
 ```
+
+Default-graph triples can also be wrapped in an unlabeled `{ ... }` block. Graph labels must be IRIs; a blank-node label (`_:g { ... }`, `[] { ... }`) is refused. Inside a labeled block, blank-node property lists (`[ ... ]`, `[]`) and collections (`( ... )`) are not supported yet; use labeled blank nodes (`_:b`) there instead.
 
 ### Submitting TriG Data
 

@@ -393,6 +393,64 @@ impl RangeProvider for BinaryRangeProvider {
     }
 }
 
+/// The attachments an index holds, read without novelty: what novelty
+/// derives its reification links against. Holds only the store, so it never
+/// pins the ledger's dictionaries.
+pub struct IndexAttachments {
+    store: Arc<BinaryIndexStore>,
+    dict_novelty: Arc<DictNovelty>,
+    runtime_small_dicts: Arc<RuntimeSmallDicts>,
+}
+
+impl IndexAttachments {
+    pub fn new(store: Arc<BinaryIndexStore>) -> Self {
+        Self {
+            store,
+            dict_novelty: Arc::new(DictNovelty::new_uninitialized()),
+            runtime_small_dicts: Arc::new(RuntimeSmallDicts::new()),
+        }
+    }
+}
+
+impl std::fmt::Debug for IndexAttachments {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndexAttachments")
+            .field("max_t", &self.store.max_t())
+            .finish()
+    }
+}
+
+impl fluree_db_core::link::AttachmentBase for IndexAttachments {
+    fn attachments(
+        &self,
+        g_id: GraphId,
+        reifiers: &[Sid],
+    ) -> std::io::Result<Vec<fluree_db_core::link::AttachmentSlots>> {
+        let opts = RangeOptions::new();
+        reifiers
+            .iter()
+            .map(|reifier| {
+                let rows = binary_range_eq_v3(
+                    &self.store,
+                    &self.dict_novelty,
+                    &self.runtime_small_dicts,
+                    g_id,
+                    IndexType::Spot,
+                    &RangeMatch::new().with_subject(reifier.clone()),
+                    &opts,
+                    &fluree_db_core::NoOverlay,
+                    None,
+                )?;
+                let mut slots = fluree_db_core::link::AttachmentSlots::default();
+                for row in &rows {
+                    slots.observe(row);
+                }
+                Ok(slots)
+            })
+            .collect()
+    }
+}
+
 /// The slice of `raw` — sorted in `index` order — that can hold a flake
 /// matching `match_val`: the span between [`overlay_eq_bounds`]' sentinels,
 /// or all of `raw` when the match binds no prefix of the order.

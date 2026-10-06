@@ -552,7 +552,9 @@ fn parse_construct_query(
                 .filter(|p| {
                     matches!(
                         p,
-                        UnresolvedPattern::Triple(_) | UnresolvedPattern::EdgeAnnotation { .. }
+                        UnresolvedPattern::Triple(_)
+                            | UnresolvedPattern::EdgeAnnotation { .. }
+                            | UnresolvedPattern::TripleTermValue { .. }
                     )
                 })
                 .cloned()
@@ -633,7 +635,9 @@ fn parse_construct_items(
                 patterns.extend(temp_query.patterns.into_iter().filter(|p| {
                     matches!(
                         p,
-                        UnresolvedPattern::Triple(_) | UnresolvedPattern::EdgeAnnotation { .. }
+                        UnresolvedPattern::Triple(_)
+                            | UnresolvedPattern::EdgeAnnotation { .. }
+                            | UnresolvedPattern::TripleTermValue { .. }
                     )
                 }));
             }
@@ -4297,7 +4301,13 @@ mod tests {
                 assert!(
                     matches!(&edge.p, UnresolvedTerm::Iri(p) if p.as_ref() == "http://example.org/worksFor")
                 );
-                assert!(matches!(&edge.o, UnresolvedTerm::Var(v) if v.as_ref() == "?org"));
+                assert!(matches!(
+                    &edge.o,
+                    crate::parse::ast::UnresolvedTermObject::Value {
+                        o: UnresolvedTerm::Var(v),
+                        ..
+                    } if v.as_ref() == "?org"
+                ));
                 // Body: 2 facts about the annotation (ex:role, ex:since).
                 assert_eq!(body.len(), 2, "body should have ex:role + ex:since");
             }

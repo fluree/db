@@ -193,16 +193,14 @@ mod tests {
         prev_index: Option<BinaryPrevIndexRef>,
         garbage: Option<BinaryGarbageRef>,
     ) -> Vec<u8> {
-        minimal_fir6_root(t, prev_index, garbage, None).encode()
+        minimal_fir6_root(t, prev_index, garbage).encode()
     }
 
-    /// Build a minimal IndexRoot in struct form so callers can attach
-    /// optional sections (e.g. annotation_index) before encoding.
+    /// Build a minimal IndexRoot in struct form.
     fn minimal_fir6_root(
         t: i64,
         prev_index: Option<BinaryPrevIndexRef>,
         garbage: Option<BinaryGarbageRef>,
-        annotation_index: Option<fluree_db_core::AnnotationIndexRoot>,
     ) -> IndexRoot {
         let dummy_cid = ContentId::new(ContentKind::IndexLeaf, b"dummy");
         let dummy_tree = DictTreeRefs {
@@ -241,10 +239,10 @@ mod tests {
             prev_index,
             garbage,
             sketch_ref: None,
-            has_annotations: annotation_index.is_some(),
-            had_annotation_arena: annotation_index.is_some(),
+            has_annotations: false,
             has_list_meta: None,
-            annotation_index,
+            legacy_annotation_arena: None,
+            term_dict: None,
             o_type_table: IndexRoot::build_o_type_table(&[], &[]),
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
         }
@@ -418,119 +416,6 @@ mod tests {
         assert_eq!(cids.len(), 2);
         assert!(cids.contains(&config_cid));
         assert!(cids.contains(&context_cid));
-    }
-
-    #[tokio::test]
-    async fn test_collect_includes_annotation_arena() {
-        // Verify the CID-walk fallback covers annotation arena branches
-        // AND the leaves they route to. On non-listable / permanent
-        // backends (IPFS) this is the only signal that lets the host
-        // unpin annotation blobs on hard drop.
-        use fluree_db_binary_index::annotation_arena::format::{
-            AnnotationForwardBranch, AnnotationForwardBranchEntry, AnnotationForwardLeaf,
-            AnnotationReverseBranch, AnnotationReverseBranchEntry, AnnotationReverseLeaf,
-        };
-
-        let storage = MemoryStorage::new();
-        let store = test_store(&storage);
-
-        let fwd_leaf_bytes = AnnotationForwardLeaf::default().encode();
-        let fwd_leaf_cid = store
-            .put(ContentKind::AnnotationForwardLeaf, &fwd_leaf_bytes)
-            .await
-            .unwrap();
-        let rev_leaf_bytes = AnnotationReverseLeaf::default().encode();
-        let rev_leaf_cid = store
-            .put(ContentKind::AnnotationReverseLeaf, &rev_leaf_bytes)
-            .await
-            .unwrap();
-
-        // Sample edge / Sid for the branch entries — content doesn't
-        // matter, the helper only walks branch → leaf links.
-        use fluree_db_core::{EdgeKey, FlakeValue, Sid};
-        let sample = EdgeKey {
-            g: None,
-            s: Sid::new(1, "s"),
-            p: Sid::new(1, "p"),
-            o: FlakeValue::Ref(Sid::new(1, "o")),
-            dt: Sid::new(0, "http://www.w3.org/2001/XMLSchema#anyURI"),
-            lang: None,
-            list_i: None,
-        };
-        let ann_sid = Sid::new(2, "a");
-
-        let fwd_branch = AnnotationForwardBranch {
-            leaves: vec![AnnotationForwardBranchEntry {
-                first_edge: sample.clone(),
-                first_ann: ann_sid.clone(),
-                last_edge: sample.clone(),
-                last_ann: ann_sid.clone(),
-                row_count: 0,
-                leaf_cid: fwd_leaf_cid.clone(),
-            }],
-        };
-        let fwd_branch_cid = store
-            .put(ContentKind::AnnotationForwardBranch, &fwd_branch.encode())
-            .await
-            .unwrap();
-        let rev_branch = AnnotationReverseBranch {
-            leaves: vec![AnnotationReverseBranchEntry {
-                first_ann: ann_sid.clone(),
-                first_edge: sample.clone(),
-                last_ann: ann_sid,
-                last_edge: sample,
-                row_count: 0,
-                leaf_cid: rev_leaf_cid.clone(),
-            }],
-        };
-        let rev_branch_cid = store
-            .put(ContentKind::AnnotationReverseBranch, &rev_branch.encode())
-            .await
-            .unwrap();
-
-        let root = minimal_fir6_root(
-            1,
-            None,
-            None,
-            Some(fluree_db_core::AnnotationIndexRoot {
-                version: 1,
-                max_t: 0,
-                forward_branch_cid: fwd_branch_cid.clone(),
-                reverse_branch_cid: rev_branch_cid.clone(),
-                stats: fluree_db_core::AnnotationStats::default(),
-            }),
-        );
-        let root_bytes = root.encode();
-        let root_cid = ContentId::new(ContentKind::IndexRoot, &root_bytes);
-        let root_addr = fluree_db_core::content_address(
-            "memory",
-            ContentKind::IndexRoot,
-            LEDGER,
-            &root_cid.digest_hex(),
-        );
-        storage.write_bytes(&root_addr, &root_bytes).await.unwrap();
-
-        let cids = collect_ledger_cids(&store, None, Some(&root_cid), None, None)
-            .await
-            .unwrap();
-
-        assert!(cids.contains(&root_cid), "missing root CID");
-        assert!(
-            cids.contains(&fwd_branch_cid),
-            "missing annotation forward branch CID"
-        );
-        assert!(
-            cids.contains(&rev_branch_cid),
-            "missing annotation reverse branch CID"
-        );
-        assert!(
-            cids.contains(&fwd_leaf_cid),
-            "missing annotation forward leaf CID — branch was not expanded"
-        );
-        assert!(
-            cids.contains(&rev_leaf_cid),
-            "missing annotation reverse leaf CID — branch was not expanded"
-        );
     }
 
     #[tokio::test]

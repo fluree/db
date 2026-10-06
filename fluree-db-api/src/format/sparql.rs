@@ -340,6 +340,25 @@ fn write_term(out: &mut String, binding: &Binding, compactor: &IriCompactor) -> 
                 write_node(out, iri.as_ref());
             }
         }
+        Binding::Lit {
+            val: FlakeValue::TripleTerm(term),
+            ..
+        } => {
+            out.push_str(r#"{"type":"triple","value":{"#);
+            for (i, (name, component)) in ["subject", "predicate", "object"]
+                .into_iter()
+                .zip(super::triple_term_components(term))
+                .enumerate()
+            {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_string(out, name);
+                out.push(':');
+                write_term(out, &component, compactor)?;
+            }
+            out.push_str("}}");
+        }
         Binding::Lit { val, dtc, .. } => {
             let dt_iri = compactor.decode_sid(dtc.datatype())?;
             write_literal(
@@ -674,6 +693,22 @@ fn format_binding(
                     "value": v.to_string(),
                     "datatype": dt_iri
                 }))),
+                FlakeValue::TripleTerm(term) => {
+                    let mut value = serde_json::Map::new();
+                    for (name, component) in ["subject", "predicate", "object"]
+                        .into_iter()
+                        .zip(super::triple_term_components(term))
+                    {
+                        let rendered =
+                            format_binding(result, &component, compactor)?.ok_or_else(|| {
+                                FormatError::InvalidBinding(format!(
+                                    "triple term {name} has no value"
+                                ))
+                            })?;
+                        value.insert(name.to_string(), rendered);
+                    }
+                    Ok(Some(json!({ "type": "triple", "value": value })))
+                }
             }
         }
 

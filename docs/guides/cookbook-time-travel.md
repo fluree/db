@@ -456,7 +456,7 @@ It is rejected on `/v1/fluree/query/{ledger}` and on the streaming endpoint `/v1
 `<< ex:alice ex:name ?name >> f:t ?t` is valid; `<< ex:alice ex:name "Alice" >> f:t ?t` is rejected — there is no object binding to attach metadata to.
 
 **`<< s p o >>` and `<<( s p o )>>` are different things.**
-The bare form is this Fluree-specific flake-metadata construct. The parenthesized triple term is RDF 1.2 reification, valid only as the object of `rdf:reifies`. They do not compose — see [Edge annotations](../concepts/edge-annotations.md).
+The bare form is this Fluree-specific flake-metadata construct. The parenthesized triple term is an RDF 1.2 value: the object of `rdf:reifies` in a reification, or a stored value under any other predicate. They do not compose — see [Edge annotations](../concepts/edge-annotations.md).
 
 **Reasoning is rejected in history mode.**
 A history-range query that requests reasoning returns an error rather than silently dropping derived facts.
