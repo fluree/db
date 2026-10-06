@@ -144,6 +144,25 @@ unpinned sub-query.
 > The response's `snapshot.ledgers` map exposes exactly what each
 > sub-query observed.
 
+Every ledger a sub-query reads is pinned, wherever the query names it, as
+the query engine itself reads the dataset:
+
+- JSON-LD: `from`, `fromNamed` / `from-named`, and the same keys inside the
+  body's own `opts`, which win over the top level as they do on a single
+  query.
+- SPARQL: `FROM` and `FROM NAMED`, however the IRI is written: in full, as a
+  prefixed name (a declared `PREFIX` or the envelope context's), relative to
+  `BASE`, or in the `urn:fluree:` form.
+
+Each such ledger is resolved at envelope entry, listed once in
+`snapshot.ledgers` under its `name:branch` id, and counted once toward the
+distinct-ledger limit. The sub-query itself runs as written: only the time
+each member is read at comes from the snapshot, so a named graph keeps the
+name the query gave it (`GRAPH ?g` over `FROM NAMED <mydb:main>` binds
+`<mydb:main>`, as it does outside an envelope). A member that names a graph rather than a ledger (a
+bare graph IRI or keyword) names no ledger to pin; as on a single
+connection-scoped query, that sub-query reports an error.
+
 ### Temporal collision
 
 When `asOf` is set, no sub-query may carry its own temporal pin. The
@@ -153,6 +172,8 @@ following are all collision errors and reject the envelope with
 - JSON-LD `from: "ledger@t:42"`
 - JSON-LD `from: { "@id": "ledger", "t": 42 }`
 - JSON-LD `from: { "@id": "ledger", "at": "commit:abc123" }`
+- the same pins on a named graph (`fromNamed: { "g": { "@id": "ledger", "t": 42 } }`,
+  `from-named: ["ledger@t:42"]`) or inside the body's `opts`
 - JSON-LD body with an inner `t` field
 - SPARQL `FROM <ledger@t:42>` / `FROM <ledger@time:...>` /
   `FROM <ledger@commit:...>`
@@ -219,7 +240,7 @@ A sub-query whose opts didn't enable tracking will not appear in the `tracking` 
 | HTTP code | Meaning |
 |-----------|---------|
 | `200` | Envelope parsed, validated, executed. Body's `status` reports the aggregate (`ok` / `partial` / `all_failed`). Per-alias errors and timeouts live inside `errors`. |
-| `400` | Envelope validation failed (bounds violation, `asOf` collision, missing `from`, malformed body, history query, envelope `max-fuel`, `maxConcurrency: 0`, etc.), or an ISO `asOf` is malformed or falls before a referenced ledger's first commit. No `results` / `errors` keys — the body is the standard error shape. |
+| `400` | Envelope validation failed (bounds violation, `asOf` collision, missing `from`, malformed body, a SPARQL sub-query that does not parse or a JSON-LD dataset the parser cannot read, history query, envelope `max-fuel`, `maxConcurrency: 0`, etc.), or an ISO `asOf` is malformed or falls before a referenced ledger's first commit. No `results` / `errors` keys — the body is the standard error shape. |
 | `401` | Authentication required and missing. |
 | `404` | A referenced ledger does not exist. |
 | `500` | Envelope infrastructure failed: snapshot resolution couldn't load a ledger that exists, response would exceed the configured size cap during assembly, server-side panic. |
@@ -519,7 +540,7 @@ sub-queries still run.
 
 The following are not supported and produce documented behaviour rather than silent partial success.
 
-- **History queries are rejected.** A JSON-LD body with a `to` field or a SPARQL query with `FROM <a@t:1> TO <a@t:latest>` is rejected with `400 Bad Request`. History spans a `t`-range; the envelope's shared-snapshot contract has no meaning over a range. Use single queries against `/query` for history.
+- **History queries are rejected.** A JSON-LD body with a `to` field (at its top level or in its `opts`) or a SPARQL query with `FROM <a@t:1> TO <a@t:latest>` is rejected with `400 Bad Request`. History spans a `t`-range; the envelope's shared-snapshot contract has no meaning over a range. Use single queries against `/query` for history.
 - **Envelope-level fuel budget is rejected.** `opts.max-fuel` / `max_fuel` / `maxFuel` at the envelope level is rejected with `400 Bad Request` because the dispatcher does not currently share a fuel budget across parallel sub-queries. Per-sub-query `opts.max-fuel` works unchanged.
 - **Cancellation latency is bounded by in-flight storage reads.** When the envelope deadline fires, the dispatcher aborts the `JoinSet`; in-flight blocking storage reads still complete before the dropped future is observed (cache hit: under 5 ms; remote S3 range read: up to a few hundred ms). No new work starts after cancellation.
 - **`opts.t` is rejected at every level inside the envelope.** Pin time via `from` (e.g., `from: "ledger@t:42"`) or envelope `asOf`.

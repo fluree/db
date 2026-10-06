@@ -444,8 +444,58 @@ async fn multi_query_sub_query_min_t_covers_every_ledger_it_reads() {
     );
 }
 
-/// A sub-query that does not parse is reported under its alias, in either
-/// language, and its siblings still run.
+/// A JSON-LD sub-query's `min-t` covers every ledger its body reads, one its
+/// `opts` names included, and the envelope lists that ledger in its snapshot.
+#[tokio::test]
+async fn multi_query_jsonld_min_t_covers_every_ledger_the_body_reads() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        query_min_t_timeout_ms: 300,
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    let app = build_router(state);
+    create_ledger(&app, "mq:j1").await;
+    create_ledger(&app, "mq:j2").await;
+    insert_one(&app, "mq:j1", "ex:a", "A-1").await;
+    insert_one(&app, "mq:j1", "ex:b", "A-2").await;
+    insert_one(&app, "mq:j2", "ex:c", "B").await;
+
+    // mq:j1 is at t=2, mq:j2 (named only in the body's `opts`) at t=1.
+    let envelope = |min_t: i64| {
+        json!({
+            "queries": {
+                "both": {
+                    "language": "jsonld",
+                    "query": {
+                        "@context": { "ex": "http://example.org/" },
+                        "from": "mq:j1",
+                        "opts": { "from": ["mq:j1", "mq:j2"], "min-t": min_t },
+                        "select": ["?name"],
+                        "where": { "@id": "?s", "ex:name": "?name" }
+                    }
+                }
+            }
+        })
+    };
+    let (status, body) = post_envelope(&app, &envelope(1)).await;
+    assert_eq!(status, StatusCode::OK, "control, got body: {body}");
+    assert_eq!(body["snapshot"]["ledgers"]["mq:j2"], 1, "got body: {body}");
+
+    let (status, body) = post_envelope(&app, &envelope(2)).await;
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT, "got body: {body}");
+    assert!(
+        body.to_string().contains("current t=1"),
+        "the wait must be on mq:j2, got: {body}"
+    );
+}
+
+/// A SPARQL sub-query that does not parse refuses the whole envelope with the
+/// parser's error.
 #[tokio::test]
 async fn multi_query_sub_queries_that_do_not_parse_are_reported_per_alias() {
     let (_tmp, state) = test_state().await;

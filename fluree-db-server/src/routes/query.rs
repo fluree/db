@@ -4796,40 +4796,38 @@ fn collect_multi_query_min_t_requirements(
 
     for (alias, sub) in &envelope.queries {
         let sub_min_t = min_t_from_opts(sub.opts.as_ref())?;
-        match sub.language {
-            SubqueryLanguage::JsonLd => {
-                let mut sub_requirements =
-                    collect_jsonld_min_t_requirements(headers, &sub.query, None)?;
-                if let Some(min_t) = sub_min_t {
-                    let ledgers = collect_refreshable_jsonld_ledgers(&sub.query);
-                    for ledger_id in ledgers {
-                        merge_min_t_requirement(&mut sub_requirements, &ledger_id, min_t);
-                    }
-                }
-                for (ledger_id, min_t) in sub_requirements {
-                    merge_min_t_requirement(&mut requirements, &ledger_id, min_t);
-                }
-            }
+        // The alias's own min-t options, each applied to every member.
+        let alias_min_t = match sub.language {
+            // The body's `opts` min-t (else the `Fluree-Min-T` header, as on a
+            // single query), and the alias's `opts` min-t.
+            SubqueryLanguage::JsonLd => [
+                min_t_from_opts(sub.query.get("opts"))?.or(headers.min_t),
+                sub_min_t,
+            ],
+            // `# PRAGMA min-t` is the alias's body option, so it wins over the
+            // alias's `opts`.
             SubqueryLanguage::Sparql => {
-                if let Some(sparql) = sub.query.as_str() {
-                    // `# PRAGMA min-t` is the alias's body option, so it wins
-                    // over the alias's `opts`.
-                    let sub_min_t = fluree_db_sparql::request_pragmas(sparql)
-                        .map_err(ServerError::bad_request)?
-                        .min_t
-                        .or(sub_min_t);
-                    // The envelope already applied any `Fluree-Min-T` header to
-                    // every distinct ledger. Per alias: each member's own `@t:`
-                    // pin, and the alias's min-t on every member.
-                    for member in ledgers.sparql.get(alias).into_iter().flatten() {
-                        if let Some(TimeSpec::AtT(t)) = member.at {
-                            merge_min_t_requirement(&mut requirements, &member.ledger, t);
-                        }
-                        if let Some(min_t) = sub_min_t {
-                            merge_min_t_requirement(&mut requirements, &member.ledger, min_t);
-                        }
+                let pragma_min_t = match sub.query.as_str() {
+                    Some(sparql) => {
+                        fluree_db_sparql::request_pragmas(sparql)
+                            .map_err(ServerError::bad_request)?
+                            .min_t
                     }
-                }
+                    None => None,
+                };
+                [pragma_min_t.or(sub_min_t), None]
+            }
+        };
+        // The envelope already applied any `Fluree-Min-T` header to every
+        // distinct ledger. Per alias: each member's own `@t:` / `t` pin, and
+        // the alias's min-t on every member — the members validation read,
+        // which are the ledgers the envelope pins.
+        for member in ledgers.members.get(alias).into_iter().flatten() {
+            if let Some(TimeSpec::AtT(t)) = member.at {
+                merge_min_t_requirement(&mut requirements, &member.ledger, t);
+            }
+            for min_t in alias_min_t.into_iter().flatten() {
+                merge_min_t_requirement(&mut requirements, &member.ledger, min_t);
             }
         }
     }

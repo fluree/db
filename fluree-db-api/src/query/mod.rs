@@ -56,6 +56,11 @@ pub struct QueryExecutionOptions {
     /// connection path's one-ledger shortcut), so the view does not read the
     /// query's dataset keys again.
     pub(crate) view_is_the_dataset: bool,
+    /// A time per ledger that the query's host fixed (a multi-query envelope's
+    /// snapshot): the connection path reads each dataset member of one of these
+    /// ledgers that names no time of its own at it
+    /// ([`DatasetSpec::read_unpinned_at`](crate::DatasetSpec::read_unpinned_at)).
+    pub(crate) ledger_times: Option<Arc<crate::dataset::LedgerTimes>>,
 }
 
 impl fmt::Debug for QueryExecutionOptions {
@@ -65,6 +70,7 @@ impl fmt::Debug for QueryExecutionOptions {
             .field("trust_fk_refs", &self.trust_fk_refs)
             .field("server_identity", &self.server_identity)
             .field("has_lifecycle_guard", &self.lifecycle_guard.is_some())
+            .field("ledger_times", &self.ledger_times)
             .finish()
     }
 }
@@ -115,6 +121,13 @@ impl QueryExecutionOptions {
     /// (see [`QueryExecutionOptions::view_is_the_dataset`]).
     pub(crate) fn on_the_datasets_view(mut self) -> Self {
         self.view_is_the_dataset = true;
+        self
+    }
+
+    /// Read the dataset's unpinned members of these ledgers at their times
+    /// (see [`QueryExecutionOptions::ledger_times`]).
+    pub(crate) fn reading_ledgers_at(mut self, times: Arc<crate::dataset::LedgerTimes>) -> Self {
+        self.ledger_times = Some(times);
         self
     }
 }

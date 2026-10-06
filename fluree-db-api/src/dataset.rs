@@ -37,21 +37,9 @@ use std::sync::Arc;
 
 pub use fluree_db_core::{DatasetRef, GraphIri, GraphSel, LedgerRef, MemberRef};
 
-/// A dataset-clause IRI as written, for the multi-query snapshot rewriter:
-/// a full IRI as it stands, a prefixed name as `prefix:local`.
-pub(crate) fn iri_value_to_string(iri: &fluree_db_sparql::ast::IriValue) -> String {
-    use fluree_db_sparql::ast::IriValue;
-    match iri {
-        IriValue::Full(s) => s.to_string(),
-        IriValue::Prefixed { prefix, local } => {
-            if prefix.is_empty() {
-                format!(":{local}")
-            } else {
-                format!("{prefix}:{local}")
-            }
-        }
-    }
-}
+/// A time per ledger, fixed for a query by its host (a multi-query envelope's
+/// snapshot): see [`DatasetSpec::read_unpinned_at`].
+pub(crate) type LedgerTimes = std::collections::HashMap<LedgerId, i64>;
 
 /// Declarative dataset specification from query parsing
 ///
@@ -160,6 +148,21 @@ impl DatasetSpec {
             }
         }
         out
+    }
+
+    /// Read each member of a ledger in `times` that names no time of its own
+    /// at that ledger's `t`. A member keeps the name it was written by: only
+    /// the time it is read at changes, as if it had named that time itself
+    /// through its own `t`.
+    pub(crate) fn read_unpinned_at(&mut self, times: &LedgerTimes) {
+        for source in self.default_graphs.iter_mut().chain(&mut self.named_graphs) {
+            if source.at.is_some() {
+                continue;
+            }
+            if let Some(&t) = source.address().and_then(|address| times.get(address.id())) {
+                source.at = Some(TimeSpec::AtT(t));
+            }
+        }
     }
 
     /// Create a DatasetSpec from a SPARQL dataset clause whose IRIs the
@@ -673,19 +676,9 @@ impl DatasetSpec {
         let Some(obj) = json.as_object() else {
             return Ok(Self::new()); // Not an object, return empty spec
         };
-        let opts_obj = obj.get("opts").and_then(|v| v.as_object());
-        let in_opts = |key: &str| opts_obj.and_then(|o| o.get(key));
-
-        let from_val = in_opts("from")
-            .or_else(|| in_opts("ledger"))
-            .or_else(|| obj.get("from"))
-            .or_else(|| obj.get("ledger"));
-        // "fromNamed" (new) takes precedence over "from-named" (legacy).
-        let from_named_val = in_opts("fromNamed")
-            .or_else(|| in_opts("from-named"))
-            .or_else(|| obj.get("fromNamed"))
-            .or_else(|| obj.get("from-named"));
-        let to_val = in_opts("to").or_else(|| obj.get("to"));
+        let from_val = dataset_value(obj, &DEFAULT_GRAPH_KEYS);
+        let from_named_val = dataset_value(obj, &NAMED_GRAPH_KEYS);
+        let to_val = dataset_value(obj, &HISTORY_KEYS);
 
         let mut spec = Self::new();
         if let Some(v) = from_val {
@@ -723,6 +716,53 @@ impl DatasetSpec {
         let qc_opts = GovernanceOptions::from_json(json)?;
         Ok((spec, qc_opts))
     }
+}
+
+/// Where a JSON-LD query body names part of its dataset: in its `opts`
+/// object, or at its top level.
+#[derive(Clone, Copy)]
+enum Layer {
+    Opts,
+    Top,
+}
+
+/// The keys a body names its default graphs under, in the order the parser
+/// reads them: the first one present wins, so `opts` overrides the top level.
+const DEFAULT_GRAPH_KEYS: [(Layer, &str); 4] = [
+    (Layer::Opts, "from"),
+    (Layer::Opts, "ledger"),
+    (Layer::Top, "from"),
+    (Layer::Top, "ledger"),
+];
+
+/// The keys a body names its named graphs under, read as
+/// [`DEFAULT_GRAPH_KEYS`] are ("fromNamed" over the legacy "from-named").
+const NAMED_GRAPH_KEYS: [(Layer, &str); 4] = [
+    (Layer::Opts, "fromNamed"),
+    (Layer::Opts, "from-named"),
+    (Layer::Top, "fromNamed"),
+    (Layer::Top, "from-named"),
+];
+
+/// The keys a body names a history range's end under.
+const HISTORY_KEYS: [(Layer, &str); 2] = [(Layer::Opts, "to"), (Layer::Top, "to")];
+
+/// The value the first of `keys` present in `body` holds: the one
+/// [`DatasetSpec::from_json`] reads.
+fn dataset_value<'a>(
+    body: &'a serde_json::Map<String, JsonValue>,
+    keys: &[(Layer, &str)],
+) -> Option<&'a JsonValue> {
+    keys.iter().find_map(|&(layer, key)| match layer {
+        Layer::Opts => body.get("opts")?.as_object()?.get(key),
+        Layer::Top => body.get(key),
+    })
+}
+
+/// Does a JSON-LD body name a history range's end (`to`), where
+/// [`DatasetSpec::from_json`] reads one?
+pub(crate) fn names_history_range(body: &serde_json::Map<String, JsonValue>) -> bool {
+    dataset_value(body, &HISTORY_KEYS).is_some()
 }
 
 /// Parsed query-connection options (policy/identity-related).
@@ -2692,6 +2732,37 @@ mod tests {
     /// every place a body can name a ledger is reported, with the reference as
     /// the query named it (a pin removed, a `#graph` kept), and a per-source
     /// policy is visible on the member.
+    /// A host's ledger times reach exactly the members of those ledgers that
+    /// name no time of their own, and no member's name changes.
+    #[test]
+    fn ledger_times_read_the_unpinned_members_of_their_ledgers() {
+        let mut spec = DatasetSpec::from_json(&json!({
+            "from": ["a:main", "a:main@t:1", "urn:fluree:a#txn-meta", "b:main"],
+            "from-named": ["a:main", { "@id": "a", "alias": "x", "t": 2 }, "http://ex.org/g"]
+        }))
+        .unwrap();
+        let names = |spec: &DatasetSpec| -> Vec<String> {
+            spec.sources().map(|s| s.name().to_string()).collect()
+        };
+        let before = names(&spec);
+        let times: LedgerTimes = [(LedgerId::parse("a:main").unwrap(), 7)].into();
+        spec.read_unpinned_at(&times);
+        let at: Vec<Option<&TimeSpec>> = spec.sources().map(GraphSource::time_spec).collect();
+        assert_eq!(
+            at,
+            [
+                Some(&TimeSpec::AtT(7)),
+                Some(&TimeSpec::AtT(1)),
+                Some(&TimeSpec::AtT(7)),
+                None,
+                Some(&TimeSpec::AtT(7)),
+                Some(&TimeSpec::AtT(2)),
+                None,
+            ]
+        );
+        assert_eq!(names(&spec), before);
+    }
+
     #[test]
     fn from_query_json_reports_every_named_ledger() {
         let cases: Vec<(JsonValue, Vec<&str>)> = vec![

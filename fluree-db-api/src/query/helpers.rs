@@ -5,8 +5,8 @@ use serde_json::Value as JsonValue;
 
 use crate::view::QueryInput;
 use crate::{
-    ApiError, Batch, DatasetSpec, ExecutableQuery, GovernanceOptions, OverlayProvider, Result,
-    Tracker, TrackingOptions, VarRegistry,
+    ApiError, Batch, DatasetSpec, ExecutableQuery, GovernanceOptions, OverlayProvider,
+    QueryExecutionOptions, Result, Tracker, TrackingOptions, VarRegistry,
 };
 
 use fluree_db_binary_index::BinaryGraphView;
@@ -732,6 +732,34 @@ pub(crate) fn parse_dataset_spec_as(
     let (spec, mut qc_opts) = parse_dataset_spec(query_json)?;
     qc_opts.server_identity = server_identity.cloned();
     Ok((spec, qc_opts))
+}
+
+/// The dataset a JSON-LD connection query reads, and its connection options:
+/// [`parse_dataset_spec_as`] for the caller `options` carries, with each
+/// member read at the ledger time `options` fixes for it, if any
+/// ([`QueryExecutionOptions::ledger_times`]).
+pub(crate) fn connection_dataset_spec(
+    query_json: &JsonValue,
+    options: &QueryExecutionOptions,
+) -> Result<(DatasetSpec, GovernanceOptions)> {
+    let (mut spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_ref())?;
+    if let Some(times) = &options.ledger_times {
+        spec.read_unpinned_at(times);
+    }
+    Ok((spec, qc_opts))
+}
+
+/// The dataset a SPARQL connection query reads: [`extract_sparql_dataset_spec`],
+/// with each member read at the ledger time `options` fixes for it, if any.
+pub(crate) fn connection_sparql_dataset_spec(
+    ast: &fluree_db_sparql::SparqlAst,
+    options: &QueryExecutionOptions,
+) -> Result<DatasetSpec> {
+    let mut spec = extract_sparql_dataset_spec(ast)?;
+    if let Some(times) = &options.ledger_times {
+        spec.read_unpinned_at(times);
+    }
+    Ok(spec)
 }
 
 /// Extract dataset spec from a SPARQL AST's dataset clause (FROM / FROM NAMED),

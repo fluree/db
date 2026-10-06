@@ -16,9 +16,8 @@
 //!   30 s in the permit queue on a 60 s envelope gets ≤30 s of execution
 //!   regardless of what its own `opts.timeoutMs` says.
 //!
-//! Each task assembles the merged `@context` / `opts`, applies the
-//! envelope snapshot (rewriting `from` to pin per-ledger `t`), then
-//! calls into the language-specific helpers
+//! Each task assembles the merged `@context` / `opts` and calls into the
+//! language-specific helpers
 //! ([`run_jsonld_subquery`], [`run_sparql_subquery`] in
 //! [`crate::query::multi::run`]). The connection-level ledger cache means
 //! parallel sub-queries against the same ledger share a snapshot load.
@@ -72,9 +71,7 @@ use tracing::Instrument;
 
 use super::response::{assemble_response, ResponseAssemblyError};
 use super::run::{run_jsonld_subquery, run_sparql_subquery, SubqueryOutput};
-use super::snapshot::{
-    apply_snapshot_to_jsonld, apply_snapshot_to_sparql, resolve_envelope_snapshot, EnvelopeSnapshot,
-};
+use super::snapshot::resolve_envelope_snapshot;
 use crate::format::{FormatterConfig, OutputFormat};
 use crate::query::multi::{
     merged_context, merged_opts, sparql_subquery_text, validate_envelope, MultiQueryBounds,
@@ -417,16 +414,19 @@ pub(crate) async fn run_envelope(
         "mq.validate.ok; resolving snapshot"
     );
 
-    let snapshot = Arc::new(
+    let snapshot =
         resolve_envelope_snapshot(fluree.as_ref(), &distinct_ledgers, envelope.as_of.as_ref())
             .await
             .inspect_err(|e| tracing::warn!(error = %e, "mq.snapshot.err"))
-            .map_err(MultiQueryError::Snapshot)?,
-    );
+            .map_err(MultiQueryError::Snapshot)?;
     tracing::debug!(
         ledgers = snapshot.ledgers.len(),
         "mq.snapshot.resolved; dispatching"
     );
+    // Every sub-query runs as written; the connection path reads each of its
+    // dataset members that names no time of its own at the snapshot's `t` for
+    // that member's ledger.
+    let execution = execution.reading_ledgers_at(Arc::new(snapshot.ledger_times()));
 
     let include_meta = envelope_meta_enabled(envelope.opts.as_ref());
     let config = DispatchConfig::from_envelope(&envelope, bounds);
@@ -436,29 +436,15 @@ pub(crate) async fn run_envelope(
         "mq.dispatch.config"
     );
 
-    let outcomes = dispatch_subqueries(
-        fluree,
-        envelope,
-        Arc::clone(&snapshot),
-        config,
-        default_format,
-        execution,
-    )
-    .await;
+    let outcomes = dispatch_subqueries(fluree, envelope, config, default_format, execution).await;
     tracing::debug!(
         outcomes = outcomes.len(),
         "mq.dispatch.complete; assembling"
     );
     let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
-    let response = assemble_response(
-        outcomes,
-        snapshot.as_ref(),
-        bounds,
-        include_meta,
-        elapsed_ms,
-    )
-    .map_err(MultiQueryError::ResponseAssembly)?;
+    let response = assemble_response(outcomes, &snapshot, bounds, include_meta, elapsed_ms)
+        .map_err(MultiQueryError::ResponseAssembly)?;
     tracing::debug!("mq.assemble.ok");
 
     Ok(response)
@@ -477,7 +463,6 @@ pub(crate) async fn run_envelope(
 async fn dispatch_subqueries(
     fluree: Arc<Fluree>,
     envelope: MultiQueryRequest,
-    snapshot: Arc<EnvelopeSnapshot>,
     config: DispatchConfig,
     default_format: Option<FormatterConfig>,
     execution: QueryExecutionOptions,
@@ -494,7 +479,6 @@ async fn dispatch_subqueries(
 
     for (idx, (alias, sub)) in envelope.queries.into_iter().enumerate() {
         let fluree = Arc::clone(&fluree);
-        let snapshot = Arc::clone(&snapshot);
         let envelope_context = Arc::clone(&envelope_context);
         let envelope_opts = Arc::clone(&envelope_opts);
         let envelope_format = Arc::clone(&envelope_format);
@@ -550,7 +534,6 @@ async fn dispatch_subqueries(
                     envelope_context.as_ref().as_ref(),
                     envelope_opts.as_ref().as_ref(),
                     envelope_format.as_ref().as_ref(),
-                    snapshot.as_ref(),
                     execution,
                 );
                 let kind = match tokio::time::timeout(effective, exec).await {
@@ -670,7 +653,6 @@ fn success_or_size_error(output: SubqueryOutput, max_bytes: usize) -> AliasOutco
 async fn dispatch_subqueries(
     fluree: Arc<Fluree>,
     envelope: MultiQueryRequest,
-    snapshot: Arc<EnvelopeSnapshot>,
     config: DispatchConfig,
     default_format: Option<FormatterConfig>,
     execution: QueryExecutionOptions,
@@ -687,7 +669,6 @@ async fn dispatch_subqueries(
             envelope_context.as_ref(),
             envelope_opts.as_ref(),
             default_format.as_ref(),
-            snapshot.as_ref(),
             execution.clone(),
         )
         .await
@@ -703,8 +684,7 @@ async fn dispatch_subqueries(
     outcomes
 }
 
-/// Build the rewritten sub-query body (merged @context/opts + snapshot
-/// applied), then dispatch to the language-specific helper and return
+/// Build the sub-query body (merged @context/opts), then dispatch to the language-specific helper and return
 /// the raw output. Errors propagate as `ApiError` which the dispatcher
 /// wraps into `AliasOutcomeKind::Error`.
 ///
@@ -719,7 +699,6 @@ async fn execute_subquery(
     envelope_context: Option<&JsonValue>,
     envelope_opts: Option<&JsonValue>,
     envelope_format: Option<&FormatterConfig>,
-    snapshot: &EnvelopeSnapshot,
     execution: QueryExecutionOptions,
 ) -> crate::Result<SubqueryOutput> {
     // Three-layer opts merge with body opts winning. The body layer is
@@ -777,8 +756,6 @@ async fn execute_subquery(
                 }
             }
 
-            apply_snapshot_to_jsonld(&mut query_body, snapshot);
-
             run_jsonld_subquery(fluree, &query_body, envelope_format.cloned(), execution).await
         }
         SubqueryLanguage::Sparql => {
@@ -788,7 +765,6 @@ async fn execute_subquery(
             // from the envelope context only. Validation reads this
             // sub-query's dataset from the same text.
             let text = sparql_subquery_text(sparql, envelope_context);
-            let with_snapshot = apply_snapshot_to_sparql(&text, snapshot);
 
             let tracking = if tracking_enabled {
                 Some(tracking_opts)
@@ -834,7 +810,7 @@ async fn execute_subquery(
             policy_opts.server_identity = execution.server_identity.clone();
             run_sparql_subquery(
                 fluree,
-                &with_snapshot,
+                &text,
                 Some(policy_opts),
                 tracking,
                 sparql_format,
