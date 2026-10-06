@@ -5500,13 +5500,15 @@ async fn ledger_with_failing_player_constraint(
 }
 
 /// An `sh:sparql` constraint that cannot run (its query does not parse, lower
-/// or plan, or an aggregate reads a variable nothing binds) follows the shape's
-/// severity and the graph's validation mode, as a result would: on a Violation
-/// shape in a reject-mode graph it fails the transaction with the constraint's
-/// error, which names the shape and any variable (fail closed); on a Warning
-/// or Info shape, or in a warn-mode graph, it is logged and the write commits.
-/// Every such failure used to fail the transaction, whatever the severity or
-/// mode, and the unbound aggregate input printed a raw variable id.
+/// or plan, or fails on its own terms: an aggregate reads a variable nothing
+/// binds, two aggregates output one variable, an expression calls an unknown
+/// function) follows the shape's severity and the graph's validation mode, as
+/// a result would: on a Violation shape in a reject-mode graph it fails the
+/// transaction with the constraint's error, which names the shape and any
+/// variable (fail closed); on a Warning or Info shape, or in a warn-mode
+/// graph, it is logged and the write commits. Every such failure used to fail
+/// the transaction, whatever the severity or mode, and the aggregate errors
+/// printed raw variable ids.
 #[tokio::test]
 async fn shacl_sparql_constraint_failure_follows_severity_and_mode() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -5539,6 +5541,12 @@ async fn shacl_sparql_constraint_failure_follows_severity_and_mode() {
             "SELECT $this (MIN(?s) AS ?m) (MAX(?s) AS ?m) \
              WHERE { $this <http://example.org/ns/score> ?s } GROUP BY $this",
             "variable ?m is the output of more than one aggregate",
+        ),
+        (
+            "expression",
+            "SELECT $this WHERE { $this <http://example.org/ns/score> ?s \
+             BIND(<http://example.org/fn>(?s) AS ?b) }",
+            "Unknown function: http://example.org/fn",
         ),
     ];
     // (severity, warn-mode graph, the write commits)
