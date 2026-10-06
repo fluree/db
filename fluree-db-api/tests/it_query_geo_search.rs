@@ -316,18 +316,17 @@ async fn geo_search_retraction_removes_point_from_results() {
 // Deduplication tests
 // =============================================================================
 
+/// A subject with several points within the radius matches once per point,
+/// each with that point's own distance and the point bound — exactly what the
+/// triple + bind + filter evaluated as written gives, before the ledger is
+/// indexed. The rewrite into GeoSearch must not change the answer.
 #[tokio::test]
-async fn geo_search_dedup_returns_min_distance_per_subject() {
-    // Test that when a subject has multiple GeoPoint values for the same predicate,
-    // deduplication returns only one result per subject with the minimum distance.
-    //
-    // Scenario:
-    // - Insert a city with two locations (e.g., city center and airport)
-    // - Query should return the city once with the closer location's distance
-
-    let fluree = FlureeBuilder::memory().build_memory();
-    let alias = "it/geo-search-dedup:main";
-
+async fn geo_search_matches_once_per_point_like_the_patterns_it_replaces() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let mut fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+    let alias = "it/geo-search-points:main";
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
         fluree
@@ -336,67 +335,76 @@ async fn geo_search_dedup_returns_min_distance_per_subject() {
             .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(alias);
-            let ledger = LedgerState::new(db0, Novelty::new(0));
-
-            // Insert Paris with two locations: city center and a point 100km away
-            // City center: (2.3522, 48.8566)
-            // Far point: (2.3522, 49.7566) - ~100km north
+            let ledger = fluree.create_ledger(alias).await.expect("create");
+            // Paris with two points ~100km apart, and Rome, out of range.
             let tx = json!({
                 "@context": geo_search_context(),
-                "@id": "ex:paris",
-                "@type": "ex:City",
-                "ex:name": "Paris",
-                "ex:location": [
-                    {
-                        "@value": "POINT(2.3522 48.8566)",
-                        "@type": "geo:wktLiteral"
-                    },
-                    {
-                        "@value": "POINT(2.3522 49.7566)",
-                        "@type": "geo:wktLiteral"
-                    }
+                "@graph": [
+                    {"@id": "ex:paris", "ex:name": "Paris", "ex:location": [
+                        {"@value": "POINT(2.3522 48.8566)", "@type": "geo:wktLiteral"},
+                        {"@value": "POINT(2.3522 49.7566)", "@type": "geo:wktLiteral"}
+                    ]},
+                    {"@id": "ex:rome", "ex:name": "Rome",
+                     "ex:location": {"@value": "POINT(12.4964 41.9028)", "@type": "geo:wktLiteral"}}
                 ]
             });
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 1_000_000,
+            };
+            let ledger = fluree
+                .insert_with_opts(
+                    ledger,
+                    &tx,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert")
+                .ledger;
+            let query = json!({
+                "@context": geo_search_context(),
+                "select": ["?name", "?loc", "?dist"],
+                "where": [
+                    { "@id": "?place", "ex:location": "?loc" },
+                    ["bind", "?dist", "(geof:distance ?loc \"POINT(2.3522 48.8566)\")"],
+                    ["filter", "(<= ?dist 200000)"],
+                    { "@id": "?place", "ex:name": "?name" }
+                ],
+                "orderBy": "?dist"
+            });
+            let rows = |ledger: LedgerState| {
+                let (fluree, query) = (&fluree, &query);
+                async move {
+                    support::query_jsonld(fluree, &ledger, query)
+                        .await
+                        .expect("query")
+                        .to_jsonld(&ledger.snapshot)
+                        .expect("format")
+                }
+            };
 
-            let ledger = fluree.insert(ledger, &tx).await.expect("insert").ledger;
-            let t = ledger.snapshot.t;
+            let as_written = rows(ledger.clone()).await;
+            let found = as_written.as_array().expect("rows");
+            assert_eq!(found.len(), 2, "one row per point: {as_written}");
+            assert!(found
+                .iter()
+                .all(|row| row[0] == "Paris" && row[1].is_object()));
+            assert!(found[0][2].as_f64().unwrap() < 1.0);
+            assert!(found[1][2].as_f64().unwrap() > 90_000.0);
 
-            // Trigger indexing
-            let completion = handle
-                .trigger(&fluree_db_api::LedgerId::parse(alias).unwrap(), t)
-                .await;
-            match completion.wait().await {
-                fluree_db_api::IndexOutcome::Completed { .. } => {}
-                fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
-                fluree_db_api::IndexOutcome::Cancelled => panic!("indexing cancelled"),
-            }
-
-            // Load the indexed ledger
-            let loaded = fluree.ledger(alias).await.expect("load ledger");
-
-            // Query from Paris city center with large radius to find both points
-            let results =
-                query_nearby_with_distance(&fluree, &loaded, 2.3522, 48.8566, 200_000.0).await;
-            println!("Results with distance: {results:?}");
-
-            // Deduplication should return Paris once with the minimum distance (0m for city center)
-            // Not twice (once for each location)
-            let paris_count = results.iter().filter(|(name, _)| name == "Paris").count();
+            trigger_index_and_wait_outcome(&handle, alias, ledger.t()).await;
+            let indexed = fluree.ledger(alias).await.expect("load ledger");
             assert!(
-                paris_count <= 1,
-                "Expected at most 1 result for Paris (dedup), got {paris_count}"
+                indexed.snapshot.range_provider.is_some(),
+                "the index is loaded"
             );
-
-            if let Some((_, dist)) = results.iter().find(|(name, _)| name == "Paris") {
-                assert!(
-                    *dist < 1000.0, // Should be ~0m for city center, not ~100km for far point
-                    "Expected min distance (~0m), got {dist}m"
-                );
-            }
+            assert_eq!(rows(indexed).await, as_written);
         })
         .await;
 }

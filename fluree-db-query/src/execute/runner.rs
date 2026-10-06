@@ -422,10 +422,20 @@ pub async fn prepare_execution_with_config(
             // Detects Triple(?s, pred, ?loc) + Bind(?dist = geof:distance(?loc, WKT)) + Filter(?dist < r)
             // and collapses them into a single Pattern::GeoSearch for index acceleration.
             // This runs for both SPARQL and JSON-LD queries — same patterns, same rewrite.
-            let rewritten_patterns =
-                crate::geo_rewrite::rewrite_geo_patterns(rewritten_patterns, &|iri: &str| {
-                    db.snapshot.encode_iri(iri)
-                });
+            // The GeoSearch operator reads the binary index, so without one
+            // covering `to_t` (a ledger not yet indexed, a time before the
+            // index's base) the patterns stay as written and evaluate as such.
+            // The operator reads the store its execution context takes from
+            // the snapshot, which a caller need not have passed in here.
+            let geo_index_covers = binary_store
+                .cloned()
+                .or_else(|| crate::context::ExecutionContext::extract_binary_store(db.snapshot))
+                .is_some_and(|store| db.t >= store.base_t());
+            let rewritten_patterns = crate::geo_rewrite::rewrite_geo_patterns_if_indexed(
+                rewritten_patterns,
+                &|iri: &str| db.snapshot.encode_iri(iri),
+                geo_index_covers,
+            );
 
             let before_dedup = rewritten_patterns.len();
             let rewritten_patterns = dedup_exact_triples(rewritten_patterns);
