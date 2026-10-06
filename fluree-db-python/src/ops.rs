@@ -79,7 +79,14 @@ pub(crate) fn validate<'py>(
     from_json(py, &json)
 }
 
-fn fuel_exhausted(e: &ApiError) -> bool {
+pub(crate) fn fuel_exhausted(e: &ApiError) -> bool {
+    // A query's overrun is transparent, so the cause chain skips past it.
+    if matches!(
+        e,
+        ApiError::Query(fluree_db_query::QueryError::FuelLimitExceeded(_))
+    ) {
+        return true;
+    }
     let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(e);
     while let Some(error) = cause {
         if error.is::<FuelExceededError>() {

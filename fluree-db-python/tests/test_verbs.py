@@ -94,11 +94,7 @@ def test_parameters_in_every_language(ledger):
 
 
 def test_unsupported_cypher_combinations(ledger):
-    with pytest.raises(InvalidRequestError):
-        ledger.query(CYPHER_NAMES, max_fuel=1000)
-    with pytest.raises(InvalidRequestError):
-        ledger.profile(CYPHER_NAMES)
-    with pytest.raises(InvalidRequestError):
+    with pytest.raises(InvalidRequestError, match="streaming"):
         ledger.stream(CYPHER_NAMES)
     with pytest.raises(InvalidRequestError):
         ledger._connection.query(CYPHER_NAMES)

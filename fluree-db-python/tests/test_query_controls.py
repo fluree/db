@@ -114,3 +114,33 @@ def test_signal_interrupts_a_running_query(ledger):
         timer.cancel()
         signal.signal(signal.SIGINT, previous)
     assert len(ledger.query(NAMES)) == 300
+
+
+CYPHER_CROSS = "MATCH (a:N), (b:N), (c:N) RETURN count(*) AS count"
+
+
+@pytest.fixture
+def nodes(conn):
+    ledger = conn.create("nodes")
+    ledger.update("UNWIND range(1, 300) AS i CREATE (:N {i: i})")
+    return ledger
+
+
+def test_cypher_profile_and_max_fuel(nodes):
+    query = "MATCH (n:N) WHERE n.i <= 10 RETURN n.i AS i ORDER BY i"
+    profile = nodes.profile(query)
+    assert profile.result.value("i") == list(range(1, 11))
+    assert profile.fuel > 0 and isinstance(profile.time, dt.timedelta)
+    assert len(nodes.query(query, max_fuel=profile.fuel * 2)) == 10
+    with pytest.raises(fluree.ResourceLimitError):
+        nodes.query(query, max_fuel=profile.fuel / 10)
+    assert nodes.snapshot().profile(query).fuel > 0
+
+
+def test_cypher_timeout_stops_the_query(nodes):
+    # 27 million rows; uncancelled it would run for a long while.
+    started = time.monotonic()
+    with pytest.raises(fluree.QueryTimeoutError):
+        nodes.query(CYPHER_CROSS, timeout=0.3)
+    assert time.monotonic() - started < 5
+    assert nodes.query("MATCH (n:N) RETURN count(n) AS c").single().c == 300

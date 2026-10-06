@@ -90,6 +90,10 @@ impl Controls {
         })
     }
 
+    pub(crate) fn wants_stats(&self) -> bool {
+        self.stats
+    }
+
     pub(crate) fn timeout(&self) -> Option<f64> {
         self.timeout
     }

@@ -10,7 +10,7 @@
 //! `("path", [node], [rel], indices)`.
 
 use crate::convert::from_json;
-use crate::error::{api_error, invalid_request};
+use crate::error::{api_error, invalid_request, raise_status};
 use crate::query::Controls;
 use crate::runtime::block_on_cancellable;
 use fluree_db_api::cypher_import::split_statements;
@@ -18,9 +18,9 @@ use fluree_db_api::cypher_write::cypher_statement_is_write;
 use fluree_db_api::format::cypher_typed::{
     CypherCell, CypherNode, CypherRelationship, CypherTemporal,
 };
-use fluree_db_api::{ApiError, CypherParamMap, Fluree, GraphDb, QueryExecutionOptions};
+use fluree_db_api::{ApiError, CypherParamMap, Fluree, GraphDb, QueryExecutionOptions, Tracker};
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyTuple};
+use pyo3::types::{PyDict, PyList, PyTuple};
 
 type Table = (Vec<String>, Vec<Vec<CypherCell>>);
 
@@ -57,7 +57,8 @@ pub(crate) fn require_read(cypher: &str) -> PyResult<()> {
 }
 
 /// Run a read against `db`, cancelled at the controls' timeout, through
-/// their canceller, or on Ctrl-C.
+/// their canceller, or on Ctrl-C, and stopped at their fuel limit. Returns
+/// the table, or `(table, stats)` when the controls ask for stats.
 pub(crate) fn read<'py>(
     py: Python<'py>,
     fluree: &Fluree,
@@ -65,17 +66,38 @@ pub(crate) fn read<'py>(
     cypher: &str,
     params: Option<&CypherParamMap>,
     controls: Controls,
-) -> PyResult<Bound<'py, PyTuple>> {
+) -> PyResult<Bound<'py, PyAny>> {
+    let timeout = controls.checked_timeout()?;
     let cancellation = controls.cancellation();
     let options = QueryExecutionOptions::new().with_cancellation(cancellation.clone());
-    let table = block_on_cancellable(
-        py,
-        &cancellation,
-        controls.checked_timeout()?,
-        read_table(fluree, db, cypher, params, &options),
-    )?
-    .map_err(api_error)?;
-    table_to_py(py, &table)
+    let tracker = controls
+        .tracking()
+        .map_or_else(Tracker::disabled, Tracker::new);
+    let table = block_on_cancellable(py, &cancellation, timeout, async {
+        let result = fluree
+            .query_cypher_with_tracker(db, cypher, params, &options, &tracker)
+            .await?;
+        result
+            .to_cypher_typed_table(db)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))
+    })?
+    .map_err(|e| {
+        if crate::ops::fuel_exhausted(&e) {
+            raise_status("ResourceLimitError", e.to_string(), e.status_code())
+        } else {
+            api_error(e)
+        }
+    })?;
+    let table = table_to_py(py, &table)?.into_any();
+    if !controls.wants_stats() {
+        return Ok(table);
+    }
+    let tally = tracker.tally();
+    let stats = PyDict::new(py);
+    stats.set_item("fuel", tally.as_ref().and_then(|t| t.fuel))?;
+    stats.set_item("time", tally.and_then(|t| t.time))?;
+    (table, stats).into_pyobject(py).map(Bound::into_any)
 }
 
 pub(crate) async fn read_table(

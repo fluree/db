@@ -722,7 +722,7 @@ class Ledger:
     def _run(self, query: Any, language: str, controls: dict[str, Any] | None, params: Any) -> Any:
         native = self._connection._native
         if language == "cypher":
-            return _table(native.cypher_query(self._id, query, params, None, self._policy, controls))
+            return native.cypher_query(self._id, query, params, None, self._policy, controls)
         if language == "sparql":
             return native.query_sparql(self._id, query, None, self._policy, controls, params)
         return native.query_jsonld(self._id, query, None, self._policy, controls)
@@ -1292,8 +1292,7 @@ class Snapshot:
         ``max_fuel`` caps the work the query may do (see :meth:`profile` for
         what a query costs); past it the query stops with
         :class:`ResourceLimitError`. ``timeout`` is in seconds; past it the
-        query is cancelled with :class:`QueryTimeoutError`. Cypher takes
-        ``timeout`` but not yet ``max_fuel``.
+        query is cancelled with :class:`QueryTimeoutError`.
         """
         return _execute(
             self._run, query, max_fuel, timeout, False,
@@ -1369,7 +1368,7 @@ class Snapshot:
 
     def _run(self, query: Any, language: str, controls: dict[str, Any] | None, params: Any) -> Any:
         if language == "cypher":
-            return _table(self._native.cypher_query(query, params, controls))
+            return self._native.cypher_query(query, params, controls)
         if language == "sparql":
             return self._native.query_sparql(query, controls, params)
         return self._native.query_jsonld(query, controls)
@@ -1579,19 +1578,18 @@ def _execute(
     kind = _query_language(query, language)
     if select:
         _require_table(query, kind)
-    if kind == "cypher":
-        if stats or max_fuel is not None:
-            raise InvalidRequestError("max_fuel and profile() are not yet supported for Cypher")
-        return run(query, "cypher", _controls(None, timeout, False, cancel), _cypher_params(params))
     controls = _controls(max_fuel, timeout, stats, cancel)
-    sparql = kind == "sparql"
-    if sparql:
+    if kind == "cypher":
+        raw = run(query, kind, controls, _cypher_params(params))
+    elif kind == "sparql":
         raw = run(query, kind, controls, _sparql_params(params))
     else:
         _no_jsonld_parameters(params)
         raw = run(_json_query(query), kind, controls, None)
     result, measured = raw if stats else (raw, None)
-    if sparql:
+    if kind == "cypher":
+        result = _table(result)
+    elif kind == "sparql":
         result = _sparql_result(result)
     return (result, measured) if stats else result
 

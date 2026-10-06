@@ -580,7 +580,7 @@ impl Connection {
         at: Option<&Bound<'py, PyTuple>>,
         policy: Option<&Bound<'py, PyAny>>,
         controls: Option<Controls>,
-    ) -> PyResult<Bound<'py, PyTuple>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         cypher::require_read(cypher)?;
         let id = canonical(ledger)?;
         let params = cypher::params(params)?;
@@ -1158,7 +1158,7 @@ impl Snapshot {
         cypher: &str,
         params: Option<&Bound<'py, PyAny>>,
         controls: Option<Controls>,
-    ) -> PyResult<Bound<'py, PyTuple>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         cypher::require_read(cypher)?;
         let params = cypher::params(params)?;
         let controls = controls.unwrap_or_default();

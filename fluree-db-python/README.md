@@ -180,7 +180,7 @@ commit.result.single()["p"]
   seeing the others, in one commit.
 - Cypher and SPARQL see the same data: Cypher's names are bare IRIs (`Person`
   is `<Person>`).
-- Not yet for Cypher: `max_fuel`, `profile()` and `stream()`.
+- Not yet for Cypher: `stream()`; read a large Cypher result with `query()`.
 
 ## Search
 
