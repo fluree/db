@@ -321,6 +321,21 @@ never widen what a governed handle sees.
 - `ledger.archive(path)` writes a `.flpack` archive of the whole ledger, and
   `conn.restore(path, name)` loads one back.
 
+## rdflib
+
+[rdflib](https://rdflib.readthedocs.io) reads formats Fluree does not, such as
+RDF/XML and N3, and is what tools like pySHACL take and return. N-Triples
+moves a graph between the two without loss:
+
+```python
+import rdflib
+
+g = rdflib.Graph().parse("ontology.owl", format="xml")
+ledger.insert(g.serialize(format="nt"), format="turtle")       # rdflib → Fluree
+
+g = rdflib.Graph().parse(data=ledger.export(format="ntriples"), format="nt")
+```
+
 ## Storage
 
 `fluree.connect(path)` stores data in a directory. For S3 or split
