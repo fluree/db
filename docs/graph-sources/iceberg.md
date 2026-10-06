@@ -719,18 +719,25 @@ If `orderDate` is a partition column, Iceberg only scans January 2024 partitions
 
 ## Combining with Fluree Data
 
-Join Iceberg data with Fluree ledgers:
+Join Iceberg data with Fluree ledgers by naming the graph source in
+`fromNamed` (SPARQL: `FROM NAMED`) and reading it inside a `graph` block. A
+graph source cannot share the default graph with a ledger; such a query is
+refused.
 
 ```json
 {
-  "from": ["customers:main", "warehouse-orders:main"],
+  "from": "customers:main",
+  "fromNamed": "warehouse-orders:main",
   "select": ["?customerName", "?orderTotal", "?orderDate"],
   "where": [
     { "@id": "?customer", "schema:name": "?customerName" },
     { "@id": "?customer", "ex:customerId": "?customerId" },
-    { "@id": "?order", "ex:customerId": "?customerId" },
-    { "@id": "?order", "ex:total": "?orderTotal" },
-    { "@id": "?order", "ex:orderDate": "?orderDate" }
+    ["graph", "warehouse-orders:main", {
+      "@id": "?order",
+      "ex:customerId": "?customerId",
+      "ex:total": "?orderTotal",
+      "ex:orderDate": "?orderDate"
+    }]
   ],
   "filter": "?orderDate >= '2024-01-01'",
   "orderBy": ["-?orderDate"]
