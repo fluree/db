@@ -380,13 +380,30 @@ async fn indexed_ledger(
     ([db_dir, data_dir], fluree, ledger)
 }
 
-/// The fast-path sites that recorded `proceed` since event `before`.
-fn proceeded(store: &span_capture::SpanStore, before: usize) -> Vec<String> {
+/// The fast-path sites that recorded an outcome `proceed`, or one starting
+/// `fallback` (a decline at open), since event `before`.
+fn stamped(store: &span_capture::SpanStore, before: usize, outcome: &str) -> Vec<String> {
     store.find_events("fast-path outcome")[before..]
         .iter()
-        .filter(|e| e.fields.get("outcome").map(String::as_str) == Some("proceed"))
+        .filter(|e| {
+            e.fields
+                .get("outcome")
+                .is_some_and(|o| o.starts_with(outcome))
+        })
         .filter_map(|e| e.fields.get("site").cloned())
         .collect()
+}
+
+/// The fast-path sites that recorded `proceed` since event `before`.
+fn proceeded(store: &span_capture::SpanStore, before: usize) -> Vec<String> {
+    stamped(store, before, "proceed")
+}
+
+/// Whether `site` served the query: it proceeded, and did not decline at
+/// open after the plan chose it.
+fn served(store: &span_capture::SpanStore, before: usize, site: &str) -> bool {
+    proceeded(store, before).iter().any(|s| s == site)
+        && !stamped(store, before, "fallback").iter().any(|s| s == site)
 }
 
 /// A query no fast path may answer runs the generic pipeline, whose only
@@ -440,7 +457,7 @@ async fn grouped_select_expression_on_an_indexed_ledger_in_both_lanes() {
             let before = store.find_events("fast-path outcome").len();
             run(&fluree, &db, &ledger, body).await;
             let sites = proceeded(&store, before);
-            if sites.iter().any(|s| s == pair.site) != must_fire {
+            if served(&store, before, pair.site) != must_fire {
                 misrouted.push(format!(
                     "`{}` must {}proceed [proceeded: {sites:?}]\n{body}",
                     pair.site,
@@ -460,7 +477,7 @@ async fn grouped_select_expression_on_an_indexed_ledger_in_both_lanes() {
             let before = store.find_events("fast-path outcome").len();
             run_jsonld(&fluree, &db, &ledger, query).await;
             let sites = proceeded(&store, before);
-            if sites.iter().any(|s| s == pair.site) != must_fire {
+            if served(&store, before, pair.site) != must_fire {
                 misrouted.push(format!(
                     "`{}` must {}proceed [proceeded: {sites:?}]\n{query}",
                     pair.site,
@@ -605,7 +622,8 @@ fn typed_json_types(value: &Value) -> Vec<String> {
 /// An overflow integer on an indexed ledger leaves the scan as an encoded
 /// binding whose dt_id says xsd:decimal; only the decoded value says
 /// xsd:integer. Through the grouping it must stay xsd:integer, in both lanes:
-/// as a GROUP BY key read by a per-group SELECT expression and by HAVING, as
+/// as a GROUP BY key read by a per-group SELECT expression and by HAVING (also
+/// when a decoded copy of the same integer joins the group), as
 /// an aggregate input (MIN, MAX, SAMPLE, and the implicit SAMPLE of a non-key
 /// variable HAVING reads), inside a JSON-LD per-group list, and as the key of
 /// the count top-k, which must take the key-and-count query and decline the
@@ -637,6 +655,14 @@ async fn overflow_integers_through_grouping() {
              HAVING (DATATYPE(?z) = xsd:integer)"
                 .to_string(),
             json!([[big, int(3)], [int(7), int(1)]]),
+        ),
+        (
+            &["z", "n", "dt"],
+            format!(
+                "SELECT ?z (COUNT(*) AS ?n) (DATATYPE(?z) AS ?dt) \
+                 WHERE {{ {{ ?b ex:size ?z }} UNION {{ BIND({BIG} AS ?z) }} }} GROUP BY ?z"
+            ),
+            json!([[big, int(4), XSD_INTEGER], [int(7), int(1), XSD_INTEGER]]),
         ),
         (
             &["t", "mn", "mx"],
@@ -686,6 +712,18 @@ async fn overflow_integers_through_grouping() {
         ),
         (
             json!({
+                "@context": ctx,
+                "select": ["?z", "(as (count ?z) ?n)", "(as (datatype ?z) ?dt)"],
+                "where": [["union",
+                    {"@id": "?b", "ex:size": "?z"},
+                    [["values", ["?z", [{"@value": BIG, "@type": "xsd:integer"}]]]]
+                ]],
+                "groupBy": "?z"
+            }),
+            json!([[BIG, 4, "xsd:integer"], [7, 1, "xsd:integer"]]),
+        ),
+        (
+            json!({
                 "@context": ctx, "select": ["?t", "?z"],
                 "where": {"@id": "?b", "ex:tag": "?t", "ex:size": "?z"}, "groupBy": "?t"
             }),
@@ -722,7 +760,7 @@ async fn overflow_integers_through_grouping() {
             }
         }
         let sites = proceeded(&store, before);
-        let fired = sites.iter().any(|s| s == "group_by_object_count_topk");
+        let fired = served(&store, before, "group_by_object_count_topk");
         if fired != must_fire || (!must_fire && !generic_only(&sites)) {
             misrouted.push(format!(
                 "`group_by_object_count_topk` must {}proceed [proceeded: {sites:?}]\n{query}",
@@ -754,7 +792,7 @@ async fn overflow_integers_through_grouping() {
         // JSON-LD renders an overflow integer as a bare string whatever its
         // datatype; typed JSON shows it. Every size in the per-group lists and
         // every MIN / MAX is an xsd:integer.
-        for (query, sizes) in [(&jsonld_cases[3].0, 4), (&jsonld_cases[4].0, 4)] {
+        for (query, sizes) in [(&jsonld_cases[4].0, 4), (&jsonld_cases[5].0, 4)] {
             let result = fluree
                 .query(&db, query)
                 .await
