@@ -669,7 +669,9 @@ lands first, a transaction that was never read is re-based over it when they
 touched different subjects, and otherwise staged again on the new head, under
 the policy the ledger has then. One that was read through `db()` fails with
 `TransactError::CommitConflict` instead — its writes may rest on what it read —
-and should be run again.
+and should be run again. A write that fails to stage doesn't count as a read:
+if what you stage next depends on that error, read the transaction through
+`db()` first.
 
 ```rust
 use fluree_db_api::{CommitOpts, FlureeBuilder, Result, TransactionOptions, TxnOperation};
@@ -719,6 +721,10 @@ again, so values computed as they stage — `NOW()`, `UUID()`, `STRUUID()`, a
 SPARQL update's blank nodes — can change; JSON-LD, Turtle and Cypher blank
 nodes keep their identities. Rolling back past a savepoint discards it, and
 returning to it later is an error.
+
+`commit` commits on the process's own write path, as Bolt's explicit
+transactions do, so transactions are for local-commit deployments: a Raft or
+peer host must not offer them to its clients.
 
 ### Export Data
 

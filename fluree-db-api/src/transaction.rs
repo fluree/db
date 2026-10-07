@@ -23,6 +23,16 @@
 //!   read, and staging again would replay those decisions against data they
 //!   never saw — a lost update. The commit fails with
 //!   [`TransactError::CommitConflict`]; run the transaction again.
+//!
+//! An operation that fails to stage is left out and does not count as a
+//! read. A caller that chooses what to stage next from such an error — a
+//! taken value, a failed shape — should read the transaction through
+//! [`Transaction::db`] so the commit requires the head the choice was made
+//! on.
+//!
+//! [`Transaction::commit`] commits on this process's own write path, as
+//! Bolt's explicit transactions do: local-commit deployments only. A Raft or
+//! peer host must not offer transactions to its clients.
 
 use crate::cypher_write::{self, ResolvedConditional, WritePlan};
 use crate::format::cypher_typed::CypherCell;
