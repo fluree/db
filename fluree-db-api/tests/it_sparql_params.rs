@@ -241,3 +241,81 @@ async fn a_connection_query_takes_parameters() {
     assert_eq!(bindings.len(), 1, "{result}");
     assert_eq!(bindings[0]["age"]["value"], "30");
 }
+
+#[tokio::test]
+async fn a_blank_node_parameter_is_one_stored_node() {
+    let fluree = seeded().await;
+    fluree
+        .graph(LEDGER)
+        .transact()
+        .insert(&json!({ "http://example.org/name": "Dan" }))
+        .commit()
+        .await
+        .unwrap();
+    let db = head(&fluree).await;
+    let dan = rows(&fluree, &db, "SELECT ?s WHERE { ?s ex:name \"Dan\" }", None)
+        .await
+        .unwrap();
+    let dan = dan[0][0].as_str().expect("a blank node id").to_string();
+    assert!(dan.starts_with("_:fdb-"), "{dan}");
+
+    // A label that isn't a stored id would lower to a variable and match every node.
+    for label in [
+        json!({ "@id": "_:x" }),
+        json!({ "@value": "_:x", "@type": "@id" }),
+    ] {
+        let err = rows(
+            &fluree,
+            &db,
+            "SELECT ?n WHERE { $s ex:name ?n }",
+            Some(params(json!({ "s": label }))),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("blank node label"), "{err}");
+    }
+    let Err(err) = fluree
+        .graph(LEDGER)
+        .transact()
+        .sparql_update_with_params(
+            &format!("{PREFIX}DELETE WHERE {{ $s ?p ?o }}"),
+            &params(json!({ "s": { "@id": "_:x" } })),
+        )
+        .commit()
+        .await
+    else {
+        panic!("a blank node label is refused");
+    };
+    assert!(err.to_string().contains("blank node label"), "{err}");
+
+    fluree
+        .graph(LEDGER)
+        .transact()
+        .sparql_update_with_params(
+            &format!("{PREFIX}DELETE WHERE {{ $s ?p ?o }}"),
+            &params(json!({ "s": { "@id": dan } })),
+        )
+        .commit()
+        .await
+        .unwrap();
+    let db = head(&fluree).await;
+    let names = rows(&fluree, &db, "SELECT ?n WHERE { ?s ex:name ?n }", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        names,
+        vec![json!(["Alice"]), json!(["Bob"]), json!(["Carol"])]
+    );
+}
+
+#[tokio::test]
+async fn an_id_typed_value_is_an_iri() {
+    let fluree = seeded().await;
+    let db = head(&fluree).await;
+    let sparql = "SELECT ?n WHERE { $s ex:name ?n }";
+    let typed = params(json!({ "s": { "@value": "http://example.org/alice", "@type": "@id" } }));
+    let id = params(json!({ "s": { "@id": "http://example.org/alice" } }));
+    let names = rows(&fluree, &db, sparql, Some(typed)).await.unwrap();
+    assert_eq!(names, vec![json!(["Alice"])]);
+    assert_eq!(names, rows(&fluree, &db, sparql, Some(id)).await.unwrap());
+}

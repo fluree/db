@@ -52,7 +52,7 @@ use crate::span::SourceSpan;
 /// `fluree_db_core::ns_encoding::STABLE_BLANK_NODE_LABEL_PREFIX` (that crate
 /// is a feature-gated dependency, so the value is duplicated here; a
 /// lowering-feature test asserts equality).
-const STABLE_BLANK_NODE_LABEL_PREFIX: &str = "fdb-";
+pub(crate) const STABLE_BLANK_NODE_LABEL_PREFIX: &str = "fdb-";
 
 /// Fluree capability configuration.
 ///

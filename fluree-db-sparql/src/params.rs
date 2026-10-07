@@ -17,8 +17,10 @@
 //!   leave its variable unbound and silently widen the match.
 //!
 //! Values use the JSON-LD forms: a JSON string, number or boolean;
-//! `{"@id": iri}` (`"_:label"` for a blank node); `{"@value": v, "@type": iri}`;
-//! `{"@value": s, "@language": tag}`.
+//! `{"@id": iri}`; `{"@value": v, "@type": iri}` (`"@type": "@id"` reads `v`
+//! as an IRI); `{"@value": s, "@language": tag}`. IRIs are full IRIs: no
+//! prefix or `@context` applies. A blank node is a stored node's `_:fdb-…`
+//! id; any other label would lower to a variable and match every node.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -35,6 +37,7 @@ use crate::ast::{
     TriplePattern, UpdateOperation, Var, VarOrIri,
 };
 use crate::span::SourceSpan;
+use crate::validate::STABLE_BLANK_NODE_LABEL_PREFIX;
 
 /// SERVICE endpoints under this prefix query a ledger of this instance from
 /// the lowered patterns, not from the body text.
@@ -187,11 +190,7 @@ impl Value {
             let Some(id) = id.as_str() else {
                 return Err(ParamError::new(name, "has an `@id` that is not a string"));
             };
-            return match id.strip_prefix("_:") {
-                Some("") => Err(ParamError::new(name, "has an empty blank node label")),
-                Some(label) => Ok(Value::Blank(Arc::from(label))),
-                None => Ok(Value::Iri(Arc::from(id))),
-            };
+            return Self::node(name, id);
         }
         let Some(value) = object.get("@value") else {
             return Err(ParamError::new(
@@ -218,6 +217,23 @@ impl Value {
                 let Some(datatype) = datatype.as_str() else {
                     return Err(ParamError::new(name, "has a `@type` that is not a string"));
                 };
+                if datatype == "@id" {
+                    return match value.as_str() {
+                        Some(id) => Self::node(name, id),
+                        None => Err(ParamError::new(
+                            name,
+                            "has `\"@type\": \"@id\"`, so its `@value` must be a string",
+                        )),
+                    };
+                }
+                if datatype.starts_with('@') {
+                    return Err(ParamError::new(
+                        name,
+                        format!(
+                            "has a `@type` of `{datatype}`; only `@id` or a datatype IRI is a type"
+                        ),
+                    ));
+                }
                 let lexical = match value {
                     JsonValue::String(s) => s.clone(),
                     JsonValue::Number(n) => n.to_string(),
@@ -239,6 +255,22 @@ impl Value {
                 "has a `@value` that is not a string, number or boolean",
             )),
             (None, None) => Self::parse(name, value),
+        }
+    }
+
+    /// An IRI, or a stored node's `_:fdb-…` id. Any other blank-node label
+    /// lowers to a non-distinguished variable, which fixes nothing.
+    fn node(name: &str, id: &str) -> Result<Self> {
+        match id.strip_prefix("_:") {
+            Some(label) if label.starts_with(STABLE_BLANK_NODE_LABEL_PREFIX) => {
+                Ok(Value::Blank(Arc::from(label)))
+            }
+            Some(_) => Err(ParamError::new(
+                name,
+                "is a blank node label, which would match any node; \
+                 only a stored node's `_:fdb-…` id can be a parameter",
+            )),
+            None => Ok(Value::Iri(Arc::from(id))),
         }
     }
 
@@ -810,7 +842,13 @@ mod tests {
             (json!(null), "null"),
             (json!([1, 2]), "list"),
             (json!({"x": 1}), "without `@id` or `@value`"),
-            (json!({"@id": "_:"}), "empty blank node label"),
+            (json!({"@id": "_:"}), "blank node label"),
+            (json!({"@value": "_:x", "@type": "@id"}), "blank node label"),
+            (json!({"@value": 1, "@type": "@id"}), "must be a string"),
+            (
+                json!({"@value": "x", "@type": "@vocab"}),
+                "only `@id` or a datatype IRI",
+            ),
             (json!({"@id": "x", "@type": "y"}), "unexpected key"),
             (
                 json!({"@value": "a", "@type": "t", "@language": "en"}),
@@ -822,6 +860,42 @@ mod tests {
                 substituted("SELECT ?s WHERE { ?s <p> $v }", json!({ "v": value })).unwrap_err();
             assert!(err.reason.contains(reason), "{err}");
         }
+    }
+
+    #[test]
+    fn only_a_stored_blank_node_is_a_parameter() {
+        // Any other label lowers to a variable: under DELETE WHERE it would
+        // delete every triple instead of one node's.
+        for sparql in ["DELETE WHERE { $s ?p ?o }", "SELECT ?o WHERE { $s ?p ?o }"] {
+            for value in [
+                json!({"@id": "_:x"}),
+                json!({"@value": "_:x", "@type": "@id"}),
+            ] {
+                let err = substituted(sparql, json!({ "s": value })).unwrap_err();
+                assert!(err.reason.contains("blank node label"), "{sparql}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_id_typed_value_is_a_node() {
+        let ast = substituted(
+            "SELECT * WHERE { ?s <p> $a, $b }",
+            json!({
+                "a": {"@value": "http://example.org/x", "@type": "@id"},
+                "b": {"@value": "_:fdb-1", "@type": "@id"},
+            }),
+        )
+        .unwrap();
+        let GraphPattern::Bgp { patterns, .. } = &select(&ast).where_clause.pattern else {
+            panic!("expected a BGP")
+        };
+        assert!(
+            matches!(&patterns[0].object, Term::Iri(Iri { value: IriValue::Full(i), .. }) if i.as_ref() == "http://example.org/x")
+        );
+        assert!(
+            matches!(&patterns[1].object, Term::BlankNode(BlankNode { value: crate::ast::BlankNodeValue::Labeled(l), .. }) if l.as_ref() == "fdb-1")
+        );
     }
 
     #[test]
@@ -841,7 +915,7 @@ mod tests {
     fn positions_constrain_the_term() {
         let ast = substituted(
             "SELECT ?o WHERE { GRAPH $g { $s $p ?o } }",
-            json!({"s": {"@id": "_:b"}, "p": {"@id": "http://example.org/p"}, "g": {"@id": "http://example.org/g"}}),
+            json!({"s": {"@id": "_:fdb-b"}, "p": {"@id": "http://example.org/p"}, "g": {"@id": "http://example.org/g"}}),
         )
         .unwrap();
         assert!(!mentions_var(&ast, "s") && !mentions_var(&ast, "p") && !mentions_var(&ast, "g"));
@@ -857,7 +931,7 @@ mod tests {
         }
         let err = substituted(
             "SELECT * WHERE { ?s <p> ?o FILTER(?o = $v) }",
-            json!({"v": {"@id": "_:b"}}),
+            json!({"v": {"@id": "_:fdb-b"}}),
         )
         .unwrap_err();
         assert!(err.reason.contains("blank node"), "{err}");
