@@ -53,7 +53,7 @@ vector = ["fluree-db-query/vector"]
 residency = ["fluree-db-query/residency", "fluree-db-binary-index/residency"]
 # IPFS-backed storage (via Kubo HTTP RPC)
 ipfs = ["dep:fluree-db-storage-ipfs"]
-# Convenience bundle (excludes vector, aws, and test-only features)
+# Convenience bundle (excludes delta, vector, aws, and test-only features)
 full = ["native", "credential", "iceberg", "sql", "shacl", "ipfs", "graphql"]
 
 [dependencies]
