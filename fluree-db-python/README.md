@@ -403,13 +403,16 @@ Cancelling a task that awaits a query (`asyncio.timeout`, a client that
 disconnects) stops the query in the engine; a write already under way still
 completes. Cancelled inside `async with ledger.transaction()`, the block waits
 for that write to finish, rolls the transaction back, and re-raises the
-cancellation.
+cancellation, unless that write was the commit itself, which completes;
+`txn.committed` says whether it did.
 
 ## Concurrency
 
 Engine calls release the GIL, so threads can query in parallel. Several
 processes may share one database directory; a commit that loses a race to
-another process is retried against the new state.
+another process is retried against the new state, a bounded number of times
+before it raises `ConflictError`. Hand writes that contend heavily to
+`transact`, which runs them again on a conflict.
 
 A process forked after Fluree started in its parent cannot use it: the
 engine's threads do not survive a fork, and the lock state they leave behind
