@@ -329,6 +329,12 @@ impl From<String> for ShaclViolations {
     }
 }
 
+impl From<&str> for ShaclViolations {
+    fn from(message: &str) -> Self {
+        Self::from(message.to_string())
+    }
+}
+
 impl std::fmt::Display for ShaclViolations {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
