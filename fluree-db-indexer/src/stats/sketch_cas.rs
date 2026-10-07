@@ -51,7 +51,7 @@ const HEADER_LEN: usize = 4 + 2 + 1 + 8 + 4 + 4;
 const ZSTD_LEVEL: i32 = 1;
 /// Far above any plausible sketch; bounds what a corrupt or hostile header
 /// can make the decoder allocate.
-const MAX_PAYLOAD_BYTES: usize = 256 << 20;
+pub(crate) const MAX_PAYLOAD_BYTES: usize = 256 << 20;
 
 const REGISTERS: usize = 256;
 const PRECISION: u8 = HllSketch256::PRECISION as u8;
@@ -158,6 +158,10 @@ impl HllSketchBlob {
 
     /// Encode as format v2. Deterministic for a given zstd version.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        self.to_bytes_within(MAX_PAYLOAD_BYTES)
+    }
+
+    pub(crate) fn to_bytes_within(&self, max_payload: usize) -> Result<Vec<u8>> {
         let entry_count = u32::try_from(self.entries.len()).map_err(|_| {
             IndexerError::Serialization(format!(
                 "stats sketch has {} entries, more than the format holds",
@@ -187,9 +191,9 @@ impl HllSketchBlob {
             write_hll(&mut payload, &e.values_hll);
             write_hll(&mut payload, &e.subjects_hll);
         }
-        if payload.len() > MAX_PAYLOAD_BYTES {
+        if payload.len() > max_payload {
             return Err(IndexerError::Serialization(format!(
-                "stats sketch payload of {} bytes exceeds the {MAX_PAYLOAD_BYTES}-byte ceiling",
+                "stats sketch payload of {} bytes exceeds the {max_payload}-byte ceiling",
                 payload.len()
             )));
         }

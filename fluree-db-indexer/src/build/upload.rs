@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use crate::error::{IndexerError, Result};
 use crate::fuel::charge_extra_leaflets;
+use crate::stats::sketch_cas::MAX_PAYLOAD_BYTES;
 use crate::stats::{GraphPropertyKey, HllSketchBlob, IdPropertyHll};
 
 use super::types::UploadedIndexes;
@@ -36,16 +37,36 @@ pub(crate) async fn upload_dict_blob(
 }
 
 /// Encode and upload the stats sketch. `None` when there is nothing to
-/// persist; otherwise the CID and the bytes written, for cache seeding.
+/// persist or the sketch cannot be encoded; otherwise the CID and the bytes
+/// written, for cache seeding.
 pub(crate) async fn upload_stats_sketch(
     cs: &dyn ContentStore,
     index_t: i64,
     properties: &HashMap<GraphPropertyKey, IdPropertyHll>,
 ) -> Result<Option<(ContentId, Vec<u8>)>> {
+    upload_stats_sketch_within(cs, index_t, properties, MAX_PAYLOAD_BYTES).await
+}
+
+async fn upload_stats_sketch_within(
+    cs: &dyn ContentStore,
+    index_t: i64,
+    properties: &HashMap<GraphPropertyKey, IdPropertyHll>,
+    max_payload: usize,
+) -> Result<Option<(ContentId, Vec<u8>)>> {
     if properties.is_empty() {
         return Ok(None);
     }
-    let bytes = HllSketchBlob::from_properties(index_t, properties).to_bytes()?;
+    let bytes =
+        match HllSketchBlob::from_properties(index_t, properties).to_bytes_within(max_payload) {
+            Ok(bytes) => bytes,
+            // Index without a sketch rather than not at all: failing here would
+            // fail every build of this ledger, rebuilds included. The next build
+            // reseeds NDV from the root's stats.
+            Err(e) => {
+                tracing::error!(error = %e, entries = properties.len(), "stats sketch not written");
+                return Ok(None);
+            }
+        };
     let cid = cs
         .put(ContentKind::StatsSketch, &bytes)
         .await
@@ -177,4 +198,43 @@ pub(crate) async fn upload_indexes_to_cas(
         default_graph_orders: default_orders,
         named_graphs,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hll::HllSketch256;
+    use fluree_db_core::MemoryContentStore;
+
+    #[tokio::test]
+    async fn stats_sketch_past_the_ceiling_is_skipped_not_failed() {
+        let properties = HashMap::from([(
+            GraphPropertyKey { g_id: 0, p_id: 1 },
+            IdPropertyHll::from_sketches(
+                3,
+                HllSketch256::new(),
+                HllSketch256::new(),
+                1,
+                HashMap::from([(3u8, 3i64)]),
+            ),
+        )]);
+        let cs = MemoryContentStore::new();
+        let bytes = HllSketchBlob::from_properties(1, &properties)
+            .to_bytes()
+            .unwrap();
+        let cid = ContentId::new(ContentKind::StatsSketch, &bytes);
+
+        let skipped = upload_stats_sketch_within(&cs, 1, &properties, 8)
+            .await
+            .unwrap();
+        assert!(skipped.is_none());
+        assert!(!cs.has(&cid).await.unwrap());
+
+        let (written, _) = upload_stats_sketch(&cs, 1, &properties)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(written, cid);
+        assert!(cs.has(&cid).await.unwrap());
+    }
 }
