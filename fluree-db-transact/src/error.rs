@@ -188,6 +188,13 @@ pub enum TransactError {
     #[error("Transaction invariant violation: {0}")]
     InvariantViolation(String),
 
+    /// The ledger config, which decides what checks a write gets, could not
+    /// be read (a storage or read failure, not anything in the request). The
+    /// write is refused rather than admitted unchecked; it can succeed on
+    /// retry.
+    #[error("Ledger config unavailable: {0}")]
+    ConfigUnavailable(String),
+
     /// A transaction named a reserved system graph as a write target:
     /// `urn:fluree:{ledger}#config` (g_id 2) or `#txn-meta` (g_id 1). These
     /// graphs are Fluree-internal — `#config` seeds SHACL/uniqueness governance

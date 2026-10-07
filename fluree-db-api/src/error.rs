@@ -258,6 +258,13 @@ pub enum ApiError {
     #[error("Ledger configuration error: {0}")]
     LedgerConfig(String),
 
+    /// The ledger config could not be read (a storage or read failure).
+    /// Nothing in the request is wrong, and a retry can succeed. The same
+    /// condition on a transaction's staging lanes is
+    /// [`TransactError::ConfigUnavailable`](fluree_db_transact::TransactError::ConfigUnavailable).
+    #[error("Ledger config unavailable: {0}")]
+    ConfigUnavailable(String),
+
     /// A materialize pass's subject accumulator outgrew its memory budget.
     ///
     /// A pre-OOM circuit breaker, not an allocator meter: the bytes are
@@ -728,6 +735,11 @@ impl ApiError {
                 fluree_db_transact::TransactError::NoveltyAtMax
                 | fluree_db_transact::TransactError::NoveltyWouldExceed { .. },
             ) => 503,
+            // 500: the ledger config could not be read, a storage failure
+            // (`err:storage/ReadFailure` on the server). Nothing in the request
+            // is wrong; it is not capacity pressure, so not a 503.
+            ApiError::ConfigUnavailable(_)
+            | ApiError::Transact(fluree_db_transact::TransactError::ConfigUnavailable(_)) => 500,
             // 422: well-formed, but the ledger has no room for its new
             // datatypes. Permanent: datatype IDs are never released.
             ApiError::Transact(fluree_db_transact::TransactError::DatatypeLimitExceeded {

@@ -40,6 +40,36 @@ use crate::error::Result;
 use crate::view::{ConfigReasoningBudget, ReasoningModePrecedence};
 use crate::GovernanceOptions;
 
+/// Test-only fault injection for [`resolve_ledger_config`]: while a guard
+/// from [`arm`](config_read_fault::arm) is alive, every config read on this
+/// thread fails, as a storage error would, so a test sees each caller's
+/// mapping of the failure.
+#[cfg(test)]
+pub(crate) mod config_read_fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn armed() -> bool {
+        ARMED.with(Cell::get)
+    }
+
+    pub(crate) fn arm() -> Guard {
+        ARMED.with(|armed| armed.set(true));
+        Guard
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ARMED.with(|armed| armed.set(false));
+        }
+    }
+}
+
 // ============================================================================
 // Public: Privileged config read
 // ============================================================================
@@ -56,6 +86,12 @@ pub async fn resolve_ledger_config(
     overlay: &dyn OverlayProvider,
     to_t: i64,
 ) -> Result<Option<LedgerConfig>> {
+    #[cfg(test)]
+    if config_read_fault::armed() {
+        return Err(crate::error::ApiError::internal(
+            "injected config read failure",
+        ));
+    }
     let Some(config_sid) = resolve_config_sid(snapshot, overlay, to_t).await? else {
         return Ok(None);
     };

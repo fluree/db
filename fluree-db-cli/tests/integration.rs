@@ -850,6 +850,39 @@ fn insert_honors_inline_shapes_in_the_body() {
         .stdout(predicate::str::contains("Committed t=1"));
 }
 
+/// `fluree info` ends with the ledger's config diagnostics when it has some:
+/// a ledger holding shapes without a config that enables SHACL.
+#[test]
+fn info_prints_config_diagnostics() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "diagdb"])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args(["info", "diagdb"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Config diagnostics").not());
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "-e",
+            r#"{"@context": {"ex": "http://example.org/ns/", "sh": "http://www.w3.org/ns/shacl#"},
+                "@id": "ex:PersonShape", "@type": "sh:NodeShape",
+                "sh:targetClass": {"@id": "ex:Person"}}"#,
+        ])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args(["info", "diagdb"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Config diagnostics:"))
+        .stdout(predicate::str::contains("shapes present"));
+}
+
 // ============================================================================
 // Error path tests
 // ============================================================================

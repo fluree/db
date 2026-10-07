@@ -32,9 +32,20 @@ use std::collections::{BTreeSet, HashMap};
 /// staged-config guard.
 #[derive(Debug, Default)]
 pub(crate) struct BranchOpValidation {
-    /// The error a transaction producing the same state would fail with,
-    /// `None` when the view conforms.
-    rejection: Option<TransactError>,
+    /// Why the operation may not apply, `None` when the view conforms.
+    rejection: Option<Rejection>,
+}
+
+/// Why a branch operation's staged view may not apply.
+#[derive(Debug)]
+enum Rejection {
+    /// A SHACL or uniqueness violation: the error a transaction producing
+    /// the same state would fail with.
+    Check(TransactError),
+    /// The staged config conflicts with the target's: a config group the
+    /// operation would split, a second value, or another branch's config
+    /// graph. The target's state blocks the operation (409).
+    Config(String),
 }
 
 impl BranchOpValidation {
@@ -48,8 +59,9 @@ impl BranchOpValidation {
     pub(crate) fn report(&self) -> Option<String> {
         self.rejection.as_ref().map(|rejection| match rejection {
             #[cfg(feature = "shacl")]
-            TransactError::ShaclViolation(report) => report.to_string(),
-            other => other.to_string(),
+            Rejection::Check(TransactError::ShaclViolation(report)) => report.to_string(),
+            Rejection::Check(other) => other.to_string(),
+            Rejection::Config(message) => message.clone(),
         })
     }
 
@@ -67,15 +79,19 @@ impl BranchOpValidation {
         match self.rejection {
             None => Ok(()),
             #[cfg(feature = "shacl")]
-            Some(TransactError::ShaclViolation(report)) => {
+            Some(Rejection::Check(TransactError::ShaclViolation(report))) => {
                 let message = describe(report.message().to_string());
                 let report =
                     fluree_db_transact::ShaclViolations::new(message, report.results().to_vec());
                 Err(TransactError::ShaclViolation(report).into())
             }
-            Some(rejection) => {
+            Some(Rejection::Check(rejection)) => {
                 let _ = describe;
                 Err(rejection.into())
+            }
+            Some(Rejection::Config(message)) => {
+                let _ = describe;
+                Err(ApiError::BranchConflict(message))
             }
         }
     }
@@ -320,7 +336,7 @@ impl crate::Fluree {
             .await?
         {
             return Ok(BranchOpValidation {
-                rejection: Some(TransactError::Parse(refusal)),
+                rejection: Some(Rejection::Config(refusal)),
             });
         }
 
@@ -377,7 +393,10 @@ impl crate::Fluree {
         {
             Ok(_governed) => Ok(BranchOpValidation::default()),
             Err(StagedWriteError::Rejected(rejection)) => Ok(BranchOpValidation {
-                rejection: Some(rejection),
+                rejection: Some(Rejection::Check(rejection)),
+            }),
+            Err(StagedWriteError::ConfigRefused(message)) => Ok(BranchOpValidation {
+                rejection: Some(Rejection::Config(message)),
             }),
             Err(StagedWriteError::Failed(e)) => Err(e.into()),
         }

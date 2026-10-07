@@ -225,6 +225,12 @@ impl ServerError {
                 fluree_db_api::TransactError::DatatypeLimitExceeded { .. },
             ))
             | ServerError::DatatypeLimitExceeded(_) => errors::DATATYPE_LIMIT_EXCEEDED,
+            // The ledger config could not be read: a storage failure, whichever
+            // lane read it. MUST precede the generic `ApiError::Transact(_)` arm.
+            ServerError::Api(
+                ApiError::ConfigUnavailable(_)
+                | ApiError::Transact(fluree_db_api::TransactError::ConfigUnavailable(_)),
+            ) => errors::STORAGE_READ,
             ServerError::Api(ApiError::Transact(_)) => errors::INVALID_TRANSACTION,
 
             // API-level errors
@@ -339,6 +345,14 @@ impl ServerError {
                 fluree_db_api::TransactError::DatatypeLimitExceeded { .. },
             ))
             | ServerError::DatatypeLimitExceeded(_) => StatusCode::UNPROCESSABLE_ENTITY,
+
+            // 500 - the ledger config could not be read: a storage failure, not
+            // a request error and not capacity pressure (so no 503). MUST
+            // precede the generic `ApiError::Transact(_)` arm below.
+            ServerError::Api(
+                ApiError::ConfigUnavailable(_)
+                | ApiError::Transact(fluree_db_api::TransactError::ConfigUnavailable(_)),
+            ) => StatusCode::INTERNAL_SERVER_ERROR,
 
             // 503 - novelty backpressure. The same retryable capacity class
             // as `NoveltyDeferred` above: only the indexer draining clears
@@ -940,6 +954,28 @@ mod tests {
             .headers()
             .get(axum::http::header::RETRY_AFTER)
             .is_none());
+    }
+
+    /// A failure to read the ledger config answers 500 with
+    /// `err:storage/ReadFailure` and no `Retry-After`, in both of its forms:
+    /// a transaction's staging lanes (`TransactError::ConfigUnavailable`,
+    /// which the generic `Transact` arm would make a 400) and the API's own
+    /// config reads (`ApiError::ConfigUnavailable`: the policy context and a
+    /// query's config). The consensus-flattened form is in
+    /// `submission_error_variants_are_exhaustively_classified`.
+    #[test]
+    fn a_config_read_failure_is_a_storage_read_failure() {
+        for se in [
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::ConfigUnavailable("read failed".into()),
+            )),
+            ServerError::Api(ApiError::ConfigUnavailable("read failed".into())),
+        ] {
+            assert_eq!(se.status_code(), StatusCode::INTERNAL_SERVER_ERROR, "{se}");
+            assert_eq!(se.error_type(), errors::STORAGE_READ, "{se}");
+            let resp = se.into_response();
+            assert!(retry_after_secs(&resp).is_none());
+        }
     }
 
     fn retry_after_secs(resp: &Response) -> Option<u32> {

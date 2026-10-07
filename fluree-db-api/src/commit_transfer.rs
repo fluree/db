@@ -558,9 +558,11 @@ impl Fluree {
             let mut staged_view = staged_view;
             #[cfg(feature = "shacl")]
             {
+                // An unreadable config is a server-side read failure (500),
+                // not a property of the pushed commits.
                 let config = crate::tx::enforcement_config(&staged_view)
                     .await
-                    .map_err(|e| ApiError::http(422, e.to_string()))?;
+                    .map_err(ApiError::from)?;
                 crate::tx::apply_shacl_policy_to_staged_view(
                     &mut staged_view,
                     crate::tx::StagedShaclContext {

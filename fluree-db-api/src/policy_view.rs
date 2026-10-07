@@ -586,8 +586,8 @@ pub(crate) async fn resolve_ledger_config_cached(
     resolve_ledger_config_raw(snapshot, overlay, to_t).await
 }
 
-/// Uncached resolve, `Arc`-wrapping the result and mapping the error into the
-/// config-failure shape `build_transact_policy_context` reports.
+/// Uncached resolve, `Arc`-wrapping the result. A failure to read the config
+/// is [`ApiError::ConfigUnavailable`](crate::error::ApiError::ConfigUnavailable).
 async fn resolve_ledger_config_raw(
     snapshot: &LedgerSnapshot,
     overlay: &dyn OverlayProvider,
@@ -595,9 +595,7 @@ async fn resolve_ledger_config_raw(
 ) -> Result<Option<Arc<LedgerConfig>>> {
     match crate::config_resolver::resolve_ledger_config(snapshot, overlay, to_t).await {
         Ok(opt) => Ok(opt.map(Arc::new)),
-        Err(e) => Err(crate::error::ApiError::config(format!(
-            "Failed to load ledger config while resolving transaction policy: {e}"
-        ))),
+        Err(e) => Err(crate::error::ApiError::ConfigUnavailable(e.to_string())),
     }
 }
 
@@ -654,11 +652,7 @@ pub(crate) async fn resolve_policy_graphs_from_config(
     {
         Ok(Some(c)) => c,
         Ok(None) => return Ok(vec![0]),
-        Err(e) => {
-            return Err(crate::error::ApiError::config(format!(
-                "Failed to load ledger config while resolving f:policySource: {e}"
-            )));
-        }
+        Err(e) => return Err(crate::error::ApiError::ConfigUnavailable(e.to_string())),
     };
     let resolved = crate::config_resolver::resolve_effective_config(&config, None);
     let source = resolved

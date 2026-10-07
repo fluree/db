@@ -473,18 +473,10 @@ fn tracker_for_limits(txn_json: &JsonValue) -> Tracker {
 pub(crate) async fn load_transaction_config(
     ledger: &LedgerState,
 ) -> std::result::Result<Option<Arc<LedgerConfig>>, fluree_db_transact::TransactError> {
-    #[cfg(test)]
-    if config_read_fault::armed() {
-        return Err(fluree_db_transact::TransactError::Parse(
-            "failed to load ledger config: injected read failure".to_string(),
-        ));
-    }
     config_resolver::resolve_ledger_config(&ledger.snapshot, &*ledger.novelty, ledger.t())
         .await
         .map(|config| config.map(Arc::new))
-        .map_err(|e| {
-            fluree_db_transact::TransactError::Parse(format!("failed to load ledger config: {e}"))
-        })
+        .map_err(|e| fluree_db_transact::TransactError::ConfigUnavailable(e.to_string()))
 }
 
 /// The config SHACL and uniqueness enforce a staged transaction under, read
@@ -587,35 +579,6 @@ fn written_user_graphs(view: &StagedLedger) -> std::collections::BTreeSet<GraphI
         .map(|(g_id, _)| g_id)
         .filter(|g_id| !crate::export::is_system_graph(*g_id))
         .collect()
-}
-
-/// Test-only fault injection for [`load_transaction_config`]: while a guard
-/// from [`arm`](config_read_fault::arm) is alive, every config read on this
-/// thread fails.
-#[cfg(test)]
-pub(crate) mod config_read_fault {
-    use std::cell::Cell;
-
-    thread_local! {
-        static ARMED: Cell<bool> = const { Cell::new(false) };
-    }
-
-    pub(crate) fn armed() -> bool {
-        ARMED.with(Cell::get)
-    }
-
-    pub(crate) fn arm() -> Guard {
-        ARMED.with(|armed| armed.set(true));
-        Guard
-    }
-
-    pub(crate) struct Guard;
-
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            ARMED.with(|armed| armed.set(false));
-        }
-    }
 }
 
 /// The graphs stored shapes validate, with each graph's mode: the user graphs
@@ -1905,10 +1868,14 @@ impl WriteChecks<'_> {
 /// Why a staged write may not commit.
 #[derive(Debug)]
 pub(crate) enum StagedWriteError {
-    /// The staged state breaks the ledger's shapes, uniqueness constraints or
-    /// config rules: the error a write producing it fails with, and what a
+    /// The staged state breaks the ledger's shapes or uniqueness
+    /// constraints: the error a write producing it fails with, and what a
     /// branch operation's preview reports.
     Rejected(fluree_db_transact::TransactError),
+    /// The staged-config guard refuses the staged config: a transaction gets
+    /// it as a `Parse error` (400), a branch operation as a conflict with
+    /// the target's state (409).
+    ConfigRefused(String),
     /// The checks could not run.
     Failed(fluree_db_transact::TransactError),
 }
@@ -1931,18 +1898,21 @@ impl From<crate::config_guard::GuardError> for StagedWriteError {
     fn from(error: crate::config_guard::GuardError) -> Self {
         use crate::config_guard::GuardError;
         match error {
-            GuardError::Refused(message) => {
-                StagedWriteError::Rejected(fluree_db_transact::TransactError::Parse(message))
-            }
+            GuardError::Refused(message) => StagedWriteError::ConfigRefused(message),
             GuardError::Failed(e) => StagedWriteError::Failed(e),
         }
     }
 }
 
 impl From<StagedWriteError> for fluree_db_transact::TransactError {
+    /// As a transaction reports it: a config refusal is a `Parse error` (the
+    /// request wrote config the reader would not read as written).
     fn from(error: StagedWriteError) -> Self {
         match error {
             StagedWriteError::Rejected(e) | StagedWriteError::Failed(e) => e,
+            StagedWriteError::ConfigRefused(message) => {
+                fluree_db_transact::TransactError::Parse(message)
+            }
         }
     }
 }
@@ -4804,20 +4774,203 @@ mod tests {
         });
 
         let err = {
-            let _fault = config_read_fault::arm();
+            let _fault = crate::config_resolver::config_read_fault::arm();
             fluree
                 .insert(ledger.clone(), &record)
                 .await
                 .expect_err("an unreadable config refuses the write")
         };
         assert!(
-            err.to_string().contains("failed to load ledger config"),
+            matches!(
+                err,
+                ApiError::Transact(fluree_db_transact::TransactError::ConfigUnavailable(_))
+            ),
             "{err}"
+        );
+        assert_eq!(
+            err.status_code(),
+            500,
+            "a storage failure, not a request error"
         );
 
         fluree
             .insert(ledger, &record)
             .await
             .expect("with the config readable, the write commits");
+    }
+
+    /// Whether `err` is a failure to read the ledger config, in either of
+    /// its two forms (a transaction's staging lanes, or the API's own reads).
+    fn is_config_unavailable(err: &ApiError) -> bool {
+        matches!(
+            err,
+            ApiError::ConfigUnavailable(_)
+                | ApiError::Transact(fluree_db_transact::TransactError::ConfigUnavailable(_))
+        )
+    }
+
+    /// A failure to read the ledger config is the same error, with the same
+    /// status, on every lane that reads it: a transaction, a multi-operation
+    /// update, the transaction policy context, a query, a fast-forward merge
+    /// and a push. Each would otherwise run without the config's checks or
+    /// report a request error.
+    #[tokio::test]
+    async fn config_read_failure_is_config_unavailable_on_every_lane() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let name = "tx/config-unavailable";
+        let id = format!("{name}:main");
+        let ledger = fluree.create_ledger(name).await.expect("create");
+        fluree
+            .insert(
+                ledger,
+                &serde_json::json!({
+                    "@context": {"f": "https://ns.flur.ee/db#", "ex": "http://example.org/"},
+                    "@graph": [
+                        {"@id": "ex:email", "f:enforceUnique": true},
+                        {
+                            "@id": "urn:config:main",
+                            "@type": "f:LedgerConfig",
+                            "@graph": "config",
+                            "f:transactDefaults": {
+                                "@id": "urn:config:transact",
+                                "f:uniqueEnabled": true
+                            }
+                        }
+                    ]
+                }),
+            )
+            .await
+            .expect("uniqueness config");
+        fluree
+            .create_branch(name, "dev", None, None)
+            .await
+            .expect("branch");
+        let dev = fluree.ledger(&format!("{name}:dev")).await.expect("dev");
+        fluree
+            .insert(
+                dev,
+                &serde_json::json!({
+                    "@context": {"ex": "http://example.org/"},
+                    "@id": "ex:bob",
+                    "ex:email": "bob@example.org"
+                }),
+            )
+            .await
+            .expect("dev write");
+        let record = serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:alice",
+            "ex:email": "alice@example.org"
+        });
+        let dev_handle = fluree
+            .ledger_cached(&format!("{name}:dev"))
+            .await
+            .expect("dev handle");
+        let pushed = fluree
+            .export_commit_range(
+                &dev_handle,
+                &crate::ExportCommitsRequest {
+                    limit: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("export");
+
+        let main = fluree.ledger(&id).await.expect("main");
+        let mut errors: Vec<(&str, ApiError)> = Vec::new();
+        {
+            let _fault = crate::config_resolver::config_read_fault::arm();
+            let db = crate::GraphDb::from_ledger_state(&main);
+            errors.push((
+                "query",
+                fluree
+                    .query(
+                        &db,
+                        &serde_json::json!({"select": "?s", "where": {"@id": "?s"}}),
+                    )
+                    .await
+                    .expect_err("query"),
+            ));
+            errors.push((
+                "transaction policy context",
+                crate::policy_view::build_transact_policy_context(
+                    &fluree,
+                    &main.snapshot,
+                    main.novelty.as_ref(),
+                    Some(main.novelty.as_ref()),
+                    main.t(),
+                    &crate::GovernanceOptions::default(),
+                )
+                .await
+                .expect_err("policy context"),
+            ));
+            errors.push((
+                "insert",
+                fluree
+                    .insert(main.clone(), &record)
+                    .await
+                    .expect_err("insert"),
+            ));
+            errors.push((
+                "multi-operation update",
+                fluree
+                    .graph(&id)
+                    .transact()
+                    .sparql_update(
+                        "PREFIX ex: <http://example.org/>
+                         INSERT DATA { ex:carol ex:email \"carol@example.org\" } ;
+                         INSERT DATA { ex:dave ex:email \"dave@example.org\" }",
+                    )
+                    .commit()
+                    .await
+                    .expect_err("multi-op"),
+            ));
+            errors.push((
+                "fast-forward merge",
+                fluree
+                    .merge_branch(
+                        name,
+                        "dev",
+                        Some("main"),
+                        crate::ConflictStrategy::default(),
+                    )
+                    .await
+                    .expect_err("merge"),
+            ));
+            let mut commits = pushed.commits.clone();
+            commits.reverse();
+            errors.push((
+                "push",
+                fluree
+                    .push_commits(
+                        &id,
+                        crate::PushCommitsRequest {
+                            commits,
+                            blobs: pushed.blobs.clone(),
+                            missing_blobs: Vec::new(),
+                            merged_commits: Vec::new(),
+                        },
+                        &crate::GovernanceOptions::default(),
+                        &fluree.default_index_config(),
+                    )
+                    .await
+                    .expect_err("push"),
+            ));
+        }
+        for (lane, err) in &errors {
+            assert!(is_config_unavailable(err), "{lane}: {err:?}");
+            assert_eq!(err.status_code(), 500, "{lane}: {err}");
+        }
+
+        fluree
+            .merge_branch(
+                name,
+                "dev",
+                Some("main"),
+                crate::ConflictStrategy::default(),
+            )
+            .await
+            .expect("with the config readable, the merge applies");
     }
 }

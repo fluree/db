@@ -206,6 +206,9 @@ pub(crate) fn submission_error_to_server_error(err: SubmissionError) -> ServerEr
         SubmissionError::CommitNotFound { message } => {
             return ServerError::Api(ApiError::CommitNotFound(message.clone()));
         }
+        SubmissionError::ConfigUnavailable { message } => {
+            return ServerError::Api(ApiError::ConfigUnavailable(message.clone()));
+        }
         SubmissionError::Execution { status, .. } => *status,
     };
     ServerError::Api(ApiError::http(status, err.to_string()))
@@ -2625,6 +2628,9 @@ mod tests {
             SubmissionError::CommitNotFound {
                 message: "No commit found with prefix: ffffffff".into(),
             },
+            SubmissionError::ConfigUnavailable {
+                message: "Ledger config unavailable: storage read failed".into(),
+            },
         ];
         for variant in variants {
             // (status, @type) each variant must surface as. No wildcard:
@@ -2645,6 +2651,7 @@ mod tests {
                     (422, errors::DATATYPE_LIMIT_EXCEEDED)
                 }
                 SubmissionError::CommitNotFound { .. } => (404, errors::COMMIT_NOT_FOUND),
+                SubmissionError::ConfigUnavailable { .. } => (500, errors::STORAGE_READ),
             };
             let se = submission_error_to_server_error(variant);
             assert_eq!(se.status_code().as_u16(), expected_status, "{se}");

@@ -547,11 +547,7 @@ async fn refuse_second_values(
             base.t(),
         )
         .await
-        .map_err(|e| {
-            GuardError::Failed(TransactError::Parse(format!(
-                "failed to load ledger config: {e}"
-            )))
-        })?
+        .map_err(|e| GuardError::Failed(TransactError::ConfigUnavailable(e.to_string())))?
         .into_iter()
         .filter(|s| !untyped.contains(s))
         .collect();
@@ -609,7 +605,7 @@ async fn graph_flakes(
         },
     )
     .await
-    .map_err(TransactError::from)
+    .map_err(|e| TransactError::ConfigUnavailable(e.to_string()))
 }
 
 /// Reject a transaction that writes an unrecognized `f:reasoningModes` value.

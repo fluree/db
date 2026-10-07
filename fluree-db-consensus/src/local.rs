@@ -431,6 +431,12 @@ pub(crate) fn execution_failure(err: ApiError) -> SubmissionError {
         ApiError::CommitNotFound(message) => SubmissionError::CommitNotFound {
             message: message.clone(),
         },
+        ApiError::ConfigUnavailable(_)
+        | ApiError::Transact(fluree_db_api::TransactError::ConfigUnavailable(_)) => {
+            SubmissionError::ConfigUnavailable {
+                message: err.to_string(),
+            }
+        }
         _ => SubmissionError::Execution {
             status: err.status_code(),
             message: err.to_string(),

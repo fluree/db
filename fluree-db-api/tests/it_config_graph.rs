@@ -491,10 +491,14 @@ async fn config_guard_refuses_a_group_split_across_transactions() {
 // The guard on branch operations: they re-check the target's config groups.
 // -----------------------------------------------------------------------------
 
-/// The message of a branch operation the guard refused: a parse error, like a
-/// transaction's, naming the group and the repair.
+/// The message of a branch operation the guard refused: a conflict with the
+/// target's state, naming the group and the repair.
 fn branch_op_refusal(err: fluree_db_api::ApiError, group: &str) -> String {
-    let message = config_guard_refusal(err);
+    assert_eq!(err.status_code(), 409, "{err}");
+    let message = match err {
+        fluree_db_api::ApiError::BranchConflict(message) => message,
+        other => panic!("expected a branch conflict, got {other:?}"),
+    };
     assert!(message.contains(group), "{message}");
     assert!(
         message.contains("Repairing a config split across graphs"),
@@ -618,6 +622,7 @@ async fn a_merge_carrying_config_written_on_another_branch_is_refused() {
                 )
                 .await
                 .expect_err("a merge carrying dev's config");
+            assert_eq!(err.status_code(), 409, "{i}/{fast_forward}: {err}");
             let message = err.to_string();
             assert!(
                 message.contains("branch dev's config graph") && message.contains(&dev_cfg),
@@ -714,6 +719,7 @@ async fn a_merge_carrying_config_written_on_another_branch_is_refused() {
             )
             .await
             .expect_err("a merge carrying dev's config graph data");
+        assert_eq!(err.status_code(), 409, "{fast_forward}: {err}");
         let message = err.to_string();
         assert!(
             message.contains("branch dev's config graph") && message.contains(&dev_cfg),
