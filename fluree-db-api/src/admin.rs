@@ -297,8 +297,8 @@ pub struct IndexStatusResult {
     pub last_error: Option<String>,
     /// The last build stopped on committed data it cannot index, so commits
     /// start no build until an explicit index request
-    /// ([`crate::Fluree::trigger_index`]), a reindex, or a restart;
-    /// `last_error` says why. See
+    /// ([`crate::Fluree::trigger_index`]), a reindex, a newer index from any
+    /// process, or a restart; `last_error` says why. See
     /// [`fluree_db_indexer::IndexStatusSnapshot::halted`].
     pub halted: bool,
 }
