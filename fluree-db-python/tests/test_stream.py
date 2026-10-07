@@ -1,3 +1,4 @@
+import threading
 import time
 
 import pytest
@@ -51,6 +52,32 @@ def test_breaking_early_stops_a_huge_query(ledger):
     assert len(first) == 10
     assert time.monotonic() - started < 10
     assert len(ledger.query(NUMS)) == 2500
+
+
+def test_a_second_reader_is_refused(ledger):
+    # No row ever passes the filter, so the first reader waits until the stream is closed.
+    endless = f"PREFIX ex: <{EX}> SELECT ?x WHERE {{ ?a ex:n ?x . ?b ex:n ?y . ?c ex:n ?z FILTER(?x + ?y + ?z < 0) }}"
+    stream = ledger.stream(endless)
+    outcomes = {}
+
+    def read(name):
+        try:
+            outcomes[name] = next(stream, None)
+        except fluree.FlureeError as e:
+            outcomes[name] = e
+
+    first = threading.Thread(target=read, args=("first",))
+    first.start()
+    time.sleep(0.5)
+    second = threading.Thread(target=read, args=("second",))
+    second.start()
+    second.join(timeout=10)
+    assert not second.is_alive()
+    assert isinstance(outcomes["second"], InvalidRequestError)
+    assert "being read by another thread" in str(outcomes["second"])
+    stream.close()
+    first.join(timeout=30)
+    assert not first.is_alive()
 
 
 def test_stream_timeout(ledger):

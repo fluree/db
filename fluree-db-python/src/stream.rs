@@ -7,14 +7,14 @@
 
 use crate::connection::Database;
 use crate::convert::term;
-use crate::error::{class_for_status, raise_status};
+use crate::error::{class_for_status, invalid_request, raise_status};
 use crate::runtime::{runtime, InRuntime};
 use bytes::Bytes;
 use fluree_db_api::QueryCancellation;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use serde_json::Value as JsonValue;
-use std::sync::Mutex;
+use std::sync::{Mutex, TryLockError};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -85,7 +85,17 @@ impl RowStream {
         max: usize,
     ) -> PyResult<Option<Vec<Bound<'py, PyTuple>>>> {
         let runtime = runtime()?;
-        let mut guard = self.records.lock().expect("stream lock");
+        // The reader keeps the lock while it waits, taking the GIL back now
+        // and then; a second reader blocked on it with the GIL would stop both.
+        let mut guard = match self.records.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => {
+                return Err(invalid_request(
+                    "the stream is being read by another thread",
+                ))
+            }
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
         let Some(records) = guard.as_mut() else {
             return Ok(None);
         };
