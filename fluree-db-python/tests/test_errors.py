@@ -36,9 +36,20 @@ def conn():
         yield conn
 
 
+def enable_shacl(ledger):
+    """Turn SHACL on in the ledger's config, as the README shows."""
+    config = f"urn:fluree:{ledger.id}"
+    ledger.update(
+        f"PREFIX f: <{F}> INSERT DATA {{ GRAPH <{config}#config> {{ "
+        f"<{config}:config:ledger> a f:LedgerConfig ; f:shaclDefaults <{config}:config:shacl> . "
+        f"<{config}:config:shacl> f:shaclEnabled true }} }}"
+    )
+
+
 @pytest.fixture
 def shaped(conn):
     ledger = conn.create("people")
+    enable_shacl(ledger)
     ledger.insert(SHAPES)
     return ledger
 
@@ -83,6 +94,7 @@ def test_a_merge_the_shapes_reject_raises_it_too(conn):
     ledger.insert({"@context": CONTEXT, "@id": "ex:alice", "ex:name": "Alice"})
     dev = ledger.branch("dev")
     dev.insert(BOB)  # no shapes on this branch
+    enable_shacl(ledger)
     ledger.insert(SHAPES)
     with pytest.raises(ShaclViolationError) as err:
         ledger.merge(dev)

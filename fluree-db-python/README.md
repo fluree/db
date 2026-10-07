@@ -373,6 +373,20 @@ except fluree.ShaclViolationError as e:
         print(v.focus, v.path, v.message)
 ```
 
+Writes are checked against the ledger's SHACL shapes where its config turns
+SHACL on, ledger-wide as here or per graph (see
+[SHACL defaults](https://github.com/fluree/db/blob/main/docs/ledger-config/setting-groups.md#shacl-defaults)):
+
+```python
+people.update("""
+PREFIX f: <https://ns.flur.ee/db#>
+INSERT DATA { GRAPH <urn:fluree:people:main#config> {
+    <urn:fluree:people:main:config:ledger> a f:LedgerConfig ;
+        f:shaclDefaults <urn:fluree:people:main:config:shacl> .
+    <urn:fluree:people:main:config:shacl> f:shaclEnabled true .
+} }""")
+```
+
 ## Logging
 
 The engine's log goes to Python's `logging` as the `fluree.engine` logger,
