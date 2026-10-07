@@ -1140,6 +1140,10 @@ impl StorageRead for AddressIdentifierResolverStorage {
         self.route(address).resolve_local_path(address)
     }
 
+    fn resolve_local_bytes(&self, address: &str) -> Option<Arc<[u8]>> {
+        self.route(address).resolve_local_bytes(address)
+    }
+
     fn permits_plaintext_cache(&self) -> bool {
         // No address to route on — permit only if every routable storage does.
         self.default.permits_plaintext_cache()

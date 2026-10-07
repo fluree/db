@@ -482,6 +482,12 @@ fn fetch_and_load(
         validate_lazy_meta(&meta, expected_first_id, expected_last_id, ctx)?;
         return Ok(LazyLoaded { meta, backing });
     }
+    if let Some(bytes) = ctx.cs.resolve_cached_bytes(pack_cid) {
+        let backing = LoadedBacking::InMemory(bytes);
+        let meta = parse_pack_meta(backing.bytes())?;
+        validate_lazy_meta(&meta, expected_first_id, expected_last_id, ctx)?;
+        return Ok(LazyLoaded { meta, backing });
+    }
     // A store the disk cache does not serve gets nothing written there, and
     // nothing left there by an earlier run is consulted.
     let disk_cache = crate::read::artifact_cache::uses_disk_cache(ctx.cs.as_ref());
@@ -1273,6 +1279,118 @@ mod tests {
                 matches!(&reader.packs[1].inner, PackInner::Lazy {loaded, ..} if loaded.get().is_none())
             );
         }
+    }
+
+    /// Store holding its packs in memory, handed out shared as memory
+    /// storage does through the bridge. Fetches count.
+    #[derive(Debug)]
+    struct ResidentPackStore {
+        inner: MemoryContentStore,
+        resident: std::sync::RwLock<std::collections::HashMap<ContentId, Arc<[u8]>>>,
+        gets: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl ContentStore for ResidentPackStore {
+        fn permits_plaintext_cache(&self) -> bool {
+            true
+        }
+        fn is_remote(&self) -> bool {
+            false
+        }
+        async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
+            self.inner.has(id).await
+        }
+        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+            self.gets.fetch_add(1, Ordering::Relaxed);
+            self.inner.get(id).await
+        }
+        async fn put(&self, kind: ContentKind, bytes: &[u8]) -> fluree_db_core::Result<ContentId> {
+            let id = self.inner.put(kind, bytes).await?;
+            self.resident
+                .write()
+                .unwrap()
+                .insert(id.clone(), Arc::from(bytes));
+            Ok(id)
+        }
+        async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> fluree_db_core::Result<()> {
+            self.inner.put_with_id(id, bytes).await?;
+            self.resident
+                .write()
+                .unwrap()
+                .insert(id.clone(), Arc::from(bytes));
+            Ok(())
+        }
+        async fn release(&self, id: &ContentId) -> fluree_db_core::Result<()> {
+            self.inner.release(id).await
+        }
+        fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
+            self.resident.read().unwrap().get(id).cloned()
+        }
+    }
+
+    /// A store holding its packs in memory hands them out shared: the lazy
+    /// load borrows the pack and never fetches it.
+    #[tokio::test]
+    async fn resident_packs_load_without_fetching_or_copying() {
+        let cs = Arc::new(ResidentPackStore {
+            inner: MemoryContentStore::new(),
+            resident: Default::default(),
+            gets: AtomicU64::new(0),
+        });
+        let pack_cid = cs
+            .put(
+                ContentKind::DictBlob {
+                    dict: DictKind::StringForward,
+                },
+                &make_pack_bytes(0, 50),
+            )
+            .await
+            .unwrap();
+        let refs = [PackBranchEntry {
+            first_id: 0,
+            last_id: 49,
+            pack_cid: pack_cid.clone(),
+        }];
+        let cache_dir = std::env::temp_dir().join(format!(
+            "fluree_lazy_resident_{}_{}",
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let reader =
+            ForwardPackReader::from_pack_refs(cs.clone(), &cache_dir, &refs, KIND_STRING_FWD, 0)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            reader.forward_lookup_str(7).unwrap().as_deref(),
+            Some("val_7")
+        );
+        assert_eq!(
+            cs.gets.load(Ordering::Relaxed),
+            0,
+            "a resident pack must not be fetched"
+        );
+        let resident = cs.resolve_cached_bytes(&pack_cid).unwrap();
+        assert!(
+            matches!(
+                &reader.packs[0].inner,
+                PackInner::Lazy { loaded, .. }
+                    if matches!(
+                        loaded.get(),
+                        Some(LazyLoaded { backing: LoadedBacking::InMemory(bytes), .. })
+                            if Arc::ptr_eq(bytes, &resident)
+                    )
+            ),
+            "the loaded pack must be the store's own allocation"
+        );
+        assert!(
+            std::fs::read_dir(&cache_dir)
+                .map(|entries| entries.count() == 0)
+                .unwrap_or(true),
+            "nothing of a resident pack lands in the disk cache"
+        );
+        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 
     #[tokio::test]

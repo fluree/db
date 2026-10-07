@@ -234,6 +234,17 @@ pub trait StorageRead: Debug + Send + Sync {
         None
     }
 
+    /// Bytes this storage already holds in process memory for `address`,
+    /// shared rather than copied: the in-memory counterpart of
+    /// [`Self::resolve_local_path`]. Readers borrow them in place and never
+    /// copy them into the disk cache. No I/O and no blocking; a storage
+    /// whose reads transform the bytes at rest (decryption) must return
+    /// `None`, which is the default.
+    fn resolve_local_bytes(&self, address: &str) -> Option<Arc<[u8]>> {
+        let _ = address;
+        None
+    }
+
     /// Whether bytes read from this storage may be persisted unencrypted
     /// outside it. The binary-index disk cache spills fetched leaves,
     /// branches and dictionaries to a local directory as a read-through
@@ -555,6 +566,10 @@ impl StorageRead for Arc<dyn Storage> {
 
     fn resolve_local_path(&self, address: &str) -> Option<PathBuf> {
         self.as_ref().resolve_local_path(address)
+    }
+
+    fn resolve_local_bytes(&self, address: &str) -> Option<Arc<[u8]>> {
+        self.as_ref().resolve_local_bytes(address)
     }
 
     fn permits_plaintext_cache(&self) -> bool {
@@ -1091,7 +1106,22 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         // CID-keyed straight through — no address formatting on the lookup.
         // A resident tier indexes by CID regardless of which (current or
         // legacy) address the bytes were fetched from.
-        self.storage.resolve_cached_bytes(id)
+        if let Some(bytes) = self.storage.resolve_cached_bytes(id) {
+            return Some(bytes);
+        }
+        // A storage holding its bytes in memory is keyed by address: the same
+        // current-then-legacy order as `resolve_local_path`.
+        let address = self.cid_to_address(id).ok()?;
+        if let Some(bytes) = self.storage.resolve_local_bytes(&address) {
+            return Some(bytes);
+        }
+        if let Some(legacy) = self.legacy_dict_address(id) {
+            if let Some(bytes) = self.storage.resolve_local_bytes(&legacy) {
+                return Some(bytes);
+            }
+        }
+        let legacy = self.legacy_index_root_address(id)?;
+        self.storage.resolve_local_bytes(&legacy)
     }
 
     fn permits_plaintext_cache(&self) -> bool {
@@ -1894,6 +1924,52 @@ mod tests {
     /// unreferenced see every address `ContentStore::get` would resolve it to.
     /// A dict blob left at the pre-`@shared` address is readable, so it must
     /// also be listed — otherwise a sweep deletes a live blob.
+    /// Memory storage is keyed by address while readers ask by CID: the
+    /// bridge resolves resident bytes at every address the blob could sit
+    /// at, as it does for local paths, without copying them.
+    #[tokio::test]
+    async fn resolve_cached_bytes_borrows_memory_storage_bytes_at_any_candidate_address() {
+        let storage = MemoryStorage::new();
+        let store = content_store_for(storage.clone(), LEDGER);
+
+        let leaf = store
+            .put(ContentKind::IndexLeaf, b"leaf bytes")
+            .await
+            .unwrap();
+        let resident = store
+            .resolve_cached_bytes(&leaf)
+            .expect("resident at the current address");
+        assert_eq!(&resident[..], b"leaf bytes");
+        assert!(
+            Arc::ptr_eq(&resident, &store.resolve_cached_bytes(&leaf).unwrap()),
+            "the bytes are shared, not copied"
+        );
+
+        let dict = ContentId::new(
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            b"dict bytes",
+        );
+        let legacy = legacy_dict_address(storage.storage_method(), LEDGER, &dict).unwrap();
+        storage.write_bytes(&legacy, b"dict bytes").await.unwrap();
+        assert_eq!(
+            &store
+                .resolve_cached_bytes(&dict)
+                .expect("resident at the legacy address")[..],
+            b"dict bytes"
+        );
+
+        let absent = ContentId::new(ContentKind::IndexLeaf, b"absent");
+        assert!(store.resolve_cached_bytes(&absent).is_none());
+        assert!(
+            content_store_for(storage.simulating_remote(), LEDGER)
+                .resolve_cached_bytes(&leaf)
+                .is_none(),
+            "a remote view holds nothing resident"
+        );
+    }
+
     #[tokio::test]
     async fn candidate_addresses_cover_the_legacy_dict_fallback() {
         let storage = MemoryStorage::new();

@@ -23,6 +23,8 @@ mod it_indexing_workflow;
 mod it_ledger_info_reindex_cache;
 #[path = "it_ledger_info_reindex_size.rs"]
 mod it_ledger_info_reindex_size;
+#[path = "it_memory_storage_reads.rs"]
+mod it_memory_storage_reads;
 #[path = "it_notify_incremental.rs"]
 mod it_notify_incremental;
 #[path = "it_reasoning_reindex.rs"]

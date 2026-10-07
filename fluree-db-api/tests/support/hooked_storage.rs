@@ -72,6 +72,11 @@ impl<H: StorageHooks> StorageRead for HookedStorage<H> {
         self.inner.is_remote()
     }
 
+    /// Not a read: the bytes are shared, not fetched, so no hook runs.
+    fn resolve_local_bytes(&self, address: &str) -> Option<Arc<[u8]>> {
+        self.inner.resolve_local_bytes(address)
+    }
+
     fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>> {
         self.inner.encryption_admin()
     }
