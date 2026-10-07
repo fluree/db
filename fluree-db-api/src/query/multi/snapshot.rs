@@ -46,11 +46,20 @@ pub struct EnvelopeSnapshot {
 
 impl EnvelopeSnapshot {
     /// The snapshot as execution reads it: each ledger's `t`, by ledger id.
-    /// The keys are the canonical ids validation produced.
-    pub(crate) fn ledger_times(&self) -> LedgerTimes {
+    /// The keys are the canonical ids validation produced, so each parses; one
+    /// that did not would be an error here rather than a ledger read at its
+    /// head.
+    pub(crate) fn ledger_times(&self) -> Result<LedgerTimes> {
         self.ledgers
             .iter()
-            .filter_map(|(ledger, t)| Some((fluree_db_core::LedgerId::parse(ledger).ok()?, *t)))
+            .map(|(ledger, t)| {
+                let id = fluree_db_core::LedgerId::parse(ledger).map_err(|e| {
+                    ApiError::internal(format!(
+                        "snapshot ledger '{ledger}' is not a ledger id: {e}"
+                    ))
+                })?;
+                Ok((id, *t))
+            })
             .collect()
     }
 }
@@ -199,4 +208,33 @@ async fn resolve_iso_to_t(fluree: &Fluree, ledger_id: &str, iso: &str) -> Result
     })?;
 
     Ok(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each snapshot id reads back as the ledger id it came from; one that
+    /// does not is an error for the envelope, never a ledger left out of the
+    /// times (and so read at its head).
+    #[test]
+    fn a_snapshot_id_that_is_no_ledger_id_fails_the_envelope() {
+        let mut ledgers = HashMap::from([("mq:a".to_string(), 3)]);
+        let snapshot = EnvelopeSnapshot {
+            as_of: None,
+            ledgers: ledgers.clone(),
+        };
+        let times = snapshot.ledger_times().expect("canonical ids parse");
+        assert_eq!(
+            times.get(&fluree_db_core::LedgerId::parse("mq:a").unwrap()),
+            Some(&3)
+        );
+
+        ledgers.insert("http://ex.org/g".to_string(), 4);
+        let snapshot = EnvelopeSnapshot {
+            as_of: None,
+            ledgers,
+        };
+        assert!(snapshot.ledger_times().is_err());
+    }
 }

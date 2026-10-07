@@ -426,7 +426,8 @@ pub(crate) async fn run_envelope(
     // Every sub-query runs as written; the connection path reads each of its
     // dataset members that names no time of its own at the snapshot's `t` for
     // that member's ledger.
-    let execution = execution.reading_ledgers_at(Arc::new(snapshot.ledger_times()));
+    let times = snapshot.ledger_times().map_err(MultiQueryError::Snapshot)?;
+    let execution = execution.reading_ledgers_at(Arc::new(times));
 
     let include_meta = envelope_meta_enabled(envelope.opts.as_ref());
     let config = DispatchConfig::from_envelope(&envelope, bounds);

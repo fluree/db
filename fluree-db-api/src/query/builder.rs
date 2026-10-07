@@ -800,6 +800,11 @@ impl<'a> FromQueryBuilder<'a> {
         // Resolve the single target ledger from the query's own dataset spec. A
         // crawl over a federated multi-source dataset must not collapse to one
         // source, so bail unless exactly one graph is specified.
+        //
+        // This parse ignores `execution.ledger_times` (a multi-query envelope's
+        // snapshot): a crawl runs only on a graph source, and an envelope
+        // resolves every member as a ledger before it dispatches, so a crawl
+        // never runs under one.
         let (spec, opts) = parse_dataset_spec(json)?;
         if spec.default_graphs.len() + spec.named_graphs.len() != 1 {
             return Ok(None);
