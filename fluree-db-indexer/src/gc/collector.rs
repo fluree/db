@@ -324,7 +324,7 @@ pub struct GarbagePlan {
 /// Both thresholds must be satisfied for GC to occur:
 /// - `max_old_indexes`: Maximum old index versions to keep (default: 5)
 ///   With max_old_indexes=5, we keep current + 5 old = 6 total
-/// - `min_time_garbage_mins`: Minimum age before an index can be GC'd (default: 30)
+/// - `min_time_garbage_mins`: Minimum age before an index can be GC'd (default: 15)
 ///
 /// Age is determined by the garbage record's `created_at_ms` field. A record
 /// with no timestamp predates the field and is treated as past the window.

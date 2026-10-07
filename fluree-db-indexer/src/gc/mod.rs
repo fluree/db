@@ -184,7 +184,7 @@ pub struct CleanGarbageConfig {
     ///
     /// With max_old_indexes=5, we keep current + 5 old = 6 total index versions.
     pub max_old_indexes: Option<u32>,
-    /// Minimum age in minutes before GC (None = default 30)
+    /// Minimum age in minutes before GC (None = default 15)
     ///
     /// Garbage records must be at least this old before their nodes can be deleted.
     pub min_time_garbage_mins: Option<u32>,
