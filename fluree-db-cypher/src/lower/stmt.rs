@@ -739,7 +739,7 @@ fn reject_order_by_on_list<E: IriEncoder>(
     list_outputs: &std::collections::HashSet<VarId>,
 ) -> Result<()> {
     for item in order_by {
-        if expr_touches_list(ctx, &item.expr, list_outputs) {
+        if may_yield_list(ctx, &item.expr, list_outputs) {
             return Err(LowerError::unsupported(
                 "ORDER BY on a collect() list is not supported in v1 (list ordering is deferred)",
             ));
@@ -748,75 +748,67 @@ fn reject_order_by_on_list<E: IriEncoder>(
     Ok(())
 }
 
-/// True if `e` references a `collect()` list output (directly as a `collect()`
-/// call, or via a variable bound to one).
-fn expr_touches_list<E: IriEncoder>(
+/// True if `e`'s value may be a `collect()` list output, or a list built from
+/// one: the variable bound to it, a `collect()` call, or an expression that
+/// passes a list through (`tail(fs)`, `fs + [x]`, `fs[1..]`, `CASE … THEN fs`).
+/// An expression that reads such a list but yields something else (`size(fs)`,
+/// `any(x IN fs WHERE …)`, a comparison) sorts like any value.
+fn may_yield_list<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     e: &Expr,
     list_outputs: &std::collections::HashSet<VarId>,
 ) -> bool {
+    use crate::ast::BinOp;
     match e {
         Expr::Var(v) => list_outputs.contains(&ctx.intern_var(&v.name)),
         Expr::Call(c) => {
             c.name.eq_ignore_ascii_case("collect")
-                || c.args
-                    .iter()
-                    .any(|a| expr_touches_list(ctx, a, list_outputs))
+                || (!c.name.eq_ignore_ascii_case("size")
+                    && !c.name.eq_ignore_ascii_case("length")
+                    && c.args.iter().any(|a| may_yield_list(ctx, a, list_outputs)))
         }
-        Expr::BinOp(_, a, b, _)
-        | Expr::In(a, b, _)
-        | Expr::StartsWith(a, b, _)
-        | Expr::EndsWith(a, b, _)
-        | Expr::Contains(a, b, _)
-        | Expr::RegexMatch(a, b, _) => {
-            expr_touches_list(ctx, a, list_outputs) || expr_touches_list(ctx, b, list_outputs)
+        Expr::BinOp(BinOp::Add, a, b, _) => {
+            may_yield_list(ctx, a, list_outputs) || may_yield_list(ctx, b, list_outputs)
         }
-        Expr::UnaryOp(_, a, _)
-        | Expr::IsNull(a, _)
-        | Expr::IsNotNull(a, _)
-        | Expr::Prop(a, _, _) => expr_touches_list(ctx, a, list_outputs),
-        Expr::Index(a, b, _) => {
-            expr_touches_list(ctx, a, list_outputs) || expr_touches_list(ctx, b, list_outputs)
-        }
-        Expr::List(items, _) => items
-            .iter()
-            .any(|e| expr_touches_list(ctx, e, list_outputs)),
+        // Comparisons, boolean and numeric operators, and the predicates
+        // below yield a scalar.
+        Expr::BinOp(..)
+        | Expr::UnaryOp(..)
+        | Expr::In(..)
+        | Expr::StartsWith(..)
+        | Expr::EndsWith(..)
+        | Expr::Contains(..)
+        | Expr::RegexMatch(..)
+        | Expr::IsNull(..)
+        | Expr::IsNotNull(..)
+        | Expr::ListPredicate(_) => false,
+        Expr::Prop(a, _, _) | Expr::Index(a, _, _) => may_yield_list(ctx, a, list_outputs),
+        Expr::List(items, _) => items.iter().any(|e| may_yield_list(ctx, e, list_outputs)),
         Expr::Map(entries, _) => entries
             .iter()
-            .any(|(_, v)| expr_touches_list(ctx, v, list_outputs)),
+            .any(|(_, v)| may_yield_list(ctx, v, list_outputs)),
         Expr::Case(c) => {
-            c.subject
-                .as_ref()
-                .is_some_and(|s| expr_touches_list(ctx, s, list_outputs))
-                || c.branches.iter().any(|(cond, res)| {
-                    expr_touches_list(ctx, cond, list_outputs)
-                        || expr_touches_list(ctx, res, list_outputs)
-                })
+            c.branches
+                .iter()
+                .any(|(_, res)| may_yield_list(ctx, res, list_outputs))
                 || c.else_branch
                     .as_ref()
-                    .is_some_and(|e| expr_touches_list(ctx, e, list_outputs))
+                    .is_some_and(|e| may_yield_list(ctx, e, list_outputs))
         }
         Expr::ListComprehension(c) => {
-            expr_touches_list(ctx, &c.list, list_outputs)
-                || c.filter
-                    .as_ref()
-                    .is_some_and(|f| expr_touches_list(ctx, f, list_outputs))
+            may_yield_list(ctx, &c.list, list_outputs)
                 || c.map
                     .as_ref()
-                    .is_some_and(|m| expr_touches_list(ctx, m, list_outputs))
+                    .is_some_and(|m| may_yield_list(ctx, m, list_outputs))
         }
         Expr::Reduce(r) => {
-            expr_touches_list(ctx, &r.init, list_outputs)
-                || expr_touches_list(ctx, &r.list, list_outputs)
-                || expr_touches_list(ctx, &r.body, list_outputs)
-        }
-        Expr::ListPredicate(p) => {
-            expr_touches_list(ctx, &p.list, list_outputs)
-                || expr_touches_list(ctx, &p.predicate, list_outputs)
+            may_yield_list(ctx, &r.init, list_outputs)
+                || may_yield_list(ctx, &r.list, list_outputs)
+                || may_yield_list(ctx, &r.body, list_outputs)
         }
         Expr::MapProjection(mp) => mp.selectors.iter().any(|sel| {
             matches!(sel, crate::ast::MapProjectionSelector::Literal(_, e)
-                if expr_touches_list(ctx, e, list_outputs))
+                if may_yield_list(ctx, e, list_outputs))
         }),
         // A pattern comprehension is its own subquery scope; its body does not
         // reference outer collect outputs by variable in a way the sort sees.

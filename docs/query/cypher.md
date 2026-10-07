@@ -372,14 +372,18 @@ ORDER BY / SKIP / LIMIT
   aggregates. A node the clause does not project is out of scope there,
   and reading its property is an error. Nested WITHs nest Subqueries. A
   `collect()` projected by a `WITH` carries forward as a real list to the next
-  stage (`WITH p, collect(f) AS fs … RETURN size(fs)` / `UNWIND fs …`); only
-  `ORDER BY` directly on a collected list is rejected (sorting a list value is
-  unsupported in v1).
+  stage (`WITH p, collect(f) AS fs … RETURN size(fs)` / `UNWIND fs …`). An
+  `ORDER BY` key whose value is a collected list, or a list built from one
+  (`ORDER BY fs`, `ORDER BY tail(fs)`), is rejected (sorting a list value is
+  unsupported in v1); a key that reads the list and yields a single value
+  (`ORDER BY size(fs)`, `ORDER BY any(x IN fs WHERE x = 'a')`) sorts after
+  the aggregation.
 - **Properties with several values.** A property read joins every value of
   the property, as `MATCH (p) WHERE p.age > 30` does. So in `WHERE` it
   gives the row once per value that passes; in `ORDER BY` it gives the row
-  once per value, and `DISTINCT` keeps those copies (the sort key is
-  projected with them); and an aggregate in a later clause counts every
+  once per value, and `WITH DISTINCT` keeps those copies (the sort key is
+  projected with them) while `RETURN DISTINCT` removes them; and an
+  aggregate in a later clause counts every
   copy (`… WHERE p.age > 30 RETURN count(*)` counts a node with two passing
   ages twice). A read inside an aggregate's argument (`avg(n.age)`,
   `collect(p.age)`) is joined before grouping, so a property with several
