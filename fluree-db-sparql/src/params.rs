@@ -20,7 +20,8 @@
 //! `{"@id": iri}`; `{"@value": v, "@type": iri}` (`"@type": "@id"` reads `v`
 //! as an IRI); `{"@value": s, "@language": tag}`. IRIs are full IRIs: no
 //! prefix or `@context` applies. A blank node is a stored node's `_:fdb-…`
-//! id; any other label would lower to a variable and match every node.
+//! id; any other label would lower to a variable and match every node. An
+//! `f:embeddingVector` takes its numbers as a JSON array.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -238,10 +239,22 @@ impl Value {
                     JsonValue::String(s) => s.clone(),
                     JsonValue::Number(n) => n.to_string(),
                     JsonValue::Bool(b) => b.to_string(),
+                    JsonValue::Array(items)
+                        if datatype == fluree_vocab::fluree::EMBEDDING_VECTOR =>
+                    {
+                        if !items.iter().all(JsonValue::is_number) {
+                            return Err(ParamError::new(
+                                name,
+                                "is a vector whose items are not all numbers",
+                            ));
+                        }
+                        value.to_string()
+                    }
                     _ => {
                         return Err(ParamError::new(
                             name,
-                            "has a `@value` that is not a string, number or boolean",
+                            "has a `@value` that is not a string, number or boolean \
+                             (a list is only an `f:embeddingVector`)",
                         ));
                     }
                 };
@@ -852,6 +865,14 @@ mod tests {
                 json!({"@value": "x", "@type": "@vocab"}),
                 "only `@id` or a datatype IRI",
             ),
+            (
+                json!({"@value": [1, "a"], "@type": fluree_vocab::fluree::EMBEDDING_VECTOR}),
+                "not all numbers",
+            ),
+            (
+                json!({"@value": [1, 2], "@type": "http://example.org/t"}),
+                "embeddingVector",
+            ),
             (json!({"@id": "x", "@type": "y"}), "unexpected key"),
             (
                 json!({"@value": "a", "@type": "t", "@language": "en"}),
@@ -899,6 +920,22 @@ mod tests {
         assert!(
             matches!(&patterns[1].object, Term::BlankNode(BlankNode { value: crate::ast::BlankNodeValue::Labeled(l), .. }) if l.as_ref() == "fdb-1")
         );
+    }
+
+    #[test]
+    fn a_vector_takes_its_numbers_as_a_list() {
+        let ast = substituted(
+            "SELECT ?s WHERE { ?s <p> $v }",
+            json!({"v": {"@value": [0.5, 1, -2.25], "@type": fluree_vocab::fluree::EMBEDDING_VECTOR}}),
+        )
+        .unwrap();
+        let triple = first_triple(&select(&ast).where_clause.pattern);
+        assert!(matches!(
+            &triple.object,
+            Term::Literal(Literal { value: LiteralValue::Typed { value, datatype }, .. })
+                if value.as_ref() == "[0.5,1,-2.25]"
+                    && matches!(&datatype.value, IriValue::Full(d) if d.as_ref() == fluree_vocab::fluree::EMBEDDING_VECTOR)
+        ));
     }
 
     #[test]

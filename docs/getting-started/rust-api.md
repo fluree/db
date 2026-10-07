@@ -401,10 +401,12 @@ the same variable) is replaced by its value wherever it appears — subqueries,
 planned, so it runs exactly as if the value had been written inline. Values
 take the JSON-LD forms: a JSON string, number or boolean; `{"@id": iri}`;
 `{"@value": v, "@type": datatype}` (`"@type": "@id"` reads `v` as an IRI);
-`{"@value": s, "@language": tag}`. IRIs are full IRIs — neither the query's
-`PREFIX`es nor a `@context` apply. A blank node is the `_:fdb-…` id a query
-returned for a stored node; any other label is refused, since written inline
-it would be a variable and match every node.
+`{"@value": s, "@language": tag}`; and an embedding vector as its numbers,
+`{"@value": [0.1, 0.2], "@type": "https://ns.flur.ee/db#embeddingVector"}`.
+IRIs are full IRIs — neither the query's `PREFIX`es nor a `@context` apply. A
+blank node is the `_:fdb-…` id a query returned for a stored node; any other
+label is refused, since written inline it would be a variable and match every
+node.
 
 ```rust
 let params = json!({ "name": "Alice", "min": 21 });

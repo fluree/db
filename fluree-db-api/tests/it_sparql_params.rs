@@ -319,3 +319,47 @@ async fn an_id_typed_value_is_an_iri() {
     assert_eq!(names, vec![json!(["Alice"])]);
     assert_eq!(names, rows(&fluree, &db, sparql, Some(id)).await.unwrap());
 }
+
+#[tokio::test]
+async fn a_vector_parameter_scores_as_the_inline_vector() {
+    let fluree = seeded().await;
+    fluree
+        .graph(LEDGER)
+        .transact()
+        .insert(&json!({
+            "@context": { "ex": "http://example.org/" },
+            "@graph": [
+                { "@id": "ex:alice", "ex:embedding": { "@value": [0.8, 0.14, 0.9], "@type": "@vector" } },
+                { "@id": "ex:bob", "ex:embedding": { "@value": [0.1, 0.9, 0.3], "@type": "@vector" } },
+            ],
+        }))
+        .commit()
+        .await
+        .unwrap();
+    let db = head(&fluree).await;
+    let scored = |q: &str| {
+        format!(
+            "SELECT ?s ?score WHERE {{ ?s ex:embedding ?v BIND(dotProduct(?v, {q}) AS ?score) }}"
+        )
+    };
+    let inline = rows(
+        &fluree,
+        &db,
+        &scored("\"[0.5, 0.25, 1.0]\"^^<https://ns.flur.ee/db#embeddingVector>"),
+        None,
+    )
+    .await
+    .unwrap();
+    let vector =
+        json!({ "@value": [0.5, 0.25, 1.0], "@type": "https://ns.flur.ee/db#embeddingVector" });
+    let with_param = rows(
+        &fluree,
+        &db,
+        &scored("$q"),
+        Some(params(json!({ "q": vector }))),
+    )
+    .await
+    .unwrap();
+    assert_eq!(inline.len(), 2, "{inline:?}");
+    assert_eq!(with_param, inline);
+}
