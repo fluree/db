@@ -230,6 +230,54 @@ def test_governed_transaction(ledger):
     assert people(ledger) == [("Alice", None), ("Bob", None)]
 
 
+def test_a_transaction_nets_against_a_named_graph_in_the_index(tmp_path):
+    value = f'GRAPH <{EX}g> {{ ex:s ex:p "x" }}'
+    with fluree.connect(tmp_path) as conn:
+        ledger = conn.create("people")
+        ledger.update(f"PREFIX ex: <{EX}> INSERT DATA {{ {value} }}")
+        ledger.index(timeout=30)
+    with fluree.connect(tmp_path) as conn:  # the value is in the index alone
+        ledger = conn.ledger("people")
+        with ledger.transaction() as txn:
+            for op in ("INSERT", "DELETE"):
+                txn.update(f"PREFIX ex: <{EX}> {op} DATA {{ {value} }}")
+        assert (txn.committed.asserts, txn.committed.retracts) == (0, 1)
+        assert len(ledger.query(f"PREFIX ex: <{EX}> SELECT ?o WHERE {{ GRAPH <{EX}g> {{ ex:s ex:p ?o }} }}")) == 0
+
+
+def test_a_transaction_staged_again_is_checked_against_the_current_policy(ledger):
+    ledger.insert({"@context": CONTEXT, "@id": "ex:WritePolicy", "@type": "http://www.w3.org/2000/01/rdf-schema#Class"})
+    governed = ledger.with_policy(policy_class=EX + "WritePolicy", default_allow=True)
+    txn = governed.transaction()
+    txn.insert({"@context": CONTEXT, "@id": "ex:bob", "ex:ssn": "999-99-9999"})
+    ledger.insert({
+        "@context": {"ex": EX, "f": F},
+        "@id": "ex:noSsn",
+        "@type": ["f:AccessPolicy", "ex:WritePolicy"],
+        "f:action": {"@id": "f:modify"},
+        "f:required": True,
+        "f:onProperty": [{"@id": "ex:ssn"}],
+        "f:allow": False,
+    })
+    # Staged again over the commit above, under the policy it added.
+    with pytest.raises(PermissionDeniedError):
+        txn.commit()
+    assert len(ledger.query(f"PREFIX ex: <{EX}> SELECT ?s WHERE {{ ?s ex:ssn ?ssn }}")) == 0
+
+
+def test_a_failed_cypher_script_keeps_the_blank_nodes_already_read(ledger):
+    anon = f'PREFIX ex: <{EX}> SELECT ?s WHERE {{ ?s ex:name "Anon" }}'
+    with ledger.transaction() as txn:
+        txn.insert({"@context": CONTEXT, "ex:name": "Anon"})
+        node = txn.query(anon).single()["s"]
+        # Its first statement stages, its second fails: the script is rolled
+        # back, and the writes before it are staged again.
+        with pytest.raises(fluree.FlureeError):
+            txn.update('CREATE (:Person {name: "Frank"}); MATCH (p:Person) SET p.x = $missing')
+        assert txn.query(anon).single()["s"] == node
+    assert ledger.query(anon).single()["s"] == node
+
+
 def test_one_transaction_used_from_two_threads(ledger):
     txn = ledger.transaction()
     errors = []
