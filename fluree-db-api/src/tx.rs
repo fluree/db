@@ -2065,6 +2065,9 @@ async fn enforce_unique_constraints(
             };
             let value_str = match o {
                 fluree_db_core::FlakeValue::String(s) => s.clone(),
+                fluree_db_core::FlakeValue::Ref(sid) => {
+                    snapshot.decode_sid(sid).unwrap_or_else(|| sid.to_string())
+                }
                 other => other.to_string(),
             };
 
