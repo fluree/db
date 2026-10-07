@@ -11,7 +11,6 @@ use fluree_db_api::{
     LedgerManagerConfig, NameServiceMode, StaticKeyProvider, TriggerIndexOptions,
 };
 use fluree_db_binary_index::format::index_root::IndexRoot;
-use fluree_db_connection::config::ConnectionConfig;
 use fluree_db_core::{ContentId, ContentStore, MemoryStorage, Storage, StorageBackend};
 use fluree_db_nameservice::memory::MemoryNameService;
 use serde_json::json;
@@ -122,11 +121,15 @@ async fn build_twice_and_query<S: Storage + Clone + 'static>(storage: S) -> Buil
     let indexer_config = IndexerConfig::small().with_data_dir(tmp.path().join("data"));
     let cache_dir = indexer_config.artifact_cache_dir();
     let nameservice = MemoryNameService::new();
-    let mut fluree: Fluree = Fluree::new(
-        ConnectionConfig::memory(),
-        storage.clone(),
-        NameServiceMode::ReadWrite(Arc::new(nameservice.clone())),
-    );
+    let mut fluree: Fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig {
+            cache_dir: cache_dir.clone(),
+            ..LedgerManagerConfig::default()
+        })
+        .build_with(
+            storage.clone(),
+            NameServiceMode::ReadWrite(Arc::new(nameservice.clone())),
+        );
     let (worker, handle) = BackgroundIndexerWorker::new(
         StorageBackend::Managed(Arc::new(storage)),
         Arc::new(nameservice),

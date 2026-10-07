@@ -463,7 +463,10 @@ are outside it by design:
   storage (S3, a peer's upstream) keep a read-through disk cache of index
   artifacts (`$TMPDIR/fluree_binary_cache` by default, or
   `LedgerManagerConfig::cache_dir`), and the indexer seeds it with artifacts it
-  just built; storage on local disk or in memory never uses it. With
+  just built; storage on local disk or in memory never uses it. Earlier
+  releases also copied artifacts from local and in-memory storage into it,
+  which nothing reads or evicts any more: on a host where no process reads
+  remote storage, the directory can be deleted after upgrading. With
   encryption enabled that cache is bypassed
   entirely: no decrypted leaf, branch, dictionary or vector shard is written
   outside the encrypted storage, and nothing already in the cache directory is
