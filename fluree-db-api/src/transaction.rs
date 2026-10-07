@@ -16,7 +16,8 @@
 //!   `WHERE`, a Cypher `MATCH` or `MERGE`, is evaluated where it is staged),
 //!   so the commit re-bases the staged result over the other commit when the
 //!   two touched different subjects, and otherwise stages every operation
-//!   again against the new head, as a single write does when it loses a race.
+//!   again against the new head, under the policy the ledger has then, as a
+//!   single write does when it loses a race.
 //! - **Read through [`Transaction::db`], or through the `RETURN` rows of a
 //!   Cypher write:** the caller may have decided what to write from what it
 //!   read, and staging again would replay those decisions against data they
@@ -147,15 +148,7 @@ impl Fluree {
         let snapshot = handle.snapshot().await;
         let base_head = snapshot.head_commit_id.clone();
         let base = snapshot.to_ledger_state();
-        let policy = crate::build_transact_policy_context(
-            self,
-            &base.snapshot,
-            base.novelty.as_ref(),
-            Some(base.novelty.as_ref()),
-            base.t(),
-            &governance,
-        )
-        .await?;
+        let policy = transact_policy(self, &base, &governance).await?;
         let ledger_id = handle.id().to_string();
         Ok(Transaction {
             fluree: self.clone(),
@@ -291,7 +284,7 @@ impl Transaction {
             base_head,
             stager,
             operations,
-            context,
+            mut context,
             read,
         } = self;
         let read = read.into_inner();
@@ -310,19 +303,24 @@ impl Transaction {
                     head_t: guard.state().t(),
                 }));
             }
-            let rebased = match prestaged.take() {
-                Some(stage) if unchanged => Some(stage),
-                Some(stage) => Fluree::rebase_stage(&guard, stage, base_t, base_head.as_ref()),
-                None => None,
-            };
-            let stage = match rebased {
-                Some(stage) => stage,
-                None => {
-                    stage_all(&fluree, guard.clone_state(), &operations, &context)
-                        .await?
-                        .finish()
-                        .await?
-                }
+            let stage = match prestaged.take() {
+                Some(stage) if unchanged => stage,
+                prestaged => match prestaged.and_then(|stage| {
+                    Fluree::rebase_stage(&guard, stage, base_t, base_head.as_ref())
+                }) {
+                    Some(stage) => stage,
+                    None => {
+                        let state = guard.clone_state();
+                        // The policy the ledger has now: a commit since the
+                        // transaction began may have changed it.
+                        context.policy =
+                            transact_policy(&fluree, &state, &context.governance).await?;
+                        stage_all(&fluree, state, &operations, &context)
+                            .await?
+                            .finish()
+                            .await?
+                    }
+                },
             };
             match fluree
                 .commit_and_finalize(
@@ -353,6 +351,23 @@ impl Transaction {
             "transaction commit retry limit exceeded ({MAX_RETRIES} attempts)"
         )))
     }
+}
+
+/// The policy writes staged on `state` are checked against.
+async fn transact_policy(
+    fluree: &Fluree,
+    state: &LedgerState,
+    governance: &GovernanceOptions,
+) -> Result<Option<PolicyContext>> {
+    crate::build_transact_policy_context(
+        fluree,
+        &state.snapshot,
+        state.novelty.as_ref(),
+        Some(state.novelty.as_ref()),
+        state.t(),
+        governance,
+    )
+    .await
 }
 
 /// Stage one operation over the stager's state; for a Cypher write, also

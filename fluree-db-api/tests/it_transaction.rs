@@ -2,8 +2,8 @@
 //! committed as one commit.
 
 use fluree_db_api::{
-    CommitOpts, Fluree, FlureeBuilder, GraphDb, TrackingOptions, Transaction, TransactionOptions,
-    TxnOperation,
+    CommitOpts, Fluree, FlureeBuilder, GovernanceOptions, GraphDb, TrackingOptions, Transaction,
+    TransactionOptions, TxnOperation,
 };
 use serde_json::{json, Value as JsonValue};
 
@@ -380,6 +380,87 @@ async fn a_merge_restages_over_a_concurrent_create() {
         count(&fluree, "SELECT ?p WHERE { <cy> <seen> true }").await,
         1
     );
+}
+
+/// A transaction staged again over a newer head is checked against the
+/// policy the ledger has now: a deny rule committed while it was open
+/// refuses it.
+#[tokio::test]
+async fn a_restage_is_checked_against_the_current_policy() {
+    let fluree = fluree().await;
+    fluree
+        .graph(LEDGER)
+        .transact()
+        .sparql_update(&format!("{PREFIX}INSERT DATA {{ ex:WritePolicy a <http://www.w3.org/2000/01/rdf-schema#Class> }}"))
+        .commit()
+        .await
+        .unwrap();
+    let options = TransactionOptions {
+        governance: GovernanceOptions {
+            policy_class: Some(vec!["http://example.org/WritePolicy".to_string()]),
+            default_allow: Some(true),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut txn = fluree.begin_transaction(LEDGER, options).await.unwrap();
+    txn.stage(TxnOperation::Insert(json!({
+        "@context": { "ex": "http://example.org/" },
+        "@id": "ex:bob", "ex:ssn": "999-99-9999",
+    })))
+    .await
+    .unwrap();
+
+    fluree
+        .graph(LEDGER)
+        .transact()
+        .insert(&json!({
+            "@context": { "f": "https://ns.flur.ee/db#", "ex": "http://example.org/" },
+            "@id": "ex:noSsn",
+            "@type": ["f:AccessPolicy", "ex:WritePolicy"],
+            "f:action": { "@id": "f:modify" },
+            "f:required": true,
+            "f:onProperty": [{ "@id": "ex:ssn" }],
+            "f:allow": false,
+        }))
+        .commit()
+        .await
+        .unwrap();
+
+    let err = txn.commit(CommitOpts::default()).await.unwrap_err();
+    assert!(err.to_string().contains("Policy enforcement"), "{err}");
+    assert_eq!(
+        count(&fluree, "SELECT ?s WHERE { ?s ex:ssn ?ssn }").await,
+        0
+    );
+}
+
+/// A transaction that began with no policy is checked against one the
+/// ledger's config gained before it commits.
+#[tokio::test]
+async fn a_policy_configured_while_open_applies_to_the_commit() {
+    let fluree = fluree().await;
+    let mut txn = begin(&fluree).await;
+    txn.stage(insert("alice", "Alice", 30)).await.unwrap();
+
+    fluree
+        .graph(LEDGER)
+        .transact()
+        .upsert_turtle(&format!(
+            "@prefix f: <https://ns.flur.ee/db#> .
+             GRAPH <urn:fluree:{LEDGER}#config> {{
+                 <urn:config:main> a f:LedgerConfig ;
+                     f:policyDefaults <urn:config:policy> .
+                 <urn:config:policy> f:defaultAllow false .
+             }}"
+        ))
+        .commit()
+        .await
+        .unwrap();
+
+    let err = txn.commit(CommitOpts::default()).await.unwrap_err();
+    assert!(err.to_string().contains("Policy enforcement"), "{err}");
+    assert!(people(&fluree, &head(&fluree).await).await.is_empty());
 }
 
 fn tracked(max_fuel: Option<u64>) -> TransactionOptions {
