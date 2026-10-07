@@ -730,6 +730,59 @@ async fn fast_forward_into_an_ungoverned_target_is_not_validated() {
     assert_eq!(names(&fluree, "mydb:main").await, ["A", "B"]);
 }
 
+/// Into a target that governs no writes, a fast-forward is checked only when
+/// the adopted change carries config settings (a config field, an `f:` type,
+/// or a write to the target's config graph). Other `f:` data, such as an
+/// edge annotation's reifier, is not config: it fast-forwards unchecked.
+#[tokio::test]
+async fn fast_forward_into_an_ungoverned_target_checks_only_config_settings() {
+    for (i, (what, write, checked)) in [
+        (
+            "an edge annotation",
+            json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:alice",
+                   "ex:knows": {"@id": "ex:bob", "@annotation": {"ex:since": 2020}}}),
+            false,
+        ),
+        (
+            "a config field on an identity",
+            json!({"@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+                   "@id": "ex:alice", "f:policyClass": {"@id": "ex:Reader"}}),
+            true,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let name = format!("ff-ungoverned-{i}");
+        let ledger = fluree.create_ledger(&name).await.unwrap();
+        fluree
+            .insert(
+                ledger,
+                &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:seed", "ex:p": 1}),
+            )
+            .await
+            .unwrap();
+        fluree
+            .create_branch(&name, "dev", None, None)
+            .await
+            .unwrap();
+        let dev = fluree.ledger(&format!("{name}:dev")).await.unwrap();
+        fluree.insert(dev, &write).await.unwrap();
+        let preview = fluree
+            .merge_preview_with(&name, "dev", None, MergePreviewOpts::default())
+            .await
+            .expect("preview");
+        assert!(preview.fast_forward, "{what}");
+        assert_eq!(preview.validation.is_some(), checked, "{what}");
+        let report = fluree
+            .merge_branch(&name, "dev", None, ConflictStrategy::default())
+            .await
+            .expect(what);
+        assert!(report.fast_forward, "{what}");
+    }
+}
+
 /// The adopted commits are checked against the config the target has before
 /// the merge, whatever they do to it, as a transaction's own config writes do
 /// not apply to that transaction: a branch that switches SHACL off in its

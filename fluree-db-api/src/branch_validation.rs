@@ -140,6 +140,22 @@ impl crate::Fluree {
         graph_iris: &BTreeSet<String>,
         op: &'static str,
     ) -> Result<(StagedLedger, BranchOpValidation)> {
+        self.stage_validated_with(state, flakes, namespace_delta, graph_iris, op, None)
+            .await
+    }
+
+    /// [`Self::stage_validated`], with the target's config when the caller
+    /// has already read it (a fast-forward reads it to learn whether the
+    /// target governs writes), so the checks do not read it again.
+    async fn stage_validated_with(
+        &self,
+        state: LedgerState,
+        flakes: Vec<Flake>,
+        namespace_delta: &HashMap<u16, String>,
+        graph_iris: &BTreeSet<String>,
+        op: &'static str,
+        config: Option<&crate::tx::ConfigRead>,
+    ) -> Result<(StagedLedger, BranchOpValidation)> {
         let mut reverse_graph = state.snapshot.build_reverse_graph().map_err(|e| {
             ApiError::internal(format!("Failed to build reverse graph during {op}: {e}"))
         })?;
@@ -156,7 +172,7 @@ impl crate::Fluree {
             .map(|(g_id, (_, iri))| (g_id, iri))
             .collect();
         let outcome = self
-            .validate_branch_op_view(&mut view, namespace_delta, &new_graph_iris, op)
+            .validate_branch_op_view(&mut view, namespace_delta, &new_graph_iris, op, config)
             .await?;
         Ok((view, outcome))
     }
@@ -238,8 +254,12 @@ impl crate::Fluree {
             }
         };
         let config = crate::tx::load_transaction_config(&state).await?;
-        let governed = config.is_some_and(|c| governs_writes(&c));
-        Ok(FastForwardBase { state, governed })
+        let governed = config.as_deref().is_some_and(governs_writes);
+        Ok(FastForwardBase {
+            state,
+            governed,
+            config: crate::tx::ConfigRead::resolved(config),
+        })
     }
 
     /// Check a fast-forward onto `base` (from [`Self::fast_forward_base`]):
@@ -257,16 +277,17 @@ impl crate::Fluree {
         let (data, _keys) =
             crate::merge::collect_commit_data(source_store, &diff.source.commits, &diff.source.own)
                 .await?;
-        if !base.governed && !carries_config_settings(&data.flakes) {
+        if !base.governed && !carries_config_settings(&base.state, &data) {
             return Ok(None);
         }
         let (_view, outcome) = self
-            .stage_validated(
+            .stage_validated_with(
                 base.state,
                 data.flakes,
                 &data.namespace_delta,
                 &data.graph_iris,
                 "merge",
+                Some(&base.config),
             )
             .await?;
         Ok(Some(outcome))
@@ -285,6 +306,7 @@ impl crate::Fluree {
         namespace_delta: &HashMap<u16, String>,
         new_graph_iris: &HashMap<GraphId, String>,
         op: &'static str,
+        config: Option<&crate::tx::ConfigRead>,
     ) -> Result<BranchOpValidation> {
         use crate::config_guard::GuardScope;
         use crate::tx::{check_staged_write, StagedWriteError, WriteChecks};
@@ -337,7 +359,10 @@ impl crate::Fluree {
             view,
             &mut staged_ns,
             &graph_delta,
-            WriteChecks::new(GuardScope::BranchOperation(op)),
+            WriteChecks {
+                config,
+                ..WriteChecks::new(GuardScope::BranchOperation(op))
+            },
             &mut resolve_ctx,
         )
         .await
@@ -357,20 +382,38 @@ pub(crate) struct FastForwardBase {
     pub(crate) state: LedgerState,
     /// Whether its configuration governs writes ([`governs_writes`]).
     pub(crate) governed: bool,
+    /// Its configuration, read once: the checks reuse it.
+    pub(crate) config: crate::tx::ConfigRead,
 }
 
-/// Whether `flakes` carry anything the staged-config guard checks on a branch
-/// operation: an `f:` setting, or a type in the `f:` vocabulary. Every
-/// refusal it can make needs one of them, so a change without any is
-/// accepted unchecked.
-fn carries_config_settings(flakes: &[Flake]) -> bool {
+/// Whether the adopted change carries anything the staged-config guard
+/// checks on a branch operation: a config field ([`crate::config_guard::is_config_field`],
+/// the config reader's vocabulary), a type in the `f:` vocabulary, or a
+/// write to the target's config graph. Every refusal the guard can make needs
+/// one of them, so a change without any (data, edge annotations included) is
+/// accepted unchecked into a target that governs no writes.
+fn carries_config_settings(
+    target: &LedgerState,
+    data: &crate::commit_data::CollectedCommitData,
+) -> bool {
     use fluree_vocab::namespaces::{FLUREE_DB, RDF};
-    flakes.iter().any(|flake| {
-        flake.p.namespace_code == FLUREE_DB
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&target.snapshot);
+    // The adopted commits' own namespace codes, so a config graph first
+    // written on the source still encodes as its flakes do. A conflicting
+    // delta is the merge's to refuse; it cannot make the change config-free.
+    let config_graph = match ns.adopt_delta_for_persistence(&data.namespace_delta) {
+        Ok(()) => ns.lookup_sid_for_iri(&fluree_db_core::config_graph_iri(
+            &target.snapshot.ledger_id,
+        )),
+        Err(_) => return true,
+    };
+    data.flakes.iter().any(|flake| {
+        crate::config_guard::is_config_field(&flake.p)
             || (flake.p.namespace_code == RDF
                 && &*flake.p.name == fluree_vocab::rdf_names::TYPE
                 && matches!(&flake.o, fluree_db_core::FlakeValue::Ref(o)
                     if o.namespace_code == FLUREE_DB))
+            || (flake.g.is_some() && flake.g == config_graph)
     })
 }
 

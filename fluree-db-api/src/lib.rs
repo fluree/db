@@ -4201,6 +4201,7 @@ impl Fluree {
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await?;
                 return self.commit_sequential_outcome(outcome, &index_config).await;

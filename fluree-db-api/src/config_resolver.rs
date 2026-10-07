@@ -106,6 +106,29 @@ async fn resolve_config_sid(
     Ok(config_sids.into_iter().next())
 }
 
+/// Whether the config graph may hold data: false only when neither the
+/// novelty overlay nor the base index has any flake in it. The overlay check
+/// applies when the overlay is a `Novelty`; for other overlay types, and for
+/// an index root without per-graph stats, the answer is conservatively true.
+/// NOTE: `graph_registry` always *registers* the reserved config graph (via
+/// `new_for_ledger`), so registry presence is NOT a data signal.
+pub(crate) fn config_graph_may_hold_data(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+) -> bool {
+    let overlay_has_config_graph = overlay
+        .as_any()
+        .downcast_ref::<Novelty>()
+        .is_none_or(|novelty| novelty.segment_count(CONFIG_GRAPH_ID) > 0);
+    let base_has_config_graph = match snapshot.stats.as_ref().and_then(|s| s.graphs.as_ref()) {
+        Some(graphs) => graphs
+            .iter()
+            .any(|g| g.g_id == CONFIG_GRAPH_ID && g.flakes > 0),
+        None => true,
+    };
+    overlay_has_config_graph || base_has_config_graph
+}
+
 /// Every `f:LedgerConfig` subject in the config graph as-of `to_t`, ordered by
 /// decoded IRI (the first is the one the reader uses).
 pub(crate) async fn ledger_config_subjects(
@@ -119,25 +142,8 @@ pub(crate) async fn ledger_config_subjects(
     // lookup below resolves an object IRI that is absent from the dictionary,
     // which drops the bound-object filter and full-scans the rdf:type predicate
     // over the (growing) novelty overlay on EVERY transaction and query —
-    // O(novelty) per call once an index is attached. The overlay check only
-    // applies when the overlay is a `Novelty`; for other overlay types we fall
-    // through and run the scan (correctness over speed).
-    let overlay_has_config_graph = overlay
-        .as_any()
-        .downcast_ref::<Novelty>()
-        .is_none_or(|novelty| novelty.segment_count(CONFIG_GRAPH_ID) > 0);
-    // Base index has config-graph data only if per-graph stats report flakes for
-    // CONFIG_GRAPH_ID. NOTE: `graph_registry` always *registers* the reserved
-    // config graph (via `new_for_ledger`), so registry presence is NOT a data
-    // signal. When per-graph stats are absent (old/pre-index root) we
-    // conservatively assume config may exist and run the scan.
-    let base_has_config_graph = match snapshot.stats.as_ref().and_then(|s| s.graphs.as_ref()) {
-        Some(graphs) => graphs
-            .iter()
-            .any(|g| g.g_id == CONFIG_GRAPH_ID && g.flakes > 0),
-        None => true,
-    };
-    if !overlay_has_config_graph && !base_has_config_graph {
+    // O(novelty) per call once an index is attached.
+    if !config_graph_may_hold_data(snapshot, overlay) {
         return Ok(Vec::new());
     }
 

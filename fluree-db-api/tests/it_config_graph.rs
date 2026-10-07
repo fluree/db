@@ -1016,6 +1016,556 @@ async fn config_guard_checks_the_query_defaults_group() {
     );
 }
 
+/// A multi-operation SPARQL update on `name` (created here, seeded with
+/// `trig`): every operation is governed by the state before the request.
+async fn seed_multi_op_ledger(fluree: &fluree_db_api::Fluree, name: &str, trig: &str) -> String {
+    fluree.create_ledger(name).await.expect("create");
+    let ledger_id = format!("{name}:main");
+    fluree
+        .graph(&ledger_id)
+        .transact()
+        .upsert_turtle(trig)
+        .commit()
+        .await
+        .expect("seed");
+    ledger_id
+}
+
+async fn multi_op(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    sparql: &str,
+) -> fluree_db_api::Result<fluree_db_api::TransactResultRef> {
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(sparql)
+        .commit()
+        .await
+}
+
+/// Every operation of a multi-operation update is checked against the config,
+/// shapes and uniqueness constraints in effect before the request, as a
+/// single transaction is: an earlier operation that turns enforcement off, or
+/// removes the shape or constraint, does not admit a later operation's data,
+/// even when the request turns it back on. Enforcement switched on inside the
+/// request does not apply to it either, as in one transaction.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn multi_operation_update_is_governed_by_the_state_before_it() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let shacl_seed = |cfg: &str, enabled: bool| {
+        format!(
+            "@prefix f: <https://ns.flur.ee/db#> . @prefix sh: <http://www.w3.org/ns/shacl#> .
+             @prefix ex: <http://example.org/> .
+             ex:PersonShape a sh:NodeShape ; sh:targetClass ex:Person ;
+               sh:property [ sh:path ex:name ; sh:minCount 1 ] .
+             GRAPH <{cfg}> {{
+               <urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> .
+               <urn:config:shacl> f:shaclEnabled {enabled} .
+             }}"
+        )
+    };
+    let prefixes = "PREFIX f: <https://ns.flur.ee/db#> PREFIX ex: <http://example.org/>
+                    PREFIX sh: <http://www.w3.org/ns/shacl#>";
+    for (i, (what, ops)) in [
+        (
+            "SHACL off, then the violation",
+            "DELETE DATA { GRAPH <CFG> { <urn:config:shacl> f:shaclEnabled true } } ;
+             INSERT DATA { ex:bad a ex:Person }",
+        ),
+        (
+            "SHACL off, the violation, SHACL back on",
+            "DELETE DATA { GRAPH <CFG> { <urn:config:shacl> f:shaclEnabled true } } ;
+             INSERT DATA { ex:bad a ex:Person } ;
+             INSERT DATA { GRAPH <CFG> { <urn:config:shacl> f:shaclEnabled true } }",
+        ),
+        (
+            "the shape removed, then the violation",
+            "DELETE WHERE { ex:PersonShape sh:targetClass ex:Person } ;
+             INSERT DATA { ex:bad a ex:Person }",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("it/multi-op-governed-shacl-{i}");
+        let cfg = config_graph_iri(&format!("{name}:main"));
+        let ledger_id = seed_multi_op_ledger(&fluree, &name, &shacl_seed(&cfg, true)).await;
+        let err = multi_op(
+            &fluree,
+            &ledger_id,
+            &format!("{prefixes} {}", ops.replace("CFG", &cfg)),
+        )
+        .await
+        .expect_err(what);
+        assert!(
+            matches!(
+                err,
+                fluree_db_api::ApiError::Transact(
+                    fluree_db_transact::TransactError::ShaclViolation(_)
+                )
+            ),
+            "{what}: {err:?}"
+        );
+    }
+
+    // Enabled inside the request: not in effect for it.
+    let name = "it/multi-op-governed-shacl-enable";
+    let cfg = config_graph_iri(&format!("{name}:main"));
+    let ledger_id = seed_multi_op_ledger(&fluree, name, &shacl_seed(&cfg, false)).await;
+    multi_op(
+        &fluree,
+        &ledger_id,
+        &format!(
+            "{prefixes}
+             DELETE DATA {{ GRAPH <{cfg}> {{ <urn:config:shacl> f:shaclEnabled false }} }} ;
+             INSERT DATA {{ GRAPH <{cfg}> {{ <urn:config:shacl> f:shaclEnabled true }} }} ;
+             INSERT DATA {{ ex:early a ex:Person }}"
+        ),
+    )
+    .await
+    .expect("enforcement switched on inside the request does not apply to it");
+    let err = multi_op(
+        &fluree,
+        &ledger_id,
+        &format!("{prefixes} INSERT DATA {{ ex:late a ex:Person }}"),
+    )
+    .await
+    .expect_err("it applies to the next request");
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "{err:?}"
+    );
+}
+
+/// The same for uniqueness, switched off in config or by removing the
+/// property's `f:enforceUnique` annotation (data in the default graph).
+#[tokio::test]
+async fn multi_operation_update_is_governed_by_the_state_before_it_for_uniqueness() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (i, (what, off, on)) in [
+        (
+            "uniqueness off in config",
+            "DELETE DATA { GRAPH <CFG> { <urn:config:tx> f:uniqueEnabled true } }",
+            "INSERT DATA { GRAPH <CFG> { <urn:config:tx> f:uniqueEnabled true } }",
+        ),
+        (
+            "the constraint annotation removed",
+            "DELETE DATA { ex:email f:enforceUnique true }",
+            "INSERT DATA { ex:email f:enforceUnique true }",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("it/multi-op-governed-unique-{i}");
+        let cfg = config_graph_iri(&format!("{name}:main"));
+        let ledger_id = seed_multi_op_ledger(
+            &fluree,
+            &name,
+            &format!(
+                "@prefix f: <https://ns.flur.ee/db#> . @prefix ex: <http://example.org/> .
+                 ex:email f:enforceUnique true .
+                 ex:u1 ex:email \"a@x\" .
+                 GRAPH <{cfg}> {{
+                   <urn:config:main> a f:LedgerConfig ; f:transactDefaults <urn:config:tx> .
+                   <urn:config:tx> f:uniqueEnabled true .
+                 }}"
+            ),
+        )
+        .await;
+        let err = multi_op(
+            &fluree,
+            &ledger_id,
+            &format!(
+                "PREFIX f: <https://ns.flur.ee/db#> PREFIX ex: <http://example.org/>
+                 {} ; INSERT DATA {{ ex:u2 ex:email \"a@x\" }} ; {}",
+                off.replace("CFG", &cfg),
+                on.replace("CFG", &cfg)
+            ),
+        )
+        .await
+        .expect_err(what);
+        assert!(
+            matches!(
+                err,
+                fluree_db_api::ApiError::Transact(
+                    fluree_db_transact::TransactError::UniqueConstraintViolation { .. }
+                )
+            ),
+            "{what}: {err:?}"
+        );
+    }
+}
+
+/// The config guard judges a multi-operation update by what it commits, not
+/// by the order of its operations: replacing a single-valued setting by
+/// inserting the new value before deleting the old one is accepted, and a
+/// request whose result holds two values is still refused.
+#[tokio::test]
+async fn multi_operation_update_is_guarded_on_its_result() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let seed = |cfg: &str| {
+        format!(
+            "@prefix f: <https://ns.flur.ee/db#> .
+             GRAPH <{cfg}> {{
+               <urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> .
+               <urn:config:shacl> f:shaclEnabled true .
+             }}"
+        )
+    };
+    let name = "it/multi-op-guard-result";
+    let cfg = config_graph_iri(&format!("{name}:main"));
+    let ledger_id = seed_multi_op_ledger(&fluree, name, &seed(&cfg)).await;
+    multi_op(
+        &fluree,
+        &ledger_id,
+        &format!(
+            "PREFIX f: <https://ns.flur.ee/db#>
+             INSERT DATA {{ GRAPH <{cfg}> {{ <urn:config:shacl> f:shaclEnabled false }} }} ;
+             DELETE DATA {{ GRAPH <{cfg}> {{ <urn:config:shacl> f:shaclEnabled true }} }}"
+        ),
+    )
+    .await
+    .expect("insert-then-delete leaves one value");
+    let view = fluree.db(&ledger_id).await.unwrap();
+    assert_eq!(
+        view.ledger_config()
+            .and_then(|c| c.shacl.as_ref())
+            .and_then(|s| s.enabled),
+        Some(false)
+    );
+
+    let name = "it/multi-op-guard-result-refused";
+    let cfg = config_graph_iri(&format!("{name}:main"));
+    let ledger_id = seed_multi_op_ledger(&fluree, name, &seed(&cfg)).await;
+    let err = multi_op(
+        &fluree,
+        &ledger_id,
+        &format!(
+            "PREFIX f: <https://ns.flur.ee/db#> PREFIX ex: <http://example.org/>
+             INSERT DATA {{ GRAPH <{cfg}> {{ <urn:config:shacl> f:shaclEnabled false }} }} ;
+             INSERT DATA {{ ex:x ex:p 1 }}"
+        ),
+    )
+    .await
+    .expect_err("two values in the result");
+    let message = config_guard_refusal(err);
+    assert!(message.contains("f:shaclEnabled"), "{message}");
+}
+
+/// A transaction ([`fluree_db_api::Transaction`]) is governed like a
+/// multi-operation update: every operation it stages, a whole multi-operation
+/// SPARQL update or a Cypher statement included, reads SHACL and the config
+/// from the state the transaction began on, its shapes and uniqueness
+/// constraints as well as its config. An operation that turns SHACL off, or
+/// removes a shape or a property's `f:enforceUnique`, does not admit a later
+/// one's violating data; one that turns SHACL on, or adds `f:enforceUnique`,
+/// does not apply it to the transaction.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn transaction_is_governed_by_the_state_it_began_on() {
+    use fluree_db_api::{TransactionOptions, TxnOperation};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let shacl_seed = |cfg: &str, enabled: bool| {
+        format!(
+            "@prefix f: <https://ns.flur.ee/db#> . @prefix sh: <http://www.w3.org/ns/shacl#> .
+             @prefix ex: <http://example.org/> .
+             ex:PersonShape a sh:NodeShape ; sh:targetClass ex:Person ;
+               sh:property [ sh:path ex:name ; sh:minCount 1 ] .
+             GRAPH <{cfg}> {{
+               <urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> .
+               <urn:config:shacl> f:shaclEnabled {enabled} .
+             }}"
+        )
+    };
+    let flip = |cfg: &str, from: bool, to: bool| {
+        format!(
+            "PREFIX f: <https://ns.flur.ee/db#>
+             DELETE DATA {{ GRAPH <{cfg}> {{ <urn:config:shacl> f:shaclEnabled {from} }} }} ;
+             INSERT DATA {{ GRAPH <{cfg}> {{ <urn:config:shacl> f:shaclEnabled {to} }} }}"
+        )
+    };
+    let violating = || {
+        TxnOperation::Insert(json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:nameless",
+            "@type": "ex:Person"
+        }))
+    };
+
+    // SHACL on: turning it off in the transaction does not admit the data,
+    // whether the data is its own operation, a Cypher statement, or a later
+    // operation of the same SPARQL update.
+    for (case, data) in [
+        ("JSON-LD", Some(violating())),
+        ("Cypher", None),
+        ("in the same SPARQL update", None),
+        ("in a later multi-operation SPARQL update", None),
+    ] {
+        let name = format!("it/txn-gov-on-{}", case.replace(' ', "-"));
+        let cfg = config_graph_iri(&format!("{name}:main"));
+        let ledger_id = seed_multi_op_ledger(&fluree, &name, &shacl_seed(&cfg, true)).await;
+        let mut txn = fluree
+            .begin_transaction(&ledger_id, TransactionOptions::default())
+            .await
+            .expect("begin");
+        let result = match (case, data) {
+            (_, Some(data)) => {
+                txn.stage(TxnOperation::SparqlUpdate(flip(&cfg, true, false), None))
+                    .await
+                    .expect("the config change stages");
+                txn.stage(data).await
+            }
+            ("Cypher", None) => {
+                txn.stage(TxnOperation::SparqlUpdate(flip(&cfg, true, false), None))
+                    .await
+                    .expect("the config change stages");
+                txn.stage_cypher("CREATE (:`http://example.org/Person`)", None)
+                    .await
+                    .map(|_| ())
+            }
+            ("in a later multi-operation SPARQL update", None) => {
+                txn.stage(TxnOperation::SparqlUpdate(flip(&cfg, true, false), None))
+                    .await
+                    .expect("the config change stages");
+                txn.stage(TxnOperation::SparqlUpdate(
+                    "PREFIX ex: <http://example.org/>
+                     INSERT DATA { ex:other ex:p 1 } ;
+                     INSERT DATA { ex:nameless a ex:Person }"
+                        .to_string(),
+                    None,
+                ))
+                .await
+            }
+            _ => {
+                let both = format!(
+                    "{} ;
+                     PREFIX ex: <http://example.org/>
+                     INSERT DATA {{ ex:nameless a ex:Person }}",
+                    flip(&cfg, true, false)
+                );
+                txn.stage(TxnOperation::SparqlUpdate(both, None)).await
+            }
+        };
+        let err = result.expect_err(case);
+        assert!(err.to_string().contains("SHACL"), "{case}: {err}");
+    }
+
+    // SHACL off: turning it on in the transaction does not apply it to the
+    // transaction's own data.
+    let name = "it/txn-gov-off";
+    let cfg = config_graph_iri(&format!("{name}:main"));
+    let ledger_id = seed_multi_op_ledger(&fluree, name, &shacl_seed(&cfg, false)).await;
+    let mut txn = fluree
+        .begin_transaction(&ledger_id, TransactionOptions::default())
+        .await
+        .expect("begin");
+    txn.stage(TxnOperation::SparqlUpdate(flip(&cfg, false, true), None))
+        .await
+        .expect("the config change stages");
+    txn.stage(violating())
+        .await
+        .expect("not enforced within the transaction that enables it");
+    txn.commit(Default::default()).await.expect("commit");
+
+    // The shape removed in the transaction still applies to it.
+    let name = "it/txn-gov-shape-removed";
+    let cfg = config_graph_iri(&format!("{name}:main"));
+    let ledger_id = seed_multi_op_ledger(&fluree, name, &shacl_seed(&cfg, true)).await;
+    let mut txn = fluree
+        .begin_transaction(&ledger_id, TransactionOptions::default())
+        .await
+        .expect("begin");
+    txn.stage(TxnOperation::SparqlUpdate(
+        "PREFIX sh: <http://www.w3.org/ns/shacl#> PREFIX ex: <http://example.org/>
+         DELETE DATA { ex:PersonShape sh:targetClass ex:Person }"
+            .to_string(),
+        None,
+    ))
+    .await
+    .expect("the shape change stages");
+    let err = txn.stage(violating()).await.expect_err("shape removed");
+    assert!(err.to_string().contains("SHACL"), "shape removed: {err}");
+
+    // Uniqueness: a constraint removed in the transaction still applies to
+    // it, and one added does not yet.
+    let unique_seed = |cfg: &str, annotated: bool| {
+        format!(
+            "@prefix f: <https://ns.flur.ee/db#> . @prefix ex: <http://example.org/> .
+             {}
+             ex:u1 ex:email \"a@x\" .
+             GRAPH <{cfg}> {{
+               <urn:config:main> a f:LedgerConfig ; f:transactDefaults <urn:config:tx> .
+               <urn:config:tx> f:uniqueEnabled true .
+             }}",
+            if annotated {
+                "ex:email f:enforceUnique true ."
+            } else {
+                ""
+            }
+        )
+    };
+    let annotation = |op: &str| {
+        TxnOperation::SparqlUpdate(
+            format!(
+                "PREFIX f: <https://ns.flur.ee/db#> PREFIX ex: <http://example.org/>
+                 {op} DATA {{ ex:email f:enforceUnique true }}"
+            ),
+            None,
+        )
+    };
+    let duplicate = || {
+        TxnOperation::Insert(json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:u2",
+            "ex:email": "a@x"
+        }))
+    };
+    let name = "it/txn-gov-unique-removed";
+    let cfg = config_graph_iri(&format!("{name}:main"));
+    let ledger_id = seed_multi_op_ledger(&fluree, name, &unique_seed(&cfg, true)).await;
+    let mut txn = fluree
+        .begin_transaction(&ledger_id, TransactionOptions::default())
+        .await
+        .expect("begin");
+    txn.stage(annotation("DELETE"))
+        .await
+        .expect("the constraint change stages");
+    let err = txn
+        .stage(duplicate())
+        .await
+        .expect_err("constraint removed");
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(
+                fluree_db_transact::TransactError::UniqueConstraintViolation { .. }
+            )
+        ),
+        "constraint removed: {err:?}"
+    );
+
+    let name = "it/txn-gov-unique-added";
+    let cfg = config_graph_iri(&format!("{name}:main"));
+    let ledger_id = seed_multi_op_ledger(&fluree, name, &unique_seed(&cfg, false)).await;
+    let mut txn = fluree
+        .begin_transaction(&ledger_id, TransactionOptions::default())
+        .await
+        .expect("begin");
+    txn.stage(annotation("INSERT"))
+        .await
+        .expect("the constraint change stages");
+    txn.stage(duplicate())
+        .await
+        .expect("not enforced within the transaction that adds it");
+    txn.commit(Default::default()).await.expect("commit");
+}
+
+/// A transaction's config guard judges what it commits, once, as a
+/// multi-operation update's does: a second value inserted before the old one
+/// is deleted commits; a second value left in the result is refused when the
+/// transaction commits.
+#[tokio::test]
+async fn transaction_is_guarded_on_its_result() {
+    use fluree_db_api::{TransactionOptions, TxnOperation};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let seed = |cfg: &str| {
+        format!(
+            "@prefix f: <https://ns.flur.ee/db#> .
+             GRAPH <{cfg}> {{
+               <urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> .
+               <urn:config:shacl> f:shaclEnabled true .
+             }}"
+        )
+    };
+    let stage = |cfg: &str, op: &str| {
+        TxnOperation::SparqlUpdate(
+            format!(
+                "PREFIX f: <https://ns.flur.ee/db#>
+                 {op} DATA {{ GRAPH <{cfg}> {{ <urn:config:shacl> f:shaclEnabled {} }} }}",
+                op == "DELETE"
+            ),
+            None,
+        )
+    };
+
+    let name = "it/txn-guard-result";
+    let cfg = config_graph_iri(&format!("{name}:main"));
+    let ledger_id = seed_multi_op_ledger(&fluree, name, &seed(&cfg)).await;
+    let mut txn = fluree
+        .begin_transaction(&ledger_id, TransactionOptions::default())
+        .await
+        .expect("begin");
+    txn.stage(stage(&cfg, "INSERT"))
+        .await
+        .expect("insert false");
+    txn.stage(stage(&cfg, "DELETE")).await.expect("delete true");
+    txn.commit(Default::default())
+        .await
+        .expect("insert-then-delete leaves one value");
+    let view = fluree.db(&ledger_id).await.unwrap();
+    assert_eq!(
+        view.ledger_config()
+            .and_then(|c| c.shacl.as_ref())
+            .and_then(|s| s.enabled),
+        Some(false)
+    );
+
+    // The same when the second value comes from a multi-operation update:
+    // that update's own result is not guarded on its own, only the
+    // transaction's.
+    let name = "it/txn-guard-result-nested";
+    let cfg = config_graph_iri(&format!("{name}:main"));
+    let ledger_id = seed_multi_op_ledger(&fluree, name, &seed(&cfg)).await;
+    let mut txn = fluree
+        .begin_transaction(&ledger_id, TransactionOptions::default())
+        .await
+        .expect("begin");
+    txn.stage(TxnOperation::SparqlUpdate(
+        format!(
+            "PREFIX f: <https://ns.flur.ee/db#> PREFIX ex: <http://example.org/>
+             INSERT DATA {{ GRAPH <{cfg}> {{ <urn:config:shacl> f:shaclEnabled false }} }} ;
+             INSERT DATA {{ ex:x ex:p 1 }}"
+        ),
+        None,
+    ))
+    .await
+    .expect("the guard waits for the transaction's result");
+    txn.stage(stage(&cfg, "DELETE")).await.expect("delete true");
+    txn.commit(Default::default())
+        .await
+        .expect("one value in the transaction's result");
+
+    let name = "it/txn-guard-result-refused";
+    let cfg = config_graph_iri(&format!("{name}:main"));
+    let ledger_id = seed_multi_op_ledger(&fluree, name, &seed(&cfg)).await;
+    let mut txn = fluree
+        .begin_transaction(&ledger_id, TransactionOptions::default())
+        .await
+        .expect("begin");
+    txn.stage(stage(&cfg, "INSERT"))
+        .await
+        .expect("the guard waits for the result");
+    txn.stage(TxnOperation::Insert(json!({
+        "@context": {"ex": "http://example.org/"},
+        "@id": "ex:x",
+        "ex:p": 1
+    })))
+    .await
+    .expect("data stages");
+    let err = txn
+        .commit(Default::default())
+        .await
+        .expect_err("two values in the result");
+    let message = config_guard_refusal(err);
+    assert!(message.contains("f:shaclEnabled"), "{message}");
+}
+
 /// The repair recipe (`docs/ledger-config/writing-config.md`) for a config
 /// split by #1979: it moves the stranded group fields into the config graph
 /// in one transaction, which the config guard accepts, and enforcement

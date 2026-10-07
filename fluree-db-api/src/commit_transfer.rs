@@ -593,6 +593,9 @@ impl Fluree {
                     // commit was authored); followers re-validate
                     // same-ledger only.
                     None,
+                    // Each pushed commit is governed by the state it applies
+                    // to, as when it was authored.
+                    None,
                 )
                 .await
                 .map_err(|e| ApiError::http(422, e.to_string()))?;

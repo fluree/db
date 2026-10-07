@@ -72,7 +72,9 @@ fn upsert_payload_id(txn_json: &JsonValue) -> u64 {
 /// Per staged operation:
 /// 1. the op stages against the current virtual state with the FULL pipeline
 ///    (namespace adoption, policy, SHACL, uniqueness) — per-op validation is a
-///    documented semantics choice (see `stage_transaction_from_txns`);
+///    documented semantics choice (see `stage_transaction_from_txns`). Its
+///    config, shapes and uniqueness constraints come from the state before
+///    the request ([`RequestGovernance`]), read once for all operations;
 /// 2. its flakes fold into the merged set re-stamped to the final commit `t`
 ///    (`base.t() + 1`), last-wins per fact identity `(g, s, p, o, dt, m)`,
 ///    less the facts a later operation reversed (see [`Self::finish`]);
@@ -84,7 +86,7 @@ fn upsert_payload_id(txn_json: &JsonValue) -> u64 {
 ///
 /// [`Self::finish`] layers the merged fold over the ORIGINAL base, so
 /// `build_commit` stamps `t+1` and applies the union envelope deltas exactly
-/// as a single-operation commit would.
+/// as a single-operation commit would, and runs the config guard over it once.
 pub(crate) struct SequentialStager {
     original: LedgerState,
     final_t: i64,
@@ -119,6 +121,11 @@ pub(crate) struct SequentialStager {
     current: Option<LedgerState>,
     /// Every operation's scope merged; bounded only while all of them are.
     scope: WriteScope,
+    /// What governs every operation: the state before the request.
+    governance: RequestGovernance,
+    /// Staged as one operation of an enclosing request, which shares this
+    /// governance and runs the config guard over its own merged result.
+    nested: bool,
 }
 
 /// Fact identity for the sequential fold (flake minus `t`/`op`).
@@ -146,8 +153,22 @@ impl SequentialStager {
             txn_meta: Vec::new(),
             last_ns_registry: None,
             union_ns_delta: std::collections::HashMap::new(),
+            governance: RequestGovernance::new(ledger.clone()),
+            nested: false,
             current: Some(ledger),
             scope: WriteScope::Subjects(FxHashSet::default()),
+        }
+    }
+
+    /// A stager for one operation of an enclosing request (a multi-operation
+    /// SPARQL update or Cypher statement staged in a [`crate::Transaction`]):
+    /// its operations are governed by the enclosing request's state, and the
+    /// config guard is left to the enclosing request's merged result.
+    pub(crate) fn within(ledger: LedgerState, request: &RequestGovernance) -> Self {
+        Self {
+            governance: request.clone(),
+            nested: true,
+            ..Self::new(ledger)
         }
     }
 
@@ -172,26 +193,29 @@ impl SequentialStager {
         tracker: Option<&Tracker>,
         advance: bool,
     ) -> Result<usize> {
-        self.stage_with(advance, |state| {
-            fluree.stage_transaction_from_txn(state, txn, index_config, policy, tracker)
+        self.stage_with(advance, |state, request| async move {
+            fluree
+                .stage_txn_governed(state, txn, index_config, policy, tracker, Some(&request))
+                .await
         })
         .await
     }
 
     /// [`Self::stage`] for an operation staged by any staging entry point:
-    /// `stage` receives the virtual state and returns its [`StageResult`].
-    /// A stage that fails, or whose future is dropped, leaves the stager as
-    /// it was.
+    /// `stage` receives the virtual state and the request's governance, which
+    /// it must stage under (the staging entry points take it as `request`),
+    /// and returns its [`StageResult`]. A stage that fails, or whose future is
+    /// dropped, leaves the stager as it was.
     pub(crate) async fn stage_with<F, Fut>(&mut self, advance: bool, stage: F) -> Result<usize>
     where
-        F: FnOnce(LedgerState) -> Fut,
+        F: FnOnce(LedgerState, RequestGovernance) -> Fut,
         Fut: std::future::Future<Output = Result<StageResult>>,
     {
         let state = self
             .current
             .clone()
             .expect("virtual state consumed by a final non-advancing stage");
-        let result = stage(state).await?;
+        let result = stage(state, self.governance.clone()).await?;
         // Released before the apply below, whose copy-on-write would
         // otherwise deep-copy everything this pre-operation state shares.
         self.current = None;
@@ -299,8 +323,10 @@ impl SequentialStager {
     }
 
     /// Merge every staged operation into one [`StageResult`] over the
-    /// ORIGINAL base. Valid with zero staged operations (an all-no-op run):
-    /// the result is an empty staged view.
+    /// ORIGINAL base, and run the config guard over it: the request is
+    /// judged by what it commits, not by the order of its operations. Valid
+    /// with zero staged operations (an all-no-op run): the result is an empty
+    /// staged view.
     pub(crate) async fn finish(mut self) -> Result<StageResult> {
         let graphs_staged: FxHashSet<Option<Sid>> =
             self.folded.iter().map(|flake| flake.g.clone()).collect();
@@ -348,6 +374,9 @@ impl SequentialStager {
         graph_delta.retain(|_, iri| !netted_away.contains(&ns_registry.sid_for_iri(iri)));
 
         let view = StagedLedger::new(self.original, self.folded, &reverse_graph)?;
+        if !self.nested {
+            guard_request_view(&view, &ns_registry, &graph_delta).await?;
+        }
         Ok(StageResult {
             view,
             ns_registry,
@@ -434,7 +463,9 @@ fn tracker_for_limits(txn_json: &JsonValue) -> Tracker {
 ///
 /// INVARIANT: Reads config as-of the input `LedgerState` only (head t
 /// before staging). Config mutations inside the staged transaction
-/// CANNOT relax constraints for that same transaction.
+/// CANNOT relax constraints for that same transaction. A multi-operation
+/// request reads it once, from the state before the request
+/// ([`RequestGovernance`]), so no operation relaxes another's.
 ///
 /// A read failure fails the transaction: without the config there is no
 /// telling what SHACL or uniqueness would have enforced, and reading it as
@@ -464,13 +495,88 @@ pub(crate) async fn load_transaction_config(
 pub(crate) async fn enforcement_config(
     view: &StagedLedger,
 ) -> std::result::Result<Option<Arc<LedgerConfig>>, fluree_db_transact::TransactError> {
-    let writes_user_graph = view
-        .staged_flakes_by_graph()
-        .any(|(g_id, _)| !crate::export::is_system_graph(g_id));
-    if !writes_user_graph {
+    if !writes_user_graph(view) {
         return Ok(None);
     }
     load_transaction_config(view.base()).await
+}
+
+/// Whether a staged write touches a user graph (the default graph or a named
+/// graph; not `#config` or `#txn-meta`). Only such a write is governed by
+/// SHACL or uniqueness, so only it reads the config.
+fn writes_user_graph(view: &StagedLedger) -> bool {
+    view.staged_flakes_by_graph()
+        .any(|(g_id, _)| !crate::export::is_system_graph(g_id))
+}
+
+/// A write's config, read at most once ([`load_transaction_config`]) and
+/// shared by every check that needs it: by the operations of one request, or
+/// by a fast-forward's governance test and its checks.
+#[derive(Clone, Default)]
+pub(crate) struct ConfigRead(Arc<tokio::sync::OnceCell<Option<Arc<LedgerConfig>>>>);
+
+impl ConfigRead {
+    /// A config already read.
+    pub(crate) fn resolved(config: Option<Arc<LedgerConfig>>) -> Self {
+        Self(Arc::new(tokio::sync::OnceCell::new_with(Some(config))))
+    }
+
+    /// The config `state` holds, read on first use.
+    async fn get(
+        &self,
+        state: &LedgerState,
+    ) -> std::result::Result<Option<Arc<LedgerConfig>>, fluree_db_transact::TransactError> {
+        self.0
+            .get_or_try_init(|| load_transaction_config(state))
+            .await
+            .cloned()
+    }
+}
+
+/// What governs every operation of a multi-operation request: the ledger as
+/// it was before the request. Each operation reads the config, the shapes and
+/// the uniqueness constraints from this state, so an earlier operation in the
+/// request cannot change what governs a later one (the rule a single
+/// transaction follows by reading them from its own pre-transaction state).
+/// The config is read once for the whole request. Built only where the
+/// request's merged view is checked by the config guard
+/// ([`SequentialStager::finish`], [`crate::Fluree::stage_pair_from_txns`]).
+#[derive(Clone)]
+pub(crate) struct RequestGovernance {
+    state: LedgerState,
+    config: ConfigRead,
+}
+
+impl RequestGovernance {
+    pub(crate) fn new(state: LedgerState) -> Self {
+        Self {
+            state,
+            config: ConfigRead::default(),
+        }
+    }
+}
+
+/// The config guard over a multi-operation request's merged view: it checks
+/// what the request commits as a whole, against the config graph as it was
+/// before the request, so a request is judged by its result rather than by
+/// the order of its operations.
+async fn guard_request_view(
+    view: &StagedLedger,
+    ns: &NamespaceRegistry,
+    graph_delta: &FxHashMap<u16, String>,
+) -> Result<()> {
+    crate::config_guard::validate_staged_config(
+        view,
+        ns,
+        graph_delta,
+        crate::config_guard::GuardScope::Authoring,
+    )
+    .await
+    .map_err(|e| {
+        ApiError::from(fluree_db_transact::TransactError::from(
+            StagedWriteError::from(e),
+        ))
+    })
 }
 
 /// The user graphs (the default graph and named graphs; never `#config` or
@@ -996,8 +1102,16 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
     ctx: StagedShaclContext<'_>,
     config: Option<&LedgerConfig>,
     mut resolve_ctx: Option<&mut crate::cross_ledger::ResolveCtx<'_>>,
+    governance: Option<&LedgerState>,
 ) -> std::result::Result<bool, fluree_db_transact::TransactError> {
-    let base = view.base();
+    // Shapes, the schema hierarchy and the compiled-shape cache come from the
+    // governing state (the write's own base unless the caller names the
+    // state before a multi-operation request); the data validated is the
+    // staged view.
+    let base = match governance {
+        Some(state) => state,
+        None => view.base(),
+    };
 
     // 1. Stored shapes: each written graph's own enabled/mode from config.
     //    Graphs absent from the map are not validated.
@@ -1583,6 +1697,7 @@ async fn validate_staged_shacl(
     graph_delta: &FxHashMap<u16, String>,
     request: ShaclRequest<'_>,
     config: Option<&LedgerConfig>,
+    governance: Option<&LedgerState>,
     resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
     tracker: Option<&Tracker>,
     txn_context: Option<&JsonValue>,
@@ -1618,6 +1733,7 @@ async fn validate_staged_shacl(
         },
         config,
         Some(resolve_ctx),
+        governance,
     )
     .await
 }
@@ -1641,12 +1757,17 @@ async fn enforce_unique_after_staging(
     inline_unique_properties: Option<&[String]>,
     staged_ns: &NamespaceRegistry,
     config: Option<&LedgerConfig>,
+    governance: Option<&LedgerState>,
 ) -> std::result::Result<bool, fluree_db_transact::TransactError> {
     // Start with config-resolved per-graph SIDs (same/cross ledger).
     // No config → empty; inline properties below can still drive
     // enforcement when set.
     let mut per_graph_unique: HashMap<GraphId, FxHashSet<Sid>> = match config {
-        Some(cfg) => resolve_per_graph_unique_sids(view, cfg, graph_delta, resolve_ctx).await?,
+        Some(cfg) => {
+            let annotations_from = governance.unwrap_or_else(|| view.base());
+            resolve_per_graph_unique_sids(view, cfg, graph_delta, resolve_ctx, annotations_from)
+                .await?
+        }
         None => HashMap::new(),
     };
 
@@ -1719,6 +1840,14 @@ pub(crate) struct WriteChecks<'a> {
     /// authored. R2 is enforced when the data is written; branch operations
     /// re-check the integrity of the target's config groups (R1/R3).
     pub(crate) guard: crate::config_guard::GuardScope,
+    /// One operation of a multi-operation request: its config, shapes and
+    /// constraints come from the state before the request, and the config
+    /// guard runs once, on the request's merged view, rather than here.
+    /// `None`: the write is governed by its own pre-write state.
+    pub(crate) request: Option<&'a RequestGovernance>,
+    /// The config, when the caller has already read it (a fast-forward reads
+    /// it to decide whether the target governs writes at all).
+    pub(crate) config: Option<&'a ConfigRead>,
 }
 
 impl WriteChecks<'_> {
@@ -1731,6 +1860,8 @@ impl WriteChecks<'_> {
             tracker: None,
             txn_context: None,
             guard,
+            request: None,
+            config: None,
         }
     }
 }
@@ -1795,9 +1926,16 @@ pub(crate) async fn check_staged_write(
     checks: WriteChecks<'_>,
     resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
 ) -> std::result::Result<bool, StagedWriteError> {
-    let config = enforcement_config(view)
-        .await
-        .map_err(StagedWriteError::Failed)?;
+    // The state governance is read from: the request's pre-request state for
+    // an operation of a multi-operation request, else the write's own base.
+    let governance = checks.request.map(|request| &request.state);
+    let config = match (checks.request, checks.config) {
+        (None, None) => enforcement_config(view).await,
+        _ if !writes_user_graph(view) => Ok(None),
+        (Some(request), _) => request.config.get(&request.state).await,
+        (None, Some(read)) => read.get(view.base()).await,
+    }
+    .map_err(StagedWriteError::Failed)?;
 
     #[cfg(feature = "shacl")]
     let validated = Box::pin(validate_staged_shacl(
@@ -1806,6 +1944,7 @@ pub(crate) async fn check_staged_write(
         graph_delta,
         checks.shacl_request,
         config.as_deref(),
+        governance,
         resolve_ctx,
         checks.tracker,
         checks.txn_context,
@@ -1825,10 +1964,15 @@ pub(crate) async fn check_staged_write(
         checks.unique_properties,
         ns,
         config.as_deref(),
+        governance,
     )
     .await
     .map_err(StagedWriteError::from_check)?;
-    crate::config_guard::validate_staged_config(view, ns, graph_delta, checks.guard).await?;
+    // An operation of a multi-operation request is guarded with the rest of
+    // the request, on its merged view (`SequentialStager::finish`).
+    if checks.request.is_none() {
+        crate::config_guard::validate_staged_config(view, ns, graph_delta, checks.guard).await?;
+    }
     Ok(validated || unique_enforced)
 }
 
@@ -1856,6 +2000,7 @@ async fn resolve_per_graph_unique_sids(
     config: &LedgerConfig,
     graph_delta: &FxHashMap<u16, String>,
     resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
+    annotations_from: &LedgerState,
 ) -> std::result::Result<HashMap<GraphId, FxHashSet<Sid>>, fluree_db_transact::TransactError> {
     let snapshot = view.db();
     let affected_g_ids = affected_graph_ids(view);
@@ -1886,7 +2031,7 @@ async fn resolve_per_graph_unique_sids(
 
         if transact_config.constraints_sources.is_empty() {
             // Default: annotations in the default graph (g_id=0)
-            let annotations = read_enforce_unique_from_graph(view, 0u16).await?;
+            let annotations = read_enforce_unique_from_graph(annotations_from, 0u16).await?;
             unique_sids.extend(annotations);
         } else {
             let mut local_sources: Vec<&fluree_db_core::ledger_config::GraphSourceRef> = Vec::new();
@@ -1903,7 +2048,8 @@ async fn resolve_per_graph_unique_sids(
             if !local_sources.is_empty() {
                 let local_g_ids = resolve_constraint_source_g_ids_for(&local_sources, snapshot)?;
                 for source_g_id in local_g_ids {
-                    let annotations = read_enforce_unique_from_graph(view, source_g_id).await?;
+                    let annotations =
+                        read_enforce_unique_from_graph(annotations_from, source_g_id).await?;
                     unique_sids.extend(annotations);
                 }
             }
@@ -2021,10 +2167,10 @@ fn resolve_constraint_source_g_ids_for(
 /// Queries the POST index at the pre-transaction state for all subjects
 /// where `?prop f:enforceUnique true`. Returns the set of property SIDs.
 async fn read_enforce_unique_from_graph(
-    view: &StagedLedger,
+    base: &LedgerState,
     source_g_id: GraphId,
 ) -> std::result::Result<Vec<Sid>, fluree_db_transact::TransactError> {
-    let snapshot = view.db();
+    let snapshot = &base.snapshot;
 
     let enforce_unique_sid = match snapshot.encode_iri(config_iris::ENFORCE_UNIQUE) {
         Some(sid) => sid,
@@ -2037,8 +2183,8 @@ async fn read_enforce_unique_from_graph(
     };
 
     // Query: all flakes where p=f:enforceUnique, o=true, dt=xsd:boolean
-    // Uses pre-txn state (base novelty) for lagging annotation semantics.
-    let base = view.base();
+    // Uses the pre-write state (base novelty) for lagging annotation
+    // semantics: the state before the transaction, or before the request.
     let match_val = RangeMatch::predicate_object(enforce_unique_sid, FlakeValue::Boolean(true))
         .with_datatype(xsd_boolean_sid);
 
@@ -2558,6 +2704,7 @@ impl crate::Fluree {
         ns_registry: NamespaceRegistry,
         options: StageOptions<'_>,
         txn_context: Option<&JsonValue>,
+        request: Option<&RequestGovernance>,
     ) -> std::result::Result<CheckedStage, fluree_db_transact::TransactError> {
         // Without SHACL support inline shapes cannot be applied, and a request
         // that carries them expects its data checked: refuse rather than
@@ -2604,6 +2751,8 @@ impl crate::Fluree {
                 tracker,
                 txn_context,
                 guard: crate::config_guard::GuardScope::Authoring,
+                request,
+                config: None,
             },
             &mut resolve_ctx,
         ))
@@ -2711,6 +2860,33 @@ impl crate::Fluree {
         external_tracker: Option<&Tracker>,
         policy: Option<&crate::PolicyContext>,
     ) -> Result<StageResult> {
+        self.stage_transaction_governed(
+            ledger,
+            txn_type,
+            txn_json,
+            txn_opts,
+            index_config,
+            external_tracker,
+            policy,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::stage_transaction_tracked`], governed by `request` when it is
+    /// one operation of a multi-operation request.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stage_transaction_governed(
+        &self,
+        ledger: LedgerState,
+        txn_type: TxnType,
+        txn_json: &JsonValue,
+        txn_opts: TxnOpts,
+        index_config: Option<&IndexConfig>,
+        external_tracker: Option<&Tracker>,
+        policy: Option<&crate::PolicyContext>,
+        request: Option<&RequestGovernance>,
+    ) -> Result<StageResult> {
         let mut ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
 
         // Deterministic, payload-scoped blank-node identity for upsert.
@@ -2755,6 +2931,7 @@ impl crate::Fluree {
             index_config,
             external_tracker,
             policy,
+            request,
         )
         .await
     }
@@ -2776,6 +2953,35 @@ impl crate::Fluree {
         index_config: Option<&IndexConfig>,
         external_tracker: Option<&Tracker>,
         policy: Option<&crate::PolicyContext>,
+    ) -> Result<StageResult> {
+        self.stage_sync_governed(
+            ledger,
+            graph,
+            payload,
+            allow_empty,
+            txn_opts,
+            index_config,
+            external_tracker,
+            policy,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::stage_sync_transaction_tracked`], governed by `request` when it
+    /// is one operation of a multi-operation request.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stage_sync_governed(
+        &self,
+        ledger: LedgerState,
+        graph: &GraphSel,
+        payload: crate::GraphPayload<'_>,
+        allow_empty: bool,
+        txn_opts: TxnOpts,
+        index_config: Option<&IndexConfig>,
+        external_tracker: Option<&Tracker>,
+        policy: Option<&crate::PolicyContext>,
+        request: Option<&RequestGovernance>,
     ) -> Result<StageResult> {
         // Deterministic, graph-scoped blank-node identity: the payload is
         // the graph's authoritative document, so the same source label must
@@ -2809,6 +3015,7 @@ impl crate::Fluree {
             index_config,
             external_tracker,
             policy,
+            request,
         )
         .await
     }
@@ -2828,6 +3035,33 @@ impl crate::Fluree {
         external_tracker: Option<&Tracker>,
         policy: Option<&crate::PolicyContext>,
     ) -> Result<StageResult> {
+        self.stage_graph_insert_governed(
+            ledger,
+            graph,
+            payload,
+            txn_opts,
+            index_config,
+            external_tracker,
+            policy,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::stage_graph_insert_tracked`], governed by `request` when it is
+    /// one operation of a multi-operation request.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stage_graph_insert_governed(
+        &self,
+        ledger: LedgerState,
+        graph: &GraphSel,
+        payload: crate::GraphPayload<'_>,
+        txn_opts: TxnOpts,
+        index_config: Option<&IndexConfig>,
+        external_tracker: Option<&Tracker>,
+        policy: Option<&crate::PolicyContext>,
+        request: Option<&RequestGovernance>,
+    ) -> Result<StageResult> {
         self.stage_graph_payload_tracked(
             ledger,
             graph,
@@ -2837,6 +3071,7 @@ impl crate::Fluree {
             index_config,
             external_tracker,
             policy,
+            request,
         )
         .await
     }
@@ -2852,6 +3087,7 @@ impl crate::Fluree {
         index_config: Option<&IndexConfig>,
         external_tracker: Option<&Tracker>,
         policy: Option<&crate::PolicyContext>,
+        request: Option<&RequestGovernance>,
     ) -> Result<StageResult> {
         let mut ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
         let (txn, txn_json) = {
@@ -2874,6 +3110,7 @@ impl crate::Fluree {
             index_config,
             external_tracker,
             policy,
+            request,
         )
         .await
     }
@@ -2897,6 +3134,33 @@ impl crate::Fluree {
         index_config: Option<&IndexConfig>,
         external_tracker: Option<&Tracker>,
         policy: Option<&crate::PolicyContext>,
+    ) -> Result<StageResult> {
+        self.stage_rdf_text_governed(
+            ledger,
+            txn_type,
+            text,
+            txn_opts,
+            index_config,
+            external_tracker,
+            policy,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::stage_rdf_text_tracked`], governed by `request` when it is one
+    /// operation of a multi-operation request.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stage_rdf_text_governed(
+        &self,
+        ledger: LedgerState,
+        txn_type: TxnType,
+        text: &str,
+        txn_opts: TxnOpts,
+        index_config: Option<&IndexConfig>,
+        external_tracker: Option<&Tracker>,
+        policy: Option<&crate::PolicyContext>,
+        request: Option<&RequestGovernance>,
     ) -> Result<StageResult> {
         let mut ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
         let (txn, _) = {
@@ -2923,6 +3187,7 @@ impl crate::Fluree {
             index_config,
             external_tracker,
             policy,
+            request,
         )
         .await
     }
@@ -2939,6 +3204,7 @@ impl crate::Fluree {
         index_config: Option<&IndexConfig>,
         external_tracker: Option<&Tracker>,
         policy: Option<&crate::PolicyContext>,
+        request: Option<&RequestGovernance>,
     ) -> Result<StageResult> {
         // Extract txn_meta before staging consumes the Txn.
         let txn_meta = txn.txn_meta.clone();
@@ -2958,7 +3224,14 @@ impl crate::Fluree {
         let options = stage_options(index_config, policy, Some(tracker));
 
         let staged = self
-            .stage_and_check(ledger, txn, ns_registry, options, txn_json.get("@context"))
+            .stage_and_check(
+                ledger,
+                txn,
+                ns_registry,
+                options,
+                txn_json.get("@context"),
+                request,
+            )
             .await?;
 
         let scope = write_scope(
@@ -2989,10 +3262,34 @@ impl crate::Fluree {
         policy: Option<&crate::PolicyContext>,
         tracker: Option<&Tracker>,
     ) -> Result<StageResult> {
+        self.stage_txn_governed(ledger, txn, index_config, policy, tracker, None)
+            .await
+    }
+
+    /// [`Self::stage_transaction_from_txn`] for one operation of a
+    /// multi-operation request: its checks are governed by the state before
+    /// the request, and the config guard is left to the request's merged view.
+    pub(crate) async fn stage_txn_governed(
+        &self,
+        ledger: LedgerState,
+        txn: fluree_db_transact::Txn,
+        index_config: Option<&IndexConfig>,
+        policy: Option<&crate::PolicyContext>,
+        tracker: Option<&Tracker>,
+        request: Option<&RequestGovernance>,
+    ) -> Result<StageResult> {
         let ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
         let sync_graph = txn.sync_graph.clone();
         let (view, ns_registry, scope, txn_meta, graph_delta) = self
-            .stage_view_once(ledger, txn, ns_registry, index_config, policy, tracker)
+            .stage_view_once(
+                ledger,
+                txn,
+                ns_registry,
+                index_config,
+                policy,
+                tracker,
+                request,
+            )
             .await?;
         Ok(StageResult {
             view,
@@ -3010,6 +3307,7 @@ impl crate::Fluree {
     /// stage several transactions into one commit (see
     /// [`Self::stage_pair_from_txns`]) with consistent first-time namespace
     /// codes across the merged flake set.
+    #[allow(clippy::too_many_arguments)]
     async fn stage_view_once(
         &self,
         ledger: LedgerState,
@@ -3018,6 +3316,7 @@ impl crate::Fluree {
         index_config: Option<&IndexConfig>,
         policy: Option<&crate::PolicyContext>,
         tracker: Option<&Tracker>,
+        request: Option<&RequestGovernance>,
     ) -> Result<(
         StagedLedger,
         NamespaceRegistry,
@@ -3066,6 +3365,7 @@ impl crate::Fluree {
                 // Txn-based entry: no source document, so no authoring
                 // context to compact violation messages against.
                 None,
+                request,
             )
             .await?;
 
@@ -3099,6 +3399,7 @@ impl crate::Fluree {
     /// is equivalent to the sequential semantics — with true all-or-nothing
     /// atomicity: either the merged commit publishes, or an error returns with
     /// nothing committed.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn stage_pair_from_txns(
         &self,
         ledger: LedgerState,
@@ -3107,8 +3408,20 @@ impl crate::Fluree {
         index_config: Option<&IndexConfig>,
         policy: Option<&crate::PolicyContext>,
         tracker: Option<&Tracker>,
+        enclosing: Option<&RequestGovernance>,
     ) -> Result<StageResult> {
         let ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
+        // Both branches stage against the same base, under one config read,
+        // and the config guard runs once, over the merged view: this pair's,
+        // or, inside an enclosing request, that request's whole result.
+        let own;
+        let request = match enclosing {
+            Some(request) => request,
+            None => {
+                own = RequestGovernance::new(ledger.clone());
+                &own
+            }
+        };
         let (view1, ns_registry, _, mut txn_meta, mut graph_delta) = self
             .stage_view_once(
                 ledger.clone(),
@@ -3117,10 +3430,19 @@ impl crate::Fluree {
                 index_config,
                 policy,
                 tracker,
+                Some(request),
             )
             .await?;
         let (view2, ns_registry, _, meta2, gdelta2) = self
-            .stage_view_once(ledger, second, ns_registry, index_config, policy, tracker)
+            .stage_view_once(
+                ledger,
+                second,
+                ns_registry,
+                index_config,
+                policy,
+                tracker,
+                Some(request),
+            )
             .await?;
 
         txn_meta.extend(meta2);
@@ -3140,6 +3462,9 @@ impl crate::Fluree {
         let view = StagedLedger::new(base, flakes, &reverse_graph).map_err(|e| {
             ApiError::internal(format!("merging staged Cypher MERGE branches: {e}"))
         })?;
+        if enclosing.is_none() {
+            guard_request_view(&view, &ns_registry, &graph_delta).await?;
+        }
 
         Ok(StageResult {
             view,
@@ -3171,12 +3496,17 @@ impl crate::Fluree {
     /// Loop shape, per operation:
     /// 1. stage it against the current (virtual) state with the FULL per-op
     ///    pipeline — namespace adoption, policy enforcement, SHACL,
-    ///    uniqueness — via `stage_transaction_from_txn`; the final state
-    ///    (base + all N ops) is exactly what op N's validators saw. Per-op
-    ///    validation is a documented semantics choice: a transiently-
-    ///    invalid-but-finally-valid request aborts at the offending
-    ///    operation (required for ordered uniqueness; deliberate for
-    ///    SHACL — no deferred constraints);
+    ///    uniqueness; the final state (base + all N ops) is exactly what op
+    ///    N's validators saw. Per-op validation is a documented semantics
+    ///    choice: a transiently-invalid-but-finally-valid request aborts at
+    ///    the offending operation (required for ordered uniqueness;
+    ///    deliberate for SHACL — no deferred constraints). What validates is
+    ///    fixed for the whole request: every operation reads the config,
+    ///    shapes and uniqueness constraints of the state before the request,
+    ///    so an earlier operation cannot relax a later one's checks, exactly
+    ///    as a single transaction's checks read its pre-transaction state.
+    ///    The config guard, which checks the integrity of what is committed,
+    ///    runs once, over the merged view;
     /// 2. fold its flakes into the merged set, re-stamped to the final
     ///    commit `t` (`base.t() + 1`), last-wins per fact identity
     ///    `(g, s, p, o, dt, m)`, and a fact a later operation reversed back
@@ -3199,10 +3529,25 @@ impl crate::Fluree {
         policy: Option<&crate::PolicyContext>,
         tracker: Option<&Tracker>,
     ) -> Result<StageResult> {
+        self.stage_txns_governed(ledger, txns, index_config, policy, tracker, None)
+            .await
+    }
+
+    /// [`Self::stage_transaction_from_txns`], governed by `request` when the
+    /// whole SPARQL request is one operation of an enclosing request.
+    pub(crate) async fn stage_txns_governed(
+        &self,
+        ledger: LedgerState,
+        txns: Vec<fluree_db_transact::Txn>,
+        index_config: Option<&IndexConfig>,
+        policy: Option<&crate::PolicyContext>,
+        tracker: Option<&Tracker>,
+        request: Option<&RequestGovernance>,
+    ) -> Result<StageResult> {
         if txns.len() == 1 {
             let txn = txns.into_iter().next().expect("length checked");
             return self
-                .stage_transaction_from_txn(ledger, txn, index_config, policy, tracker)
+                .stage_txn_governed(ledger, txn, index_config, policy, tracker, request)
                 .await;
         }
 
@@ -3219,7 +3564,10 @@ impl crate::Fluree {
             });
         }
 
-        let mut stager = SequentialStager::new(ledger);
+        let mut stager = match request {
+            Some(request) => SequentialStager::within(ledger, request),
+            None => SequentialStager::new(ledger),
+        };
         let op_count = txns.len();
         for (i, txn) in txns.into_iter().enumerate() {
             // The last operation's apply is skipped: nothing reads the
@@ -3284,6 +3632,7 @@ impl crate::Fluree {
                 // IRIs while the same transaction without a policy reported
                 // `ex:alex`.
                 input.txn_json.get("@context"),
+                None,
             )
             .await
             // The 400 is preserved as-is: correcting the status for novelty
@@ -3618,6 +3967,7 @@ impl crate::Fluree {
                 Some(index_config),
                 None,
                 policy,
+                None,
             )
             .await?;
         self.commit_stage_result(staged, TxnType::Insert, commit_opts, index_config)
@@ -3644,6 +3994,7 @@ impl crate::Fluree {
             index_config,
             tracker,
             policy,
+            None,
         )
         .await
     }
@@ -3654,6 +4005,7 @@ impl crate::Fluree {
     /// The streaming Turtle parser has no graph-block production, so it stops
     /// at a TriG document's first block. Only then is the document read as
     /// TriG, which keeps the second parse off plain Turtle entirely.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn stage_turtle_insert_with_opts(
         &self,
         ledger: LedgerState,
@@ -3662,6 +4014,7 @@ impl crate::Fluree {
         index_config: Option<&IndexConfig>,
         tracker: Option<&Tracker>,
         policy: Option<&crate::PolicyContext>,
+        request: Option<&RequestGovernance>,
     ) -> Result<StageResult> {
         use fluree_db_transact::{generate_txn_id, stage_flakes, FlakeSink};
 
@@ -3704,6 +4057,7 @@ impl crate::Fluree {
                         index_config,
                         tracker,
                         policy,
+                        request,
                     )
                     .await;
             }
@@ -3738,6 +4092,7 @@ impl crate::Fluree {
             &rustc_hash::FxHashMap::default(),
             WriteChecks {
                 tracker,
+                request,
                 ..WriteChecks::new(crate::config_guard::GuardScope::Authoring)
             },
             &mut resolve_ctx,
@@ -3770,6 +4125,7 @@ impl crate::Fluree {
         index_config: Option<&IndexConfig>,
         tracker: Option<&Tracker>,
         policy: Option<&crate::PolicyContext>,
+        request: Option<&RequestGovernance>,
     ) -> Result<StageResult> {
         // Most rejected documents are plain Turtle with a typo; the locator
         // rules TriG out from tokens alone, and a TriG document is located
@@ -3797,6 +4153,7 @@ impl crate::Fluree {
             index_config,
             tracker,
             policy,
+            request,
         )
         .await
     }

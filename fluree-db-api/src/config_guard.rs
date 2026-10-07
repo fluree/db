@@ -120,7 +120,7 @@ const MULTI_VALUED: &[&str] = &[
 /// are a config group's fields. Other `f:` predicates written to a user
 /// graph are data (an edge annotation's `f:reifies*`, a property's
 /// `f:enforceUnique`, a policy), so writing them reads no config.
-fn is_config_field(p: &Sid) -> bool {
+pub(crate) fn is_config_field(p: &Sid) -> bool {
     static FIELDS: OnceLock<FxHashSet<&'static str>> = OnceLock::new();
     p.namespace_code == FLUREE_DB
         && FIELDS
@@ -207,7 +207,10 @@ fn split_group_for_branch_op(
 /// with an `f:` class, asserts no reasoning modes and writes no config field
 /// ([`is_config_field`]) in a user graph: one pass over the staged flakes
 /// establishes that, and nothing else is read. Edge annotations, uniqueness
-/// annotations and policies are such data.
+/// annotations and policy documents are such data. A config field can also
+/// be ordinary data: `f:policyClass` on an identity. A write of one outside
+/// the config graph reads the config graph (small) to learn whether its
+/// subject is a config group, unless the config graph holds no data at all.
 ///
 /// `scope` picks the checks: a branch operation runs R1 and R3 only, and its
 /// messages name the target's config group and the repair. `ns` and
@@ -399,8 +402,13 @@ async fn refuse_groups_split_across_transactions(
     };
 
     // Fields written elsewhere for a node the config graph already points at.
-    // The config graph is small: its edges are read once.
-    if !fields_elsewhere.is_empty() {
+    // The config graph is small: its edges are read once, and not at all when
+    // it holds no data (a ledger without config writing `f:policyClass` on an
+    // identity).
+    let base = view.base();
+    if !fields_elsewhere.is_empty()
+        && crate::config_resolver::config_graph_may_hold_data(&base.snapshot, &*base.novelty)
+    {
         let mut pointed_at: HashMap<Sid, Sid> = HashMap::new();
         for flake in config_graph_flakes(view, RangeMatch::new()).await? {
             if !edges.contains(&flake.p) {
