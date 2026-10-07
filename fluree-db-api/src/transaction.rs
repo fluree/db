@@ -227,17 +227,21 @@ impl Transaction {
     /// operations, such as a `;` Cypher script, that must stage all or
     /// nothing. A read in the discarded group still counts as a read.
     pub async fn rollback_to(&mut self, savepoint: Savepoint) -> Result<()> {
-        if savepoint.0 >= self.operations.len() {
+        let len = savepoint.0;
+        if len >= self.operations.len() {
             return Ok(());
         }
-        self.operations.truncate(savepoint.0);
-        self.stager = stage_all(
+        // Built before anything changes, so a rollback that fails or is
+        // dropped leaves the transaction as it was.
+        let stager = stage_all(
             &self.fluree,
             self.base.clone(),
-            &self.operations,
+            &self.operations[..len],
             &self.context,
         )
         .await?;
+        self.operations.truncate(len);
+        self.stager = stager;
         Ok(())
     }
 

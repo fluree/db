@@ -511,3 +511,28 @@ async fn fuel_is_tracked_across_the_transaction() {
     let err = txn.stage(insert("cy", "Cy", 50)).await.unwrap_err();
     assert!(err.to_string().contains("Fuel limit exceeded"), "{err}");
 }
+
+/// A rollback that fails part way — here, staging the operations before
+/// the savepoint again runs out of fuel — leaves the transaction as it was:
+/// it commits the operations it reports.
+#[tokio::test]
+async fn a_failed_rollback_leaves_the_transaction_as_it_was() {
+    let fluree = fluree().await;
+    let one = fuel_of_one_insert(&fluree).await;
+    // Room for two inserts and part of a third.
+    let mut txn = fluree
+        .begin_transaction(LEDGER, tracked(Some(fuel_limit(one * 2.5))))
+        .await
+        .unwrap();
+    txn.stage(insert("alice", "Alice", 30)).await.unwrap();
+    let savepoint = txn.savepoint();
+    txn.stage(insert("bob", "Bob", 40)).await.unwrap();
+    let err = txn.rollback_to(savepoint).await.unwrap_err();
+    assert!(err.to_string().contains("Fuel limit exceeded"), "{err}");
+    assert_eq!(txn.len(), 2);
+    txn.commit(CommitOpts::default()).await.unwrap();
+    assert_eq!(
+        people(&fluree, &head(&fluree).await).await,
+        vec![json!(["Alice", 30]), json!(["Bob", 40]), json!(["Zed", 1])]
+    );
+}
