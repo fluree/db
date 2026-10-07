@@ -297,7 +297,16 @@ impl SequentialStager {
     /// ORIGINAL base. Valid with zero staged operations (an all-no-op run):
     /// the result is an empty staged view.
     pub(crate) async fn finish(mut self) -> Result<StageResult> {
+        let graphs_staged: FxHashSet<Option<Sid>> =
+            self.folded.iter().map(|flake| flake.g.clone()).collect();
         self.drop_reversed_facts().await?;
+        let graphs_kept: FxHashSet<Option<Sid>> =
+            self.folded.iter().map(|flake| flake.g.clone()).collect();
+        // Graphs whose every staged fact a later operation reversed.
+        let netted_away: FxHashSet<Sid> = graphs_staged
+            .difference(&graphs_kept)
+            .filter_map(Clone::clone)
+            .collect();
         let mut ns_registry = match self.last_ns_registry {
             Some(reg) => reg,
             None => NamespaceRegistry::from_db(&self.original.snapshot),
@@ -327,6 +336,11 @@ impl SequentialStager {
                 graph_delta.insert(g_id, iri.clone());
             }
         }
+        // A graph the request introduced and then emptied again is not
+        // registered, as a reversed fact in the default graph is not
+        // committed. The ids here are the simulation's; the commit registers
+        // graphs by IRI, so leaving one out renumbers nothing.
+        graph_delta.retain(|_, iri| !netted_away.contains(&ns_registry.sid_for_iri(iri)));
 
         let view = StagedLedger::new(self.original, self.folded, &reverse_graph)?;
         Ok(StageResult {

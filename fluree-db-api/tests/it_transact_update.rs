@@ -2493,6 +2493,12 @@ async fn multi_operation_reversed_facts_leave_no_commit() {
                INSERT DATA { ex:s ex:p "kept" }"#,
             "delete-then-reinsert of an existing fact",
         ),
+        (
+            r#"PREFIX ex: <http://example.org/ns/>
+               INSERT DATA { GRAPH ex:new { ex:tmp ex:p "transient" } } ;
+               DELETE DATA { GRAPH ex:new { ex:tmp ex:p "transient" } }"#,
+            "insert-then-delete in a graph the ledger has never seen",
+        ),
     ] {
         let receipt = update(sparql).await;
         assert_eq!(
@@ -2521,6 +2527,51 @@ async fn multi_operation_reversed_facts_leave_no_commit() {
     .expect("query");
     let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
     assert!(json["results"]["bindings"].as_array().unwrap().is_empty());
+}
+
+/// A graph a request introduces and then empties again is left out of its
+/// registrations, while a graph it keeps, introduced alongside, is
+/// registered and read back.
+#[tokio::test]
+async fn multi_operation_registers_only_the_graphs_it_keeps() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "multiop-graphs:main";
+    fluree.create_ledger(ledger_id).await.expect("create");
+    let receipt = fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(
+            r#"PREFIX ex: <http://example.org/ns/>
+               INSERT DATA { GRAPH ex:a { ex:s ex:p "gone" } GRAPH ex:b { ex:s ex:p "kept" } } ;
+               DELETE DATA { GRAPH ex:a { ex:s ex:p "gone" } }"#,
+        )
+        .commit()
+        .await
+        .expect("commit")
+        .receipt;
+    assert_eq!((receipt.t, receipt.flake_count), (1, 1));
+
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/ns/> SELECT ?g ?o WHERE { GRAPH ?g { ex:s ex:p ?o } }",
+    )
+    .await
+    .expect("query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    let found: Vec<(&str, &str)> = json["results"]["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| {
+            (
+                b["g"]["value"].as_str().unwrap(),
+                b["o"]["value"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(found, vec![("http://example.org/ns/b", "kept")], "{json}");
 }
 
 /// PR-1454 review: atomicity on mid-request failure. Op 1 stages
