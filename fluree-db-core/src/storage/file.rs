@@ -1575,16 +1575,10 @@ impl StorageRead for FileStorage {
                     if is_tmp_artifact(&entry.file_name().to_string_lossy()) {
                         continue;
                     }
-                    // Convert back to relative path from base. An address
-                    // separates with `/` on every platform: a Windows path's
-                    // `\` would name a file no live address matches, which
-                    // a sweep reads as an orphan and deletes.
+                    // Convert back to relative path from base, as an address
+                    // path: one with `\` would read to a sweep as an orphan.
                     if let Ok(relative) = path.strip_prefix(&self.base_path) {
-                        let relative_str = relative
-                            .components()
-                            .map(|c| c.as_os_str().to_string_lossy())
-                            .collect::<Vec<_>>()
-                            .join("/");
+                        let relative_str = super::address_path(relative);
                         // Check if it matches the file prefix (if any)
                         if file_prefix.is_empty() || relative_str.starts_with(path_prefix) {
                             // Return as fluree:file:// address
