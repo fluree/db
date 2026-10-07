@@ -652,3 +652,36 @@ async fn a_savepoint_a_rollback_discarded_is_refused() {
     txn.rollback_to(first).await.unwrap();
     assert_eq!(txn.len(), 1);
 }
+
+/// Netting reads the base's values, which in a named graph may live only
+/// in the index: inserting and deleting a value the index holds, read cold,
+/// still deletes it.
+#[tokio::test]
+async fn netting_sees_a_named_graph_value_held_only_in_the_index() {
+    const VALUE: &str = "GRAPH ex:g { ex:s ex:p \"x\" }";
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    {
+        let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+        fluree.create_ledger(LEDGER).await.expect("create");
+        fluree
+            .graph(LEDGER)
+            .transact()
+            .sparql_update(&format!("{PREFIX}INSERT DATA {{ {VALUE} }}"))
+            .commit()
+            .await
+            .expect("seed");
+        crate::support::rebuild_and_publish_index(&fluree, LEDGER).await;
+    }
+    let fluree = FlureeBuilder::file(path).build().expect("cold reload");
+    let mut txn = begin(&fluree).await;
+    for op in ["INSERT", "DELETE"] {
+        txn.stage(TxnOperation::SparqlUpdate(format!(
+            "{PREFIX}{op} DATA {{ {VALUE} }}"
+        )))
+        .await
+        .unwrap();
+    }
+    let receipt = txn.commit(CommitOpts::default()).await.unwrap().receipt;
+    assert_eq!((receipt.t, receipt.retract_count), (2, 1));
+}
