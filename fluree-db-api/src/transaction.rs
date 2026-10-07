@@ -85,7 +85,12 @@ impl TxnOperation {
 /// A point in a [`Transaction`]'s staged operations; see
 /// [`Transaction::savepoint`].
 #[derive(Clone, Copy, Debug)]
-pub struct Savepoint(usize);
+pub struct Savepoint {
+    len: usize,
+    /// The id of the operation the savepoint follows, so one a rollback
+    /// discarded is not mistaken for the operations staged since.
+    last: Option<u64>,
+}
 
 /// The rows a Cypher write's `RETURN` produced: column names and typed cells.
 pub type CypherReturn = (Vec<String>, Vec<Vec<CypherCell>>);
@@ -120,6 +125,12 @@ enum Staged {
     },
 }
 
+/// A staged operation and the id a [`Savepoint`] knows it by.
+struct Op {
+    id: u64,
+    staged: Staged,
+}
+
 /// A transaction open on one ledger: staged operations, readable through
 /// [`Self::db`], committed together by [`Self::commit`].
 ///
@@ -131,7 +142,8 @@ pub struct Transaction {
     base: LedgerState,
     base_head: Option<ContentId>,
     stager: SequentialStager,
-    operations: Vec<Staged>,
+    operations: Vec<Op>,
+    next_id: u64,
     /// Set while the stager may hold an operation `operations` doesn't: a
     /// call interrupted there leaves the operations to be staged again.
     stale: bool,
@@ -174,6 +186,7 @@ impl Fluree {
             base,
             base_head,
             operations: Vec::new(),
+            next_id: 0,
             stale: false,
             context: StageContext {
                 ledger_id: ledger_id.clone(),
@@ -245,7 +258,10 @@ impl Transaction {
 
     /// The operations staged so far, to return to with [`Self::rollback_to`].
     pub fn savepoint(&self) -> Savepoint {
-        Savepoint(self.operations.len())
+        Savepoint {
+            len: self.operations.len(),
+            last: self.operations.last().map(|op| op.id),
+        }
     }
 
     /// Discard every operation staged since `savepoint` — for a group of
@@ -254,10 +270,20 @@ impl Transaction {
     ///
     /// The operations before the savepoint are staged again, so values an
     /// operation computes as it stages — `NOW()`, `UUID()`, `STRUUID()`, and
-    /// a SPARQL update's blank nodes — can change.
+    /// a SPARQL update's blank nodes — can change. Rolling back past a
+    /// savepoint discards it: returning to it later is an error.
     pub async fn rollback_to(&mut self, savepoint: Savepoint) -> Result<()> {
-        let len = savepoint.0;
-        if len >= self.operations.len() {
+        let Savepoint { len, last } = savepoint;
+        let follows = match len.checked_sub(1) {
+            None => last.is_none(),
+            Some(i) => self.operations.get(i).map(|op| op.id) == last,
+        };
+        if !follows {
+            return Err(ApiError::NotFound(
+                "savepoint: a rollback to an earlier savepoint discarded it".to_string(),
+            ));
+        }
+        if len == self.operations.len() {
             return Ok(());
         }
         // Built before anything changes, so a rollback that fails or is
@@ -298,7 +324,11 @@ impl Transaction {
                 Some(rows)
             }
         };
-        self.operations.push(staged);
+        self.operations.push(Op {
+            id: self.next_id,
+            staged,
+        });
+        self.next_id += 1;
         Ok(rows)
     }
 
@@ -621,12 +651,12 @@ async fn stage_cypher(
 async fn stage_all(
     fluree: &Fluree,
     base: LedgerState,
-    operations: &[Staged],
+    operations: &[Op],
     context: &StageContext,
 ) -> Result<SequentialStager> {
     let mut stager = SequentialStager::new(base);
-    for staged in operations {
-        stage_one(fluree, &mut stager, staged, context).await?;
+    for op in operations {
+        stage_one(fluree, &mut stager, &op.staged, context).await?;
     }
     Ok(stager)
 }

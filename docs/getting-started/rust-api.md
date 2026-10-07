@@ -717,7 +717,8 @@ discards it.
 discards the ones after it. The operations before the savepoint are staged
 again, so values computed as they stage — `NOW()`, `UUID()`, `STRUUID()`, a
 SPARQL update's blank nodes — can change; JSON-LD, Turtle and Cypher blank
-nodes keep their identities.
+nodes keep their identities. Rolling back past a savepoint discards it, and
+returning to it later is an error.
 
 ### Export Data
 

@@ -2,8 +2,8 @@
 //! committed as one commit.
 
 use fluree_db_api::{
-    CommitOpts, Fluree, FlureeBuilder, GovernanceOptions, GraphDb, TrackingOptions, Transaction,
-    TransactionOptions, TxnOperation,
+    ApiError, CommitOpts, Fluree, FlureeBuilder, GovernanceOptions, GraphDb, TrackingOptions,
+    Transaction, TransactionOptions, TxnOperation,
 };
 use serde_json::{json, Value as JsonValue};
 
@@ -618,4 +618,25 @@ async fn a_failed_rollback_leaves_the_transaction_as_it_was() {
         people(&fluree, &head(&fluree).await).await,
         vec![json!(["Alice", 30]), json!(["Bob", 40]), json!(["Zed", 1])]
     );
+}
+
+/// Rolling back past a savepoint discards it, as SQL does: returning to it
+/// afterwards is refused rather than landing among later operations.
+#[tokio::test]
+async fn a_savepoint_a_rollback_discarded_is_refused() {
+    let fluree = fluree().await;
+    let mut txn = begin(&fluree).await;
+    txn.stage(insert("a", "A", 1)).await.unwrap();
+    let first = txn.savepoint();
+    txn.stage(insert("b", "B", 2)).await.unwrap();
+    let second = txn.savepoint();
+    txn.rollback_to(first).await.unwrap();
+    txn.stage(insert("c", "C", 3)).await.unwrap();
+    txn.stage(insert("d", "D", 4)).await.unwrap();
+
+    let err = txn.rollback_to(second).await.unwrap_err();
+    assert!(matches!(err, ApiError::NotFound(_)), "{err}");
+    assert_eq!(txn.len(), 3);
+    txn.rollback_to(first).await.unwrap();
+    assert_eq!(txn.len(), 1);
 }
