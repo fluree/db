@@ -12,6 +12,7 @@
 //! - Retraction: a location retracted in novelty over the index
 //! - One row per matching point, as the patterns evaluated as written give
 //! - Distances, ORDER BY + LIMIT, and SPARQL
+//! - Datasets spanning two ledgers, which run without a binary index
 
 #![cfg(feature = "native")]
 
@@ -620,6 +621,81 @@ async fn sparql_geof_distance_uses_geo_index() {
             assert!(
                 (330_000.0..360_000.0).contains(&rows[1].1),
                 "London is ~343km away: {rows:?}"
+            );
+        })
+        .await;
+}
+
+// =============================================================================
+// Multi-ledger datasets
+// =============================================================================
+
+/// A dataset spanning two ledgers runs without a binary index, so the shape
+/// is left as written rather than rewritten into a `GeoSearch` that cannot
+/// run, whether the second ledger joins the default graph or is named.
+#[tokio::test]
+async fn geof_distance_across_two_indexed_ledgers() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (fluree, local, handle) = indexed_fluree(&tmp);
+    let (a, b) = ("it/geo-multi-a:main", "it/geo-multi-b:main");
+
+    local
+        .run_until(async move {
+            let ledger = fluree.create_ledger(a).await.expect("create a");
+            let ledger = insert_city(&fluree, ledger, "ex:paris", "Paris", 2.3522, 48.8566).await;
+            insert_city(&fluree, ledger, "ex:lille", "Lille", 3.0573, 50.6292).await;
+            index_and_load(&fluree, &handle, a).await;
+            let ledger = fluree.create_ledger(b).await.expect("create b");
+            insert_city(&fluree, ledger, "ex:brussels", "Brussels", 4.3517, 50.8503).await;
+            index_and_load(&fluree, &handle, b).await;
+
+            let run = |sparql: String| {
+                let fluree = &fluree;
+                async move {
+                    let rows = fluree
+                        .query_from()
+                        .sparql(&sparql)
+                        .format(fluree_db_api::FormatterConfig::jsonld())
+                        .execute_formatted()
+                        .await
+                        .unwrap_or_else(|e| panic!("{e}: {sparql}"));
+                    let mut found: Vec<String> = rows
+                        .as_array()
+                        .expect("rows")
+                        .iter()
+                        .map(|row| {
+                            row.as_str()
+                                .or_else(|| row[0].as_str())
+                                .unwrap_or_else(|| panic!("a name: {row}"))
+                                .to_string()
+                        })
+                        .collect();
+                    found.sort();
+                    found
+                }
+            };
+            let shape = r#"?place <http://example.org/location> ?loc ;
+                               <http://example.org/name> ?name .
+                        BIND(geof:distance(?loc, "POINT(2.3522 48.8566)"^^geo:wktLiteral) AS ?dist)
+                        FILTER(?dist < 300000)"#;
+            let prefixes = r"PREFIX geo: <http://www.opengis.net/ont/geosparql#>
+                PREFIX geof: <http://www.opengis.net/def/function/geosparql/>";
+
+            for (first, second) in [(a, b), (b, a)] {
+                assert_eq!(
+                    run(format!(
+                        "{prefixes} SELECT ?name FROM <{first}> FROM <{second}> WHERE {{ {shape} }}"
+                    ))
+                    .await,
+                    ["Brussels", "Lille", "Paris"]
+                );
+            }
+            assert_eq!(
+                run(format!(
+                    "{prefixes} SELECT ?name FROM <{a}> FROM NAMED <{b}> WHERE {{ GRAPH <{b}> {{ {shape} }} }}"
+                ))
+                .await,
+                ["Brussels"]
             );
         })
         .await;

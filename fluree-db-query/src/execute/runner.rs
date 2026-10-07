@@ -158,6 +158,10 @@ pub struct PrepareConfig<'a> {
     pub binary_store: Option<&'a Arc<BinaryIndexStore>>,
     /// Planning-time decisions captured before prepare runs.
     pub planning: crate::temporal_mode::PlanningContext,
+    /// Whether execution will hand operators a binary store. A dataset that
+    /// spans several ledgers runs without one, so nothing may be rewritten
+    /// into an operator that reads it.
+    pub binary_scans: bool,
 }
 
 impl<'a> PrepareConfig<'a> {
@@ -171,6 +175,7 @@ impl<'a> PrepareConfig<'a> {
         Self {
             binary_store,
             planning: crate::temporal_mode::PlanningContext::current(),
+            binary_scans: true,
         }
     }
 
@@ -186,6 +191,7 @@ impl<'a> PrepareConfig<'a> {
         Self {
             binary_store,
             planning: crate::temporal_mode::PlanningContext::current().with_semantic_elision(allow),
+            binary_scans: true,
         }
     }
 
@@ -199,7 +205,15 @@ impl<'a> PrepareConfig<'a> {
         Self {
             binary_store,
             planning: crate::temporal_mode::PlanningContext::history(),
+            binary_scans: true,
         }
+    }
+
+    /// Execution will give operators no binary store (see
+    /// [`Self::binary_scans`]).
+    pub fn without_binary_scans(mut self) -> Self {
+        self.binary_scans = false;
+        self
     }
 }
 
@@ -243,6 +257,7 @@ pub async fn prepare_execution_with_config(
 ) -> Result<PreparedExecution> {
     let binary_store = config.binary_store;
     let planning = config.planning;
+    let binary_scans = config.binary_scans;
     let span = tracing::debug_span!(
         "query_prepare",
         db_t = db.snapshot.t,
@@ -426,11 +441,13 @@ pub async fn prepare_execution_with_config(
             // covering `to_t` (a ledger not yet indexed, a time before the
             // index's base) the patterns stay as written and evaluate as such.
             // The operator reads the store its execution context takes from
-            // the snapshot, which a caller need not have passed in here.
-            let geo_index_covers = binary_store
-                .cloned()
-                .or_else(|| crate::context::ExecutionContext::extract_binary_store(db.snapshot))
-                .is_some_and(|store| db.t >= store.base_t());
+            // the snapshot, which a caller need not have passed in here,
+            // unless execution runs with none (a multi-ledger dataset).
+            let geo_index_covers = binary_scans
+                && binary_store
+                    .cloned()
+                    .or_else(|| crate::context::ExecutionContext::extract_binary_store(db.snapshot))
+                    .is_some_and(|store| db.t >= store.base_t());
             let rewritten_patterns = crate::geo_rewrite::rewrite_geo_patterns_if_indexed(
                 rewritten_patterns,
                 &|iri: &str| db.snapshot.encode_iri(iri),
