@@ -564,10 +564,6 @@ impl BatchSink for CollectSink {
     }
 }
 
-/// Reject query shapes the streaming endpoint does not support.
-///
-/// Uses `QueryError::InvalidQuery` (not `ApiError::query`, which maps to a 500)
-/// so these client mistakes surface as a `4xx`.
 /// The compactor for streamed rows. Rows are the `bindings` entries `/query`
 /// returns, so they take its SPARQL-results profile: absolute IRIs, since a
 /// row carries no prefix map to expand a compact one against.
@@ -579,6 +575,10 @@ fn row_compactor(
         .with_absolute_iris(crate::format::FormatterConfig::sparql_json().absolute_iris)
 }
 
+/// Reject query shapes the streaming endpoint does not support.
+///
+/// Uses `QueryError::InvalidQuery` (not `ApiError::query`, which maps to a 500)
+/// so these client mistakes surface as a `4xx`.
 fn ensure_streamable(output: &fluree_db_query::ir::QueryOutput) -> Result<()> {
     let reject = |what: &str| {
         Err(ApiError::Query(fluree_db_query::QueryError::InvalidQuery(
