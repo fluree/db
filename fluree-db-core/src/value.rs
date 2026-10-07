@@ -952,8 +952,12 @@ impl std::hash::Hash for FlakeValue {
                 } else if d.is_infinite() {
                     3u8.hash(state); // infinity tag
                     (*d > 0.0).hash(state); // sign
-                } else if d.fract() == 0.0 && *d >= i64::MIN as f64 && *d <= i64::MAX as f64 {
-                    // Integer-valued double in i64 range: hash as integer
+                } else if d.fract() == 0.0
+                    && *d >= i64::MIN as f64
+                    && *d < 9_223_372_036_854_775_808.0
+                {
+                    // Integer-valued double in i64 range (`i64::MAX as f64`
+                    // rounds up to 2^63, outside it): hash as integer
                     0u8.hash(state); // integer tag
                     BigInt::from(*d as i64).to_signed_bytes_le().hash(state);
                 } else {
@@ -1764,5 +1768,59 @@ mod tests {
             Some(Ordering::Less)
         );
         assert_eq!(min.cmp(&as_double), Ordering::Equal);
+    }
+
+    /// Equality is by value across numeric types (`Long(1) == Double(1.0)`,
+    /// `Double(2^63) == BigInt(2^63)`); equal values must hash equally across
+    /// those types too.
+    #[test]
+    fn equal_numbers_of_different_types_hash_equally() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        use std::str::FromStr;
+        let hash = |v: &FlakeValue| {
+            let mut h = DefaultHasher::new();
+            v.hash(&mut h);
+            h.finish()
+        };
+        let big = |s: &str| FlakeValue::BigInt(Box::new(BigInt::from_str(s).unwrap()));
+        let dec = |s: &str| FlakeValue::Decimal(Box::new(BigDecimal::from_str(s).unwrap()));
+        let two_63 = 9_223_372_036_854_775_808.0_f64;
+        let values = [
+            FlakeValue::Long(0),
+            FlakeValue::Double(0.0),
+            FlakeValue::Double(-0.0),
+            dec("0"),
+            FlakeValue::Long(1),
+            FlakeValue::Double(1.0),
+            dec("1.0"),
+            FlakeValue::Double(2.5),
+            dec("2.5"),
+            dec("2.50"),
+            FlakeValue::Long(1 << 53),
+            FlakeValue::Double((1u64 << 53) as f64),
+            FlakeValue::Long(i64::MAX),
+            FlakeValue::Long(i64::MIN),
+            FlakeValue::Double(-two_63),
+            FlakeValue::Double(two_63),
+            big("9223372036854775808"),
+            dec("9223372036854775808"),
+            FlakeValue::Double(1e19),
+            big("10000000000000000000"),
+            big("-9223372036854775809"),
+        ];
+        let mut equal_pairs = 0;
+        for a in &values {
+            for b in &values {
+                if a == b {
+                    equal_pairs += 1;
+                    assert_eq!(hash(a), hash(b), "{a:?} == {b:?}");
+                }
+            }
+        }
+        assert!(
+            equal_pairs > values.len(),
+            "some cross-type pairs are equal"
+        );
     }
 }
