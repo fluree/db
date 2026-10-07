@@ -297,16 +297,19 @@ struct Substitution<'p> {
 
 impl<'p> Substitution<'p> {
     fn new(params: &'p ParamMap) -> Result<Self> {
-        let params = params
-            .iter()
-            .map(|(name, json)| {
-                let name = name.trim_start_matches(['?', '$']);
-                let value = Value::parse(name, json)?;
-                Ok((name, Param { value, used: false }))
-            })
-            .collect::<Result<_>>()?;
+        let mut by_name = HashMap::with_capacity(params.len());
+        for (key, json) in params {
+            let name = key.trim_start_matches(['?', '$']);
+            let value = Value::parse(name, json)?;
+            if by_name.insert(name, Param { value, used: false }).is_some() {
+                return Err(ParamError::new(
+                    name,
+                    format!("is given twice (`{name}`, `?{name}` and `${name}` are one variable)"),
+                ));
+            }
+        }
         Ok(Self {
-            params,
+            params: by_name,
             in_remote_service: false,
         })
     }
@@ -896,6 +899,16 @@ mod tests {
         assert!(
             matches!(&patterns[1].object, Term::BlankNode(BlankNode { value: crate::ast::BlankNodeValue::Labeled(l), .. }) if l.as_ref() == "fdb-1")
         );
+    }
+
+    #[test]
+    fn a_name_given_twice_is_an_error() {
+        let err = substituted(
+            "SELECT ?s WHERE { ?s <name> $name }",
+            json!({"name": "Alice", "$name": "Bob"}),
+        )
+        .unwrap_err();
+        assert!(err.reason.contains("given twice"), "{err}");
     }
 
     #[test]
