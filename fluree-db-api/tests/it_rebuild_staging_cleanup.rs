@@ -25,7 +25,7 @@ impl ContentStore for RangeReadsFail {
         self.0.has(id).await
     }
 
-    async fn get(&self, id: &ContentId) -> StorageResult<Vec<u8>> {
+    async fn get(&self, id: &ContentId) -> StorageResult<fluree_db_core::ContentBytes> {
         self.0.get(id).await
     }
 

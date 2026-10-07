@@ -1048,7 +1048,7 @@ impl BinaryIndexStore {
             if persist {
                 disk_cache.best_effort_write(&cache_path_owned, &data);
             }
-            Ok(data)
+            Ok(data.into_vec())
         })
     }
 
@@ -3752,7 +3752,10 @@ pub(crate) mod tests {
             self.inner.has(id).await
         }
 
-        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+        async fn get(
+            &self,
+            id: &ContentId,
+        ) -> fluree_db_core::Result<fluree_db_core::ContentBytes> {
             self.get_calls.fetch_add(1, AtomicOrdering::Relaxed);
             self.inner.get(id).await
         }
@@ -3940,7 +3943,10 @@ pub(crate) mod tests {
             self.inner.has(id).await
         }
 
-        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+        async fn get(
+            &self,
+            id: &ContentId,
+        ) -> fluree_db_core::Result<fluree_db_core::ContentBytes> {
             self.check_injected_failure()?;
             self.inner.get(id).await
         }
@@ -4664,7 +4670,10 @@ pub(crate) mod tests {
             self.inner.has(id).await
         }
 
-        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+        async fn get(
+            &self,
+            id: &ContentId,
+        ) -> fluree_db_core::Result<fluree_db_core::ContentBytes> {
             self.cas_calls.fetch_add(1, AtomicOrdering::Relaxed);
             self.inner.get(id).await
         }
@@ -4733,7 +4742,10 @@ pub(crate) mod tests {
             self.inner.has(id).await
         }
 
-        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+        async fn get(
+            &self,
+            id: &ContentId,
+        ) -> fluree_db_core::Result<fluree_db_core::ContentBytes> {
             self.inner.get(id).await
         }
 

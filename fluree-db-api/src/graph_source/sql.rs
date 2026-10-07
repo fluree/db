@@ -382,6 +382,7 @@ impl crate::Fluree {
                 .get(&cid)
                 .await
                 .map_err(|e| crate::ApiError::Config(format!("read mapping: {e}")))?
+                .into_vec()
         } else {
             let storage = self.admin_storage().ok_or_else(|| {
                 crate::ApiError::Config(

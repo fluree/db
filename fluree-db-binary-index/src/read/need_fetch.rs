@@ -283,12 +283,15 @@ pub(crate) mod tests {
             self.inner.has(id).await
         }
 
-        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+        async fn get(
+            &self,
+            id: &ContentId,
+        ) -> fluree_db_core::Result<fluree_db_core::ContentBytes> {
             let bytes = self.inner.get(id).await?;
             // Fetch-pins contract: fetched bytes become resident.
             self.resident
                 .write()
-                .insert(id.clone(), Arc::from(bytes.clone().into_boxed_slice()));
+                .insert(id.clone(), Arc::from(&bytes[..]));
             Ok(bytes)
         }
 
@@ -434,7 +437,10 @@ pub(crate) mod tests {
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             self.inner.has(id).await
         }
-        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+        async fn get(
+            &self,
+            id: &ContentId,
+        ) -> fluree_db_core::Result<fluree_db_core::ContentBytes> {
             self.inner.get(id).await
         }
         async fn put(&self, kind: ContentKind, bytes: &[u8]) -> fluree_db_core::Result<ContentId> {

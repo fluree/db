@@ -846,7 +846,8 @@ impl LazyVectorArena {
             } else {
                 fut.await.map_err(|e| io::Error::other(e.to_string()))
             }
-        })?;
+        })?
+        .into_vec();
         if !crate::read::artifact_cache::uses_disk_cache(cas.as_ref()) {
             return Ok(bytes);
         }

@@ -541,7 +541,7 @@ fn fetch_and_load(
 
     if !disk_cache {
         // Heap-backed regardless of size: no disk copy outside the store.
-        let backing = LoadedBacking::InMemory(Arc::from(bytes));
+        let backing = LoadedBacking::InMemory(Arc::from(bytes.into_vec()));
         let meta = parse_pack_meta(backing.bytes())?;
         validate_lazy_meta(&meta, expected_first_id, expected_last_id, ctx)?;
         return Ok(LazyLoaded { meta, backing });
@@ -1186,7 +1186,10 @@ mod tests {
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             self.fallback.has(id).await
         }
-        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+        async fn get(
+            &self,
+            id: &ContentId,
+        ) -> fluree_db_core::Result<fluree_db_core::ContentBytes> {
             self.gets.fetch_add(1, Ordering::Relaxed);
             self.fallback.get(id).await
         }
@@ -1301,7 +1304,10 @@ mod tests {
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             self.inner.has(id).await
         }
-        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+        async fn get(
+            &self,
+            id: &ContentId,
+        ) -> fluree_db_core::Result<fluree_db_core::ContentBytes> {
             self.gets.fetch_add(1, Ordering::Relaxed);
             self.inner.get(id).await
         }

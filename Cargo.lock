@@ -3219,6 +3219,7 @@ dependencies = [
  "hex",
  "libc",
  "lru 0.12.5",
+ "memmap2",
  "moka",
  "multihash",
  "num-bigint",

@@ -85,7 +85,7 @@ impl<C: ContentStore + Send + Sync> ContentStore for CountingContentStore<C> {
         self.inner.has(id).await
     }
 
-    async fn get(&self, id: &ContentId) -> StorageResult<Vec<u8>> {
+    async fn get(&self, id: &ContentId) -> StorageResult<fluree_db_core::ContentBytes> {
         let bytes = self.inner.get(id).await?;
         self.counters.get_calls.fetch_add(1, Ordering::Relaxed);
         self.counters

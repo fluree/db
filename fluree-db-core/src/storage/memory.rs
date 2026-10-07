@@ -236,7 +236,7 @@ impl StorageCas for MemoryStorage {
 /// This is the CID-first counterpart to [`MemoryStorage`].
 #[derive(Debug, Clone)]
 pub struct MemoryContentStore {
-    data: Arc<RwLock<HashMap<ContentId, Vec<u8>>>>,
+    data: Arc<RwLock<HashMap<ContentId, Arc<[u8]>>>>,
 }
 
 impl Default for MemoryContentStore {
@@ -270,17 +270,18 @@ impl ContentStore for MemoryContentStore {
         Ok(self.data.read().contains_key(id))
     }
 
-    async fn get(&self, id: &ContentId) -> Result<Vec<u8>> {
+    async fn get(&self, id: &ContentId) -> Result<super::ContentBytes> {
         self.data
             .read()
             .get(id)
             .cloned()
+            .map(super::ContentBytes::Shared)
             .ok_or_else(|| crate::error::Error::not_found(id.to_string()))
     }
 
     async fn put(&self, kind: ContentKind, bytes: &[u8]) -> Result<ContentId> {
         let id = ContentId::new(kind, bytes);
-        self.data.write().insert(id.clone(), bytes.to_vec());
+        self.data.write().insert(id.clone(), Arc::from(bytes));
         Ok(id)
     }
 
@@ -290,7 +291,7 @@ impl ContentStore for MemoryContentStore {
                 "CID verification failed: provided CID {id} does not match bytes"
             )));
         }
-        self.data.write().insert(id.clone(), bytes.to_vec());
+        self.data.write().insert(id.clone(), Arc::from(bytes));
         Ok(())
     }
 

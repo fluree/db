@@ -117,6 +117,7 @@ impl Durability {
     }
 }
 
+mod content_bytes;
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 mod file;
 mod memory;
@@ -124,6 +125,7 @@ pub mod residency;
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 mod wal;
 
+pub use content_bytes::ContentBytes;
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub use file::{FileStorage, STORAGE_METHOD_FILE};
 pub use memory::{MemoryContentStore, MemoryStorage, STORAGE_METHOD_MEMORY};
@@ -658,7 +660,7 @@ pub trait ContentStore: Debug + Send + Sync {
     async fn has(&self, id: &ContentId) -> Result<bool>;
 
     /// Retrieve object bytes by CID.
-    async fn get(&self, id: &ContentId) -> Result<Vec<u8>>;
+    async fn get(&self, id: &ContentId) -> Result<ContentBytes>;
 
     /// Store bytes, computing CID from kind + bytes. Returns the CID.
     async fn put(&self, kind: ContentKind, bytes: &[u8]) -> Result<ContentId>;
@@ -802,7 +804,7 @@ impl ContentStore for Arc<dyn ContentStore> {
         self.as_ref().sync().await
     }
 
-    async fn get(&self, id: &ContentId) -> Result<Vec<u8>> {
+    async fn get(&self, id: &ContentId) -> Result<ContentBytes> {
         self.as_ref().get(id).await
     }
 
@@ -987,24 +989,24 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         Ok(false)
     }
 
-    async fn get(&self, id: &ContentId) -> Result<Vec<u8>> {
+    async fn get(&self, id: &ContentId) -> Result<ContentBytes> {
         let address = self.cid_to_address(id)?;
         // Keep the primary miss's message rather than discarding it: it carries
         // the resolved path, and — for a zero-length blob — the reason the
         // backend called it absent. Rebuilding a bare `not_found(address)` here
         // throws both away, and this is the error a caller actually sees.
         let primary = match self.storage.read_bytes(&address).await {
-            Ok(bytes) => return Ok(bytes),
+            Ok(bytes) => return Ok(bytes.into()),
             Err(crate::error::Error::NotFound(reason)) => reason,
             Err(e) => return Err(e),
         };
         // Fallback: dicts moved from per-branch to @shared namespace
         if let Some(legacy) = self.legacy_dict_address(id) {
-            return self.storage.read_bytes(&legacy).await;
+            return self.storage.read_bytes(&legacy).await.map(Into::into);
         }
         // Fallback: index roots stored with .json before .fir6 rename
         if let Some(legacy) = self.legacy_index_root_address(id) {
-            return self.storage.read_bytes(&legacy).await;
+            return self.storage.read_bytes(&legacy).await.map(Into::into);
         }
         Err(crate::error::Error::not_found(primary))
     }
@@ -1428,7 +1430,7 @@ impl ContentStore for BranchedContentStore {
         Ok(false)
     }
 
-    async fn get(&self, id: &ContentId) -> Result<Vec<u8>> {
+    async fn get(&self, id: &ContentId) -> Result<ContentBytes> {
         match self.branch_store.get(id).await {
             Ok(bytes) => return Ok(bytes),
             Err(e) if self.parents.is_empty() => return Err(e),

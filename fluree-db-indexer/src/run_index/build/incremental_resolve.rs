@@ -48,6 +48,7 @@ async fn fetch_cached_or_get(
         None => cs
             .get(cid)
             .await
+            .map(fluree_db_core::ContentBytes::into_vec)
             .map_err(|e| IncrementalResolveError::RootLoad(format!("{context}: {e}"))),
     }
 }
@@ -1102,9 +1103,13 @@ async fn fetch_commit_bytes(
                     ))
                 })
         }
-        None => cs.get(cid).await.map_err(|e| {
-            IncrementalResolveError::CommitChain(format!("failed to load commit {cid}: {e}"))
-        }),
+        None => cs
+            .get(cid)
+            .await
+            .map(fluree_db_core::ContentBytes::into_vec)
+            .map_err(|e| {
+                IncrementalResolveError::CommitChain(format!("failed to load commit {cid}: {e}"))
+            }),
     }
 }
 
@@ -1163,6 +1168,7 @@ async fn walk_commit_chain_since(
                             "failed to load commit {cid}: {e}"
                         ))
                     })?;
+                    let bytes = bytes.into_vec();
                     Ok::<_, IncrementalResolveError>(WalkedCommit { cid, t, bytes })
                 })
                 .buffered(k);

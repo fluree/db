@@ -4391,11 +4391,13 @@ async fn compact_window(
         .iter()
         .map(|cid| content_store.get(cid))
         .collect();
-    let fetched: std::result::Result<Vec<Vec<u8>>, fluree_db_core::error::Error> =
-        stream::iter(fetches)
-            .buffered(COMPACTION_CONCURRENCY)
-            .try_collect()
-            .await;
+    let fetched: std::result::Result<
+        Vec<fluree_db_core::ContentBytes>,
+        fluree_db_core::error::Error,
+    > = stream::iter(fetches)
+        .buffered(COMPACTION_CONCURRENCY)
+        .try_collect()
+        .await;
 
     let bytes = match fetched {
         Ok(b) => b,
@@ -4409,7 +4411,7 @@ async fn compact_window(
         }
     };
 
-    let borrowed: Vec<&[u8]> = bytes.iter().map(Vec::as_slice).collect();
+    let borrowed: Vec<&[u8]> = bytes.iter().map(|b| &b[..]).collect();
     let merged = concat_forward_packs(&borrowed).map_err(|e| {
         IndexerError::StorageWrite(format!("forward pack compaction ({stream_label}): {e}"))
     })?;

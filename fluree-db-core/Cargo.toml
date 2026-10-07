@@ -61,6 +61,10 @@ fluree-db-credential = { path = "../fluree-db-credential", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# `ContentBytes::Mapped`: stores hand out file mappings.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+memmap2 = "0.9"
+
 [dev-dependencies]
 tokio = { workspace = true }
 postcard = { workspace = true }

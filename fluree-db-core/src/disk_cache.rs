@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
-use crate::{ContentId, ContentStore};
+use crate::{ContentBytes, ContentId, ContentStore};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
@@ -880,7 +880,10 @@ async fn fetch_uncached(
 ) -> io::Result<Vec<u8>> {
     UNCACHED_FLIGHTS
         .coalesce(target, false, || async {
-            cs.get(id).await.map_err(storage_to_io_error)
+            cs.get(id)
+                .await
+                .map(ContentBytes::into_vec)
+                .map_err(storage_to_io_error)
         })
         .await
 }
@@ -933,7 +936,10 @@ async fn fetch_through_cache(
     }
     DiskArtifactCache::for_dir(cache_dir)
         .coalesced_fetch(cached, || async {
-            cs.get(id).await.map_err(storage_to_io_error)
+            cs.get(id)
+                .await
+                .map(ContentBytes::into_vec)
+                .map_err(storage_to_io_error)
         })
         .await
 }
@@ -1400,10 +1406,10 @@ mod tests {
         async fn has(&self, _id: &ContentId) -> crate::error::Result<bool> {
             Ok(true)
         }
-        async fn get(&self, _id: &ContentId) -> crate::error::Result<Vec<u8>> {
+        async fn get(&self, _id: &ContentId) -> crate::error::Result<crate::storage::ContentBytes> {
             self.gets.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
-            Ok(self.data.clone())
+            Ok(self.data.clone().into())
         }
         async fn put(
             &self,

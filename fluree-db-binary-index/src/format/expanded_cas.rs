@@ -226,7 +226,7 @@ impl ChainCasIds {
             ))
         })?;
 
-        Ok(Some(bytes))
+        Ok(Some(bytes.into_vec()))
     }
 }
 
@@ -363,7 +363,7 @@ mod tests {
             self.inner.has(id).await
         }
 
-        async fn get(&self, id: &ContentId) -> Result<Vec<u8>> {
+        async fn get(&self, id: &ContentId) -> Result<fluree_db_core::ContentBytes> {
             *self.gets.lock().unwrap().entry(id.clone()).or_insert(0) += 1;
             self.inner.get(id).await
         }

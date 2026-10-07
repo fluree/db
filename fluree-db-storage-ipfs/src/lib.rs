@@ -166,11 +166,15 @@ impl ContentStore for IpfsStorage {
         }
     }
 
-    async fn get(&self, id: &ContentId) -> fluree_db_core::error::Result<Vec<u8>> {
+    async fn get(
+        &self,
+        id: &ContentId,
+    ) -> fluree_db_core::error::Result<fluree_db_core::ContentBytes> {
         let cid_str = id.to_string();
         self.kubo
             .block_get(&cid_str)
             .await
+            .map(Into::into)
             .map_err(fluree_db_core::error::Error::from)
     }
 

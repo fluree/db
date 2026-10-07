@@ -582,6 +582,7 @@ impl DictTreeReader {
                     } else {
                         cs.get(&cid)
                             .await
+                            .map(fluree_db_core::ContentBytes::into_vec)
                             .map_err(|e| io::Error::other(e.to_string()))
                     }
                 };
@@ -895,9 +896,12 @@ mod tests {
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             Ok(self.paths.lock().contains_key(id))
         }
-        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+        async fn get(
+            &self,
+            id: &ContentId,
+        ) -> fluree_db_core::Result<fluree_db_core::ContentBytes> {
             let path = self.paths.lock().get(id).cloned().expect("known cid");
-            Ok(std::fs::read(path).unwrap())
+            Ok(std::fs::read(path).unwrap().into())
         }
         async fn put(
             &self,
@@ -1040,7 +1044,10 @@ mod tests {
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             self.inner.has(id).await
         }
-        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+        async fn get(
+            &self,
+            id: &ContentId,
+        ) -> fluree_db_core::Result<fluree_db_core::ContentBytes> {
             self.inner.get(id).await
         }
         async fn put(
@@ -1154,7 +1161,10 @@ mod tests {
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             self.inner.has(id).await
         }
-        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+        async fn get(
+            &self,
+            id: &ContentId,
+        ) -> fluree_db_core::Result<fluree_db_core::ContentBytes> {
             self.gets.fetch_add(1, Ordering::Relaxed);
             self.inner.get(id).await
         }

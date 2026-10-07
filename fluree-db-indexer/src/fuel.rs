@@ -127,7 +127,7 @@ impl ContentStore for MeteredContentStore {
         self.inner.sync().await
     }
 
-    async fn get(&self, id: &ContentId) -> StorageResult<Vec<u8>> {
+    async fn get(&self, id: &ContentId) -> StorageResult<fluree_db_core::ContentBytes> {
         self.inner.get(id).await
     }
 

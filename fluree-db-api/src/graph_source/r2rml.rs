@@ -2397,11 +2397,14 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
         // fall back to raw storage read (legacy address-based mappings).
         let mapping_bytes = if let Ok(cid) = mapping_source.parse::<fluree_db_core::ContentId>() {
             let cs = self.fluree.content_store(graph_source_id);
-            cs.get(&cid).await.map_err(|e| {
-                QueryError::InvalidQuery(format!(
-                    "Failed to load R2RML mapping (CID {mapping_source}): {e}"
-                ))
-            })?
+            cs.get(&cid)
+                .await
+                .map_err(|e| {
+                    QueryError::InvalidQuery(format!(
+                        "Failed to load R2RML mapping (CID {mapping_source}): {e}"
+                    ))
+                })?
+                .into_vec()
         } else {
             let storage = self.fluree.admin_storage().ok_or_else(|| {
                 QueryError::InvalidQuery(format!(

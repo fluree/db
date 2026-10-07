@@ -1659,7 +1659,10 @@ mod tests {
         async fn has(&self, _id: &ContentId) -> fluree_db_core::error::Result<bool> {
             Ok(false)
         }
-        async fn get(&self, id: &ContentId) -> fluree_db_core::error::Result<Vec<u8>> {
+        async fn get(
+            &self,
+            id: &ContentId,
+        ) -> fluree_db_core::error::Result<fluree_db_core::ContentBytes> {
             Err(fluree_db_core::error::Error::not_found(id.to_string()))
         }
         async fn put(

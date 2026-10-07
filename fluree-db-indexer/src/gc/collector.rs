@@ -747,7 +747,7 @@ async fn get_cached_or_remote(
             .await
             .map_err(|e| crate::error::IndexerError::StorageRead(e.to_string()))?,
         ),
-        None => Ok(store.get(id).await?),
+        None => Ok(store.get(id).await?.into_vec()),
     }
 }
 

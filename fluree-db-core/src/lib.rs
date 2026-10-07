@@ -188,6 +188,7 @@ pub use storage::{
     CasAction,
     CasOutcome,
     ContentAddressedWrite,
+    ContentBytes,
     ContentStore,
     ContentWriteResult,
     Durability,
