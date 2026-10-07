@@ -157,6 +157,10 @@ impl ContentStore for MeteredContentStore {
         self.inner.is_remote()
     }
 
+    fn supports_ranged_reads(&self) -> bool {
+        self.inner.supports_ranged_reads()
+    }
+
     async fn release(&self, id: &ContentId) -> StorageResult<()> {
         self.inner.release(id).await
     }

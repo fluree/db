@@ -936,13 +936,13 @@ impl BinaryIndexStore {
     }
 
     fn get_leaf_bytes_shared_native(&self, leaf_cid: &ContentId) -> io::Result<ContentBytes> {
+        let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
         if let Some(cs) = self.cas.as_ref() {
-            let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
             if let Some(bytes) = self.local_leaf_bytes(cs, leaf_cid, leaf_id)? {
                 return Ok(bytes);
             }
         }
-        self.get_leaf_bytes_sync(leaf_cid)
+        self.fetch_whole_leaf(leaf_cid, leaf_id)
     }
 
     /// A leaf's bytes when they are on this machine: the shared cache entry,
@@ -1023,10 +1023,10 @@ impl BinaryIndexStore {
         // sync bridge: run the async CAS request without deadlocking current-thread runtimes.
         let cs = Arc::clone(cs);
         let cid = leaf_cid.clone();
-        let cache_path_owned = cache_path;
+        let cache_path_owned = cache_path.clone();
         let disk_cache = Arc::clone(&self.disk_cache);
         let timeout = cas_sync_timeout();
-        run_sync_on_runtime(async move {
+        let data = run_sync_on_runtime(async move {
             let fut = cs.get(&cid);
             let data = if let Some(dur) = timeout {
                 tokio::time::timeout(dur, fut)
@@ -1047,6 +1047,26 @@ impl BinaryIndexStore {
                 disk_cache.best_effort_write(&cache_path_owned, &data);
             }
             Ok(data)
+        })?;
+        // Read back the copy just written, so a large leaf is held as a
+        // mapping (page cache) rather than heap.
+        if persist {
+            if let Ok(Some(local)) = map_file(&cache_path) {
+                return Ok(local);
+            }
+        }
+        Ok(data)
+    }
+
+    /// Fetch a remote leaf whole and keep it in the cache, so later opens
+    /// neither fetch nor range-read it. Whatever backs the fetched bytes,
+    /// the store does not serve them locally, so the cache is what holds
+    /// them.
+    fn fetch_whole_leaf(&self, leaf_cid: &ContentId, leaf_id: u128) -> io::Result<ContentBytes> {
+        let bytes = self.get_leaf_bytes_sync(leaf_cid)?;
+        Ok(match &self.leaflet_cache {
+            Some(cache) => cache.get_or_insert_leaf_bytes(leaf_id, bytes),
+            None => bytes,
         })
     }
 
@@ -1059,7 +1079,8 @@ impl BinaryIndexStore {
     ///   shared bytes, with the directory shared through the cache.
     /// - Remote (S3/etc): a `RangeReadLeafHandle` (header+dir only, lazy
     ///   column fetch via byte-range reads), promoted to a whole-blob fetch
-    ///   once the leaf is opened again.
+    ///   once the leaf is opened again — or at once, for a store that
+    ///   cannot read ranges without fetching the whole object.
     pub fn open_leaf_handle(
         &self,
         leaf_cid: &ContentId,
@@ -1104,9 +1125,7 @@ impl BinaryIndexStore {
         sidecar_cid: Option<&ContentId>,
         need_replay: bool,
     ) -> io::Result<Box<dyn super::leaf_access::LeafHandle>> {
-        use super::leaf_access::{
-            fetch_header_and_directory, FullBlobLeafHandle, RangeReadLeafHandle,
-        };
+        use super::leaf_access::{fetch_header_and_directory, RangeReadLeafHandle};
         let cs = self
             .cas
             .as_ref()
@@ -1119,24 +1138,26 @@ impl BinaryIndexStore {
         }
 
         let touch_count = self.note_remote_leaf_open(leaf_cid);
+        let known_dir = self.remote_leaf_metadata.read().get(leaf_cid).cloned();
 
-        if let Some(dir) = self.remote_leaf_metadata.read().get(leaf_cid).cloned() {
-            if touch_count >= HOT_REMOTE_LEAF_PROMOTION_TOUCHES {
-                tracing::debug!(
-                    leaf = %leaf_cid,
-                    need_replay,
-                    source = "remote_promote_disk",
-                    touch_count,
-                    "promoting hot remote leaf to disk cache"
-                );
-                let bytes = self.get_leaf_bytes_sync(leaf_cid)?;
-                let sidecar = if need_replay {
-                    self.fetch_sidecar_bytes_sync(sidecar_cid)?
-                } else {
-                    None
-                };
-                return Ok(Box::new(FullBlobLeafHandle::new(bytes, sidecar, leaf_id)?));
-            }
+        // A leaf opened again is fetched whole rather than range-read again,
+        // and so is every leaf of a store whose range reads fetch the whole
+        // object anyway.
+        if !cs.supports_ranged_reads()
+            || (known_dir.is_some() && touch_count >= HOT_REMOTE_LEAF_PROMOTION_TOUCHES)
+        {
+            tracing::debug!(
+                leaf = %leaf_cid,
+                need_replay,
+                source = "remote_whole",
+                touch_count,
+                "fetching remote leaf whole"
+            );
+            let bytes = self.fetch_whole_leaf(leaf_cid, leaf_id)?;
+            return self.leaf_handle_from_bytes(bytes, leaf_id, sidecar_cid, need_replay);
+        }
+
+        if let Some(dir) = known_dir {
             let sc_cid = if need_replay {
                 sidecar_cid.cloned()
             } else {
@@ -1259,6 +1280,12 @@ impl BinaryIndexStore {
         {
             Some(bytes) => Some(bytes),
             None => cs.get_local(leaf_cid).map_err(storage_io_error)?,
+        };
+        let local = match local {
+            Some(bytes) => Some(bytes),
+            // Range reads that fetch the whole leaf anyway: fetch it once.
+            None if !cs.supports_ranged_reads() => Some(self.fetch_whole_leaf(leaf_cid, leaf_id)?),
+            None => None,
         };
         if let Some(bytes) = local {
             let header = crate::format::leaf::decode_leaf_header_v3(&bytes)?;
@@ -3608,6 +3635,7 @@ pub(crate) mod tests {
         get_calls: Arc<AtomicUsize>,
         range_calls: Arc<AtomicUsize>,
         permits_plaintext_cache: bool,
+        ranged: bool,
     }
 
     impl CountingContentStore {
@@ -3617,6 +3645,15 @@ pub(crate) mod tests {
                 get_calls: Arc::new(AtomicUsize::new(0)),
                 range_calls: Arc::new(AtomicUsize::new(0)),
                 permits_plaintext_cache: true,
+                ranged: true,
+            }
+        }
+
+        /// Answers like a store whose range reads fetch the whole object.
+        fn without_ranged_reads() -> Self {
+            Self {
+                ranged: false,
+                ..Self::new()
             }
         }
 
@@ -3678,6 +3715,10 @@ pub(crate) mod tests {
 
         fn is_remote(&self) -> bool {
             true
+        }
+
+        fn supports_ranged_reads(&self) -> bool {
+            self.ranged && self.inner.supports_ranged_reads()
         }
     }
 
@@ -3828,6 +3869,10 @@ pub(crate) mod tests {
 
         fn is_remote(&self) -> bool {
             self.inner.is_remote()
+        }
+
+        fn supports_ranged_reads(&self) -> bool {
+            self.inner.supports_ranged_reads()
         }
 
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
@@ -4347,6 +4392,56 @@ pub(crate) mod tests {
                     "a forbidding store must not overwrite the cache either"
                 );
             }
+            let _ = std::fs::remove_dir_all(cache_dir);
+        }
+    }
+
+    /// A store whose range reads fetch the whole object (encrypted remote
+    /// storage, which also keeps nothing in the disk cache) gets each leaf
+    /// fetched whole on its first open, full or directory-only, and the
+    /// fetched bytes serve every later open.
+    #[test]
+    fn leaves_of_a_store_without_ranged_reads_are_fetched_whole_once() {
+        for dir_first in [false, true] {
+            let store = CountingContentStore {
+                permits_plaintext_cache: false,
+                ..CountingContentStore::without_ranged_reads()
+            };
+            let leaf_bytes = build_test_leaf_bytes();
+            let leaf_cid = run_sync_on_runtime({
+                let store = store.clone();
+                async move {
+                    store
+                        .put(ContentKind::IndexLeaf, &leaf_bytes)
+                        .await
+                        .map_err(|e| io::Error::other(e.to_string()))
+                }
+            })
+            .expect("store leaf bytes");
+            let cache_dir = temp_cache_dir();
+            let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+            binary_store.leaflet_cache = Some(Arc::new(LeafletCache::with_max_mb(4)));
+
+            if dir_first {
+                let dir = binary_store.open_leaf_dir(&leaf_cid).expect("dir open");
+                assert_eq!(dir.entries.len(), 1);
+            }
+            for _ in 0..3 {
+                let handle = binary_store
+                    .open_leaf_handle(&leaf_cid, None, false)
+                    .expect("open");
+                assert_eq!(handle.dir().entries[0].row_count, 5);
+            }
+            assert_eq!(
+                store.range_calls(),
+                0,
+                "dir_first={dir_first}: no range reads"
+            );
+            assert_eq!(
+                store.get_calls(),
+                1,
+                "dir_first={dir_first}: one whole fetch serves every open"
+            );
             let _ = std::fs::remove_dir_all(cache_dir);
         }
     }

@@ -322,6 +322,10 @@ impl ContentStore for MemoryContentStore {
         }
         Ok(full[start..end].to_vec())
     }
+
+    fn supports_ranged_reads(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

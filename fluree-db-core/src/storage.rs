@@ -758,6 +758,14 @@ pub trait ContentStore: Debug + Send + Sync {
         Ok(full[start..end].to_vec())
     }
 
+    /// Whether [`Self::get_range`] reads only the requested bytes. When it
+    /// does not — the default `get_range` fetches the whole object, and so
+    /// does any store that must decrypt the whole object — readers fetch an
+    /// object whole once rather than issue several range reads against it.
+    fn supports_ranged_reads(&self) -> bool {
+        false
+    }
+
     /// Make every write this store reported complete short of the device
     /// durable now; see [`StorageWrite::sync`]. Call it before publishing a
     /// pointer to content written through this store.
@@ -821,6 +829,10 @@ impl ContentStore for Arc<dyn ContentStore> {
 
     async fn get_range(&self, id: &ContentId, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
         self.as_ref().get_range(id, range).await
+    }
+
+    fn supports_ranged_reads(&self) -> bool {
+        self.as_ref().supports_ranged_reads()
     }
 }
 
@@ -1107,6 +1119,10 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
 
     fn is_remote(&self) -> bool {
         self.storage.is_remote()
+    }
+
+    fn supports_ranged_reads(&self) -> bool {
+        self.storage.supports_ranged_reads()
     }
 
     fn miss_register(&self) -> Option<&residency::MissRegister> {
@@ -1448,6 +1464,13 @@ impl ContentStore for BranchedContentStore {
     /// ancestry makes the whole chain remote.
     fn is_remote(&self) -> bool {
         self.branch_store.is_remote() || self.parents.iter().any(ContentStore::is_remote)
+    }
+
+    /// A read may be served by any ancestor, so every store in the ancestry
+    /// must read ranges natively.
+    fn supports_ranged_reads(&self) -> bool {
+        self.branch_store.supports_ranged_reads()
+            && self.parents.iter().all(ContentStore::supports_ranged_reads)
     }
 
     fn miss_register(&self) -> Option<&residency::MissRegister> {
