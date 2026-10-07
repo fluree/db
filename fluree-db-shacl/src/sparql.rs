@@ -817,194 +817,145 @@ mod tests {
     use fluree_db_query::eval::{ArithmeticError, ComparisonError};
     use fluree_db_query::QueryError;
 
-    /// The variant's name; the match is exhaustive, so a new variant fails to
-    /// compile here until the table below classifies a representative of it.
-    fn variant(e: &QueryError) -> &'static str {
-        match e {
-            QueryError::Core(_) => "Core",
-            QueryError::Batch(_) => "Batch",
-            QueryError::R2rml(_) => "R2rml",
-            QueryError::OperatorNotOpened => "OperatorNotOpened",
-            QueryError::OperatorAlreadyOpened => "OperatorAlreadyOpened",
-            QueryError::OperatorClosed => "OperatorClosed",
-            QueryError::VariableNotFound(_) => "VariableNotFound",
-            QueryError::NoSuitableIndex => "NoSuitableIndex",
-            QueryError::InvalidQuery(_) => "InvalidQuery",
-            QueryError::UngroupedRead(_) => "UngroupedRead",
-            QueryError::InvalidFilter(_) => "InvalidFilter",
-            QueryError::InvalidExpression(_) => "InvalidExpression",
-            QueryError::DictionaryLookup(_) => "DictionaryLookup",
-            QueryError::SnapshotNotFound { .. } => "SnapshotNotFound",
-            QueryError::NoSnapshotAtTime { .. } => "NoSnapshotAtTime",
-            QueryError::ResourceLimit(_) => "ResourceLimit",
-            QueryError::FuelLimitExceeded(_) => "FuelLimitExceeded",
-            QueryError::Cancelled { .. } => "Cancelled",
-            QueryError::MemoryBudgetExceeded { .. } => "MemoryBudgetExceeded",
-            QueryError::R2rmlUnsupportedPattern { .. } => "R2rmlUnsupportedPattern",
-            QueryError::StorageAccessDenied { .. } => "StorageAccessDenied",
-            QueryError::CatalogCredentialsNotVended { .. } => "CatalogCredentialsNotVended",
-            QueryError::CatalogAccessDenied { .. } => "CatalogAccessDenied",
-            QueryError::Internal(_) => "Internal",
-            QueryError::Policy(_) => "Policy",
-            QueryError::NeedFetch(_) => "NeedFetch",
-            QueryError::UnsupportedMode(_) => "UnsupportedMode",
-            QueryError::UnsupportedFeature(_) => "UnsupportedFeature",
-            QueryError::TimeRangeNotCovered { .. } => "TimeRangeNotCovered",
-            QueryError::Arithmetic(_) => "Arithmetic",
-            QueryError::Comparison(_) => "Comparison",
-        }
+    /// The classification table: for each `QueryError` variant, its pattern,
+    /// the class it must get, and its representatives. The same patterns also
+    /// form a `match` over a `&QueryError` with no wildcard, so a new variant
+    /// fails to compile here until it has an entry, and with it a class and a
+    /// representative; each representative must match its own pattern.
+    macro_rules! classification {
+        ($($pat:pat => $raised:expr, [$($rep:expr),+ $(,)?];)+) => {{
+            fn entry(e: &QueryError) -> &'static str {
+                match e {
+                    $($pat => stringify!($pat),)+
+                }
+            }
+            let mut rows: Vec<(&'static str, QueryError, bool)> = Vec::new();
+            $($(
+                let rep: QueryError = $rep;
+                assert!(
+                    matches!(&rep, $pat),
+                    "{rep:?} is not a {}",
+                    stringify!($pat)
+                );
+                rows.push((entry(&rep), rep, $raised));
+            )+)+
+            rows
+        }};
     }
 
-    /// One representative per `QueryError` variant, with the class a
-    /// constraint query's error must get. `true`: the request's budgets
-    /// (fuel, deadline, memory, cancellation), its access to storage, catalogs
-    /// and policy, the state of the data and internal faults fail the write
-    /// whatever the shape's severity and the graph's mode. `false`: the
-    /// constraint's own query cannot run, and severity and mode decide.
+    /// `true`: the request's budgets (fuel, deadline, memory, cancellation),
+    /// its access to storage, catalogs, graph sources and policy, the state of
+    /// the data and internal faults fail the write whatever the shape's
+    /// severity and the graph's mode. `false`: the constraint's own query
+    /// cannot run, and severity and mode decide.
     #[test]
     fn constraint_query_errors_are_classified_by_variant() {
         let s = String::new;
-        let table: Vec<(QueryError, bool)> = vec![
-            (
+        let rows = classification! {
+            QueryError::FuelLimitExceeded(_) => true, [
                 QueryError::FuelLimitExceeded(fluree_db_core::FuelExceededError {
                     used_micro_fuel: 2,
                     limit_micro_fuel: 1,
                 }),
-                true,
-            ),
-            (
-                QueryError::Cancelled {
-                    reason: QueryCancellationReason::Timeout,
-                },
-                true,
-            ),
-            (
-                QueryError::Cancelled {
-                    reason: QueryCancellationReason::ClientDisconnected,
-                },
-                true,
-            ),
-            (
-                QueryError::MemoryBudgetExceeded {
-                    used_bytes: 2,
-                    budget_bytes: 1,
-                },
-                true,
-            ),
-            (QueryError::ResourceLimit(s()), true),
-            (
+            ];
+            QueryError::Cancelled { .. } => true, [
+                QueryError::Cancelled { reason: QueryCancellationReason::Timeout },
+                QueryError::Cancelled { reason: QueryCancellationReason::ClientDisconnected },
+            ];
+            QueryError::MemoryBudgetExceeded { .. } => true, [
+                QueryError::MemoryBudgetExceeded { used_bytes: 2, budget_bytes: 1 },
+            ];
+            QueryError::ResourceLimit(_) => true, [QueryError::ResourceLimit(s())];
+            QueryError::NeedFetch(_) => true, [
                 QueryError::NeedFetch(NeedFetch::new(
                     ContentId::new(ContentKind::Commit, b"leaf"),
                     FetchKind::IndexLeaf,
                 )),
-                true,
-            ),
-            (
+            ];
+            QueryError::StorageAccessDenied { .. } => true, [
                 QueryError::StorageAccessDenied {
                     bucket: s(),
                     key: s(),
                     region: None,
                     message: s(),
                 },
-                true,
-            ),
-            (
+            ];
+            QueryError::CatalogCredentialsNotVended { .. } => true, [
                 QueryError::CatalogCredentialsNotVended { catalog_uri: s() },
-                true,
-            ),
-            (
-                QueryError::CatalogAccessDenied {
-                    table: s(),
-                    message: s(),
-                },
-                true,
-            ),
-            (QueryError::Policy(s()), true),
-            (
-                QueryError::TimeRangeNotCovered {
-                    requested_t: 1,
-                    base_t: 2,
-                },
-                true,
-            ),
-            (
-                QueryError::SnapshotNotFound {
-                    table: s(),
-                    snapshot_id: 1,
-                },
-                true,
-            ),
-            (
-                QueryError::NoSnapshotAtTime {
-                    table: s(),
-                    requested: s(),
-                    oldest: None,
-                },
-                true,
-            ),
-            (QueryError::Core(fluree_db_core::Error::Storage(s())), true),
-            (
+            ];
+            QueryError::CatalogAccessDenied { .. } => true, [
+                QueryError::CatalogAccessDenied { table: s(), message: s() },
+            ];
+            QueryError::Policy(_) => true, [QueryError::Policy(s())];
+            QueryError::TimeRangeNotCovered { .. } => true, [
+                QueryError::TimeRangeNotCovered { requested_t: 1, base_t: 2 },
+            ];
+            QueryError::SnapshotNotFound { .. } => true, [
+                QueryError::SnapshotNotFound { table: s(), snapshot_id: 1 },
+            ];
+            QueryError::NoSnapshotAtTime { .. } => true, [
+                QueryError::NoSnapshotAtTime { table: s(), requested: s(), oldest: None },
+            ];
+            QueryError::R2rml(_) => true, [
+                QueryError::R2rml(fluree_db_r2rml::R2rmlError::Parse(s())),
+            ];
+            QueryError::Core(_) => true, [
+                QueryError::Core(fluree_db_core::Error::Storage(s())),
+            ];
+            QueryError::Batch(_) => true, [
                 QueryError::Batch(BatchError::ColumnLengthMismatch {
                     expected: 1,
                     got: 2,
                     column: 0,
                 }),
-                true,
-            ),
-            (QueryError::Internal(s()), true),
-            (QueryError::DictionaryLookup(s()), true),
-            (QueryError::OperatorNotOpened, true),
-            (QueryError::OperatorAlreadyOpened, true),
-            (QueryError::OperatorClosed, true),
-            (QueryError::InvalidQuery(s()), false),
-            (
+            ];
+            QueryError::Internal(_) => true, [QueryError::Internal(s())];
+            QueryError::DictionaryLookup(_) => true, [QueryError::DictionaryLookup(s())];
+            QueryError::OperatorNotOpened => true, [QueryError::OperatorNotOpened];
+            QueryError::OperatorAlreadyOpened => true, [QueryError::OperatorAlreadyOpened];
+            QueryError::OperatorClosed => true, [QueryError::OperatorClosed];
+            QueryError::InvalidQuery(_) => false, [QueryError::InvalidQuery(s())];
+            QueryError::UngroupedRead(_) => false, [
                 QueryError::UngroupedRead(fluree_db_query::ir::UngroupedRead {
                     var: fluree_db_query::VarId(0),
                     stage: fluree_db_query::ir::ReadStage::UnboundAggregateInput,
                 }),
-                false,
-            ),
-            (QueryError::VariableNotFound(s()), false),
-            (QueryError::NoSuitableIndex, false),
-            (QueryError::InvalidFilter(s()), false),
-            (QueryError::InvalidExpression(s()), false),
-            (QueryError::UnsupportedMode(s()), false),
-            (QueryError::UnsupportedFeature(s()), false),
-            (QueryError::R2rmlUnsupportedPattern { detail: s() }, false),
-            (QueryError::Arithmetic(ArithmeticError::DivideByZero), false),
-            (
+            ];
+            QueryError::VariableNotFound(_) => false, [QueryError::VariableNotFound(s())];
+            QueryError::NoSuitableIndex => false, [QueryError::NoSuitableIndex];
+            QueryError::InvalidFilter(_) => false, [QueryError::InvalidFilter(s())];
+            QueryError::InvalidExpression(_) => false, [QueryError::InvalidExpression(s())];
+            QueryError::UnsupportedMode(_) => false, [QueryError::UnsupportedMode(s())];
+            QueryError::UnsupportedFeature(_) => false, [QueryError::UnsupportedFeature(s())];
+            QueryError::R2rmlUnsupportedPattern { .. } => false, [
+                QueryError::R2rmlUnsupportedPattern { detail: s() },
+            ];
+            QueryError::Arithmetic(_) => false, [
+                QueryError::Arithmetic(ArithmeticError::DivideByZero),
+            ];
+            QueryError::Comparison(_) => false, [
                 QueryError::Comparison(ComparisonError::TypeMismatch {
                     operator: "<",
                     left_type: "a",
                     right_type: "b",
                 }),
-                false,
-            ),
-        ];
+            ];
+        };
 
-        let mut wrong: Vec<String> = Vec::new();
-        for (error, raised) in &table {
-            if raised_whatever_the_severity(error) != *raised {
-                wrong.push(format!(
-                    "{} must be {}",
-                    variant(error),
+        let wrong: Vec<String> = rows
+            .iter()
+            .filter(|(_, error, raised)| raised_whatever_the_severity(error) != *raised)
+            .map(|(entry, _, raised)| {
+                format!(
+                    "{entry} must be {}",
                     if *raised {
                         "raised whatever the severity"
                     } else {
                         "the constraint's own failure"
                     }
-                ));
-            }
-        }
+                )
+            })
+            .collect();
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-
-        // Every variant has a representative, except `R2rml`: building an
-        // `R2rmlError` needs `fluree-db-r2rml`, which this crate does not
-        // depend on. It is on the raised side (a mapping error is the graph
-        // source's, not the constraint's).
-        let covered: std::collections::BTreeSet<&str> =
-            table.iter().map(|(error, _)| variant(error)).collect();
-        assert_eq!(covered.len(), 30, "{covered:?}");
-        assert!(!covered.contains("R2rml"));
     }
 }
