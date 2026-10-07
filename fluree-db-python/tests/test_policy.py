@@ -113,6 +113,14 @@ def test_denied_write_raises_permission_error(ledger):
     assert ledger.query(f"PREFIX ex: <{EX}> ASK {{ ex:x ?p ?o }}") is False
 
 
+def test_reads_policy_cannot_filter_are_refused(ledger):
+    governed = ledger.with_policy(identity=EX + "nobody")
+    for read in (governed.log, governed.info, governed.graphs):
+        with pytest.raises(fluree.PermissionDeniedError, match="not subject to policy"):
+            read()
+    assert len(governed.query(SSNS)) == 0
+
+
 def test_with_policy_needs_an_option(ledger):
     with pytest.raises(ValueError):
         ledger.with_policy()

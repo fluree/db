@@ -438,7 +438,9 @@ class Ledger:
           is to deny.
 
         Reads filter out what policy does not allow; a write that policy does
-        not allow raises :class:`PermissionDeniedError`.
+        not allow raises :class:`PermissionDeniedError`. So does what policy
+        cannot filter: the commit log, :meth:`info` and :meth:`graphs`, and
+        maintenance, branch and export operations.
         """
         opts: dict[str, Any] = {}
         if identity is not None:
@@ -794,6 +796,7 @@ class Ledger:
 
     def log(self, limit: int | None = None) -> list[Commit]:
         """The ledger's commits, newest first; at most ``limit`` of them."""
+        self._require_unrestricted("log")
         commits, _total = self._connection._native.log(self._id, limit)
         return [_commit(c) for c in commits]
 
@@ -1100,6 +1103,7 @@ class Ledger:
 
     def info(self) -> dict[str, Any]:
         """Ledger metadata and statistics."""
+        self._require_unrestricted("info")
         return self._connection._native.info(self._id)
 
     def graphs(self) -> list[IRI]:
@@ -1110,6 +1114,7 @@ class Ledger:
         A graph is created by writing to it — TriG, SPARQL ``GRAPH``, or a
         JSON-LD node's ``"@graph"`` — and queried with SPARQL ``GRAPH`` or
         JSON-LD ``["graph", iri, pattern]``."""
+        self._require_unrestricted("graphs")
         system = {"urn:default", f"urn:fluree:{self._id}#txn-meta", self._config_graph}
         named = self.info()["ledger"]["named-graphs"]
         return [IRI(g["iri"]) for g in named if g["iri"] not in system]
