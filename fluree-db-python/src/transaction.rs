@@ -8,7 +8,7 @@ use crate::runtime::{block_on, InRuntime};
 use fluree_db_api::cypher_import::split_statements;
 use fluree_db_api::cypher_write::cypher_statement_is_write;
 use fluree_db_api::QueryExecutionOptions;
-use fluree_db_api::{Fluree, GovernanceOptions, GraphDb};
+use fluree_db_api::{Fluree, GovernanceOptions, GraphDb, TransactionOptions};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 use std::sync::Mutex;
@@ -40,8 +40,11 @@ impl Transaction {
         policy: Option<GovernanceOptions>,
     ) -> PyResult<Self> {
         let fluree = database.get()?;
-        let txn =
-            block_on(py, fluree.begin_transaction(ledger, policy.clone()))?.map_err(api_error)?;
+        let options = TransactionOptions {
+            governance: policy.clone().unwrap_or_default(),
+            ..TransactionOptions::default()
+        };
+        let txn = block_on(py, fluree.begin_transaction(ledger, options))?.map_err(api_error)?;
         Ok(Self {
             fluree: database.clone(),
             ledger: ledger.to_string(),
