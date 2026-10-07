@@ -749,12 +749,6 @@ pub(crate) fn is_reifies_subject(p: &Sid) -> bool {
         && &*p.name == fluree_vocab::db::REIFIES_SUBJECT
 }
 
-/// Whether `p` is `f:reifiesPredicate`, compared without allocating.
-pub(crate) fn is_reifies_predicate(p: &Sid) -> bool {
-    p.namespace_code == fluree_vocab::namespaces::FLUREE_DB
-        && &*p.name == fluree_vocab::db::REIFIES_PREDICATE
-}
-
 /// The named graphs one transaction writes to, interned so every template of
 /// a graph shares its IRI. The only way to obtain a named [`GraphScope`].
 #[derive(Debug, Default)]

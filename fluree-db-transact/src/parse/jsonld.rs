@@ -181,7 +181,6 @@ fn parse_rooted(
     if annotated {
         refuse_annotations_under_a_variable_graph(&txn.insert_templates)?;
         refuse_annotations_under_a_variable_graph(&txn.delete_templates)?;
-        check_reifiers_match_edges(&txn.insert_templates)?;
     }
     Ok(txn)
 }
@@ -271,81 +270,6 @@ fn refuse_annotations_under_a_variable_graph(templates: &[TripleTemplate]) -> Re
              (an IRI, a compact IRI or a keyword) where an annotated edge is written"
                 .to_string(),
         ));
-    }
-    Ok(())
-}
-
-/// Every reifier bundle the annotation lowering added must reify an edge this
-/// document asserts, in the bundle's own graph: a bundle written to graph `g`
-/// with `f:reifiesSubject s` and `f:reifiesPredicate p` needs an asserted
-/// `(s, p)` template in `g` (JSON-LD `@annotation` always asserts the edge it
-/// annotates). The lowering places each bundle beside its edge; if its graph
-/// scoping ever disagreed with the parser's, the annotation would commit in a
-/// graph that does not hold its edge. That is refused here instead.
-///
-/// A document whose templates all write the default graph has no scoping to
-/// disagree about, so the check runs once any template names a graph.
-fn check_reifiers_match_edges(templates: &[TripleTemplate]) -> Result<()> {
-    use rustc_hash::{FxHashMap, FxHashSet};
-
-    if templates.iter().all(|t| t.graph == TemplateGraph::Default) {
-        return Ok(());
-    }
-
-    /// A template term by reference: the check allocates nothing per
-    /// template.
-    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-    enum Key<'a> {
-        Sid(u16, &'a str),
-        Var(fluree_db_query::VarId),
-        Blank(&'a str),
-    }
-    fn key(term: &TemplateTerm) -> Option<Key<'_>> {
-        match term {
-            TemplateTerm::Sid(sid) => Some(Key::Sid(sid.namespace_code, &sid.name)),
-            TemplateTerm::Var(var) => Some(Key::Var(*var)),
-            TemplateTerm::BlankNode(label) => Some(Key::Blank(label)),
-            TemplateTerm::Value(_) => None,
-        }
-    }
-
-    let mut subjects: FxHashMap<(Key<'_>, &TemplateGraph), Key<'_>> = FxHashMap::default();
-    let mut predicates: FxHashMap<(Key<'_>, &TemplateGraph), Key<'_>> = FxHashMap::default();
-    let mut edges: FxHashSet<(Key<'_>, Key<'_>, &TemplateGraph)> =
-        FxHashSet::with_capacity_and_hasher(templates.len(), Default::default());
-    for t in templates {
-        let Some(subject) = key(&t.subject) else {
-            continue;
-        };
-        match (&t.predicate, key(&t.object)) {
-            (TemplateTerm::Sid(p), Some(object)) if crate::ir::is_reifies_subject(p) => {
-                subjects.insert((subject, &t.graph), object);
-            }
-            (TemplateTerm::Sid(p), Some(object)) if crate::ir::is_reifies_predicate(p) => {
-                predicates.insert((subject, &t.graph), object);
-            }
-            (predicate, _) => {
-                if let Some(p) = key(predicate) {
-                    edges.insert((subject, p, &t.graph));
-                }
-            }
-        }
-    }
-    for (&(reifier, graph), &s) in &subjects {
-        let asserted = predicates
-            .get(&(reifier, graph))
-            .is_some_and(|&p| edges.contains(&(s, p, graph)));
-        if !asserted {
-            return Err(TransactError::Parse(format!(
-                "an edge annotation would be written to {} without the edge it annotates; \
-                 an annotation and its edge must be in the same graph",
-                match graph {
-                    TemplateGraph::Default => "the default graph".to_string(),
-                    TemplateGraph::Iri(iri) => format!("graph <{iri}>"),
-                    TemplateGraph::Var(_) => "a variable graph".to_string(),
-                }
-            )));
-        }
     }
     Ok(())
 }
@@ -4363,11 +4287,6 @@ mod tests {
                 json!({"@context": ctx, "@id": "ex:s", "@reverse": "ex:o"}),
             ),
             (
-                "annotation inside @reverse",
-                TxnType::Insert,
-                json!({"@context": ctx, "@id": "ex:s", "@reverse": {"ex:p": {"@id": "ex:o", "@annotation": {"ex:r": 1}}}}),
-            ),
-            (
                 "reserved annotation label",
                 TxnType::Insert,
                 json!({"@context": ctx, "@id": "_:fluree_ann_0", "ex:p": 1}),
@@ -4602,48 +4521,111 @@ mod tests {
         }
     }
 
-    /// The fail-closed cross-check: a reifier bundle whose edge is not
-    /// asserted in the bundle's graph is refused.
+    /// Annotation bundles land beside their edges by construction: the
+    /// lowering includes each annotation node in its edge's subject node
+    /// (`@included`), so the parser writes both in one scope. For every
+    /// document shape that scopes an edge (a node selector, a named-graph
+    /// object, an envelope, a `["graph", …]` item, an update's `graph` key,
+    /// a nested node with its own selector, a reverse term), every reifier's
+    /// `(f:reifiesSubject, f:reifiesPredicate)` is an asserted edge in the
+    /// reifier's own graph.
     #[test]
-    fn reifier_without_its_edge_in_the_same_graph_is_refused() {
-        let mut ns = test_registry();
-        let s = TemplateTerm::Sid(ns.sid_for_iri("http://example.org/alice"));
-        let p = TemplateTerm::Sid(ns.sid_for_iri("http://example.org/worksFor"));
-        let o = TemplateTerm::Sid(ns.sid_for_iri("http://example.org/acme"));
-        let ann = TemplateTerm::BlankNode("_:fluree_ann_0".to_string());
-        let reifies = |local: &str| {
-            TemplateTerm::Sid(fluree_db_core::Sid::new(
-                fluree_vocab::namespaces::FLUREE_DB,
-                local,
-            ))
+    fn annotation_bundles_land_beside_their_edges() {
+        use rustc_hash::{FxHashMap, FxHashSet};
+        let ctx = json!({"ex": "http://example.org/", "childOf": {"@reverse": "ex:child"}});
+        let ann = json!({"ex:since": 2020});
+        let edge = |extra: Value| {
+            let mut node = json!({"@id": "ex:a", "ex:knows": {"@id": "ex:b", "@annotation": ann}});
+            if let (Value::Object(node), Value::Object(extra)) = (&mut node, extra) {
+                node.extend(extra);
+            }
+            node
         };
-        let edge = TripleTemplate::new(s.clone(), p.clone(), o.clone());
-        let bundle = |graph: TemplateGraph| {
-            [
-                (reifies(fluree_vocab::db::REIFIES_SUBJECT), s.clone()),
-                (reifies(fluree_vocab::db::REIFIES_PREDICATE), p.clone()),
-            ]
-            .into_iter()
-            .map(|(pred, obj)| {
-                let mut t = TripleTemplate::new(ann.clone(), pred, obj);
-                t.graph = graph.clone();
-                t
-            })
-            .collect::<Vec<_>>()
-        };
-        let mut same = vec![edge.clone()];
-        same.extend(bundle(TemplateGraph::Default));
-        check_reifiers_match_edges(&same).unwrap();
-
-        let mut edge_in_g = edge.clone();
-        edge_in_g.graph = in_graph(G);
-        let mut same_named = vec![edge_in_g];
-        same_named.extend(bundle(in_graph(G)));
-        check_reifiers_match_edges(&same_named).unwrap();
-
-        let mut split = vec![edge];
-        split.extend(bundle(in_graph(G)));
-        let err = check_reifiers_match_edges(&split).unwrap_err().to_string();
-        assert!(err.starts_with("Parse error: ") && err.contains(G), "{err}");
+        let docs: Vec<(&str, TxnType, Value)> = vec![
+            (
+                "default graph",
+                TxnType::Insert,
+                json!({"@context": ctx, "@graph": [edge(json!({}))]}),
+            ),
+            (
+                "node selector",
+                TxnType::Insert,
+                json!({"@context": ctx, "@graph": [edge(json!({"@graph": "ex:g"}))]}),
+            ),
+            ("single node with selector", TxnType::Insert, {
+                let mut d = edge(json!({"@graph": "ex:g"}));
+                d["@context"] = ctx.clone();
+                d
+            }),
+            (
+                "named-graph object",
+                TxnType::Insert,
+                json!({"@context": ctx, "@id": "ex:g", "@graph": [edge(json!({}))]}),
+            ),
+            (
+                "nested subject with its own selector",
+                TxnType::Insert,
+                json!({"@context": ctx, "@id": "ex:top", "ex:has": edge(json!({"@graph": "ex:g2"}))}),
+            ),
+            (
+                "object with its own selector",
+                TxnType::Insert,
+                json!({"@context": ctx, "@id": "ex:a",
+                    "ex:knows": {"@id": "ex:b", "@graph": "ex:g2", "@annotation": ann}}),
+            ),
+            (
+                "update graph key",
+                TxnType::Update,
+                json!({"@context": ctx, "graph": "ex:g", "insert": edge(json!({}))}),
+            ),
+            (
+                "update graph item",
+                TxnType::Update,
+                json!({"@context": ctx, "insert": [["graph", "ex:g", edge(json!({}))]]}),
+            ),
+            (
+                "reverse term",
+                TxnType::Insert,
+                json!({"@context": ctx, "@id": "ex:kid", "@graph": "ex:g",
+                    "childOf": {"@id": "ex:mom", "@annotation": ann}}),
+            ),
+            (
+                "reverse keyword",
+                TxnType::Insert,
+                json!({"@context": ctx, "@id": "ex:kid", "@graph": "ex:g",
+                    "@reverse": {"ex:child": {"@id": "ex:mom", "@annotation": ann}}}),
+            ),
+        ];
+        for (what, txn_type, doc) in docs {
+            let txn = parse_doc(&doc, txn_type).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let templates = &txn.insert_templates;
+            // Terms and graphs by their debug form: test-only keys.
+            let key = |v: &dyn std::fmt::Debug| format!("{v:?}");
+            let mut subjects: FxHashMap<(String, String), String> = FxHashMap::default();
+            let mut predicates: FxHashMap<(String, String), String> = FxHashMap::default();
+            let mut edges: FxHashSet<(String, String, String)> = FxHashSet::default();
+            for t in templates {
+                let (s, g) = (key(&t.subject), key(&t.graph));
+                match &t.predicate {
+                    TemplateTerm::Sid(p) if crate::ir::is_reifies_subject(p) => {
+                        subjects.insert((s, g), key(&t.object));
+                    }
+                    TemplateTerm::Sid(p) if &*p.name == fluree_vocab::db::REIFIES_PREDICATE => {
+                        predicates.insert((s, g), key(&t.object));
+                    }
+                    p => {
+                        edges.insert((s, key(p), g));
+                    }
+                }
+            }
+            assert!(!subjects.is_empty(), "{what}: a reifier was written");
+            for ((reifier, graph), s) in &subjects {
+                let p = &predicates[&(reifier.clone(), graph.clone())];
+                assert!(
+                    edges.contains(&(s.clone(), p.clone(), graph.clone())),
+                    "{what}: the reifier in {graph} has no edge {s} {p} there"
+                );
+            }
+        }
     }
 }
