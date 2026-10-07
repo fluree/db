@@ -407,6 +407,62 @@ async fn bm25_recreate_after_drop() {
     );
 }
 
+/// A dropped BM25 index stays as a tombstone whose snapshots are deleted; a
+/// query names it as not found rather than failing to read them.
+#[tokio::test]
+async fn bm25_query_after_drop_is_not_found() {
+    use fluree_db_query::bm25::Bm25SearchProvider;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "bm25/dropped:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [{ "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Rust programming" }]
+    });
+    let ledger = fluree.insert(ledger0, &tx).await.unwrap().ledger;
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("dropped-text", ledger_id, query))
+        .await
+        .unwrap();
+
+    let provider = FlureeIndexProvider::new(&fluree);
+    let id = created.graph_source_id.as_str();
+    provider
+        .bm25_index(id, Some(ledger.t()), false, None)
+        .await
+        .expect("index before drop");
+    provider
+        .search_bm25(id, "rust", 10, None, false, None)
+        .await
+        .expect("search before drop");
+
+    fluree.drop_full_text_index(id).await.unwrap();
+    let not_found = |err: fluree_db_query::QueryError| {
+        assert!(
+            err.to_string().contains("Graph source not found"),
+            "after drop: {err}"
+        );
+    };
+    not_found(
+        provider
+            .bm25_index(id, Some(ledger.t()), false, None)
+            .await
+            .expect_err("index after drop"),
+    );
+    not_found(
+        provider
+            .search_bm25(id, "rust", 10, None, false, None)
+            .await
+            .expect_err("search after drop"),
+    );
+}
+
 /// Test BM25 federated query: FlureeIndexProvider loads index and search works
 ///
 /// This tests the full integration flow:
