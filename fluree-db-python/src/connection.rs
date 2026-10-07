@@ -211,6 +211,37 @@ fn sparql_policy_free(sparql: &str) -> PyResult<()> {
     refuse_inline_policy(GovernanceOptions::from_sparql(sparql))
 }
 
+/// A JSON-LD query on a ledger reads that ledger, and the engine ignores a
+/// dataset the query names there, so one that names anything else is refused
+/// rather than answered from the wrong graph.
+fn jsonld_reads_ledger(json: &JsonValue, ledger: &str) -> fluree_db_api::Result<()> {
+    let names_ledger = |value: &JsonValue| {
+        value
+            .as_str()
+            .is_some_and(|name| normalize_ledger_id(name).is_ok_and(|id| id == ledger))
+    };
+    for scope in [Some(json), json.get("opts")].into_iter().flatten() {
+        for key in ["from", "ledger", "fromNamed", "from-named"] {
+            let Some(value) = scope.get(key) else {
+                continue;
+            };
+            let this_ledger = matches!(key, "from" | "ledger")
+                && match value {
+                    JsonValue::Array(names) => !names.is_empty() && names.iter().all(names_ledger),
+                    name => names_ledger(name),
+                };
+            if !this_ledger {
+                return Err(ApiError::invalid_query(format!(
+                    "a query on ledger {ledger} reads that ledger, so its `{key}` cannot name \
+                     another dataset; query other ledgers with Connection.query(), and a named \
+                     graph with [\"graph\", iri, pattern]"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A view of `ledger` at `spec`, governed by the ledger's policy defaults or
 /// by `policy`, carrying the ledger's default context so a query without
 /// `PREFIX` / `@context` resolves its prefixes, as the CLI and server do. A
@@ -677,6 +708,7 @@ impl Connection {
         let policy = governance(policy)?;
         let query = to_jsonld(query)?;
         jsonld_policy_free(&query)?;
+        jsonld_reads_ledger(&query, &id).map_err(api_error)?;
         let fluree = self.fluree.get()?;
         let controls = controls.unwrap_or_default();
         let (id, policy, query) = (&id, policy.as_ref(), &query);
@@ -1226,6 +1258,7 @@ impl Snapshot {
         jsonld_policy_free(&query)?;
         let controls = controls.unwrap_or_default();
         let (fluree, db, query) = (self.fluree.get()?, self.db.get()?, &query);
+        jsonld_reads_ledger(query, &db.ledger_id).map_err(api_error)?;
         let answer = controls.run(py, |cancel, controls| async move {
             execute!(
                 controls,
@@ -1276,26 +1309,33 @@ fn start_stream(
     query: QueryText,
     controls: Controls,
 ) -> PyResult<RowStream> {
-    let (input, columns, params) = match query {
-        QueryText::Sparql(sparql, params) => {
-            let columns = sparql_columns(&sparql);
-            (OwnedStreamQuery::Sparql(sparql), columns, params)
-        }
-        QueryText::JsonLd(json) => {
-            let columns = jsonld_columns(&json);
-            (OwnedStreamQuery::JsonLd(json), columns, None)
-        }
-    };
     controls.checked_timeout()?;
     let fluree = database.get()?;
+    // The producer reads a dataset, which keeps the view's policy with it: the
+    // graphs a SPARQL `FROM` names in this ledger, as `query()` reads them, or
+    // else the view alone.
+    let (input, columns, params, dataset) = match query {
+        QueryText::Sparql(sparql, params) => {
+            let columns = sparql_columns(&sparql);
+            let dataset = fluree
+                .sparql_dataset_within_ledger(&db, &sparql)
+                .map_err(api_error)?;
+            let dataset = dataset.unwrap_or_else(|| DataSetDb::single(db));
+            (OwnedStreamQuery::Sparql(sparql), columns, params, dataset)
+        }
+        QueryText::JsonLd(json) => {
+            jsonld_reads_ledger(&json, &db.ledger_id).map_err(api_error)?;
+            let columns = jsonld_columns(&json);
+            let dataset = DataSetDb::single(db);
+            (OwnedStreamQuery::JsonLd(json), columns, None, dataset)
+        }
+    };
     let cancellation = controls.cancellation();
     let options = QueryExecutionOptions::new().with_cancellation(cancellation.clone());
     let options = match params {
         Some(params) => options.with_params(params),
         None => options,
     };
-    // A single-ledger dataset keeps the view's policy with the producer.
-    let dataset = DataSetDb::single(db);
     let plan = block_on(
         py,
         fluree.plan_stream_query_dataset_with_options(&dataset, &input, &options),
@@ -1353,7 +1393,10 @@ impl QueryText {
                     .explain_sparql_with_params(db, sparql, params.as_ref())
                     .await
             }
-            Self::JsonLd(query) => fluree.explain(db, query).await,
+            Self::JsonLd(query) => {
+                jsonld_reads_ledger(query, &db.ledger_id)?;
+                fluree.explain(db, query).await
+            }
         }
     }
 }

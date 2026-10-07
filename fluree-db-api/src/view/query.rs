@@ -1193,6 +1193,23 @@ impl Fluree {
         ))
     }
 
+    /// The dataset a SPARQL query's `FROM` / `FROM NAMED` clauses name within
+    /// `db`'s ledger, resolved as [`Self::query`] resolves them, for an entry
+    /// that takes a [`DataSetDb`] such as
+    /// [`Self::plan_stream_query_dataset_with_options`]. Each graph keeps
+    /// `db`'s policy.
+    ///
+    /// `None` when the query names no dataset; an error when a clause names a
+    /// graph outside this ledger.
+    pub fn sparql_dataset_within_ledger(
+        &self,
+        db: &GraphDb,
+        sparql: &str,
+    ) -> Result<Option<DataSetDb>> {
+        let ast = parse_and_validate_sparql(sparql, None)?;
+        self.build_within_ledger_dataset_from_ast(db, &ast)
+    }
+
     // ========================================================================
     // Internal Helpers
     // ========================================================================

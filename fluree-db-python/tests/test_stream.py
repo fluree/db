@@ -3,6 +3,7 @@ import time
 import pytest
 
 import fluree
+from fluree import InvalidRequestError
 
 EX = "http://example.org/"
 NUMS = f"PREFIX ex: <{EX}> SELECT ?n ?s WHERE {{ ?s ex:n ?n }} ORDER BY ?n"
@@ -72,3 +73,49 @@ def test_only_select_streams(ledger):
 def test_stream_respects_policy(ledger):
     deny_all = ledger.with_policy(policy=[{"@id": "none", "f:action": {"@id": "https://ns.flur.ee/db#view"}, "f:allow": False}])
     assert list(deny_all.stream(NUMS)) == []
+
+
+DENY_ALL = [{"@id": "none", "f:action": {"@id": "https://ns.flur.ee/db#view"}, "f:allow": False}]
+
+
+@pytest.fixture
+def conn():
+    with fluree.connect(":memory:") as conn:
+        conn.create("people").update(f"PREFIX ex: <{EX}> INSERT DATA {{ ex:a ex:n 1 . GRAPH <urn:g1> {{ ex:a ex:n 2 }} }}")
+        conn.create("other").update(f"PREFIX ex: <{EX}> INSERT DATA {{ ex:a ex:n 3 }}")
+        yield conn
+
+
+def test_a_stream_reads_the_graphs_its_from_names(conn):
+    people = conn.ledger("people")
+    from_g1 = f"PREFIX ex: <{EX}> SELECT ?n FROM <urn:g1> WHERE {{ ?s ex:n ?n }}"
+    named_g1 = f"PREFIX ex: <{EX}> SELECT ?n FROM NAMED <urn:g1> WHERE {{ GRAPH <urn:g1> {{ ?s ex:n ?n }} }}"
+    for query in (from_g1, named_g1):
+        assert [r.n for r in people.stream(query)] == people.query(query).value("n") == [2]
+        assert [r.n for r in people.snapshot().stream(query)] == [2]
+    assert list(people.with_policy(policy=DENY_ALL).stream(from_g1)) == []
+    other = f"PREFIX ex: <{EX}> SELECT ?n FROM <other:main> WHERE {{ ?s ex:n ?n }}"
+    for verb in (people.query, people.stream):
+        with pytest.raises(InvalidRequestError, match="not in this ledger"):
+            verb(other)
+
+
+def test_a_jsonld_query_on_a_ledger_reads_only_that_ledger(conn):
+    people = conn.ledger("people")
+    query = {"@context": {"ex": EX}, "select": ["?n"], "where": {"@id": "?s", "ex:n": "?n"}}
+    assert people.query({**query, "from": "people"}) == [[1]]
+    assert [r.n for r in people.stream({**query, "from": ["people:main"]})] == [1]
+    txn = people.transaction()
+    verbs = (people.query, people.stream, people.explain, people.snapshot().query, txn.query)
+    datasets = (
+        {"from": "other"},
+        {"from": ["people", "other"]},
+        {"from": "people@t:1"},
+        {"fromNamed": "people"},
+        {"opts": {"ledger": "other"}},
+    )
+    for dataset in datasets:
+        for verb in verbs:
+            with pytest.raises(InvalidRequestError, match="cannot name another dataset"):
+                verb({**query, **dataset})
+    txn.rollback()
