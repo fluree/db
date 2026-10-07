@@ -6,6 +6,11 @@ import logging
 
 from fluree import _fluree
 
+# The application decides what a library's log shows, as the logging HOWTO
+# advises: without a handler here, Python's last-resort handler would print
+# every engine warning to stderr.
+logging.getLogger("fluree").addHandler(logging.NullHandler())
+
 _BY_NAME = {"OFF": 0, "CRITICAL": 1, "ERROR": 1, "WARNING": 2, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
 
 

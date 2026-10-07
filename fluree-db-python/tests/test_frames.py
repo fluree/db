@@ -192,3 +192,16 @@ def test_engine_events_reach_python_logging(ledger, caplog):
         fluree.set_log_level("WARNING")
     with pytest.raises(ValueError):
         fluree.set_log_level("LOUD")
+
+
+def test_the_log_shows_once_the_application_configures_logging():
+    import subprocess
+    import sys
+
+    warn = "import fluree, logging; logging.getLogger('fluree.engine').warning('engine warning')"
+
+    def stderr(setup):
+        return subprocess.run([sys.executable, "-c", setup + warn], capture_output=True, text=True, check=True).stderr
+
+    assert "engine warning" not in stderr("")
+    assert "engine warning" in stderr("import logging; logging.basicConfig(); ")

@@ -379,7 +379,9 @@ The engine's log goes to Python's `logging` as the `fluree.engine` logger,
 each record carrying the engine module that wrote it as `record.target`.
 Warnings and errors are sent by default; `fluree.set_log_level("INFO")` (or
 `"DEBUG"`, `"TRACE"`) sends more, and `"OFF"` none. Below the level the engine
-skips the events altogether.
+skips the events altogether. As with any library, what is shown is the
+application's choice: nothing reaches the console until it configures
+`logging` (`logging.basicConfig()`, say).
 
 ## asyncio
 
