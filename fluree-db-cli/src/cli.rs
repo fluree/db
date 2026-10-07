@@ -267,7 +267,7 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = 0)]
     pub parallelism: usize,
 
-    /// Timeout in seconds for remote HTTP requests (default: 300).
+    /// Timeout in seconds for remote HTTP requests.
     /// Set higher for long-running queries or transactions.
     #[arg(long, global = true, default_value_t = 300)]
     pub timeout: u64,
@@ -439,7 +439,7 @@ pub enum Commands {
         action: GraphAction,
     },
 
-    /// Create, list, sync, or drop BM25 full-text search indexes (graph sources).
+    /// Create, list, sync, or drop BM25 full-text search indexes (graph sources)
     ///
     /// These commands run against a server when one is reachable — `--remote
     /// <name>` picks a configured remote, and otherwise a locally-running server
@@ -454,6 +454,7 @@ pub enum Commands {
     ///   fluree bm25 list --stale
     ///   fluree bm25 sync --index silver-search:main
     ///   fluree bm25 drop --index silver-search:main
+    #[command(verbatim_doc_comment)]
     Bm25 {
         #[command(subcommand)]
         action: Bm25Action,
@@ -466,8 +467,9 @@ pub enum Commands {
     ///   fluree insert -f data.ttl
     ///   fluree insert mydb -f data.jsonld
     ///   cat data.ttl | fluree insert
+    #[command(verbatim_doc_comment)]
     Insert {
-        /// Optional ledger name and/or inline data.
+        /// Optional ledger name and/or inline data
         ///
         /// With 0 args: uses active ledger; provide data via -e, -f, or stdin.
         /// With 1 arg: if it looks like data (JSON or Turtle), uses it as
@@ -475,6 +477,7 @@ pub enum Commands {
         ///   reads from it; otherwise treats it as a ledger name.
         /// With 2 args: first is ledger name, second is inline data.
         #[arg(num_args = 0..=2)]
+        #[arg(verbatim_doc_comment)]
         args: Vec<String>,
 
         /// Ledger name (defaults to active ledger). Explicit alternative to
@@ -510,8 +513,9 @@ pub enum Commands {
     ///   fluree update -f update.json
     ///   fluree update -f update.ru --format sparql
     ///   cat update.json | fluree update
+    #[command(verbatim_doc_comment)]
     Update {
-        /// Optional ledger name and/or inline data.
+        /// Optional ledger name and/or inline data
         ///
         /// With 0 args: uses active ledger; provide data via -e, -f, or stdin.
         /// With 1 arg: if it looks like data (JSON or SPARQL UPDATE), uses it as
@@ -519,6 +523,7 @@ pub enum Commands {
         ///   reads from it; otherwise treats it as a ledger name.
         /// With 2 args: first is ledger name, second is inline data.
         #[arg(num_args = 0..=2)]
+        #[arg(verbatim_doc_comment)]
         args: Vec<String>,
 
         /// Ledger name (defaults to active ledger). Explicit alternative to
@@ -553,8 +558,9 @@ pub enum Commands {
     ///   fluree upsert '<http://example.org/alice> <http://example.org/name> "Alice" .'
     ///   fluree upsert mydb -f data.ttl
     ///   cat data.jsonld | fluree upsert
+    #[command(verbatim_doc_comment)]
     Upsert {
-        /// Optional ledger name and/or inline data.
+        /// Optional ledger name and/or inline data
         ///
         /// With 0 args: uses active ledger; provide data via -e, -f, or stdin.
         /// With 1 arg: if it looks like data (JSON or Turtle), uses it as
@@ -562,6 +568,7 @@ pub enum Commands {
         ///   reads from it; otherwise treats it as a ledger name.
         /// With 2 args: first is ledger name, second is inline data.
         #[arg(num_args = 0..=2)]
+        #[arg(verbatim_doc_comment)]
         args: Vec<String>,
 
         /// Ledger name (defaults to active ledger). Explicit alternative to
@@ -590,8 +597,9 @@ pub enum Commands {
         policy: PolicyArgs,
     },
 
-    /// Synchronize a graph: make its contents exactly the supplied data,
-    /// committing only the delta. Without --graph, the default graph.
+    /// Make a graph's contents exactly the supplied data, committing only the delta
+    ///
+    /// Targets the default graph unless --graph names another.
     ///
     /// The target graph is the constant; the SOURCE of the desired contents
     /// is pluggable. Today the source is RDF text (Turtle or JSON-LD) from a
@@ -603,6 +611,7 @@ pub enum Commands {
     ///   fluree sync mydb --graph urn:example:ontology -f ontology.ttl
     ///   fluree sync mydb --graph urn:example:ontology -f ontology.ttl --dry-run
     ///   cat export.jsonld | fluree sync --graph urn:example:ontology --remote origin
+    #[command(verbatim_doc_comment)]
     Sync {
         /// Optional ledger name and/or inline data (same resolution rules
         /// as `upsert`: 0 args = active ledger + -e/-f/stdin; 1 arg = data,
@@ -654,8 +663,7 @@ pub enum Commands {
         policy: PolicyArgs,
     },
 
-    /// Bulk-upsert CSV rows into a ledger via a per-row Cypher or JSON-LD
-    /// template (the `LOAD CSV` analog).
+    /// Bulk-upsert CSV rows into a ledger via a per-row Cypher or JSON-LD template (the `LOAD CSV` analog)
     ///
     /// Reads the CSV locally and streams it to the ledger — local or remote —
     /// one batch per transaction (one commit each). All cell values are
@@ -672,6 +680,7 @@ pub enum Commands {
     ///     --cypher 'MERGE (n:Person {id: row.id}) SET n.name = row.name'
     ///   fluree load people --from people.csv \
     ///     --jsonld '{"where":{"@id":"?s","ex:id":"?id"},"insert":{"@id":"?s","ex:name":"?name"}}'
+    #[command(verbatim_doc_comment)]
     Load {
         /// Ledger name (defaults to the active ledger).
         ledger: Option<String>,
@@ -709,8 +718,9 @@ pub enum Commands {
     ///   fluree query mydb '{"select": ["*"], "where": {"@type": "Person"}}'
     ///   fluree query -f query.sparql
     ///   cat query.rq | fluree query
+    #[command(verbatim_doc_comment)]
     Query {
-        /// Optional ledger name and/or inline query.
+        /// Optional ledger name and/or inline query
         ///
         /// With 0 args: uses active ledger; provide query via -e, -f, or stdin.
         /// With 1 arg: if it looks like a query (SPARQL or JSON-LD), uses it
@@ -718,6 +728,7 @@ pub enum Commands {
         ///   reads from it; otherwise treats it as a ledger name.
         /// With 2 args: first is ledger name, second is inline query.
         #[arg(num_args = 0..=2)]
+        #[arg(verbatim_doc_comment)]
         args: Vec<String>,
 
         /// Ledger name (defaults to active ledger). Explicit alternative to
@@ -852,6 +863,7 @@ pub enum Commands {
     ///
     /// See `docs/api/multi-query.md` for the full envelope wire format.
     #[command(name = "multi-query")]
+    #[command(verbatim_doc_comment)]
     MultiQuery {
         /// Optional path to envelope JSON file. With 0 args reads from
         /// stdin (or use -e / -f).
@@ -933,18 +945,7 @@ pub enum Commands {
         #[command(subcommand)]
         action: ContextAction,
     },
-    /// Validate data against SHACL shapes and print a validation report
-    ///
-    /// Ledger mode validates the current state of a local ledger against its
-    /// attached shapes (or ad-hoc shapes via --shacl / --shacl-graph).
-    /// File mode validates an RDF file in an ephemeral in-memory ledger —
-    /// nothing persists. Exits 1 when results at or above --fail-on exist.
-    ///
-    /// Examples:
-    ///   fluree validate mydb
-    ///   fluree validate mydb --shacl proposed-shapes.ttl
-    ///   fluree validate data.ttl --shacl shapes.ttl
-    ///   fluree validate data.jsonld --format jsonld
+
     /// Query a ledger through GraphQL
     ///
     /// The schema is derived from the ledger's own data — every class becomes a
@@ -956,6 +957,7 @@ pub enum Commands {
     ///   fluree graphql mydb '{ persons { id name } }'
     ///   fluree graphql mydb -f query.graphql --variables '{"n": 10}'
     #[cfg(feature = "graphql")]
+    #[command(verbatim_doc_comment)]
     Graphql {
         /// Optional ledger name and/or inline GraphQL document.
         ///
@@ -1003,7 +1005,20 @@ pub enum Commands {
         explain: bool,
     },
 
+    /// Validate data against SHACL shapes and print a validation report
+    ///
+    /// Ledger mode validates the current state of a local ledger against its
+    /// attached shapes (or ad-hoc shapes via --shacl / --shacl-graph).
+    /// File mode validates an RDF file in an ephemeral in-memory ledger —
+    /// nothing persists. Exits 1 when results at or above --fail-on exist.
+    ///
+    /// Examples:
+    ///   fluree validate mydb
+    ///   fluree validate mydb --shacl proposed-shapes.ttl
+    ///   fluree validate data.ttl --shacl shapes.ttl
+    ///   fluree validate data.jsonld --format jsonld
     #[cfg(feature = "shacl")]
+    #[command(verbatim_doc_comment)]
     Validate {
         /// Ledger name (with optional :branch) or an RDF data file
         /// (.ttl / .jsonld / .json). Defaults to the active ledger.
@@ -1260,6 +1275,7 @@ pub enum Commands {
     ///
     /// Usage:
     ///   fluree publish <remote> [ledger]
+    #[command(verbatim_doc_comment)]
     Publish {
         /// Remote name (e.g., "origin")
         remote: String,
@@ -1278,6 +1294,7 @@ pub enum Commands {
     ///   fluree clone <remote> <ledger>                        # named-remote clone
     ///   fluree clone --origin <uri> <ledger>                  # CID-based clone
     ///   fluree clone --origin <uri> --token <tok> <ledger>    # with auth
+    #[command(verbatim_doc_comment)]
     Clone {
         /// Positional args: <remote> <ledger> (named-remote) or <ledger> (with --origin)
         #[arg(num_args = 1..=2)]
@@ -1432,29 +1449,28 @@ pub enum Commands {
         action: DeltaAction,
     },
 
-    /// Materialize a native twin ledger from a virtual (R2RML-over-Iceberg)
-    /// graph source: bulk-build every triple, verify it against the source, and
-    /// write it as a native ledger or a .flpack pack (DEC-003 Deliverable 1).
+    /// Materialize a native twin ledger from a virtual (R2RML-over-Iceberg) graph source
+    ///
+    /// Bulk-builds every triple, verifies it against the source, and writes it
+    /// as a native ledger or a .flpack pack.
     ///
     /// MACHINE-SAFETY: the default posture is co-resident-tolerant (a modest
     /// fixed memory budget + low parallelism, NOT own-the-box auto-sizing).
     /// Raise it explicitly with `--memory-budget-mb` / `--parallelism`, or pass
     /// `--max-performance` on a cleared machine to auto-size to the host.
     ///
-    /// PARALLELISM: `--parallelism` sizes the produce-side worker pool (O1) — that
+    /// PARALLELISM: `--parallelism` sizes the produce-side worker pool — that
     /// many threads render + encode table batches concurrently (it also bounds the
-    /// concurrent snapshot pins and FK pre-index scans, O5). Default 2 (co-resident).
+    /// concurrent snapshot pins and FK pre-index scans). Default 2 (co-resident).
     ///
-    /// BUDGET MODEL: `--memory-budget-mb` now scales the chunk size for sub-2GB
-    /// budgets too (previously any budget below ~2GB underflowed to a fixed 128MB
-    /// chunk regardless — O6); below 2GB the chunk is ~budget×0.6 / working-set,
-    /// clamped to [16, 128] MB. Peak produce RAM ≈ parallelism × chunk × ~2.5 (one
-    /// chunk buffer + encoding sink per worker) plus the FK parent index. That
-    /// parent index — held resident for the whole build — is now CHARGED against the
-    /// budget (up to ~50% of it) and the build FAILS LOUD if it would overflow,
-    /// rather than silently OOM the host. Verify is memory-bounded in both modes
-    /// (O2): peak is O(sampled subjects) for `quick` and O(one external-sort run)
-    /// for `full`.
+    /// BUDGET MODEL: `--memory-budget-mb` scales the chunk size; below 2GB the
+    /// chunk is ~budget×0.6 / working-set, clamped to [16, 128] MB. Peak produce
+    /// RAM ≈ parallelism × chunk × ~2.5 (one chunk buffer + encoding sink per
+    /// worker) plus the FK parent index. That parent index — held resident for
+    /// the whole build — is CHARGED against the budget (up to ~50% of it) and the
+    /// build FAILS LOUD if it would overflow, rather than silently OOM the host.
+    /// Verify is memory-bounded in both modes: peak is O(sampled subjects) for
+    /// `quick` and O(one external-sort run) for `full`.
     Materialize {
         /// The virtual graph-source id to materialize (e.g. `dw-gs:main`).
         graph_source: String,
@@ -1466,7 +1482,7 @@ pub enum Commands {
 
         /// Output form: `pack` (a .flpack file, the default), `ledger` (a local
         /// native ledger, left registered), or `s3` (direct-S3 CAS publish —
-        /// not yet wired in the file-backed CLI; see DEC-003 §3).
+        /// not yet supported by the file-backed CLI).
         #[arg(long, value_enum, default_value_t = MaterializeOutput::Pack)]
         output: MaterializeOutput,
 
@@ -1527,13 +1543,12 @@ pub enum Commands {
 /// Output form for `fluree materialize`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum MaterializeOutput {
-    /// A `.flpack` pack file (prebuilt commits + index) — the negotiated door
-    /// for solo delivery. The default.
+    /// A `.flpack` pack file (prebuilt commits + index). The default.
     Pack,
     /// A local native ledger, left registered in this home.
     Ledger,
-    /// Direct-S3 CAS publish (the >40GB escape hatch). Not yet wired in the
-    /// file-backed CLI — see DEC-003 §3.
+    /// Direct-S3 CAS publish (for packs too large to ship as a file). Not yet
+    /// supported by the file-backed CLI.
     S3,
 }
 
@@ -1551,13 +1566,14 @@ pub enum MaterializeVerify {
 /// BM25 full-text index subcommands.
 #[derive(Subcommand)]
 pub enum Bm25Action {
-    /// Create a BM25 full-text search index over a ledger.
+    /// Create a BM25 full-text search index over a ledger
     ///
     /// The indexing query (FQL / JSON-LD) selects the documents and the text
     /// properties to index; it MUST select `@id`. Example indexing query:
     ///   {"@context":{"as":"https://www.w3.org/ns/activitystreams#"},
     ///    "where":{"@id":"?s"},
     ///    "select":{"?s":["@id","as:content","as:name","as:summary"]}}
+    #[command(verbatim_doc_comment)]
     Create {
         /// Graph-source name for the index (no ':'). The alias is
         /// `<name>:<branch>` (e.g. `silver-search:main`).
@@ -1664,6 +1680,7 @@ pub enum GraphAction {
     ///   fluree graph list --ledger mydb:feature-x
     ///   fluree graph list --ledger mydb --remote origin
     ///   fluree graph list --ledger mydb --include-system --json
+    #[command(verbatim_doc_comment)]
     List {
         /// Ledger identifier (e.g. "mydb" or "mydb:feature-x").
         /// Defaults to the active ledger.
@@ -1700,6 +1717,7 @@ pub enum GraphAction {
     ///   fluree graph drop urn:example:org/payroll --ledger mydb
     ///   fluree graph drop urn:example:org/payroll --ledger mydb:feature-x
     ///   fluree graph drop urn:example:org/payroll --ledger mydb --remote origin
+    #[command(verbatim_doc_comment)]
     Drop {
         /// Full IRI of the named graph to drop.
         iri: String,
@@ -2488,6 +2506,7 @@ pub enum MemoryAction {
     ///   fluree memory audit
     ///   fluree memory audit --base develop
     ///   fluree memory audit --all --format json
+    #[command(verbatim_doc_comment)]
     Audit {
         /// Audit every memory instead of just this branch's
         #[arg(long)]
@@ -2878,6 +2897,7 @@ pub enum ContextAction {
     /// Examples:
     ///   fluree context set mydb '{"ex": "http://example.org/"}'
     ///   fluree context set mydb -f context.json
+    #[command(verbatim_doc_comment)]
     Set {
         /// Ledger name (defaults to active ledger)
         ledger: Option<String>,
@@ -3204,6 +3224,7 @@ pub enum IcebergAction {
     ///   fluree iceberg map my-gs --catalog-uri https://polaris.example.com --table openflights.airlines
     ///   fluree iceberg map my-gs --catalog-uri https://... --r2rml mappings/airlines.ttl
     ///   fluree iceberg map my-gs --mode direct --table-location s3://bucket/warehouse/ns/table
+    #[command(verbatim_doc_comment)]
     Map(Box<IcebergMapArgs>),
 
     /// List Iceberg-family graph sources (Iceberg and R2RML mappings)
@@ -3249,6 +3270,7 @@ pub enum SqlAction {
     /// Examples:
     ///   fluree sql map orders-db --endpoint https://trino.example.com:8443 --r2rml mappings/orders.ttl --auth-bearer $TOKEN
     ///   fluree sql map crm --endpoint http://localhost:8080 --catalog pg --schema public --r2rml crm.ttl
+    #[command(verbatim_doc_comment)]
     Map(Box<SqlMapArgs>),
 
     /// List mapped graph sources (SQL, Iceberg and R2RML)
@@ -3312,6 +3334,7 @@ pub enum DeltaAction {
     ///     --unity-uri https://<workspace>.cloud.databricks.com --unity-catalog main \
     ///     --oauth2-client-id <application-id> \
     ///     --oauth2-client-secret-env DATABRICKS_CLIENT_SECRET --s3-region us-east-1
+    #[command(verbatim_doc_comment)]
     Map(Box<DeltaMapArgs>),
 
     /// List what a Unity Catalog holds
@@ -3323,6 +3346,7 @@ pub enum DeltaAction {
     /// Examples:
     ///   fluree delta browse --unity-uri https://<workspace> --auth-bearer-env DATABRICKS_TOKEN
     ///   fluree delta browse --unity-uri ... --auth-bearer-env ... --unity-catalog main
+    #[command(verbatim_doc_comment)]
     Browse(Box<DeltaBrowseArgs>),
 
     /// Show a Unity Catalog table's columns and declared keys
@@ -3340,6 +3364,7 @@ pub enum DeltaAction {
     ///   fluree delta generate main.sales.orders main.sales.customers \
     ///     --unity-uri https://<workspace> --auth-bearer-env DATABRICKS_TOKEN \
     ///     --base-namespace https://example.org/sales# -o sales.ttl
+    #[command(verbatim_doc_comment)]
     Generate(Box<DeltaGenerateArgs>),
 
     /// Check a mapping against the tables `delta map` would read, registering
@@ -3941,8 +3966,7 @@ mod tests {
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum DocAction {
-    /// Parse documents into a ledger: DoCO structure graph, retrieval chunks,
-    /// embeddings, and the vector + full-text indexes over them
+    /// Parse documents into a ledger: DoCO structure graph, retrieval chunks, embeddings, and the vector + full-text indexes over them
     ///
     /// Reads PDF, Markdown, HTML, DOCX, PPTX and images. Parsing is
     /// deterministic and local; with `[doc.vlm]` (or `[doc.llm]`) configured,
@@ -3956,6 +3980,7 @@ pub enum DocAction {
     ///   fluree doc ingest report.pdf notes/ -l docs --no-escalate
     ///   fluree config set doc.embedding.url http://localhost:11434/v1
     ///   fluree config set doc.embedding.model nomic-embed-text
+    #[command(verbatim_doc_comment)]
     Ingest(DocIngestArgs),
 
     /// Search a ledger's chunks by meaning (vector) or by words (full-text)
@@ -3963,6 +3988,7 @@ pub enum DocAction {
     /// Examples:
     ///   fluree doc search "termination notice period" -l contracts
     ///   fluree doc search "LM358B supply voltage" --mode text -n 5
+    #[command(verbatim_doc_comment)]
     Search(DocSearchArgs),
 }
 

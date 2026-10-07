@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, next]
   pull_request:
-    branches: [main]
+    branches: [main, next]
 
 # Superseded pushes to main should cancel stale CI just like PR updates do.
 # Cache note: `save-if: main` still fires on a cancelled main job, because
@@ -27,7 +27,9 @@ env:
   RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
 # Save dependency caches on main; PRs restore them without filling the cache
-# quota with copies that other PRs and main cannot reuse.
+# quota with copies that other PRs and main cannot reuse. `next` deliberately
+# does not save either: the repo already sits at the cache quota, and its runs
+# fall back to main's caches.
 jobs:
   workflow-lint:
     runs-on: ubuntu-24.04

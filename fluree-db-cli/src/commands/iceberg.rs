@@ -68,7 +68,7 @@ pub async fn run_iceberg_list(
         }
     }
 
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let gs_records = fluree.nameservice().all_graph_source_records().await?;
     let mut entries: Vec<_> = gs_records
         .into_iter()
@@ -133,7 +133,7 @@ pub async fn run_iceberg_info(
         }
     }
 
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let gs_id = context::to_ledger_id(name)?;
     let gs = fluree
         .nameservice()
@@ -202,7 +202,7 @@ pub async fn run_iceberg_drop(
         }
     }
 
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let gs_id = context::to_ledger_id(name)?;
     let gs = fluree
         .nameservice()
@@ -581,7 +581,7 @@ fn print_remote_drop_response(response: &serde_json::Value) -> CliResult<()> {
 
 #[cfg(feature = "iceberg")]
 async fn run_iceberg_map_local(args: IcebergMapArgs, dirs: &FlureeDir) -> CliResult<()> {
-    let fluree = crate::context::build_fluree(dirs)?;
+    let fluree = crate::context::build_fluree(dirs).await?;
     let iceberg_config = build_iceberg_config(&args)?;
 
     if let Some(ref r2rml_path) = args.r2rml {

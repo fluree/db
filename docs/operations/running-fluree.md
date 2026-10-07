@@ -315,7 +315,7 @@ use serde_json::json;
 let fluree = FlureeBuilder::memory().build_memory();
 
 // File-based persistence — typed
-let fluree = FlureeBuilder::file("./data").build()?;
+let fluree = FlureeBuilder::file("./data").build_async().await?;
 
 // AWS S3 (requires `aws` feature) — typed
 let fluree = FlureeBuilder::s3("my-bucket", "https://s3.us-east-1.amazonaws.com")
@@ -337,7 +337,7 @@ Quick setup with typed builders:
 use fluree_db_api::FlureeBuilder;
 
 let fluree = FlureeBuilder::memory().build_memory();                               // In-memory
-let fluree = FlureeBuilder::file("./data").build()?;                               // File-based
+let fluree = FlureeBuilder::file("./data").build_async().await?;                   // File-based
 let fluree = FlureeBuilder::s3("bucket", "endpoint").build_client().await?;        // S3
 ```
 
