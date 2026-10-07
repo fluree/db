@@ -139,9 +139,23 @@ In an update, the `graph` key scopes every template to one graph, and accepts th
 
 ## Enabling SHACL
 
-SHACL is enforced only where the ledger config sets `f:shaclEnabled true`, ledger-wide or for a graph. Shapes on their own never enable it. A ledger that holds shapes without that setting reports `shapes present; SHACL enforcement not configured` in ledger info (`configDiagnostics`, also printed by `fluree info`).
+SHACL is enforced only where the ledger config sets `f:shaclEnabled true`, ledger-wide or for a graph. Shapes on their own never enable it. A ledger that holds shapes without that setting reports `shapes present; SHACL enforcement not configured` in ledger info (`configDiagnostics`, also printed by `fluree info`), and logs it as a warning once each time the ledger loads.
 
-Attach the setting to the ledger's existing config subject: a ledger has one `f:LedgerConfig` subject, and a second one is refused. When the ledger has a config, this attaches a SHACL group to it (and does nothing when there is none):
+When the ledger has no config yet (the usual case for a ledger that holds shapes and nothing else), write one:
+
+```sparql
+PREFIX f: <https://ns.flur.ee/db#>
+
+INSERT DATA {
+  GRAPH <urn:fluree:mydb:main#config> {
+    <urn:fluree:mydb:main:config:ledger> a f:LedgerConfig ;
+      f:shaclDefaults <urn:fluree:mydb:main:config:shacl> .
+    <urn:fluree:mydb:main:config:shacl> f:shaclEnabled true .
+  }
+}
+```
+
+When the ledger already has a config, attach the setting to its existing config subject instead: a ledger has one `f:LedgerConfig` subject, and a second one is refused. This form attaches a SHACL group to the existing subject, and does nothing when there is none:
 
 ```sparql
 PREFIX f: <https://ns.flur.ee/db#>
@@ -154,20 +168,6 @@ INSERT {
 }
 WHERE {
   GRAPH <urn:fluree:mydb:main#config> { ?c a f:LedgerConfig }
-}
-```
-
-When the ledger has no config yet, write one:
-
-```sparql
-PREFIX f: <https://ns.flur.ee/db#>
-
-INSERT DATA {
-  GRAPH <urn:fluree:mydb:main#config> {
-    <urn:fluree:mydb:main:config:ledger> a f:LedgerConfig ;
-      f:shaclDefaults <urn:fluree:mydb:main:config:shacl> .
-    <urn:fluree:mydb:main:config:shacl> f:shaclEnabled true .
-  }
 }
 ```
 
@@ -232,7 +232,9 @@ A transaction that writes ledger config is checked before it commits, and refuse
 
 Writing the same value again is not refused. The checks read only the transaction, the current config graph, and (for a new link to a group) that group's statements in the other graphs.
 
-Merges (fast-forwards included), rebases and reverts re-check the integrity of the target's config groups: a result that would leave a setting group's fields outside the config graph, or a single-valued setting with two values, is refused with the same `Parse error`, naming the group. A branch that carries a split config from before these checks is refused until the config is repaired ([Repairing a config split across graphs](#repairing-a-config-split-across-graphs)).
+Merges (fast-forwards included), rebases and reverts re-check the integrity of the target's config groups: a result that would leave a setting group's fields outside the config graph, or a single-valued setting with two values, is refused as a conflict with the target's state (HTTP 409), naming the group. A branch that carries a split config from before these checks is refused until the config is repaired ([Repairing a config split across graphs](#repairing-a-config-split-across-graphs)).
+
+A branch's config graph (`urn:fluree:mydb:dev#config`) configures that branch only. A merge or rebase that would carry what a branch wrote there into another branch is refused (HTTP 409), since on the target it would be an ordinary graph rather than config: make the change on the target itself. The same holds for a branch's `#txn-meta` graph. Merging from a branch the target was created from (its parent, directly or not) is not affected, because that branch's config graph was already an ordinary graph on the target when it forked.
 
 A transaction that writes only the config graph is never validated against SHACL shapes or uniqueness constraints, and never needs a shapes, schema or constraints source to be available: you can always turn SHACL or uniqueness off, or point a source somewhere else, even when the source it names is gone. Policy is the exception. A config write is still subject to the ledger's policy, including a policy source in another ledger, because policy decides who may change the config.
 

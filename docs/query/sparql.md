@@ -1350,6 +1350,14 @@ offending operation. Ordered uniqueness checking requires this; for SHACL it
 is a deliberate choice (every intermediate state must satisfy the shapes,
 like a database without deferred constraints).
 
+What is enforced is read once, from the state before the request: the ledger
+config, the shapes and the uniqueness constraints. An operation that turns
+SHACL or uniqueness off, or removes a shape or a constraint, does not relax
+the checks on a later operation in the same request, and one that turns them
+on does not apply them to the request, as in a single transaction. The config
+checks (a setting group split across graphs, a second value for a
+single-valued setting) run once, on the request's result.
+
 ### SPARQL UPDATE Restrictions
 
 Current restrictions / boundaries:

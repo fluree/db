@@ -2535,7 +2535,7 @@ POST /rebase
 - `200 OK` - Rebase completed successfully
 - `400 Bad Request` - Cannot rebase main, invalid strategy, or missing branch point
 - `404 Not Found` - Ledger or branch does not exist
-- `409 Conflict` - Rebase aborted due to conflict (abort strategy)
+- `409 Conflict` - Rebase aborted due to conflict (abort strategy), or refused by the target's config checks (a config group the rebase would split, a second value for a single-valued setting, or a write to another branch's config or txn-meta graph)
 - `500 Internal Server Error` - Server error
 
 **Examples:**
@@ -2625,7 +2625,7 @@ POST /merge
 - `200 OK` - Merge completed successfully
 - `400 Bad Request` - Source has no branch point (e.g., main), self-merge, unknown strategy, or unsupported merge strategy
 - `404 Not Found` - Ledger or branch does not exist
-- `409 Conflict` - Merge aborted due to conflicts when using the `abort` strategy, or the target HEAD changed during commit publishing
+- `409 Conflict` - Merge aborted due to conflicts when using the `abort` strategy, the target HEAD changed during commit publishing, or the merge is refused by the target's config checks (a config group the merge would split, a second value for a single-valued setting, or a write to the source branch's own config or txn-meta graph)
 - `500 Internal Server Error` - Server error
 
 **Examples:**
@@ -2737,7 +2737,7 @@ GET /merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}
 | `behind` | object | Commits on target not on source |
 | `fast_forward` | bool | True when target HEAD == ancestor (or both heads absent) |
 | `mergeable` | bool | Whether the strategy and the shapes both accept the merge: the selected strategy can be applied without aborting (false for `strategy=abort` with conflicts) **and**, when `validation` is present, the merged state conforms to the target's shapes. Commit-time conditions such as novelty backpressure are outside it. With `include_validation=false` it is the strategy/conflict signal alone. |
-| `validation` | object | Present iff `include_validation=true` (the default) and the merge validates: always for a merge that is not a fast-forward, and for a fast-forward when the target's config enables SHACL or uniqueness, or the adopted commits carry config settings (`f:` predicates). `{ "conforms": bool, "report"?: string }`, the same outcome `POST /merge` would produce for this strategy (a SHACL report, a uniqueness violation, or a refusal naming a config group the merge would split or give a second value); `report` is present only when `conforms` is false and is the message the merge would fail with. Any other fast-forward adopts its commits unvalidated and carries no `validation`. |
+| `validation` | object | Present iff `include_validation=true` (the default) and the merge validates: always for a merge that is not a fast-forward, and for a fast-forward when the target's config enables SHACL or uniqueness, or the adopted commits carry config settings (config fields, an `f:` config class, or writes to the target's config graph; an edge annotation's `f:reifies*` is not one). `{ "conforms": bool, "report"?: string }`, the same outcome `POST /merge` would produce for this strategy (a SHACL report, a uniqueness violation, or a refusal naming a config group the merge would split or give a second value); `report` is present only when `conforms` is false and is the message the merge would fail with. Any other fast-forward adopts its commits unvalidated and carries no `validation`. |
 | `conflicts` | object | Overlapping `(s, p, g)` keys touched on both sides since the ancestor. Empty when `fast_forward` or `include_conflicts=false` |
 | `changes` | object | Present iff `include_changes=true`. Aggregate netted change set — see below |
 
