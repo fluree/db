@@ -5731,6 +5731,89 @@ async fn shacl_sparql_only_shape_keeps_its_severity() {
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
 }
 
+/// `sh:and`, `sh:or` and `sh:xone` lists resolve however they were written.
+/// A JSON-LD `@list` stores one statement per member; a SPARQL UPDATE stores
+/// `( … )` as an `rdf:first` / `rdf:rest` collection, whose head the shape
+/// compiler used to take for a shape ("Referenced shape … could not be
+/// resolved"). Two members each, so the walk goes past the first.
+#[tokio::test]
+async fn shacl_logical_lists_resolve_from_either_surface() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    // (class, data, the write commits)
+    let cases = [
+        ("ex:A", json!({"ex:name": "n", "ex:age": 1}), true),
+        ("ex:A", json!({"ex:name": "n"}), false),
+        ("ex:O", json!({"ex:age": 1}), true),
+        ("ex:O", json!({"ex:note": "x"}), false),
+        ("ex:X", json!({"ex:name": "n"}), true),
+        ("ex:X", json!({"ex:name": "n", "ex:age": 1}), false),
+    ];
+    let mut wrong: Vec<String> = Vec::new();
+    for via_sparql in [false, true] {
+        for (i, (class, data, commits)) in cases.iter().enumerate() {
+            let ledger_id = format!("shacl/logical-lists-{i}-{via_sparql}:main");
+            let ledger = fluree.create_ledger(&ledger_id).await.unwrap();
+            let ledger = if via_sparql {
+                let update = r"PREFIX sh: <http://www.w3.org/ns/shacl#>
+                    PREFIX ex: <http://example.org/ns/>
+                    INSERT DATA {
+                      ex:HasName a sh:NodeShape ; sh:property [ sh:path ex:name ; sh:minCount 1 ] .
+                      ex:HasAge a sh:NodeShape ; sh:property [ sh:path ex:age ; sh:minCount 1 ] .
+                      ex:AndShape a sh:NodeShape ; sh:targetClass ex:A ;
+                        sh:and ( ex:HasName ex:HasAge ) .
+                      ex:OrShape a sh:NodeShape ; sh:targetClass ex:O ;
+                        sh:or ( ex:HasName ex:HasAge ) .
+                      ex:XoneShape a sh:NodeShape ; sh:targetClass ex:X ;
+                        sh:xone ( ex:HasName ex:HasAge ) .
+                    }";
+                drop(ledger);
+                fluree
+                    .graph(&ledger_id)
+                    .transact()
+                    .sparql_update(update)
+                    .commit()
+                    .await
+                    .expect("shapes via SPARQL UPDATE");
+                fluree.ledger(&ledger_id).await.expect("ledger")
+            } else {
+                let members = json!({"@list": [{"@id": "ex:HasName"}, {"@id": "ex:HasAge"}]});
+                let shapes = json!({
+                    "@context": shacl_context(),
+                    "@graph": [
+                        {"@id": "ex:HasName", "@type": "sh:NodeShape",
+                         "sh:property": {"sh:path": {"@id": "ex:name"}, "sh:minCount": 1}},
+                        {"@id": "ex:HasAge", "@type": "sh:NodeShape",
+                         "sh:property": {"sh:path": {"@id": "ex:age"}, "sh:minCount": 1}},
+                        {"@id": "ex:AndShape", "@type": "sh:NodeShape",
+                         "sh:targetClass": {"@id": "ex:A"}, "sh:and": members.clone()},
+                        {"@id": "ex:OrShape", "@type": "sh:NodeShape",
+                         "sh:targetClass": {"@id": "ex:O"}, "sh:or": members.clone()},
+                        {"@id": "ex:XoneShape", "@type": "sh:NodeShape",
+                         "sh:targetClass": {"@id": "ex:X"}, "sh:xone": members}
+                    ]
+                });
+                fluree.upsert(ledger, &shapes).await.unwrap().ledger
+            };
+            let mut node = data.clone();
+            node["@context"] = shacl_context();
+            node["@id"] = json!("ex:n1");
+            node["@type"] = json!(class);
+            let outcome = fluree.upsert(ledger, &node).await;
+            let case = format!("{class} {data} (SPARQL {via_sparql})");
+            match (outcome, commits) {
+                (Ok(_), true) => {}
+                (Err(ApiError::Transact(TransactError::ShaclViolation(_))), false) => {}
+                (outcome, _) => wrong.push(format!(
+                    "{case}: expected {}, got {:?}",
+                    if *commits { "a commit" } else { "a violation" },
+                    outcome.map(|_| ())
+                )),
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
 /// How an outer shape on `ex:Player` reaches `ex:InnerShape` in
 /// [`ledger_with_nested_failing_constraint`].
 #[derive(Clone, Copy, Debug)]
@@ -5898,8 +5981,7 @@ async fn ledger_with_nested_failing_constraint(
 /// fails the write with the constraint's error, also when the inner shape is a
 /// Warning; a warn-mode graph logs it. Before, the failure took the inner
 /// shape's severity (Violation by default), so it rejected the write under a
-/// Warning outer shape. Shapes written in JSON-LD, and with SPARQL UPDATE for
-/// the nestings that need no RDF list.
+/// Warning outer shape. Shapes written in JSON-LD and with SPARQL UPDATE.
 #[tokio::test]
 async fn shacl_nested_constraint_failure_takes_the_outer_severity() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -5925,13 +6007,6 @@ async fn shacl_nested_constraint_failure_takes_the_outer_severity() {
     let mut wrong: Vec<String> = Vec::new();
     for via_sparql in [false, true] {
         for nesting in nestings {
-            // A SPARQL UPDATE writes `( … )` as an rdf:first / rdf:rest
-            // collection, which the shape compiler does not resolve as an
-            // `sh:and` / `sh:or` / `sh:xone` list ("Referenced shape …#coll0
-            // could not be resolved"), so those run from JSON-LD only.
-            if via_sparql && matches!(nesting, Nesting::And | Nesting::Or | Nesting::Xone) {
-                continue;
-            }
             for (i, (outer, inner, warn_mode, commits)) in cells.into_iter().enumerate() {
                 let ledger_id = format!("shacl/nested-failure-{nesting:?}-{i}-{via_sparql}:main")
                     .to_lowercase();

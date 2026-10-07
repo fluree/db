@@ -185,17 +185,12 @@ struct ShapeData {
     node_shapes: Vec<Sid>,
     /// sh:not - reference to a shape that must NOT match
     not_shape: Option<Sid>,
-    /// sh:and - reference to RDF list head (expanded during list processing)
-    and_list: Option<Sid>,
-    /// sh:and - expanded shape references
+    /// sh:and - shape references (an RDF list head among them is expanded
+    /// during list processing)
     and_shapes: Vec<Sid>,
-    /// sh:or - reference to RDF list head (expanded during list processing)
-    or_list: Option<Sid>,
-    /// sh:or - expanded shape references
+    /// sh:or - shape references, as for `and_shapes`
     or_shapes: Vec<Sid>,
-    /// sh:xone - reference to RDF list head (expanded during list processing)
-    xone_list: Option<Sid>,
-    /// sh:xone - expanded shape references
+    /// sh:xone - shape references, as for `and_shapes`
     xone_shapes: Vec<Sid>,
     severity: Severity,
     name: Option<String>,
@@ -688,74 +683,51 @@ impl ShapeCompiler {
             }
         }
 
-        // Collect logical constraint list heads
-        let mut and_lists: Vec<(Sid, Sid)> = Vec::new();
-        let mut or_lists: Vec<(Sid, Sid)> = Vec::new();
-        let mut xone_lists: Vec<(Sid, Sid)> = Vec::new();
-
-        for (shape_id, shape_data) in &self.shapes {
-            if let Some(list_head) = &shape_data.and_list {
-                and_lists.push((shape_id.clone(), list_head.clone()));
-            }
-            if let Some(list_head) = &shape_data.or_list {
-                or_lists.push((shape_id.clone(), list_head.clone()));
-            }
-            if let Some(list_head) = &shape_data.xone_list {
-                xone_lists.push((shape_id.clone(), list_head.clone()));
-            }
-        }
-
-        // Expand sh:and lists
-        for (shape_id, list_head) in and_lists {
-            let values = traverse_rdf_list(db, &list_head, &rdf_first, &rdf_rest, &rdf_nil).await?;
-            let shape_refs: Vec<Sid> = values
-                .into_iter()
-                .filter_map(|v| {
-                    if let FlakeValue::Ref(sid) = v {
-                        Some(sid)
+        // sh:and / sh:or / sh:xone members. A JSON-LD @list or a Turtle
+        // collection arrives as one flake per member; an RDF collection
+        // stored as an rdf:first / rdf:rest spine (as a SPARQL UPDATE writes
+        // `( … )`) arrives as one flake whose object is the spine's head.
+        // A member that heads a list in this graph is replaced by the list's
+        // members, as for sh:ignoredProperties.
+        let logical: Vec<Sid> = self
+            .shapes
+            .iter()
+            .filter(|(_, sd)| {
+                !(sd.and_shapes.is_empty() && sd.or_shapes.is_empty() && sd.xone_shapes.is_empty())
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for shape_id in logical {
+            let Some(sd) = self.shapes.get_mut(&shape_id) else {
+                continue;
+            };
+            let mut lists = [
+                std::mem::take(&mut sd.and_shapes),
+                std::mem::take(&mut sd.or_shapes),
+                std::mem::take(&mut sd.xone_shapes),
+            ];
+            for members in &mut lists {
+                let mut expanded = Vec::with_capacity(members.len());
+                for member in members.drain(..) {
+                    let values =
+                        traverse_rdf_list(db, &member, &rdf_first, &rdf_rest, &rdf_nil).await?;
+                    if values.is_empty() {
+                        // Not a list head in this graph — a shape reference.
+                        expanded.push(member);
                     } else {
-                        None
+                        expanded.extend(values.into_iter().filter_map(|v| match v {
+                            FlakeValue::Ref(sid) => Some(sid),
+                            _ => None,
+                        }));
                     }
-                })
-                .collect();
-            if let Some(shape_data) = self.shapes.get_mut(&shape_id) {
-                shape_data.and_shapes = shape_refs;
+                }
+                *members = expanded;
             }
-        }
-
-        // Expand sh:or lists
-        for (shape_id, list_head) in or_lists {
-            let values = traverse_rdf_list(db, &list_head, &rdf_first, &rdf_rest, &rdf_nil).await?;
-            let shape_refs: Vec<Sid> = values
-                .into_iter()
-                .filter_map(|v| {
-                    if let FlakeValue::Ref(sid) = v {
-                        Some(sid)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if let Some(shape_data) = self.shapes.get_mut(&shape_id) {
-                shape_data.or_shapes = shape_refs;
-            }
-        }
-
-        // Expand sh:xone lists
-        for (shape_id, list_head) in xone_lists {
-            let values = traverse_rdf_list(db, &list_head, &rdf_first, &rdf_rest, &rdf_nil).await?;
-            let shape_refs: Vec<Sid> = values
-                .into_iter()
-                .filter_map(|v| {
-                    if let FlakeValue::Ref(sid) = v {
-                        Some(sid)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if let Some(shape_data) = self.shapes.get_mut(&shape_id) {
-                shape_data.xone_shapes = shape_refs;
+            let [and_shapes, or_shapes, xone_shapes] = lists;
+            if let Some(sd) = self.shapes.get_mut(&shape_id) {
+                sd.and_shapes = and_shapes;
+                sd.or_shapes = or_shapes;
+                sd.xone_shapes = xone_shapes;
             }
         }
 
