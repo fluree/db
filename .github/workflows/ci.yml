@@ -335,15 +335,6 @@ jobs:
       - name: Runtime smoke (wasm32 under Node)
         run: node wasm-probe/run-node.mjs
 
-  # Executes the browser build (the wasm32 job only proves it compiles).
-  # 1. The playground binding runs create → insert → query → format inside a
-  #    dedicated worker in headless Chrome (wasm-bindgen-test, assertions on
-  #    returned rows — a positive ran-marker, never "didn't crash").
-  # 2. The SHIPPED npm package (main-thread proxy → module worker → wasm) is
-  #    driven end to end over the DevTools protocol with no COOP/COEP headers,
-  #    which is the package's hosting contract.
-  # ubuntu-24.04 ships a matching Chrome + chromedriver pair. Same RUSTFLAGS
-  # restatement as the wasm32 job (an env RUSTFLAGS masks .cargo/config.toml).
   python:
     # The `fluree` Python package is tested by pytest (its Rust lib is
     # `test = false`), so no job above runs its tests. One abi3 wheel per OS
@@ -414,6 +405,15 @@ jobs:
           ../venv-314/bin/pip install mypy pandas-stubs polars
           ../venv-314/bin/python -m mypy
 
+  # Executes the browser build (the wasm32 job only proves it compiles).
+  # 1. The playground binding runs create → insert → query → format inside a
+  #    dedicated worker in headless Chrome (wasm-bindgen-test, assertions on
+  #    returned rows — a positive ran-marker, never "didn't crash").
+  # 2. The SHIPPED npm package (main-thread proxy → module worker → wasm) is
+  #    driven end to end over the DevTools protocol with no COOP/COEP headers,
+  #    which is the package's hosting contract.
+  # ubuntu-24.04 ships a matching Chrome + chromedriver pair. Same RUSTFLAGS
+  # restatement as the wasm32 job (an env RUSTFLAGS masks .cargo/config.toml).
   wasm-smoke:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
