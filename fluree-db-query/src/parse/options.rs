@@ -41,6 +41,15 @@ fn validate_var_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// An `orderBy` term's variable. An expression in its place (`(count ?e)`) is
+/// [`ParseError::InvalidOrderBy`], whose message says how to sort on one.
+fn validate_order_var(name: &str) -> Result<()> {
+    if name.trim_start().starts_with('(') {
+        return Err(ParseError::InvalidOrderBy);
+    }
+    validate_var_name(name)
+}
+
 /// Parse depth option for graph select auto-expansion
 ///
 /// Default is 0 (no auto-expansion).
@@ -190,7 +199,7 @@ fn parse_order_term_object(map: &serde_json::Map<String, JsonValue>) -> Result<U
         .get("var")
         .and_then(|v| v.as_str())
         .ok_or(ParseError::InvalidOrderBy)?;
-    validate_var_name(var)?;
+    validate_order_var(var)?;
 
     // Accept both "direction" and "order" as synonyms (clients vary)
     let dir_val = map
@@ -222,7 +231,7 @@ fn parse_order_term_string(s: &str) -> Result<UnresolvedSortSpec> {
         }
         let direction = parse_sort_direction(parts[0])?;
         let var = parts[1];
-        validate_var_name(var)?;
+        validate_order_var(var)?;
         return Ok(UnresolvedSortSpec {
             var: Arc::from(var),
             direction,
@@ -230,7 +239,7 @@ fn parse_order_term_string(s: &str) -> Result<UnresolvedSortSpec> {
     }
 
     // Plain var string (defaults to ascending)
-    validate_var_name(trimmed)?;
+    validate_order_var(trimmed)?;
     Ok(UnresolvedSortSpec {
         var: Arc::from(trimmed),
         direction: UnresolvedSortDirection::Asc,
@@ -245,7 +254,7 @@ fn parse_order_term_array(arr: &[JsonValue]) -> Result<UnresolvedSortSpec> {
     let dir = arr[0].as_str().ok_or(ParseError::InvalidOrderBy)?;
     let var = arr[1].as_str().ok_or(ParseError::InvalidOrderBy)?;
     let direction = parse_sort_direction(dir)?;
-    validate_var_name(var)?;
+    validate_order_var(var)?;
     Ok(UnresolvedSortSpec {
         var: Arc::from(var),
         direction,
@@ -805,6 +814,32 @@ mod tests {
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].var.as_ref(), "?x");
         assert_eq!(specs[0].direction, UnresolvedSortDirection::Desc);
+    }
+
+    #[test]
+    fn test_parse_order_by_expression_names_the_alias_route() {
+        // An expression or aggregate where a variable belongs gets the message
+        // that says how to sort on one, in every term form.
+        for val in [
+            json!("(desc (count ?e))"),
+            json!(["(desc (count ?e))"]),
+            json!([["desc", "(count ?e)"]]),
+            json!([{"var": "(count ?e)", "direction": "desc"}]),
+        ] {
+            let obj = json!({ "orderBy": val });
+            let err = parse_order_by(obj.as_object().unwrap()).unwrap_err();
+            assert!(matches!(err, ParseError::InvalidOrderBy), "{val}: {err:?}");
+            assert!(
+                err.to_string().contains("select it under an alias"),
+                "{val}: {err}"
+            );
+        }
+        // A bare word is still a malformed variable.
+        let obj = json!({ "orderBy": ["name"] });
+        assert!(matches!(
+            parse_order_by(obj.as_object().unwrap()).unwrap_err(),
+            ParseError::InvalidVariable(_)
+        ));
     }
 
     #[test]
