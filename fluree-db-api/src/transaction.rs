@@ -26,7 +26,7 @@
 
 use crate::cypher_write::{self, ResolvedConditional, WritePlan};
 use crate::format::cypher_typed::CypherCell;
-use crate::ledger_manager::RefreshOpts;
+use crate::ledger_manager::{RefreshOpts, WritePath};
 use crate::tx::{SequentialStager, TransactResultRef};
 use crate::tx_builder::{is_retryable_commit_conflict, OpPlan, TransactOperation};
 use crate::{
@@ -407,12 +407,19 @@ impl Transaction {
                 }));
             }
             let stage = match prestaged.take() {
-                Some(stage) if unchanged => stage,
+                Some(stage) if unchanged => {
+                    handle.note_write_path(WritePath::Direct);
+                    stage
+                }
                 prestaged => match prestaged.and_then(|stage| {
                     Fluree::rebase_stage(&guard, stage, base_t, base_head.as_ref())
                 }) {
-                    Some(stage) => stage,
+                    Some(stage) => {
+                        handle.note_write_path(WritePath::Rebased);
+                        stage
+                    }
                     None => {
+                        handle.note_write_path(WritePath::Restaged);
                         let state = guard.clone_state();
                         // The policy the ledger has now: a commit since the
                         // transaction began may have changed it.

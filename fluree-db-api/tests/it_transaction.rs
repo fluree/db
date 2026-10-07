@@ -40,6 +40,16 @@ async fn begin(fluree: &Fluree) -> Transaction {
         .expect("begin")
 }
 
+/// How many commits re-based and how many staged again.
+async fn write_paths(fluree: &Fluree) -> (u64, u64) {
+    let stats = fluree
+        .ledger_cached(LEDGER)
+        .await
+        .expect("handle")
+        .write_path_stats();
+    (stats.rebased, stats.restaged)
+}
+
 async fn head(fluree: &Fluree) -> GraphDb {
     fluree.db(LEDGER).await.expect("db")
 }
@@ -188,6 +198,7 @@ async fn commits_over_a_concurrent_write_to_other_subjects() {
 
     let result = txn.commit(CommitOpts::default()).await.unwrap();
     assert_eq!(result.receipt.t, 2);
+    assert_eq!(write_paths(&fluree).await, (1, 0), "re-based");
     assert_eq!(
         people(&fluree, &head(&fluree).await).await,
         vec![json!(["Alice", 30]), json!(["Carol", null])]
@@ -208,6 +219,7 @@ async fn restages_over_a_concurrent_write_its_update_matches() {
     set_alice_age(&fluree, 50).await;
 
     txn.commit(CommitOpts::default()).await.unwrap();
+    assert_eq!(write_paths(&fluree).await, (0, 1), "staged again");
     assert_eq!(
         people(&fluree, &head(&fluree).await).await,
         vec![json!(["Alice", 51])]
