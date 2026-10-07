@@ -20,9 +20,7 @@ use crate::support;
 use crate::support::{start_background_indexer_local, trigger_index_and_wait_outcome};
 use fluree_db_api::{
     policy_builder, Fluree, FlureeBuilder, GovernanceOptions, GraphDb, IndexConfig, LedgerState,
-    Novelty,
 };
-use fluree_db_core::LedgerSnapshot;
 use fluree_db_indexer::IndexerHandle;
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::{json, Value as JsonValue};
@@ -418,40 +416,23 @@ async fn geo_search_respects_limit_returns_nearest() {
 // Named Graph Tests
 // =============================================================================
 
-/// Test that geo queries respect named graph boundaries.
-///
-/// This verifies that when querying a named graph, only locations within that
-/// graph are returned - not locations from the default graph or other named graphs.
-///
-/// This test uses TWO named graphs (Germany and Italy) plus a default graph to ensure
-/// that the g_id routing correctly distinguishes between different named graphs,
-/// not just between "named" and "default".
+/// Geo search stays within the graph it reads: the default graph's cities
+/// and each named graph's, though every one is within reach of the others.
+/// Two named graphs, so graph routing must tell them apart, not only named
+/// from default.
 #[tokio::test]
-#[ignore = "named graph geo boundary test needs graph-scoped binary index routing"]
 async fn geo_search_respects_named_graph_boundaries() {
-    let fluree = FlureeBuilder::memory().build_memory();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (fluree, local, handle) = indexed_fluree(&tmp);
     let alias = "it/geo-named-graph:main";
-
-    let (local, handle) = start_background_indexer_local(
-        fluree.backend().clone(),
-        fluree
-            .nameservice_mode()
-            .publisher_arc()
-            .expect("test setup requires ReadWrite nameservice mode"),
-        fluree_db_indexer::IndexerConfig::small(),
-    );
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(alias);
-            let ledger = LedgerState::new(db0, Novelty::new(0));
-
-            // Insert cities in default graph (France)
+            let ledger = fluree.create_ledger(alias).await.expect("create");
+            // Default graph: France.
             let ledger = insert_city(&fluree, ledger, "ex:paris", "Paris", 2.3522, 48.8566).await;
             let ledger = insert_city(&fluree, ledger, "ex:lyon", "Lyon", 4.8357, 45.7640).await;
-
-            // Insert cities in named graph: Germany (TriG format via staged builder)
-            let germany_trig = r#"
+            let trig = r#"
                 @prefix ex: <http://example.org/> .
                 @prefix geo: <http://www.opengis.net/ont/geosparql#> .
 
@@ -463,21 +444,6 @@ async fn geo_search_respects_named_graph_boundaries() {
                         ex:name "Munich" ;
                         ex:location "POINT(11.5820 48.1351)"^^geo:wktLiteral .
                 }
-            "#;
-
-            let ledger = fluree
-                .stage_owned(ledger)
-                .upsert_turtle(germany_trig)
-                .execute()
-                .await
-                .expect("insert germany graph")
-                .ledger;
-
-            // Insert cities in named graph: Italy (TriG format via staged builder)
-            let italy_trig = r#"
-                @prefix ex: <http://example.org/> .
-                @prefix geo: <http://www.opengis.net/ont/geosparql#> .
-
                 GRAPH <http://example.org/graphs/italy> {
                     ex:rome a ex:City ;
                         ex:name "Rome" ;
@@ -487,73 +453,70 @@ async fn geo_search_respects_named_graph_boundaries() {
                         ex:location "POINT(9.1900 45.4642)"^^geo:wktLiteral .
                 }
             "#;
-
-            let ledger = fluree
+            fluree
                 .stage_owned(ledger)
-                .upsert_turtle(italy_trig)
+                .upsert_turtle(trig)
                 .execute()
                 .await
-                .expect("insert italy graph")
-                .ledger;
-            let t = ledger.snapshot.t;
+                .expect("named graphs");
+            let indexed = index_and_load(&fluree, &handle, alias).await;
 
-            // Trigger indexing
-            let completion = handle
-                .trigger(&fluree_db_api::LedgerId::parse(alias).unwrap(), t)
-                .await;
-            match completion.wait().await {
-                fluree_db_api::IndexOutcome::Completed { .. } => {}
-                fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
-                fluree_db_api::IndexOutcome::Cancelled => panic!("indexing cancelled"),
-            }
-
-            // Load the indexed ledger
-            let loaded = fluree.ledger(alias).await.expect("load ledger");
-
-            // Query default graph from Paris - should find Paris and Lyon only
-            let default_query = json!({
-                "@context": geo_search_context(),
-                "from": alias,
-                "select": ["?name"],
-                "where": [
-                    { "@id": "?place", "ex:location": "?loc" },
-                    ["bind", "?dist", "(geof:distance ?loc \"POINT(2.3522 48.8566)\")"],
-                    ["filter", "(<= ?dist 2000000)"],
-                    { "@id": "?place", "ex:name": "?name" }
-                ]
-            });
-
-            let result = support::query_jsonld(&fluree, &loaded, &default_query).await;
-            match result {
-                Ok(r) => {
-                    let json_rows = r.to_jsonld(&loaded.snapshot).expect("jsonld");
-                    let names: Vec<&str> = json_rows
-                        .as_array()
-                        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-                        .unwrap_or_default();
-
-                    println!("Default graph results: {names:?}");
-                    assert!(
-                        names.contains(&"Paris"),
-                        "Paris should be in default graph results"
+            // Every city is within 1,500 km of Paris, and of Munich.
+            let names_in = |graph: Option<&'static str>, center: &'static str| {
+                let (fluree, indexed) = (&fluree, &indexed);
+                async move {
+                    let shape = format!(
+                        r#"?place <http://example.org/location> ?loc ;
+                                  <http://example.org/name> ?name .
+                           BIND(geof:distance(?loc, "{center}"^^geo:wktLiteral) AS ?dist)
+                           FILTER(?dist <= 1500000)"#
                     );
-                    assert!(
-                        names.contains(&"Lyon"),
-                        "Lyon should be in default graph results"
+                    let pattern = match graph {
+                        Some(iri) => format!("GRAPH <{iri}> {{ {shape} }}"),
+                        None => shape,
+                    };
+                    let sparql = format!(
+                        "PREFIX geo: <http://www.opengis.net/ont/geosparql#>
+                         PREFIX geof: <http://www.opengis.net/def/function/geosparql/>
+                         SELECT ?name WHERE {{ {pattern} }} ORDER BY ?name"
                     );
-                    assert!(
-                        !names.contains(&"Berlin"),
-                        "Berlin should NOT be in default graph results"
-                    );
-                    assert!(
-                        !names.contains(&"Rome"),
-                        "Rome should NOT be in default graph results"
-                    );
+                    let rows = support::query_sparql(fluree, indexed, &sparql)
+                        .await
+                        .expect("geo query")
+                        .to_jsonld(&indexed.snapshot)
+                        .expect("jsonld");
+                    rows.as_array()
+                        .expect("rows")
+                        .iter()
+                        .map(|row| {
+                            row.as_str()
+                                .or_else(|| row[0].as_str())
+                                .unwrap_or_else(|| panic!("a name: {row}"))
+                                .to_string()
+                        })
+                        .collect::<Vec<_>>()
                 }
-                Err(e) => {
-                    eprintln!("Default graph query error (expected if binary index issue): {e}");
-                }
-            }
+            };
+            assert_eq!(
+                names_in(None, "POINT(2.3522 48.8566)").await,
+                ["Lyon", "Paris"]
+            );
+            assert_eq!(
+                names_in(
+                    Some("http://example.org/graphs/germany"),
+                    "POINT(11.5820 48.1351)"
+                )
+                .await,
+                ["Berlin", "Munich"]
+            );
+            assert_eq!(
+                names_in(
+                    Some("http://example.org/graphs/italy"),
+                    "POINT(11.5820 48.1351)"
+                )
+                .await,
+                ["Milan", "Rome"]
+            );
         })
         .await;
 }
