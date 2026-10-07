@@ -11113,3 +11113,58 @@ async fn cypher_reads_honor_fuel_limits_and_cancellation() {
         .expect_err("cancelled");
     assert!(err.to_string().to_lowercase().contains("cancel"), "{err}");
 }
+
+/// The reads a Cypher write makes count against its fuel limit, as its
+/// staging does: a write whose read is the costly part stops at a limit its
+/// writes alone fit under.
+#[tokio::test]
+async fn cypher_write_reads_count_against_its_fuel_limit() {
+    use fluree_db_api::cypher_seq::{detect_sequential, CypherSeqInput};
+    use fluree_db_api::TrackingOptions;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:write-fuel";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let people: Vec<JsonValue> = (0..60)
+        .map(|i| json!({"@id": format!("p{i}"), "@type": "Person", "n": i}))
+        .collect();
+    fluree
+        .insert(ledger0, &json!({"@context": ctx(), "@graph": people}))
+        .await
+        .expect("seed");
+    let write = |cypher: &'static str, max_fuel: Option<u64>| {
+        let fluree = &fluree;
+        async move {
+            let ast = fluree_db_cypher::parse_cypher(cypher).ast.expect("parse");
+            let plan = detect_sequential(&ast).expect("a sequential write");
+            let handle = fluree.ledger_cached(ledger_id).await.expect("handle");
+            fluree
+                .stage(&handle)
+                .cypher_sequential(CypherSeqInput {
+                    plan,
+                    governance: Default::default(),
+                    skolem_txn_id: None,
+                })
+                .tracking(TrackingOptions {
+                    track_time: false,
+                    track_fuel: true,
+                    track_policy: false,
+                    max_fuel,
+                })
+                .execute()
+                .await
+        }
+    };
+    // A one-row MERGE, read through a 60^3 cross product: its writes cost
+    // ~10 fuel, its read ~220.
+    let cypher = "MATCH (a:Person), (b:Person), (c:Person) WHERE a.n + b.n + c.n = 177 \
+                  MERGE (t:Tag {name: 'probe'})";
+    let fifty_fuel = 50 * fluree_db_core::tracking::MICRO_FUEL_PER_FUEL;
+    let err = write(cypher, Some(fifty_fuel))
+        .await
+        .expect_err("fuel limit");
+    assert!(err.to_string().to_lowercase().contains("fuel"), "{err}");
+    let committed = write(cypher, None).await.expect("unlimited");
+    let fuel = committed.tally.and_then(|t| t.fuel).expect("fuel tallied");
+    assert!(fuel > 50.0, "{fuel}");
+}

@@ -552,6 +552,17 @@ impl Fluree {
         db: &GraphDb,
         ast: &fluree_db_cypher::CypherAst,
     ) -> Result<QueryResult> {
+        self.query_cypher_ast_tracked(db, ast, None).await
+    }
+
+    /// [`Self::query_cypher_ast`], charging `tracker`: a Cypher write's reads
+    /// count against its fuel limit.
+    pub(crate) async fn query_cypher_ast_tracked(
+        &self,
+        db: &GraphDb,
+        ast: &fluree_db_cypher::CypherAst,
+        tracker: Option<&Tracker>,
+    ) -> Result<QueryResult> {
         let (vars, mut parsed) = crate::query::helpers::lower_cypher_ast_to_ir(
             ast,
             &db.snapshot,
@@ -563,13 +574,14 @@ impl Fluree {
         guard_graph_source_patterns(db, &parsed, QuerySyntax::Cypher)?;
         // Code-built probe ASTs carry no query-time reasoning or datalog
         // overrides, so override control has nothing to gate: anonymous.
+        let disabled = Tracker::disabled();
         self.execute_cypher_ir(
             db,
             vars,
             parsed,
             0.0,
             &QueryExecutionOptions::default(),
-            &Tracker::disabled(),
+            tracker.unwrap_or(&disabled),
         )
         .await
     }
@@ -588,6 +600,7 @@ impl Fluree {
         ast: &fluree_db_cypher::CypherAst,
         seed_cols: &[String],
         rows: Vec<Vec<fluree_db_query::Binding>>,
+        tracker: Option<&Tracker>,
     ) -> Result<QueryResult> {
         let (vars, mut parsed) = crate::query::helpers::lower_cypher_ast_to_ir(
             ast,
@@ -637,13 +650,14 @@ impl Fluree {
         guard_graph_source_patterns(db, &parsed, QuerySyntax::Cypher)?;
         // Code-built probe ASTs carry no query-time reasoning or datalog
         // overrides, so override control has nothing to gate: anonymous.
+        let disabled = Tracker::disabled();
         self.execute_cypher_ir(
             db,
             vars,
             parsed,
             0.0,
             &QueryExecutionOptions::default(),
-            &Tracker::disabled(),
+            tracker.unwrap_or(&disabled),
         )
         .await
     }

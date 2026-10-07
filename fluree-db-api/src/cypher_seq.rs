@@ -251,7 +251,7 @@ impl Fluree {
             let view = self
                 .seq_probe_view(stager.state(), governance, default_context.as_ref())
                 .await?;
-            let result = self.query_cypher_ast(&view, &ast).await?;
+            let result = self.query_cypher_ast_tracked(&view, &ast, tracker).await?;
             let mut rows = if cols.is_empty() {
                 extract_rows(result, &[ROW_SEED_VAR.to_string()])?
             } else {
@@ -281,6 +281,7 @@ impl Fluree {
                     default_context.as_ref(),
                     stager.state(),
                     span,
+                    tracker,
                 )
                 .await?;
             let clause = &clause;
@@ -358,10 +359,16 @@ impl Fluree {
                     .seq_probe_view(stager.state(), governance, default_context.as_ref())
                     .await?;
                 let result = if seeded {
-                    self.query_cypher_ast_seeded(&view, &ast, &table.cols, table.rows.clone())
-                        .await?
+                    self.query_cypher_ast_seeded(
+                        &view,
+                        &ast,
+                        &table.cols,
+                        table.rows.clone(),
+                        tracker,
+                    )
+                    .await?
                 } else {
-                    self.query_cypher_ast(&view, &ast).await?
+                    self.query_cypher_ast_tracked(&view, &ast, tracker).await?
                 };
                 Some(result)
             }
@@ -382,7 +389,7 @@ impl Fluree {
                     .seq_probe_view(stager.state(), governance, default_context.as_ref())
                     .await?;
                 let result = self
-                    .query_cypher_ast_seeded(&view, &ast, &table.cols, Vec::new())
+                    .query_cypher_ast_seeded(&view, &ast, &table.cols, Vec::new(), tracker)
                     .await?;
                 Some(result)
             }
@@ -607,13 +614,19 @@ impl Fluree {
                         &ast,
                         &cols_with_index(&table.cols),
                         rows_with_index(&table.rows, span),
+                        tracker,
                     )
                     .await?;
                 extract_row_indices(result)?
             } else {
                 // Unit table: one empty row; matched iff the pattern exists.
                 let probe = crate::cypher_write::build_merge_path_probe_ast(merge);
-                if self.query_cypher_ast(&view, &probe).await?.row_count() > 0 {
+                if self
+                    .query_cypher_ast_tracked(&view, &probe, tracker)
+                    .await?
+                    .row_count()
+                    > 0
+                {
                     std::iter::once(0).collect()
                 } else {
                     std::collections::HashSet::new()
@@ -637,6 +650,7 @@ impl Fluree {
                     governance,
                     default_context,
                     span,
+                    tracker,
                 )
                 .await?;
             let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
@@ -711,6 +725,7 @@ impl Fluree {
                         &ast,
                         &cols_with_index(&table.cols),
                         rows_with_index(&table.rows, span),
+                        tracker,
                     )
                     .await?,
                     table.cols.clone(),
@@ -748,7 +763,10 @@ impl Fluree {
                     }),
                     span,
                 };
-                (self.query_cypher_ast(&view, &ast).await?, Vec::new())
+                (
+                    self.query_cypher_ast_tracked(&view, &ast, tracker).await?,
+                    Vec::new(),
+                )
             };
 
             let mut wanted: Vec<String> = vec![ROW_IDX_VAR.to_string()];
@@ -898,6 +916,7 @@ impl Fluree {
                     default_context,
                     stager.state(),
                     span,
+                    tracker,
                 )
                 .await?;
             self.seq_stage_seeded(
@@ -931,6 +950,7 @@ impl Fluree {
         governance: Option<&GovernanceOptions>,
         default_context: Option<&serde_json::Value>,
         span: SourceSpan,
+        tracker: Option<&Tracker>,
     ) -> Result<Vec<Vec<u8>>> {
         let part = &merge.pattern.parts[0];
         // The identity expressions, in a fixed order.
@@ -1040,7 +1060,7 @@ impl Fluree {
             let mut seed_cols = table.cols.clone();
             seed_cols.push(ROW_IDX_VAR.to_string());
             let result = self
-                .query_cypher_ast_seeded(&view, &ast, &seed_cols, sub_rows)
+                .query_cypher_ast_seeded(&view, &ast, &seed_cols, sub_rows, tracker)
                 .await?;
             let mut wanted: Vec<String> = vec![ROW_IDX_VAR.to_string()];
             for i in 0..exprs.len() {
@@ -1072,6 +1092,7 @@ impl Fluree {
     /// `SET n.x = p.age + 1`) is evaluated per row against the current
     /// virtual state and replaced by a fresh synthetic column reference.
     /// The write lowering then sees only literals and bound variables.
+    #[allow(clippy::too_many_arguments)]
     async fn hoist_clause_value_exprs(
         &self,
         table: &mut RowTable,
@@ -1080,6 +1101,7 @@ impl Fluree {
         default_context: Option<&serde_json::Value>,
         state: &LedgerState,
         span: SourceSpan,
+        tracker: Option<&Tracker>,
     ) -> Result<WriteClause> {
         let include_merge_sets = !matches!(clause, WriteClause::Merge(_));
         let mut clause = clause.clone();
@@ -1151,6 +1173,7 @@ impl Fluree {
                     &ast,
                     &cols_with_index(&table.cols),
                     rows_with_index(&table.rows, span),
+                    tracker,
                 )
                 .await?;
             let mut wanted: Vec<String> = vec![ROW_IDX_VAR.to_string()];
@@ -1184,7 +1207,7 @@ impl Fluree {
                 }),
                 span,
             };
-            let result = self.query_cypher_ast(&view, &ast).await?;
+            let result = self.query_cypher_ast_tracked(&view, &ast, tracker).await?;
             (result, hoisted.iter().map(|(n, _)| n.clone()).collect())
         };
 
