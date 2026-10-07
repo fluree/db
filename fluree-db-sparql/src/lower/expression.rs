@@ -212,7 +212,8 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                         | FlakeValue::BigInt(_)
                         | FlakeValue::Boolean(_)
                         | FlakeValue::String(_)
-                        | FlakeValue::Vector(_),
+                        | FlakeValue::Vector(_)
+                        | FlakeValue::GeoPoint(_),
                 ) || fv.is_temporal()
                     || fv.is_duration()
                 {

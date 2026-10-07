@@ -418,6 +418,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 })?;
                 Ok(FlakeValue::Vector(arr.into()))
             }
+            // A WKT POINT is stored as a GeoPoint; a constant that stayed a
+            // string would match no stored point. Coerced as a write coerces.
+            fluree_vocab::geo::WKT_LITERAL => {
+                Ok(fluree_db_core::coerce::coerce_string_value(value, &dt_iri)
+                    .unwrap_or_else(|_| FlakeValue::String(value.to_string())))
+            }
             _ => {
                 // Default to string for unknown datatypes
                 Ok(FlakeValue::String(value.to_string()))

@@ -88,6 +88,11 @@ async fn geof_distance_answers_before_and_after_indexing() {
                 }
                 ORDER BY ?dist
             "#;
+            // A typed center lowers to a GeoPoint constant, not a string.
+            let sparql_typed = sparql.replace(
+                r#""POINT(2.3522 48.8566)")"#,
+                r#""POINT(2.3522 48.8566)"^^<http://www.opengis.net/ont/geosparql#wktLiteral>)"#,
+            );
             let jsonld = json!({
                 "@context": geo_search_context(),
                 "select": "?name",
@@ -99,13 +104,20 @@ async fn geof_distance_answers_before_and_after_indexing() {
                 "orderBy": "?dist"
             });
             let both = |ledger: LedgerState| {
-                let (fluree, sparql, jsonld) = (&fluree, sparql, &jsonld);
+                let (fluree, sparql, sparql_typed, jsonld) =
+                    (&fluree, sparql, sparql_typed.as_str(), &jsonld);
                 async move {
                     let by_sparql = support::query_sparql(fluree, &ledger, sparql)
                         .await
                         .expect("sparql")
                         .to_jsonld(&ledger.snapshot)
                         .expect("format");
+                    let by_typed = support::query_sparql(fluree, &ledger, sparql_typed)
+                        .await
+                        .expect("sparql, typed center")
+                        .to_jsonld(&ledger.snapshot)
+                        .expect("format");
+                    assert_eq!(by_typed, by_sparql, "typed center");
                     let by_jsonld = support::query_jsonld(fluree, &ledger, jsonld)
                         .await
                         .expect("jsonld")
@@ -119,14 +131,14 @@ async fn geof_distance_answers_before_and_after_indexing() {
             let (seen, _) = geo_stamps(0);
             assert_eq!(both(ledger.clone()).await, expected);
             let (seen, unindexed) = geo_stamps(seen);
-            assert_eq!(unindexed, ["fallback:gate_declined"; 2]);
+            assert_eq!(unindexed, ["fallback:gate_declined"; 3]);
 
             trigger_index_and_wait_outcome(&handle, alias, ledger.t()).await;
             let indexed = fluree.ledger(alias).await.expect("load ledger");
             assert!(indexed.snapshot.range_provider.is_some(), "the index is loaded");
             assert_eq!(both(indexed).await, expected);
             let (_, indexed) = geo_stamps(seen);
-            assert_eq!(indexed, ["proceed"; 2]);
+            assert_eq!(indexed, ["proceed"; 3]);
         })
         .await;
 }

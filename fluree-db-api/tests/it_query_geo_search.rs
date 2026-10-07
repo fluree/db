@@ -94,13 +94,22 @@ async fn insert_city(
         .ledger
 }
 
-/// Retract a city's location. The location is bound by a variable: a WKT
-/// constant in a pattern does not match a stored point.
-async fn retract_location(fluree: &Fluree, ledger: LedgerState, id: &str) -> LedgerState {
+/// Retract a city's location, naming it by its WKT value.
+async fn retract_location(
+    fluree: &Fluree,
+    ledger: LedgerState,
+    id: &str,
+    lng: f64,
+    lat: f64,
+) -> LedgerState {
+    let point = json!({
+        "@value": format!("POINT({lng} {lat})"),
+        "@type": "geo:wktLiteral"
+    });
     let tx = json!({
         "@context": geo_search_context(),
-        "where": { "@id": id, "ex:location": "?loc" },
-        "delete": { "@id": id, "ex:location": "?loc" }
+        "where": { "@id": id, "ex:location": point },
+        "delete": { "@id": id, "ex:location": point }
     });
     let result = fluree.update(ledger, &tx).await.expect("retract");
     assert_eq!(result.receipt.retract_count, 1, "the location is retracted");
@@ -206,7 +215,7 @@ async fn geo_search_retraction_removes_point_from_results() {
                 ["Paris", "London"]
             );
 
-            let ledger = retract_location(&fluree, indexed, "ex:london").await;
+            let ledger = retract_location(&fluree, indexed, "ex:london", -0.1278, 51.5074).await;
             let after = GraphDb::from_ledger_state(&ledger);
             assert_eq!(
                 names(&nearby(&fluree, &after, PARIS, 500_000.0).await),
@@ -785,6 +794,67 @@ async fn geo_search_enforces_view_policy_on_location_flake() {
                 !rendered.contains("london"),
                 "London (hidden location) must not leak through geo search; got {jsonld:#?}"
             );
+        })
+        .await;
+}
+
+// =============================================================================
+// WKT constants
+// =============================================================================
+
+/// A `geo:wktLiteral` POINT is stored as a GeoPoint, and a POINT constant in
+/// a query lowers to the same value, so it matches: as a triple object, in
+/// VALUES, compared in a FILTER, and as a JSON-LD value object. Checked with
+/// the point in novelty and again from the index.
+#[tokio::test]
+async fn a_wkt_point_constant_matches_the_stored_point() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (fluree, local, handle) = indexed_fluree(&tmp);
+    let alias = "it/geo-wkt-constant:main";
+
+    local
+        .run_until(async move {
+            let ledger = fluree.create_ledger(alias).await.expect("create");
+            let ledger =
+                insert_city(&fluree, ledger, "ex:london", "London", -0.1278, 51.5074).await;
+            let sparql = [
+                r#"SELECT ?s WHERE { ?s ex:location "POINT(-0.1278 51.5074)"^^geo:wktLiteral }"#,
+                r#"SELECT ?s WHERE { VALUES ?l { "POINT(-0.1278 51.5074)"^^geo:wktLiteral } ?s ex:location ?l }"#,
+                r#"SELECT ?s WHERE { ?s ex:location ?l FILTER(?l = "POINT(-0.1278 51.5074)"^^geo:wktLiteral) }"#,
+            ];
+            let jsonld = json!({
+                "@context": geo_search_context(),
+                "select": ["?s"],
+                "where": {
+                    "@id": "?s",
+                    "ex:location": {"@value": "POINT(-0.1278 51.5074)", "@type": "geo:wktLiteral"}
+                }
+            });
+            let check = |ledger: LedgerState| {
+                let (fluree, jsonld) = (&fluree, &jsonld);
+                async move {
+                    for query in sparql {
+                        let query = format!(
+                            "PREFIX ex: <http://example.org/> \
+                             PREFIX geo: <http://www.opengis.net/ont/geosparql#> {query}"
+                        );
+                        let rows = support::query_sparql(fluree, &ledger, &query)
+                            .await
+                            .expect("query")
+                            .to_jsonld(&ledger.snapshot)
+                            .expect("jsonld");
+                        assert_eq!(rows, json!([["ex:london"]]), "{query}");
+                    }
+                    let rows = support::query_jsonld(fluree, &ledger, jsonld)
+                        .await
+                        .expect("query")
+                        .to_jsonld(&ledger.snapshot)
+                        .expect("jsonld");
+                    assert_eq!(rows, json!([["ex:london"]]), "JSON-LD value object");
+                }
+            };
+            check(ledger).await;
+            check(index_and_load(&fluree, &handle, alias).await).await;
         })
         .await;
 }

@@ -216,14 +216,13 @@ fn extract_distance_call(expr: &Expression) -> Option<(VarId, GeoSearchCenter)> 
             _ => return None,
         };
 
-        // Second arg must be a constant WKT string
-        let wkt = match &args[1] {
-            Expression::Const(FlakeValue::String(s)) => s.as_str(),
+        // Second arg must be a constant point: a WKT string, or the
+        // GeoPoint a typed `geo:wktLiteral` POINT constant lowers to
+        let (lat, lng) = match &args[1] {
+            Expression::Const(FlakeValue::String(wkt)) => try_extract_point(wkt)?,
+            Expression::Const(FlakeValue::GeoPoint(bits)) => (bits.lat(), bits.lng()),
             _ => return None,
         };
-
-        // Parse WKT POINT to lat/lng
-        let (lat, lng) = try_extract_point(wkt)?;
 
         Some((loc_var, GeoSearchCenter::Const { lat, lng }))
     } else {
