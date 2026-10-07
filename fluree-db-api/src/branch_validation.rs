@@ -315,6 +315,14 @@ impl crate::Fluree {
         if !view.has_staged() {
             return Ok(BranchOpValidation::default());
         }
+        if let Some(refusal) = self
+            .other_branch_system_graph_write(view, new_graph_iris, op)
+            .await?
+        {
+            return Ok(BranchOpValidation {
+                rejection: Some(TransactError::Parse(refusal)),
+            });
+        }
 
         let base = view.base();
         let ledger_id = base.snapshot.ledger_id.clone();
@@ -376,6 +384,73 @@ impl crate::Fluree {
     }
 }
 
+impl crate::Fluree {
+    /// Why a branch operation may not write another branch's system graph,
+    /// if it does: config (or commit metadata) written on a branch is named
+    /// for that branch (`urn:fluree:<name>:<branch>#config`) and configures
+    /// that branch only, so carried to another branch it would land in an
+    /// ordinary graph, never as that branch's config. A branch the target
+    /// was created from (directly or not) is the exception: its system
+    /// graphs are already ordinary graphs on the target, copied at the fork.
+    /// Retractions (a revert cleaning such a graph up) are allowed.
+    async fn other_branch_system_graph_write(
+        &self,
+        view: &StagedLedger,
+        new_graph_iris: &HashMap<GraphId, String>,
+        op: &str,
+    ) -> Result<Option<String>> {
+        let base = view.base();
+        let ledger_id = base.snapshot.ledger_id.to_string();
+        let mut written: BTreeSet<GraphId> = BTreeSet::new();
+        for (g_id, flake) in view.staged_flakes_by_graph() {
+            if flake.op && g_id != fluree_db_core::DEFAULT_GRAPH_ID {
+                written.insert(g_id);
+            }
+        }
+        for g_id in written {
+            let iri = new_graph_iris
+                .get(&g_id)
+                .map(String::as_str)
+                .or_else(|| base.snapshot.graph_registry.iri_for_graph_id(g_id));
+            let Some((branch, role)) =
+                iri.and_then(|iri| crate::config_guard::other_branch_system_graph(iri, &ledger_id))
+            else {
+                continue;
+            };
+            if self.is_ancestor_branch(&ledger_id, branch).await? {
+                continue;
+            }
+            return Ok(Some(format!(
+                "the {op} would write to branch {branch}'s {role} graph <{}>: what is written \
+                 there on a branch configures that branch only and is not carried over as \
+                 {role}; make the change on this branch, or revert it on {branch} first",
+                iri.unwrap_or_default()
+            )));
+        }
+        Ok(None)
+    }
+
+    /// Whether `branch` is one `ledger_id`'s branch was created from,
+    /// directly or through other branches.
+    async fn is_ancestor_branch(&self, ledger_id: &str, branch: &str) -> Result<bool> {
+        let mut id = fluree_db_core::LedgerId::parse(ledger_id)?;
+        // A branch chain is short; the bound only guards a malformed cycle.
+        for _ in 0..64 {
+            let Some(record) = self.nameservice().lookup(&id).await? else {
+                return Ok(false);
+            };
+            let Some(parent) = record.source_branch else {
+                return Ok(false);
+            };
+            if parent == branch {
+                return Ok(true);
+            }
+            id = fluree_db_core::LedgerId::from_parts(id.name(), &parent)?;
+        }
+        Ok(false)
+    }
+}
+
 /// A fast-forward target's state before the merge.
 pub(crate) struct FastForwardBase {
     /// The target's state at the merge's head.
@@ -388,10 +463,11 @@ pub(crate) struct FastForwardBase {
 
 /// Whether the adopted change carries anything the staged-config guard
 /// checks on a branch operation: a config field ([`crate::config_vocab::is_config_field`],
-/// the config reader's vocabulary), a type in the `f:` vocabulary, or a
-/// write to the target's config graph. Every refusal the guard can make needs
-/// one of them, so a change without any (data, edge annotations included) is
-/// accepted unchecked into a target that governs no writes.
+/// the config reader's vocabulary), a type in the `f:` vocabulary, a write
+/// to the target's config graph, or a write to another branch's system graph
+/// of this ledger. Every refusal the guard can make needs one of them, so a
+/// change without any (data, edge annotations included) is accepted
+/// unchecked into a target that governs no writes.
 fn carries_config_settings(
     target: &LedgerState,
     data: &crate::commit_data::CollectedCommitData,
@@ -407,13 +483,23 @@ fn carries_config_settings(
         )),
         Err(_) => return true,
     };
+    let ledger_id = target.snapshot.ledger_id.to_string();
+    let mut graphs_seen: std::collections::HashSet<&Sid> = std::collections::HashSet::new();
     data.flakes.iter().any(|flake| {
         crate::config_vocab::is_config_field(&flake.p)
             || (flake.p.namespace_code == RDF
                 && &*flake.p.name == fluree_vocab::rdf_names::TYPE
                 && matches!(&flake.o, fluree_db_core::FlakeValue::Ref(o)
                     if o.namespace_code == FLUREE_DB))
-            || (flake.g.is_some() && flake.g == config_graph)
+            || flake.g.as_ref().is_some_and(|g| {
+                flake.g == config_graph
+                    || (graphs_seen.insert(g)
+                        && ns.get_prefix(g.namespace_code).is_some_and(|prefix| {
+                            let iri = format!("{prefix}{}", g.name);
+                            crate::config_guard::other_branch_system_graph(&iri, &ledger_id)
+                                .is_some()
+                        }))
+            })
     })
 }
 

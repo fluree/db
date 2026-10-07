@@ -208,6 +208,28 @@ pub(crate) async fn validate_staged_config(
     Ok(())
 }
 
+/// The branch (and the graph's role, `config` or `txn-meta`) when `iri` is
+/// one of this ledger's system graphs on a branch other than `ledger_id`'s:
+/// `urn:fluree:<name>:<branch>#config` or `…#txn-meta`. A branch's system
+/// graphs are named for the branch, so on another branch they are ordinary
+/// graphs, never its configuration or commit metadata.
+pub(crate) fn other_branch_system_graph<'i>(
+    iri: &'i str,
+    ledger_id: &str,
+) -> Option<(&'i str, &'i str)> {
+    let (name, own_branch) = ledger_id.rsplit_once(':')?;
+    let rest = iri
+        .strip_prefix("urn:fluree:")?
+        .strip_prefix(name)?
+        .strip_prefix(':')?;
+    let (branch, role) = rest.split_once('#')?;
+    (matches!(role, "config" | "txn-meta")
+        && !branch.is_empty()
+        && !branch.contains(':')
+        && branch != own_branch)
+        .then_some((branch, role))
+}
+
 /// The `Sid` of a Fluree vocabulary IRI (`https://ns.flur.ee/db#...`).
 fn fluree_sid(iri: &str) -> Sid {
     let local = iri
@@ -707,15 +729,20 @@ impl<'a> Names<'a> {
         if g_id == fluree_db_core::DEFAULT_GRAPH_ID {
             return "the default graph".to_string();
         }
-        match self.graph_delta.get(&g_id).map(String::as_str).or_else(|| {
+        match self.graph_iri(g_id) {
+            Some(iri) => format!("graph <{iri}>"),
+            None => format!("graph {g_id}"),
+        }
+    }
+
+    /// A named graph's IRI: the write's own routing, else the registry.
+    fn graph_iri(&self, g_id: GraphId) -> Option<&'a str> {
+        self.graph_delta.get(&g_id).map(String::as_str).or_else(|| {
             self.view
                 .base()
                 .snapshot
                 .graph_registry
                 .iri_for_graph_id(g_id)
-        }) {
-            Some(iri) => format!("graph <{iri}>"),
-            None => format!("graph {g_id}"),
-        }
+        })
     }
 }

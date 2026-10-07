@@ -784,10 +784,11 @@ async fn fast_forward_into_an_ungoverned_target_checks_only_config_settings() {
 }
 
 /// The adopted commits are checked against the config the target has before
-/// the merge, whatever they do to it, as a transaction's own config writes do
-/// not apply to that transaction: a branch that switches SHACL off in its
-/// config and then writes what main's shapes reject is refused. Into a target
-/// whose config enables nothing, the same data fast-forwards unvalidated.
+/// the merge, whatever they do: a branch's own config (its config graph) is
+/// not carried over, so a branch that switches SHACL off in its config and
+/// then writes what main's shapes reject is refused, naming the branch's
+/// config graph it would carry. Into a target whose config enables nothing,
+/// the same data fast-forwards unvalidated.
 #[tokio::test]
 async fn fast_forward_is_validated_against_the_config_it_merges_into() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -812,8 +813,11 @@ async fn fast_forward_is_validated_against_the_config_it_merges_into() {
     let err = fluree
         .merge_branch("mydb", "dev", None, ConflictStrategy::default())
         .await
-        .expect_err("main's pre-merge config enables SHACL");
-    assert_shacl_violation(err, "config switched off on the branch");
+        .expect_err("dev's config is not carried to main");
+    assert!(
+        err.to_string().contains("branch dev's config graph"),
+        "config switched off on the branch: {err:?}"
+    );
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = fluree.create_ledger("mydb").await.unwrap();

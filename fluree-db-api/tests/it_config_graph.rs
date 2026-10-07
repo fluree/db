@@ -542,6 +542,186 @@ fn shacl_group_field_in_the_default_graph() -> serde_json::Value {
     })
 }
 
+/// Config written on a branch is in that branch's own config graph
+/// (`urn:fluree:<name>:<branch>#config`) and configures that branch only. A
+/// merge or fast-forward carrying it to another branch is refused, naming the
+/// branch and the graph, rather than landing it in an ordinary graph of the
+/// target where it would never be read; the preview reports it. Merging the
+/// other way, from the branch a branch was created from, is not refused:
+/// that parent's config graph is already an ordinary graph on the branch.
+#[tokio::test]
+async fn a_merge_carrying_config_written_on_another_branch_is_refused() {
+    let edits = [
+        // A whole config of the branch's own.
+        "<urn:config:dev> a f:LedgerConfig ; f:shaclDefaults <urn:config:devshacl> .
+         <urn:config:devshacl> f:shaclEnabled false .",
+        // A setting on a group main's config links.
+        "<urn:config:shacl> f:validationMode f:ValidationWarn .",
+    ];
+    for (i, edit) in edits.into_iter().enumerate() {
+        for fast_forward in [true, false] {
+            let fluree = FlureeBuilder::memory().build_memory();
+            let name = format!("it-config-branch-own-{i}-{fast_forward}");
+            let ledger = fluree.create_ledger(&name).await.unwrap();
+            let main = fluree
+                .stage_owned(ledger)
+                .upsert_turtle(&format!(
+                    "@prefix f: <https://ns.flur.ee/db#> . @prefix ex: <http://example.org/> .
+                     ex:seed ex:p 1 .
+                     GRAPH <{}> {{ <urn:config:main> a f:LedgerConfig ;
+                       f:shaclDefaults <urn:config:shacl> . <urn:config:shacl> f:shaclEnabled true . }}",
+                    config_graph_iri(&format!("{name}:main"))
+                ))
+                .execute()
+                .await
+                .expect("main's config")
+                .ledger;
+            fluree
+                .create_branch(&name, "dev", None, None)
+                .await
+                .unwrap();
+            let dev_cfg = config_graph_iri(&format!("{name}:dev"));
+            let dev = fluree.ledger(&format!("{name}:dev")).await.unwrap();
+            fluree
+                .stage_owned(dev)
+                .upsert_turtle(&format!(
+                    "@prefix f: <https://ns.flur.ee/db#> . GRAPH <{dev_cfg}> {{ {edit} }}"
+                ))
+                .execute()
+                .await
+                .expect("dev configures itself");
+            if !fast_forward {
+                fluree
+                    .insert(main, &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:x", "ex:p": 2}))
+                    .await
+                    .unwrap();
+            }
+            let preview = fluree
+                .merge_preview_with(
+                    &name,
+                    "dev",
+                    None,
+                    fluree_db_api::MergePreviewOpts::default(),
+                )
+                .await
+                .expect("preview");
+            assert!(
+                !preview.mergeable,
+                "{i}/{fast_forward}: the preview refuses"
+            );
+            let err = fluree
+                .merge_branch(
+                    &name,
+                    "dev",
+                    None,
+                    fluree_db_api::ConflictStrategy::default(),
+                )
+                .await
+                .expect_err("a merge carrying dev's config");
+            let message = err.to_string();
+            assert!(
+                message.contains("branch dev's config graph") && message.contains(&dev_cfg),
+                "{i}/{fast_forward}: {message}"
+            );
+            let view = fluree.db(&format!("{name}:main")).await.unwrap();
+            assert_eq!(
+                view.ledger_config()
+                    .and_then(|c| c.shacl.as_ref())
+                    .and_then(|s| s.enabled),
+                Some(true),
+                "{i}/{fast_forward}: main's config is untouched"
+            );
+        }
+    }
+
+    // From the parent: main's config change after the fork merges into dev.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it-config-branch-parent";
+    let main = ledger_with_branch(&fluree, name).await;
+    let dev = fluree.ledger(&format!("{name}:dev")).await.unwrap();
+    fluree
+        .insert(
+            dev,
+            &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:d", "ex:p": 1}),
+        )
+        .await
+        .unwrap();
+    fluree
+        .stage_owned(main)
+        .upsert_turtle(&format!(
+            "@prefix f: <https://ns.flur.ee/db#> .
+             GRAPH <{}> {{ <urn:config:main> a f:LedgerConfig ;
+               f:shaclDefaults <urn:config:shacl> . <urn:config:shacl> f:shaclEnabled true . }}",
+            config_graph_iri(&format!("{name}:main"))
+        ))
+        .execute()
+        .await
+        .expect("main's config");
+    fluree
+        .merge_branch(
+            name,
+            "main",
+            Some("dev"),
+            fluree_db_api::ConflictStrategy::default(),
+        )
+        .await
+        .expect("main's history merges into dev");
+
+    // Plain data a branch wrote to its own config graph is refused the same
+    // way, also into a target whose config governs no writes, where a
+    // fast-forward is checked only when its commits carry config settings.
+    for fast_forward in [true, false] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let name = format!("it-config-branch-own-data-{fast_forward}");
+        let ledger = fluree.create_ledger(&name).await.unwrap();
+        let main = fluree
+            .insert(
+                ledger,
+                &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:seed", "ex:p": 1}),
+            )
+            .await
+            .unwrap()
+            .ledger;
+        fluree
+            .create_branch(&name, "dev", None, None)
+            .await
+            .unwrap();
+        let dev_cfg = config_graph_iri(&format!("{name}:dev"));
+        fluree
+            .graph(&format!("{name}:dev"))
+            .transact()
+            .upsert_turtle(&format!(
+                "@prefix ex: <http://example.org/> . GRAPH <{dev_cfg}> {{ ex:note ex:p 1 . }}"
+            ))
+            .commit()
+            .await
+            .expect("dev writes data to its config graph");
+        if !fast_forward {
+            fluree
+                .insert(
+                    main,
+                    &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:x", "ex:p": 2}),
+                )
+                .await
+                .unwrap();
+        }
+        let err = fluree
+            .merge_branch(
+                &name,
+                "dev",
+                None,
+                fluree_db_api::ConflictStrategy::default(),
+            )
+            .await
+            .expect_err("a merge carrying dev's config graph data");
+        let message = err.to_string();
+        assert!(
+            message.contains("branch dev's config graph") && message.contains(&dev_cfg),
+            "{fast_forward}: {message}"
+        );
+    }
+}
+
 /// A merge may not split one of the target's config groups. After the fork
 /// the target links a group from its config graph, and the branch writes the
 /// group's field in the default graph (through JSON-LD, or SPARQL). Each
