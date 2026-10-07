@@ -1272,6 +1272,11 @@ impl StorageRead for FileStorage {
         true
     }
 
+    /// Reads are local files, which readers map or read in place.
+    fn is_remote(&self) -> bool {
+        false
+    }
+
     fn encryption_admin(&self) -> Option<std::sync::Arc<dyn crate::EncryptionAdmin>> {
         None
     }

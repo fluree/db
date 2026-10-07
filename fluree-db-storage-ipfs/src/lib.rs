@@ -153,6 +153,10 @@ impl ContentStore for IpfsStorage {
         true
     }
 
+    fn is_remote(&self) -> bool {
+        true
+    }
+
     async fn has(&self, id: &ContentId) -> fluree_db_core::error::Result<bool> {
         let cid_str = id.to_string();
         match self.kubo.block_stat(&cid_str).await {

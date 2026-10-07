@@ -3,6 +3,8 @@ mod support;
 
 #[path = "it_custom_datatype_limit.rs"]
 mod it_custom_datatype_limit;
+#[path = "it_disk_cache_locality.rs"]
+mod it_disk_cache_locality;
 #[path = "it_duration_index_roundtrip.rs"]
 mod it_duration_index_roundtrip;
 #[path = "it_fwd_pack_compaction.rs"]
@@ -21,6 +23,8 @@ mod it_indexing_workflow;
 mod it_ledger_info_reindex_cache;
 #[path = "it_ledger_info_reindex_size.rs"]
 mod it_ledger_info_reindex_size;
+#[path = "it_memory_storage_reads.rs"]
+mod it_memory_storage_reads;
 #[path = "it_notify_incremental.rs"]
 mod it_notify_incremental;
 #[path = "it_reasoning_reindex.rs"]

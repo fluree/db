@@ -1485,7 +1485,7 @@ impl crate::Fluree {
     /// Delete the branch-scoped storage artifacts for a single branch.
     ///
     /// Enumerates the per-branch subprefixes (`commit/`, `txn/`, `index/`,
-    /// `config/`). Cross-branch `@shared/dicts/` is **not** touched here —
+    /// `config/`, `blob/`). Cross-branch `@shared/dicts/` is **not** touched here —
     /// `drop_ledger` cleans it up via [`drop_shared_artifacts`] once every
     /// branch has been dropped.
     ///
@@ -1530,12 +1530,14 @@ impl crate::Fluree {
         // must hit each one separately. `index/` covers index roots, garbage,
         // and all object subkinds (branches, leaves, dicts when per-branch);
         // `config/` covers the LedgerConfig blob and the default-context blob,
-        // both stored as `ContentKind::LedgerConfig`.
+        // both stored as `ContentKind::LedgerConfig`; `blob/` holds every kind
+        // with no layout of its own, which includes the edge-annotation arenas.
         let subprefixes = vec![
             format!("fluree:{storage_method}://{branch_prefix}/commit/"),
             format!("fluree:{storage_method}://{branch_prefix}/txn/"),
             format!("fluree:{storage_method}://{branch_prefix}/index/"),
             format!("fluree:{storage_method}://{branch_prefix}/config/"),
+            format!("fluree:{storage_method}://{branch_prefix}/blob/"),
         ];
 
         let mut total = 0usize;

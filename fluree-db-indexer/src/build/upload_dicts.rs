@@ -1652,6 +1652,10 @@ mod tests {
             true
         }
 
+        fn is_remote(&self) -> bool {
+            false
+        }
+
         async fn has(&self, _id: &ContentId) -> fluree_db_core::error::Result<bool> {
             Ok(false)
         }

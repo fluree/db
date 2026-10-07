@@ -697,7 +697,8 @@ mod tests {
     /// while every root it walks is still in storage.
     #[tokio::test]
     async fn a_cached_plan_matches_an_uncached_one() {
-        let storage = MemoryStorage::new();
+        // Only remote storage gets a disk cache.
+        let storage = MemoryStorage::new().simulating_remote();
         let dict = dict_cid(b"live-dict");
         let (_, dict_addr) = cid_and_addr_for(
             MAIN,
@@ -730,7 +731,8 @@ mod tests {
     /// failing the plan on the manifests that were released with it.
     #[tokio::test]
     async fn a_released_root_ends_the_chain_even_when_its_cache_entry_survives() {
-        let storage = MemoryStorage::new();
+        // Only remote storage gets a disk cache.
+        let storage = MemoryStorage::new().simulating_remote();
         let dict = dict_cid(b"live-dict");
         let (_, dict_addr) = cid_and_addr_for(
             MAIN,
@@ -787,7 +789,8 @@ mod tests {
     /// the cache, pinned by `an_unreadable_head_aborts_the_plan`.
     #[tokio::test]
     async fn a_released_head_aborts_the_plan_even_when_its_cache_entry_survives() {
-        let storage = MemoryStorage::new();
+        // Only remote storage gets a disk cache.
+        let storage = MemoryStorage::new().simulating_remote();
         let dict = dict_cid(b"live-dict");
         let (_, dict_addr) = cid_and_addr_for(
             MAIN,
@@ -1105,6 +1108,10 @@ mod tests {
     impl fluree_db_core::StorageRead for FailsToReadOne {
         fn permits_plaintext_cache(&self) -> bool {
             self.inner.permits_plaintext_cache()
+        }
+
+        fn is_remote(&self) -> bool {
+            self.inner.is_remote()
         }
 
         fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
