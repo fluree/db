@@ -69,3 +69,6 @@ mod it_query_subquery_streaming;
 
 #[path = "it_union_default_graph.rs"]
 mod it_union_default_graph;
+
+#[path = "it_query_sparql_vector_constant.rs"]
+mod it_query_sparql_vector_constant;

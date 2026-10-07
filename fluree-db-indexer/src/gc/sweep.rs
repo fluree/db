@@ -135,6 +135,27 @@ where
         swept_addresses(storage, &method, ledger_name, branches, nested),
     )?;
 
+    // The difference is only sound if the listing names files the way the
+    // live set does. A listing in another form (a Windows path's `\` once)
+    // matches no live address, so every file it holds, live ones included,
+    // would read as an orphan. Each branch's head root, which the walk just
+    // read, must be in it.
+    for branch in branches {
+        let Some(head) = branch.index_head_id.as_ref() else {
+            continue;
+        };
+        let listed = candidate_addresses(&method, &branch.ledger_id, head)
+            .iter()
+            .any(|address| scanned.contains(address));
+        if !listed {
+            return Err(IndexerError::StorageRead(format!(
+                "the storage listing does not include {}'s index root {head} at any address \
+                 the index uses; refusing to sweep",
+                branch.ledger_id
+            )));
+        }
+    }
+
     let mut orphans: Vec<String> = scanned.difference(&live).cloned().collect();
     orphans.sort();
 
@@ -1164,6 +1185,104 @@ mod tests {
         fn storage_method(&self) -> &str {
             self.inner.storage_method()
         }
+    }
+
+    /// Storage whose listing separates path segments with `\`, as file
+    /// storage on Windows once did, while reads and the index use `/`.
+    #[derive(Debug, Clone)]
+    struct BackslashListing(MemoryStorage);
+
+    #[async_trait::async_trait]
+    impl fluree_db_core::StorageRead for BackslashListing {
+        fn permits_plaintext_cache(&self) -> bool {
+            self.0.permits_plaintext_cache()
+        }
+
+        fn is_remote(&self) -> bool {
+            self.0.is_remote()
+        }
+
+        fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
+            self.0.encryption_admin()
+        }
+
+        async fn read_bytes(&self, address: &str) -> fluree_db_core::Result<Vec<u8>> {
+            self.0.read_bytes(address).await
+        }
+
+        async fn exists(&self, address: &str) -> fluree_db_core::Result<bool> {
+            self.0.exists(address).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> fluree_db_core::Result<Vec<String>> {
+            Ok(self
+                .0
+                .list_prefix(prefix)
+                .await?
+                .into_iter()
+                .map(|address| match address.split_once("://") {
+                    Some((scheme, path)) => format!("{scheme}://{}", path.replace('/', "\\")),
+                    None => address,
+                })
+                .collect())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl fluree_db_core::StorageWrite for BackslashListing {
+        async fn write_bytes(&self, address: &str, bytes: &[u8]) -> fluree_db_core::Result<()> {
+            self.0.write_bytes(address, bytes).await
+        }
+
+        async fn delete(&self, address: &str) -> fluree_db_core::Result<()> {
+            self.0.delete(address).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl fluree_db_core::ContentAddressedWrite for BackslashListing {
+        async fn content_write_bytes_with_hash(
+            &self,
+            kind: ContentKind,
+            ledger_id: &str,
+            content_hash_hex: &str,
+            bytes: &[u8],
+        ) -> fluree_db_core::Result<fluree_db_core::ContentWriteResult> {
+            self.0
+                .content_write_bytes_with_hash(kind, ledger_id, content_hash_hex, bytes)
+                .await
+        }
+    }
+
+    impl fluree_db_core::StorageMethod for BackslashListing {
+        fn storage_method(&self) -> &str {
+            self.0.storage_method()
+        }
+    }
+
+    /// A listing that names files in another form than the index does
+    /// matches no live address. Planned anyway, every file would be an
+    /// orphan, the current index's included, so the plan refuses.
+    #[tokio::test]
+    async fn a_listing_in_another_address_form_aborts_the_plan() {
+        let inner = MemoryStorage::new();
+        let dict = dict_cid(b"live-dict");
+        let roots = write_chain(&inner, MAIN, 2, &dict).await;
+
+        let result = plan_sweep(
+            &BackslashListing(inner),
+            &name(NAME),
+            &heads(&[(MAIN, roots.last())]),
+            &[],
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a listing the live set cannot match must not plan: {:?}",
+            result.map(|plan| plan.orphans)
+        );
     }
 
     /// A root that still exists but cannot be read is not a chain ending. If

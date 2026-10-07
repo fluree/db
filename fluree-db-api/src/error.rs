@@ -676,6 +676,13 @@ impl ApiError {
                 | fluree_db_query::QueryError::CatalogCredentialsNotVended { .. }
                 | fluree_db_query::QueryError::CatalogAccessDenied { .. },
             ) => 403,
+            // The write was understood but refused by its policy. Other
+            // policy errors (invalid definitions, evaluation failures) are
+            // not authorization denials.
+            ApiError::Policy(fluree_db_policy::PolicyError::ModifyDenied { .. })
+            | ApiError::Transact(fluree_db_transact::TransactError::PolicyViolation(
+                fluree_db_policy::PolicyError::ModifyDenied { .. },
+            )) => 403,
             // A malformed ledger config graph is the operator's to fix, and no
             // change to the request can clear it.
             ApiError::LedgerConfig(_) => 500,
@@ -804,6 +811,23 @@ mod tests {
         // errors.
         assert_eq!(
             ApiError::Query(fluree_db_query::QueryError::InvalidQuery("bad".into())).status_code(),
+            400
+        );
+    }
+
+    #[test]
+    fn only_actual_policy_denials_are_forbidden() {
+        use fluree_db_policy::PolicyError;
+        use fluree_db_transact::TransactError;
+
+        let denied = || PolicyError::modify_denied("write refused");
+        assert_eq!(ApiError::Policy(denied()).status_code(), 403);
+        assert_eq!(
+            ApiError::Transact(TransactError::PolicyViolation(denied())).status_code(),
+            403
+        );
+        assert_eq!(
+            ApiError::Transact(TransactError::InvalidTerm("bad term".into())).status_code(),
             400
         );
     }

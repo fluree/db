@@ -7,6 +7,8 @@ mod it_cached_handle_cow_cancel;
 mod it_cached_handle_cow_recovery;
 #[path = "it_concurrent_update_reconcile.rs"]
 mod it_concurrent_update_reconcile;
+#[path = "it_cypher_txn.rs"]
+mod it_cypher_txn;
 #[path = "it_default_graph_name.rs"]
 mod it_default_graph_name;
 #[path = "it_enforce_unique_upsert_indexed.rs"]

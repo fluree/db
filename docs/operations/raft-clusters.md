@@ -392,7 +392,8 @@ If no leader is currently elected (mid-election), follower nodes return `503 Ser
 
 - `409 Conflict` — branch head was reset while the request was queued.
 - `410 Gone` — branch was dropped, purged, or retracted while queued.
-- `422 Unprocessable Entity` — staging failed (policy denial, malformed body, conflict outcome).
+- `403 Forbidden` — a policy denied the staged write after refresh and retry.
+- `422 Unprocessable Entity` — another staging failure (malformed body or conflict outcome).
 
 **When it happens:** The queue can outlive the branch state it targets. Admin operations and concurrent writes can invalidate queued work.
 

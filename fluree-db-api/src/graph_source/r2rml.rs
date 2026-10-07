@@ -1381,6 +1381,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
             .nameservice()
             .lookup_graph_source(&id)
             .await
+            .map(|record| record.filter(|record| !record.retracted))
             .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))
     }
 
@@ -1448,6 +1449,8 @@ impl<'a> FlureeR2rmlProvider<'a> {
             .lookup_graph_source(graph_source_id)
             .await
             .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            // A drop leaves the record as a tombstone.
+            .filter(|record| !record.retracted)
             .ok_or_else(|| {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;
@@ -1770,6 +1773,8 @@ impl<'a> FlureeR2rmlProvider<'a> {
             .lookup_graph_source(graph_source_id)
             .await
             .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            // A drop leaves the record as a tombstone.
+            .filter(|record| !record.retracted)
             .ok_or_else(|| {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;
@@ -2320,7 +2325,7 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
             .lookup_graph_source(graph_source_id)
             .await
         {
-            Ok(Some(record)) => mapping_source_of(&record).is_some(),
+            Ok(Some(record)) => !record.retracted && mapping_source_of(&record).is_some(),
             Ok(None) => false,
             Err(_) => false,
         }
@@ -2341,6 +2346,8 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
             .lookup_graph_source(graph_source_id)
             .await
             .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            // A drop leaves the record as a tombstone.
+            .filter(|record| !record.retracted)
             .ok_or_else(|| {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;
@@ -3247,6 +3254,8 @@ impl FlureeR2rmlProvider<'_> {
             .lookup_graph_source(graph_source_id)
             .await
             .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            // A drop leaves the record as a tombstone.
+            .filter(|record| !record.retracted)
             .ok_or_else(|| {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;

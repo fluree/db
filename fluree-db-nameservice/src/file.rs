@@ -593,11 +593,7 @@ impl crate::NameServiceLookup for FileNameService {
 
 /// `a/b/main.json` → `a/b/main`, with `/` separators on every platform.
 fn ns_record_stem(relative: &std::path::Path) -> String {
-    let joined = relative
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/");
+    let joined = fluree_db_core::storage::address_path(relative);
     joined
         .strip_suffix(".json")
         .map_or(joined.clone(), str::to_string)

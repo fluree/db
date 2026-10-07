@@ -723,21 +723,6 @@ impl Fluree {
 
         reject_reasoning_in_history_mode(history_mode, executable).map_err(ApiError::query)?;
 
-        let mut prepare_config = if history_mode {
-            PrepareConfig::history(primary.binary_store.as_ref())
-        } else {
-            PrepareConfig::current(primary.binary_store.as_ref())
-        };
-        // A `>= 2`-member default union is an RDF merge (a set), not a bag
-        // (SPARQL §13.2); tell the planner so it forces full triple identity and
-        // the `DatasetOperator` deduplicates across members.
-        prepare_config.planning = prepare_config
-            .planning
-            .with_multi_default_graph(runtime_dataset.default_graphs().len() >= 2);
-        let prepared = prepare_execution_with_config(db, executable, &prepare_config)
-            .await
-            .map_err(query_error_to_api_error)?;
-
         // Binary scans rely on a ledger-specific binary index store. For datasets that span
         // multiple ledgers, using only the primary view's store will silently drop results.
         //
@@ -752,6 +737,24 @@ impl Fluree {
                 .named
                 .values()
                 .all(|v| v.ledger_id.as_ref() == primary_ledger_id);
+
+        let mut prepare_config = if history_mode {
+            PrepareConfig::history(primary.binary_store.as_ref())
+        } else {
+            PrepareConfig::current(primary.binary_store.as_ref())
+        };
+        // A `>= 2`-member default union is an RDF merge (a set), not a bag
+        // (SPARQL §13.2); tell the planner so it forces full triple identity and
+        // the `DatasetOperator` deduplicates across members.
+        prepare_config.planning = prepare_config
+            .planning
+            .with_multi_default_graph(runtime_dataset.default_graphs().len() >= 2);
+        if !is_single_ledger_dataset {
+            prepare_config = prepare_config.without_binary_scans();
+        }
+        let prepared = prepare_execution_with_config(db, executable, &prepare_config)
+            .await
+            .map_err(query_error_to_api_error)?;
 
         // Perf guardrail: skip fulltext arena map + `"en"` lang_id resolution
         // for queries that don't actually call `fulltext(...)`. Spatial
@@ -908,6 +911,18 @@ impl Fluree {
         reject_reasoning_in_history_mode(history_mode, executable)
             .map_err(fluree_db_query::QueryError::InvalidQuery)?;
 
+        // See `execute_dataset_into_with_r2rml`: a multi-ledger dataset runs
+        // without binary scans.
+        let primary_ledger_id: &str = primary.ledger_id.as_ref();
+        let is_single_ledger_dataset = dataset
+            .default
+            .iter()
+            .all(|v| v.ledger_id.as_ref() == primary_ledger_id)
+            && dataset
+                .named
+                .values()
+                .all(|v| v.ledger_id.as_ref() == primary_ledger_id);
+
         let mut prepare_config = if history_mode {
             PrepareConfig::history(primary.binary_store.as_ref())
         } else {
@@ -918,17 +933,10 @@ impl Fluree {
         prepare_config.planning = prepare_config
             .planning
             .with_multi_default_graph(runtime_dataset.default_graphs().len() >= 2);
+        if !is_single_ledger_dataset {
+            prepare_config = prepare_config.without_binary_scans();
+        }
         let prepared = prepare_execution_with_config(db, executable, &prepare_config).await?;
-
-        let primary_ledger_id: &str = primary.ledger_id.as_ref();
-        let is_single_ledger_dataset = dataset
-            .default
-            .iter()
-            .all(|v| v.ledger_id.as_ref() == primary_ledger_id)
-            && dataset
-                .named
-                .values()
-                .all(|v| v.ledger_id.as_ref() == primary_ledger_id);
 
         // Perf guardrail: skip fulltext arena map + `"en"` lang_id resolution
         // for queries that don't actually call `fulltext(...)`. Spatial

@@ -1333,3 +1333,115 @@ async fn an_incremental_backlog_drains_in_bounded_passes() {
         assert!(distinct.contains(name.as_str()), "{name} missing");
     }
 }
+
+/// A graph source sharing the default graph with a ledger is refused, in
+/// SPARQL and JSON-LD alike — the default graph would not union it in, and a
+/// query that silently read only some of its sources would be wrong. Named
+/// and addressed with GRAPH, the same join works.
+#[tokio::test]
+async fn a_graph_source_joins_a_ledger_as_a_named_graph_not_in_the_default_graph() {
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let config = R2rmlCreateConfig::new_direct("joined-people", &location, PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create graph source");
+    let ledger = fluree.create_ledger("crm:main").await.expect("ledger");
+    fluree
+        .insert(
+            ledger,
+            &serde_json::json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "http://example.org/person/1", "ex:tier": "gold"
+            }),
+        )
+        .await
+        .expect("insert");
+
+    let mixed = "PREFIX ex: <http://example.org/> SELECT ?name ?tier \
+                 FROM <crm:main> FROM <joined-people:main> \
+                 WHERE { ?p ex:name ?name ; ex:tier ?tier }";
+    let err = fluree
+        .query_from()
+        .sparql(mixed)
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("FROM NAMED"), "{err}");
+    let mixed_jsonld = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": ["joined-people:main", "crm:main"],
+        "select": ["?name", "?tier"],
+        "where": {"@id": "?p", "ex:name": "?name", "ex:tier": "?tier"}
+    });
+    let err = fluree
+        .query_from()
+        .jsonld(&mixed_jsonld)
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("FROM NAMED"), "{err}");
+
+    let named = "PREFIX ex: <http://example.org/> SELECT ?name ?tier \
+                 FROM <crm:main> FROM NAMED <joined-people:main> \
+                 WHERE { ?p ex:tier ?tier GRAPH <joined-people:main> { ?p ex:name ?name } }";
+    let rows = fluree
+        .query_from()
+        .sparql(named)
+        .execute_formatted()
+        .await
+        .expect("named join");
+    assert_eq!(
+        rows["results"]["bindings"].as_array().map(Vec::len),
+        Some(1),
+        "{rows}"
+    );
+}
+
+/// A dropped graph source is gone: its record stays as a tombstone, which
+/// must not still resolve for queries in the same process.
+#[tokio::test]
+async fn a_dropped_graph_source_no_longer_answers() {
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let config = R2rmlCreateConfig::new_direct("dropped-people", &location, PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create graph source");
+    let sparql =
+        "SELECT ?name FROM <dropped-people:main> WHERE { ?s <http://example.org/name> ?name }";
+    fluree
+        .query_from()
+        .sparql(sparql)
+        .execute()
+        .await
+        .expect("query before drop");
+
+    fluree
+        .drop_graph_source("dropped-people", None, fluree_db_api::DropMode::Hard)
+        .await
+        .expect("drop");
+
+    let err = fluree
+        .query_from()
+        .sparql(sparql)
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(err.is_not_found(), "connection query after drop: {err}");
+    let graph = fluree.graph("dropped-people:main");
+    let err = graph
+        .query()
+        .with_r2rml()
+        .sparql("SELECT ?name WHERE { ?s <http://example.org/name> ?name }")
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(err.is_not_found(), "graph query after drop: {err}");
+}

@@ -1548,6 +1548,17 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(digest)
 }
 
+/// A path relative to a storage root as an address path: its segments
+/// joined with `/` on every platform. A Windows path's `\` would name a file
+/// no address matches.
+pub fn address_path(relative: &std::path::Path) -> String {
+    relative
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Convert a ledger ID to a path prefix (`"mydb:main"` -> `"mydb/main"`).
 pub fn ledger_id_prefix_for_path(ledger_id: &str) -> String {
     storage_path_prefixes(ledger_id).0

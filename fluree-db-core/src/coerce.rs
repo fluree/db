@@ -389,6 +389,10 @@ pub fn coerce_value(value: FlakeValue, datatype_iri: &str) -> CoercionResult<Fla
         // Already JSON → rdf:JSON
         (FlakeValue::Json(j), dt) if dt == rdf::JSON => Ok(FlakeValue::Json(j.clone())),
 
+        // String → geo:wktLiteral: a POINT becomes the GeoPoint it is stored
+        // as, so a constant matches it; other WKT stays a string.
+        (FlakeValue::String(s), geo::WKT_LITERAL) => coerce_string_value(s, geo::WKT_LITERAL),
+
         // ====================================================================
         // Pass-through: already correct type or unknown datatype
         // ====================================================================
@@ -852,6 +856,25 @@ fn validate_bigint_range(value: &BigInt, datatype_iri: &str) -> CoercionResult<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Query constants and STRDT go through `coerce_value`; a WKT POINT must
+    /// become the GeoPoint a write stores, or it matches nothing.
+    #[test]
+    fn test_coerce_wkt_point_as_written() {
+        let point = "POINT(-0.1278 51.5074)";
+        let coerced = coerce_value(FlakeValue::String(point.to_string()), geo::WKT_LITERAL);
+        let written = coerce_string_value(point, geo::WKT_LITERAL);
+        assert!(
+            matches!(coerced, Ok(FlakeValue::GeoPoint(_))),
+            "{coerced:?}"
+        );
+        assert_eq!(coerced.unwrap(), written.unwrap());
+        let line = "LINESTRING(0 0, 1 1)";
+        assert_eq!(
+            coerce_value(FlakeValue::String(line.to_string()), geo::WKT_LITERAL).unwrap(),
+            FlakeValue::String(line.to_string())
+        );
+    }
 
     #[test]
     fn test_coerce_long_to_integer() {

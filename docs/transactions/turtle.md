@@ -621,7 +621,7 @@ curl -X POST "http://localhost:8090/v1/fluree/upsert?ledger=mydb:main" \
 
 From the CLI, `fluree insert -f data.trig` and `fluree upsert -f data.trig` do the same.
 
-**Known limitation ([#1930](https://github.com/fluree/db/issues/1930)):** on `/insert`, `/upsert` and bulk import, a `GRAPH` block's contents are read by a smaller parser that rejects anonymous blank nodes (`[ … ]`) and collections (`( … )`) with `expected object, found '['`. Triples outside blocks are unaffected. `/sync` and the [Graph Store Protocol](../api/graph-store.md) read block contents with the full Turtle parser, so they accept both; for `/insert` and `/upsert`, use labeled blank nodes (`_:b1`) inside blocks.
+**Known limitation ([#1930](https://github.com/fluree/db/issues/1930)):** on `/insert`, `/upsert` and bulk import, a `GRAPH` block's contents are read by a smaller parser that rejects anonymous blank nodes (`[ … ]`) and collections (`( … )`) with an error naming the construct. Triples outside blocks are unaffected. `/sync` and the [Graph Store Protocol](../api/graph-store.md) read block contents with the full Turtle parser, so they accept both; for `/insert` and `/upsert`, use labeled blank nodes (`_:b1`) inside blocks.
 
 ### Querying Named Graphs
 
