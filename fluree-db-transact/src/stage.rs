@@ -3790,8 +3790,9 @@ pub async fn validate_view_with_shacl(
     // controlled vocabulary (cross-ledger `f:shapesSource`), consulted on
     // demand for `sh:class` membership.
     // An `sh:sparql` constraint that cannot run is recorded with its shape's
-    // severity rather than raised, so severity and the graph's mode apply to
-    // it as they do to a result (below).
+    // severity (the outermost reporting shape's, when its shape is checked as
+    // a nested shape) rather than raised, so severity and the graph's mode
+    // apply to it as they do to a result (below).
     let constraint_failures = std::sync::Arc::new(fluree_db_shacl::ConstraintFailures::default());
     let engine = ShaclEngine::from_shared_cache(shacl_cache, hierarchy)
         .with_membership_graphs(membership_g_ids.to_vec())

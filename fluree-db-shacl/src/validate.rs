@@ -102,6 +102,25 @@ struct ClassMembershipCtx<'a> {
     /// Where an `sh:sparql` constraint that cannot run is recorded instead
     /// of raised. See [`ShaclEngine::with_constraint_failures`].
     failures: Option<&'a crate::sparql::ConstraintFailures>,
+    /// While a nested shape is checked for conformance (`sh:node`, `sh:not`,
+    /// `sh:and`, `sh:or`, `sh:xone`, `sh:qualifiedValueShape`), the severity of
+    /// the outermost shape that reports the result: an `sh:sparql` constraint
+    /// inside that cannot run is recorded with it, as the nested shape's own
+    /// results surface only through that shape's. `None` outside nesting. Set
+    /// by [`ClassMembershipCtx::reported_under`].
+    failure_severity: Option<Severity>,
+}
+
+impl ClassMembershipCtx<'_> {
+    /// This context for checking a nested shape whose result `severity`
+    /// reports. The outermost reporting shape wins: a severity already set by
+    /// an enclosing nesting stays.
+    fn reported_under(self, severity: Severity) -> Self {
+        Self {
+            failure_severity: self.failure_severity.or(Some(severity)),
+            ..self
+        }
+    }
 }
 
 /// SHACL validation engine
@@ -277,8 +296,9 @@ impl ShaclEngine {
     }
 
     /// Record an `sh:sparql` constraint that cannot run (its query does not
-    /// parse, lower or plan) in `failures`, with its shape's severity, instead
-    /// of raising it; validation continues with the shape's other
+    /// parse, lower or plan) in `failures`, with its shape's severity (or,
+    /// when the shape is checked as a nested shape, the outermost reporting
+    /// shape's), instead of raising it; validation continues with the shape's other
     /// constraints. For a caller that applies severity and validation mode to
     /// such a failure (the transaction path). Without it the failure is
     /// raised as `ShaclError::SparqlConstraint`.
@@ -402,6 +422,7 @@ impl ShaclEngine {
             iri_encoder,
             cancellation: self.cancellation.as_ref(),
             failures: self.constraint_failures.as_deref(),
+            failure_severity: None,
         };
         let active = ActiveShapeChecks::default();
         for shape in applicable_shapes {
@@ -474,6 +495,7 @@ impl ShaclEngine {
             iri_encoder,
             cancellation: self.cancellation.as_ref(),
             failures: self.constraint_failures.as_deref(),
+            failure_severity: None,
         };
         // Class-target focus nodes are constant across the shape loop (same
         // `db`, same hierarchy), so memoize them per class: several shapes
@@ -829,10 +851,12 @@ fn validate_shape<'a>(
             results.extend(node_results);
         }
 
-        // Validate structural constraints (closed, logical)
+        // Validate structural constraints (closed, logical). The nested shapes
+        // they check report through this shape's results.
+        let nested_ctx = class_ctx.map(|c| c.reported_under(shape.severity));
         for constraint in &shape.structural_constraints {
             let constraint_results = validate_structural_constraint(
-                db, focus_node, constraint, shape, all_shapes, class_ctx, active,
+                db, focus_node, constraint, shape, all_shapes, nested_ctx, active,
             )
             .await?;
             results.extend(constraint_results);
@@ -852,6 +876,7 @@ fn validate_shape<'a>(
                     iri_encoder: class_ctx.and_then(|c| c.iri_encoder),
                     cancellation: class_ctx.and_then(|c| c.cancellation),
                     failures: class_ctx.and_then(|c| c.failures),
+                    failure_severity: class_ctx.and_then(|c| c.failure_severity),
                 },
             )
             .await?;
@@ -913,7 +938,9 @@ async fn validate_literal_focus<'a>(
         }
     }
 
-    // Structural constraints: test the literal against the nested shapes.
+    // Structural constraints: test the literal against the nested shapes,
+    // which report through this shape's results.
+    let nested_ctx = class_ctx.map(|c| c.reported_under(shape.severity));
     for constraint in &shape.structural_constraints {
         let conforms_to = |nested: &'a std::sync::Arc<crate::constraints::NestedShape>| {
             check_value_against_nested_shape(
@@ -924,7 +951,7 @@ async fn validate_literal_focus<'a>(
                 nested,
                 shape,
                 all_shapes,
-                class_ctx,
+                nested_ctx,
                 active,
             )
         };
@@ -1817,6 +1844,10 @@ async fn validate_property_shape<'a>(
     active: &'a ActiveShapeChecks,
 ) -> Result<Vec<ValidationResult>> {
     let mut results = Vec::new();
+    // The nested shapes this property shape checks (`sh:node`, the logical
+    // constraints, `sh:qualifiedValueShape`) report through its results; its
+    // own `sh:sparql` constraints are unaffected unless it is itself nested.
+    let class_ctx = class_ctx.map(|c| c.reported_under(prop_shape.severity));
 
     // A path that never compiled surfaces here (only for focus nodes this shape
     // actually targets) rather than as a ledger-wide compile failure.
@@ -1855,6 +1886,7 @@ async fn validate_property_shape<'a>(
                     iri_encoder: class_ctx.and_then(|c| c.iri_encoder),
                     cancellation: class_ctx.and_then(|c| c.cancellation),
                     failures: class_ctx.and_then(|c| c.failures),
+                    failure_severity: class_ctx.and_then(|c| c.failure_severity),
                 },
             )
             .await?,

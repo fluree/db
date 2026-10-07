@@ -58,8 +58,10 @@ use std::sync::Arc;
 ///
 /// Raised as [`ShaclError::SparqlConstraint`] unless the validation pass
 /// collects failures ([`ConstraintFailures`]), in which case it is recorded
-/// with the severity of the shape that owns the constraint and the graph
-/// being validated, and the pass goes on to the shape's other constraints.
+/// with the severity of the shape that owns the constraint (of the outermost
+/// reporting shape, when that shape is checked as a nested shape) and the
+/// graph being validated, and the pass goes on to the shape's other
+/// constraints.
 /// The transaction path then decides by severity and the graph's validation
 /// mode: a Violation in a reject-mode graph fails the transaction with the
 /// same error; anything else is logged.
@@ -69,7 +71,9 @@ pub struct ConstraintFailure {
     pub constraint: String,
     /// Why it could not run.
     pub message: String,
-    /// The severity of the shape that owns the constraint.
+    /// The severity of the shape that owns the constraint, or, when that
+    /// shape is checked as a nested shape, of the outermost shape that reports
+    /// its result.
     pub severity: Severity,
     /// The graph being validated.
     pub graph_id: fluree_db_core::GraphId,
@@ -533,6 +537,11 @@ pub(crate) struct SparqlConstraintCtx<'a> {
     /// Where a constraint that cannot run is recorded instead of raised
     /// ([`ConstraintFailure`]). `None` raises it.
     pub failures: Option<&'a ConstraintFailures>,
+    /// The severity a recorded failure takes in place of the owning shape's,
+    /// when the shape is checked as a nested shape: the outermost reporting
+    /// shape's. Results keep the owning shape's severity, which the nested
+    /// conformance check reads.
+    pub failure_severity: Option<Severity>,
 }
 
 /// Whether an error of a constraint's query ends the validation whatever the
@@ -620,7 +629,7 @@ pub(crate) async fn validate_sparql_constraint(
             failures.record(ConstraintFailure {
                 constraint,
                 message,
-                severity,
+                severity: exec.failure_severity.unwrap_or(severity),
                 graph_id: db.g_id,
             });
             Ok(Vec::new())
