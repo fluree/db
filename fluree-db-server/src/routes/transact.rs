@@ -1891,9 +1891,9 @@ fn is_misrouted_cypher_envelope(body: &JsonValue) -> bool {
 /// submission path and the sync dry-run path so both stage under the same
 /// inline constraints.
 ///
-/// Inline shapes are refused in a request carrying policy inputs (identity,
-/// policy class, inline policy or policy values): support for inline shapes
-/// in policy-scoped requests is a follow-up.
+/// Inline governance (`opts.shapes`, `opts.uniqueProperties`) is refused in a
+/// request carrying policy inputs (identity, policy class, inline policy or
+/// policy values): support in policy-scoped requests is a follow-up.
 fn txn_opts_from_body(
     body: &JsonValue,
     governance: &GovernanceOptions,
@@ -1965,6 +1965,13 @@ fn txn_opts_from_body(
         // constraints" rather than an error — operators may build
         // the array dynamically and end up with zero entries.
         if !iris.is_empty() {
+            if governance.has_any_policy_inputs() {
+                set_span_error_code(span, "error:BadRequest");
+                return Err(ServerError::bad_request(
+                    "inline uniqueness constraints (opts.uniqueProperties) are not supported in \
+                     a policy-scoped request",
+                ));
+            }
             txn_opts.unique_properties = Some(iris);
         }
     }

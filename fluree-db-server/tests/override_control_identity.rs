@@ -732,6 +732,49 @@ fn inline_shapes_insert(subject: &str, mut opts: JsonValue) -> String {
     .to_string()
 }
 
+/// Inline uniqueness constraints are refused like inline shapes in a request
+/// carrying an identity: a 400, and nothing commits. Without one they apply.
+#[tokio::test]
+async fn inline_unique_properties_are_refused_in_a_policy_scoped_request_over_http() {
+    let (_tmp, app) = seeded_app_with(DataAuthMode::None, OPEN_POLICY_TRIG).await;
+    let refusal = "inline uniqueness constraints (opts.uniqueProperties) are not supported \
+                   in a policy-scoped request";
+    let body = |subject: &str| {
+        json!({
+            "@context": {"ex": "http://example.org/"},
+            "insert": {"@id": subject, "ex:handle": "dup"},
+            "opts": {"uniqueProperties": ["http://example.org/handle"]}
+        })
+        .to_string()
+    };
+
+    let (status, json) = insert(&app, body("ex:u1"), &[]).await;
+    assert_eq!(status, StatusCode::OK, "no policy input: {json}");
+
+    let header = ("fluree-identity", ADMIN.to_string());
+    let (status, json) = insert(&app, body("ex:u2"), &[header]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "identity header: {json}");
+    assert!(
+        json.to_string().contains(refusal),
+        "identity header: {json}"
+    );
+
+    let (status, json) = query(
+        &app,
+        "application/json",
+        json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": "?s",
+            "where": {"@id": "?s", "ex:handle": "dup"}
+        })
+        .to_string(),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json, json!(["ex:u1"]), "only the unscoped write committed");
+}
+
 /// Inline request shapes are not supported in a policy-scoped request (a
 /// current limitation: support for inline shapes in policy-scoped requests is
 /// a follow-up). A request carrying an identity, by header or in its opts, is

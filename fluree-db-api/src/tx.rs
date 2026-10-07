@@ -1615,15 +1615,42 @@ fn format_violations(
     )
 }
 
-/// Refuse inline request shapes (`opts.shapes`) in a policy-scoped request.
+/// Inline governance a request can carry: constraints that apply to this
+/// transaction only, sent with it rather than stored in the ledger.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum InlineGovernance {
+    /// `opts.shapes`.
+    #[cfg(feature = "shacl")]
+    Shapes,
+    /// `opts.uniqueProperties`.
+    UniqueProperties,
+}
+
+impl InlineGovernance {
+    fn refusal(self) -> &'static str {
+        match self {
+            #[cfg(feature = "shacl")]
+            InlineGovernance::Shapes => {
+                "inline request shapes are not supported in a policy-scoped request"
+            }
+            InlineGovernance::UniqueProperties => {
+                "inline uniqueness constraints (opts.uniqueProperties) are not supported in a \
+                 policy-scoped request"
+            }
+        }
+    }
+}
+
+/// Refuse inline governance (`opts.shapes`, `opts.uniqueProperties`) in a
+/// policy-scoped request.
 ///
-/// They are accepted only when the request runs without a policy context:
-/// the caller supplied none (or an unrestricted one), and no policy group
+/// It is accepted only when the request runs without a policy context: the
+/// caller supplied none (or an unrestricted one), and no policy group
 /// anywhere in the ledger config (ledger-wide or for any graph) sets more
 /// than an unrestricted `f:defaultAllow true`. This is a current limitation:
-/// support for inline shapes in policy-scoped requests is a follow-up.
-#[cfg(feature = "shacl")]
-fn refuse_inline_shapes_in_policy_scope(
+/// support in policy-scoped requests is a follow-up.
+fn refuse_inline_governance_in_policy_scope(
+    what: InlineGovernance,
     policy: Option<&crate::PolicyContext>,
     config: Option<&LedgerConfig>,
 ) -> std::result::Result<(), fluree_db_transact::TransactError> {
@@ -1643,7 +1670,7 @@ fn refuse_inline_shapes_in_policy_scope(
     });
     if request_scoped || config_scoped {
         return Err(fluree_db_transact::TransactError::UnsupportedFeature(
-            "inline request shapes are not supported in a policy-scoped request".to_string(),
+            what.refusal().to_string(),
         ));
     }
     Ok(())
@@ -1706,7 +1733,11 @@ async fn validate_staged_shacl(
     // terms are the transaction's own.
     let inline_shape_bundle = match request.inline_shapes.as_ref() {
         Some(shapes_json) => {
-            refuse_inline_shapes_in_policy_scope(request.policy, config)?;
+            refuse_inline_governance_in_policy_scope(
+                InlineGovernance::Shapes,
+                request.policy,
+                config,
+            )?;
             let ledger_id = view.base().snapshot.ledger_id.to_string();
             crate::inline_shapes::parse_inline_shapes_to_bundle(
                 shapes_json,
@@ -1836,6 +1867,10 @@ pub(crate) struct WriteChecks<'a> {
     pub(crate) tracker: Option<&'a Tracker>,
     /// The request's `@context`, to compact violation reports against.
     pub(crate) txn_context: Option<&'a JsonValue>,
+    /// The policy context the write stages under: inline governance
+    /// (`opts.shapes`, `opts.uniqueProperties`) is refused in a policy-scoped
+    /// request.
+    pub(crate) policy: Option<&'a crate::PolicyContext>,
     /// Which staged-config checks run: all of them where a transaction is
     /// authored. R2 is enforced when the data is written; branch operations
     /// re-check the integrity of the target's config groups (R1/R3).
@@ -1859,6 +1894,7 @@ impl WriteChecks<'_> {
             unique_properties: None,
             tracker: None,
             txn_context: None,
+            policy: None,
             guard,
             request: None,
             config: None,
@@ -1957,6 +1993,17 @@ pub(crate) async fn check_staged_write(
         false
     };
 
+    if checks
+        .unique_properties
+        .is_some_and(|iris| !iris.is_empty())
+    {
+        refuse_inline_governance_in_policy_scope(
+            InlineGovernance::UniqueProperties,
+            checks.policy,
+            config.as_deref(),
+        )
+        .map_err(StagedWriteError::Failed)?;
+    }
     let unique_enforced = enforce_unique_after_staging(
         view,
         graph_delta,
@@ -2721,8 +2768,9 @@ impl crate::Fluree {
         let mut resolve_ctx =
             crate::cross_ledger::ResolveCtx::new(&ledger_id, self).with_data_state(ledger.clone());
         let tracker = options.tracker;
+        let policy = options.policy_ctx;
         #[cfg(feature = "shacl")]
-        let shacl_request = ShaclRequest::take(&mut txn, options.policy_ctx);
+        let shacl_request = ShaclRequest::take(&mut txn, policy);
 
         // The staged delta, not the Txn's: it includes graphs `GRAPH ?g`
         // templates resolved to, and drives per-graph config lookup.
@@ -2750,6 +2798,7 @@ impl crate::Fluree {
                 unique_properties: inline_unique_properties.as_deref(),
                 tracker,
                 txn_context,
+                policy,
                 guard: crate::config_guard::GuardScope::Authoring,
                 request,
                 config: None,
