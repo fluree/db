@@ -214,6 +214,7 @@ async fn jsonld_tokens(fluree: &Fluree, ledger: &LedgerState, query: &Value) -> 
             };
             match cell {
                 Value::Null => "unbound".to_string(),
+                Value::Bool(b) => b.to_string(),
                 Value::String(s) => match s.as_str() {
                     "NaN" | "INF" | "-INF" => s.clone(),
                     s => s
@@ -1217,6 +1218,243 @@ async fn special_values_copy_and_retract_through_a_where_clause() {
         sparql_tokens(&fluree, &rebuilt, copies).await,
         [BIG, "INF", "NaN"],
         "copies, full rebuild"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Indexes earlier versions built
+// ---------------------------------------------------------------------------
+
+/// Copy `from` into `to`, recursively.
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("create dir");
+    for entry in std::fs::read_dir(from).expect("read dir") {
+        let entry = entry.expect("dir entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy file");
+        }
+    }
+}
+
+fn cases_bulk_import_text() -> Vec<Case> {
+    let over = |subjects: &[&str], aggregate: &str| {
+        let ids: Vec<Value> = subjects.iter().map(|s| json!({"@id": s})).collect();
+        json!({"select": [format!("(as ({aggregate} ?v) ?out)")],
+               "where": [["values", ["?s", ids]], {"@id": "?s", "ex:v": "?v"}]})
+    };
+    vec![
+        case(
+            "SUM reads `inf` text as INF",
+            "SELECT (SUM(?v) AS ?out) WHERE { VALUES ?s { ex:a ex:inf } ?s ex:v ?v }",
+            over(&["ex:a", "ex:inf"], "sum"),
+            &["INF"],
+        ),
+        case(
+            "SUM reads `-inf` text as -INF",
+            "SELECT (SUM(?v) AS ?out) WHERE { VALUES ?s { ex:a ex:ninf } ?s ex:v ?v }",
+            over(&["ex:a", "ex:ninf"], "sum"),
+            &["-INF"],
+        ),
+        case(
+            "AVG reads `inf` text as INF",
+            "SELECT (AVG(?v) AS ?out) WHERE { VALUES ?s { ex:a ex:b ex:inf } ?s ex:v ?v }",
+            over(&["ex:a", "ex:b", "ex:inf"], "avg"),
+            &["INF"],
+        ),
+        case(
+            "a comparison reads `inf` text under xsd:float as INF",
+            "SELECT ?g WHERE { ?s ex:f ?v BIND(?v > 1 AS ?g) }",
+            json!({"select": ["?g"], "where": [{"@id": "?s", "ex:f": "?v"}, ["bind", "?g", "(> ?v 1)"]]}),
+            &["true"],
+        ),
+    ]
+}
+
+/// `ex:a` 1.5, plus `inf` / `-inf` text under `xsd:double` (`ex:t`, `ex:n`)
+/// and `xsd:float` (`ex:ft`), written as Turtle, which keeps them as text.
+async fn write_inf_text(fluree: &Fluree, ledger_id: &str) {
+    let turtle = format!(
+        "@prefix ex: <{EX}> .\n@prefix xsd: <{XSD}> .\n\
+         ex:a ex:v \"1.5\"^^xsd:double .\n\
+         ex:b ex:v \"-2.5\"^^xsd:double .\n\
+         ex:t ex:v \"inf\"^^xsd:double .\n\
+         ex:n ex:v \"-inf\"^^xsd:double .\n\
+         ex:ft ex:f \"inf\"^^xsd:float .\n"
+    );
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .insert_turtle(&turtle)
+        .commit()
+        .await
+        .expect("Turtle insert of inf text");
+}
+
+fn cases_inf_text() -> Vec<Case> {
+    let over = |subjects: &[&str], aggregate: &str| {
+        let ids: Vec<Value> = subjects.iter().map(|s| json!({"@id": s})).collect();
+        json!({"select": [format!("(as ({aggregate} ?v) ?out)")],
+               "where": [["values", ["?s", ids]], {"@id": "?s", "ex:v": "?v"}]})
+    };
+    vec![
+        case(
+            "SUM reads `inf` text as INF",
+            "SELECT (SUM(?v) AS ?out) WHERE { VALUES ?s { ex:a ex:t } ?s ex:v ?v }",
+            over(&["ex:a", "ex:t"], "sum"),
+            &["INF"],
+        ),
+        case(
+            "SUM reads `-inf` text as -INF",
+            "SELECT (SUM(?v) AS ?out) WHERE { VALUES ?s { ex:a ex:n } ?s ex:v ?v }",
+            over(&["ex:a", "ex:n"], "sum"),
+            &["-INF"],
+        ),
+        case(
+            "AVG reads `inf` text as INF",
+            "SELECT (AVG(?v) AS ?out) WHERE { VALUES ?s { ex:a ex:b ex:t } ?s ex:v ?v }",
+            over(&["ex:a", "ex:b", "ex:t"], "avg"),
+            &["INF"],
+        ),
+        case(
+            "a comparison reads `inf` text under xsd:float as INF",
+            "SELECT ?g WHERE { ?s ex:f ?v BIND(?v > 1 AS ?g) }",
+            json!({"select": ["?g"], "where": [{"@id": "?s", "ex:f": "?v"}, ["bind", "?g", "(> ?v 1)"]]}),
+            &["true"],
+        ),
+        case(
+            "arithmetic reads `-inf` text as -INF",
+            "SELECT ?x WHERE { ex:n ex:v ?v BIND(?v + 1 AS ?x) }",
+            json!({"select": ["?x"], "where": [{"@id": "ex:n", "ex:v": "?v"}, ["bind", "?x", "(+ ?v 1)"]]}),
+            &["-INF"],
+        ),
+        case(
+            "isNumeric: the text is not a number",
+            "SELECT ?s WHERE { ?s ex:v ?v FILTER(isNumeric(?v)) }",
+            json!({"select": ["?s"], "where": [{"@id": "?s", "ex:v": "?v"}, ["filter", "(is-numeric ?v)"]]}),
+            &["a", "b"],
+        ),
+        case(
+            "a range FILTER compares the text as text",
+            "SELECT ?s WHERE { ?s ex:v ?v FILTER(?v > 1) }",
+            json!({"select": ["?s"], "where": [{"@id": "?s", "ex:v": "?v"}, ["filter", "(> ?v 1)"]]}),
+            &["a"],
+        ),
+        ordered(
+            "ORDER BY sorts the text after the numbers",
+            "SELECT ?s WHERE { ?s ex:v ?v } ORDER BY ?v ?s",
+            json!({"select": ["?s"], "where": {"@id": "?s", "ex:v": "?v"}, "orderBy": ["?v", "?s"]}),
+            &["b", "a", "n", "t"],
+        ),
+        case(
+            "MAX: the text sorts above the numbers",
+            "SELECT (MAX(?v) AS ?out) WHERE { ?s ex:v ?v }",
+            aggregate_where("(max ?v)", None),
+            &["inf"],
+        ),
+    ]
+}
+
+/// Text `inf` / `-inf` under `xsd:double` or `xsd:float` reads as INF / -INF
+/// in arithmetic, expression comparisons, SUM and AVG, from novelty and once
+/// indexed: the shape an earlier bulk import left in the index. It stays text
+/// to `isNumeric`, ORDER BY, MAX and range filters.
+#[tokio::test]
+async fn inf_text_reads_as_infinity_in_arithmetic_and_aggregates() {
+    let fluree = memory_fluree();
+    let mut failures = Vec::new();
+    let ledger_id = "special-doubles:inf-text";
+    fluree.create_ledger(ledger_id).await.expect("create");
+    write_inf_text(&fluree, ledger_id).await;
+    let novelty = fluree.ledger(ledger_id).await.expect("load");
+    failures.extend(check_cases(&fluree, "novelty", &novelty, cases_inf_text()).await);
+    let rebuilt = reindexed(&fluree, ledger_id).await;
+    failures.extend(check_cases(&fluree, "indexed", &rebuilt, cases_inf_text()).await);
+    assert!(
+        failures.is_empty(),
+        "{} failure(s):\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+}
+
+/// Bulk import in earlier versions stored `xsd:double` and `xsd:float` `INF`
+/// and `-INF` in the index as the text `inf` and `-inf`. The fixture is such
+/// an index, written by v4.2.3's bulk import from `source.ttl` beside it. It
+/// reads as before: the values come back as stored, and SUM, AVG, arithmetic
+/// and comparisons take the text as the number it stands for. The expected
+/// answers are v4.2.3's own on this index.
+#[tokio::test]
+async fn values_a_previous_bulk_import_stored_as_text_read_as_before() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/bulk-import-4.2.3/storage");
+    let db = tempfile::TempDir::new().expect("tmp");
+    copy_dir(&fixture, db.path());
+    let fluree = FlureeBuilder::file(db.path().to_string_lossy().to_string())
+        .build()
+        .expect("file-backed Fluree");
+    let ledger = fluree.ledger("ex:main").await.expect("load the fixture");
+    assert_eq!(
+        ledger.snapshot.t,
+        ledger.t(),
+        "the fixture is fully indexed"
+    );
+
+    let mut failures = check_cases(
+        &fluree,
+        "v4.2.3 bulk import",
+        &ledger,
+        cases_bulk_import_text(),
+    )
+    .await;
+    for (query, expected) in [
+        (
+            "SELECT ?v WHERE { ?s ex:v ?v } ORDER BY ?s",
+            &["1.5", "-2.5", "inf", "NaN", "-inf"][..],
+        ),
+        (
+            "SELECT (isNumeric(?v) AS ?n) WHERE { ?s ex:v ?v } ORDER BY ?s",
+            &["true", "true", "false", "false", "false"],
+        ),
+        (
+            "SELECT (SUM(?v) AS ?x) WHERE { ?s ex:v ?v FILTER(?s != ex:nan) }",
+            &["NaN"],
+        ),
+        (
+            "SELECT (AVG(?v) AS ?x) WHERE { ?s ex:v ?v FILTER(?s != ex:nan && ?s != ex:ninf) }",
+            &["INF"],
+        ),
+        ("SELECT (MIN(?v) AS ?x) WHERE { ?s ex:v ?v }", &["-2.5"]),
+        ("SELECT (MAX(?v) AS ?x) WHERE { ?s ex:v ?v }", &["inf"]),
+        (
+            "SELECT ?s WHERE { ?s ex:v ?v FILTER(?v > 1) } ORDER BY ?s",
+            &["a"],
+        ),
+        ("SELECT ?s WHERE { ?s ex:f ?v FILTER(?v > 1) }", &[]),
+        (
+            "SELECT ?s WHERE { ?s ex:v ?v FILTER(?v < 0) } ORDER BY ?s",
+            &["b"],
+        ),
+        (
+            "SELECT ?s WHERE { ?s ex:v ?v } ORDER BY ?v ?s",
+            &["b", "a", "ninf", "nan", "inf"],
+        ),
+        (r#"SELECT ?s WHERE { ?s ex:v "INF"^^xsd:double }"#, &[]),
+    ] {
+        let got = sparql_tokens(&fluree, &ledger, query).await;
+        if got != expected {
+            failures.push(format!(
+                "SPARQL: {query}\n  expected {expected:?}\n  got      {got:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} failure(s):\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
     );
 }
 

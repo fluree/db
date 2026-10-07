@@ -80,6 +80,14 @@ Supported numeric types:
 spellings such as `inf`, `Infinity` or `nan` are not values of these datatypes
 (see [Text That Is Not a Value of Its Datatype](#text-that-is-not-a-value-of-its-datatype)).
 
+One exception keeps existing indexes reading as before. Bulk import in earlier
+versions stored `INF` and `-INF` in the index as the text `inf` and `-inf`.
+Text `inf` or `-inf` under `xsd:double` or `xsd:float` reads as `INF` or
+`-INF` in arithmetic, `SUM`, `AVG` and comparisons inside expressions such as
+`BIND(?v > 1 AS ?b)`. To `isNumeric`, `ORDER BY`, `MIN`/`MAX` and range filters
+such as `FILTER(?v > 1)` it stays text. A full reindex of an index that bulk
+import built stores those values as numbers.
+
 Queries treat the special values as SPARQL specifies:
 
 - `INF` is greater, and `-INF` less, than every other number.
