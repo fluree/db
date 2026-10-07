@@ -598,6 +598,37 @@ async fn jsonld_values_reach_generated_binds() {
     );
 }
 
+/// The JSON-LD twin of `subselect_grouped_expression_sorts_in_the_outer_query`:
+/// a subquery's grouped select expression is one value per group, so the
+/// outer `orderBy` sorts on it.
+#[tokio::test]
+async fn jsonld_subquery_grouped_expression_sorts_in_the_outer_query() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "jsonld-grouped/subquery-order-by:main").await;
+    let ctx = json!({"ex": "http://example.org/"});
+    let query = json!({
+        "@context": ctx,
+        "select": ["?a", "?len"],
+        "where": [["query", {
+            "@context": ctx,
+            "select": ["?a", "(as (strlen ?a) ?len)"],
+            "where": {"@id": "?e", "ex:area": "?a"},
+            "groupBy": "?a"
+        }]],
+        "orderBy": "(desc ?len)"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{query}"))
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        rows,
+        json!([["Remote", 6], ["Local", 5], ["Net", 3]]),
+        "{query}"
+    );
+}
+
 /// The JSON-LD twin of `aggregate_over_a_variable_nothing_binds_is_a_named_error`,
 /// with the aggregate-output errors SPARQL's validator catches first (JSON-LD
 /// reaches the plan-time check): each names its variable, a 400. They printed

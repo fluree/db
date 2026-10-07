@@ -384,6 +384,45 @@ async fn having_reads_a_select_alias() {
     assert_eq!(result.row_count(), 0, "HAVING (?nosuch = 1)");
 }
 
+/// A sub-SELECT's grouped SELECT expression is one value per group, so an
+/// outer ORDER BY on its alias sorts the groups. Evaluated per solution, it
+/// was a per-group list: the outer sort compared two lists (a `debug_assert!`
+/// in the sort comparator; equal, so no order, in release builds).
+#[tokio::test]
+async fn subselect_grouped_expression_sorts_in_the_outer_query() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "grouped-projection/subselect-order-by:main").await;
+    for (body, expected) in [
+        (
+            "SELECT ?a ?len WHERE { { SELECT ?a (STRLEN(?a) AS ?len) \
+             WHERE { ?e ex:area ?a } GROUP BY ?a } } ORDER BY DESC(?len)",
+            json!([["Remote", 6], ["Local", 5], ["Net", 3]]),
+        ),
+        (
+            "SELECT ?e ?k WHERE { { SELECT ?e (CONCAT(?a, STR(?e)) AS ?k) \
+             WHERE { ?e ex:area ?a } GROUP BY ?e ?a } } ORDER BY ?k LIMIT 3",
+            json!([
+                ["ex:e4", "Localhttp://example.org/e4"],
+                ["ex:e5", "Localhttp://example.org/e5"],
+                ["ex:e1", "Nethttp://example.org/e1"]
+            ]),
+        ),
+        (
+            "SELECT ?a ?d WHERE { { SELECT ?a (COUNT(?e) * 2 AS ?d) \
+             WHERE { ?e ex:area ?a } GROUP BY ?a } } ORDER BY ?d",
+            json!([["Remote", 2], ["Local", 4], ["Net", 6]]),
+        ),
+    ] {
+        let query = format!("{PREFIX}{body}");
+        let rows = support::query_sparql(&fluree, &ledger, &query)
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{query}"))
+            .to_jsonld(&ledger.snapshot)
+            .expect("to_jsonld");
+        assert_eq!(rows, expected, "{query}");
+    }
+}
+
 /// An aggregate over a variable nothing binds is a plan error naming the
 /// variable, a 400 on both query paths; it printed `Aggregate input variable
 /// VarId(n) not found in schema`, a 500 on the tracked path.
