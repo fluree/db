@@ -8,6 +8,7 @@ use fluree_db_core::{
 };
 use std::fmt::Debug;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Hooks a [`HookedStorage`] runs around the operations it forwards.
@@ -150,5 +151,36 @@ impl<H: StorageHooks> ContentAddressedWrite for HookedStorage<H> {
 impl<H: StorageHooks> StorageMethod for HookedStorage<H> {
     fn storage_method(&self) -> &str {
         self.inner.storage_method()
+    }
+}
+
+/// Storage hooks that count index artifact writes by the address written.
+#[derive(Debug, Default)]
+pub struct IndexWriteCounts {
+    index_leaf_writes: AtomicU64,
+    index_branch_writes: AtomicU64,
+    index_root_writes: AtomicU64,
+}
+
+impl IndexWriteCounts {
+    /// `(leaves, branches, roots)` written so far.
+    pub fn snapshot_counts(&self) -> (u64, u64, u64) {
+        (
+            self.index_leaf_writes.load(Ordering::Relaxed),
+            self.index_branch_writes.load(Ordering::Relaxed),
+            self.index_root_writes.load(Ordering::Relaxed),
+        )
+    }
+}
+
+impl StorageHooks for IndexWriteCounts {
+    fn after_write(&self, address: &str) {
+        if address.contains("/index/objects/leaves/") {
+            self.index_leaf_writes.fetch_add(1, Ordering::Relaxed);
+        } else if address.contains("/index/objects/branches/") {
+            self.index_branch_writes.fetch_add(1, Ordering::Relaxed);
+        } else if address.contains("/index/roots/") {
+            self.index_root_writes.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }

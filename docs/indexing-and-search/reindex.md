@@ -105,7 +105,7 @@ Key `IndexerConfig` fields:
 | `branch_target_children` | 100 | Target children per branch node |
 | `branch_max_children` | 200 | Maximum children per branch node |
 | `gc_max_old_indexes` | 5 | Old index versions to retain before GC |
-| `gc_min_time_mins` | 30 | Minimum age (minutes) before an index can be GC'd |
+| `gc_min_time_mins` | 15 | Minimum age (minutes) before an index can be GC'd |
 | `gc_hard_max_old_indexes` | unset | Version ceiling past which the age guard is overridden. Bounds versions, not bytes, and can release artifacts a still-running query needs — see [Index Retention](background-indexing.md#index-retention) |
 | `run_budget_bytes` | 256 MB | Memory budget for sort buffers (split across all sort orders) |
 | `data_dir` | System temp dir | Base directory for index artifacts |

@@ -77,7 +77,7 @@ Supported:
   - `defaults.indexing.reindexMinBytes` / `reindexMaxBytes` are applied as the default `IndexConfig` for writes
   - `defaults.indexing.indexingEnabled=false` suppresses background index triggers
   - `defaults.indexing.maxOldIndexes` sets the maximum number of old index versions to retain before GC (default: 5)
-  - `defaults.indexing.gcMinTimeMins` sets the minimum age in minutes before an index can be garbage collected (default: 30)
+  - `defaults.indexing.gcMinTimeMins` sets the minimum age in minutes before an index can be garbage collected (default: 15)
 
 ### addressIdentifiers (read routing)
 

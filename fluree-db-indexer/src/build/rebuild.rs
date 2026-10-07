@@ -5,7 +5,7 @@
 //! orders, and writes an `IndexRoot` (FIR6) descriptor to storage.
 
 use fluree_db_binary_index::{BinaryPrevIndexRef, GraphArenaRefs, RunRecord, VectorDictRef};
-use fluree_db_core::{ContentId, ContentKind, ContentStore};
+use fluree_db_core::{ContentId, ContentStore};
 
 use crate::error::{IndexerError, Result};
 use crate::run_index;
@@ -884,28 +884,13 @@ where
             }
 
             // Upload HLL sketches to CAS.
-            let sketch_ref = {
-                let sketch_blob =
-                    crate::stats::HllSketchBlob::from_properties(commit_t, stats_hook.properties());
-                if !sketch_blob.entries.is_empty() {
-                    let sketch_bytes = sketch_blob.to_json_bytes().map_err(|e| {
-                        IndexerError::StorageWrite(format!("sketch serialize: {e}"))
-                    })?;
-                    let cid = content_store
-                        .put(ContentKind::StatsSketch, &sketch_bytes)
-                        .await
-                        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                    tracing::info!(
-                        %cid,
-                        bytes = sketch_bytes.len(),
-                        entries = sketch_blob.entries.len(),
-                        "Phase D-V3 stats: HLL sketch uploaded"
-                    );
-                    Some(cid)
-                } else {
-                    None
-                }
-            };
+            let sketch_ref = super::upload::upload_stats_sketch(
+                &content_store,
+                commit_t,
+                stats_hook.properties(),
+            )
+            .await?
+            .map(|(cid, _)| cid);
 
             // Finalize HLL stats (no per-subject maps to move — hll_only mode).
             let id_stats_result = stats_hook.finalize();

@@ -95,11 +95,11 @@
 //!
 //! GC respects two thresholds:
 //! - `max_old_indexes`: Maximum number of old index versions to keep (default: 5)
-//! - `min_time_garbage_mins`: Minimum age before an index can be GC'd (default: 30)
+//! - `min_time_garbage_mins`: Minimum age before an index can be GC'd (default: 15)
 //!
 //! Both thresholds must be satisfied for GC to occur, so the slower of the two
 //! wins. Under a sustained publish rate that is the age guard: a ledger
-//! publishing twice a minute holds ~60 versions inside a 30-minute guard, and
+//! publishing twice a minute holds ~30 versions inside a 15-minute guard, and
 //! `max_old_indexes = 5` then bounds nothing. Real retention becomes "however
 //! many versions fit in `min_time_garbage_mins`", which grows with publish rate
 //! and per-version size.
@@ -175,7 +175,7 @@ pub enum SharedBlobPolicy {
 pub const DEFAULT_MAX_OLD_INDEXES: u32 = 5;
 
 /// Default minimum age (in minutes) before an index can be garbage collected
-pub const DEFAULT_MIN_TIME_GARBAGE_MINS: u32 = 30;
+pub const DEFAULT_MIN_TIME_GARBAGE_MINS: u32 = 15;
 
 /// Configuration for garbage collection
 #[derive(Debug, Clone, Default)]
@@ -184,7 +184,7 @@ pub struct CleanGarbageConfig {
     ///
     /// With max_old_indexes=5, we keep current + 5 old = 6 total index versions.
     pub max_old_indexes: Option<u32>,
-    /// Minimum age in minutes before GC (None = default 30)
+    /// Minimum age in minutes before GC (None = default 15)
     ///
     /// Garbage records must be at least this old before their nodes can be deleted.
     pub min_time_garbage_mins: Option<u32>,

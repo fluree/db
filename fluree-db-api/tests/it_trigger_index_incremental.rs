@@ -1,7 +1,7 @@
 #![cfg(feature = "native")]
 
 use crate::support;
-use crate::support::hooked_storage::{HookedStorage, StorageHooks};
+use crate::support::hooked_storage::{HookedStorage, IndexWriteCounts};
 use fluree_db_api::tx::IndexingMode;
 use fluree_db_api::{Fluree, IndexerConfig, NameServiceMode, TriggerIndexOptions};
 use fluree_db_connection::config::ConnectionConfig;
@@ -9,38 +9,7 @@ use fluree_db_core::ContentStore;
 use fluree_db_nameservice::memory::MemoryNameService;
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-
-/// Storage hooks that count index artifact writes by the address written.
-#[derive(Debug, Default)]
-struct IndexWriteCounts {
-    index_leaf_writes: AtomicU64,
-    index_branch_writes: AtomicU64,
-    index_root_writes: AtomicU64,
-}
-
-impl IndexWriteCounts {
-    fn snapshot_counts(&self) -> (u64, u64, u64) {
-        (
-            self.index_leaf_writes.load(Ordering::Relaxed),
-            self.index_branch_writes.load(Ordering::Relaxed),
-            self.index_root_writes.load(Ordering::Relaxed),
-        )
-    }
-}
-
-impl StorageHooks for IndexWriteCounts {
-    fn after_write(&self, address: &str) {
-        if address.contains("/index/objects/leaves/") {
-            self.index_leaf_writes.fetch_add(1, Ordering::Relaxed);
-        } else if address.contains("/index/objects/branches/") {
-            self.index_branch_writes.fetch_add(1, Ordering::Relaxed);
-        } else if address.contains("/index/roots/") {
-            self.index_root_writes.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
 
 #[tokio::test(flavor = "current_thread")]
 async fn trigger_index_second_run_uses_incremental_not_full_rebuild() {

@@ -2148,10 +2148,9 @@ pub async fn incremental_index(
             )
             .await
             {
-                Ok(bytes) => match stats::HllSketchBlob::from_json_bytes(&bytes)
-                    .and_then(stats::HllSketchBlob::into_properties)
-                {
-                    Ok(props) => {
+                Ok(bytes) => match stats::HllSketchBlob::from_bytes(&bytes) {
+                    Ok(blob) => {
+                        let props = blob.into_properties();
                         tracing::debug!(
                             entries = props.len(),
                             bytes = bytes.len(),
@@ -2159,19 +2158,16 @@ pub async fn incremental_index(
                         );
                         props
                     }
+                    // A newer format means a downgraded indexer. Reseeding
+                    // would silently thin NDV on every build; fail instead.
+                    Err(e @ stats::SketchDecodeError::Unsupported(_)) => return Err(e.into()),
                     Err(e) => {
-                        tracing::warn!(error = %e, "failed to decode prior sketches, starting fresh");
+                        tracing::error!(error = %e, %cid, "failed to decode prior sketches, starting fresh");
                         std::collections::HashMap::new()
                     }
                 },
-                Err(IndexerError::StorageRead(e)) if e.contains("not found") => {
-                    tracing::debug!(
-                        "sketch blob CID present but content not found, starting fresh"
-                    );
-                    std::collections::HashMap::new()
-                }
                 Err(e) => {
-                    tracing::warn!(error = %e, "failed to load sketch blob, starting fresh");
+                    tracing::error!(error = %e, %cid, "failed to load sketch blob, starting fresh");
                     std::collections::HashMap::new()
                 }
             }
@@ -2281,34 +2277,18 @@ pub async fn incremental_index(
         }
 
         // Upload HLL sketches (before finalize consumes the hook).
-        let sketch_ref = {
-            let sketch_blob =
-                stats::HllSketchBlob::from_properties(novelty.max_t, stats_hook.properties());
-            if !sketch_blob.entries.is_empty() {
-                let sketch_bytes = sketch_blob
-                    .to_json_bytes()
-                    .map_err(|e| IndexerError::StorageWrite(format!("sketch serialize: {e}")))?;
-                let cid = content_store
-                    .put(ContentKind::StatsSketch, &sketch_bytes)
-                    .await
-                    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                cache_artifact_bytes(
-                    &*content_store,
-                    &cache_dir,
-                    &cid,
-                    &sketch_bytes,
-                    "stats_sketch",
-                );
-                tracing::debug!(
-                    %cid,
-                    bytes = sketch_bytes.len(),
-                    entries = sketch_blob.entries.len(),
-                    "incremental V6: HLL sketch uploaded"
-                );
+        let sketch_ref = match super::upload::upload_stats_sketch(
+            content_store.as_ref(),
+            novelty.max_t,
+            stats_hook.properties(),
+        )
+        .await?
+        {
+            Some((cid, bytes)) => {
+                cache_artifact_bytes(&*content_store, &cache_dir, &cid, &bytes, "stats_sketch");
                 Some(cid)
-            } else {
-                None
             }
+            None => None,
         };
 
         // Move per-subject maps out of the hook (avoids cloning).
