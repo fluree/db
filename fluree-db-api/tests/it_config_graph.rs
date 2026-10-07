@@ -4369,12 +4369,13 @@ async fn shacl_turtle_insert_without_config_is_not_validated() {
 /// The source commits here skip the source's own checks, so the forbidden
 /// record reaches the receiver either way: where the pushed config enables
 /// SHACL it is refused, and where the ledger only holds shapes it is not.
+/// The receiver is another instance of the same ledger, as in replication.
 #[cfg(feature = "shacl")]
 #[tokio::test]
 async fn push_validates_only_where_config_enables_shacl() {
     for enabled in [false, true] {
-        let fluree = FlureeBuilder::memory().build_memory();
-        let src_id = format!("it/shacl-push-src-{enabled}:main");
+        let source = FlureeBuilder::memory().build_memory();
+        let ledger_id = format!("it/shacl-push-{enabled}:main");
         let mut seed = vec![json!({
             "@id": "ex:PersonShape",
             "@type": "sh:NodeShape",
@@ -4385,8 +4386,8 @@ async fn push_validates_only_where_config_enables_shacl() {
             seed.push(support::shacl_enabled_config_node());
         }
         let src = commit_unchecked(
-            &fluree,
-            genesis_ledger(&fluree, &src_id),
+            &source,
+            genesis_ledger(&source, &ledger_id),
             &json!({
                 "@context": {"sh": "http://www.w3.org/ns/shacl#", "ex": "http://example.org/"},
                 "@graph": seed
@@ -4394,7 +4395,7 @@ async fn push_validates_only_where_config_enables_shacl() {
         )
         .await;
         commit_unchecked(
-            &fluree,
+            &source,
             src,
             &json!({
                 "@context": {"ex": "http://example.org/"},
@@ -4404,32 +4405,17 @@ async fn push_validates_only_where_config_enables_shacl() {
         )
         .await;
 
-        let src_handle = fluree.ledger_cached(&src_id).await.expect("source handle");
-        let export = fluree
-            .export_commit_range(
-                &src_handle,
-                &fluree_db_api::ExportCommitsRequest {
-                    limit: Some(100),
-                    ..Default::default()
-                },
-            )
+        let target = FlureeBuilder::memory().build_memory();
+        target
+            .create_ledger(&ledger_id)
             .await
-            .expect("export commits");
-        let tgt_id = format!("it/shacl-push-tgt-{enabled}:main");
-        fluree.create_ledger(&tgt_id).await.expect("create target");
-        let mut commits = export.commits;
-        commits.reverse();
-        let result = fluree
+            .expect("create target");
+        let result = target
             .push_commits(
-                &tgt_id,
-                fluree_db_api::PushCommitsRequest {
-                    commits,
-                    blobs: export.blobs,
-                    missing_blobs: Vec::new(),
-                    merged_commits: Vec::new(),
-                },
+                &ledger_id,
+                newest_commits(&source, &ledger_id, 100).await,
                 &GovernanceOptions::default(),
-                &fluree.default_index_config(),
+                &target.default_index_config(),
             )
             .await;
         match (enabled, result) {
@@ -4440,6 +4426,319 @@ async fn push_validates_only_where_config_enables_shacl() {
                 assert!(err.to_string().contains("SHACL"), "{err}");
             }
             (true, Ok(_)) => panic!("the pushed config enables SHACL: the push must be refused"),
+        }
+    }
+}
+
+/// The newest `limit` commits of `ledger_id`, oldest first, as a push sends
+/// them.
+async fn newest_commits(
+    from: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    limit: usize,
+) -> fluree_db_api::PushCommitsRequest {
+    let handle = from.ledger_cached(ledger_id).await.expect("source handle");
+    let export = from
+        .export_commit_range(
+            &handle,
+            &fluree_db_api::ExportCommitsRequest {
+                limit: Some(limit),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("export commits");
+    let mut commits = export.commits;
+    commits.reverse();
+    fluree_db_api::PushCommitsRequest {
+        commits,
+        blobs: export.blobs,
+        missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
+    }
+}
+
+#[cfg(feature = "shacl")]
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("create dir");
+    for entry in std::fs::read_dir(from).expect("read dir") {
+        let entry = entry.expect("dir entry");
+        let dest = to.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_dir(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), dest).expect("copy file");
+        }
+    }
+}
+
+/// A pushed commit is validated in each named graph it writes, under that
+/// graph's config, whether or not the receiving ledger is indexed: a graph
+/// the ledger has registered, one the pushed commits register (in the same
+/// commit or an earlier one of the push), and the default graph alike. The
+/// receiver is an unindexed copy of the sender. SHACL is on ledger-wide and
+/// off for `ex:a` and for `ex:g7`, which no commit has written before the
+/// push; each pushed commit holds a record the shapes forbid, committed at
+/// the source under a requested warn.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn push_validates_each_named_graph_under_its_own_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let base = dir.path().join("base");
+    let file_fluree = |path: &std::path::Path| {
+        FlureeBuilder::file(path.to_str().expect("utf-8 path"))
+            .without_indexing()
+            .build()
+            .expect("file fluree")
+    };
+    let name = "it/push-graph-config";
+    let ledger_id = format!("{name}:main");
+    let cfg = config_graph_iri(&ledger_id);
+    {
+        let fluree = file_fluree(&base);
+        fluree.create_ledger(name).await.expect("create");
+        for trig in [
+            format!(
+                "@prefix f: <https://ns.flur.ee/db#> . @prefix sh: <http://www.w3.org/ns/shacl#> .
+                 @prefix ex: <http://example.org/> .
+                 ex:PersonShape a sh:NodeShape ; sh:targetClass ex:Person ;
+                   sh:property [ sh:path ex:name ; sh:minCount 1 ] .
+                 GRAPH <{cfg}> {{
+                   <urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> ;
+                     f:graphOverrides <urn:config:ga>, <urn:config:g7> .
+                   <urn:config:shacl> f:shaclEnabled true .
+                   <urn:config:ga> a f:GraphConfig ; f:targetGraph ex:a ;
+                     f:shaclDefaults <urn:config:gashacl> .
+                   <urn:config:gashacl> f:shaclEnabled false .
+                   <urn:config:g7> a f:GraphConfig ; f:targetGraph ex:g7 ;
+                     f:shaclDefaults <urn:config:g7shacl> .
+                   <urn:config:g7shacl> f:shaclEnabled false .
+                 }}"
+            ),
+            "@prefix ex: <http://example.org/> . GRAPH ex:a { ex:x1 ex:p 1 . }".to_string(),
+            "@prefix ex: <http://example.org/> . GRAPH ex:z { ex:x2 ex:p 2 . }".to_string(),
+        ] {
+            fluree
+                .graph(&ledger_id)
+                .transact()
+                .upsert_turtle(&trig)
+                .commit()
+                .await
+                .expect("seed");
+        }
+    }
+
+    let bad = |graph: &str| match graph {
+        "" => "ex:bad a ex:Person".to_string(),
+        g => format!("GRAPH {g} {{ ex:bad a ex:Person }}"),
+    };
+    let fine = |graph: &str| format!("GRAPH {graph} {{ ex:fine ex:p 1 }}");
+    // (case, the pushed commits' INSERT DATA bodies, whether the push is accepted)
+    let cases: Vec<(&str, Vec<String>, bool)> = vec![
+        ("a new graph", vec![bad("ex:g2")], false),
+        (
+            "two new graphs",
+            vec![format!("{} {}", fine("ex:g1"), bad("ex:g2"))],
+            false,
+        ),
+        ("a registered graph", vec![bad("ex:z")], false),
+        ("the default graph", vec![bad("")], false),
+        ("a graph with SHACL off", vec![bad("ex:a")], true),
+        ("a new graph with SHACL off", vec![bad("ex:g7")], true),
+        (
+            "a graph an earlier pushed commit registers",
+            vec![fine("ex:g3"), bad("ex:g3")],
+            false,
+        ),
+    ];
+    for (i, (case, bodies, accepted)) in cases.into_iter().enumerate() {
+        let src_dir = dir.path().join(format!("src-{i}"));
+        let tgt_dir = dir.path().join(format!("tgt-{i}"));
+        copy_dir(&base, &src_dir);
+        copy_dir(&base, &tgt_dir);
+        let source = file_fluree(&src_dir);
+        for body in &bodies {
+            source
+                .graph(&ledger_id)
+                .transact()
+                .txn_opts(fluree_db_api::TxnOpts {
+                    validation_mode: Some(fluree_db_core::ledger_config::ValidationMode::Warn),
+                    ..Default::default()
+                })
+                .sparql_update(&format!(
+                    "PREFIX ex: <http://example.org/> INSERT DATA {{ {body} }}"
+                ))
+                .commit()
+                .await
+                .unwrap_or_else(|e| panic!("{case}: source commit: {e}"));
+        }
+        let target = file_fluree(&tgt_dir);
+        let result = target
+            .push_commits(
+                &ledger_id,
+                newest_commits(&source, &ledger_id, bodies.len()).await,
+                &GovernanceOptions::default(),
+                &target.default_index_config(),
+            )
+            .await;
+        match (accepted, result) {
+            (true, Ok(pushed)) => assert_eq!(pushed.accepted, bodies.len(), "{case}"),
+            (true, Err(err)) => panic!("{case}: SHACL is off for this graph: {err}"),
+            (false, Err(err)) => {
+                assert_eq!(err.status_code(), 422, "{case}: {err}");
+                assert!(err.to_string().contains("SHACL"), "{case}: {err}");
+            }
+            (false, Ok(_)) => panic!("{case}: the shapes apply in this graph"),
+        }
+    }
+}
+
+/// Graphs a push registers are validated apart from the ledger's other
+/// graphs, under the ids the ledger gives them when the commits apply, and
+/// their data reads back from each graph after the ledger reloads. Here a
+/// subject has one email in an existing graph and one in a graph the push
+/// registers; each graph conforms to a one-email shape on its own.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn pushed_graphs_are_validated_apart_from_the_ledgers_other_graphs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file_fluree = |path: &std::path::Path| {
+        FlureeBuilder::file(path.to_str().expect("utf-8 path"))
+            .without_indexing()
+            .build()
+            .expect("file fluree")
+    };
+    let name = "it/push-graph-ids";
+    let ledger_id = format!("{name}:main");
+    let cfg = config_graph_iri(&ledger_id);
+    let base = dir.path().join("base");
+    {
+        let fluree = file_fluree(&base);
+        fluree.create_ledger(name).await.expect("create");
+        fluree
+            .graph(&ledger_id)
+            .transact()
+            .upsert_turtle(&format!(
+                "@prefix f: <https://ns.flur.ee/db#> . @prefix sh: <http://www.w3.org/ns/shacl#> .
+                 @prefix ex: <http://example.org/> .
+                 ex:PersonShape a sh:NodeShape ; sh:targetSubjectsOf ex:email ;
+                   sh:property [ sh:path ex:email ; sh:maxCount 1 ] .
+                 GRAPH <{cfg}> {{
+                   <urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> .
+                   <urn:config:shacl> f:shaclEnabled true .
+                 }}
+                 GRAPH ex:m {{ ex:s ex:email \"a@example.org\" . }}"
+            ))
+            .commit()
+            .await
+            .expect("seed");
+    }
+    let src_dir = dir.path().join("src");
+    let tgt_dir = dir.path().join("tgt");
+    copy_dir(&base, &src_dir);
+    copy_dir(&base, &tgt_dir);
+    let source = file_fluree(&src_dir);
+    for body in [
+        "GRAPH ex:n1 { ex:t ex:email \"t@example.org\" }",
+        "GRAPH ex:n2 { ex:s ex:email \"b@example.org\" }",
+    ] {
+        source
+            .graph(&ledger_id)
+            .transact()
+            .sparql_update(&format!(
+                "PREFIX ex: <http://example.org/> INSERT DATA {{ {body} }}"
+            ))
+            .commit()
+            .await
+            .expect("source commit");
+    }
+    {
+        let target = file_fluree(&tgt_dir);
+        let pushed = target
+            .push_commits(
+                &ledger_id,
+                newest_commits(&source, &ledger_id, 2).await,
+                &GovernanceOptions::default(),
+                &target.default_index_config(),
+            )
+            .await
+            .expect("each graph conforms on its own");
+        assert_eq!(pushed.accepted, 2);
+    }
+    let reloaded = file_fluree(&tgt_dir);
+    for (graph, email) in [
+        ("m", "a@example.org"),
+        ("n1", "t@example.org"),
+        ("n2", "b@example.org"),
+    ] {
+        let out = reloaded
+            .query_connection(&json!({
+                "@context": {"ex": "http://example.org/"},
+                "from": format!("{ledger_id}#http://example.org/{graph}"),
+                "select": "?email",
+                "where": {"@id": "?s", "ex:email": "?email"}
+            }))
+            .await
+            .unwrap_or_else(|e| panic!("query graph {graph}: {e}"));
+        let view = reloaded.ledger(&ledger_id).await.expect("reload");
+        let rows = out.to_jsonld(&view.snapshot).expect("jsonld");
+        assert_eq!(rows, json!([email]), "graph {graph}");
+    }
+}
+
+/// A pushed flake in a graph that neither the receiving ledger nor the
+/// pushed commits register has no graph id to apply under, so the push is
+/// refused. Here the sender is a different ledger whose commit writes its
+/// own config graph without registering it (a commit staged and committed
+/// directly, without the transaction path's graph registration).
+#[tokio::test]
+async fn push_refuses_a_graph_nothing_registers() {
+    let source = FlureeBuilder::memory().build_memory();
+    let src_id = "it/push-unregistered-src:main";
+    commit_unchecked(
+        &source,
+        genesis_ledger(&source, src_id),
+        &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@graph": [
+                    {"@id": "ex:alice", "ex:name": "Alice"},
+                support::shacl_enabled_config_node()
+            ]
+        }),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tgt_id = "it/push-unregistered-tgt:main";
+    let file_fluree = || {
+        FlureeBuilder::file(dir.path().to_str().expect("utf-8 path"))
+            .without_indexing()
+            .build()
+            .expect("file fluree")
+    };
+    let target = file_fluree();
+    target.create_ledger(tgt_id).await.expect("create target");
+    let result = target
+        .push_commits(
+            tgt_id,
+            newest_commits(&source, src_id, 1).await,
+            &GovernanceOptions::default(),
+            &target.default_index_config(),
+        )
+        .await;
+    match result {
+        Err(err) => {
+            assert_eq!(err.status_code(), 422, "{err}");
+            let message = err.to_string();
+            assert!(
+                message.contains(&config_graph_iri(src_id))
+                    && message.contains("neither this ledger nor the pushed commits register"),
+                "{message}"
+            );
+        }
+        Ok(_) => {
+            let reload = file_fluree().ledger(tgt_id).await.map(|_| ());
+            panic!("accepted a graph nothing registers; the ledger reloads as: {reload:?}");
         }
     }
 }
