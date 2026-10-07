@@ -562,8 +562,8 @@ impl FlakeValue {
 
     /// Check if i64 is exactly representable as f64 (within 2^53)
     fn i64_fits_f64(v: i64) -> bool {
-        const MAX_SAFE: i64 = 1 << 53;
-        v.abs() <= MAX_SAFE
+        const MAX_SAFE: u64 = 1 << 53;
+        v.unsigned_abs() <= MAX_SAFE
     }
 
     /// Compare values of the same type
@@ -1745,5 +1745,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `Long(i64::MIN)` compares with a double by value, like any other
+    /// integer beyond 2^53.
+    #[test]
+    fn long_min_compares_with_doubles() {
+        let min = FlakeValue::Long(i64::MIN);
+        let as_double = FlakeValue::Double(-9_223_372_036_854_775_808.0);
+        assert_eq!(min.numeric_cmp(&as_double), Some(Ordering::Equal));
+        assert_eq!(as_double.numeric_cmp(&min), Some(Ordering::Equal));
+        assert_eq!(
+            min.numeric_cmp(&FlakeValue::Double(0.0)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            FlakeValue::Double(-1e19).numeric_cmp(&min),
+            Some(Ordering::Less)
+        );
+        assert_eq!(min.cmp(&as_double), Ordering::Equal);
     }
 }
