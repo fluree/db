@@ -250,6 +250,18 @@ where
     // requires decrypting the entire blob — partial range reads on ciphertext
     // are not meaningful. The default calls read_bytes() → decrypt → slice.
 
+    /// The inner storage's local ciphertext, decrypted. CPU work only, and
+    /// the plaintext goes back to the caller, never into a cache file.
+    fn get_local(
+        &self,
+        address: &str,
+    ) -> fluree_db_core::error::Result<Option<fluree_db_core::ContentBytes>> {
+        match self.inner.get_local(address)? {
+            Some(envelope) => Ok(Some(self.decrypt(&envelope)?.into())),
+            None => Ok(None),
+        }
+    }
+
     async fn exists(&self, address: &str) -> fluree_db_core::error::Result<bool> {
         // Pass through - existence check doesn't need decryption
         self.inner.exists(address).await
@@ -545,6 +557,36 @@ mod tests {
         let decrypted = encrypted.read_bytes("test/data").await.unwrap();
 
         assert_eq!(decrypted, plaintext);
+    }
+
+    /// Local reads decrypt, like fetched ones: a reader handed the inner
+    /// storage's envelope would parse ciphertext as an index artifact.
+    #[tokio::test]
+    async fn get_local_serves_plaintext() {
+        let storage = MemoryStorage::new();
+        let encrypted = EncryptedStorage::new(storage.clone(), test_provider());
+        encrypted
+            .write_bytes("test/data", b"leaf bytes")
+            .await
+            .unwrap();
+
+        let local = encrypted.get_local("test/data").unwrap().expect("local");
+        assert_eq!(local, b"leaf bytes");
+        assert_ne!(
+            storage.get_local("test/data").unwrap().unwrap(),
+            b"leaf bytes",
+            "the inner storage holds ciphertext"
+        );
+        assert!(encrypted.get_local("test/absent").unwrap().is_none());
+
+        let other_key = EncryptedStorage::new(
+            storage,
+            StaticKeyProvider::new(EncryptionKey::new([0x02; 32], 1)),
+        );
+        assert!(
+            other_key.get_local("test/data").is_err(),
+            "a local copy that fails to decrypt is an error, not a miss"
+        );
     }
 
     #[tokio::test]

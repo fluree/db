@@ -2,7 +2,8 @@
 //!
 //! On targets without a sync→async bridge (`wasm32`), the binary-index read
 //! path serves CAS-backed bytes exclusively from a store's resident tier
-//! ([`ContentStore::resolve_cached_bytes`](crate::ContentStore::resolve_cached_bytes) /
+//! ([`ContentStore::get_local`](crate::ContentStore::get_local), which
+//! `StorageContentStore` answers from
 //! [`StorageRead::resolve_cached_bytes`](crate::storage::StorageRead::resolve_cached_bytes)).
 //! A miss cannot block on a fetch, so it must be *reported* instead. Two
 //! channels exist, with different guarantees:
@@ -26,14 +27,13 @@
 //!   precedent) and in log messages, which always name the wanted CID.
 //!
 //! Progress and termination: content is immutable and pinned once fetched
-//! (see the fetch-pins contract on `resolve_cached_bytes`), so the resident
+//! (see the fetch-pins contract on `ContentStore::miss_register`), so the resident
 //! set grows monotonically and the wanted set for a fixed query is finite.
 //! A retry loop therefore terminates by requiring *progress* — at least one
 //! drained want newly resident per round — rather than by guessing a round
 //! count; a large sanity cap guards against contract violations.
 
 use std::io;
-use std::sync::Arc;
 
 use parking_lot::Mutex;
 
@@ -251,14 +251,18 @@ impl MissRegister {
 /// The whole sync read tier for residency-mode stores: an O(1) lookup
 /// returning shared zero-copy bytes on hit; on miss, the want is recorded
 /// into the store's [`MissRegister`] (when it exposes one) and a typed
-/// [`NeedFetch`] error is returned. Performs no I/O and never blocks, so it
-/// is safe from any sync frame on any target.
+/// [`NeedFetch`] error is returned. A residency store's `get_local`
+/// performs no I/O and never blocks, so this is safe from any sync frame on
+/// any target.
 pub fn resident_or_need_fetch(
     cs: &dyn crate::ContentStore,
     cid: &ContentId,
     kind: FetchKind,
-) -> io::Result<Arc<[u8]>> {
-    match cs.resolve_cached_bytes(cid) {
+) -> io::Result<crate::ContentBytes> {
+    match cs
+        .get_local(cid)
+        .map_err(|e| io::Error::other(format!("resident lookup for {cid}: {e}")))?
+    {
         Some(bytes) => Ok(bytes),
         None => {
             if let Some(register) = cs.miss_register() {

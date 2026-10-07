@@ -42,6 +42,7 @@
 //! }
 //! ```
 
+use fluree_db_core::ContentBytes;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::ops::ControlFlow;
@@ -565,12 +566,12 @@ pub fn load_arena_from_shards(
 pub struct ShardSource {
     /// xxh3_128 of shard CID bytes — LeafletCache key.
     pub(crate) cid_hash: u128,
-    /// Content ID for remote fetching. `None` for FileStorage (local path suffices).
+    /// Content ID, read through the store. `None` for a shard that exists
+    /// only as the file at `path`.
     pub(crate) cid: Option<fluree_db_core::ContentId>,
-    /// Local file path to shard data.
-    /// FileStorage: direct CAS path. Remote: disk-cache path.
+    /// The shard's file: its disk-cache path when it comes from a store.
     pub(crate) path: PathBuf,
-    /// Whether the shard file is known to exist on disk.
+    /// Whether the file at `path` is known to exist.
     /// AtomicBool for safe mutation through `Arc<BinaryIndexStore>`.
     pub(crate) on_disk: AtomicBool,
 }
@@ -756,7 +757,7 @@ impl LazyVectorArena {
     /// Resolve a shard's bytes from the residency tier or report the miss
     /// (recording it in the store's miss register) with the shard's CID.
     #[cfg(any(target_arch = "wasm32", feature = "residency"))]
-    fn resident_shard_bytes(&self, source: &ShardSource, idx: usize) -> io::Result<Arc<[u8]>> {
+    fn resident_shard_bytes(&self, source: &ShardSource, idx: usize) -> io::Result<ContentBytes> {
         let cas = self.cas.as_ref().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -789,18 +790,25 @@ impl LazyVectorArena {
         })
     }
 
-    /// Bytes of shard `idx`: read from its local file when one exists, else
-    /// fetched from the CAS.
+    /// Bytes of shard `idx`: the store's local bytes when it has them, else
+    /// a copy in the disk cache, else fetched from the CAS.
     ///
-    /// For FileStorage (all shards `on_disk: true` at construction) this is
-    /// a fast Acquire-load and a file read. For remote backends it uses the
-    /// same sync→async bridge as `ensure_index_leaf_cached`, then keeps the
-    /// fetched shard on disk for the next miss — unless the store forbids a
-    /// plaintext copy outside it (encrypted storage), in which case the
-    /// bytes stay in memory and the next miss fetches again.
-    fn shard_bytes(&self, source: &ShardSource, idx: usize) -> io::Result<Vec<u8>> {
+    /// A fetch uses the same sync→async bridge as `ensure_index_leaf_cached`,
+    /// then keeps the fetched shard on disk for the next miss — unless the
+    /// store is not one the disk cache serves (local, or encrypted storage),
+    /// in which case the bytes stay in memory and the next miss fetches
+    /// again.
+    fn shard_bytes(&self, source: &ShardSource, idx: usize) -> io::Result<ContentBytes> {
+        if let (Some(cas), Some(cid)) = (self.cas.as_ref(), source.cid.as_ref()) {
+            if let Some(bytes) = cas
+                .get_local(cid)
+                .map_err(|e| io::Error::other(format!("vector shard {idx}: {e}")))?
+            {
+                return Ok(bytes);
+            }
+        }
         if source.on_disk.load(Ordering::Acquire) {
-            return std::fs::read(&source.path);
+            return std::fs::read(&source.path).map(Into::into);
         }
         // Shard not on disk — try lazy fetch from remote CAS.
         let cas = self.cas.as_ref().ok_or_else(|| {
@@ -846,8 +854,7 @@ impl LazyVectorArena {
             } else {
                 fut.await.map_err(|e| io::Error::other(e.to_string()))
             }
-        })?
-        .into_vec();
+        })?;
         if !crate::read::artifact_cache::uses_disk_cache(cas.as_ref()) {
             return Ok(bytes);
         }
@@ -1589,6 +1596,103 @@ mod tests {
         assert!(err.to_string().contains("dims"), "got: {err}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Store that counts fetches and serves its blobs locally.
+    #[derive(Debug, Default)]
+    struct LocalStore {
+        inner: fluree_db_core::MemoryContentStore,
+        gets: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl fluree_db_core::ContentStore for LocalStore {
+        fn permits_plaintext_cache(&self) -> bool {
+            true
+        }
+        fn is_remote(&self) -> bool {
+            false
+        }
+        async fn has(&self, id: &fluree_db_core::ContentId) -> fluree_db_core::Result<bool> {
+            self.inner.has(id).await
+        }
+        async fn get(
+            &self,
+            id: &fluree_db_core::ContentId,
+        ) -> fluree_db_core::Result<ContentBytes> {
+            self.gets.fetch_add(1, Ordering::Relaxed);
+            self.inner.get(id).await
+        }
+        fn get_local(
+            &self,
+            id: &fluree_db_core::ContentId,
+        ) -> fluree_db_core::Result<Option<ContentBytes>> {
+            self.inner.get_local(id)
+        }
+        async fn put(
+            &self,
+            kind: fluree_db_core::ContentKind,
+            bytes: &[u8],
+        ) -> fluree_db_core::Result<fluree_db_core::ContentId> {
+            self.inner.put(kind, bytes).await
+        }
+        async fn put_with_id(
+            &self,
+            id: &fluree_db_core::ContentId,
+            bytes: &[u8],
+        ) -> fluree_db_core::Result<()> {
+            self.inner.put_with_id(id, bytes).await
+        }
+        async fn release(&self, id: &fluree_db_core::ContentId) -> fluree_db_core::Result<()> {
+            self.inner.release(id).await
+        }
+    }
+
+    /// A shard the store holds locally is read from it in place: no fetch,
+    /// and no copy written to the disk cache.
+    #[test]
+    fn shards_a_store_holds_locally_are_not_fetched() {
+        use fluree_db_core::ContentStore;
+        let store = Arc::new(LocalStore::default());
+        let bytes = write_vector_shard_to_bytes(2, &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        let cid = futures::executor::block_on(store.put(
+            fluree_db_core::ContentKind::DictBlob {
+                dict: fluree_db_core::DictKind::VectorShard { p_id: 7 },
+            },
+            &bytes,
+        ))
+        .unwrap();
+
+        let cache_dir =
+            std::env::temp_dir().join(format!("fluree_vector_local_{}", std::process::id()));
+        let source = ShardSource {
+            cid_hash: crate::read::leaflet_cache::LeafletCache::cid_cache_key(&cid.to_bytes()),
+            cid: Some(cid),
+            path: cache_dir.join("shard.vas"),
+            on_disk: AtomicBool::new(false),
+        };
+        let manifest = VectorManifest {
+            version: 1,
+            dims: 2,
+            dtype: "f32".to_string(),
+            normalized: false,
+            shard_capacity: SHARD_CAPACITY,
+            total_count: 2,
+            shards: vec![ShardInfo {
+                cas: "local".to_string(),
+                count: 2,
+            }],
+        };
+        let cache = Arc::new(crate::read::leaflet_cache::LeafletCache::with_max_bytes(
+            10 * 1024 * 1024,
+        ));
+        let cas: Arc<dyn fluree_db_core::ContentStore> = store.clone();
+        let arena = LazyVectorArena::new(manifest, vec![source], cache, Some(cas));
+
+        let vs = arena.lookup_vector(1).unwrap().unwrap();
+        assert_eq!(vs.as_f32(), &[3.0f32, 4.0]);
+        assert_eq!(store.gets.load(Ordering::Relaxed), 0, "no fetch");
+        assert!(!cache_dir.exists(), "nothing written to the disk cache");
     }
 
     #[test]

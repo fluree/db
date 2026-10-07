@@ -1325,9 +1325,12 @@ async fn prefetch_reconcile_leaves(
     let (subject_keys, string_keys) = derive_reconcile_keys(chunk);
 
     // Distinct (cache_dir, cid) pairs to prewarm, deduped by cid string across
-    // both trees. Only remote leaves with a configured disk cache dir qualify;
-    // local/in-memory readers and readers without a disk cache are skipped
-    // (the prefetch cannot warm what `load_leaf` does not read from disk).
+    // both trees. Only a store the disk cache serves, with a configured disk
+    // cache dir, qualifies: a local or in-memory read is already cheap, and
+    // the prefetch cannot warm what `load_leaf` does not read from disk.
+    if !fluree_db_binary_index::read::artifact_cache::uses_disk_cache(cs) {
+        return;
+    }
     let mut seen_cids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut targets: Vec<(std::path::PathBuf, ContentId)> = Vec::new();
 
@@ -1336,7 +1339,7 @@ async fn prefetch_reconcile_leaves(
             return;
         };
         for address in tree.touched_leaf_addresses(keys) {
-            if let Some(cid) = tree.remote_leaf_cid(address) {
+            if let Some(cid) = tree.leaf_cid(address) {
                 if seen_cids.insert(cid.to_string()) {
                     targets.push((cache_dir.clone(), cid.clone()));
                 }
@@ -1413,8 +1416,6 @@ fn reconcile_chunk_to_global(
         subject_tree_entries = subject_tree.total_entries(),
         subject_tree_source = subject_tree.source_kind(),
         subject_tree_leaf_count = subject_tree.leaf_count(),
-        subject_tree_local_file_count = subject_tree.local_file_count(),
-        subject_tree_remote_cid_count = subject_tree.remote_cid_count(),
         subject_tree_has_global_cache = subject_tree.has_global_cache(),
         subject_tree_disk_reads = subject_reads_before,
         subject_tree_local_file_reads = subject_tree.local_file_reads(),
@@ -1497,8 +1498,6 @@ fn reconcile_chunk_to_global(
         string_tree_entries = string_tree.total_entries(),
         string_tree_source = string_tree.source_kind(),
         string_tree_leaf_count = string_tree.leaf_count(),
-        string_tree_local_file_count = string_tree.local_file_count(),
-        string_tree_remote_cid_count = string_tree.remote_cid_count(),
         string_tree_has_global_cache = string_tree.has_global_cache(),
         string_tree_disk_reads = string_reads_before,
         string_tree_local_file_reads = string_tree.local_file_reads(),

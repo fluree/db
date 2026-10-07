@@ -72,7 +72,11 @@ The `ContentStore` trait is the primary interface for accessing immutable, conte
 #[async_trait]
 pub trait ContentStore: Debug + Send + Sync {
     /// Retrieve bytes by content ID
-    async fn get(&self, id: &ContentId) -> Result<Vec<u8>>;
+    async fn get(&self, id: &ContentId) -> Result<ContentBytes>;
+
+    /// The bytes when this machine already has them, without fetching.
+    /// Sync readers try this before bridging to `get`.
+    fn get_local(&self, id: &ContentId) -> Result<Option<ContentBytes>> { Ok(None) }
 
     /// Store bytes, returning the computed ContentId
     async fn put(&self, kind: ContentKind, bytes: &[u8]) -> Result<ContentId>;
@@ -131,8 +135,10 @@ pub trait StorageRead: Debug + Send + Sync {
     async fn list_prefix_with_metadata(&self, prefix: &str)
         -> Result<Vec<RemoteObject>>;
 
-    /// Resolve a CAS address to a local filesystem path, if available.
-    fn resolve_local_path(&self, address: &str) -> Option<PathBuf> { None }
+    /// The bytes at `address` when this machine already has them: a local
+    /// file (mapped, or read when small) or bytes held in memory. `Ok(None)`
+    /// when absent or remote; `Err` when a local copy cannot be read.
+    fn get_local(&self, address: &str) -> Result<Option<ContentBytes>> { Ok(None) }
 
     /// Whether bytes read here may be persisted unencrypted outside this
     /// storage. Plain backends answer `true`; `EncryptedStorage` answers
@@ -181,8 +187,9 @@ pub trait EncryptionAdmin: Send + Sync {
 - `list_prefix_with_metadata` is used by the bulk-import remote-source path so the
   importer can size each chunk before fetching. Backends without cheap size metadata
   return an error; callers can fall back to caller-supplied object lists
-- `resolve_local_path` lets callers (e.g., import scratch staging) skip a copy when
-  the storage already exposes data on the local filesystem (`FileStorage`)
+- `get_local` lets sync readers use bytes already on the machine — a mapping of a
+  `FileStorage` file, `MemoryStorage`'s own allocation, or `EncryptedStorage`'s
+  decryption of its inner storage's local copy — without a fetch or a copy
 - All methods return `fluree_db_core::Result<T>` (alias for `std::result::Result<T, Error>`)
 
 ### StorageWrite
@@ -521,7 +528,7 @@ let store = BranchedContentStore::with_parents(storage, "mydb:dev", vec![parent]
 3. If no parent finds it, return the last `NotFound` error
 4. **Non-`NotFound` errors propagate immediately** — only `NotFound` triggers fallback
 
-`has()` and `resolve_local_path()` follow the same fallback pattern.
+`has()` and `get_local()` follow the same fallback pattern.
 
 ### Write Behavior
 

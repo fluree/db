@@ -779,10 +779,10 @@ pub fn uses_disk_cache(cs: &dyn ContentStore) -> bool {
 }
 
 /// Whether a copy of `id` belongs in the disk cache: [`uses_disk_cache`],
-/// and the store does not already hold it as a local file (a remote store's
-/// local tier).
+/// and the store does not already serve it locally (a remote store's local
+/// tier).
 pub fn needs_disk_copy(cs: &dyn ContentStore, id: &ContentId) -> bool {
-    uses_disk_cache(cs) && cs.resolve_local_path(id).is_none()
+    uses_disk_cache(cs) && !matches!(cs.get_local(id), Ok(Some(_)))
 }
 
 /// Copy `bytes`, which `cs` holds as `id`, into the cache at `cache_dir` when
@@ -910,23 +910,17 @@ pub fn fetch_cached_bytes_cid<'a>(
     fetch_through_cache(cs, id, cache_dir, cached)
 }
 
-/// Read `id` from the store's own local file when it has one, else through
-/// the disk cache entry `cached` when [`uses_disk_cache`] allows, else
-/// straight from the store.
+/// Read `id` from the store's local tier when it has one, else through the
+/// disk cache entry `cached` when [`uses_disk_cache`] allows, else straight
+/// from the store.
 async fn fetch_through_cache(
     cs: &dyn ContentStore,
     id: &ContentId,
     cache_dir: &Path,
     cached: PathBuf,
 ) -> io::Result<Vec<u8>> {
-    if let Some(local_path) = cs.resolve_local_path(id) {
-        if let Some(bytes) = try_read_cached_bytes(&local_path)? {
-            return Ok(bytes);
-        }
-        tracing::debug!(
-            path = %local_path.display(),
-            "local artifact path disappeared during read; fetching from the store"
-        );
+    if let Some(bytes) = cs.get_local(id).map_err(storage_to_io_error)? {
+        return Ok(bytes.into_vec());
     }
     if !uses_disk_cache(cs) {
         return fetch_uncached(cs, id, cached).await;
@@ -1098,7 +1092,7 @@ mod tests {
             delay: Duration::ZERO,
             permits_plaintext_cache: true,
             remote: true,
-            local_path: None,
+            local: false,
         };
 
         fetch_cached_bytes_cid(&store, &id, &dir).await.unwrap();
@@ -1398,7 +1392,7 @@ mod tests {
         delay: Duration,
         permits_plaintext_cache: bool,
         remote: bool,
-        local_path: Option<PathBuf>,
+        local: bool,
     }
 
     #[async_trait::async_trait]
@@ -1432,8 +1426,8 @@ mod tests {
             self.remote
         }
 
-        fn resolve_local_path(&self, _id: &ContentId) -> Option<PathBuf> {
-            self.local_path.clone()
+        fn get_local(&self, _id: &ContentId) -> crate::error::Result<Option<ContentBytes>> {
+            Ok(self.local.then(|| self.data.clone().into()))
         }
     }
 
@@ -1456,35 +1450,31 @@ mod tests {
         out
     }
 
-    fn store(
-        remote: bool,
-        permits_plaintext_cache: bool,
-        local_path: Option<PathBuf>,
-    ) -> CountingStore {
+    fn store(remote: bool, permits_plaintext_cache: bool, local: bool) -> CountingStore {
         CountingStore {
             data: b"bytes".to_vec(),
             gets: Arc::new(AtomicUsize::new(0)),
             delay: Duration::ZERO,
             permits_plaintext_cache,
             remote,
-            local_path,
+            local,
         }
     }
 
     #[test]
     fn only_remote_plaintext_artifacts_without_a_local_file_need_a_disk_copy() {
         let id = ContentId::new(crate::ContentKind::IndexLeaf, b"leaf");
-        assert!(needs_disk_copy(&store(true, true, None), &id));
+        assert!(needs_disk_copy(&store(true, true, false), &id));
         assert!(
-            !needs_disk_copy(&store(false, true, None), &id),
+            !needs_disk_copy(&store(false, true, false), &id),
             "local store"
         );
         assert!(
-            !needs_disk_copy(&store(true, false, None), &id),
+            !needs_disk_copy(&store(true, false, false), &id),
             "decrypting store"
         );
         assert!(
-            !needs_disk_copy(&store(true, true, Some(PathBuf::from("/tier/leaf"))), &id),
+            !needs_disk_copy(&store(true, true, true), &id),
             "a remote store's local tier"
         );
     }
@@ -1495,7 +1485,7 @@ mod tests {
         let id = ContentId::new(crate::ContentKind::IndexLeaf, b"leaf");
 
         assert!(!seed_disk_cache(
-            &store(false, true, None),
+            &store(false, true, false),
             &id,
             &dir,
             b"bytes"
@@ -1503,7 +1493,7 @@ mod tests {
         assert!(regular_files_under(&dir).is_empty());
 
         assert!(seed_disk_cache(
-            &store(true, true, None),
+            &store(true, true, false),
             &id,
             &dir,
             b"bytes"
@@ -1551,7 +1541,7 @@ mod tests {
             delay: Duration::ZERO,
             permits_plaintext_cache: false,
             remote: true,
-            local_path: None,
+            local: false,
         };
 
         for _ in 0..2 {
@@ -1578,7 +1568,7 @@ mod tests {
             delay: Duration::ZERO,
             permits_plaintext_cache: true,
             remote: true,
-            local_path: None,
+            local: false,
         };
         fetch_cached_bytes_cid(&permitting, &id, &dir)
             .await
@@ -1599,7 +1589,7 @@ mod tests {
             delay: Duration::from_millis(100),
             permits_plaintext_cache: true,
             remote: true,
-            local_path: None,
+            local: false,
         });
 
         let mut handles = Vec::new();
@@ -1646,7 +1636,7 @@ mod tests {
             delay: Duration::from_millis(100),
             permits_plaintext_cache: false,
             remote: true,
-            local_path: None,
+            local: false,
         });
 
         let mut handles = Vec::new();

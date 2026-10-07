@@ -73,9 +73,12 @@ impl<H: StorageHooks> StorageRead for HookedStorage<H> {
         self.inner.is_remote()
     }
 
-    /// Not a read: the bytes are shared, not fetched, so no hook runs.
-    fn resolve_local_bytes(&self, address: &str) -> Option<Arc<[u8]>> {
-        self.inner.resolve_local_bytes(address)
+    /// Not a fetch: the bytes are shared, not copied, so no hook runs.
+    fn get_local(
+        &self,
+        address: &str,
+    ) -> fluree_db_core::Result<Option<fluree_db_core::ContentBytes>> {
+        self.inner.get_local(address)
     }
 
     fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>> {

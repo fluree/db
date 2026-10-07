@@ -628,7 +628,7 @@ fn register_routed_wants(
     for (min_key, max_key) in ranges {
         let range = branch.find_leaves_in_range(&min_key, &max_key, cmp);
         for entry in &branch.leaves[range] {
-            if cs.resolve_cached_bytes(&entry.leaf_cid).is_none() {
+            if !super::need_fetch::is_resident(cs.as_ref(), &entry.leaf_cid) {
                 register.record(&entry.leaf_cid, FetchKind::IndexLeaf);
             }
         }

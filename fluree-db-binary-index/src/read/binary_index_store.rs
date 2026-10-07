@@ -4,8 +4,6 @@
 //! - `o_type` table for decode dispatch
 //! - `ColumnBatch` output
 
-#[cfg(target_arch = "wasm32")]
-use crate::wasm_compat::memmap2;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io;
@@ -23,7 +21,8 @@ use fluree_db_core::o_type_registry::OTypeRegistry;
 use fluree_db_core::value_id::{ObjKey, ObjKind};
 use fluree_db_core::GraphId;
 use fluree_db_core::{
-    ContentId, ContentStore, FlakeMeta, FlakeValue, PrefixTrie, RuntimeSmallDicts, Sid,
+    ContentBytes, ContentId, ContentStore, FlakeMeta, FlakeValue, PrefixTrie, RuntimeSmallDicts,
+    Sid,
 };
 use fluree_vocab::{geo_names, jsonld_names, namespaces, rdf_names, xsd_names};
 use parking_lot::RwLock;
@@ -181,7 +180,7 @@ where
 /// wasm32: no threads and no `block_on` — a sync-context CAS fetch cannot be
 /// bridged. Every CAS-backed sync read path short-circuits *before* reaching
 /// this bridge: it serves already-resident bytes via
-/// `ContentStore::resolve_cached_bytes` and surfaces a typed
+/// `ContentStore::get_local` and surfaces a typed
 /// [`super::need_fetch::NeedFetch`] miss (naming the wanted CID) for an async
 /// caller to fetch and retry. Reaching this stub therefore means a read path
 /// gained a bridge call without a wasm residency arm — keep it an error, not
@@ -201,7 +200,7 @@ where
     drop(fut);
     Err(io::Error::other(
         "sync CAS fetch bridge unavailable on wasm32; this read path is missing \
-         a residency-tier arm (expected resolve_cached_bytes + NeedFetch)",
+         a residency-tier arm (expected get_local + NeedFetch)",
     ))
 }
 
@@ -242,25 +241,26 @@ struct GraphIndex {
 /// must change with it, or the translation cache will serve stale ids.
 static NEXT_STORE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Whole-leaf bytes: a shared memory mapping when the leaf is local
-/// (saving the per-call open/read/copy), a shared view of bytes the store
-/// already holds in memory (`resolve_cached_bytes`), or an owned buffer
-/// for remote leaves.
-pub enum SharedLeafBytes {
-    Mmap(Arc<memmap2::Mmap>),
-    Owned(Vec<u8>),
-    Shared(Arc<[u8]>),
+/// A store error as the `io::Error` the sync read path speaks.
+fn storage_io_error(e: fluree_db_core::Error) -> io::Error {
+    match e {
+        fluree_db_core::Error::NotFound(msg) => io::Error::new(io::ErrorKind::NotFound, msg),
+        other => io::Error::other(other.to_string()),
+    }
 }
 
-impl std::ops::Deref for SharedLeafBytes {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        match self {
-            SharedLeafBytes::Mmap(mmap) => mmap,
-            SharedLeafBytes::Owned(bytes) => bytes,
-            SharedLeafBytes::Shared(bytes) => bytes,
-        }
-    }
+/// A file in the disk artifact cache, or `None` when it is not there.
+#[cfg(not(target_arch = "wasm32"))]
+fn map_file(path: &Path) -> io::Result<Option<ContentBytes>> {
+    // SAFETY: disk-cache entries land by renaming a staged file into place
+    // and are only ever unlinked after that.
+    unsafe { ContentBytes::open(path) }
+}
+
+/// wasm32 has no filesystem: the disk cache never holds anything.
+#[cfg(target_arch = "wasm32")]
+fn map_file(_path: &Path) -> io::Result<Option<ContentBytes>> {
+    Ok(None)
 }
 
 /// Index store — reads FLI3/FBR3/FHS1 artifacts via FIR6 root.
@@ -682,7 +682,7 @@ impl BinaryIndexStore {
         let mut targets: Vec<ContentId> = Vec::new();
         for entry in &branch.leaves[range] {
             let cid = &entry.leaf_cid;
-            if cs.resolve_local_path(cid).is_some() {
+            if matches!(cs.get_local(cid), Ok(Some(_))) {
                 continue;
             }
             if seen.insert(cid.clone()) {
@@ -769,8 +769,9 @@ impl BinaryIndexStore {
                 })
                 .collect();
             for address in tree.touched_leaf_addresses(keys.iter().map(Vec::as_slice)) {
-                if let Some(cid) = tree.remote_leaf_cid(address) {
-                    if cs.resolve_cached_bytes(cid).is_none() && seen.insert(cid.clone()) {
+                if let Some(cid) = tree.leaf_cid(address) {
+                    if !super::need_fetch::is_resident(cs.as_ref(), cid) && seen.insert(cid.clone())
+                    {
                         wants.push(Want {
                             cid: cid.clone(),
                             kind: FetchKind::DictLeaf,
@@ -784,8 +785,9 @@ impl BinaryIndexStore {
             // `find_string_id`).
             let keys: Vec<&[u8]> = strings.map(str::as_bytes).collect();
             for address in tree.touched_leaf_addresses(keys.iter().copied()) {
-                if let Some(cid) = tree.remote_leaf_cid(address) {
-                    if cs.resolve_cached_bytes(cid).is_none() && seen.insert(cid.clone()) {
+                if let Some(cid) = tree.leaf_cid(address) {
+                    if !super::need_fetch::is_resident(cs.as_ref(), cid) && seen.insert(cid.clone())
+                    {
                         wants.push(Want {
                             cid: cid.clone(),
                             kind: FetchKind::DictLeaf,
@@ -808,8 +810,9 @@ impl BinaryIndexStore {
     /// subsequent serial `reverse_lookup` reads. Only warms the disk cache —
     /// lookup results are byte-identical.
     ///
-    /// Remote-only: skipped if there is no CAS or the reverse tree has no disk
-    /// cache dir (a local/in-memory reader is already cheap). Bounded by the
+    /// Remote-only: skipped if there is no CAS, the store is not one the disk
+    /// cache serves, or the reverse tree has no disk cache dir (a local or
+    /// in-memory read is already cheap). Bounded by the
     /// shared `budget`; per-leaf failures are logged and ignored — the serial
     /// lookup fetches them the old way.
     pub async fn prefetch_subject_reverse_leaves(
@@ -828,6 +831,9 @@ impl BinaryIndexStore {
         let Some(cache_dir) = tree.disk_cache_dir().map(Path::to_path_buf) else {
             return;
         };
+        if !uses_disk_cache(cs.as_ref()) {
+            return;
+        }
 
         let keys: Vec<Vec<u8>> = parts
             .iter()
@@ -839,7 +845,7 @@ impl BinaryIndexStore {
         let mut seen: std::collections::HashSet<ContentId> = std::collections::HashSet::new();
         let mut targets: Vec<ContentId> = Vec::new();
         for address in tree.touched_leaf_addresses(keys.iter().map(Vec::as_slice)) {
-            if let Some(cid) = tree.remote_leaf_cid(address) {
+            if let Some(cid) = tree.leaf_cid(address) {
                 if seen.insert(cid.clone()) {
                     targets.push(cid.clone());
                 }
@@ -883,27 +889,23 @@ impl BinaryIndexStore {
         *count
     }
 
-    /// Fetch leaf bytes by CID: local path first, then CAS with caching.
-    /// Leaf bytes served from the shared mmap cache when the leaf is on
-    /// local disk (or promoted to the disk cache), falling back to an owned
-    /// read for remote leaves. Point-lookup scan lanes read whole leaves
-    /// through this instead of [`Self::get_leaf_bytes_sync`], which copies
-    /// the full file into a fresh `Vec` on every call.
-    pub fn get_leaf_bytes_shared(&self, leaf_cid: &ContentId) -> io::Result<SharedLeafBytes> {
+    /// Whole leaf bytes: the shared mapping or the store's own bytes when the
+    /// leaf is on this machine, else fetched. Point-lookup scan lanes read
+    /// whole leaves through this; a local leaf is mapped once and shared
+    /// through the [`LeafletCache`] rather than read per call.
+    pub fn get_leaf_bytes_shared(&self, leaf_cid: &ContentId) -> io::Result<ContentBytes> {
         #[cfg(any(target_arch = "wasm32", feature = "residency"))]
         if self.residency_mode() {
-            return self
-                .resident_leaf_bytes(leaf_cid, super::need_fetch::FetchKind::IndexLeaf)
-                .map(SharedLeafBytes::Shared);
+            return self.resident_leaf_bytes(leaf_cid, super::need_fetch::FetchKind::IndexLeaf);
         }
         self.get_leaf_bytes_shared_native(leaf_cid)
     }
 
     /// True when the content store carries a sync residency tier (it exposes
     /// a miss register): sync reads are then served exclusively from
-    /// `resolve_cached_bytes` + `NeedFetch` misses, never the filesystem or
-    /// bridge tiers. Always true for browser stores; native stores opt in
-    /// (tests) by exposing a register.
+    /// `get_local` + `NeedFetch` misses, never the filesystem or bridge
+    /// tiers. Always true for browser stores; native stores opt in (tests)
+    /// by exposing a register.
     #[cfg(any(target_arch = "wasm32", feature = "residency"))]
     pub(crate) fn residency_mode(&self) -> bool {
         self.residency_mode
@@ -916,16 +918,16 @@ impl BinaryIndexStore {
         self.cas.as_ref()
     }
 
-    /// Residency tier: serve `cid` from the content store's
-    /// `resolve_cached_bytes` or surface a typed [`super::need_fetch::NeedFetch`]
-    /// miss (recorded in the store's miss register) for an async caller to
-    /// fetch and retry. No I/O, no blocking.
+    /// Residency tier: serve `cid` from the content store's `get_local` or
+    /// surface a typed [`super::need_fetch::NeedFetch`] miss (recorded in the
+    /// store's miss register) for an async caller to fetch and retry. No
+    /// I/O, no blocking.
     #[cfg(any(target_arch = "wasm32", feature = "residency"))]
     fn resident_leaf_bytes(
         &self,
         cid: &ContentId,
         kind: super::need_fetch::FetchKind,
-    ) -> io::Result<Arc<[u8]>> {
+    ) -> io::Result<ContentBytes> {
         let cs = self
             .cas
             .as_ref()
@@ -933,79 +935,75 @@ impl BinaryIndexStore {
         super::need_fetch::resident_or_need_fetch(cs.as_ref(), cid, kind)
     }
 
-    fn get_leaf_bytes_shared_native(&self, leaf_cid: &ContentId) -> io::Result<SharedLeafBytes> {
+    fn get_leaf_bytes_shared_native(&self, leaf_cid: &ContentId) -> io::Result<ContentBytes> {
         if let Some(cs) = self.cas.as_ref() {
             let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
-            let mut local = cs.resolve_local_path(leaf_cid);
-            if local.is_none() && uses_disk_cache(cs.as_ref()) {
-                let promoted = self.cache_dir.join(leaf_cid.to_string());
-                if promoted.exists() {
-                    local = Some(promoted);
-                }
-            }
-            if let Some(path) = local {
-                let load = || -> io::Result<Arc<memmap2::Mmap>> {
-                    let file = std::fs::File::open(&path)?;
-                    // SAFETY: leaf files are immutable, content-addressed
-                    // CAS artifacts — never modified after write.
-                    Ok(Arc::new(unsafe { memmap2::Mmap::map(&file)? }))
-                };
-                let result = if let Some(cache) = &self.leaflet_cache {
-                    cache.try_get_or_load_leaf_mmap(leaf_id, load)
-                } else {
-                    load()
-                };
-                match result {
-                    Ok(mmap) => return Ok(SharedLeafBytes::Mmap(mmap)),
-                    // Path raced away (GC/promotion churn): fall back to the
-                    // owned read, which retries resolution from scratch.
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                    Err(err) => return Err(err),
-                }
-            }
-            if let Some(bytes) = cs.resolve_cached_bytes(leaf_cid) {
-                return Ok(SharedLeafBytes::Shared(bytes));
+            if let Some(bytes) = self.local_leaf_bytes(cs, leaf_cid, leaf_id)? {
+                return Ok(bytes);
             }
         }
         self.get_leaf_bytes_sync(leaf_cid)
-            .map(SharedLeafBytes::Owned)
     }
 
-    pub fn get_leaf_bytes_sync(&self, leaf_cid: &ContentId) -> io::Result<Vec<u8>> {
+    /// A leaf's bytes when they are on this machine: the shared cache entry,
+    /// the store's local tier, or a copy an earlier open promoted into the
+    /// disk cache. `None` means the leaf has to be fetched.
+    ///
+    /// Bytes the store already shares (memory storage) are returned as they
+    /// are; caching them again would charge the budget for memory the store
+    /// holds anyway. Mapped and heap bytes enter the cache, so a local leaf is
+    /// opened and mapped once rather than per read. The lookup runs outside
+    /// the cache's single-flight loader: nothing here fetches over the
+    /// sync→async bridge, and the loader's `block_in_place` would otherwise
+    /// be paid on every open of a leaf the cache never holds.
+    fn local_leaf_bytes(
+        &self,
+        cs: &Arc<dyn ContentStore>,
+        leaf_cid: &ContentId,
+        leaf_id: u128,
+    ) -> io::Result<Option<ContentBytes>> {
+        if let Some(bytes) = self
+            .leaflet_cache
+            .as_ref()
+            .and_then(|cache| cache.get_leaf_bytes(leaf_id))
+        {
+            return Ok(Some(bytes));
+        }
+        let bytes = match cs.get_local(leaf_cid).map_err(storage_io_error)? {
+            Some(bytes) => bytes,
+            None if uses_disk_cache(cs.as_ref()) => {
+                match map_file(&self.cache_dir.join(leaf_cid.to_string()))? {
+                    Some(bytes) => bytes,
+                    None => return Ok(None),
+                }
+            }
+            None => return Ok(None),
+        };
+        if matches!(bytes, ContentBytes::Shared(_)) {
+            return Ok(Some(bytes));
+        }
+        Ok(Some(match &self.leaflet_cache {
+            Some(cache) => cache.get_or_insert_leaf_bytes(leaf_id, bytes),
+            None => bytes,
+        }))
+    }
+
+    pub fn get_leaf_bytes_sync(&self, leaf_cid: &ContentId) -> io::Result<ContentBytes> {
         #[cfg(any(target_arch = "wasm32", feature = "residency"))]
         if self.residency_mode() {
-            return self
-                .resident_leaf_bytes(leaf_cid, super::need_fetch::FetchKind::IndexLeaf)
-                .map(|bytes| bytes.to_vec());
+            return self.resident_leaf_bytes(leaf_cid, super::need_fetch::FetchKind::IndexLeaf);
         }
         self.get_leaf_bytes_sync_native(leaf_cid)
     }
 
-    fn get_leaf_bytes_sync_native(&self, leaf_cid: &ContentId) -> io::Result<Vec<u8>> {
+    fn get_leaf_bytes_sync_native(&self, leaf_cid: &ContentId) -> io::Result<ContentBytes> {
         let cs = self
             .cas
             .as_ref()
             .ok_or_else(|| io::Error::other("no content store"))?;
 
-        // Try local path first.
-        if let Some(local_path) = cs.resolve_local_path(leaf_cid) {
-            match std::fs::read(&local_path) {
-                Ok(bytes) => return Ok(bytes),
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                    tracing::debug!(
-                        path = %local_path.display(),
-                        leaf = %leaf_cid,
-                        "local leaf path disappeared during read; falling back to remote fetch"
-                    );
-                }
-                Err(err) => return Err(err),
-            }
-        }
-
-        // Bytes the store holds in memory: one copy into the owned buffer
-        // this returns. The shared readers borrow them instead.
-        if let Some(bytes) = cs.resolve_cached_bytes(leaf_cid) {
-            return Ok(bytes.to_vec());
+        if let Some(bytes) = cs.get_local(leaf_cid).map_err(storage_io_error)? {
+            return Ok(bytes);
         }
 
         // Check cache, for a store the cache serves at all. Any other store
@@ -1015,7 +1013,7 @@ impl BinaryIndexStore {
         let cache_path = self.cache_dir.join(leaf_cid.to_string());
         if persist {
             match std::fs::read(&cache_path) {
-                Ok(bytes) => return Ok(bytes),
+                Ok(bytes) => return Ok(bytes.into()),
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err),
             }
@@ -1048,7 +1046,7 @@ impl BinaryIndexStore {
             if persist {
                 disk_cache.best_effort_write(&cache_path_owned, &data);
             }
-            Ok(data.into_vec())
+            Ok(data)
         })
     }
 
@@ -1056,12 +1054,12 @@ impl BinaryIndexStore {
 
     /// Open a leaf for reading, choosing the optimal access strategy.
     ///
-    /// - Local filesystem: returns `FullBlobLeafHandle` (OS page cache is optimal)
-    /// - Held in memory by the store: returns `SharedBlobLeafHandle` (borrowed,
-    ///   no copy)
-    /// - Cached locally: returns `FullBlobLeafHandle` (read from disk cache)
-    /// - Remote (S3/etc): returns `RangeReadLeafHandle` (header+dir only, lazy
-    ///   column fetch via byte-range reads)
+    /// - On this machine (a local file, the store's memory, or a copy
+    ///   promoted into the disk cache): a `FullBlobLeafHandle` over the
+    ///   shared bytes, with the directory shared through the cache.
+    /// - Remote (S3/etc): a `RangeReadLeafHandle` (header+dir only, lazy
+    ///   column fetch via byte-range reads), promoted to a whole-blob fetch
+    ///   once the leaf is opened again.
     pub fn open_leaf_handle(
         &self,
         leaf_cid: &ContentId,
@@ -1077,9 +1075,8 @@ impl BinaryIndexStore {
 
     /// Residency-mode leaf open: whole leaf (and sidecar when replaying)
     /// must be resident; a miss surfaces as `NeedFetch` and is recorded in
-    /// the miss register. The local-path/mmap and range-read tiers are
-    /// bypassed — on wasm there is no filesystem, and the residency tier
-    /// holds full blobs.
+    /// the miss register. The local and range-read tiers are bypassed — on
+    /// wasm there is no filesystem, and the residency tier holds full blobs.
     #[cfg(any(target_arch = "wasm32", feature = "residency"))]
     fn open_resident_leaf_handle(
         &self,
@@ -1096,7 +1093,7 @@ impl BinaryIndexStore {
             }
             _ => None,
         };
-        Ok(Box::new(super::leaf_access::SharedBlobLeafHandle::new(
+        Ok(Box::new(super::leaf_access::FullBlobLeafHandle::new(
             bytes, sidecar, leaf_id,
         )?))
     }
@@ -1117,43 +1114,8 @@ impl BinaryIndexStore {
 
         let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
 
-        // Fast path 0: the mapping is already shared through the cache, so no
-        // path needs resolving. Both local and promoted leaves land in the same
-        // cache under the same key, and the `stat` behind `resolve_local_path`
-        // was a tenth of a wide nested-loop probe once every leaf it touched
-        // was warm.
-        if let Some(mmap) = self
-            .leaflet_cache
-            .as_ref()
-            .and_then(|cache| cache.get_leaf_mmap(leaf_id))
-        {
-            return self.leaf_handle_from_mmap(mmap, leaf_id, sidecar_cid, need_replay);
-        }
-
-        // Fast path 1: local filesystem — mmap so the raw bytes stay in OS page
-        // cache (only touched pages fault in) with the directory served from the
-        // shared cache. Avoids copying the whole (possibly grown) leaf blob and
-        // re-decoding its directory on every read.
-        if let Some(local_path) = cs.resolve_local_path(leaf_cid) {
-            return self.open_mmapped_leaf(&local_path, leaf_id, sidecar_cid, need_replay);
-        }
-
-        // Fast path 1b: the store holds the bytes in memory — borrow them,
-        // with the directory shared through the cache as for a mapped leaf.
-        if let Some(bytes) = cs.resolve_cached_bytes(leaf_cid) {
-            return self.leaf_handle_from_resident(bytes, leaf_id, sidecar_cid, need_replay);
-        }
-
-        // Fast path 2: locally cached (remote-promoted) — same mmap path; a
-        // missing cache file falls through to the range-read paths below.
-        // Skipped for a store the cache does not serve.
-        if uses_disk_cache(cs.as_ref()) {
-            let cache_path = self.cache_dir.join(leaf_cid.to_string());
-            match self.open_mmapped_leaf(&cache_path, leaf_id, sidecar_cid, need_replay) {
-                Ok(handle) => return Ok(handle),
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err),
-            }
+        if let Some(bytes) = self.local_leaf_bytes(cs, leaf_cid, leaf_id)? {
+            return self.leaf_handle_from_bytes(bytes, leaf_id, sidecar_cid, need_replay);
         }
 
         let touch_count = self.note_remote_leaf_open(leaf_cid);
@@ -1227,83 +1189,12 @@ impl BinaryIndexStore {
         )))
     }
 
-    /// Open just a leaf's decoded directory — no column payload access.
-    ///
-    /// For directory-only walks (metadata counts, leaflet skips) this reads
-    /// only the header+directory prefix (a few KB) instead of the full leaf
-    /// blob, regardless of whether the leaf is local, disk-cached, or remote
-    /// (`ContentStoreRangeFetcher` resolves locality with positional reads).
-    /// Decoded directories are cached in the shared [`LeafletCache`] keyed by
-    /// leaf CID — content-addressed, so entries never go stale.
-    ///
-    /// Open a local (or locally-cached) leaf via mmap, with the decoded
-    /// directory served from the shared `LeafletCache`. The raw bytes stay in OS
-    /// page cache (only touched pages fault in) — no whole-blob copy, and the
-    /// directory is parsed once per leaf CID. See [`super::leaf_access::MmapLeafHandle`].
-    fn open_mmapped_leaf(
+    /// Build the handle for a leaf whose bytes are on this machine, sharing
+    /// the decoded directory through the cache: content-addressed, so it is
+    /// parsed once per leaf CID however many times the leaf is opened.
+    fn leaf_handle_from_bytes(
         &self,
-        path: &Path,
-        leaf_id: u128,
-        sidecar_cid: Option<&ContentId>,
-        need_replay: bool,
-    ) -> io::Result<Box<dyn super::leaf_access::LeafHandle>> {
-        // SAFETY: leaf files are immutable, content-addressed CAS artifacts —
-        // never modified after write, so the mapping's bytes are stable.
-        // The mapping is created once per leaf and shared through the cache:
-        // the open+mmap (and later munmap) syscall cycle dominated the fixed
-        // cost of an indexed point lookup. `Mmap` does not hold the file
-        // descriptor, so cached mappings cost address space, not fds.
-        let load = || -> io::Result<Arc<memmap2::Mmap>> {
-            let file = std::fs::File::open(path)?;
-            Ok(Arc::new(unsafe { memmap2::Mmap::map(&file)? }))
-        };
-        let mmap = if let Some(cache) = &self.leaflet_cache {
-            cache.try_get_or_load_leaf_mmap(leaf_id, load)?
-        } else {
-            load()?
-        };
-        self.leaf_handle_from_mmap(mmap, leaf_id, sidecar_cid, need_replay)
-    }
-
-    /// Build the handle for a leaf whose bytes are already mapped, sharing
-    /// the decoded directory through the cache.
-    fn leaf_handle_from_mmap(
-        &self,
-        mmap: Arc<memmap2::Mmap>,
-        leaf_id: u128,
-        sidecar_cid: Option<&ContentId>,
-        need_replay: bool,
-    ) -> io::Result<Box<dyn super::leaf_access::LeafHandle>> {
-        // Content-addressed directory: parse once per leaf CID, reused across
-        // opens. `leaf_id` == xxh3_128(leaf_cid) is the same key `open_leaf_dir`
-        // and warm-on-write use.
-        let dir = if let Some(cache) = &self.leaflet_cache {
-            cache.try_get_or_load_leaf_dir(leaf_id, || {
-                let header = crate::format::leaf::decode_leaf_header_v3(&mmap[..])?;
-                crate::format::leaf::decode_leaf_dir_v3_with_base(&mmap[..], &header).map(Arc::new)
-            })?
-        } else {
-            let header = crate::format::leaf::decode_leaf_header_v3(&mmap[..])?;
-            Arc::new(crate::format::leaf::decode_leaf_dir_v3_with_base(
-                &mmap[..],
-                &header,
-            )?)
-        };
-        let sidecar = if need_replay {
-            self.fetch_sidecar_bytes_sync(sidecar_cid)?
-        } else {
-            None
-        };
-        Ok(Box::new(super::leaf_access::MmapLeafHandle::new(
-            mmap, dir, sidecar, leaf_id,
-        )))
-    }
-
-    /// Build the handle for a leaf whose bytes the store holds in memory,
-    /// sharing the decoded directory through the cache.
-    fn leaf_handle_from_resident(
-        &self,
-        bytes: Arc<[u8]>,
+        bytes: ContentBytes,
         leaf_id: u128,
         sidecar_cid: Option<&ContentId>,
         need_replay: bool,
@@ -1318,25 +1209,40 @@ impl BinaryIndexStore {
             decode()?
         };
         let sidecar = if need_replay {
-            self.fetch_sidecar_bytes_sync(sidecar_cid)?.map(Arc::from)
+            self.fetch_sidecar_bytes_sync(sidecar_cid)?
         } else {
             None
         };
-        Ok(Box::new(
-            super::leaf_access::SharedBlobLeafHandle::with_dir(bytes, dir, sidecar, leaf_id),
-        ))
+        Ok(Box::new(super::leaf_access::FullBlobLeafHandle::with_dir(
+            bytes, dir, sidecar, leaf_id,
+        )))
     }
 
-    /// Callers that may need `load_columns` must use [`Self::open_leaf_handle`].
+    /// Open just a leaf's decoded directory — no column payload access.
+    ///
+    /// For directory-only walks (metadata counts, leaflet skips). Decoded
+    /// directories are cached in the shared [`LeafletCache`] keyed by leaf
+    /// CID — content-addressed, so entries never go stale. Callers that may
+    /// need `load_columns` must use [`Self::open_leaf_handle`].
     pub fn open_leaf_dir(&self, leaf_cid: &ContentId) -> io::Result<Arc<DecodedLeafDirV3>> {
         let key = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
         if let Some(cache) = &self.leaflet_cache {
-            return cache.try_get_or_load_leaf_dir(key, || self.load_leaf_dir_uncached(leaf_cid));
+            return cache
+                .try_get_or_load_leaf_dir(key, || self.load_leaf_dir_uncached(leaf_cid, key));
         }
-        self.load_leaf_dir_uncached(leaf_cid)
+        self.load_leaf_dir_uncached(leaf_cid, key)
     }
 
-    fn load_leaf_dir_uncached(&self, leaf_cid: &ContentId) -> io::Result<Arc<DecodedLeafDirV3>> {
+    /// A local leaf's directory is decoded from its bytes without entering
+    /// them into the cache: a directory walk touches many leaves it never
+    /// scans, and only the header and directory pages of each are read. A
+    /// remote leaf's directory comes from a prefix range read, so the walk
+    /// never downloads column payloads.
+    fn load_leaf_dir_uncached(
+        &self,
+        leaf_cid: &ContentId,
+        leaf_id: u128,
+    ) -> io::Result<Arc<DecodedLeafDirV3>> {
         // A prior full open may already have memoized this remote leaf's
         // directory — reuse it rather than re-fetching.
         if let Some(dir) = self.remote_leaf_metadata.read().get(leaf_cid) {
@@ -1346,6 +1252,19 @@ impl BinaryIndexStore {
             .cas
             .as_ref()
             .ok_or_else(|| io::Error::other("no content store"))?;
+        let local = match self
+            .leaflet_cache
+            .as_ref()
+            .and_then(|cache| cache.get_leaf_bytes(leaf_id))
+        {
+            Some(bytes) => Some(bytes),
+            None => cs.get_local(leaf_cid).map_err(storage_io_error)?,
+        };
+        if let Some(bytes) = local {
+            let header = crate::format::leaf::decode_leaf_header_v3(&bytes)?;
+            return crate::format::leaf::decode_leaf_dir_v3_with_base(&bytes, &header)
+                .map(Arc::new);
+        }
         let fetcher = ContentStoreRangeFetcher::new(Arc::clone(cs), self.cache_dir.clone());
         let (dir, _payload_base) =
             super::leaf_access::fetch_header_and_directory(&fetcher, leaf_cid)?;
@@ -1360,7 +1279,7 @@ impl BinaryIndexStore {
     pub fn fetch_sidecar_bytes_sync(
         &self,
         sidecar_cid: Option<&ContentId>,
-    ) -> io::Result<Option<Vec<u8>>> {
+    ) -> io::Result<Option<ContentBytes>> {
         let sc_cid = match sidecar_cid {
             Some(cid) => cid,
             None => return Ok(None),
@@ -1369,10 +1288,9 @@ impl BinaryIndexStore {
         if self.residency_mode() {
             return self
                 .resident_leaf_bytes(sc_cid, super::need_fetch::FetchKind::HistorySidecar)
-                .map(|bytes| Some(bytes.to_vec()));
+                .map(Some);
         }
-        let bytes = self.get_leaf_bytes_sync(sc_cid)?;
-        Ok(Some(bytes))
+        self.get_leaf_bytes_sync(sc_cid).map(Some)
     }
 
     // ── Value decoding ─────────────────────────────────────────────
@@ -3396,24 +3314,16 @@ async fn build_dictionary_set(
 // Arena loading (reuses V5 infrastructure)
 // ============================================================================
 
-/// Where a vector shard's bytes come from: its local CAS file when one
-/// exists, else the disk cache — which counts as present only for a store the
-/// cache serves, so a stale shard left there by an earlier run is fetched
-/// afresh rather than served.
+/// Where a vector shard's bytes come from: the store's local tier, else the
+/// disk cache — which counts as present only for a store the cache serves,
+/// so a stale shard left there by an earlier run is fetched afresh rather
+/// than served.
 fn vector_shard_source(
     cs: &dyn ContentStore,
     shard_cid: &ContentId,
     cache_dir: &Path,
 ) -> crate::arena::vector::ShardSource {
     let cid_hash = LeafletCache::cid_cache_key(&shard_cid.to_bytes());
-    if let Some(local) = cs.resolve_local_path(shard_cid) {
-        return crate::arena::vector::ShardSource {
-            cid_hash,
-            cid: None,
-            path: local,
-            on_disk: std::sync::atomic::AtomicBool::new(true),
-        };
-    }
     let cache_path = cache_dir.join(format!("{shard_cid}.vas"));
     let on_disk = uses_disk_cache(cs) && cache_path.exists();
     crate::arena::vector::ShardSource {
@@ -3637,28 +3547,9 @@ impl ContentStoreRangeFetcher {
             Ok(Some(buf))
         }
 
-        // Try local path first — positional read.
-        if let Some(local_path) = self.cs.resolve_local_path(id) {
-            match read_range_from_file(&local_path, range.clone())? {
-                Some(buf) => return Ok(buf),
-                None => {
-                    tracing::debug!(
-                        path = %local_path.display(),
-                        id = %id,
-                        "local artifact path disappeared during range read; falling back to remote fetch"
-                    );
-                }
-            }
-        }
-
-        // Bytes the store holds in memory: slice them.
-        if let Some(bytes) = self.cs.resolve_cached_bytes(id) {
-            let start = (range.start as usize).min(bytes.len());
-            let end = (range.end as usize).min(bytes.len());
-            return Ok(bytes[start..end].to_vec());
-        }
-
-        // Check cache, for a store the cache serves.
+        // Only leaves the store does not serve locally reach this fetcher:
+        // local ones are opened whole, or have their directory decoded in
+        // place. A copy promoted into the disk cache is read positionally.
         if uses_disk_cache(self.cs.as_ref()) {
             let cache_path = self.cache_dir.join(id.to_string());
             if let Some(buf) = read_range_from_file(&cache_path, range.clone())? {
@@ -4297,7 +4188,7 @@ pub(crate) mod tests {
             "fixture must produce a multi-leaf tree, got {}",
             result.branch.leaves.len()
         );
-        let mut remote_cids = HashMap::new();
+        let mut cids = HashMap::new();
         for (artifact, branch_leaf) in result.leaves.iter().zip(result.branch.leaves.iter()) {
             let cid = run_sync_on_runtime({
                 let store = Arc::clone(&store);
@@ -4311,14 +4202,13 @@ pub(crate) mod tests {
                 }
             })
             .expect("seed reverse leaf");
-            remote_cids.insert(branch_leaf.address.clone(), cid);
+            cids.insert(branch_leaf.address.clone(), cid);
         }
         let tree = DictTreeReader::new(
             result.branch,
-            LeafSource::CasOnDemand {
+            LeafSource::Cas {
                 cs: Arc::clone(&cs),
-                local_files: HashMap::new(),
-                remote_cids,
+                cids,
             },
         );
 
@@ -4699,9 +4589,17 @@ pub(crate) mod tests {
             self.inner.get_range(id, range).await
         }
 
-        fn resolve_local_path(&self, id: &ContentId) -> Option<PathBuf> {
+        fn get_local(
+            &self,
+            id: &ContentId,
+        ) -> fluree_db_core::Result<Option<fluree_db_core::ContentBytes>> {
             self.local_path_calls.fetch_add(1, AtomicOrdering::Relaxed);
-            self.local.read().get(id).cloned()
+            let Some(path) = self.local.read().get(id).cloned() else {
+                return Ok(None);
+            };
+            // SAFETY: the test never rewrites a file it has stored.
+            unsafe { fluree_db_core::ContentBytes::open(&path) }
+                .map_err(|e| fluree_db_core::Error::io(e.to_string()))
         }
     }
 
@@ -4769,8 +4667,16 @@ pub(crate) mod tests {
             self.inner.get_range(id, range).await
         }
 
-        fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
-            self.resident.read().get(id).cloned()
+        fn get_local(
+            &self,
+            id: &ContentId,
+        ) -> fluree_db_core::Result<Option<fluree_db_core::ContentBytes>> {
+            Ok(self
+                .resident
+                .read()
+                .get(id)
+                .cloned()
+                .map(fluree_db_core::ContentBytes::Shared))
         }
     }
 
@@ -4811,9 +4717,9 @@ pub(crate) mod tests {
                 let shared = binary_store
                     .get_leaf_bytes_shared(&leaf_cid)
                     .expect("resident bytes");
-                let resident = store.resolve_cached_bytes(&leaf_cid).unwrap();
+                let resident = store.get_local(&leaf_cid).unwrap().unwrap();
                 assert!(
-                    matches!(shared, SharedLeafBytes::Shared(ref bytes) if Arc::ptr_eq(bytes, &resident)),
+                    shared.ptr_eq(&resident),
                     "whole-leaf bytes must be the store's own allocation"
                 );
                 assert_eq!(
@@ -4821,7 +4727,14 @@ pub(crate) mod tests {
                         .get_leaf_bytes_sync(&leaf_cid)
                         .expect("owned copy"),
                     leaf_bytes,
-                    "an owned copy is taken from the resident bytes"
+                    "the resident bytes are served"
+                );
+            }
+            if let Some(cache) = &binary_store.leaflet_cache {
+                let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
+                assert!(
+                    cache.get_leaf_bytes(leaf_id).is_none(),
+                    "bytes the store already shares must not be charged to the cache"
                 );
             }
         }
@@ -4898,6 +4811,16 @@ pub(crate) mod tests {
             store.cas_calls.load(AtomicOrdering::Relaxed),
             0,
             "cached local dir opens must not touch CAS either"
+        );
+        let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
+        assert!(
+            binary_store
+                .leaflet_cache
+                .as_ref()
+                .unwrap()
+                .get_leaf_bytes(leaf_id)
+                .is_none(),
+            "a directory walk must not charge the leaf's bytes to the cache"
         );
 
         let _ = std::fs::remove_dir_all(local_dir);

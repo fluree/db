@@ -126,6 +126,8 @@ pub mod residency;
 mod wal;
 
 pub use content_bytes::ContentBytes;
+#[cfg(not(target_arch = "wasm32"))]
+pub use content_bytes::DEFAULT_MMAP_MIN_BYTES;
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub use file::{FileStorage, STORAGE_METHOD_FILE};
 pub use memory::{MemoryContentStore, MemoryStorage, STORAGE_METHOD_MEMORY};
@@ -135,7 +137,6 @@ use crate::error::Result;
 use async_trait::async_trait;
 use sha2::Digest;
 use std::fmt::Debug;
-use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -222,29 +223,22 @@ pub trait StorageRead: Debug + Send + Sync {
     /// - Small, bounded prefixes
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>>;
 
-    /// Resolve a CAS address to a local filesystem path, if available.
+    /// The bytes at `address` when this machine already has them: a local
+    /// file, mapped (or read, when small), or bytes held in process memory.
     ///
-    /// Returns `Some(path)` for storage backends where data is already on
-    /// the local filesystem (e.g., `FileStorage`). Returns `None` for
-    /// remote or in-memory backends.
+    /// Synchronous: it never leaves the machine and never touches the
+    /// sync→async bridge, so sync readers call it on their hot path.
     ///
-    /// Callers read or map the path in place, and never copy it into the
-    /// disk cache. A storage whose reads transform the bytes at rest
-    /// (decryption) must return `None`.
-    fn resolve_local_path(&self, address: &str) -> Option<PathBuf> {
+    /// - `Ok(Some(bytes))`: served locally.
+    /// - `Ok(None)`: not here — absent, a zero-length file, or a remote
+    ///   storage. The caller fetches with [`Self::read_bytes`].
+    /// - `Err`: the local copy exists but cannot be read (permissions, I/O,
+    ///   decryption). Surfaced rather than masked by a fetch.
+    ///
+    /// The default answers `Ok(None)`.
+    fn get_local(&self, address: &str) -> Result<Option<ContentBytes>> {
         let _ = address;
-        None
-    }
-
-    /// Bytes this storage already holds in process memory for `address`,
-    /// shared rather than copied: the in-memory counterpart of
-    /// [`Self::resolve_local_path`]. Readers borrow them in place and never
-    /// copy them into the disk cache. No I/O and no blocking; a storage
-    /// whose reads transform the bytes at rest (decryption) must return
-    /// `None`, which is the default.
-    fn resolve_local_bytes(&self, address: &str) -> Option<Arc<[u8]>> {
-        let _ = address;
-        None
+        Ok(None)
     }
 
     /// Whether bytes read from this storage may be persisted unencrypted
@@ -277,14 +271,13 @@ pub trait StorageRead: Debug + Send + Sync {
     /// default would report an encrypted store as plaintext.
     fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>>;
 
-    /// Synchronous, non-blocking lookup of already-resident bytes for a CID.
+    /// Synchronous, non-blocking lookup of a residency tier's bytes for a CID.
     ///
-    /// Mirror of [`ContentStore::resolve_cached_bytes`] for address-keyed
-    /// backends: `StorageContentStore` forwards the CID straight through
-    /// (no address formatting on the lookup), so a `StorageRead` implementor
-    /// with a resident tier — e.g. a browser fetch-backed storage that
-    /// caches by CID — is consulted by the sync read path. Implementations
-    /// must not perform I/O or block; the default returns `None`.
+    /// For storages with a CID-keyed resident tier (the browser
+    /// fetch-backed storage): `StorageContentStore::get_local` consults it
+    /// before formatting an address for [`Self::get_local`].
+    /// Implementations must not perform I/O or block; the default returns
+    /// `None`.
     fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
         let _ = id;
         None
@@ -566,12 +559,8 @@ impl StorageRead for Arc<dyn Storage> {
         self.as_ref().list_prefix_with_metadata(prefix).await
     }
 
-    fn resolve_local_path(&self, address: &str) -> Option<PathBuf> {
-        self.as_ref().resolve_local_path(address)
-    }
-
-    fn resolve_local_bytes(&self, address: &str) -> Option<Arc<[u8]>> {
-        self.as_ref().resolve_local_bytes(address)
+    fn get_local(&self, address: &str) -> Result<Option<ContentBytes>> {
+        self.as_ref().get_local(address)
     }
 
     fn permits_plaintext_cache(&self) -> bool {
@@ -673,14 +662,17 @@ pub trait ContentStore: Debug + Send + Sync {
     /// is `SHA-256(full blob)`, matching `id.verify(bytes)`.
     async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> Result<()>;
 
-    /// Resolve a CID to a local filesystem path, if available.
+    /// The object's bytes when this machine already has them, without
+    /// fetching: see [`StorageRead::get_local`] for the contract.
     ///
-    /// Returns `Some(path)` for storage backends where data is already on
-    /// the local filesystem (e.g., `FileContentStore`). Returns `None` for
-    /// remote or in-memory backends.
-    fn resolve_local_path(&self, id: &ContentId) -> Option<std::path::PathBuf> {
+    /// Sync readers call this first and fall back to [`Self::get`] (over
+    /// the sync→async bridge) on `Ok(None)`. For a store with a residency
+    /// tier ([`Self::miss_register`] returns `Some`) it is that tier's
+    /// lookup, and must not perform I/O or block. The default answers
+    /// `Ok(None)`.
+    fn get_local(&self, id: &ContentId) -> Result<Option<ContentBytes>> {
         let _ = id;
-        None
+        Ok(None)
     }
 
     /// Whether bytes returned by [`Self::get`] may be persisted unencrypted
@@ -696,28 +688,11 @@ pub trait ContentStore: Debug + Send + Sync {
     /// [`crate::disk_cache::uses_disk_cache`] rather than reading this.
     fn is_remote(&self) -> bool;
 
-    /// Synchronous, non-blocking lookup of already-resident bytes for a CID.
-    ///
-    /// This is the sync residency tier for targets without a sync→async
-    /// bridge (`wasm32`): the binary-index read path consults it instead of
-    /// filesystem probes or a bridged CAS fetch, and surfaces a typed
-    /// `NeedFetch` miss when it returns `None` so an async caller can fetch
-    /// and retry. Implementations must not perform I/O or block — a hit is
-    /// an O(1) map lookup returning a shared `Arc` clone (zero copy); on a
-    /// backend with no resident tier the default returns `None`.
-    ///
-    /// Content is immutable (CID-addressed), so implementations may pin and
-    /// serve entries indefinitely without invalidation.
-    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
-        let _ = id;
-        None
-    }
-
     /// The store's residency miss register, if it participates in the sync
     /// residency tier.
     ///
     /// Returning `Some` is the participation signal: the sync read path then
-    /// serves reads *exclusively* from [`Self::resolve_cached_bytes`] —
+    /// serves reads *exclusively* from [`Self::get_local`] —
     /// never the filesystem or a bridged fetch — and records every miss into
     /// this register for an async retry frame to drain (see
     /// [`residency::MissRegister`]). A participating store must uphold the
@@ -816,8 +791,8 @@ impl ContentStore for Arc<dyn ContentStore> {
         self.as_ref().put_with_id(id, bytes).await
     }
 
-    fn resolve_local_path(&self, id: &ContentId) -> Option<std::path::PathBuf> {
-        self.as_ref().resolve_local_path(id)
+    fn get_local(&self, id: &ContentId) -> Result<Option<ContentBytes>> {
+        self.as_ref().get_local(id)
     }
 
     fn permits_plaintext_cache(&self) -> bool {
@@ -826,10 +801,6 @@ impl ContentStore for Arc<dyn ContentStore> {
 
     fn is_remote(&self) -> bool {
         self.as_ref().is_remote()
-    }
-
-    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
-        self.as_ref().resolve_cached_bytes(id)
     }
 
     fn miss_register(&self) -> Option<&residency::MissRegister> {
@@ -1104,26 +1075,30 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         failures
     }
 
-    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
-        // CID-keyed straight through — no address formatting on the lookup.
-        // A resident tier indexes by CID regardless of which (current or
-        // legacy) address the bytes were fetched from.
+    fn get_local(&self, id: &ContentId) -> Result<Option<ContentBytes>> {
+        // A residency tier indexes by CID regardless of which (current or
+        // legacy) address the bytes were fetched from, so it is asked first
+        // and without formatting an address.
         if let Some(bytes) = self.storage.resolve_cached_bytes(id) {
-            return Some(bytes);
+            return Ok(Some(ContentBytes::Shared(bytes)));
         }
-        // A storage holding its bytes in memory is keyed by address: the same
-        // current-then-legacy order as `resolve_local_path`.
-        let address = self.cid_to_address(id).ok()?;
-        if let Some(bytes) = self.storage.resolve_local_bytes(&address) {
-            return Some(bytes);
+        let Ok(address) = self.cid_to_address(id) else {
+            return Ok(None);
+        };
+        if let Some(bytes) = self.storage.get_local(&address)? {
+            return Ok(Some(bytes));
         }
+        // The same legacy fallbacks as `get`: dicts moved from per-branch to
+        // the @shared namespace, and index roots were stored with `.json`.
         if let Some(legacy) = self.legacy_dict_address(id) {
-            if let Some(bytes) = self.storage.resolve_local_bytes(&legacy) {
-                return Some(bytes);
+            if let Some(bytes) = self.storage.get_local(&legacy)? {
+                return Ok(Some(bytes));
             }
         }
-        let legacy = self.legacy_index_root_address(id)?;
-        self.storage.resolve_local_bytes(&legacy)
+        match self.legacy_index_root_address(id) {
+            Some(legacy) => self.storage.get_local(&legacy),
+            None => Ok(None),
+        }
     }
 
     fn permits_plaintext_cache(&self) -> bool {
@@ -1140,22 +1115,6 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
 
     fn query_guard(&self) -> Option<residency::InFlightGuard> {
         self.storage.query_guard()
-    }
-
-    fn resolve_local_path(&self, id: &ContentId) -> Option<std::path::PathBuf> {
-        let address = self.cid_to_address(id).ok()?;
-        if let Some(path) = self.storage.resolve_local_path(&address) {
-            return Some(path);
-        }
-        // Fallback: dicts moved from per-branch to @shared namespace
-        if let Some(legacy) = self.legacy_dict_address(id) {
-            if let Some(path) = self.storage.resolve_local_path(&legacy) {
-                return Some(path);
-            }
-        }
-        // Fallback: index roots stored with .json before .fir6 rename
-        let legacy = self.legacy_index_root_address(id)?;
-        self.storage.resolve_local_path(&legacy)
     }
 
     async fn get_range(&self, id: &ContentId, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
@@ -1463,16 +1422,16 @@ impl ContentStore for BranchedContentStore {
         self.branch_store.release_many(ids).await
     }
 
-    fn resolve_local_path(&self, id: &ContentId) -> Option<std::path::PathBuf> {
-        self.branch_store
-            .resolve_local_path(id)
-            .or_else(|| self.parents.iter().find_map(|p| p.resolve_local_path(id)))
-    }
-
-    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
-        self.branch_store
-            .resolve_cached_bytes(id)
-            .or_else(|| self.parents.iter().find_map(|p| p.resolve_cached_bytes(id)))
+    fn get_local(&self, id: &ContentId) -> Result<Option<ContentBytes>> {
+        if let Some(bytes) = self.branch_store.get_local(id)? {
+            return Ok(Some(bytes));
+        }
+        for parent in &self.parents {
+            if let Some(bytes) = parent.get_local(id)? {
+                return Ok(Some(bytes));
+            }
+        }
+        Ok(None)
     }
 
     /// A read may be served by any ancestor, so every store in the
@@ -1933,15 +1892,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cache_dir);
     }
 
-    /// `candidate_addresses` exists so that callers deciding a blob is
-    /// unreferenced see every address `ContentStore::get` would resolve it to.
-    /// A dict blob left at the pre-`@shared` address is readable, so it must
-    /// also be listed — otherwise a sweep deletes a live blob.
     /// Memory storage is keyed by address while readers ask by CID: the
-    /// bridge resolves resident bytes at every address the blob could sit
-    /// at, as it does for local paths, without copying them.
+    /// bridge serves local bytes at every address the blob could sit at,
+    /// without copying them.
     #[tokio::test]
-    async fn resolve_cached_bytes_borrows_memory_storage_bytes_at_any_candidate_address() {
+    async fn get_local_borrows_memory_storage_bytes_at_any_candidate_address() {
         let storage = MemoryStorage::new();
         let store = content_store_for(storage.clone(), LEDGER);
 
@@ -1949,12 +1904,13 @@ mod tests {
             .put(ContentKind::IndexLeaf, b"leaf bytes")
             .await
             .unwrap();
-        let resident = store
-            .resolve_cached_bytes(&leaf)
-            .expect("resident at the current address");
-        assert_eq!(&resident[..], b"leaf bytes");
+        let local = store
+            .get_local(&leaf)
+            .unwrap()
+            .expect("local at the current address");
+        assert_eq!(local, b"leaf bytes");
         assert!(
-            Arc::ptr_eq(&resident, &store.resolve_cached_bytes(&leaf).unwrap()),
+            local.ptr_eq(&store.get_local(&leaf).unwrap().unwrap()),
             "the bytes are shared, not copied"
         );
 
@@ -1967,22 +1923,28 @@ mod tests {
         let legacy = legacy_dict_address(storage.storage_method(), LEDGER, &dict).unwrap();
         storage.write_bytes(&legacy, b"dict bytes").await.unwrap();
         assert_eq!(
-            &store
-                .resolve_cached_bytes(&dict)
-                .expect("resident at the legacy address")[..],
+            store
+                .get_local(&dict)
+                .unwrap()
+                .expect("local at the legacy address"),
             b"dict bytes"
         );
 
         let absent = ContentId::new(ContentKind::IndexLeaf, b"absent");
-        assert!(store.resolve_cached_bytes(&absent).is_none());
+        assert!(store.get_local(&absent).unwrap().is_none());
         assert!(
             content_store_for(storage.simulating_remote(), LEDGER)
-                .resolve_cached_bytes(&leaf)
+                .get_local(&leaf)
+                .unwrap()
                 .is_none(),
-            "a remote view holds nothing resident"
+            "a remote view holds nothing locally"
         );
     }
 
+    /// `candidate_addresses` exists so that callers deciding a blob is
+    /// unreferenced see every address `ContentStore::get` would resolve it to.
+    /// A dict blob left at the pre-`@shared` address is readable, so it must
+    /// also be listed — otherwise a sweep deletes a live blob.
     #[tokio::test]
     async fn candidate_addresses_cover_the_legacy_dict_fallback() {
         let storage = MemoryStorage::new();

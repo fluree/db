@@ -336,12 +336,12 @@ impl BinaryCursor {
             .saturating_add(PREFETCH_WINDOW)
             .min(self.leaf_range.end);
         for entry in &self.branch.leaves[from_leaf_idx..window_end] {
-            if cs.resolve_cached_bytes(&entry.leaf_cid).is_none() {
+            if !super::need_fetch::is_resident(cs.as_ref(), &entry.leaf_cid) {
                 register.record(&entry.leaf_cid, FetchKind::IndexLeaf);
             }
             if self.need_replay() {
                 if let Some(sc_cid) = &entry.sidecar_cid {
-                    if cs.resolve_cached_bytes(sc_cid).is_none() {
+                    if !super::need_fetch::is_resident(cs.as_ref(), sc_cid) {
                         register.record(sc_cid, FetchKind::HistorySidecar);
                     }
                 }

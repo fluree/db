@@ -4118,7 +4118,7 @@ impl Default for CompactionSpans {
 ///
 /// Compaction rewrites and re-uploads dictionary data during an index build, so
 /// a deployment needs a way to stop it without a rollback — the same reason
-/// `FLUREE_DICT_PACK_MMAP_MIN_BYTES` exists. Off means packs are appended and
+/// `FLUREE_MMAP_MIN_BYTES` exists. Off means packs are appended and
 /// never merged, which is the pre-compaction behaviour exactly.
 ///
 /// Defaults to on; only `0`, `false`, `off`, or `no` disable it. Read once per
@@ -4211,18 +4211,16 @@ async fn pack_encoded_sizes(
 
     let mut sizes = Vec::with_capacity(cids.len());
 
-    // Serve memo hits and local metadata without spending budget, and collect
+    // Serve memo hits and local packs without spending budget, and collect
     // whatever still needs a remote probe.
     let mut pending: Vec<(usize, &ContentId)> = Vec::new();
     for (i, cid) in cids.iter().enumerate() {
         if let Some(&size) = cache.get(cid) {
             sizes.push(Some(size));
-        } else if let Some(meta) = content_store
-            .resolve_local_path(cid)
-            .and_then(|path| std::fs::metadata(path).ok())
-        {
-            cache.insert(cid.clone(), meta.len());
-            sizes.push(Some(meta.len()));
+        } else if let Ok(Some(bytes)) = content_store.get_local(cid) {
+            let size = bytes.len() as u64;
+            cache.insert(cid.clone(), size);
+            sizes.push(Some(size));
         } else {
             sizes.push(None);
             pending.push((i, cid));

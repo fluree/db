@@ -67,8 +67,8 @@ pub fn charge_extra_leaflets(tracker: &Tracker, re_encoded_leaflet_count: u32) -
 /// A [`ContentStore`] wrapper that charges fuel for every successful CAS
 /// write the indexer makes through it.
 ///
-/// Delegates all read paths (`has`, `get`, `get_range`, `release`,
-/// `resolve_local_path`) and the `put` / `put_with_id` writes to the inner
+/// Delegates all read paths (`has`, `get`, `get_local`, `get_range`,
+/// `release`) and the `put` / `put_with_id` writes to the inner
 /// store. After each successful write the wrapper charges
 /// [`INDEX_CAS_WRITE_MICRO_FUEL`] against the tracker — once per CAS call,
 /// regardless of `ContentKind`.
@@ -145,12 +145,8 @@ impl ContentStore for MeteredContentStore {
         Ok(())
     }
 
-    fn resolve_local_path(&self, id: &ContentId) -> Option<std::path::PathBuf> {
-        self.inner.resolve_local_path(id)
-    }
-
-    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
-        self.inner.resolve_cached_bytes(id)
+    fn get_local(&self, id: &ContentId) -> StorageResult<Option<fluree_db_core::ContentBytes>> {
+        self.inner.get_local(id)
     }
 
     fn permits_plaintext_cache(&self) -> bool {

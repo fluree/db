@@ -895,6 +895,17 @@ where
         self.commit.supports_ranged_reads() && self.index.supports_ranged_reads()
     }
 
+    fn get_local(
+        &self,
+        address: &str,
+    ) -> std::result::Result<Option<fluree_db_core::ContentBytes>, fluree_db_core::Error> {
+        if Self::route_to_commit(address) {
+            self.commit.get_local(address)
+        } else {
+            self.index.get_local(address)
+        }
+    }
+
     fn permits_plaintext_cache(&self) -> bool {
         self.commit.permits_plaintext_cache() && self.index.permits_plaintext_cache()
     }
@@ -1138,12 +1149,11 @@ impl StorageRead for AddressIdentifierResolverStorage {
         self.default.list_prefix(prefix).await
     }
 
-    fn resolve_local_path(&self, address: &str) -> Option<std::path::PathBuf> {
-        self.route(address).resolve_local_path(address)
-    }
-
-    fn resolve_local_bytes(&self, address: &str) -> Option<Arc<[u8]>> {
-        self.route(address).resolve_local_bytes(address)
+    fn get_local(
+        &self,
+        address: &str,
+    ) -> std::result::Result<Option<fluree_db_core::ContentBytes>, fluree_db_core::Error> {
+        self.route(address).get_local(address)
     }
 
     fn permits_plaintext_cache(&self) -> bool {
@@ -5422,6 +5432,26 @@ pub fn fluree_memory() -> Fluree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Local reads route like every other read: commit blobs to the commit
+    /// tier, everything else to the index tier.
+    #[tokio::test]
+    async fn tiered_storage_serves_local_bytes_from_the_owning_tier() {
+        let commit = MemoryStorage::new();
+        let index = MemoryStorage::new();
+        let commit_addr = "fluree:memory://l/main/commit/abc.fcv2";
+        let index_addr = "fluree:memory://l/main/index/objects/leaves/def.fli";
+        commit.insert(commit_addr, b"commit".to_vec());
+        index.insert(index_addr, b"leaf".to_vec());
+        let tiered = TieredStorage::new(commit.clone(), index.clone());
+
+        assert_eq!(tiered.get_local(commit_addr).unwrap().unwrap(), b"commit");
+        assert_eq!(tiered.get_local(index_addr).unwrap().unwrap(), b"leaf");
+        // Each address only in the other tier: not found where it routes.
+        commit.insert(index_addr, b"misplaced".to_vec());
+        index.remove(index_addr);
+        assert!(tiered.get_local(index_addr).unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn test_fluree_builder_memory() {
