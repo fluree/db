@@ -532,7 +532,7 @@ pub fn cypher_to_jsonld(text: &str, opts: &CypherImportOptions) -> Result<Vec<Va
 /// [`for_each_statement`]). A single statement — with or without a trailing
 /// `;` — yields a one-element vec. Used by `Fluree::transact_cypher_returning`
 /// to accept `;`-separated scripts.
-pub(crate) fn split_statements(script: &str) -> Vec<String> {
+pub fn split_statements(script: &str) -> Vec<String> {
     let mut out = Vec::new();
     // Reading from an in-memory slice cannot fail, and the callback is
     // infallible.

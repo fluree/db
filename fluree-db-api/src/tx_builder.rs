@@ -156,7 +156,7 @@ pub(crate) fn parse_and_lower_sparql_update(
 /// `commit_with_handle` would consume the already-built `stage_result`.
 /// The consensus layer's retry, which preserves the request body across
 /// attempts, handles that case instead.
-fn is_retryable_commit_conflict(e: &ApiError) -> bool {
+pub(crate) fn is_retryable_commit_conflict(e: &ApiError) -> bool {
     matches!(
         e,
         ApiError::Transact(
@@ -1177,7 +1177,7 @@ fn remap_sid(sid: &mut Sid, remap: &HashMap<u16, u16>) {
     }
 }
 
-enum OpPlan<'a> {
+pub(crate) enum OpPlan<'a> {
     InsertTurtle(&'a str),
     /// A SPARQL UPDATE request, parsed and lowered against whichever state
     /// it is staged on — lowering allocates namespace codes relative to
@@ -1196,7 +1196,7 @@ enum OpPlan<'a> {
 impl<'a> OpPlan<'a> {
     /// Pre-parse a [`TransactOperation`] into an [`OpPlan`], extracting TriG
     /// metadata and named graphs for Turtle inputs.
-    fn from_op(op: TransactOperation<'a>) -> Result<Self> {
+    pub(crate) fn from_op(op: TransactOperation<'a>) -> Result<Self> {
         match op {
             TransactOperation::InsertTurtle(turtle) => Ok(OpPlan::InsertTurtle(turtle)),
             TransactOperation::Graph(op) => Ok(OpPlan::Graph(op)),
@@ -1531,7 +1531,8 @@ impl Fluree {
 
     /// Stage a pre-parsed [`OpPlan`] against a given [`LedgerState`] — one
     /// iteration of the optimistic-path retry loop.
-    async fn stage_plan(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stage_plan(
         &self,
         op_plan: &OpPlan<'_>,
         ledger_state: LedgerState,
@@ -1539,6 +1540,7 @@ impl Fluree {
         commit_opts_base: &CommitOpts,
         tracker_ref: Option<&Tracker>,
         index_config: &IndexConfig,
+        policy: Option<&PolicyContext>,
     ) -> Result<(StageResult, TxnType, CommitOpts)> {
         let ledger_id = ledger_state.ledger_id().to_string();
         let store_raw_txn = txn_opts.store_raw_txn.unwrap_or(false);
@@ -1556,7 +1558,7 @@ impl Fluree {
                         ledger_state,
                         txns,
                         Some(index_config),
-                        None,
+                        policy,
                         tracker_ref,
                     )
                     .await?;
@@ -1576,7 +1578,7 @@ impl Fluree {
                         txn_opts,
                         Some(index_config),
                         tracker_ref,
-                        None,
+                        policy,
                     )
                     .await?;
                 Ok((stage_result, TxnType::Insert, commit_opts))
@@ -1603,7 +1605,7 @@ impl Fluree {
                         trig_meta.as_ref(),
                         named_graphs,
                         tracker_ref,
-                        None,
+                        policy,
                     )
                     .await?;
                 Ok((stage_result, *txn_type, commit_opts))
@@ -1622,7 +1624,7 @@ impl Fluree {
                         txn_opts,
                         Some(index_config),
                         tracker_ref,
-                        None,
+                        policy,
                     )
                     .await?;
                 Ok((stage_result, op.txn_type(), commit_opts))
@@ -1676,7 +1678,7 @@ impl Fluree {
     /// Short-circuits a no-op stage ([`StageResult::is_noop`]) without
     /// touching the cache or triggering indexing.
     #[allow(clippy::too_many_arguments)]
-    async fn commit_and_finalize(
+    pub(crate) async fn commit_and_finalize(
         &self,
         write_guard: LedgerWriteGuard,
         stage_result: StageResult,
@@ -1885,7 +1887,7 @@ impl Fluree {
     /// On a pass the flakes are restamped to the new `t` and layered over a
     /// clone of the locked state; on a fail the stage is dropped and `None`
     /// says to stage again under the lock.
-    fn rebase_stage(
+    pub(crate) fn rebase_stage(
         guard: &LedgerWriteGuard,
         stage: StageResult,
         base_t: i64,
@@ -2358,6 +2360,7 @@ impl Fluree {
                         &commit_opts_base,
                         tracker_ref,
                         &index_config,
+                        None,
                     )
                     .await?;
                 let stage_us = stage_started.elapsed().as_micros() as u64;
@@ -2397,6 +2400,7 @@ impl Fluree {
                             &commit_opts_base,
                             tracker_ref,
                             &index_config,
+                            None,
                         )
                         .await?;
                     (write_guard, stage_result, txn_type, commit_opts)
@@ -2411,6 +2415,7 @@ impl Fluree {
                         &commit_opts_base,
                         tracker_ref,
                         &index_config,
+                        None,
                     )
                     .await?;
                 (write_guard, stage_result, txn_type, commit_opts)
