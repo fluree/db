@@ -178,7 +178,7 @@ Each row is `[age, expanded_person, expanded_org]`. When every column is an IRI-
 }
 ```
 
-In a query that does not group, a scalar select expression desugars to a `bind` in the WHERE pattern list. In a query that groups (a `groupBy`, or an aggregate anywhere in `select`, `having` or `orderBy`), where it runs depends on what it reads — the same rule SPARQL uses:
+In a query that does not group, a scalar select expression desugars to a `bind` in the WHERE pattern list. In a query that groups (a `groupBy`, or an aggregate anywhere in `select` or `having`), where it runs depends on what it reads — the same rule SPARQL uses:
 
 - An expression over `groupBy` keys, aggregate outputs and earlier such aliases — or a constant — runs **once per group**, after aggregation (before `having` when `having` reads its alias, after it otherwise): its alias is a single value per group. `(as (+ ?count 1) ?adjusted)` and `(as (strlen ?category) ?len)` under `"groupBy": ["?category"]` both give one value per row.
 - An expression over a variable that is neither a `groupBy` key nor an aggregate runs **before grouping**, once per solution, so its alias is a per-group list like any other ungrouped variable (see [groupBy](#groupby)).
@@ -1325,6 +1325,16 @@ Sort results:
 ```json
 {
   "orderBy": ["?last", ["desc", "?age"]]
+}
+```
+
+Sort keys are variables. To sort on an expression or an aggregate, select it under an alias and sort on the alias:
+
+```json
+{
+  "select": ["?category", "(as (count ?product) ?n)"],
+  "groupBy": ["?category"],
+  "orderBy": [["desc", "?n"]]
 }
 ```
 
