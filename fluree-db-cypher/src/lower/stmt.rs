@@ -513,22 +513,25 @@ fn reads_after_aggregation(
 /// property accessor the body already joins (the clause-local dedup
 /// `resolve_property_accessor` does within one list).
 fn extend_aux(patterns: &mut Vec<Pattern>, aux: impl IntoIterator<Item = Pattern>) {
-    fn accessor(p: &Pattern) -> Option<(VarId, VarId)> {
-        match p {
-            Pattern::Optional(inner) => match inner.as_slice() {
-                [Pattern::Triple(tp)] => Some((tp.s.as_var()?, tp.o.as_var()?)),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
     for p in aux {
-        if let Some(key) = accessor(&p) {
-            if patterns.iter().any(|q| accessor(q) == Some(key)) {
+        if let Some(key) = property_accessor(&p) {
+            if patterns.iter().any(|q| property_accessor(q) == Some(key)) {
                 continue;
             }
         }
         patterns.push(p);
+    }
+}
+
+/// The node and value variables of a property accessor
+/// (`resolve_property_accessor`): `OPTIONAL { ?node <p> ?value }`.
+fn property_accessor(p: &Pattern) -> Option<(VarId, VarId)> {
+    match p {
+        Pattern::Optional(inner) => match inner.as_slice() {
+            [Pattern::Triple(tp)] => Some((tp.s.as_var()?, tp.o.as_var()?)),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -1294,6 +1297,13 @@ fn lower_with<E: IriEncoder>(
     // reference to an aggregate output variable (e.g. `WHERE c > 0`
     // after `count(*) AS c`) silently match zero rows.
     //
+    // - With SKIP or LIMIT, the WHERE filters the clause's sliced rows, as
+    //   openCypher's WITH applies it to its results: `WITH x ORDER BY x
+    //   LIMIT 5 WHERE x > 3` keeps at most two rows. The clause is lowered
+    //   without it, and `filter_after_slice` adds the stage that filters.
+    //   Without a slice, filtering before or after the sort gives the same
+    //   rows, so the WHERE stays in the clause as above.
+    //
     // The WHERE's auxiliary patterns (property accessors) and the ORDER BY's
     // (accessors, and binds for expression keys) are lowered into `post` and
     // placed below: in the body, or, when they read a property of an output
@@ -1302,6 +1312,14 @@ fn lower_with<E: IriEncoder>(
     let lowered_where = match &w.where_clause {
         Some(where_expr) => Some(lower_expr(ctx, where_expr, &mut post)?),
         None => None,
+    };
+    let limit = const_usize(&w.limit)?;
+    let offset = const_usize(&w.skip)?;
+    let (lowered_where, after_slice) = match lowered_where {
+        Some(filter) if limit.is_some() || offset.is_some() => {
+            (None, Some((filter, std::mem::take(&mut post))))
+        }
+        unsliced => (unsliced, None),
     };
     let where_aux = post.len();
 
@@ -1316,6 +1334,9 @@ fn lower_with<E: IriEncoder>(
     let order_by = align_order_by_with_projection(&w.items, &w.order_by);
     reject_order_by_on_list(ctx, &order_by, &list_outputs)?;
     let ordering = lower_order_by(ctx, &order_by, &mut post)?;
+    // After an aggregating or DISTINCT WITH, a WHERE sees only what the
+    // clause projects; after a plain one it also sees the variables before it.
+    let scoped = has_aggregates || w.distinct;
 
     if has_aggregates
         && !projection.saw_star
@@ -1346,16 +1367,19 @@ fn lower_with<E: IriEncoder>(
         if !ordering.is_empty() {
             sq = sq.with_ordering(ordering);
         }
-        if let Some(limit) = const_usize(&w.limit)? {
+        if let Some(limit) = limit {
             sq = sq.with_limit(limit);
         }
-        if let Some(offset) = const_usize(&w.skip)? {
+        if let Some(offset) = offset {
             sq = sq.with_offset(offset);
         }
         if w.distinct {
             sq = sq.with_distinct();
         }
-        return Ok(sq);
+        return match after_slice {
+            Some(after) => filter_after_slice(ctx, sq, &[], after, scoped),
+            None => Ok(sq),
+        };
     }
 
     // One level. With aggregates the WHERE is HAVING; without, a Filter over
@@ -1394,20 +1418,27 @@ fn lower_with<E: IriEncoder>(
     // `relationships(p)` coalesces back to the path value, which answers
     // `size()`, `type()` and the endpoints correctly and reads `null` for the
     // per-hop properties it cannot carry (see `lower/expr.rs`).
-    let augmented_select = if has_aggregates {
+    let mut augmented_select = if has_aggregates {
         augmented_select
     } else {
         augment_select_with_path_rel_lists(ctx, augmented_select)
     };
+    // A plain WITH's sliced rows keep the variables before it that the WHERE
+    // after the slice reads; the stage drops them again.
+    let carried = match &after_slice {
+        Some(after) if !scoped => carried_into_where(after, &inner_patterns, &augmented_select),
+        _ => Vec::new(),
+    };
+    augmented_select.extend(&carried);
     let mut sq = SubqueryPattern::new(augmented_select, inner_patterns);
 
     if !ordering.is_empty() {
         sq = sq.with_ordering(ordering);
     }
-    if let Some(limit) = const_usize(&w.limit)? {
+    if let Some(limit) = limit {
         sq = sq.with_limit(limit);
     }
-    if let Some(offset) = const_usize(&w.skip)? {
+    if let Some(offset) = offset {
         sq = sq.with_offset(offset);
     }
     if w.distinct {
@@ -1415,6 +1446,113 @@ fn lower_with<E: IriEncoder>(
     }
     if let Some(g) = grouping {
         sq = sq.with_grouping(g);
+    }
+    match after_slice {
+        Some(after) => filter_after_slice(ctx, sq, &carried, after, scoped),
+        None => Ok(sq),
+    }
+}
+
+/// A sliced `WITH`'s `WHERE`, lowered for the stage after the slice: the
+/// filter, and the property accessors it reads.
+type AfterSlice = (fluree_db_query::ir::Expression, Vec<Pattern>);
+
+/// What a pattern a `WHERE` lowered reads from the row: a property accessor,
+/// its node; anything else, what it references and does not bind.
+fn aux_reads(p: &Pattern) -> Vec<VarId> {
+    match property_accessor(p) {
+        Some((node, _)) => vec![node],
+        None => {
+            let produced = p.produced_vars();
+            p.referenced_vars()
+                .into_iter()
+                .filter(|v| !produced.contains(v))
+                .collect()
+        }
+    }
+}
+
+/// The variables a plain `WITH`'s sliced rows carry for the `WHERE` after the
+/// slice: what it reads (an `exists { … }` body included, so the body still
+/// correlates with them) that the clause's body binds and `select` does not
+/// already hold. openCypher's `WHERE` after a plain `WITH` sees the variables
+/// before it; in one level it saw them because the filter ran in the body.
+fn carried_into_where(
+    (filter, post): &AfterSlice,
+    body: &[Pattern],
+    select: &[VarId],
+) -> Vec<VarId> {
+    let bound = fluree_db_query::ir::pattern::produced_vars_of(body);
+    let reads = filter
+        .referenced_vars()
+        .into_iter()
+        .chain(post.iter().flat_map(aux_reads));
+    let mut carried = Vec::new();
+    for var in reads {
+        if bound.contains(&var) && !select.contains(&var) && !carried.contains(&var) {
+            carried.push(var);
+        }
+    }
+    carried
+}
+
+/// The stage after a sliced `WITH` (`inner`, lowered without its `WHERE`):
+/// the `WHERE`'s property accessors, then its filter, over the sliced rows.
+/// The rows keep the clause's order, as rows do across any `WITH`. The stage
+/// repeats `DISTINCT`, because an accessor over a property with several
+/// values can repeat a row, and projects what `inner` does, less the
+/// `carried` variables.
+///
+/// An accessor whose value `inner` already carries (a sort key, or a carried
+/// variable) is not joined again. When `scoped` (an aggregating or `DISTINCT`
+/// clause), a read of anything `inner` does not project is an error, as one
+/// level reports a HAVING read of an ungrouped variable, rather than a free
+/// variable that matches every node.
+fn filter_after_slice<E: IriEncoder>(
+    ctx: &LoweringContext<'_, E>,
+    inner: SubqueryPattern,
+    carried: &[VarId],
+    (filter, post): AfterSlice,
+    scoped: bool,
+) -> Result<SubqueryPattern> {
+    let mut visible: std::collections::HashSet<VarId> = inner.select.iter().copied().collect();
+    // The first read a scoped clause does not see; a plain one reads as its
+    // body did.
+    let unseen = |visible: &std::collections::HashSet<VarId>, reads: Vec<VarId>| {
+        reads.into_iter().find(|v| scoped && !visible.contains(v))
+    };
+    let out_of_scope = |var: VarId| {
+        LowerError::generic(format!(
+            "WITH … WHERE reads `{}`, which is out of scope: after an aggregating or \
+             DISTINCT WITH, its WHERE sees only the variables the WITH projects",
+            ctx.vars.try_name(var).unwrap_or("?")
+        ))
+    };
+    let select: Vec<VarId> = inner
+        .select
+        .iter()
+        .copied()
+        .filter(|v| !carried.contains(v))
+        .collect();
+    let distinct = inner.distinct;
+    let mut stage = vec![Pattern::Subquery(inner)];
+    for p in post {
+        if property_accessor(&p).is_some_and(|(_, value)| visible.contains(&value)) {
+            continue;
+        }
+        if let Some(var) = unseen(&visible, aux_reads(&p)) {
+            return Err(out_of_scope(var));
+        }
+        visible.extend(p.produced_vars());
+        stage.push(p);
+    }
+    if let Some(var) = unseen(&visible, filter.row_reads()) {
+        return Err(out_of_scope(var));
+    }
+    stage.push(Pattern::Filter(filter));
+    let mut sq = SubqueryPattern::new(select, stage);
+    if distinct {
+        sq = sq.with_distinct();
     }
     Ok(sq)
 }

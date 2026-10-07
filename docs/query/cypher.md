@@ -360,7 +360,13 @@ ORDER BY / SKIP / LIMIT
   (`RETURN n, count(*) AS c`) implicitly group by the non-aggregate
   projections.
 - `WITH ... [WHERE/ORDER BY/SKIP/LIMIT/DISTINCT]` and `WITH *` — subquery
-  boundary. WHERE that references aggregate aliases lowers to HAVING
+  boundary. A `WITH`'s `WHERE` filters the clause's results, so it applies
+  after its `ORDER BY`, `SKIP` and `LIMIT`: `WITH x ORDER BY x LIMIT 5 WHERE
+  x > 3` keeps at most two rows. After a plain `WITH`, the `WHERE` can also
+  read the variables from before the `WITH`. After an aggregating `WITH`, it
+  can read only what the clause projects, and so it can after a `DISTINCT` one
+  with `SKIP` or `LIMIT`; reading anything else is an error. WHERE that
+  references aggregate aliases lowers to HAVING
   rather than a pre-aggregation Filter; it sees the whole projection,
   composite aliases included (`WITH p, count(f) + 0 AS c WHERE c > 1`).
   After an aggregating `WITH` or `RETURN`, its `WHERE` and `ORDER BY` can

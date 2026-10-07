@@ -1582,6 +1582,176 @@ async fn cypher_output_node_properties_are_read_after_aggregation() {
     }
 }
 
+/// A `WITH`'s `WHERE` filters the clause's results: after its `ORDER BY`,
+/// `SKIP` and `LIMIT`, as openCypher's grammar places it (`WITH … [ORDER BY]
+/// [SKIP] [LIMIT] [WHERE]`). So `WITH x ORDER BY x LIMIT 5 WHERE x > 3` keeps
+/// 4 and 5, where filtering first would keep 4 to 8. Covered on each way a
+/// `WITH` lowers: plain, aggregating in one level, aggregating in two (a sort
+/// on a property of an output node), and `DISTINCT`. The filtered rows keep
+/// the clause's order. Without a slice the two orders agree.
+///
+/// After a plain `WITH` the `WHERE` also reads the variables before it (`p`
+/// below, and those of an `exists { … }`), which then leave scope. After an
+/// aggregating or `DISTINCT` one it reads only what the clause projects. A
+/// property with several values gives a row once per value that passes, as
+/// `MATCH … WHERE` does, and a `DISTINCT` clause's rows stay distinct.
+#[tokio::test]
+async fn cypher_with_where_filters_after_the_slice() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "grouped-projection/cypher-where-after-slice:main").await;
+    let db = cypher_db(&ledger);
+    let cypher = |query: &'static str| {
+        let (fluree, db) = (&fluree, &db);
+        async move {
+            fluree
+                .query_cypher(db, query)
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{query}"))
+                .to_jsonld_async(db.as_graph_db_ref())
+                .await
+                .expect("jsonld")
+        }
+    };
+    const KNOWS: &str = "MATCH (p:P)-[:knows]->(f) ";
+    for (query, expected) in [
+        // Plain.
+        (
+            "UNWIND range(1, 10) AS x WITH x ORDER BY x LIMIT 5 WHERE x > 3 RETURN x",
+            json!([[4], [5]]),
+        ),
+        (
+            "UNWIND range(1, 10) AS x WITH x ORDER BY x DESC SKIP 2 WHERE x % 2 = 0 RETURN x",
+            json!([[8], [6], [4], [2]]),
+        ),
+        (
+            "UNWIND range(1, 10) AS x WITH x ORDER BY x WHERE x > 7 RETURN x",
+            json!([[8], [9], [10]]),
+        ),
+        (
+            "MATCH (p:P) WITH p.age AS a ORDER BY a LIMIT 2 WHERE p.age > 30 RETURN a",
+            json!([[35]]),
+        ),
+        (
+            "MATCH (p:P)-[:knows]->(f) WITH f.age AS fa ORDER BY fa DESC, p.age DESC LIMIT 3 \
+             WHERE exists { (p)-[:likes]->(f) } RETURN fa",
+            json!([[35]]),
+        ),
+        (
+            "MATCH (p:P)-[:knows]->(f) WITH f.age AS fa ORDER BY fa DESC, p.age DESC LIMIT 2 \
+             WHERE exists { (p)-[:likes]->(f) } RETURN fa",
+            json!([]),
+        ),
+        // Aggregating, one level.
+        (
+            "MATCH (p:P)-[:knows]->(f) WITH p, count(f) AS c ORDER BY c DESC LIMIT 2 \
+             WHERE c < 3 RETURN p.age, c",
+            json!([[40, 2]]),
+        ),
+        (
+            "MATCH (p:P)-[:knows]->(f) WITH p, count(f) AS c ORDER BY c LIMIT 2 \
+             WHERE p.age > 30 RETURN p.age, c",
+            json!([[40, 2]]),
+        ),
+        // Aggregating, two levels.
+        (
+            "MATCH (p:P)-[:knows]->(f) WITH p, count(f) AS c ORDER BY p.age LIMIT 2 \
+             WHERE c > 1 RETURN p.age, c",
+            json!([[40, 2]]),
+        ),
+        (
+            "MATCH (p:P)-[:knows]->(f) WITH p, count(f) AS c ORDER BY p.age DESC LIMIT 2 \
+             WHERE p.age < 45 RETURN p.age, c",
+            json!([[40, 2]]),
+        ),
+        (
+            "MATCH (p:P)-[:knows]->(f) WITH p, count(f) AS c ORDER BY p.age DESC SKIP 1 \
+             WHERE c < 3 RETURN p.age, c",
+            json!([[40, 2], [25, 1]]),
+        ),
+        // DISTINCT.
+        (
+            "UNWIND [3, 1, 3, 2, 1, 4] AS x WITH DISTINCT x ORDER BY x LIMIT 3 WHERE x > 1 \
+             RETURN x",
+            json!([[2], [3]]),
+        ),
+        (
+            "MATCH (p:P)-[:knows]->(f) WITH DISTINCT f ORDER BY f.age DESC LIMIT 2 \
+             WHERE f.age < 40 RETURN f.age",
+            json!([[35]]),
+        ),
+    ] {
+        assert_eq!(cypher(query).await, expected, "{query}");
+    }
+
+    // `p` is out of scope after the WITH: the MATCH binds it afresh.
+    let rows = cypher(
+        "MATCH (p:P) WITH p.age AS a ORDER BY a LIMIT 2 WHERE p.age > 30 \
+         MATCH (p:P) RETURN a, p.age",
+    )
+    .await;
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([[35, 25], [35, 35], [35, 40], [35, 50]])),
+        "{rows}"
+    );
+
+    // A property with several values: Alice's ages (40 and 41) both pass, so
+    // the WHERE gives her row twice, as `MATCH … WHERE` does, and once after
+    // `DISTINCT`, whose rows the WHERE only removes.
+    let two_ages = seed_people_two_ages(
+        &fluree,
+        "grouped-projection/cypher-where-after-slice-2:main",
+    )
+    .await;
+    let two_ages = cypher_db(&two_ages);
+    for (query, expected) in [
+        (
+            "MATCH (p:P) WITH p ORDER BY p.name LIMIT 2 WHERE p.age > 30 RETURN p.name",
+            json!([["Alice"], ["Alice"]]),
+        ),
+        (
+            "MATCH (p:P) WITH DISTINCT p ORDER BY p.name LIMIT 2 WHERE p.age > 30 RETURN p.name",
+            json!([["Alice"]]),
+        ),
+    ] {
+        let rows = fluree
+            .query_cypher(&two_ages, query)
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{query}"))
+            .to_jsonld_async(two_ages.as_graph_db_ref())
+            .await
+            .expect("jsonld");
+        assert_eq!(rows, expected, "{query}");
+    }
+
+    // After an aggregating or DISTINCT WITH, a variable it does not project
+    // is out of scope in its WHERE.
+    for (rest, var) in [
+        (
+            "WITH p, count(f) AS c ORDER BY c LIMIT 2 WHERE f.age > 30 RETURN c",
+            "f",
+        ),
+        (
+            "WITH DISTINCT f.age AS a ORDER BY a LIMIT 2 WHERE p.age > 30 RETURN a",
+            "p",
+        ),
+        (
+            "WITH DISTINCT f ORDER BY f.age LIMIT 2 WHERE p = f RETURN f",
+            "p",
+        ),
+    ] {
+        let query = format!("{KNOWS}{rest}");
+        let Err(err) = fluree.query_cypher(&db, &query).await else {
+            panic!("a WHERE read of `{var}` must fail: {query}");
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("reads `{var}`, which is out of scope")),
+            "{query}: {message}"
+        );
+    }
+}
+
 /// Cypher parity. Cypher makes a non-aggregate RETURN expression a grouping
 /// key, so `RETURN CASE … AS seg, count(e)` groups by the label — SPARQL's
 /// `GROUP BY (IF(…) AS ?seg)`. Grouping by the area first and mapping it after
