@@ -74,9 +74,9 @@ use super::run::{run_jsonld_subquery, run_sparql_subquery, SubqueryOutput};
 use super::snapshot::resolve_envelope_snapshot;
 use crate::format::{FormatterConfig, OutputFormat};
 use crate::query::multi::{
-    merged_context, merged_opts, sparql_subquery_text, validate_envelope, MultiQueryBounds,
-    MultiQueryRequest, MultiQueryResponse, MultiQuerySubquery, MultiQueryValidationError,
-    SubqueryLanguage,
+    effective_jsonld_body, merged_context, merged_opts, sparql_subquery_text, validate_envelope,
+    MultiQueryBounds, MultiQueryRequest, MultiQueryResponse, MultiQuerySubquery,
+    MultiQueryValidationError, SubqueryLanguage,
 };
 use crate::{
     ApiError, Fluree, GovernanceOptions, QueryExecutionOptions, TrackingOptions, TrackingTally,
@@ -713,24 +713,9 @@ async fn execute_subquery(
     //                         SPARQL alias, its `# PRAGMA` options
     //   sub.opts            ← per-sub-query override
     //   envelope.opts       ← envelope defaults
-    let body_opts = match sub.language {
-        SubqueryLanguage::JsonLd => sub.query.as_object().and_then(|o| o.get("opts").cloned()),
-        SubqueryLanguage::Sparql => {
-            super::sparql_pragma_opts(sub.query.as_str().unwrap_or_default())
-                .map_err(ApiError::invalid_query)?
-        }
-    };
-    let envelope_with_sub = merged_opts(envelope_opts, sub.opts.as_ref());
-    let mut merged_opts_val = merged_opts(envelope_with_sub.as_ref(), body_opts.as_ref());
-    if matches!(sub.language, SubqueryLanguage::Sparql) {
-        super::hold_pragma_tracking(&mut merged_opts_val, envelope_with_sub.as_ref());
-    }
-    let tracking_opts = TrackingOptions::from_opts_value(merged_opts_val.as_ref());
-    let tracking_enabled = tracking_opts.track_time
-        || tracking_opts.track_fuel
-        || tracking_opts.track_policy
-        || tracking_opts.max_fuel.is_some();
-
+    //
+    // A JSON-LD body runs as `effective_jsonld_body` builds it, the body
+    // validation read its dataset from.
     match sub.language {
         SubqueryLanguage::JsonLd => {
             let inner_ctx = sub
@@ -740,7 +725,7 @@ async fn execute_subquery(
                 .cloned();
             let merged_ctx = merged_context(envelope_context, inner_ctx.as_ref());
 
-            let mut query_body = sub.query;
+            let mut query_body = effective_jsonld_body(envelope_opts, sub.opts.as_ref(), sub.query);
             if let Some(obj) = query_body.as_object_mut() {
                 if let Some(ctx) = merged_ctx {
                     obj.insert("@context".to_string(), ctx);
@@ -751,15 +736,21 @@ async fn execute_subquery(
                     obj.remove("@context");
                     obj.remove("context");
                 }
-                if let Some(opts) = merged_opts_val {
-                    obj.insert("opts".to_string(), opts);
-                }
             }
 
             run_jsonld_subquery(fluree, &query_body, envelope_format.cloned(), execution).await
         }
         SubqueryLanguage::Sparql => {
             let sparql = sub.query.as_str().unwrap_or_default();
+            let body_opts = super::sparql_pragma_opts(sparql).map_err(ApiError::invalid_query)?;
+            let envelope_with_sub = merged_opts(envelope_opts, sub.opts.as_ref());
+            let mut merged_opts_val = merged_opts(envelope_with_sub.as_ref(), body_opts.as_ref());
+            super::hold_pragma_tracking(&mut merged_opts_val, envelope_with_sub.as_ref());
+            let tracking_opts = TrackingOptions::from_opts_value(merged_opts_val.as_ref());
+            let tracking_enabled = tracking_opts.track_time
+                || tracking_opts.track_fuel
+                || tracking_opts.track_policy
+                || tracking_opts.max_fuel.is_some();
 
             // SPARQL has no inner JSON-LD context — directives come
             // from the envelope context only. Validation reads this
@@ -1019,17 +1010,16 @@ mod tests {
     // identity.
     // -------------------------------------------------------------------------
 
-    /// Reimplementation of `execute_subquery`'s merge step in isolation
-    /// so we can assert what ends up in `sub.query["opts"]` without
-    /// actually executing a query. Mirrors the production code in this
-    /// file — keep them in sync.
+    /// The `opts` a JSON-LD sub-query runs with, from the function
+    /// `execute_subquery` builds its body with, so these tests assert what
+    /// ends up in `sub.query["opts"]` without executing a query.
     fn compute_final_opts(
         envelope_opts: Option<&JsonValue>,
         sub: &MultiQuerySubquery,
     ) -> Option<JsonValue> {
-        let body_opts = sub.query.as_object().and_then(|o| o.get("opts").cloned());
-        let envelope_with_sub = merged_opts(envelope_opts, sub.opts.as_ref());
-        merged_opts(envelope_with_sub.as_ref(), body_opts.as_ref())
+        effective_jsonld_body(envelope_opts, sub.opts.as_ref(), sub.query.clone())
+            .get("opts")
+            .cloned()
     }
 
     #[test]

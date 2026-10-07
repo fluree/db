@@ -4938,8 +4938,13 @@ pub async fn multi_query(
 
             // Validation — we re-run it inside the api crate's dispatcher,
             // but pre-validating here gives us the ledgers the envelope reads
-            // for the bearer-scope check and the freshness wait before any
-            // execution starts.
+            // (the set its snapshot pins) for the bearer-scope check and the
+            // freshness wait before any execution starts. It reads each
+            // JSON-LD body with its outer `opts` merged in, as the premerge
+            // below builds it and the dispatcher runs it; it runs on the
+            // envelope as submitted, before that premerge, because a body
+            // whose dataset the outer `opts` would change is refused, and
+            // the premerge folds those layers together.
             let envelope_ledgers =
                 match fluree_db_api::query::multi::validate_envelope_ledgers(&envelope, &bounds) {
                     Ok(ledgers) => ledgers,
@@ -5279,25 +5284,16 @@ fn same_policy_selection(
         && a.default_allow == b.default_allow
 }
 
-/// Merge envelope, alias, and body options before authorization, using the
-/// dispatcher's precedence. The trusted result is stored in the most specific
-/// layer so subsequent merges preserve it.
+/// Merge envelope, alias, and body options before authorization, with the
+/// function the dispatcher runs and validation reads
+/// ([`effective_jsonld_body`](fluree_db_api::query::multi::effective_jsonld_body)).
+/// The trusted result is stored in the most specific layer so subsequent
+/// merges preserve it.
 fn premerge_opts_into_subquery_body(
     envelope_opts: Option<&JsonValue>,
     sub: &mut MultiQuerySubquery,
 ) {
-    let envelope_with_sub =
-        fluree_db_api::query::multi::merged_opts(envelope_opts, sub.opts.as_ref());
-    let Some(envelope_with_sub) = envelope_with_sub else {
-        return;
-    };
-    let Some(body) = sub.query.as_object_mut() else {
-        return;
-    };
-    let body_opts = body.remove("opts");
-    let final_opts =
-        fluree_db_api::query::multi::merged_opts(Some(&envelope_with_sub), body_opts.as_ref());
-    if let Some(opts) = final_opts {
-        body.insert("opts".to_string(), opts);
-    }
+    let body = std::mem::take(&mut sub.query);
+    sub.query =
+        fluree_db_api::query::multi::effective_jsonld_body(envelope_opts, sub.opts.as_ref(), body);
 }

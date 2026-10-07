@@ -297,6 +297,15 @@ pub enum MultiQueryValidationError {
     /// engine reports for the same body.
     #[error("sub-query '{alias}': {message}")]
     JsonLdDatasetUnreadable { alias: String, message: String },
+    /// The JSON-LD body names part of its dataset (its default graphs, its
+    /// named graphs, or a history end), and the envelope's or the sub-query's
+    /// `opts` name a different one: the body would not run on the dataset it
+    /// names.
+    #[error(
+        "sub-query '{alias}': its body names its {part}, and the envelope's or the \
+         sub-query's 'opts' name different ones; name the dataset in one place"
+    )]
+    DatasetConflict { alias: String, part: String },
     #[error(
         "sub-query '{alias}': missing or empty 'from' — each sub-query must specify its own dataset"
     )]
@@ -410,7 +419,9 @@ pub fn validate_envelope_ledgers(
         }
 
         let alias_members = match sq.language {
-            SubqueryLanguage::JsonLd => validate_jsonld_subquery(alias, sq, envelope_pinned)?,
+            SubqueryLanguage::JsonLd => {
+                validate_jsonld_subquery(alias, sq, req.opts.as_ref(), envelope_pinned)?
+            }
             SubqueryLanguage::Sparql => {
                 validate_sparql_subquery(alias, sq, req.context.as_ref(), envelope_pinned)?
             }
@@ -488,22 +499,30 @@ fn validate_envelope_opts(
 
 /// The members of a JSON-LD sub-query's dataset, as the engine will read them.
 ///
-/// The body's dataset is read with the engine's own parser
+/// Validation reads the body the dispatcher runs ([`effective_jsonld_body`]:
+/// the body with the envelope's and the sub-query's `opts` merged under its
+/// own), with the engine's own parser
 /// ([`DatasetSpec::from_json`](crate::dataset::DatasetSpec::from_json)): its
-/// default and named graphs, from the body's `opts` or its top level, in the
-/// parser's precedence. A body the parser cannot read is refused here with the
-/// parser's error. The body must still name its own `from`.
+/// default and named graphs, from `opts` or the top level, in the parser's
+/// precedence. A body the parser cannot read is refused here with the
+/// parser's error. The body must still name its own `from`, and a part of its
+/// dataset it names may not be named differently by the outer `opts`.
 fn validate_jsonld_subquery(
     alias: &str,
     sq: &MultiQuerySubquery,
+    envelope_opts: Option<&JsonValue>,
     envelope_pinned: bool,
 ) -> Result<Vec<SubqueryLedger>, MultiQueryValidationError> {
-    let body =
+    let raw =
         sq.query
             .as_object()
             .ok_or_else(|| MultiQueryValidationError::JsonLdBodyNotObject {
                 alias: alias.to_string(),
             })?;
+    let effective = effective_jsonld_body(envelope_opts, sq.opts.as_ref(), sq.query.clone());
+    let body = effective
+        .as_object()
+        .expect("merging opts into an object body keeps it an object");
 
     // History queries (explicit `to` endpoint) span a range across two `t`
     // values rather than a single snapshot. The envelope's shared-snapshot
@@ -539,10 +558,16 @@ fn validate_jsonld_subquery(
     let missing_from = || MultiQueryValidationError::MissingFrom {
         alias: alias.to_string(),
     };
-    if !body.contains_key("from") {
+    if !raw.contains_key("from") {
         return Err(missing_from());
     }
-    let spec = crate::dataset::DatasetSpec::from_json(&sq.query).map_err(|e| {
+    if let Some(part) = crate::dataset::dataset_part_overridden(raw, body) {
+        return Err(MultiQueryValidationError::DatasetConflict {
+            alias: alias.to_string(),
+            part: part.to_string(),
+        });
+    }
+    let spec = crate::dataset::DatasetSpec::from_json(&effective).map_err(|e| {
         MultiQueryValidationError::JsonLdDatasetUnreadable {
             alias: alias.to_string(),
             message: e.to_string(),
@@ -673,6 +698,40 @@ pub fn merged_opts(envelope: Option<&JsonValue>, inner: Option<&JsonValue>) -> O
         (Some(v), None) | (None, Some(v)) => Some(v.clone()),
         (Some(env), Some(inner)) => Some(shallow_merge_objects(env, inner)),
     }
+}
+
+/// A sub-query's `opts` as it runs: three layers merged shallowly, the most
+/// specific winning: `body_opts` (a JSON-LD body's own `opts`, a SPARQL
+/// alias's `# PRAGMA` options), then the sub-query's `opts`, then the
+/// envelope's.
+pub fn alias_opts(
+    envelope_opts: Option<&JsonValue>,
+    sub_opts: Option<&JsonValue>,
+    body_opts: Option<&JsonValue>,
+) -> Option<JsonValue> {
+    merged_opts(merged_opts(envelope_opts, sub_opts).as_ref(), body_opts)
+}
+
+/// A JSON-LD sub-query's body as it runs, as far as its dataset goes: `body`
+/// with its `opts` replaced by [`alias_opts`]. Validation reads this body and
+/// the dispatcher runs it (the dispatcher also merges the envelope's
+/// `@context` into it, which no dataset key reads), so the ledgers an
+/// envelope counts, pins and waits on are the ones the sub-query reads,
+/// whichever layer names them. A host that also merges the layers itself
+/// before dispatch does it with this function, after it has validated the
+/// envelope as submitted: validation refuses outer `opts` that would change
+/// the dataset a body names, which it can only see while the layers are apart.
+pub fn effective_jsonld_body(
+    envelope_opts: Option<&JsonValue>,
+    sub_opts: Option<&JsonValue>,
+    mut body: JsonValue,
+) -> JsonValue {
+    if let Some(obj) = body.as_object_mut() {
+        if let Some(opts) = alias_opts(envelope_opts, sub_opts, obj.get("opts")) {
+            obj.insert("opts".to_string(), opts);
+        }
+    }
+    body
 }
 
 /// A SPARQL sub-query's `# PRAGMA` options as the `opts` object a JSON-LD body
@@ -1463,6 +1522,30 @@ mod tests {
         let env = json!({ "schema": "http://schema.org/" });
         let merged = merged_context(Some(&env), Some(&JsonValue::Null));
         assert!(merged.is_none());
+    }
+
+    /// A JSON-LD body runs with its own `opts` over the sub-query's over the
+    /// envelope's, key by key; validation and the dispatcher both read it so.
+    #[test]
+    fn effective_jsonld_body_merges_opts_most_specific_first() {
+        let body = json!({ "from": "a", "opts": { "from": "b", "meta": true } });
+        let effective = effective_jsonld_body(
+            Some(&json!({ "from": "c", "fromNamed": ["d"], "max-fuel": 1 })),
+            Some(&json!({ "fromNamed": ["e"], "max-fuel": 2 })),
+            body,
+        );
+        assert_eq!(
+            effective,
+            json!({
+                "from": "a",
+                "opts": { "from": "b", "meta": true, "fromNamed": ["e"], "max-fuel": 2 }
+            })
+        );
+        let untouched = json!({ "from": "a" });
+        assert_eq!(
+            effective_jsonld_body(None, None, untouched.clone()),
+            untouched
+        );
     }
 
     #[test]

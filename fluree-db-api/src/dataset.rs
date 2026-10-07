@@ -759,6 +759,27 @@ fn dataset_value<'a>(
     })
 }
 
+/// The part of a dataset that `body` names and `effective` (the same body
+/// with outer `opts` merged in) names differently, if any: for each part (the
+/// default graphs, the named graphs, a history end), when `body` names it,
+/// `effective` must select the same value where [`DatasetSpec::from_json`]
+/// reads it. A part `body` leaves unnamed may come from the outer layers.
+pub(crate) fn dataset_part_overridden(
+    body: &serde_json::Map<String, JsonValue>,
+    effective: &serde_json::Map<String, JsonValue>,
+) -> Option<&'static str> {
+    [
+        ("default graphs", &DEFAULT_GRAPH_KEYS[..]),
+        ("named graphs", &NAMED_GRAPH_KEYS[..]),
+        ("history end", &HISTORY_KEYS[..]),
+    ]
+    .into_iter()
+    .find_map(|(part, keys)| {
+        let named = dataset_value(body, keys)?;
+        (dataset_value(effective, keys) != Some(named)).then_some(part)
+    })
+}
+
 /// Does a JSON-LD body name a history range's end (`to`), where
 /// [`DatasetSpec::from_json`] reads one?
 pub(crate) fn names_history_range(body: &serde_json::Map<String, JsonValue>) -> bool {

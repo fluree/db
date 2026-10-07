@@ -23,7 +23,9 @@ use std::sync::Arc;
 
 use crate::support::{genesis_ledger, MemoryFluree, MemoryLedger};
 use fluree_db_api::query::multi::MultiQueryError;
-use fluree_db_api::query::multi::{MultiQueryBounds, MultiQueryRequest, MultiQueryStatus};
+use fluree_db_api::query::multi::{
+    MultiQueryBounds, MultiQueryRequest, MultiQueryStatus, MultiQueryValidationError,
+};
 use fluree_db_api::{FlureeBuilder, FormatterConfig};
 use serde_json::json;
 
@@ -965,4 +967,272 @@ async fn multi_query_a_member_naming_its_own_time_keeps_it() {
         );
     }
     assert!(text("head").contains("Carol"), "{}", text("head"));
+}
+
+// =============================================================================
+// Validation reads the body the dispatcher runs
+// =============================================================================
+
+/// `mq:hist` (two commits) and `mq:other` (one).
+async fn seed_hist_and_other(fluree: &MemoryFluree) {
+    seed_two_commits(fluree).await;
+    fluree
+        .insert(
+            genesis_ledger(fluree, "mq:other"),
+            &json!({
+                "@context": { "schema": "http://schema.org/" },
+                "@id": "http://example.org/olga",
+                "schema:name": "Olga"
+            }),
+        )
+        .await
+        .expect("seed mq:other");
+}
+
+/// One JSON-LD sibling over `mq:other`, the envelope's and the alias's `opts`
+/// set as given.
+fn layered_envelope(
+    envelope_opts: serde_json::Value,
+    alias_opts: serde_json::Value,
+    body_extra: serde_json::Value,
+    as_of: serde_json::Value,
+) -> MultiQueryRequest {
+    let mut body = json!({
+        "from": "mq:other",
+        "select": ["?n"],
+        "where": [["graph", "h", { "@id": "?s", "http://schema.org/name": "?n" }]]
+    });
+    for (k, v) in body_extra.as_object().into_iter().flatten() {
+        body[k] = v.clone();
+    }
+    let mut envelope = json!({
+        "queries": { "a": { "language": "jsonld", "query": body } }
+    });
+    if !envelope_opts.is_null() {
+        envelope["opts"] = envelope_opts;
+    }
+    if !alias_opts.is_null() {
+        envelope["queries"]["a"]["opts"] = alias_opts;
+    }
+    if !as_of.is_null() {
+        envelope["asOf"] = as_of;
+    }
+    serde_json::from_value(envelope).expect("envelope deserialises")
+}
+
+/// A ledger the envelope's or the alias's `opts` adds to a sibling's dataset
+/// is one the sibling reads: validation counts it against the bound, the
+/// snapshot pins it and lists it, as for a ledger the body names.
+#[tokio::test]
+async fn multi_query_a_ledger_named_in_outer_opts_is_counted_and_pinned() {
+    let fluree = Arc::new(FlureeBuilder::memory().build_memory());
+    seed_hist_and_other(&fluree).await;
+    let named = json!({ "fromNamed": { "h": { "@id": "mq:hist" } } });
+    let mut failures = Vec::new();
+    for (layer, envelope_opts, alias_opts) in [
+        ("envelope", named.clone(), serde_json::Value::Null),
+        ("alias", serde_json::Value::Null, named.clone()),
+    ] {
+        let envelope = layered_envelope(
+            envelope_opts.clone(),
+            alias_opts.clone(),
+            json!({}),
+            serde_json::Value::Null,
+        );
+        let ledgers = fluree_db_api::query::multi::validate_envelope_ledgers(
+            &envelope,
+            &MultiQueryBounds::DEFAULT,
+        )
+        .expect("validates");
+        let distinct: Vec<&String> = ledgers.distinct.iter().collect();
+        if distinct != ["mq:hist", "mq:other"] {
+            failures.push(format!("{layer}: validation reports {distinct:?}"));
+        }
+        let one = MultiQueryBounds {
+            max_distinct_ledgers: 1,
+            ..MultiQueryBounds::DEFAULT
+        };
+        match fluree
+            .multi_query()
+            .envelope(envelope)
+            .bounds(one)
+            .execute()
+            .await
+        {
+            Err(MultiQueryError::Validation(
+                MultiQueryValidationError::TooManyDistinctLedgers { actual: 2, .. },
+            )) => {}
+            other => failures.push(format!("{layer}: bound of 1 gave {other:?}")),
+        }
+        // An integer `asOf` is for one ledger, and this sibling reads two.
+        let envelope = layered_envelope(
+            envelope_opts.clone(),
+            alias_opts.clone(),
+            json!({}),
+            json!(1),
+        );
+        match fluree.multi_query().envelope(envelope).execute().await {
+            Err(MultiQueryError::Validation(
+                MultiQueryValidationError::AsOfIntegerMultiLedger { distinct: 2 },
+            )) => {}
+            other => failures.push(format!("{layer}: integer asOf gave {other:?}")),
+        }
+        // With no `asOf`, the envelope resolves both ledgers' heads: listed
+        // and read.
+        let envelope = layered_envelope(
+            envelope_opts,
+            alias_opts,
+            json!({}),
+            serde_json::Value::Null,
+        );
+        match fluree.multi_query().envelope(envelope).execute().await {
+            Ok(response) => {
+                let mut listed: Vec<&String> = response.snapshot.ledgers.keys().collect();
+                listed.sort();
+                let text = serde_json::to_string(&response.results).unwrap();
+                if listed != ["mq:hist", "mq:other"] || !text.contains("Carol") {
+                    failures.push(format!(
+                        "{layer}: snapshot {listed:?}, results {text}, errors {:?}",
+                        response.errors
+                    ));
+                }
+            }
+            Err(e) => failures.push(format!("{layer}: {e}")),
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// How a refused envelope's validation error is recognised.
+type RefusedBy = fn(&MultiQueryValidationError) -> bool;
+
+/// The outer `opts` may add to a sibling's dataset but not change a part the
+/// body names: a different default graph from the envelope or the alias is a
+/// 400, as is a history end, and a pin there collides with an envelope
+/// `asOf`. The same default graph, or `opts` that name no dataset, compose.
+#[tokio::test]
+async fn multi_query_outer_opts_may_not_change_the_dataset_the_body_names() {
+    let fluree = Arc::new(FlureeBuilder::memory().build_memory());
+    seed_hist_and_other(&fluree).await;
+    let null = serde_json::Value::Null;
+    let iso = json!("2099-01-01T00:00:00Z");
+    let refused: Vec<(&str, MultiQueryRequest, RefusedBy)> = vec![
+        (
+            "envelope opts.from",
+            layered_envelope(
+                json!({ "from": "mq:hist" }),
+                null.clone(),
+                json!({}),
+                json!(1),
+            ),
+            |e| e.to_string().contains("names its default graphs"),
+        ),
+        (
+            "alias opts.from",
+            layered_envelope(
+                null.clone(),
+                json!({ "from": "mq:hist" }),
+                json!({}),
+                json!(1),
+            ),
+            |e| e.to_string().contains("names its default graphs"),
+        ),
+        (
+            "alias opts.ledger",
+            layered_envelope(
+                null.clone(),
+                json!({ "ledger": "mq:hist" }),
+                json!({}),
+                null.clone(),
+            ),
+            |e| e.to_string().contains("names its default graphs"),
+        ),
+        (
+            "envelope opts.fromNamed over the body's",
+            layered_envelope(
+                json!({ "fromNamed": { "h": { "@id": "mq:hist" } } }),
+                null.clone(),
+                json!({ "fromNamed": { "h": { "@id": "mq:other" } } }),
+                null.clone(),
+            ),
+            |e| e.to_string().contains("names its named graphs"),
+        ),
+        (
+            "envelope opts.to",
+            layered_envelope(
+                json!({ "to": "mq:other@t:1" }),
+                null.clone(),
+                json!({}),
+                null.clone(),
+            ),
+            |e| matches!(e, MultiQueryValidationError::HistoryQueryInEnvelope { .. }),
+        ),
+        (
+            "a pin in the envelope's named graphs under asOf",
+            layered_envelope(
+                json!({ "fromNamed": { "h": { "@id": "mq:hist", "t": 1 } } }),
+                null.clone(),
+                json!({}),
+                iso.clone(),
+            ),
+            |e| matches!(e, MultiQueryValidationError::AsOfCollision { .. }),
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (name, envelope, expected) in refused {
+        match fluree.multi_query().envelope(envelope).execute().await {
+            Err(MultiQueryError::Validation(e)) if expected(&e) => {}
+            other => failures.push(format!("{name}: {other:?}")),
+        }
+    }
+    let composed = [
+        (
+            "envelope opts.from naming the body's own",
+            layered_envelope(
+                json!({ "from": "mq:other" }),
+                null.clone(),
+                json!({}),
+                null.clone(),
+            ),
+        ),
+        (
+            "the body's own opts.from over the envelope's",
+            layered_envelope(
+                json!({ "from": "mq:hist" }),
+                null.clone(),
+                json!({ "opts": { "from": "mq:other" } }),
+                null.clone(),
+            ),
+        ),
+        (
+            "outer opts naming no dataset",
+            layered_envelope(
+                json!({ "meta": true }),
+                json!({ "max-fuel": 1_000_000 }),
+                json!({}),
+                null.clone(),
+            ),
+        ),
+    ];
+    for (name, envelope) in composed {
+        match fluree.multi_query().envelope(envelope).execute().await {
+            Ok(response) if response.status == MultiQueryStatus::Ok => {}
+            Ok(response) => failures.push(format!("{name}: {:?}", response.errors)),
+            Err(e) => failures.push(format!("{name}: {e:?}")),
+        }
+    }
+    // A body that names no `from` of its own is refused as before, whatever
+    // the outer `opts` name.
+    let mut envelope =
+        layered_envelope(json!({ "from": "mq:other" }), null.clone(), json!({}), null);
+    envelope.queries["a"]
+        .query
+        .as_object_mut()
+        .unwrap()
+        .remove("from");
+    match fluree.multi_query().envelope(envelope).execute().await {
+        Err(MultiQueryError::Validation(MultiQueryValidationError::MissingFrom { .. })) => {}
+        other => failures.push(format!("no body from: {other:?}")),
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }

@@ -1510,3 +1510,67 @@ async fn explain_uses_final_body_policy_selection_on_both_routes() {
         }
     }
 }
+
+/// A multi-query sub-query's options reach it on the server whichever layer
+/// sets them: `default-allow: false` in the envelope's or the sub-query's
+/// `opts` narrows a credential's default-allow selection for a JSON-LD
+/// sub-query exactly as it does in the body's own `opts`.
+#[tokio::test]
+async fn multi_query_outer_opts_narrow_a_jsonld_sub_query_as_its_own_do() {
+    let (_tmp, state) = policy_test_state().await;
+    let ledger = "outer-opts-narrow:main";
+    let app = setup_policy_ledger(build_router(state), ledger).await;
+    let token = delegated_token(
+        "http://example.org/new-application-user",
+        ledger,
+        serde_json::json!({"default-allow": true}),
+    );
+    let docs = |body_opts: JsonValue| {
+        let mut query = serde_json::json!({
+            "@context": {"ex": "http://example.org/", "schema": "http://schema.org/"},
+            "from": ledger,
+            "select": ["?name", "?class"],
+            "where": [
+                {"@id": "?doc", "@type": "ex:Document"},
+                {"@id": "?doc", "schema:name": "?name"},
+                {"@id": "?doc", "ex:classification": "?class"}
+            ]
+        });
+        if !body_opts.is_null() {
+            query["opts"] = body_opts;
+        }
+        query
+    };
+    let deny = serde_json::json!({"default-allow": false});
+    let null = JsonValue::Null;
+    for (layer, envelope_opts, alias_opts, body_opts, expected) in [
+        ("none", null.clone(), null.clone(), null.clone(), 3),
+        ("body", null.clone(), null.clone(), deny.clone(), 0),
+        ("alias", null.clone(), deny.clone(), null.clone(), 0),
+        ("envelope", deny.clone(), null.clone(), null.clone(), 0),
+    ] {
+        let mut envelope = serde_json::json!({
+            "queries": {"docs": {"language": "jsonld", "query": docs(body_opts)}}
+        });
+        if !envelope_opts.is_null() {
+            envelope["opts"] = envelope_opts;
+        }
+        if !alias_opts.is_null() {
+            envelope["queries"]["docs"]["opts"] = alias_opts;
+        }
+        let (status, body) = post_policy_request(
+            &app,
+            "/v1/fluree/multi-query",
+            Some(&token),
+            "application/json",
+            envelope.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{layer}: {body}");
+        let rows = body["results"]["docs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{layer}: {body}"))
+            .len();
+        assert_eq!(rows, expected, "{layer}: {body}");
+    }
+}
