@@ -263,17 +263,24 @@ WHERE {
 
 ## Combining with Fluree Data
 
-Join Iceberg data with Fluree ledgers:
+Join Iceberg data with Fluree ledgers by naming the graph source in
+`fromNamed` (SPARQL: `FROM NAMED`) and reading it inside a `graph` block. A
+graph source cannot share the default graph with a ledger; such a query is
+refused.
 
 ```json
 {
-  "from": ["products:main", "warehouse-inventory:main"],
+  "from": "products:main",
+  "fromNamed": "warehouse-inventory:main",
   "select": ["?productName", "?stockLevel"],
   "where": [
     { "@id": "?product", "schema:name": "?productName" },
     { "@id": "?product", "ex:sku": "?sku" },
-    { "@id": "?inventory", "ex:sku": "?sku" },
-    { "@id": "?inventory", "ex:stockLevel": "?stockLevel" }
+    ["graph", "warehouse-inventory:main", {
+      "@id": "?inventory",
+      "ex:sku": "?sku",
+      "ex:stockLevel": "?stockLevel"
+    }]
   ]
 }
 ```
