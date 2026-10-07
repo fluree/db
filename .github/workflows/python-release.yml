@@ -7,12 +7,14 @@ name: Python release
 # tag (`v4.3.0-rc.1`) publishes a PyPI pre-release (4.3.0rc1).
 #
 # Publishing uses PyPI trusted publishing: PyPI trusts this workflow, run in
-# the `pypi` environment, so no token is stored. Run it by hand
-# (workflow_dispatch) to build and test the wheels without publishing.
+# the `pypi` environment, so no token is stored. That environment admits only
+# `v*` tags, only a tag push publishes, and only when the tag names the
+# version the wheels carry. Run it by hand (workflow_dispatch) to build and
+# test the wheels without publishing.
 on:
   push:
     tags:
-      - '**[0-9]+.[0-9]+.[0-9]+*'
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
   workflow_dispatch:
 
 permissions:
@@ -66,6 +68,16 @@ jobs:
           manylinux: "2_28"
           rust-toolchain: "1.97.0"
 
+      # PyPI never takes a version twice, so a tag on the wrong commit must
+      # not publish whatever version that commit carries.
+      - name: The tag names the version being built
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          py="${{ steps.py314.outputs.python-path }}"
+          "$py" -m pip install --quiet packaging
+          "$py" -c 'import glob, os, sys; from packaging.version import Version as V; tag = V(os.environ["GITHUB_REF_NAME"].removeprefix("v")); built = {V(os.path.basename(w).split("-")[1]) for w in glob.glob("dist/*.whl")}; sys.exit(0 if built == {tag} else f"tag {tag} does not match the wheel version {sorted(map(str, built))}")'
+
       - name: Test the wheel on Python 3.10 and 3.14
         shell: bash
         run: |
@@ -87,7 +99,7 @@ jobs:
   publish:
     name: publish to PyPI
     needs: wheels
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     environment:
       name: pypi
@@ -100,4 +112,5 @@ jobs:
           pattern: wheel-*
           path: dist
           merge-multiple: true
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      # Pinned: this step holds the OIDC token PyPI trusts.
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
