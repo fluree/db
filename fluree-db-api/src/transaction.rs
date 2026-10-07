@@ -28,7 +28,10 @@ use crate::format::cypher_typed::CypherCell;
 use crate::ledger_manager::RefreshOpts;
 use crate::tx::{SequentialStager, TransactResultRef};
 use crate::tx_builder::{is_retryable_commit_conflict, OpPlan, TransactOperation};
-use crate::{ApiError, CypherParamMap, Fluree, GovernanceOptions, GraphDb, PolicyContext, Result};
+use crate::{
+    ApiError, CypherParamMap, Fluree, GovernanceOptions, GraphDb, PolicyContext, Result, Tracker,
+    TrackingOptions,
+};
 use fluree_db_core::ContentId;
 use fluree_db_ledger::{IndexConfig, LedgerState};
 use fluree_db_transact::{CommitOpts, TransactError, TxnOpts, TxnType};
@@ -74,6 +77,21 @@ pub struct Savepoint(usize);
 /// The rows a Cypher write's `RETURN` produced: column names and typed cells.
 pub type CypherReturn = (Vec<String>, Vec<Vec<CypherCell>>);
 
+/// How a [`Transaction`] stages and commits.
+#[derive(Clone, Debug, Default)]
+pub struct TransactionOptions {
+    /// The identity and policy inputs every operation is checked against;
+    /// the default applies the ledger's configured policy defaults only.
+    pub governance: GovernanceOptions,
+    /// Fuel, time and policy accounting across the whole transaction,
+    /// including any operations staged again; a fuel limit bounds its work.
+    /// The tally is reported with the commit.
+    pub tracking: TrackingOptions,
+    /// The novelty limits the commit is held to; `None` uses the server
+    /// defaults.
+    pub index_config: Option<IndexConfig>,
+}
+
 /// A staged operation, as replayed when the transaction stages again.
 enum Staged {
     Operation(TxnOperation),
@@ -110,22 +128,25 @@ struct StageContext {
     governance: GovernanceOptions,
     policy: Option<PolicyContext>,
     index_config: IndexConfig,
+    tracker: Tracker,
 }
 
 impl Fluree {
-    /// Open a transaction on `ledger_id` at its current head. Operations
-    /// staged on it are checked against the policy `governance` describes
-    /// (`None`: the ledger's configured defaults only).
+    /// Open a transaction on `ledger_id` at its current head.
     pub async fn begin_transaction(
         &self,
         ledger_id: &str,
-        governance: Option<GovernanceOptions>,
+        options: TransactionOptions,
     ) -> Result<Transaction> {
+        let TransactionOptions {
+            governance,
+            tracking,
+            index_config,
+        } = options;
         let handle = self.ledger_cached(ledger_id).await?;
         let snapshot = handle.snapshot().await;
         let base_head = snapshot.head_commit_id.clone();
         let base = snapshot.to_ledger_state();
-        let governance = governance.unwrap_or_default();
         let policy = crate::build_transact_policy_context(
             self,
             &base.snapshot,
@@ -146,7 +167,9 @@ impl Fluree {
                 ledger_id: ledger_id.clone(),
                 governance,
                 policy,
-                index_config: crate::server_defaults::default_index_config(),
+                index_config: index_config
+                    .unwrap_or_else(crate::server_defaults::default_index_config),
+                tracker: Tracker::new(tracking),
             },
             ledger_id,
             read: AtomicBool::new(false),
@@ -308,7 +331,7 @@ impl Transaction {
                     TxnType::Update,
                     commit_opts.clone(),
                     &context.index_config,
-                    None,
+                    context.tracker.tally(),
                     None,
                 )
                 .await
@@ -351,7 +374,7 @@ async fn stage_one(
                             state,
                             TxnOpts::default(),
                             &CommitOpts::default(),
-                            None,
+                            Some(&context.tracker),
                             &context.index_config,
                             context.policy.as_ref(),
                         )
@@ -412,7 +435,7 @@ async fn stage_cypher(
                             Some(&context.governance),
                             Some(&context.index_config),
                             context.policy.as_ref(),
-                            None,
+                            Some(&context.tracker),
                             Some(skolem_txn_id.to_string()),
                         )
                         .await?;
@@ -473,7 +496,7 @@ async fn stage_cypher(
                             followup,
                             Some(&context.index_config),
                             context.policy.as_ref(),
-                            None,
+                            Some(&context.tracker),
                         )
                         .await
                 }
@@ -484,7 +507,7 @@ async fn stage_cypher(
                             resolved.primary,
                             Some(&context.index_config),
                             context.policy.as_ref(),
-                            None,
+                            Some(&context.tracker),
                         )
                         .await
                 }

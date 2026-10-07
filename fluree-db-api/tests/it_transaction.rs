@@ -1,7 +1,10 @@
 //! `Transaction`: operations staged one at a time, readable before commit,
 //! committed as one commit.
 
-use fluree_db_api::{CommitOpts, Fluree, FlureeBuilder, GraphDb, TxnOperation};
+use fluree_db_api::{
+    CommitOpts, Fluree, FlureeBuilder, GraphDb, TrackingOptions, Transaction, TransactionOptions,
+    TxnOperation,
+};
 use serde_json::{json, Value as JsonValue};
 
 const LEDGER: &str = "it/transaction:main";
@@ -28,6 +31,13 @@ async fn select(fluree: &Fluree, db: &GraphDb, sparql: &str) -> Vec<JsonValue> {
     };
     rows.sort_by_key(ToString::to_string);
     rows
+}
+
+async fn begin(fluree: &Fluree) -> Transaction {
+    fluree
+        .begin_transaction(LEDGER, TransactionOptions::default())
+        .await
+        .expect("begin")
 }
 
 async fn head(fluree: &Fluree) -> GraphDb {
@@ -57,7 +67,7 @@ const BIRTHDAY: &str = "PREFIX ex: <http://example.org/> \
 #[tokio::test]
 async fn operations_see_earlier_ones_and_commit_once() {
     let fluree = fluree().await;
-    let mut txn = fluree.begin_transaction(LEDGER, None).await.unwrap();
+    let mut txn = begin(&fluree).await;
     txn.stage(insert("alice", "Alice", 30)).await.unwrap();
     // Reads alice's age from the insert above.
     txn.stage(TxnOperation::SparqlUpdate(BIRTHDAY.into()))
@@ -93,7 +103,7 @@ async fn operations_see_earlier_ones_and_commit_once() {
 #[tokio::test]
 async fn a_failed_operation_leaves_the_transaction_as_it_was() {
     let fluree = fluree().await;
-    let mut txn = fluree.begin_transaction(LEDGER, None).await.unwrap();
+    let mut txn = begin(&fluree).await;
     txn.stage(insert("alice", "Alice", 30)).await.unwrap();
     txn.stage(TxnOperation::SparqlUpdate(
         "INSERT DATA { not sparql".into(),
@@ -116,7 +126,7 @@ async fn a_failed_operation_leaves_the_transaction_as_it_was() {
 #[tokio::test]
 async fn rollback_to_a_savepoint_discards_the_operations_after_it() {
     let fluree = fluree().await;
-    let mut txn = fluree.begin_transaction(LEDGER, None).await.unwrap();
+    let mut txn = begin(&fluree).await;
     txn.stage(insert("alice", "Alice", 30)).await.unwrap();
     let savepoint = txn.savepoint();
     txn.stage(insert("bob", "Bob", 40)).await.unwrap();
@@ -141,7 +151,7 @@ async fn rollback_to_a_savepoint_discards_the_operations_after_it() {
 #[tokio::test]
 async fn net_zero_and_empty_transactions_commit_nothing() {
     let fluree = fluree().await;
-    let mut txn = fluree.begin_transaction(LEDGER, None).await.unwrap();
+    let mut txn = begin(&fluree).await;
     txn.stage(insert("alice", "Alice", 30)).await.unwrap();
     txn.stage(TxnOperation::SparqlUpdate(format!(
         "{PREFIX}DELETE DATA {{ ex:alice ex:name \"Alice\" ; ex:age 30 }}"
@@ -151,7 +161,7 @@ async fn net_zero_and_empty_transactions_commit_nothing() {
     let result = txn.commit(CommitOpts::default()).await.unwrap();
     assert_eq!((result.receipt.t, result.receipt.flake_count), (0, 0));
 
-    let txn = fluree.begin_transaction(LEDGER, None).await.unwrap();
+    let txn = begin(&fluree).await;
     let result = txn.commit(CommitOpts::default()).await.unwrap();
     assert_eq!((result.receipt.t, result.receipt.flake_count), (0, 0));
     assert_eq!(fluree.commit_log(LEDGER, None).await.unwrap().1, 0);
@@ -162,7 +172,7 @@ async fn net_zero_and_empty_transactions_commit_nothing() {
 #[tokio::test]
 async fn commits_over_a_concurrent_write_to_other_subjects() {
     let fluree = fluree().await;
-    let mut txn = fluree.begin_transaction(LEDGER, None).await.unwrap();
+    let mut txn = begin(&fluree).await;
     txn.stage(insert("alice", "Alice", 30)).await.unwrap();
 
     fluree
@@ -191,7 +201,7 @@ async fn restages_over_a_concurrent_write_its_update_matches() {
     let fluree = fluree().await;
     insert_alice(&fluree, 30).await;
 
-    let mut txn = fluree.begin_transaction(LEDGER, None).await.unwrap();
+    let mut txn = begin(&fluree).await;
     txn.stage(TxnOperation::SparqlUpdate(BIRTHDAY.into()))
         .await
         .unwrap();
@@ -212,7 +222,7 @@ async fn a_read_transaction_conflicts_when_the_ledger_moved() {
     let fluree = fluree().await;
     insert_alice(&fluree, 30).await;
 
-    let mut txn = fluree.begin_transaction(LEDGER, None).await.unwrap();
+    let mut txn = begin(&fluree).await;
     let ages = people(&fluree, &txn.db().await.unwrap()).await;
     assert_eq!(ages, vec![json!(["Alice", 30])]);
     // Decided from the read: 30 + 1.
@@ -238,7 +248,7 @@ async fn a_read_transaction_conflicts_when_the_ledger_moved() {
     );
 
     // Unmoved, a read transaction commits as usual.
-    let mut txn = fluree.begin_transaction(LEDGER, None).await.unwrap();
+    let mut txn = begin(&fluree).await;
     txn.db().await.unwrap();
     txn.stage(TxnOperation::SparqlUpdate(BIRTHDAY.into()))
         .await
@@ -285,7 +295,7 @@ async fn count(fluree: &Fluree, sparql: &str) -> usize {
 #[tokio::test]
 async fn cypher_and_sparql_mix_in_one_commit() {
     let fluree = fluree().await;
-    let mut txn = fluree.begin_transaction(LEDGER, None).await.unwrap();
+    let mut txn = begin(&fluree).await;
     let returned = txn
         .stage_cypher(r#"CREATE (:Person {name: "Ann"})"#, None)
         .await
@@ -322,7 +332,7 @@ async fn cypher_and_sparql_mix_in_one_commit() {
 #[tokio::test]
 async fn cypher_return_rows_count_as_a_read() {
     let fluree = fluree().await;
-    let mut txn = fluree.begin_transaction(LEDGER, None).await.unwrap();
+    let mut txn = begin(&fluree).await;
     let (columns, rows) = txn
         .stage_cypher(r#"CREATE (p:Person {name: "Bo"}) RETURN p"#, None)
         .await
@@ -345,7 +355,7 @@ async fn cypher_return_rows_count_as_a_read() {
 #[tokio::test]
 async fn a_merge_restages_over_a_concurrent_create() {
     let fluree = fluree().await;
-    let mut txn = fluree.begin_transaction(LEDGER, None).await.unwrap();
+    let mut txn = begin(&fluree).await;
     txn.stage_cypher(r#"MERGE (p:Person {name: "Cy"}) SET p.seen = true"#, None)
         .await
         .unwrap();
@@ -370,4 +380,53 @@ async fn a_merge_restages_over_a_concurrent_create() {
         count(&fluree, "SELECT ?p WHERE { <cy> <seen> true }").await,
         1
     );
+}
+
+fn tracked(max_fuel: Option<u64>) -> TransactionOptions {
+    TransactionOptions {
+        tracking: TrackingOptions {
+            track_fuel: true,
+            max_fuel,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn fuel_limit(fuel: f64) -> u64 {
+    (fuel * fluree_db_core::tracking::MICRO_FUEL_PER_FUEL as f64) as u64
+}
+
+/// Commit one insert in a tracked transaction and return the fuel it used.
+async fn fuel_of_one_insert(fluree: &Fluree) -> f64 {
+    let mut txn = fluree
+        .begin_transaction(LEDGER, tracked(None))
+        .await
+        .unwrap();
+    txn.stage(insert("zed", "Zed", 1)).await.unwrap();
+    let fuel = txn
+        .commit(CommitOpts::default())
+        .await
+        .unwrap()
+        .tally
+        .and_then(|tally| tally.fuel)
+        .expect("fuel");
+    assert!(fuel > 0.0);
+    fuel
+}
+
+/// The fuel a transaction's operations use adds up across all of them, so
+/// a limit bounds the transaction as a whole.
+#[tokio::test]
+async fn fuel_is_tracked_across_the_transaction() {
+    let fluree = fluree().await;
+    let one = fuel_of_one_insert(&fluree).await;
+    // Room for one insert, not two.
+    let mut txn = fluree
+        .begin_transaction(LEDGER, tracked(Some(fuel_limit(one * 1.5))))
+        .await
+        .unwrap();
+    txn.stage(insert("bob", "Bob", 40)).await.unwrap();
+    let err = txn.stage(insert("cy", "Cy", 50)).await.unwrap_err();
+    assert!(err.to_string().contains("Fuel limit exceeded"), "{err}");
 }

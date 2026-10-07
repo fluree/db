@@ -671,7 +671,7 @@ that was read through `db()` fails with `TransactError::CommitConflict`
 instead — its writes may rest on what it read — and should be run again.
 
 ```rust
-use fluree_db_api::{CommitOpts, FlureeBuilder, Result, TxnOperation};
+use fluree_db_api::{CommitOpts, FlureeBuilder, Result, TransactionOptions, TxnOperation};
 use serde_json::json;
 
 #[tokio::main]
@@ -679,7 +679,9 @@ async fn main() -> Result<()> {
     let fluree = FlureeBuilder::memory().build_memory();
     fluree.create_ledger("mydb").await?;
 
-    let mut txn = fluree.begin_transaction("mydb:main", None).await?;
+    let mut txn = fluree
+        .begin_transaction("mydb:main", TransactionOptions::default())
+        .await?;
     txn.stage(TxnOperation::Insert(json!({
         "@context": {"ex": "http://example.org/ns/"},
         "@id": "ex:alice", "ex:age": 30
@@ -700,11 +702,15 @@ async fn main() -> Result<()> {
 }
 ```
 
-Pass `GovernanceOptions` to `begin_transaction` to check every write against
-that policy. `stage_cypher(query, params)` stages a Cypher write alongside the
-other operations — its `MATCH` and `MERGE` see them — and returns the rows of
-its `RETURN`, if any. Receiving those rows counts as reading the transaction,
-as `db()` does. Dropping a `Transaction` discards it.
+`TransactionOptions` sets what the transaction runs under: `governance`
+checks every write against that policy; `tracking` accounts for fuel, time and
+policy across every operation, so a `max_fuel` limit bounds the transaction as
+a whole and the tally comes back with the commit; `index_config` sets the
+novelty limits the commit is held to. `stage_cypher(query, params)` stages a
+Cypher write alongside the other operations — its `MATCH` and `MERGE` see
+them — and returns the rows of its `RETURN`, if any. Receiving those rows
+counts as reading the transaction, as `db()` does. Dropping a `Transaction`
+discards it.
 
 ### Export Data
 
