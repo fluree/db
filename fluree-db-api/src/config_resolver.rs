@@ -227,18 +227,6 @@ pub enum ConfigDiagnosticCode {
     DuplicateGraphOverride,
 }
 
-/// The setting-group pointers of a config node, with the group each names.
-pub(crate) const GROUP_POINTERS: &[&str] = &[
-    config_iris::POLICY_DEFAULTS,
-    config_iris::SHACL_DEFAULTS,
-    config_iris::REASONING_DEFAULTS,
-    config_iris::DATALOG_DEFAULTS,
-    config_iris::TRANSACT_DEFAULTS,
-    config_iris::FULL_TEXT_DEFAULTS,
-    config_iris::SERVING_DEFAULTS,
-    config_iris::QUERY_DEFAULTS,
-];
-
 /// Whether the group node `group_sid`, named by `pointer_iri`, sets nothing.
 async fn group_is_empty(
     snapshot: &LedgerSnapshot,
@@ -324,7 +312,7 @@ pub async fn diagnose(
         }
     }
     for node in &config_nodes {
-        for pointer in GROUP_POINTERS {
+        for pointer in crate::config_vocab::GROUP_POINTERS {
             let candidates = read_group_candidates(snapshot, overlay, to_t, node, pointer).await?;
             if candidates.len() > 1 {
                 out.push(ConfigDiagnostic {
@@ -352,21 +340,50 @@ pub async fn diagnose(
                     ),
                     subjects: vec![iri(group)],
                 });
-                let stranded = graphs_with_config_fields(snapshot, overlay, to_t, group).await?;
-                if !stranded.is_empty() {
-                    out.push(ConfigDiagnostic {
-                        code: ConfigDiagnosticCode::StrandedFields,
-                        message: format!(
-                            "the {pointer} group {} has its fields in {}, not in the config \
-                             graph; move them into the config graph (see the repair recipe in \
-                             docs/ledger-config/writing-config.md)",
-                            iri(group),
-                            stranded.join(", ")
-                        ),
-                        subjects: vec![iri(group)],
-                    });
-                }
             }
+        }
+    }
+
+    // A per-graph override the reader skips: no `f:targetGraph` in the config
+    // graph (typically written to another graph with its groups).
+    for node in config_nodes.iter().skip(1) {
+        if read_iri_field(snapshot, overlay, to_t, node, config_iris::TARGET_GRAPH)
+            .await?
+            .is_none()
+        {
+            out.push(ConfigDiagnostic {
+                code: ConfigDiagnosticCode::EmptyGroup,
+                message: format!(
+                    "the f:graphOverrides entry {} has no f:targetGraph in the config graph, so \
+                     it is skipped",
+                    iri(node)
+                ),
+                subjects: vec![iri(node)],
+            });
+        }
+    }
+
+    // Config fields stranded outside the config graph, on any config node:
+    // the config subject, a per-graph override, a setting group, a source or
+    // any node they link to, whether or not the node sets anything in the
+    // config graph.
+    if let Some(root) = config_sids.first() {
+        for node in reachable_config_nodes(snapshot, overlay, to_t, root).await? {
+            let stranded = graphs_with_config_fields(snapshot, overlay, to_t, &node).await?;
+            if stranded.is_empty() {
+                continue;
+            }
+            out.push(ConfigDiagnostic {
+                code: ConfigDiagnosticCode::StrandedFields,
+                message: format!(
+                    "config node {} has config fields in {}, not in the config graph, where \
+                     they are not read; move them into the config graph (see the repair recipe \
+                     in docs/ledger-config/writing-config.md)",
+                    iri(&node),
+                    stranded.join(", ")
+                ),
+                subjects: vec![iri(&node)],
+            });
         }
     }
 
@@ -394,7 +411,54 @@ pub async fn diagnose(
     Ok(out)
 }
 
-/// The graphs other than the config graph where `node` has `f:` fields.
+/// The config graph's nodes reachable from the config subject `root` through
+/// config edges ([`crate::config_vocab::CONFIG_EDGES`]) asserted in the config
+/// graph, `root` first. The config graph is small; it is read once.
+async fn reachable_config_nodes(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    root: &Sid,
+) -> Result<Vec<Sid>> {
+    let edges: Vec<Sid> = crate::config_vocab::CONFIG_EDGES
+        .iter()
+        .filter_map(|iri| try_encode(snapshot, iri))
+        .collect();
+    let flakes = fluree_db_core::range_with_overlay(
+        snapshot,
+        CONFIG_GRAPH_ID,
+        overlay,
+        fluree_db_core::IndexType::Spot,
+        fluree_db_core::RangeTest::Eq,
+        fluree_db_core::RangeMatch::new(),
+        fluree_db_core::RangeOptions {
+            to_t: Some(to_t),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let mut out: Vec<Sid> = vec![root.clone()];
+    let mut seen: HashSet<Sid> = out.iter().cloned().collect();
+    let mut next = 0;
+    while next < out.len() {
+        let node = out[next].clone();
+        next += 1;
+        for flake in flakes
+            .iter()
+            .filter(|f| f.s == node && edges.contains(&f.p))
+        {
+            if let fluree_db_core::FlakeValue::Ref(target) = &flake.o {
+                if seen.insert(target.clone()) {
+                    out.push(target.clone());
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The graphs other than the config graph where `node` has config fields
+/// ([`crate::config_vocab::is_config_field`]).
 async fn graphs_with_config_fields(
     snapshot: &LedgerSnapshot,
     overlay: &dyn OverlayProvider,
@@ -425,7 +489,7 @@ async fn graphs_with_config_fields(
                 batch
                     .get(row, p)
                     .and_then(|b| b.as_sid())
-                    .is_some_and(|sid| sid.namespace_code == fluree_vocab::namespaces::FLUREE_DB)
+                    .is_some_and(crate::config_vocab::is_config_field)
             })
         });
         if has_config_field {
@@ -1183,6 +1247,8 @@ async fn query_config_predicate(
 /// Unlike `policy_builder::resolve_iri_to_sid`, this returns `None` instead
 /// of an error — missing config predicates are normal (unconfigured fields).
 fn try_encode(snapshot: &LedgerSnapshot, iri: &str) -> Option<Sid> {
+    #[cfg(test)]
+    crate::config_vocab::read_recorder::note(iri);
     snapshot.encode_iri(iri)
 }
 
@@ -1285,6 +1351,20 @@ fn warn_degenerate_config(pointer_iri: &str) {
              using the non-empty group whose IRI sorts lowest (see ledger info \
              configDiagnostics)"
         );
+    }
+}
+
+/// Log a config node the reader skips at most once per thousand occurrences:
+/// the config is resolved on every transaction, so an unthrottled warning
+/// would repeat on every write. [`diagnose`] reports it on demand (ledger
+/// info `configDiagnostics`).
+fn warn_degenerate_node(what: &'static str) {
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if SEEN
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .is_multiple_of(1000)
+    {
+        tracing::warn!("{what} (see ledger info configDiagnostics)");
     }
 }
 
@@ -2098,7 +2178,7 @@ async fn read_fulltext_fields(
                 match target {
                     Some(iri) => properties.push(FullTextProperty { target: iri }),
                     None => {
-                        tracing::warn!("FullTextProperty node without f:target — skipping");
+                        warn_degenerate_node("FullTextProperty node without f:target — skipping");
                     }
                 }
             }
@@ -2152,7 +2232,7 @@ async fn read_single_graph_config(
         match read_iri_field(snapshot, overlay, to_t, gc_sid, config_iris::TARGET_GRAPH).await? {
             Some(iri) => iri,
             None => {
-                tracing::warn!("GraphConfig without f:targetGraph — skipping");
+                warn_degenerate_node("GraphConfig without f:targetGraph — skipping");
                 return Ok(None);
             }
         };

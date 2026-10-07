@@ -1566,92 +1566,284 @@ async fn transaction_is_guarded_on_its_result() {
     assert!(message.contains("f:shaclEnabled"), "{message}");
 }
 
-/// The repair recipe (`docs/ledger-config/writing-config.md`) for a config
-/// split by #1979: it moves the stranded group fields into the config graph
-/// in one transaction, which the config guard accepts, and enforcement
-/// returns.
+/// The repair recipe exactly as `docs/ledger-config/writing-config.md` gives
+/// it, for the ledger whose config graph is `config_graph`.
+#[cfg(feature = "shacl")]
+fn docs_repair_recipe(config_graph: &str) -> String {
+    let doc = include_str!("../../docs/ledger-config/writing-config.md");
+    let section = doc
+        .split_once("## Repairing a config split across graphs")
+        .expect("the repair section")
+        .1;
+    let recipe = section
+        .split_once("```sparql")
+        .and_then(|(_, rest)| rest.split_once("```"))
+        .expect("the recipe")
+        .0;
+    recipe.replace("urn:fluree:mydb:main#config", config_graph)
+}
+
+/// The repair recipe (`docs/ledger-config/writing-config.md`, run as the docs
+/// give it) restores each config the pre-fix JSON-LD parser could split
+/// across graphs: a setting group's fields in the default graph; the config
+/// subject's own group link and group there; a per-graph override's target
+/// and groups there; and a group partly in the config graph. Before the
+/// repair each reads without its SHACL setting (the forbidden record
+/// commits) and ledger info reports `stranded-fields`; after it, nothing is
+/// stranded and SHACL enforces again.
 #[cfg(feature = "shacl")]
 #[tokio::test]
 async fn repair_recipe_restores_a_split_config() {
+    let shape = json!({
+        "@id": "ex:PersonShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Person"},
+        "sh:property": [{"sh:path": {"@id": "ex:name"}, "sh:minCount": 1}]
+    });
+    let cases: Vec<(&str, Option<&str>, Vec<serde_json::Value>)> = vec![
+        (
+            "a group's fields in the default graph",
+            None,
+            vec![
+                json!({"@id": "urn:config:main", "@type": "f:LedgerConfig", "@graph": "config",
+                       "f:shaclDefaults": {"@id": "urn:config:shacl"}}),
+                json!({"@id": "urn:config:shacl", "f:shaclEnabled": true,
+                       "f:validationMode": {"@id": "f:ValidationReject"}}),
+            ],
+        ),
+        (
+            "the config subject's group link and group in the default graph",
+            None,
+            vec![
+                json!({"@id": "urn:config:main", "@type": "f:LedgerConfig", "@graph": "config"}),
+                json!({"@id": "urn:config:main", "f:shaclDefaults": {"@id": "urn:config:shacl"}}),
+                json!({"@id": "urn:config:shacl", "f:shaclEnabled": true}),
+            ],
+        ),
+        (
+            "a per-graph override's target and group in the default graph",
+            Some("ex:g"),
+            vec![
+                json!({"@id": "urn:config:main", "@type": "f:LedgerConfig", "@graph": "config",
+                       "f:graphOverrides": {"@id": "urn:config:g"}}),
+                json!({"@id": "urn:config:g", "@type": "f:GraphConfig",
+                       "f:targetGraph": {"@id": "ex:g"},
+                       "f:shaclDefaults": {"@id": "urn:config:gshacl"}}),
+                json!({"@id": "urn:config:gshacl", "f:shaclEnabled": true}),
+            ],
+        ),
+        (
+            "a group partly in the config graph",
+            None,
+            vec![
+                json!({"@id": "urn:config:main", "@type": "f:LedgerConfig", "@graph": "config",
+                       "f:shaclDefaults": {"@id": "urn:config:shacl"}}),
+                json!({"@id": "urn:config:shacl", "@graph": "config",
+                       "f:validationMode": {"@id": "f:ValidationReject"}}),
+                json!({"@id": "urn:config:shacl", "f:shaclEnabled": true}),
+            ],
+        ),
+    ];
+    for (i, (what, data_graph, config)) in cases.into_iter().enumerate() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger_id = format!("it/config-repair-recipe-{i}:main");
+        let cfg = config_graph_iri(&ledger_id);
+        let forbidden = |id: &str| {
+            let mut doc =
+                json!({"@context": {"ex": "http://example.org/"}, "@id": id, "@type": "ex:Person"});
+            if let Some(g) = data_graph {
+                doc["@graph"] = json!(g);
+            }
+            doc
+        };
+        let mut seed = vec![shape.clone()];
+        seed.extend(config);
+        // The state as the pre-fix parser (and writes before the config guard)
+        // left it, seeded unchecked, as that history reaches a ledger.
+        let ledger = commit_unchecked(
+            &fluree,
+            genesis_ledger(&fluree, &ledger_id),
+            &json!({
+                "@context": {
+                    "f": "https://ns.flur.ee/db#",
+                    "sh": "http://www.w3.org/ns/shacl#",
+                    "ex": "http://example.org/"
+                },
+                "@graph": seed
+            }),
+        )
+        .await;
+        assert!(
+            config_diagnostic_codes(&fluree, &ledger_id)
+                .await
+                .contains(&"stranded-fields".to_string()),
+            "{what}: reported before the repair"
+        );
+        let ledger = fluree
+            .insert(ledger, &forbidden("ex:before"))
+            .await
+            .unwrap_or_else(|e| panic!("{what}: the split setting is not in effect: {e}"))
+            .ledger;
+
+        let ledger = sparql_update(&fluree, ledger, &docs_repair_recipe(&cfg))
+            .await
+            .unwrap_or_else(|e| panic!("{what}: the repair recipe commits: {e}"))
+            .ledger;
+
+        assert!(
+            !config_diagnostic_codes(&fluree, &ledger_id)
+                .await
+                .contains(&"stranded-fields".to_string()),
+            "{what}: nothing stranded after the repair"
+        );
+        let err = fluree
+            .insert(ledger, &forbidden("ex:after"))
+            .await
+            .expect_err(what);
+        assert!(
+            matches!(
+                err,
+                fluree_db_api::ApiError::Transact(
+                    fluree_db_transact::TransactError::ShaclViolation(_)
+                )
+            ),
+            "{what}: {err:?}"
+        );
+    }
+}
+
+/// Fields of the ledger's config subject belong in the config graph like a
+/// group's: written without it (JSON-LD with no `@graph`, SPARQL `INSERT
+/// DATA` with no `GRAPH`), they would never be read, so the write is
+/// refused, naming the config subject and the config graph. So is typing a
+/// subject `f:LedgerConfig` in the config graph whose config fields already
+/// sit in another graph.
+#[tokio::test]
+async fn config_guard_refuses_fields_of_the_config_subject_outside_the_config_graph() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/config-repair-recipe:main";
-    let cfg = config_graph_iri(ledger_id);
-    let forbidden = |id: &str| json!({"@context": {"ex": "http://example.org/"}, "@id": id, "@type": "ex:Person"});
-    // The #1979 state as the pre-fix parser wrote it: the config node and its
-    // f:shaclDefaults edge in the config graph, the group's fields in the
-    // default graph. Seeded unchecked, as that history reaches a ledger.
-    let ledger = commit_unchecked(
+    for (i, form) in ["jsonld", "sparql"].into_iter().enumerate() {
+        let name = format!("it/config-guard-root-{i}");
+        fluree.create_ledger(&name).await.unwrap();
+        let ledger_id = format!("{name}:main");
+        let cfg = config_graph_iri(&ledger_id);
+        let root = format!("urn:fluree:{ledger_id}:config:ledger");
+        fluree
+            .graph(&ledger_id)
+            .transact()
+            .upsert_turtle(&format!(
+                "@prefix f: <https://ns.flur.ee/db#> . GRAPH <{cfg}> {{ <{root}> a f:LedgerConfig . }}"
+            ))
+            .commit()
+            .await
+            .expect("the config subject");
+        let result = if form == "jsonld" {
+            fluree
+                .graph(&ledger_id)
+                .transact()
+                .insert(&json!({
+                    "@context": {"f": "https://ns.flur.ee/db#"},
+                    "@id": root,
+                    "f:shaclDefaults": {"f:shaclEnabled": true}
+                }))
+                .commit()
+                .await
+        } else {
+            fluree
+                .graph(&ledger_id)
+                .transact()
+                .sparql_update(&format!(
+                    "PREFIX f: <https://ns.flur.ee/db#>
+                     INSERT DATA {{ <{root}> f:shaclDefaults <urn:x:shacl> .
+                                    <urn:x:shacl> f:shaclEnabled true . }}"
+                ))
+                .commit()
+                .await
+        };
+        let message = config_guard_refusal(result.expect_err(form));
+        assert!(
+            message.contains("config subject") && message.contains(&cfg),
+            "{form}: {message}"
+        );
+    }
+
+    // The reverse order: the fields first (no config yet), then the typing.
+    let name = "it/config-guard-root-late";
+    fluree.create_ledger(name).await.unwrap();
+    let ledger_id = format!("{name}:main");
+    let cfg = config_graph_iri(&ledger_id);
+    fluree
+        .graph(&ledger_id)
+        .transact()
+        .insert(&json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "@id": "urn:config:main",
+            "f:shaclDefaults": {"@id": "urn:config:shacl"}
+        }))
+        .commit()
+        .await
+        .expect("an f: field on a subject that is not config yet is data");
+    let err = fluree
+        .graph(&ledger_id)
+        .transact()
+        .upsert_turtle(&format!(
+            "@prefix f: <https://ns.flur.ee/db#> . GRAPH <{cfg}> {{ <urn:config:main> a f:LedgerConfig . }}"
+        ))
+        .commit()
+        .await
+        .expect_err("typing it in the config graph would leave its group link outside");
+    let message = config_guard_refusal(err);
+    assert!(message.contains("already has fields"), "{message}");
+}
+
+/// Ledger info reports every config node with config fields outside the
+/// config graph, not only empty groups: a per-graph override whose target and
+/// groups were written to the default graph (reported, with the override the
+/// reader skips for want of a target), and a group partly in the config
+/// graph.
+#[tokio::test]
+async fn diagnostics_report_every_stranded_config_node() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-diagnostics-override:main";
+    commit_unchecked(
         &fluree,
         genesis_ledger(&fluree, ledger_id),
         &json!({
-            "@context": {
-                "f": "https://ns.flur.ee/db#",
-                "sh": "http://www.w3.org/ns/shacl#",
-                "ex": "http://example.org/"
-            },
+            "@context": {"f": "https://ns.flur.ee/db#", "ex": "http://example.org/"},
             "@graph": [
-                {
-                    "@id": "ex:PersonShape",
-                    "@type": "sh:NodeShape",
-                    "sh:targetClass": {"@id": "ex:Person"},
-                    "sh:property": [{"sh:path": {"@id": "ex:name"}, "sh:minCount": 1}]
-                },
-                {
-                    "@id": "urn:config:main",
-                    "@type": "f:LedgerConfig",
-                    "@graph": "config",
-                    "f:shaclDefaults": {"@id": "urn:config:shacl"}
-                },
-                {
-                    "@id": "urn:config:shacl",
-                    "f:shaclEnabled": true,
-                    "f:validationMode": {"@id": "f:ValidationReject"}
-                }
+                {"@id": "urn:config:main", "@type": "f:LedgerConfig", "@graph": "config",
+                 "f:graphOverrides": {"@id": "urn:config:g"}},
+                {"@id": "urn:config:g", "@type": "f:GraphConfig",
+                 "f:targetGraph": {"@id": "ex:g"},
+                 "f:shaclDefaults": {"@id": "urn:config:gshacl"}},
+                {"@id": "urn:config:gshacl", "f:shaclEnabled": true}
             ]
         }),
     )
     .await;
-    let ledger = fluree
-        .insert(ledger, &forbidden("ex:before"))
-        .await
-        .expect("the split group reads as empty, so SHACL is off")
-        .ledger;
+    assert_eq!(
+        config_diagnostic_codes(&fluree, ledger_id).await,
+        ["empty-group", "stranded-fields"]
+    );
 
-    let ledger = sparql_update(
+    let ledger_id = "it/config-diagnostics-partial:main";
+    commit_unchecked(
         &fluree,
-        ledger,
-        &format!(
-            "PREFIX f: <https://ns.flur.ee/db#>
-             DELETE {{ ?n ?p ?o }}
-             INSERT {{ GRAPH <{cfg}> {{ ?n ?p ?o }} }}
-             WHERE {{
-               GRAPH <{cfg}> {{ ?parent ?edge ?root }}
-               VALUES ?edge {{ f:policyDefaults f:shaclDefaults f:reasoningDefaults
-                              f:datalogDefaults f:transactDefaults f:fullTextDefaults
-                              f:servingDefaults f:queryDefaults f:graphOverrides }}
-               ?root (f:overrideControl|f:shapesSource|f:policySource|f:schemaSource|
-                      f:rulesSource|f:constraintsSource|f:graphSource|f:trustPolicy|
-                      f:rollbackGuard|f:ontologyImportMap|f:graphRef|f:property|
-                      f:shaclDefaults|f:policyDefaults|f:reasoningDefaults|
-                      f:datalogDefaults|f:transactDefaults|f:fullTextDefaults)* ?n .
-               ?n ?p ?o .
-             }}"
-        ),
+        genesis_ledger(&fluree, ledger_id),
+        &json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "@graph": [
+                {"@id": "urn:config:main", "@type": "f:LedgerConfig", "@graph": "config",
+                 "f:shaclDefaults": {"@id": "urn:config:shacl"}},
+                {"@id": "urn:config:shacl", "@graph": "config",
+                 "f:validationMode": {"@id": "f:ValidationReject"}},
+                {"@id": "urn:config:shacl", "f:shaclEnabled": true}
+            ]
+        }),
     )
-    .await
-    .expect("the repair recipe commits")
-    .ledger;
-
-    let err = fluree
-        .insert(ledger, &forbidden("ex:after"))
-        .await
-        .expect_err("repaired: SHACL enforces again");
-    assert!(
-        matches!(
-            err,
-            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
-        ),
-        "{err:?}"
+    .await;
+    assert_eq!(
+        config_diagnostic_codes(&fluree, ledger_id).await,
+        ["stranded-fields"]
     );
 }
 

@@ -387,7 +387,7 @@ pub(crate) struct FastForwardBase {
 }
 
 /// Whether the adopted change carries anything the staged-config guard
-/// checks on a branch operation: a config field ([`crate::config_guard::is_config_field`],
+/// checks on a branch operation: a config field ([`crate::config_vocab::is_config_field`],
 /// the config reader's vocabulary), a type in the `f:` vocabulary, or a
 /// write to the target's config graph. Every refusal the guard can make needs
 /// one of them, so a change without any (data, edge annotations included) is
@@ -408,7 +408,7 @@ fn carries_config_settings(
         Err(_) => return true,
     };
     data.flakes.iter().any(|flake| {
-        crate::config_guard::is_config_field(&flake.p)
+        crate::config_vocab::is_config_field(&flake.p)
             || (flake.p.namespace_code == RDF
                 && &*flake.p.name == fluree_vocab::rdf_names::TYPE
                 && matches!(&flake.o, fluree_db_core::FlakeValue::Ref(o)

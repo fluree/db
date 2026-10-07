@@ -238,24 +238,32 @@ A transaction that writes only the config graph is never validated against SHACL
 
 ## Repairing a config split across graphs
 
-Before this release, a JSON-LD config written with nested setting groups (the form in [Writing via JSON-LD](#writing-via-json-ld)) put the groups' fields in the default graph, where the config reader never looks. The group reads as empty, so the setting it held is off: for a policy group, `f:defaultAllow false` is lost and anonymous reads and writes are open; for a SHACL group, validation is off. Ledger info reports such configs as `empty-group` and `stranded-fields` diagnostics.
+Before this release, a JSON-LD config written with nested setting groups (the form in [Writing via JSON-LD](#writing-via-json-ld)) put the groups' fields in the default graph, where the config reader never looks. The group reads as empty, so the setting it held is off: for a policy group, `f:defaultAllow false` is lost and anonymous reads and writes are open; for a SHACL group, validation is off. The same holds for fields written on the config subject itself without the config graph (a `f:shaclDefaults` link, say), and for a per-graph override whose `f:targetGraph` and groups were written there. Ledger info reports such configs as `empty-group` and `stranded-fields` diagnostics.
 
-This SPARQL moves the stranded fields into the config graph in one transaction, restoring exactly what was written. Run it with `SELECT ?n ?p ?o` in place of the `DELETE`/`INSERT` first to see what it will move. It covers fields in the default graph; for another graph, wrap the last two patterns in `GRAPH <g> { }`.
+This SPARQL moves the stranded fields into the config graph in one transaction, restoring exactly what was written. It starts from the config subject and from every node a config edge in the config graph points at, and follows config edges (and the RDF lists `f:reasoningModes` may hold) through the default graph. Run it with `SELECT ?n ?p ?o` in place of the `DELETE`/`INSERT` first to see what it will move. It covers fields in the default graph; for another graph, wrap the last two patterns in `GRAPH <g> { }`.
 
 ```sparql
 PREFIX f: <https://ns.flur.ee/db#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 
 DELETE { ?n ?p ?o }
 INSERT { GRAPH <urn:fluree:mydb:main#config> { ?n ?p ?o } }
 WHERE {
-  GRAPH <urn:fluree:mydb:main#config> { ?parent ?edge ?root }
-  VALUES ?edge { f:policyDefaults f:shaclDefaults f:reasoningDefaults f:datalogDefaults
-                 f:transactDefaults f:fullTextDefaults f:servingDefaults f:queryDefaults
-                 f:graphOverrides }
-  ?root (f:overrideControl|f:shapesSource|f:policySource|f:schemaSource|f:rulesSource|
-         f:constraintsSource|f:graphSource|f:trustPolicy|f:rollbackGuard|f:ontologyImportMap|
-         f:graphRef|f:property|f:shaclDefaults|f:policyDefaults|f:reasoningDefaults|
-         f:datalogDefaults|f:transactDefaults|f:fullTextDefaults)* ?n .
+  {
+    GRAPH <urn:fluree:mydb:main#config> { ?root a f:LedgerConfig }
+  } UNION {
+    GRAPH <urn:fluree:mydb:main#config> { ?parent ?edge ?root }
+    VALUES ?edge { f:policyDefaults f:shaclDefaults f:reasoningDefaults f:datalogDefaults
+                   f:transactDefaults f:fullTextDefaults f:servingDefaults f:queryDefaults
+                   f:graphOverrides f:overrideControl f:shapesSource f:policySource
+                   f:schemaSource f:rulesSource f:constraintsSource f:graphSource
+                   f:trustPolicy f:rollbackGuard f:ontologyImportMap f:graphRef f:property }
+  }
+  ?root (f:policyDefaults|f:shaclDefaults|f:reasoningDefaults|f:datalogDefaults|
+         f:transactDefaults|f:fullTextDefaults|f:servingDefaults|f:queryDefaults|
+         f:graphOverrides|f:overrideControl|f:shapesSource|f:policySource|f:schemaSource|
+         f:rulesSource|f:constraintsSource|f:graphSource|f:trustPolicy|f:rollbackGuard|
+         f:ontologyImportMap|f:graphRef|f:property|f:reasoningModes|rdf:rest)* ?n .
   ?n ?p ?o .
 }
 ```

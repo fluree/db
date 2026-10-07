@@ -23,6 +23,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use crate::config_vocab::{is_config_field, CONFIG_CLASSES, CONFIG_EDGES, SINGLE_VALUED};
 use fluree_db_core::graph_registry::{config_graph_iri, CONFIG_GRAPH_ID};
 use fluree_db_core::{
     range_with_overlay, Flake, FlakeValue, GraphId, IndexType, RangeMatch, RangeOptions, RangeTest,
@@ -32,111 +33,7 @@ use fluree_db_ledger::StagedLedger;
 use fluree_db_transact::{NamespaceRegistry, TransactError};
 use fluree_vocab::config_iris;
 use fluree_vocab::namespaces::{FLUREE_DB, RDF};
-use rustc_hash::{FxHashMap, FxHashSet};
-use std::sync::OnceLock;
-
-/// Edges from a config node to another config node. The node an edge points
-/// at is part of the configuration, so its fields belong in the config graph
-/// with the edge.
-const CONFIG_EDGES: &[&str] = &[
-    config_iris::POLICY_DEFAULTS,
-    config_iris::SHACL_DEFAULTS,
-    config_iris::REASONING_DEFAULTS,
-    config_iris::DATALOG_DEFAULTS,
-    config_iris::TRANSACT_DEFAULTS,
-    config_iris::FULL_TEXT_DEFAULTS,
-    config_iris::SERVING_DEFAULTS,
-    config_iris::QUERY_DEFAULTS,
-    config_iris::GRAPH_OVERRIDES,
-    config_iris::OVERRIDE_CONTROL,
-    config_iris::SHAPES_SOURCE,
-    config_iris::POLICY_SOURCE,
-    config_iris::SCHEMA_SOURCE,
-    config_iris::RULES_SOURCE,
-    config_iris::CONSTRAINTS_SOURCE,
-    config_iris::GRAPH_SOURCE,
-    config_iris::TRUST_POLICY_PRED,
-    config_iris::ROLLBACK_GUARD,
-    config_iris::ONTOLOGY_IMPORT_MAP,
-    config_iris::GRAPH_REF_PROP,
-    config_iris::FULL_TEXT_PROPERTY,
-];
-
-/// Config predicates the reader takes a single value of.
-const SINGLE_VALUED: &[&str] = &[
-    config_iris::POLICY_DEFAULTS,
-    config_iris::SHACL_DEFAULTS,
-    config_iris::REASONING_DEFAULTS,
-    config_iris::DATALOG_DEFAULTS,
-    config_iris::TRANSACT_DEFAULTS,
-    config_iris::FULL_TEXT_DEFAULTS,
-    config_iris::SERVING_DEFAULTS,
-    config_iris::QUERY_DEFAULTS,
-    config_iris::DEFAULT_ALLOW,
-    config_iris::POLICY_SOURCE,
-    config_iris::SHACL_ENABLED,
-    config_iris::SHAPES_SOURCE,
-    config_iris::VALIDATION_MODE,
-    config_iris::OVERRIDE_CONTROL,
-    config_iris::CONTROL_MODE,
-    config_iris::SCHEMA_SOURCE,
-    config_iris::FOLLOW_OWL_IMPORTS,
-    config_iris::REASONING_MAX_FACTS,
-    config_iris::REASONING_MAX_SECONDS,
-    config_iris::REASONING_MAX_MEMORY_MB,
-    config_iris::DATALOG_ENABLED,
-    config_iris::RULES_SOURCE,
-    config_iris::ALLOW_QUERY_TIME_RULES,
-    config_iris::SERVE_QUERY,
-    config_iris::SERVE_BLOCKS,
-    config_iris::PUBLIC_VISIBILITY,
-    config_iris::UNION_DEFAULT_GRAPH,
-    config_iris::UNIQUE_ENABLED,
-    config_iris::DEFAULT_LANGUAGE,
-    config_iris::TARGET_GRAPH,
-    config_iris::GRAPH_SOURCE,
-    config_iris::LEDGER_PRED,
-    config_iris::GRAPH_SELECTOR,
-    config_iris::AT_T,
-    config_iris::TRUST_POLICY_PRED,
-    config_iris::TRUST_MODE,
-    config_iris::ROLLBACK_GUARD,
-    config_iris::MIN_T,
-    config_iris::ONTOLOGY_IRI,
-    config_iris::GRAPH_REF_PROP,
-    config_iris::FULL_TEXT_TARGET,
-];
-
-/// Config predicates the reader takes several values of.
-const MULTI_VALUED: &[&str] = &[
-    fluree_vocab::policy_iris::POLICY_CLASS,
-    config_iris::REASONING_MODES,
-    config_iris::ALLOWED_IDENTITIES,
-];
-
-/// Whether `p` is a predicate the config reader reads: a group pointer or
-/// source edge ([`CONFIG_EDGES`]), a single-valued setting
-/// ([`SINGLE_VALUED`]) or a multi-valued one ([`MULTI_VALUED`]). Only these
-/// are a config group's fields. Other `f:` predicates written to a user
-/// graph are data (an edge annotation's `f:reifies*`, a property's
-/// `f:enforceUnique`, a policy), so writing them reads no config.
-pub(crate) fn is_config_field(p: &Sid) -> bool {
-    static FIELDS: OnceLock<FxHashSet<&'static str>> = OnceLock::new();
-    p.namespace_code == FLUREE_DB
-        && FIELDS
-            .get_or_init(|| {
-                CONFIG_EDGES
-                    .iter()
-                    .chain(SINGLE_VALUED)
-                    .chain(MULTI_VALUED)
-                    .map(|iri| {
-                        iri.strip_prefix(fluree_vocab::fluree::DB)
-                            .expect("a Fluree vocabulary IRI")
-                    })
-                    .collect()
-            })
-            .contains(&*p.name)
-}
+use rustc_hash::FxHashMap;
 
 /// Maximum RDF-list length walked when validating a staged `f:reasoningModes`
 /// collection — a malformed cyclic list must not spin.
@@ -169,23 +66,77 @@ impl From<TransactError> for GuardError {
     }
 }
 
+/// Why a node is part of the configuration, so that its fields belong in
+/// the config graph: it is the value of a config edge there, or a subject
+/// typed `f:LedgerConfig` / `f:GraphConfig` there.
+#[derive(Clone, Debug)]
+enum Link {
+    Edge(Sid),
+    Typed(Sid),
+}
+
+impl Link {
+    /// "config group X (the value of f:p in the config graph)", or
+    /// "config subject X (typed f:LedgerConfig in the config graph)".
+    fn node(&self, names: &Names<'_>, node: &Sid) -> String {
+        match self {
+            Link::Edge(edge) => format!(
+                "config group {} (the value of {} in the config graph)",
+                names.term(node),
+                names.term(edge)
+            ),
+            Link::Typed(class) => format!(
+                "config subject {} (typed {} in the config graph)",
+                names.term(node),
+                names.term(class)
+            ),
+        }
+    }
+}
+
+/// The links a staged flake in the config graph makes: `Some((node, link))`
+/// for an asserted or retracted config edge or config typing.
+fn link_of<'f>(
+    flake: &'f Flake,
+    edges: &[Sid],
+    classes: &[Sid],
+    rdf_type: &Sid,
+) -> Option<(&'f Sid, Link)> {
+    let FlakeValue::Ref(object) = &flake.o else {
+        return None;
+    };
+    if edges.contains(&flake.p) {
+        Some((object, Link::Edge(flake.p.clone())))
+    } else if flake.p == *rdf_type && classes.contains(object) {
+        Some((&flake.s, Link::Typed(object.clone())))
+    } else {
+        None
+    }
+}
+
+fn config_link_terms() -> (Vec<Sid>, Vec<Sid>, Sid) {
+    (
+        CONFIG_EDGES.iter().map(|iri| fluree_sid(iri)).collect(),
+        CONFIG_CLASSES.iter().map(|iri| fluree_sid(iri)).collect(),
+        Sid::new(RDF, fluree_vocab::rdf_names::TYPE),
+    )
+}
+
 /// What a branch operation is told when it would split one of the target's
-/// config groups: the group, and the repair. Never the graph the fields would
+/// config nodes: the node, and the repair. Never the graph the fields would
 /// land in.
 fn split_group_for_branch_op(
     names: &Names<'_>,
     op: &str,
     node: &Sid,
-    edge: &Sid,
+    link: &Link,
     fields: &str,
 ) -> String {
     format!(
-        "config group {} (the value of {} in the config graph) would have fields {} outside \
-         the config graph, where they are not read; a {op} may not split a config group: \
-         repair the configuration first (see \"Repairing a config split across graphs\" in \
-         the ledger config docs)",
-        names.term(node),
-        names.term(edge),
+        "{} would have fields {} outside the config graph, where they are not read; a {op} \
+         may not split a config group: repair the configuration first (see \"Repairing a \
+         config split across graphs\" in the ledger config docs)",
+        link.node(names, node),
         fields,
     )
 }
@@ -193,10 +144,10 @@ fn split_group_for_branch_op(
 /// Check what a staged transaction writes into the ledger config.
 ///
 /// Refuses (a transaction gets the message as a `Parse error`):
-/// - a config group split across graphs: a config edge written into the
-///   config graph whose target node gets its config fields
-///   ([`is_config_field`]) in another graph, in this transaction or across
-///   two;
+/// - a config group split across graphs: a config node (the value of a
+///   config edge in the config graph, or a subject typed `f:LedgerConfig` /
+///   `f:GraphConfig` there) that gets config fields ([`is_config_field`]) in
+///   another graph, in this transaction or across two;
 /// - an `f:LedgerConfig` or `f:GraphConfig` typed outside the config graph,
 ///   which has no effect;
 /// - a second value for a single-valued config setting, or a second
@@ -296,23 +247,24 @@ fn refuse_config_typed_outside_config_graph(
     Ok(())
 }
 
-/// A config edge written into the config graph whose target node gets `f:`
-/// fields in another graph: the reader sees the group without them.
+/// A config node this transaction links in the config graph (a config edge
+/// to it, or its typing as `f:LedgerConfig` / `f:GraphConfig`) whose config
+/// fields it writes to another graph: the reader sees the node without them.
 fn refuse_split_groups(
     view: &StagedLedger,
     names: &Names<'_>,
     scope: GuardScope,
 ) -> Result<(), GuardError> {
-    let edges: Vec<Sid> = CONFIG_EDGES.iter().map(|iri| fluree_sid(iri)).collect();
-    let mut groups: HashMap<&Sid, &Sid> = HashMap::new();
+    let (edges, classes, rdf_type) = config_link_terms();
+    let mut nodes: HashMap<&Sid, Link> = HashMap::new();
     for (g_id, flake) in view.staged_flakes_by_graph() {
-        if flake.op && g_id == CONFIG_GRAPH_ID && edges.contains(&flake.p) {
-            if let FlakeValue::Ref(node) = &flake.o {
-                groups.insert(node, &flake.p);
+        if flake.op && g_id == CONFIG_GRAPH_ID {
+            if let Some((node, link)) = link_of(flake, &edges, &classes, &rdf_type) {
+                nodes.entry(node).or_insert(link);
             }
         }
     }
-    if groups.is_empty() {
+    if nodes.is_empty() {
         return Ok(());
     }
     let mut stray: BTreeMap<(&Sid, GraphId), Vec<&Sid>> = BTreeMap::new();
@@ -320,7 +272,7 @@ fn refuse_split_groups(
         if flake.op
             && g_id != CONFIG_GRAPH_ID
             && is_config_field(&flake.p)
-            && groups.contains_key(&flake.s)
+            && nodes.contains_key(&flake.s)
         {
             stray.entry((&flake.s, g_id)).or_default().push(&flake.p);
         }
@@ -332,54 +284,53 @@ fn refuse_split_groups(
             let fields = fields.into_iter().collect::<Vec<_>>().join(", ");
             Err(GuardError::Refused(match scope {
                 GuardScope::Authoring => format!(
-                    "config group {} (the value of {} in the config graph) has its fields {} in \
-                     {}; a group is read only from the config graph <{}>, so write its fields \
-                     into that graph too",
-                    names.term(node),
-                    names.term(groups[node]),
+                    "{} has its fields {} in {}; config is read only from the config graph \
+                     <{}>, so write its fields into that graph too",
+                    nodes[node].node(names, node),
                     fields,
                     names.graph(g_id),
                     names.config_graph,
                 ),
                 GuardScope::BranchOperation(op) => {
-                    split_group_for_branch_op(names, op, node, groups[node], &fields)
+                    split_group_for_branch_op(names, op, node, &nodes[node], &fields)
                 }
             }))
         }
     }
 }
 
-/// A config group split across transactions, which [`refuse_split_groups`]
+/// A config node split across transactions, which [`refuse_split_groups`]
 /// (seeing only this transaction) cannot catch: config fields
 /// ([`is_config_field`]) this transaction writes outside the config graph for
-/// a node the config graph's edges already point at, or a config edge it
-/// writes into the config graph to a node that already has config fields in
-/// another graph. Either way the reader would see
-/// the group without those fields: a policy group's `f:defaultAllow false`
-/// lost, a SHACL group read as off.
+/// a node the config graph already links (the value of a config edge, or a
+/// subject typed `f:LedgerConfig` / `f:GraphConfig`), or a link it writes
+/// into the config graph to a node that already has config fields in another
+/// graph. Either way the reader would see the node without those fields: a
+/// policy group's `f:defaultAllow false` lost, a SHACL group read as off, the
+/// ledger's config subject without the group it was given.
 ///
 /// Runs only for a transaction that writes the config graph or config
-/// fields in a user graph, and reads only what it needs: the config graph (small)
-/// once, and each new edge target's statements in the user graphs. Fields
-/// this transaction retracts (a repair moving them into the config graph)
-/// do not count.
+/// fields in a user graph, and reads only what it needs: the config graph
+/// (small) once, and each newly linked node's statements in the user graphs.
+/// Fields this transaction retracts (a repair moving them into the config
+/// graph) do not count.
 async fn refuse_groups_split_across_transactions(
     view: &StagedLedger,
     names: &Names<'_>,
     scope: GuardScope,
 ) -> Result<(), GuardError> {
-    let edges: Vec<Sid> = CONFIG_EDGES.iter().map(|iri| fluree_sid(iri)).collect();
-    let mut new_edges: BTreeMap<&Sid, &Sid> = BTreeMap::new();
-    let mut retracted_edges: BTreeSet<(&Sid, &Sid, &Sid)> = BTreeSet::new();
+    let (edges, classes, rdf_type) = config_link_terms();
+    let mut new_links: BTreeMap<&Sid, Link> = BTreeMap::new();
+    let mut unlinked: BTreeSet<(&Sid, &Sid, &FlakeValue)> = BTreeSet::new();
     let mut fields_elsewhere: BTreeMap<(&Sid, GraphId), BTreeSet<&Sid>> = BTreeMap::new();
     let mut retracted_elsewhere: Vec<(GraphId, &Sid, &Sid, &FlakeValue)> = Vec::new();
     for (g_id, flake) in view.staged_flakes_by_graph() {
         if g_id == CONFIG_GRAPH_ID {
-            if let (true, FlakeValue::Ref(node)) = (edges.contains(&flake.p), &flake.o) {
+            if let Some((node, link)) = link_of(flake, &edges, &classes, &rdf_type) {
                 if flake.op {
-                    new_edges.insert(node, &flake.p);
+                    new_links.entry(node).or_insert(link);
                 } else {
-                    retracted_edges.insert((&flake.s, &flake.p, node));
+                    unlinked.insert((&flake.s, &flake.p, &flake.o));
                 }
             }
         } else if is_config_field(&flake.p) && !crate::export::is_system_graph(g_id) {
@@ -401,48 +352,44 @@ async fn refuse_groups_split_across_transactions(
             .join(", ")
     };
 
-    // Fields written elsewhere for a node the config graph already points at.
-    // The config graph is small: its edges are read once, and not at all when
-    // it holds no data (a ledger without config writing `f:policyClass` on an
+    // Fields written elsewhere for a node the config graph already links.
+    // The config graph is small: it is read once, and not at all when it
+    // holds no data (a ledger without config writing `f:policyClass` on an
     // identity).
     let base = view.base();
     if !fields_elsewhere.is_empty()
         && crate::config_resolver::config_graph_may_hold_data(&base.snapshot, &*base.novelty)
     {
-        let mut pointed_at: HashMap<Sid, Sid> = HashMap::new();
+        let mut linked: HashMap<Sid, Link> = HashMap::new();
         for flake in config_graph_flakes(view, RangeMatch::new()).await? {
-            if !edges.contains(&flake.p) {
+            if unlinked.contains(&(&flake.s, &flake.p, &flake.o)) {
                 continue;
             }
-            if let FlakeValue::Ref(node) = &flake.o {
-                if !retracted_edges.contains(&(&flake.s, &flake.p, node)) {
-                    pointed_at.insert(node.clone(), flake.p.clone());
-                }
+            if let Some((node, link)) = link_of(&flake, &edges, &classes, &rdf_type) {
+                linked.entry(node.clone()).or_insert(link);
             }
         }
         for ((node, g_id), fields) in &fields_elsewhere {
-            if let Some(edge) = pointed_at.get(*node) {
+            if let Some(link) = linked.get(*node) {
                 return Err(GuardError::Refused(match scope {
                     GuardScope::Authoring => format!(
-                        "config group {} (the value of {} in the config graph) would get its \
-                         fields {} in {}; a group is read only from the config graph <{}>, so \
-                         write its fields into that graph",
-                        names.term(node),
-                        names.term(edge),
+                        "{} would get its fields {} in {}; config is read only from the config \
+                         graph <{}>, so write its fields into that graph",
+                        link.node(names, node),
                         fields_list(fields),
                         names.graph(*g_id),
                         names.config_graph,
                     ),
                     GuardScope::BranchOperation(op) => {
-                        split_group_for_branch_op(names, op, node, edge, &fields_list(fields))
+                        split_group_for_branch_op(names, op, node, link, &fields_list(fields))
                     }
                 }));
             }
         }
     }
 
-    // A new edge to a node whose fields already sit in another graph.
-    if new_edges.is_empty() {
+    // A new link to a node whose fields already sit in another graph.
+    if new_links.is_empty() {
         return Ok(());
     }
     let registry = &view.base().snapshot.graph_registry;
@@ -450,7 +397,7 @@ async fn refuse_groups_split_across_transactions(
         .chain(registry.iter_entries().map(|(g_id, _)| g_id))
         .filter(|g_id| !crate::export::is_system_graph(*g_id))
         .collect();
-    for (node, edge) in new_edges {
+    for (node, link) in new_links {
         for &g_id in &user_graphs {
             let statements = graph_flakes(
                 view,
@@ -472,17 +419,15 @@ async fn refuse_groups_split_across_transactions(
             if !fields.is_empty() {
                 return Err(GuardError::Refused(match scope {
                     GuardScope::Authoring => format!(
-                        "config group {} (the value of {} written into the config graph) \
-                         already has fields {} in {}; a group is read only from the config \
+                        "{} already has fields {} in {}; config is read only from the config \
                          graph <{}>, so move them into that graph in the same transaction",
-                        names.term(node),
-                        names.term(edge),
+                        link.node(names, node),
                         fields_list(&fields),
                         names.graph(g_id),
                         names.config_graph,
                     ),
                     GuardScope::BranchOperation(op) => {
-                        split_group_for_branch_op(names, op, node, edge, &fields_list(&fields))
+                        split_group_for_branch_op(names, op, node, &link, &fields_list(&fields))
                     }
                 }));
             }
@@ -592,7 +537,10 @@ async fn refuse_second_values(
         if subjects.len() > 1 {
             let listed: Vec<String> = subjects.iter().map(|s| names.term(s)).collect();
             let remedy = match scope {
-                GuardScope::Authoring => "so add settings to the existing subject".to_string(),
+                GuardScope::Authoring => format!(
+                    "so add settings to the existing subject, in the config graph <{}>",
+                    names.config_graph
+                ),
                 GuardScope::BranchOperation(op) => format!(
                     "and a {op} may not add a second one: keep one first (see \"What a config \
                      write is checked for\" in the ledger config docs)"
@@ -769,155 +717,5 @@ impl<'a> Names<'a> {
             Some(iri) => format!("graph <{iri}>"),
             None => format!("graph {g_id}"),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn f(local: &str) -> Sid {
-        Sid::new(FLUREE_DB, local)
-    }
-
-    /// Only predicates the config reader reads are a group's fields. Data in
-    /// the Fluree vocabulary (an edge annotation's `f:reifies*`, a property's
-    /// `f:enforceUnique`, a policy's `f:allow`) is not, so writing it to a
-    /// user graph reads no config.
-    #[test]
-    fn config_fields_are_the_reader_vocabulary() {
-        for field in [
-            "shaclEnabled",
-            "shaclDefaults",
-            "defaultAllow",
-            "policyClass",
-            "reasoningModes",
-            "allowedIdentities",
-            "graphOverrides",
-            "uniqueEnabled",
-            "queryDefaults",
-            "unionDefaultGraph",
-        ] {
-            assert!(is_config_field(&f(field)), "{field}");
-        }
-        for data in [
-            fluree_vocab::db::REIFIES_SUBJECT,
-            fluree_vocab::db::REIFIES_GRAPH,
-            "enforceUnique",
-            "allow",
-        ] {
-            assert!(!is_config_field(&f(data)), "{data}");
-        }
-        assert!(!is_config_field(&Sid::new(RDF, "shaclEnabled")));
-    }
-
-    /// The pointer that names each setting group of a [`LedgerConfig`]
-    /// (`f:graphOverrides` aside: several values, read as overrides). The
-    /// destructure names every field, so a group added to `LedgerConfig`
-    /// stops this compiling until it is listed here, and so reaches the
-    /// checks below.
-    fn setting_group_pointers(
-        config: &fluree_db_core::ledger_config::LedgerConfig,
-    ) -> Vec<(&'static str, bool)> {
-        let fluree_db_core::ledger_config::LedgerConfig {
-            config_id: _,
-            policy,
-            shacl,
-            reasoning,
-            datalog,
-            transact,
-            full_text,
-            serving,
-            query,
-            graph_overrides: _,
-        } = config;
-        vec![
-            (config_iris::POLICY_DEFAULTS, policy.is_some()),
-            (config_iris::SHACL_DEFAULTS, shacl.is_some()),
-            (config_iris::REASONING_DEFAULTS, reasoning.is_some()),
-            (config_iris::DATALOG_DEFAULTS, datalog.is_some()),
-            (config_iris::TRANSACT_DEFAULTS, transact.is_some()),
-            (config_iris::FULL_TEXT_DEFAULTS, full_text.is_some()),
-            (config_iris::SERVING_DEFAULTS, serving.is_some()),
-            (config_iris::QUERY_DEFAULTS, query.is_some()),
-        ]
-    }
-
-    /// Every setting group is a config edge the guard follows (R1), a
-    /// single-valued setting (R3), and a pointer ledger info diagnoses.
-    #[test]
-    fn every_setting_group_is_guarded_and_diagnosed() {
-        let groups = setting_group_pointers(&Default::default());
-        assert_eq!(groups.len(), crate::config_resolver::GROUP_POINTERS.len());
-        for (pointer, _) in groups {
-            assert!(CONFIG_EDGES.contains(&pointer), "{pointer}: a config edge");
-            assert!(SINGLE_VALUED.contains(&pointer), "{pointer}: single-valued");
-            assert!(
-                crate::config_resolver::GROUP_POINTERS.contains(&pointer),
-                "{pointer}: diagnosed"
-            );
-        }
-        assert!(CONFIG_EDGES.contains(&config_iris::GRAPH_OVERRIDES));
-        assert!(!SINGLE_VALUED.contains(&config_iris::GRAPH_OVERRIDES));
-    }
-
-    /// The terms of `fluree_vocab::config_iris` that are not config fields:
-    /// classes, the IRI values a field takes, and `f:enforceUnique`, which
-    /// annotates a property in the data.
-    const NOT_FIELDS: &[&str] = &[
-        config_iris::LEDGER_CONFIG,
-        config_iris::GRAPH_CONFIG,
-        config_iris::GRAPH_REF,
-        config_iris::TRUST_POLICY,
-        config_iris::FULL_TEXT_DEFAULTS_CLASS,
-        config_iris::FULL_TEXT_PROPERTY_CLASS,
-        config_iris::VALIDATION_REJECT,
-        config_iris::VALIDATION_WARN,
-        config_iris::DEFAULT_GRAPH,
-        config_iris::TXN_META_GRAPH,
-        config_iris::TRUSTED,
-        config_iris::SIGNED_INDEX,
-        config_iris::COMMIT_VERIFIED,
-        config_iris::OVERRIDE_NONE,
-        config_iris::OVERRIDE_ALL,
-        config_iris::IDENTITY_RESTRICTED,
-        config_iris::ENFORCE_UNIQUE,
-    ];
-
-    /// Every term `fluree_vocab::config_iris` defines is a config field the
-    /// guard checks (an edge, a single-valued or a multi-valued setting) or
-    /// is listed above as not a field. The terms are read from the vocabulary
-    /// source, so a setting added to any group, or a new group, fails here
-    /// until the guard lists it.
-    #[test]
-    fn every_config_vocabulary_term_is_a_field_or_listed() {
-        let source = include_str!("../../fluree-vocab/src/lib.rs");
-        let module = source
-            .split_once("pub mod config_iris {")
-            .expect("the config_iris module")
-            .1;
-        let module = &module[..module.find("\n}").expect("the module's end")];
-        let terms: Vec<(&str, &str)> = module
-            .lines()
-            .filter_map(|line| {
-                let rest = line.trim().strip_prefix("pub const ")?;
-                let (name, rest) = rest.split_once(": &str = \"")?;
-                Some((name, rest.strip_suffix("\";")?))
-            })
-            .collect();
-        assert!(terms.len() > 50, "read {} config_iris terms", terms.len());
-        let unlisted: Vec<&str> = terms
-            .iter()
-            .filter(|(_, iri)| {
-                ![CONFIG_EDGES, SINGLE_VALUED, MULTI_VALUED, NOT_FIELDS]
-                    .iter()
-                    .any(|list| list.contains(iri))
-            })
-            .map(|(name, _)| *name)
-            .collect();
-        assert!(
-            unlisted.is_empty(),
-            "config_iris terms neither guarded nor listed as non-fields: {unlisted:?}"
-        );
     }
 }

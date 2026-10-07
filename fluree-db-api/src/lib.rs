@@ -45,6 +45,7 @@ mod commit_data;
 pub mod commit_transfer;
 mod config_guard;
 pub mod config_resolver;
+mod config_vocab;
 #[cfg(feature = "credential")]
 pub mod credential;
 pub mod cross_ledger;
