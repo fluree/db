@@ -382,6 +382,61 @@ async fn a_merge_restages_over_a_concurrent_create() {
     );
 }
 
+/// A failed operation leaves the operations before it as they were read:
+/// their blank nodes and the values `STRUUID()` computed don't change.
+#[tokio::test]
+async fn a_failed_operation_keeps_the_values_already_staged() {
+    const ORDER: &str = "SELECT ?item ?token WHERE { ex:order ex:item ?item ; ex:token ?token }";
+    let fluree = fluree().await;
+    let mut txn = begin(&fluree).await;
+    txn.stage(TxnOperation::Insert(json!({
+        "@context": { "ex": "http://example.org/" },
+        "@id": "ex:order", "ex:item": { "ex:sku": "A1" },
+    })))
+    .await
+    .unwrap();
+    txn.stage(TxnOperation::SparqlUpdate(format!(
+        "{PREFIX}INSERT {{ ex:order ex:token ?t }} WHERE {{ BIND(STRUUID() AS ?t) }}"
+    )))
+    .await
+    .unwrap();
+    let staged = select(&fluree, &txn.db().await.unwrap(), ORDER).await;
+    assert_eq!(staged.len(), 1);
+
+    txn.stage(TxnOperation::SparqlUpdate(
+        "INSERT DATA { not sparql".into(),
+    ))
+    .await
+    .expect_err("parse error");
+    assert_eq!(
+        select(&fluree, &txn.db().await.unwrap(), ORDER).await,
+        staged
+    );
+    txn.commit(CommitOpts::default()).await.unwrap();
+    assert_eq!(select(&fluree, &head(&fluree).await, ORDER).await, staged);
+}
+
+/// A Cypher write that staged but whose `RETURN` failed is not added.
+#[tokio::test]
+async fn a_cypher_write_whose_return_fails_is_not_staged() {
+    let fluree = fluree().await;
+    let mut txn = begin(&fluree).await;
+    txn.stage_cypher("UNWIND range(1, 4097) AS i CREATE (:Item {i: i})", None)
+        .await
+        .unwrap();
+    // One row per item: more than a write's RETURN may produce.
+    txn.stage_cypher("MATCH (i:Item) CREATE (c:Copy) RETURN c", None)
+        .await
+        .expect_err("too many RETURN rows");
+    assert_eq!(txn.len(), 1);
+    txn.commit(CommitOpts::default()).await.unwrap();
+    assert_eq!(count(&fluree, "SELECT ?c WHERE { ?c a <Copy> }").await, 0);
+    assert_eq!(
+        count(&fluree, "SELECT ?i WHERE { ?i a <Item> }").await,
+        4097
+    );
+}
+
 /// A transaction staged again over a newer head is checked against the
 /// policy the ledger has now: a deny rule committed while it was open
 /// refuses it.
@@ -463,6 +518,26 @@ async fn a_policy_configured_while_open_applies_to_the_commit() {
     assert!(people(&fluree, &head(&fluree).await).await.is_empty());
 }
 
+/// A rollback stages the operations before the savepoint again, and their
+/// blank nodes keep the identities the caller already read.
+#[tokio::test]
+async fn a_rollback_keeps_the_blank_nodes_staged_before_it() {
+    const ITEM: &str = "SELECT ?item WHERE { ex:order ex:item ?item }";
+    let fluree = fluree().await;
+    let mut txn = begin(&fluree).await;
+    txn.stage(TxnOperation::Insert(json!({
+        "@context": { "ex": "http://example.org/" },
+        "@id": "ex:order", "ex:item": { "ex:sku": "A1" },
+    })))
+    .await
+    .unwrap();
+    let item = select(&fluree, &txn.db().await.unwrap(), ITEM).await;
+    let savepoint = txn.savepoint();
+    txn.stage(insert("bob", "Bob", 40)).await.unwrap();
+    txn.rollback_to(savepoint).await.unwrap();
+    assert_eq!(select(&fluree, &txn.db().await.unwrap(), ITEM).await, item);
+}
+
 fn tracked(max_fuel: Option<u64>) -> TransactionOptions {
     TransactionOptions {
         tracking: TrackingOptions {
@@ -497,7 +572,8 @@ async fn fuel_of_one_insert(fluree: &Fluree) -> f64 {
 }
 
 /// The fuel a transaction's operations use adds up across all of them, so
-/// a limit bounds the transaction as a whole.
+/// a limit bounds the transaction as a whole. An operation that runs out
+/// is not staged, and the transaction carries on without it.
 #[tokio::test]
 async fn fuel_is_tracked_across_the_transaction() {
     let fluree = fluree().await;
@@ -510,6 +586,13 @@ async fn fuel_is_tracked_across_the_transaction() {
     txn.stage(insert("bob", "Bob", 40)).await.unwrap();
     let err = txn.stage(insert("cy", "Cy", 50)).await.unwrap_err();
     assert!(err.to_string().contains("Fuel limit exceeded"), "{err}");
+    assert_eq!(txn.len(), 1);
+    assert_eq!(
+        people(&fluree, &txn.db().await.unwrap()).await,
+        vec![json!(["Bob", 40]), json!(["Zed", 1])]
+    );
+    let tally = txn.commit(CommitOpts::default()).await.unwrap().tally;
+    assert!(tally.and_then(|tally| tally.fuel).expect("fuel") > one);
 }
 
 /// A rollback that fails part way — here, staging the operations before

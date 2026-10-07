@@ -193,8 +193,8 @@ impl SequentialStager {
 
     /// [`Self::stage`] for an operation staged by any staging entry point:
     /// `stage` receives the virtual state and returns its [`StageResult`].
-    /// On an error the virtual state is gone; the stager must not be used
-    /// again.
+    /// A stage that fails, or whose future is dropped, leaves the stager as
+    /// it was.
     pub(crate) async fn stage_with<F, Fut>(&mut self, advance: bool, stage: F) -> Result<usize>
     where
         F: FnOnce(LedgerState) -> Fut,
@@ -202,9 +202,12 @@ impl SequentialStager {
     {
         let state = self
             .current
-            .take()
+            .clone()
             .expect("virtual state consumed by a final non-advancing stage");
         let result = stage(state).await?;
+        // Released before the apply below, whose copy-on-write would
+        // otherwise deep-copy everything this pre-operation state shares.
+        self.current = None;
         // The staged delta, which includes graphs `GRAPH ?g` templates resolved
         // to; needed to advance the virtual state between operations.
         let graph_iris: Vec<String> = result.graph_delta.values().cloned().collect();

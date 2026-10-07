@@ -713,6 +713,12 @@ them — and returns the rows of its `RETURN`, if any. Receiving those rows
 counts as reading the transaction, as `db()` does. Dropping a `Transaction`
 discards it.
 
+`savepoint()` marks the operations staged so far, and `rollback_to(savepoint)`
+discards the ones after it. The operations before the savepoint are staged
+again, so values computed as they stage — `NOW()`, `UUID()`, `STRUUID()`, a
+SPARQL update's blank nodes — can change; JSON-LD, Turtle and Cypher blank
+nodes keep their identities.
+
 ### Export Data
 
 Stream ledger data as Turtle, N-Triples, N-Quads, TriG, or JSON-LD using the builder API:
