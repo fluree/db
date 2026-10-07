@@ -275,6 +275,10 @@ pub(crate) mod tests {
             self.inner.permits_plaintext_cache()
         }
 
+        fn is_remote(&self) -> bool {
+            self.inner.is_remote()
+        }
+
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             self.inner.has(id).await
         }
@@ -421,6 +425,10 @@ pub(crate) mod tests {
     impl ContentStore for NonPinningStore {
         fn permits_plaintext_cache(&self) -> bool {
             self.inner.permits_plaintext_cache()
+        }
+
+        fn is_remote(&self) -> bool {
+            self.inner.is_remote()
         }
 
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {

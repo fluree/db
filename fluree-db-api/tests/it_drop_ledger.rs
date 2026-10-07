@@ -71,6 +71,60 @@ async fn drop_ledger_soft_mode_retracts_only() {
     assert!(!files.is_empty(), "Commit files should remain in soft mode");
 }
 
+/// The edge-annotation arenas have no storage layout of their own and land
+/// under the branch's `blob/` prefix; a hard drop must take them too.
+#[tokio::test]
+async fn hard_drop_removes_annotation_arenas_under_blob() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+    let ledger_id = "drop-blob-test:main";
+    let ledger = LedgerState::new(LedgerSnapshot::genesis(ledger_id), Novelty::new(0));
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {"@id": "ex:emp/alice-acme", "ex:role": "Engineer"}
+                }
+            }),
+        )
+        .await
+        .expect("insert");
+    fluree
+        .reindex(ledger_id, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    let storage = fluree.admin_storage().expect("managed backend");
+    let blob_prefix = format!(
+        "fluree:file://{}/blob/",
+        ledger_id_to_path_prefix(ledger_id).unwrap()
+    );
+    assert!(
+        !storage
+            .list_prefix(&blob_prefix)
+            .await
+            .expect("list")
+            .is_empty(),
+        "the reindex should have sealed an annotation arena under blob/"
+    );
+
+    fluree
+        .drop_ledger("drop-blob-test", DropMode::Hard)
+        .await
+        .expect("drop");
+    let left = storage.list_prefix(&blob_prefix).await.expect("list");
+    assert!(
+        left.is_empty(),
+        "hard drop left files under blob/: {left:?}"
+    );
+}
+
 /// Test that hard drop deletes all files and retracts from nameservice.
 #[tokio::test]
 async fn drop_ledger_hard_mode_deletes_files() {

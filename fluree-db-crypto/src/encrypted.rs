@@ -266,6 +266,10 @@ where
         false
     }
 
+    fn is_remote(&self) -> bool {
+        self.inner.is_remote()
+    }
+
     fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>> {
         Some(Arc::new(self.clone()))
     }

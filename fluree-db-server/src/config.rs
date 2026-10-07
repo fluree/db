@@ -489,7 +489,7 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_GC_MAX_OLD_INDEXES")]
     pub gc_max_old_indexes: Option<u32>,
 
-    /// Minimum age in minutes before an index version can be GC'd (default 30)
+    /// Minimum age in minutes before an index version can be GC'd (default 15)
     ///
     /// Protects queries that started against an older version. This is ANDed
     /// with `--gc-max-old-indexes`, so the slower of the two wins.

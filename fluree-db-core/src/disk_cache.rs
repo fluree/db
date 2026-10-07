@@ -768,8 +768,37 @@ impl DiskArtifactCache {
     }
 }
 
-pub fn best_effort_cache_bytes_to_path(cache_dir: &Path, target: &Path, bytes: &[u8]) {
-    DiskArtifactCache::for_dir(cache_dir).best_effort_write(target, bytes);
+/// Whether `cs`'s artifacts belong in the disk cache at all.
+///
+/// The rule every reader and writer of the cache follows. A local copy pays
+/// off only when the store's reads leave the machine — a store on local disk
+/// or in memory is already as fast as the cache would be — and is allowed
+/// only when the store's bytes may sit outside it in plaintext.
+pub fn uses_disk_cache(cs: &dyn ContentStore) -> bool {
+    cs.is_remote() && cs.permits_plaintext_cache()
+}
+
+/// Whether a copy of `id` belongs in the disk cache: [`uses_disk_cache`],
+/// and the store does not already hold it as a local file (a remote store's
+/// local tier).
+pub fn needs_disk_copy(cs: &dyn ContentStore, id: &ContentId) -> bool {
+    uses_disk_cache(cs) && cs.resolve_local_path(id).is_none()
+}
+
+/// Copy `bytes`, which `cs` holds as `id`, into the cache at `cache_dir` when
+/// [`needs_disk_copy`] says a copy is worth having, returning whether it
+/// tried. Best effort: a failed write only costs a later fetch.
+pub fn seed_disk_cache(
+    cs: &dyn ContentStore,
+    id: &ContentId,
+    cache_dir: &Path,
+    bytes: &[u8],
+) -> bool {
+    if !needs_disk_copy(cs, id) {
+        return false;
+    }
+    DiskArtifactCache::for_dir(cache_dir).best_effort_write(&cache_dir.join(id.to_string()), bytes);
+    true
 }
 
 /// Drop `id` from every disk cache this process holds open.
@@ -838,12 +867,12 @@ pub fn evict_cached_cid(id: &ContentId) {
     }
 }
 
-/// Read `id` straight from the store, touching no cache path. This is the
-/// whole read path for a store that decrypts on read: its bytes must not
-/// land in the cache directory, and a stale plaintext entry from an earlier
-/// unencrypted run must not be consulted either. Concurrent readers of one
-/// artifact still share a single fetch, keyed by `target` — the path the
-/// cache would have used.
+/// Read `id` straight from the store, touching no cache path: the read path
+/// for every store [`uses_disk_cache`] keeps out of the cache. For one that
+/// decrypts on read, its bytes must not land in the cache directory, and a
+/// stale plaintext entry from an earlier unencrypted run must not be
+/// consulted either. Concurrent readers of one artifact still share a single
+/// fetch, keyed by `target` — the path the cache would have used.
 async fn fetch_uncached(
     cs: &dyn ContentStore,
     id: &ContentId,
@@ -856,73 +885,53 @@ async fn fetch_uncached(
         .await
 }
 
-pub async fn fetch_cached_bytes(
-    cs: &dyn ContentStore,
-    id: &ContentId,
-    cache_dir: &Path,
+// Both return `fetch_through_cache`'s future rather than awaiting it: an
+// extra `async fn` layer here pushes some callers' future types past the
+// compiler's layout depth limit.
+pub fn fetch_cached_bytes<'a>(
+    cs: &'a dyn ContentStore,
+    id: &'a ContentId,
+    cache_dir: &'a Path,
     ext: &str,
-) -> io::Result<Vec<u8>> {
+) -> impl std::future::Future<Output = io::Result<Vec<u8>>> + 'a {
     let cached = cache_dir.join(format!("{}.{}", id.digest_hex(), ext));
-    if !cs.permits_plaintext_cache() {
-        return fetch_uncached(cs, id, cached).await;
-    }
-    let cache = DiskArtifactCache::for_dir(cache_dir);
-
-    if let Some(local_path) = cs.resolve_local_path(id) {
-        if let Some(bytes) = try_read_cached_bytes(&local_path)? {
-            return Ok(bytes);
-        }
-        tracing::debug!(
-            path = %local_path.display(),
-            "local artifact path disappeared during read; falling back to remote fetch"
-        );
-        return cache
-            .coalesced_fetch(cached, || async {
-                cs.get(id).await.map_err(storage_to_io_error)
-            })
-            .await;
-    }
-
-    if let Some(bytes) = try_read_cached_bytes(&cached)? {
-        return Ok(bytes);
-    }
-    cache
-        .coalesced_fetch(cached, || async {
-            cs.get(id).await.map_err(storage_to_io_error)
-        })
-        .await
+    fetch_through_cache(cs, id, cache_dir, cached)
 }
 
-pub async fn fetch_cached_bytes_cid(
+pub fn fetch_cached_bytes_cid<'a>(
+    cs: &'a dyn ContentStore,
+    id: &'a ContentId,
+    cache_dir: &'a Path,
+) -> impl std::future::Future<Output = io::Result<Vec<u8>>> + 'a {
+    let cached = cache_dir.join(id.to_string());
+    fetch_through_cache(cs, id, cache_dir, cached)
+}
+
+/// Read `id` from the store's own local file when it has one, else through
+/// the disk cache entry `cached` when [`uses_disk_cache`] allows, else
+/// straight from the store.
+async fn fetch_through_cache(
     cs: &dyn ContentStore,
     id: &ContentId,
     cache_dir: &Path,
+    cached: PathBuf,
 ) -> io::Result<Vec<u8>> {
-    let cached = cache_dir.join(id.to_string());
-    if !cs.permits_plaintext_cache() {
-        return fetch_uncached(cs, id, cached).await;
-    }
-    let cache = DiskArtifactCache::for_dir(cache_dir);
-
     if let Some(local_path) = cs.resolve_local_path(id) {
         if let Some(bytes) = try_read_cached_bytes(&local_path)? {
             return Ok(bytes);
         }
         tracing::debug!(
             path = %local_path.display(),
-            "local artifact path disappeared during read; falling back to remote fetch"
+            "local artifact path disappeared during read; fetching from the store"
         );
-        return cache
-            .coalesced_fetch(cached, || async {
-                cs.get(id).await.map_err(storage_to_io_error)
-            })
-            .await;
     }
-
+    if !uses_disk_cache(cs) {
+        return fetch_uncached(cs, id, cached).await;
+    }
     if let Some(bytes) = try_read_cached_bytes(&cached)? {
         return Ok(bytes);
     }
-    cache
+    DiskArtifactCache::for_dir(cache_dir)
         .coalesced_fetch(cached, || async {
             cs.get(id).await.map_err(storage_to_io_error)
         })
@@ -1082,6 +1091,8 @@ mod tests {
             gets: Arc::new(AtomicUsize::new(0)),
             delay: Duration::ZERO,
             permits_plaintext_cache: true,
+            remote: true,
+            local_path: None,
         };
 
         fetch_cached_bytes_cid(&store, &id, &dir).await.unwrap();
@@ -1380,6 +1391,8 @@ mod tests {
         gets: Arc<AtomicUsize>,
         delay: Duration,
         permits_plaintext_cache: bool,
+        remote: bool,
+        local_path: Option<PathBuf>,
     }
 
     #[async_trait::async_trait]
@@ -1408,6 +1421,14 @@ mod tests {
         fn permits_plaintext_cache(&self) -> bool {
             self.permits_plaintext_cache
         }
+
+        fn is_remote(&self) -> bool {
+            self.remote
+        }
+
+        fn resolve_local_path(&self, _id: &ContentId) -> Option<PathBuf> {
+            self.local_path.clone()
+        }
     }
 
     fn regular_files_under(root: &Path) -> Vec<PathBuf> {
@@ -1429,6 +1450,86 @@ mod tests {
         out
     }
 
+    fn store(
+        remote: bool,
+        permits_plaintext_cache: bool,
+        local_path: Option<PathBuf>,
+    ) -> CountingStore {
+        CountingStore {
+            data: b"bytes".to_vec(),
+            gets: Arc::new(AtomicUsize::new(0)),
+            delay: Duration::ZERO,
+            permits_plaintext_cache,
+            remote,
+            local_path,
+        }
+    }
+
+    #[test]
+    fn only_remote_plaintext_artifacts_without_a_local_file_need_a_disk_copy() {
+        let id = ContentId::new(crate::ContentKind::IndexLeaf, b"leaf");
+        assert!(needs_disk_copy(&store(true, true, None), &id));
+        assert!(
+            !needs_disk_copy(&store(false, true, None), &id),
+            "local store"
+        );
+        assert!(
+            !needs_disk_copy(&store(true, false, None), &id),
+            "decrypting store"
+        );
+        assert!(
+            !needs_disk_copy(&store(true, true, Some(PathBuf::from("/tier/leaf"))), &id),
+            "a remote store's local tier"
+        );
+    }
+
+    #[test]
+    fn seeding_writes_only_what_needs_a_disk_copy() {
+        let dir = temp_cache_dir("seed");
+        let id = ContentId::new(crate::ContentKind::IndexLeaf, b"leaf");
+
+        assert!(!seed_disk_cache(
+            &store(false, true, None),
+            &id,
+            &dir,
+            b"bytes"
+        ));
+        assert!(regular_files_under(&dir).is_empty());
+
+        assert!(seed_disk_cache(
+            &store(true, true, None),
+            &id,
+            &dir,
+            b"bytes"
+        ));
+        assert_eq!(fs::read(dir.join(id.to_string())).unwrap(), b"bytes");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A store in memory is read directly: fetching through the cache helpers
+    /// writes nothing to the cache directory.
+    #[tokio::test]
+    async fn fetch_from_a_local_store_writes_nothing_to_the_cache() {
+        let dir = temp_cache_dir("local-store");
+        let store = crate::storage::MemoryContentStore::new();
+        let id = store
+            .put(crate::ContentKind::IndexLeaf, b"bytes")
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                fetch_cached_bytes_cid(&store, &id, &dir).await.unwrap(),
+                b"bytes"
+            );
+            assert_eq!(
+                fetch_cached_bytes(&store, &id, &dir, "nba").await.unwrap(),
+                b"bytes"
+            );
+        }
+        assert!(regular_files_under(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// A store that decrypts on read must leave nothing in the cache
     /// directory: neither the CID-keyed nor the extension-keyed fetch may
     /// spill its plaintext, and a second fetch goes back to the store.
@@ -1443,6 +1544,8 @@ mod tests {
             gets: Arc::clone(&gets),
             delay: Duration::ZERO,
             permits_plaintext_cache: false,
+            remote: true,
+            local_path: None,
         };
 
         for _ in 0..2 {
@@ -1468,6 +1571,8 @@ mod tests {
             gets: Arc::new(AtomicUsize::new(0)),
             delay: Duration::ZERO,
             permits_plaintext_cache: true,
+            remote: true,
+            local_path: None,
         };
         fetch_cached_bytes_cid(&permitting, &id, &dir)
             .await
@@ -1487,6 +1592,8 @@ mod tests {
             gets: Arc::clone(&gets),
             delay: Duration::from_millis(100),
             permits_plaintext_cache: true,
+            remote: true,
+            local_path: None,
         });
 
         let mut handles = Vec::new();
@@ -1532,6 +1639,8 @@ mod tests {
             gets: Arc::clone(&gets),
             delay: Duration::from_millis(100),
             permits_plaintext_cache: false,
+            remote: true,
+            local_path: None,
         });
 
         let mut handles = Vec::new();
