@@ -156,6 +156,18 @@ pub struct ShapeCompiler {
     /// Built `sh:sparql` constraints by attachment subject (filled by
     /// `build_sparql_constraints`, consumed by `finalize`)
     built_sparql: HashMap<Sid, Vec<Arc<crate::sparql::SparqlConstraint>>>,
+    /// Shape metadata whose subject no shape map held when its flake was
+    /// processed (see `claim_metadata`).
+    unclaimed_metadata: HashMap<Sid, ShapeMetadata>,
+}
+
+/// `sh:severity`, `sh:message`, `sh:name` and `sh:description` of one subject.
+#[derive(Default)]
+struct ShapeMetadata {
+    severity: Option<Severity>,
+    message: Option<String>,
+    name: Option<String>,
+    description: Option<String>,
 }
 
 /// Intermediate representation during compilation
@@ -246,6 +258,7 @@ impl ShapeCompiler {
             decl_namespace: HashMap::new(),
             owl_imports: HashMap::new(),
             built_sparql: HashMap::new(),
+            unclaimed_metadata: HashMap::new(),
         }
     }
 
@@ -412,6 +425,8 @@ impl ShapeCompiler {
             // resolve; a plain-predicate path resolves trivially on any graph.
             compiler.resolve_paths(*db).await?;
         }
+
+        compiler.claim_metadata();
 
         // Implicit class targets: a subject targets its own instances only when
         // it is *both* a declared shape and typed as a class. When no shapes were
@@ -1052,6 +1067,8 @@ impl ShapeCompiler {
                         ps.severity = severity;
                     } else if let Some(ns) = self.shapes.get_mut(&flake.s) {
                         ns.severity = severity;
+                    } else {
+                        self.unclaimed(&flake.s).severity = Some(severity);
                     }
                 }
             }
@@ -1061,6 +1078,8 @@ impl ShapeCompiler {
                         ps.message = Some(msg.clone());
                     } else if let Some(ns) = self.shapes.get_mut(&flake.s) {
                         ns.message = Some(msg.clone());
+                    } else {
+                        self.unclaimed(&flake.s).message = Some(msg.clone());
                     }
                     // Also tracked by subject for sh:sparql constraint nodes,
                     // which live outside the shape maps.
@@ -1076,6 +1095,8 @@ impl ShapeCompiler {
                         ps.name = Some(n.clone());
                     } else if let Some(ns) = self.shapes.get_mut(&flake.s) {
                         ns.name = Some(n.clone());
+                    } else {
+                        self.unclaimed(&flake.s).name = Some(n.clone());
                     }
                 }
             }
@@ -1088,6 +1109,8 @@ impl ShapeCompiler {
                         ps.description = Some(d.clone());
                     } else if let Some(ns) = self.shapes.get_mut(&flake.s) {
                         ns.description = Some(d.clone());
+                    } else {
+                        self.unclaimed(&flake.s).description = Some(d.clone());
                     }
                 }
             }
@@ -1169,6 +1192,48 @@ impl ShapeCompiler {
 
     fn get_or_create_shape(&mut self, id: &Sid) -> &mut ShapeData {
         self.shapes.entry(id.clone()).or_default()
+    }
+
+    fn unclaimed(&mut self, id: &Sid) -> &mut ShapeMetadata {
+        self.unclaimed_metadata.entry(id.clone()).or_default()
+    }
+
+    /// Give each shape the metadata recorded before it was registered.
+    ///
+    /// Predicates are scanned in a fixed order, and the metadata arms only
+    /// write to a subject a shape map already holds. A node shape registered
+    /// later (by its `rdf:type sh:NodeShape`, after the scan, typically one
+    /// whose only constraint is `sh:sparql`, or by a predicate in a later
+    /// graph) would otherwise lose them and compile as a Violation shape with
+    /// no message. Routed as the arms route (property shape first); a value
+    /// the subject already has, written once it was registered, stays.
+    fn claim_metadata(&mut self) {
+        for (id, meta) in std::mem::take(&mut self.unclaimed_metadata) {
+            let (severity, message, name, description) =
+                if let Some(ps) = self.property_shapes.get_mut(&id) {
+                    (
+                        &mut ps.severity,
+                        &mut ps.message,
+                        &mut ps.name,
+                        &mut ps.description,
+                    )
+                } else if let Some(ns) = self.shapes.get_mut(&id) {
+                    (
+                        &mut ns.severity,
+                        &mut ns.message,
+                        &mut ns.name,
+                        &mut ns.description,
+                    )
+                } else {
+                    continue;
+                };
+            if *severity == Severity::Violation {
+                *severity = meta.severity.unwrap_or(Severity::Violation);
+            }
+            *message = message.take().or(meta.message);
+            *name = name.take().or(meta.name);
+            *description = description.take().or(meta.description);
+        }
     }
 
     fn get_or_create_property_shape(&mut self, id: &Sid) -> &mut PropertyShapeData {

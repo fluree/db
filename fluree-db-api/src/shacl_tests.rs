@@ -5642,6 +5642,95 @@ async fn shacl_sparql_constraint_failure_keeps_other_shapes_enforced() {
         .expect("a named player commits; the failing Warning constraint is logged");
 }
 
+/// A node shape whose only constraint is `sh:sparql` keeps its `sh:severity`.
+/// Only its `rdf:type sh:NodeShape` registers such a shape, after the shape
+/// compiler has read `sh:severity`, which it used to apply only to an already
+/// registered shape. A Warning or Info shape then compiled as a Violation
+/// shape and rejected the write. Here the shape is also a class, so it targets
+/// its own instances; it is written in JSON-LD and with SPARQL UPDATE.
+#[tokio::test]
+async fn shacl_sparql_only_shape_keeps_its_severity() {
+    const SELECT: &str =
+        "SELECT $this WHERE { $this <http://example.org/ns/score> ?s FILTER(?s < 0) }";
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut wrong: Vec<String> = Vec::new();
+    for via_sparql in [false, true] {
+        for (i, (severity, commits)) in [
+            ("sh:Warning", true),
+            ("sh:Info", true),
+            ("sh:Violation", false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let ledger_id = format!("shacl/sparql-only-severity-{i}-{via_sparql}:main");
+            let ledger = fluree.create_ledger(&ledger_id).await.unwrap();
+            let ledger = if via_sparql {
+                let update = format!(
+                    r#"PREFIX sh: <http://www.w3.org/ns/shacl#>
+                       PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+                       PREFIX ex: <http://example.org/ns/>
+                       INSERT DATA {{
+                         ex:Scored a sh:NodeShape, rdfs:Class ;
+                           sh:severity {severity} ;
+                           sh:sparql ex:Scored-sparql .
+                         ex:Scored-sparql sh:message "score is negative" ;
+                           sh:select "{SELECT}" .
+                       }}"#
+                );
+                drop(ledger);
+                fluree
+                    .graph(&ledger_id)
+                    .transact()
+                    .sparql_update(&update)
+                    .commit()
+                    .await
+                    .expect("shape via SPARQL UPDATE");
+                fluree.ledger(&ledger_id).await.expect("ledger")
+            } else {
+                let shape = json!({
+                    "@context": shacl_context(),
+                    "@id": "ex:Scored",
+                    "@type": ["sh:NodeShape", "rdfs:Class"],
+                    "sh:severity": {"@id": severity},
+                    "sh:sparql": {
+                        "@id": "ex:Scored-sparql",
+                        "sh:message": "score is negative",
+                        "sh:select": SELECT
+                    }
+                });
+                fluree.upsert(ledger, &shape).await.unwrap().ledger
+            };
+            let outcome = fluree
+                .upsert(
+                    ledger,
+                    &json!({
+                        "@context": shacl_context(),
+                        "@id": "ex:s1",
+                        "@type": "ex:Scored",
+                        "ex:score": -1
+                    }),
+                )
+                .await;
+            match (outcome, commits) {
+                (Ok(_), true) => {}
+                (Err(err), false) => {
+                    let message = shacl_violation_message(err);
+                    if !message.contains("score is negative") {
+                        wrong.push(format!("{severity} (SPARQL {via_sparql}): {message}"));
+                    }
+                }
+                (outcome, _) => wrong.push(format!(
+                    "{severity} (SPARQL {via_sparql}): expected {}, got {:?}",
+                    if commits { "a commit" } else { "a violation" },
+                    outcome.map(|_| ())
+                )),
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
 /// How an outer shape on `ex:Player` reaches `ex:InnerShape` in
 /// [`ledger_with_nested_failing_constraint`].
 #[derive(Clone, Copy, Debug)]
@@ -5666,11 +5755,6 @@ enum Nesting {
 /// property-shape nestings put `outer` on the property shape, which reports
 /// their results. Written with a SPARQL UPDATE `INSERT DATA` when `via_sparql`,
 /// a JSON-LD upsert otherwise; in a warn-mode graph when `warn_mode`.
-///
-/// The inner shape targets a class nothing has: the shape compiler drops the
-/// `sh:severity` of a node shape that no earlier-processed predicate (a
-/// target, a property, a node constraint) has registered, and an inner shape
-/// with only `sh:sparql` would otherwise compile as a Violation shape.
 async fn ledger_with_nested_failing_constraint(
     fluree: &crate::Fluree,
     ledger_id: &str,
@@ -5706,7 +5790,7 @@ async fn ledger_with_nested_failing_constraint(
             r#"PREFIX sh: <http://www.w3.org/ns/shacl#>
                PREFIX ex: <http://example.org/ns/>
                INSERT DATA {{
-                 ex:InnerShape a sh:NodeShape ; sh:targetClass ex:Unused ;
+                 ex:InnerShape a sh:NodeShape ;
                    {inner_severity} sh:sparql ex:InnerShape-sparql .
                  ex:InnerShape-sparql sh:message "inner constraint" ;
                    sh:select "{SELECT}" .
@@ -5729,7 +5813,6 @@ async fn ledger_with_nested_failing_constraint(
         let mut inner_shape = json!({
             "@id": "ex:InnerShape",
             "@type": "sh:NodeShape",
-            "sh:targetClass": {"@id": "ex:Unused"},
             "sh:sparql": {
                 "@id": "ex:InnerShape-sparql",
                 "sh:message": "inner constraint",
