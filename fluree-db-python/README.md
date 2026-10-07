@@ -149,11 +149,13 @@ frozen view that every query sees identically.
                name="Alice", min=21)
   ```
 
-  A value is an `IRI`, `BlankNode`, `LangString` or `Literal`, a Python
-  `str`, `int`, `float`, `bool`, `Decimal`, `datetime`, `date` or `time`, or
-  a Cypher `Node` (its `element_id`). A parameter the query never mentions
-  raises `InvalidRequestError` rather than leaving a misspelt variable
-  unbound. JSON-LD queries take none.
+  A value is an `IRI`, `LangString`, `Literal` or `Vector`, a Python `str`,
+  `int`, `float`, `bool`, `Decimal`, `datetime`, `date` or `time`, a Cypher
+  `Node` (its `element_id`), or a `BlankNode` a query returned. A `BlankNode`
+  built from any other label raises `InvalidRequestError`: written in the
+  query, it would match every node. So does a parameter the query never
+  mentions, rather than leaving a misspelt variable unbound. JSON-LD queries
+  take none.
 
 ### Cypher
 

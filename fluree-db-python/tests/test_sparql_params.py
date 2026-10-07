@@ -8,7 +8,7 @@ import pytest
 
 import fluree
 import fluree.aio
-from fluree import IRI, InvalidRequestError, LangString, Literal, Node
+from fluree import IRI, BlankNode, InvalidRequestError, LangString, Literal, Node
 
 EX = "http://example.org/"
 P = f"PREFIX ex: <{EX}> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> "
@@ -63,6 +63,17 @@ def test_rdf_terms_and_python_values(ledger):
     ]
     names = ledger.query(P + "SELECT ?n WHERE { $who ex:name ?n }", who=IRI(EX + "carol"))
     assert names.value("n") == ["Carol"]
+
+
+def test_a_blank_node_is_one_stored_node(ledger):
+    ledger.update(P + 'INSERT DATA { [] ex:name "Dan" }')
+    dan = ledger.query(P + 'SELECT ?s WHERE { ?s ex:name "Dan" }').single()["s"]
+    assert isinstance(dan, BlankNode)
+    assert ledger.query(P + "SELECT ?n WHERE { $who ex:name ?n }", who=dan).value("n") == ["Dan"]
+    # Any other label would be a variable, and delete every triple.
+    with pytest.raises(InvalidRequestError, match="blank node label"):
+        ledger.update(P + "DELETE WHERE { $who ?p ?o }", who=BlankNode("x"))
+    assert len(ledger.query(P + "SELECT ?n WHERE { ?s ex:name ?n }").values()) == 4
 
 
 def test_a_cypher_node_stands_for_its_element_id(ledger):

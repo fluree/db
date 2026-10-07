@@ -276,15 +276,9 @@ pub(crate) fn sparql_params(
     let mut map = fluree_db_api::SparqlParamMap::new();
     for (name, value) in params.iter() {
         let name: String = name.extract()?;
-        let mut term = to_jsonld(&value).map_err(|e| {
+        let term = to_jsonld(&value).map_err(|e| {
             invalid_request(format!("parameter {name:?}: {}", e.value(params.py())))
         })?;
-        // A parameter's `@value` is a scalar, so a vector goes as its JSON text.
-        if let Some(object) = term.as_object_mut() {
-            if let Some(vector) = object.get_mut("@value").filter(|v| v.is_array()) {
-                *vector = JsonValue::String(vector.to_string());
-            }
-        }
         map.insert(name, term);
     }
     Ok(Some(map))
