@@ -1442,11 +1442,43 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
         );
     }
     if !reject_violations.is_empty() {
+        // The structured results name every identifier in full, as
+        // `validate` reports them; the message compacts them for reading.
+        let full = crate::format::IriCompactor::from_namespaces(violation_namespaces(view, &ctx));
+        let results = crate::validate::report_results(&reject_violations, &|sid| {
+            full.compact_id_sid(sid)
+                .unwrap_or_else(|_| fluree_db_shacl::unresolved_sid(sid))
+        });
         return Err(fluree_db_transact::TransactError::ShaclViolation(
-            format_violations(&reject_violations, &compactor),
+            fluree_db_transact::ShaclViolations::new(
+                format_violations(&reject_violations, &compactor),
+                results,
+            ),
         ));
     }
     Ok(true)
+}
+
+/// The namespaces a violation's identifiers resolve against: the snapshot's
+/// plus those the operation introduced and has not committed yet.
+#[cfg(feature = "shacl")]
+fn violation_namespaces(
+    view: &StagedLedger,
+    ctx: &StagedShaclContext<'_>,
+) -> std::sync::Arc<std::collections::HashMap<u16, String>> {
+    let base = view.base().snapshot.shared_namespaces();
+    match ctx.uncommitted_namespaces {
+        Some(uncommitted) if !uncommitted.is_empty() => {
+            let mut merged = (*base).clone();
+            merged.extend(
+                uncommitted
+                    .iter()
+                    .map(|(code, prefix)| (*code, prefix.clone())),
+            );
+            std::sync::Arc::new(merged)
+        }
+        _ => base,
+    }
 }
 
 /// Build the compactor that renders identifiers in violation messages.
@@ -1464,20 +1496,7 @@ fn violation_iri_compactor(
 ) -> crate::format::IriCompactor {
     use crate::format::IriCompactor;
 
-    let base = view.base().snapshot.shared_namespaces();
-    let namespace_codes = match ctx.uncommitted_namespaces {
-        Some(uncommitted) if !uncommitted.is_empty() => {
-            let mut merged = (*base).clone();
-            merged.extend(
-                uncommitted
-                    .iter()
-                    .map(|(code, prefix)| (*code, prefix.clone())),
-            );
-            std::sync::Arc::new(merged)
-        }
-        _ => base,
-    };
-
+    let namespace_codes = violation_namespaces(view, ctx);
     match ctx
         .txn_context
         .and_then(|raw| crate::ParsedContext::parse(None, raw).ok())
@@ -2044,7 +2063,13 @@ async fn enforce_unique_constraints(
                     })
                     .unwrap_or_else(|| format!("g_id={g_id}"))
             };
-            let value_str = format!("{o:?}");
+            let value_str = match o {
+                fluree_db_core::FlakeValue::String(s) => s.clone(),
+                fluree_db_core::FlakeValue::Ref(sid) => {
+                    snapshot.decode_sid(sid).unwrap_or_else(|| sid.to_string())
+                }
+                other => other.to_string(),
+            };
 
             // Pick two subjects for the error message
             let mut subj_iter = seen_subjects.iter();

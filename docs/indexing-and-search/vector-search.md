@@ -135,9 +135,9 @@ Or with the full IRI:
 ]
 ```
 
-## Inline Similarity Functions (JSON-LD Query)
+## Inline Similarity Functions
 
-Fluree provides three vector similarity functions that can be used in `bind` expressions within JSON-LD queries. These compute similarity scores directly during query execution without requiring a pre-built index.
+Fluree provides three vector similarity functions for `bind` expressions in JSON-LD queries and `BIND` in SPARQL ([SPARQL support](#sparql-support)). These compute similarity scores directly during query execution without requiring a pre-built index.
 
 Function names are case-insensitive; `dotProduct`, `dotproduct`, and `dot_product` are all equivalent.
 

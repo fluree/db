@@ -269,7 +269,7 @@ impl Fluree {
         r2rml_table_provider: &dyn R2rmlTableProvider,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let ast = parse_and_validate_sparql(sparql)?;
+        let ast = parse_and_validate_sparql(sparql, None)?;
         let spec = extract_sparql_dataset_spec(&ast)?;
 
         if spec.is_empty() {
@@ -703,7 +703,7 @@ impl Fluree {
         sparql: &str,
         opts: &GovernanceOptions,
     ) -> Result<JsonValue> {
-        let ast = parse_and_validate_sparql(sparql)?;
+        let ast = parse_and_validate_sparql(sparql, None)?;
         let spec = extract_sparql_dataset_spec(&ast)?;
 
         if spec.is_empty() {
@@ -736,7 +736,7 @@ impl Fluree {
         sparql: &str,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let ast = parse_and_validate_sparql(sparql)?;
+        let ast = parse_and_validate_sparql(sparql, None)?;
         let spec = extract_sparql_dataset_spec(&ast)?;
 
         if spec.is_empty() {
@@ -756,7 +756,7 @@ impl Fluree {
         policy: &PolicyContext,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let ast = parse_and_validate_sparql(sparql)?;
+        let ast = parse_and_validate_sparql(sparql, None)?;
         let spec = extract_sparql_dataset_spec(&ast)?;
 
         if spec.is_empty() {
@@ -789,7 +789,7 @@ impl Fluree {
         r2rml: Option<crate::R2rmlProviders<'_>>,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let ast = parse_and_validate_sparql(sparql)?;
+        let ast = parse_and_validate_sparql(sparql, None)?;
         let spec = extract_sparql_dataset_spec(&ast)?;
 
         if spec.is_empty() {
@@ -825,7 +825,7 @@ impl Fluree {
         r2rml_table_provider: &dyn R2rmlTableProvider,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let ast = parse_and_validate_sparql(sparql)?;
+        let ast = parse_and_validate_sparql(sparql, None)?;
         let spec = extract_sparql_dataset_spec(&ast)?;
 
         if spec.is_empty() {
@@ -880,7 +880,7 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let ast = parse_and_validate_sparql(sparql).map_err(|e| {
+        let ast = parse_and_validate_sparql(sparql, None).map_err(|e| {
             crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
         })?;
         let spec = extract_sparql_dataset_spec(&ast).map_err(|e| {
@@ -945,7 +945,7 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let ast = parse_and_validate_sparql(sparql).map_err(|e| {
+        let ast = parse_and_validate_sparql(sparql, None).map_err(|e| {
             crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
         })?;
         let spec = extract_sparql_dataset_spec(&ast).map_err(|e| {
@@ -993,7 +993,7 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let ast = parse_and_validate_sparql(sparql).map_err(|e| {
+        let ast = parse_and_validate_sparql(sparql, None).map_err(|e| {
             crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
         })?;
         let spec = extract_sparql_dataset_spec(&ast).map_err(|e| {
@@ -1043,7 +1043,7 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let ast = parse_and_validate_sparql(sparql).map_err(|e| {
+        let ast = parse_and_validate_sparql(sparql, None).map_err(|e| {
             crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
         })?;
         let spec = extract_sparql_dataset_spec(&ast).map_err(|e| {
@@ -1102,7 +1102,7 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let ast = parse_and_validate_sparql(sparql).map_err(|e| {
+        let ast = parse_and_validate_sparql(sparql, None).map_err(|e| {
             crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
         })?;
         let spec = extract_sparql_dataset_spec(&ast).map_err(|e| {

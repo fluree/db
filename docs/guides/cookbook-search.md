@@ -83,6 +83,20 @@ fluree query '{
 }'
 ```
 
+The same search in SPARQL:
+
+```bash
+fluree query '
+PREFIX ex: <http://example.org/>
+SELECT ?title ?score WHERE {
+  ?doc a ex:Article ; ex:body ?body ; ex:title ?title .
+  BIND(fulltext(?body, "graph database relationships") AS ?score)
+  FILTER(?score > 0)
+}
+ORDER BY DESC(?score)
+LIMIT 10'
+```
+
 The `fulltext()` function returns a BM25 relevance score. Higher scores mean better matches. Documents with none of the search terms score 0.
 
 ### 3. Combine search with graph filters

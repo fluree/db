@@ -376,6 +376,26 @@ WHERE {
 }
 ```
 
+### Parameters
+
+When Fluree is embedded (the Rust API and the Python package), a query or
+update can take parameters: values bound to variables by name. A parameter
+replaces its variable — written `?name` or `$name`, which SPARQL treats as the
+same variable — everywhere in the request before it is planned, so
+`SELECT ?person WHERE { ?person ex:name $name }` with `name = "Alice"` runs
+exactly as `SELECT ?person WHERE { ?person ex:name "Alice" }`. Unlike a
+`VALUES` block, the value is visible inside every `FILTER`, `OPTIONAL` and
+subquery.
+
+- A projected parameter (`SELECT $name ?age`) is still a column, holding the
+  value; `SELECT *` does not list it.
+- A parameter that the request never mentions is an error, since a misspelt
+  variable would otherwise be unbound and match everything. So is a parameter
+  the request assigns itself (`BIND`, `VALUES`, `AS`), and one used inside a
+  remote `SERVICE`, whose body is sent to the endpoint as written.
+- `INSERT DATA` and `DELETE DATA` take no variables, so no parameters; use
+  `INSERT { ... } WHERE { ... }`.
+
 ## Aggregation
 
 ### GROUP BY
@@ -754,6 +774,33 @@ Per W3C SPARQL 1.1 §17.5, XSD constructor functions cast values between datatyp
 - `ISBLANK(?x)` - Is blank node
 - `ISLITERAL(?x)` - Is literal
 - `ISNUMERIC(?x)` - Is numeric
+
+### Search and Similarity Functions
+
+Fluree extensions that score values for ranking, used in `BIND`:
+
+- `fulltext(?text, "query")` - BM25 relevance of a full-text value to a query string; `0` when no query term occurs. Also written `f:fulltext(...)`. See [Inline Fulltext Search](../indexing-and-search/fulltext.md).
+- `dotProduct(?v1, ?v2)` - Dot product of two vectors
+- `cosineSimilarity(?v1, ?v2)` - Cosine similarity of two vectors
+- `euclideanDistance(?v1, ?v2)` - Euclidean (L2) distance between two vectors
+
+Vectors are `f:embeddingVector` literals (`"[0.1, 0.2]"^^f:embeddingVector`); see [Vector Search](../indexing-and-search/vector-search.md). Names are case-insensitive and accept underscores (`cosine_similarity`).
+
+```sparql
+PREFIX ex: <http://example.org/>
+PREFIX f:  <https://ns.flur.ee/db#>
+
+SELECT ?doc ?text ?similar WHERE {
+  VALUES ?q { "[0.88, 0.12, 0.08]"^^f:embeddingVector }
+  ?doc ex:body ?body ;
+       ex:embedding ?vec .
+  BIND(fulltext(?body, "graph databases") AS ?text)
+  BIND(cosineSimilarity(?vec, ?q) AS ?similar)
+  FILTER(?text > 0 || ?similar > 0.8)
+}
+ORDER BY DESC(0.6 * ?text + 0.4 * ?similar)
+LIMIT 10
+```
 
 ## Subqueries
 

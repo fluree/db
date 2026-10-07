@@ -341,8 +341,9 @@ impl Fluree {
         // #1473: parse SPARQL once. The AST is reused for FROM-clause resolution
         // and IR lowering below, instead of re-lexing the string 2–3×.
         let parse_start = fluree_db_core::clock::Instant::now();
+        let params = options.sparql_params(&input)?;
         let mut sparql_ast = match input {
-            QueryInput::Sparql(sparql) => Some(parse_and_validate_sparql(sparql)?),
+            QueryInput::Sparql(sparql) => Some(parse_and_validate_sparql(sparql, params)?),
             QueryInput::JsonLd(_) => None,
         };
 
@@ -721,9 +722,10 @@ impl Fluree {
         // connection/spawn contexts), so a dataset clause is rejected here rather
         // than silently ignored; plain within-ledger datasets are handled by
         // `query_with_options`. Otherwise the AST is reused for lowering.
+        let params = options.sparql_params(&input)?;
         let mut sparql_ast = match input {
             QueryInput::Sparql(sparql) => {
-                let ast = parse_and_validate_sparql(sparql)?;
+                let ast = parse_and_validate_sparql(sparql, params)?;
                 if sparql_ast_has_dataset(&ast) {
                     return Err(single_ledger_dataset_clause_error());
                 }
@@ -817,11 +819,23 @@ impl Fluree {
 
     /// Explain a SPARQL query plan against a GraphDb.
     pub async fn explain_sparql(&self, db: &GraphDb, sparql: &str) -> Result<JsonValue> {
+        self.explain_sparql_with_params(db, sparql, None).await
+    }
+
+    /// [`Self::explain_sparql`] with parameters substituted, as
+    /// [`QueryExecutionOptions::with_params`] would run the query.
+    pub async fn explain_sparql_with_params(
+        &self,
+        db: &GraphDb,
+        sparql: &str,
+        params: Option<&fluree_db_sparql::ParamMap>,
+    ) -> Result<JsonValue> {
         let db = self.prepare_explain_view(db).await?;
         crate::explain::explain_sparql_for_view(
             &db.snapshot,
             sparql,
             db.default_context.as_ref(),
+            params,
             db.is_root(),
         )
         .map(|result| explain_policy_notice(result, &db))
@@ -870,9 +884,21 @@ impl Fluree {
         // already-parsed AST) before charging the floor (the dataset method
         // charges it) so fuel is accounted exactly once. `Err` = cross-ledger
         // clause IRI.
+        let params = match options.sparql_params(&input) {
+            Ok(params) => params,
+            Err(e) => {
+                let tracker = tracked_query_tracker(&input, &tracking_override, None);
+                let _ = charge_query_floor(&tracker);
+                return Err(crate::query::TrackedErrorResponse::new(
+                    400,
+                    e.to_string(),
+                    tracker.tally(),
+                ));
+            }
+        };
         let mut sparql_ast = None;
         if let QueryInput::Sparql(sparql) = input {
-            let ast = match parse_and_validate_sparql(sparql) {
+            let ast = match parse_and_validate_sparql(sparql, params) {
                 Ok(ast) => ast,
                 Err(e) => {
                     let tracker = tracked_query_tracker(&input, &tracking_override, None);
@@ -1036,9 +1062,21 @@ impl Fluree {
         // FROM/FROM NAMED is unsupported (the R2RML dataset path is non-`Send`;
         // this runs from `Send` contexts), so a resolved clause is rejected
         // rather than silently ignored. Otherwise the AST is reused for lowering.
+        let params = match options.sparql_params(&input) {
+            Ok(params) => params,
+            Err(e) => {
+                let tracker = tracked_query_tracker(&input, &tracking_override, None);
+                let _ = charge_query_floor(&tracker);
+                return Err(crate::query::TrackedErrorResponse::new(
+                    400,
+                    e.to_string(),
+                    tracker.tally(),
+                ));
+            }
+        };
         let mut sparql_ast = None;
         if let QueryInput::Sparql(sparql) = input {
-            let parsed = parse_and_validate_sparql(sparql);
+            let parsed = parse_and_validate_sparql(sparql, params);
             let tracker = tracked_query_tracker(&input, &tracking_override, parsed.as_ref().ok());
             let ast = match parsed {
                 Ok(ast) => ast,
@@ -1367,7 +1405,7 @@ impl Fluree {
     /// [`build_within_ledger_dataset_from_ast`](Self::build_within_ledger_dataset_from_ast)
     /// and only reject cross-ledger clause IRIs.
     pub(crate) fn validate_sparql_for_view(&self, sparql: &str) -> Result<()> {
-        let ast = parse_and_validate_sparql(sparql)?;
+        let ast = parse_and_validate_sparql(sparql, None)?;
         if sparql_ast_has_dataset(&ast) {
             return Err(single_ledger_dataset_clause_error());
         }

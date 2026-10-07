@@ -63,8 +63,9 @@ pub enum TxnOperation {
     InsertTurtle(String),
     /// Turtle or TriG upsert.
     UpsertTurtle(String),
-    /// SPARQL UPDATE, which may itself hold several `;`-separated operations.
-    SparqlUpdate(String),
+    /// SPARQL UPDATE, which may itself hold several `;`-separated operations,
+    /// with optional parameters (see [`fluree_db_sparql::substitute_params`]).
+    SparqlUpdate(String, Option<fluree_db_sparql::ParamMap>),
 }
 
 impl TxnOperation {
@@ -75,7 +76,7 @@ impl TxnOperation {
             Self::Update(json) => OpPlan::from_op(TransactOperation::UpdateJson(json))?,
             Self::InsertTurtle(turtle) => OpPlan::from_op(TransactOperation::InsertTurtle(turtle))?,
             Self::UpsertTurtle(turtle) => OpPlan::from_op(TransactOperation::UpsertTurtle(turtle))?,
-            Self::SparqlUpdate(sparql) => OpPlan::Sparql(sparql),
+            Self::SparqlUpdate(sparql, params) => OpPlan::Sparql(sparql, params.as_ref()),
         })
     }
 
@@ -87,7 +88,7 @@ impl TxnOperation {
             Self::Insert(_) | Self::Update(_) | Self::InsertTurtle(_) => {
                 Some(cypher_write::fresh_skolem_txn_id())
             }
-            Self::Upsert(_) | Self::UpsertTurtle(_) | Self::SparqlUpdate(_) => None,
+            Self::Upsert(_) | Self::UpsertTurtle(_) | Self::SparqlUpdate(..) => None,
         }
     }
 }
