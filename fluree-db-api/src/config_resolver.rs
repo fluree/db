@@ -545,7 +545,75 @@ async fn shapes_without_enforcement(
     to_t: i64,
 ) -> Result<Option<ConfigDiagnostic>> {
     let config = resolve_ledger_config(snapshot, overlay, to_t).await?;
-    let enabled = config.as_ref().is_some_and(|c| {
+    unenforced_shapes(snapshot, overlay, to_t, config.as_ref()).await
+}
+
+/// Whether the ledger may hold a SHACL shape, decided in memory, without
+/// reading the index: its index stats count instances of `sh:NodeShape` or
+/// `sh:PropertyShape`, or its novelty asserts one in the default graph. An
+/// index without class stats counts as holding none. A gate for checks that
+/// would otherwise read the ledger.
+#[cfg(feature = "shacl")]
+pub(crate) fn may_hold_shapes(
+    snapshot: &LedgerSnapshot,
+    novelty: &dyn OverlayProvider,
+    to_t: i64,
+) -> bool {
+    let shape_types: Vec<Sid> = [
+        fluree_vocab::shacl::NODE_SHAPE,
+        fluree_vocab::shacl::PROPERTY_SHAPE,
+    ]
+    .iter()
+    .filter_map(|iri| snapshot.encode_iri_strict(iri))
+    .collect();
+    if shape_types.is_empty() {
+        return false;
+    }
+    let indexed = snapshot
+        .stats
+        .as_ref()
+        .and_then(|stats| stats.classes.as_ref())
+        .is_some_and(|classes| {
+            classes
+                .iter()
+                .any(|class| class.count > 0 && shape_types.contains(&class.class_sid))
+        });
+    if indexed {
+        return true;
+    }
+    let Some(rdf_type) = snapshot.encode_iri_strict(RDF_TYPE_IRI) else {
+        return false;
+    };
+    shape_types.into_iter().any(|shape_type| {
+        let shape_type = fluree_db_core::FlakeValue::Ref(shape_type);
+        let mut asserted = false;
+        novelty.for_each_overlay_flake(
+            fluree_db_core::DEFAULT_GRAPH_ID,
+            fluree_db_core::IndexType::Post,
+            Some(&fluree_db_core::Flake::min_for_predicate_object(
+                rdf_type.clone(),
+                shape_type.clone(),
+            )),
+            Some(&fluree_db_core::Flake::max_for_predicate_object(
+                rdf_type.clone(),
+                shape_type,
+            )),
+            false,
+            to_t,
+            &mut |flake| asserted |= flake.op,
+        );
+        asserted
+    })
+}
+
+/// [`shapes_without_enforcement`] under an already-resolved `config`.
+pub(crate) async fn unenforced_shapes(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    config: Option<&LedgerConfig>,
+) -> Result<Option<ConfigDiagnostic>> {
+    let enabled = config.is_some_and(|c| {
         std::iter::once(None)
             .chain(
                 c.graph_overrides
@@ -563,7 +631,6 @@ async fn shapes_without_enforcement(
     // The configured shapes graph when it is a local one, else the default
     // graph (a cross-ledger source is not examined here).
     let source = config
-        .as_ref()
         .and_then(|c| c.shacl.as_ref())
         .and_then(|s| s.shapes_source.as_ref());
     let g_id = match source {
