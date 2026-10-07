@@ -144,12 +144,13 @@ The server understood the request but refused the operation under its access pol
 - Ledger access restricted
 
 A write rejected by a modify policy returns `403` with
-`@type: "err:policy/AccessDenied"`. Malformed transactions still return `400`.
+`@type: "err:policy/AccessDenied"`, and `error` carries the policy's
+`f:exMessage` when it has one. Malformed transactions still return `400`.
 
 **Example:**
 ```json
 {
-  "error": "access denied (403)",
+  "error": "Employees may not modify document content.",
   "status": 403,
   "@type": "err:policy/AccessDenied"
 }
