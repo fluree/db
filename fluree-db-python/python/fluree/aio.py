@@ -136,6 +136,7 @@ class Connection:
         await self.close()
 
     async def close(self) -> None:
+        """Flush pending writes and release the database; see :meth:`fluree.Connection.close`."""
         await _call(self._sync.close)
 
     async def exists(self, ledger: str) -> bool:
@@ -143,12 +144,16 @@ class Connection:
         return await _call(self._sync.__contains__, ledger)
 
     async def create(self, ledger: str, *, source: str | os.PathLike[str] | None = None) -> Ledger:
+        """Create a ledger, optionally bulk-loading RDF files into it; see
+        :meth:`fluree.Connection.create`."""
         return Ledger(self, await _call(self._sync.create, ledger, source=source))
 
     async def ledger(self, ledger: str) -> Ledger:
+        """An existing ledger; see :meth:`fluree.Connection.ledger`."""
         return Ledger(self, await _call(self._sync.ledger, ledger))
 
     async def ledgers(self) -> list[str]:
+        """The ids of every ledger, as ``name:branch``; see :meth:`fluree.Connection.ledgers`."""
         return await _call(self._sync.ledgers)
 
     async def query(
@@ -161,6 +166,8 @@ class Connection:
         timeout: float | None = None,
         **kwparameters: Any,
     ) -> Any:
+        """Run a query whose ``FROM`` names the ledgers to read; see
+        :meth:`fluree.Connection.query`."""
         params = _params(parameters, kwparameters)
         return await _query(
             lambda c: _sync._execute(
@@ -178,6 +185,8 @@ class Connection:
         timeout: float | None = None,
         **kwparameters: Any,
     ) -> Result:
+        """A SPARQL ``SELECT`` whose ``FROM`` names the ledgers, as for :meth:`query`, returning
+        its :class:`Result`; see :meth:`fluree.Connection.select`."""
         params = _params(parameters, kwparameters)
         return await _query(
             lambda c: _sync._execute(
@@ -196,6 +205,8 @@ class Connection:
         timeout: float | None = None,
         **kwparameters: Any,
     ) -> QueryProfile:
+        """Run :meth:`query` and report the fuel and time it took; see
+        :meth:`fluree.Connection.profile`."""
         params = _params(parameters, kwparameters)
         return await _query(
             lambda c: _sync._profile(
@@ -218,15 +229,21 @@ class Connection:
         return GraphSource(await _call(self._sync.map_sql, name, endpoint, mapping, **options))
 
     async def graph_sources(self) -> list[GraphSource]:
+        """Every graph source, by id; see :meth:`fluree.Connection.graph_sources`."""
         return [GraphSource(s) for s in await _call(self._sync.graph_sources)]
 
     async def graph_source(self, name: str) -> GraphSource:
+        """Graph source ``name`` (``"name"`` or ``"name:branch"``); see
+        :meth:`fluree.Connection.graph_source`."""
         return GraphSource(await _call(self._sync.graph_source, name))
 
     async def restore(self, path: str | os.PathLike[str], ledger: str) -> Ledger:
+        """Create ``ledger`` from a ``.flpack`` archive; see :meth:`fluree.Connection.restore`."""
         return Ledger(self, await _call(self._sync.restore, path, ledger))
 
     async def drop(self, ledger: str) -> None:
+        """Delete a ledger, every branch and all history (``"people"``), or one branch
+        (``"people:dev"``); see :meth:`fluree.Connection.drop`."""
         await _call(self._sync.drop, ledger)
 
 
@@ -241,6 +258,7 @@ class Ledger:
 
     @property
     def id(self) -> str:
+        """The ledger's id, ``name:branch``."""
         return self._sync.id
 
     def __repr__(self) -> str:
@@ -258,6 +276,7 @@ class Ledger:
         values: dict[str, Any] | None = None,
         default_allow: bool | None = None,
     ) -> Ledger:
+        """This ledger, governed; see :meth:`fluree.Ledger.with_policy`."""
         return self._wrap(
             self._sync.with_policy(
                 identity=identity,
@@ -269,9 +288,12 @@ class Ledger:
         )
 
     async def insert(self, data: Data, *, format: Format | None = None, message: str | None = None) -> Commit:
+        """Add data; see :meth:`fluree.Ledger.insert`."""
         return await _call(self._sync.insert, data, format=format, message=message)
 
     async def upsert(self, data: Data, *, format: Format | None = None, message: str | None = None) -> Commit:
+        """Add data, replacing existing values of the properties it sets; see
+        :meth:`fluree.Ledger.upsert`."""
         return await _call(self._sync.upsert, data, format=format, message=message)
 
     async def insert_rows(self, rows: Any, **options: Any) -> Commit:
@@ -291,6 +313,8 @@ class Ledger:
         message: str | None = None,
         **kwparameters: Any,
     ) -> Commit:
+        """Apply a SPARQL UPDATE, a Cypher write, or a JSON-LD ``where``/``delete``/``insert``;
+        see :meth:`fluree.Ledger.update`."""
         return await _call(
             self._sync.update, transaction, parameters, language=language, message=message, **kwparameters
         )
@@ -305,6 +329,8 @@ class Ledger:
         dry_run: bool = False,
         message: str | None = None,
     ) -> Commit:
+        """Make a graph hold exactly ``data``, committing only the difference; see
+        :meth:`fluree.Ledger.sync`."""
         return await _call(
             self._sync.sync,
             data,
@@ -355,6 +381,7 @@ class Ledger:
         timeout: float | None = None,
         **kwparameters: Any,
     ) -> Any:
+        """Query the latest state; see :meth:`fluree.Ledger.query`."""
         params = _params(parameters, kwparameters)
         return await _query(
             lambda c: _sync._execute(
@@ -372,6 +399,7 @@ class Ledger:
         timeout: float | None = None,
         **kwparameters: Any,
     ) -> Result:
+        """Run a ``SELECT`` on the latest state; see :meth:`fluree.Ledger.select`."""
         params = _params(parameters, kwparameters)
         return await _query(
             lambda c: _sync._execute(
@@ -390,6 +418,8 @@ class Ledger:
         timeout: float | None = None,
         **kwparameters: Any,
     ) -> QueryProfile:
+        """Run :meth:`query` and report the fuel and time it took; see
+        :meth:`fluree.Ledger.profile`."""
         params = _params(parameters, kwparameters)
         return await _query(
             lambda c: _sync._profile(
@@ -423,9 +453,12 @@ class Ledger:
         language: Language | None = None,
         **kwparameters: Any,
     ) -> dict[str, Any]:
+        """The plan the engine would run ``query`` with, without running it; see
+        :meth:`fluree.Ledger.explain`."""
         return await _call(self._sync.explain, query, parameters, language=language, **kwparameters)
 
     async def snapshot(self) -> Snapshot:
+        """The latest state, frozen; see :meth:`fluree.Ledger.snapshot`."""
         return Snapshot(self, await _call(self._sync.snapshot))
 
     async def at(
@@ -435,6 +468,8 @@ class Ledger:
         time: _dt.datetime | str | None = None,
         commit: str | None = None,
     ) -> Snapshot:
+        """The ledger as it was at transaction ``t``, a wall-clock ``time``, or a ``commit``;
+        see :meth:`fluree.Ledger.at`."""
         return Snapshot(self, await _call(self._sync.at, t, time=time, commit=commit))
 
     async def history(
@@ -445,21 +480,29 @@ class Ledger:
         from_t: int = 1,
         to_t: int | None = None,
     ) -> list[Change]:
+        """Every change to ``subject``, oldest first; see :meth:`fluree.Ledger.history`."""
         return await _call(self._sync.history, subject, predicate, from_t=from_t, to_t=to_t)
 
     async def log(self, limit: int | None = None) -> list[Commit]:
+        """The ledger's commits, newest first; see :meth:`fluree.Ledger.log`."""
         return await _call(self._sync.log, limit)
 
     async def changes(self, commit: CommitRef) -> list[Change]:
+        """The facts one commit asserted and retracted; see :meth:`fluree.Ledger.changes`."""
         return await _call(self._sync.changes, commit)
 
     async def branch(self, name: str) -> Ledger:
+        """Create branch ``name`` from this ledger's latest state and return it; see
+        :meth:`fluree.Ledger.branch`."""
         return self._wrap(await _call(self._sync.branch, name))
 
     async def branches(self) -> list[Branch]:
+        """Every branch of this ledger, by name; see :meth:`fluree.Ledger.branches`."""
         return await _call(self._sync.branches)
 
     async def merge(self, source: str | Ledger, *, strategy: MergeStrategy = "take-both") -> MergeResult:
+        """Bring the commits of branch ``source`` (a name like ``"dev"``, or its
+        :class:`Ledger`) into this branch; see :meth:`fluree.Ledger.merge`."""
         return await _call(self._sync.merge, _source(source), strategy=strategy)
 
     async def merge_preview(self, source: str | Ledger, **options: Any) -> MergePreview:
@@ -467,11 +510,14 @@ class Ledger:
         return await _call(self._sync.merge_preview, _source(source), **options)
 
     async def rebase(self, *, strategy: RebaseStrategy = "take-both") -> RebaseResult:
+        """Replay this branch's own commits on top of the latest commit of the branch it was
+        created from, as if it had been created from there; see :meth:`fluree.Ledger.rebase`."""
         return await _call(self._sync.rebase, strategy=strategy)
 
     async def revert(
         self, commits: CommitRef | list[CommitRef], *, strategy: RevertStrategy = "abort"
     ) -> RevertResult:
+        """Undo one commit or several, in one new commit; see :meth:`fluree.Ledger.revert`."""
         return await _call(self._sync.revert, commits, strategy=strategy)
 
     async def revert_preview(self, commits: CommitRef | list[CommitRef], **options: Any) -> RevertPreview:
@@ -483,18 +529,28 @@ class Ledger:
         return await _call(self._sync.validate, shapes, **options)
 
     async def index_status(self) -> IndexStatus:
+        """How far indexing has caught up with the ledger's commits; see
+        :meth:`fluree.Ledger.index_status`."""
         return await _call(self._sync.index_status)
 
     async def index(self, *, timeout: float | None = None) -> int:
+        """Index everything committed so far, waiting up to ``timeout`` seconds; see
+        :meth:`fluree.Ledger.index`."""
         return await _call(self._sync.index, timeout=timeout)
 
     async def reindex(self) -> int:
+        """Rebuild the index from scratch from the commit history; see
+        :meth:`fluree.Ledger.reindex`."""
         return await _call(self._sync.reindex)
 
     async def verify(self, *, max_commits: int | None = None) -> VerifyReport:
+        """Check that every commit, back to the first (or the last ``max_commits``), and the
+        index root are present and readable; see :meth:`fluree.Ledger.verify`."""
         return await _call(self._sync.verify, max_commits=max_commits)
 
     async def sweep(self, *, dry_run: bool = False) -> SweepResult:
+        """Delete index files that no index of any branch of this ledger references any more —
+        left behind as indexing replaces old index files; see :meth:`fluree.Ledger.sweep`."""
         return await _call(self._sync.sweep, dry_run=dry_run)
 
     async def export(
@@ -506,11 +562,14 @@ class Ledger:
         all_graphs: bool = False,
         context: dict[str, Any] | None = None,
     ) -> str | None:
+        """Export the ledger's current data as RDF; see :meth:`fluree.Ledger.export`."""
         return await _call(
             self._sync.export, path, format=format, graph=graph, all_graphs=all_graphs, context=context
         )
 
     async def archive(self, path: str | os.PathLike[str], *, include_indexes: bool = True) -> None:
+        """Write the whole ledger, every commit, to a ``.flpack`` archive that
+        :meth:`Connection.restore` loads back; see :meth:`fluree.Ledger.archive`."""
         await _call(self._sync.archive, path, include_indexes=include_indexes)
 
     async def context(self) -> dict[str, Any] | None:
@@ -518,23 +577,33 @@ class Ledger:
         return await _call(lambda: self._sync.context)
 
     async def set_context(self, context: dict[str, Any]) -> None:
+        """Replace the ledger's default JSON-LD context; see :meth:`fluree.Ledger.set_context`."""
         await _call(self._sync.set_context, context)
 
     async def set_full_text(
         self, properties: Iterable[str], *, language: str = "en", reindex: bool = True
     ) -> None:
+        """Make the plain-string values of ``properties`` searchable with ``fulltext()``; see
+        :meth:`fluree.Ledger.set_full_text`."""
         await _call(self._sync.set_full_text, list(properties), language=language, reindex=reindex)
 
     async def full_text(self) -> FullText | None:
+        """The ledger's full-text configuration, or ``None`` without one; see
+        :meth:`fluree.Ledger.full_text`."""
         return await _call(self._sync.full_text)
 
     async def info(self) -> dict[str, Any]:
+        """Ledger metadata and statistics; see :meth:`fluree.Ledger.info`."""
         return await _call(self._sync.info)
 
     async def graphs(self) -> list[fluree.IRI]:
+        """The IRIs of the ledger's named graphs, in the order they were first written to; see
+        :meth:`fluree.Ledger.graphs`."""
         return await _call(self._sync.graphs)
 
     async def drop_graph(self, graph: str) -> Commit:
+        """Retract everything in named graph ``graph`` (its full IRI) in one commit; see
+        :meth:`fluree.Ledger.drop_graph`."""
         return await _call(self._sync.drop_graph, graph)
 
 
@@ -553,10 +622,12 @@ class Snapshot:
 
     @property
     def ledger(self) -> str:
+        """The id of the ledger this is a snapshot of, ``name:branch``."""
         return self._sync.ledger
 
     @property
     def t(self) -> int:
+        """The transaction this snapshot reflects; see :attr:`fluree.Snapshot.t`."""
         return self._sync.t
 
     def __repr__(self) -> str:
@@ -572,6 +643,7 @@ class Snapshot:
         timeout: float | None = None,
         **kwparameters: Any,
     ) -> Any:
+        """Run a SPARQL, Cypher, or JSON-LD query; see :meth:`fluree.Snapshot.query`."""
         params = _params(parameters, kwparameters)
         return await _query(
             lambda c: _sync._execute(
@@ -589,6 +661,9 @@ class Snapshot:
         timeout: float | None = None,
         **kwparameters: Any,
     ) -> Result:
+        """Run a SPARQL ``SELECT`` or a Cypher query and return its :class:`Result` —
+        :meth:`query` for the queries whose result is a table, typed as one; see
+        :meth:`fluree.Snapshot.select`."""
         params = _params(parameters, kwparameters)
         return await _query(
             lambda c: _sync._execute(
@@ -607,6 +682,8 @@ class Snapshot:
         timeout: float | None = None,
         **kwparameters: Any,
     ) -> QueryProfile:
+        """Run :meth:`query` and report the fuel and time it took; see
+        :meth:`fluree.Snapshot.profile`."""
         params = _params(parameters, kwparameters)
         return await _query(
             lambda c: _sync._profile(
@@ -624,6 +701,8 @@ class Snapshot:
         batch_size: int = 1000,
         **kwparameters: Any,
     ) -> RowStream:
+        """Run a SELECT and read its rows as they are produced; see
+        :meth:`fluree.Snapshot.stream`."""
         return RowStream(
             lambda: self._sync.stream(
                 query, parameters, max_fuel=max_fuel, timeout=timeout, batch_size=batch_size, **kwparameters
@@ -638,6 +717,8 @@ class Snapshot:
         language: Language | None = None,
         **kwparameters: Any,
     ) -> dict[str, Any]:
+        """The plan the engine would run ``query`` with, without running it; see
+        :meth:`fluree.Snapshot.explain`."""
         return await _call(self._sync.explain, query, parameters, language=language, **kwparameters)
 
     async def export(
@@ -649,11 +730,13 @@ class Snapshot:
         all_graphs: bool = False,
         context: dict[str, Any] | None = None,
     ) -> str | None:
+        """Export the data as of this snapshot; see :meth:`fluree.Snapshot.export`."""
         return await _call(
             self._sync.export, path, format=format, graph=graph, all_graphs=all_graphs, context=context
         )
 
     async def branch(self, name: str) -> Ledger:
+        """Create branch ``name`` from this past state; see :meth:`fluree.Snapshot.branch`."""
         return self._ledger._wrap(await _call(self._sync.branch, name))
 
 
@@ -674,6 +757,7 @@ class Transaction:
 
     @property
     def committed(self) -> Commit | None:
+        """The :class:`Commit` once the transaction has committed, else ``None``."""
         return self._sync.committed
 
     def __repr__(self) -> str:
@@ -686,15 +770,19 @@ class Transaction:
         await asyncio.shield(self._finish(exc_type, *exc))
 
     async def insert(self, data: Data, *, format: Format | None = None) -> None:
+        """Stage an insert; see :meth:`fluree.Transaction.insert`."""
         await self._call(self._sync.insert, data, format=format)
 
     async def upsert(self, data: Data, *, format: Format | None = None) -> None:
+        """Stage an upsert; see :meth:`fluree.Transaction.upsert`."""
         await self._call(self._sync.upsert, data, format=format)
 
     async def insert_rows(self, rows: Any, **options: Any) -> None:
+        """Stage :meth:`Ledger.insert_rows`; see :meth:`fluree.Transaction.insert_rows`."""
         await self._call(self._sync.insert_rows, rows, **options)
 
     async def upsert_rows(self, rows: Any, **options: Any) -> None:
+        """Stage :meth:`Ledger.upsert_rows`; see :meth:`fluree.Transaction.upsert_rows`."""
         await self._call(self._sync.upsert_rows, rows, **options)
 
     async def update(
@@ -705,6 +793,8 @@ class Transaction:
         language: Language | None = None,
         **kwparameters: Any,
     ) -> Result | None:
+        """Stage an update — SPARQL UPDATE, a Cypher write, or JSON-LD; see
+        :meth:`fluree.Transaction.update`."""
         return await self._call(self._sync.update, transaction, parameters, language=language, **kwparameters)
 
     async def query(
@@ -717,6 +807,7 @@ class Transaction:
         timeout: float | None = None,
         **kwparameters: Any,
     ) -> Any:
+        """Query the staged state; see :meth:`fluree.Transaction.query`."""
         return await self._query(query, parameters, language, max_fuel, timeout, kwparameters, False)
 
     async def select(
@@ -729,6 +820,7 @@ class Transaction:
         timeout: float | None = None,
         **kwparameters: Any,
     ) -> Result:
+        """Run a ``SELECT`` on the staged state; see :meth:`fluree.Transaction.select`."""
         return await self._query(query, parameters, language, max_fuel, timeout, kwparameters, True)
 
     async def _query(
@@ -762,12 +854,18 @@ class Transaction:
         language: Language | None = None,
         **kwparameters: Any,
     ) -> dict[str, Any]:
+        """The plan ``query`` would run with over the staged state; see
+        :meth:`fluree.Transaction.explain`."""
         return await self._call(self._sync.explain, query, parameters, language=language, **kwparameters)
 
     async def commit(self, *, message: str | None = None) -> Commit:
+        """Commit the staged writes as one commit, recording ``message`` (by default the one the
+        transaction was opened with); see :meth:`fluree.Transaction.commit`."""
         return await self._call(self._sync.commit, message=message)
 
     async def rollback(self) -> None:
+        """Discard the staged writes and close the transaction; see
+        :meth:`fluree.Transaction.rollback`."""
         await self._call(self._sync.rollback)
 
     async def _call(self, fn: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
@@ -800,18 +898,22 @@ class GraphSource:
 
     @property
     def id(self) -> str:
+        """The source's id, ``name:branch``."""
         return self._sync.id
 
     @property
     def name(self) -> str:
+        """The source's name."""
         return self._sync.name
 
     @property
     def branch(self) -> str:
+        """The source's branch."""
         return self._sync.branch
 
     @property
     def kind(self) -> str:
+        """The kind of source, such as ``"iceberg"``, ``"delta"`` or ``"sql"``."""
         return self._sync.kind
 
     def __repr__(self) -> str:
@@ -833,6 +935,7 @@ class GraphSource:
         timeout: float | None = None,
         **kwparameters: Any,
     ) -> Any:
+        """Run a SPARQL or JSON-LD query of this source; see :meth:`fluree.GraphSource.query`."""
         params = _params(parameters, kwparameters)
         return await _query(
             lambda c: _sync._execute(
@@ -850,6 +953,7 @@ class GraphSource:
         timeout: float | None = None,
         **kwparameters: Any,
     ) -> Result:
+        """Run a SPARQL ``SELECT`` of this source; see :meth:`fluree.GraphSource.select`."""
         params = _params(parameters, kwparameters)
         return await _query(
             lambda c: _sync._execute(
@@ -859,9 +963,13 @@ class GraphSource:
         )
 
     async def materialize(self, into: str, *, full: bool = False) -> MaterializeResult:
+        """Copy this source's rows into ledger ``into`` (created if missing) as ordinary ledger
+        data, so they gain history, policy and indexes; see
+        :meth:`fluree.GraphSource.materialize`."""
         return await _call(self._sync.materialize, into, full=full)
 
     async def drop(self) -> None:
+        """Remove this graph source; see :meth:`fluree.GraphSource.drop`."""
         await _call(self._sync.drop)
 
 
@@ -881,6 +989,7 @@ class RowStream(AsyncIterator[Record]):
 
     @property
     def columns(self) -> list[str] | None:
+        """The same as :meth:`keys`; see :attr:`fluree.RowStream.columns`."""
         return None if self._stream is None else self._stream.columns
 
     def __aiter__(self) -> RowStream:

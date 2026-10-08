@@ -162,6 +162,9 @@ class GraphSource:
     :meth:`Connection.graph_source`. Query it on its own here, or with other
     graph sources and ledgers through :meth:`Connection.query`, naming it in
     ``FROM <name:main>`` (SPARQL) or ``"from"`` (JSON-LD).
+
+    ``id`` is ``name:branch``, and ``kind`` the kind of source, such as
+    ``"iceberg"``, ``"delta"`` or ``"sql"``.
     """
 
     __slots__ = ("_connection", "branch", "id", "kind", "name")

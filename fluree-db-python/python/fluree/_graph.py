@@ -69,6 +69,7 @@ class Relationship(Mapping[str, Any]):
 
     @property
     def nodes(self) -> tuple[Node, Node]:
+        """``(start_node, end_node)``."""
         return (self.start_node, self.end_node)
 
     def __getitem__(self, key: str) -> Any:
@@ -110,10 +111,12 @@ class Path:
 
     @property
     def start_node(self) -> Node:
+        """The node the path starts at."""
         return self.nodes[0]
 
     @property
     def end_node(self) -> Node:
+        """The node the path ends at."""
         return self.nodes[-1]
 
     def __len__(self) -> int:

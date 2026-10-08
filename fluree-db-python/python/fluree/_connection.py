@@ -409,6 +409,7 @@ class Ledger:
 
     @property
     def id(self) -> str:
+        """The ledger's id, ``name:branch``."""
         return self._id
 
     def __repr__(self) -> str:
@@ -1246,6 +1247,7 @@ class Snapshot:
 
     @property
     def ledger(self) -> str:
+        """The id of the ledger this is a snapshot of, ``name:branch``."""
         return self._native.ledger
 
     @property

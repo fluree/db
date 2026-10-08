@@ -48,6 +48,7 @@ class Record(tuple):  # type: ignore[type-arg]
         return self[name]
 
     def get(self, key: str, default: Any = None) -> Any:
+        """The value of column ``key``, or ``default`` without one."""
         return self[key] if key in self._keys else default
 
     def index(self, key: str | int) -> int:  # type: ignore[override]
@@ -62,12 +63,15 @@ class Record(tuple):  # type: ignore[type-arg]
             raise KeyError(key) from None
 
     def keys(self) -> list[str]:
+        """The column names, in order."""
         return list(self._keys)
 
     def values(self, *keys: str | int) -> list[Any]:
+        """The values of columns ``keys`` (names or positions), or of every column."""
         return [self[k] for k in keys] if keys else list(self)
 
     def items(self, *keys: str | int) -> list[tuple[str, Any]]:
+        """``(column, value)`` pairs for columns ``keys``, or for every column."""
         positions = [self.index(k) for k in keys] if keys else range(len(self))
         return [(self._keys[i], super(Record, self).__getitem__(i)) for i in positions]
 
@@ -165,6 +169,7 @@ class Result(Sequence[Record]):
         return [r[key] for r in self._records]
 
     def values(self, *keys: str | int) -> list[list[Any]]:
+        """Every record's values, as lists; see :meth:`Record.values`."""
         return [r.values(*keys) for r in self._records]
 
     def data(self, *keys: str | int) -> list[dict[str, Any]]:

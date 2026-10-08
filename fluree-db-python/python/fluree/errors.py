@@ -40,6 +40,7 @@ class ShaclViolationError(InvalidRequestError):
 
     @property
     def violations(self) -> list[ValidationResult]:
+        """Each way the write breaks the shapes, as :class:`ValidationResult` objects."""
         from fluree._records import _validation_results
 
         return _validation_results(self._results)

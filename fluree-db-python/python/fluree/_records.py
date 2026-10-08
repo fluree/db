@@ -346,6 +346,7 @@ class VerifyReport:
 
     @property
     def healthy(self) -> bool:
+        """Whether nothing was found missing or unreadable."""
         return self.severity == "healthy"
 
 
