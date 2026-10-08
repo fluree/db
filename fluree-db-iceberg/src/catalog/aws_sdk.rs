@@ -11,8 +11,8 @@
 //!
 //! This is the empirically-chosen path for AWS catalogs: for a normally
 //! S3-authorized principal, neither Glue Data Catalog (IAM mode) nor S3 Tables
-//! vends credentials, so ambient reads suffice. Lake-Formation-governed catalogs
-//! that require *vended* credentials remain the REST client's domain.
+//! vends credentials, so ambient reads suffice. Glue tables readable only with
+//! Lake-Formation-vended credentials are not supported yet (fluree/db#1456).
 //!
 //! The SDK config comes from `aws_config::defaults`, so the standard AWS
 //! endpoint overrides apply (`AWS_ENDPOINT_URL_GLUE`, `AWS_ENDPOINT_URL_S3TABLES`,

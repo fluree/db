@@ -1231,6 +1231,8 @@ triples map a scan skipped because its predicates were hidden.
 
 Credentials, regions and endpoint overrides for these modes are described under [AWS Credentials](#aws-credentials).
 
+To try the Glue mode without an AWS account, `scripts/glue-local/` in the repository runs moto (a local mock of S3 and the Glue Data Catalog), writes Glue-catalogued tables with pyiceberg, and grades a `fluree` binary against them; see its `README.md`.
+
 ### Schema Mismatch
 
 ```json
