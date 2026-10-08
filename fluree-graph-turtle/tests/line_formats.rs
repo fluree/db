@@ -27,7 +27,7 @@ fn quads_land_in_their_graphs_and_literals_keep_their_form() {
 #[test]
 fn triple_terms_nest_in_object_position() {
     let d = nquads(
-        "<http://ex/r> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> \
+        "<http://ex/doc> <http://ex/says> \
          <<( _:s <http://ex/p> <<( <http://ex/a> <http://ex/b> \"c\" )>> )>> .\n",
     );
     let object = &d.default.iter().next().unwrap().o;
@@ -36,6 +36,38 @@ fn triple_terms_nest_in_object_position() {
     };
     assert!(matches!(outer[0], Term::BlankNode(_)));
     assert!(matches!(outer[2], Term::TripleTerm(_)));
+}
+
+/// `r rdf:reifies <<( s p o )>>` is a reification, as Turtle reads it, in
+/// either line format and in any graph; it does not assert its triple.
+#[test]
+fn a_reifies_statement_is_a_reification() {
+    let reifies = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
+    let d = nquads(&format!(
+        "_:r {reifies} <<( <http://ex/a> <http://ex/b> \"c\" )>> .\n\
+         <http://ex/r> {reifies} <<( <http://ex/a> <http://ex/b> <http://ex/c> )>> <http://ex/g> .\n\
+         <http://ex/r> {reifies} <http://ex/c> .\n"
+    ));
+    assert_eq!(d.default.reifications().len(), 1);
+    assert_eq!(d.default.reifications()[0].reifier, Term::blank("r"));
+    assert_eq!(
+        d.default.len(),
+        1,
+        "only the IRI-valued rdf:reifies is a triple"
+    );
+    let named = &d.named[&Term::iri("http://ex/g")];
+    assert!(named.is_empty());
+    assert_eq!(named.reifications()[0].reifier, Term::iri("http://ex/r"));
+
+    let mut sink = GraphCollectorSink::new();
+    parse_ntriples(
+        &format!("_:r {reifies} <<( <http://ex/a> <http://ex/b> \"c\" )>> .\n"),
+        &mut sink,
+    )
+    .unwrap();
+    let graph = sink.into_graph();
+    assert!(graph.is_empty());
+    assert_eq!(graph.reifications().len(), 1);
 }
 
 #[test]
