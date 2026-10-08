@@ -56,6 +56,15 @@ struct Reader<'a, 'i, S> {
     pos: usize,
     sink: &'a mut S,
     format: LineFormat,
+    /// `rdf:reifies` as the sink interned it, once a document names it.
+    reifies_term: Option<TermId>,
+}
+
+/// A statement's object: a term, or the triple term of an
+/// `r rdf:reifies <<( s p o )>>` statement, kept as its parts.
+enum Object {
+    Term(TermId),
+    Reified(TermId, TermId, TermId),
 }
 
 impl<'a, 'i, S: GraphSink> Reader<'a, 'i, S> {
@@ -67,6 +76,7 @@ impl<'a, 'i, S: GraphSink> Reader<'a, 'i, S> {
             pos: 0,
             sink,
             format,
+            reifies_term: None,
         })
     }
 
@@ -124,12 +134,23 @@ impl<'a, 'i, S: GraphSink> Reader<'a, 'i, S> {
 
     /// `subject predicate object graphLabel? '.'`, then only whitespace or a
     /// comment to the end of the line.
+    ///
+    /// `r rdf:reifies <<( s p o )>>` is emitted as the reification it is, as
+    /// the Turtle parser emits it, when the sink records reifications.
     fn statement(&mut self) -> Result<()> {
         let subject = self.node("subject")?;
         self.skip_inline_ws();
         let predicate = self.predicate()?;
         self.skip_inline_ws();
-        let object = self.object()?;
+        let object = if Some(predicate) == self.reifies_term
+            && self.rest().starts_with("<<(")
+            && self.sink.supports_reified_triples()
+        {
+            let (s, p, o) = self.triple_term_parts()?;
+            Object::Reified(s, p, o)
+        } else {
+            Object::Term(self.object()?)
+        };
         self.skip_inline_ws();
         let graph = if self.format == LineFormat::NQuads && self.peek() != Some(b'.') {
             let graph = self.node("graph label")?;
@@ -152,15 +173,22 @@ impl<'a, 'i, S: GraphSink> Reader<'a, 'i, S> {
                 self.format.name()
             )));
         }
-        match graph {
-            None => self.sink.emit_triple(subject, predicate, object)?,
-            Some(_) if !self.sink.supports_quads() => {
-                return Err(self.err(
-                    "the document has a named graph, which this parse's output cannot \
-                     represent without dropping the graph's name",
-                ))
+        if graph.is_some() && !self.sink.supports_quads() {
+            return Err(self.err(
+                "the document has a named graph, which this parse's output cannot \
+                 represent without dropping the graph's name",
+            ));
+        }
+        match (object, graph) {
+            (Object::Term(object), None) => self.sink.emit_triple(subject, predicate, object)?,
+            (Object::Term(object), Some(graph)) => {
+                self.sink.emit_quad(subject, predicate, object, graph)?;
             }
-            Some(graph) => self.sink.emit_quad(subject, predicate, object, graph)?,
+            (Object::Reified(s, p, o), None) => self.sink.emit_reified_triple(s, p, o, subject)?,
+            (Object::Reified(s, p, o), Some(graph)) => {
+                self.sink
+                    .emit_quad_reified_triple(s, p, o, subject, graph)?;
+            }
         }
         self.sink.end_statement();
         Ok(())
@@ -211,6 +239,11 @@ impl<'a, 'i, S: GraphSink> Reader<'a, 'i, S> {
         if !self.sink.supports_triple_terms() {
             return Err(self.err("this parse's output cannot represent triple terms"));
         }
+        let (subject, predicate, object) = self.triple_term_parts()?;
+        Ok(self.sink.term_triple(subject, predicate, object)?)
+    }
+
+    fn triple_term_parts(&mut self) -> Result<(TermId, TermId, TermId)> {
         self.pos += 3; // `<<(`
         self.skip_inline_ws();
         let subject = self.node("triple term's subject")?;
@@ -223,12 +256,16 @@ impl<'a, 'i, S: GraphSink> Reader<'a, 'i, S> {
             return Err(self.err("expected ')>>' to close the triple term"));
         }
         self.pos += 3;
-        Ok(self.sink.term_triple(subject, predicate, object)?)
+        Ok((subject, predicate, object))
     }
 
     fn iri_term(&mut self) -> Result<TermId> {
         let iri = self.iri_text()?;
-        Ok(self.sink.term_iri(&iri))
+        let id = self.sink.term_iri(&iri);
+        if iri == rdf::REIFIES {
+            self.reifies_term = Some(id);
+        }
+        Ok(id)
     }
 
     /// `<…>`: an absolute IRI, whose only escapes are `\u` and `\U`, and in
