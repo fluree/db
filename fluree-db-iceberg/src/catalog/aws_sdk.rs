@@ -73,9 +73,10 @@ fn classify_sdk_failure(code: Option<&str>, http_status: Option<u16>) -> SdkFail
 fn sdk_catalog_error(op: &str, what: &str, failure: SdkFailure, detail: String) -> IcebergError {
     match failure {
         SdkFailure::NotFound => IcebergError::TableNotFound(format!("{what} not found: {detail}")),
+        // `load_table` renames `table` to the table identifier (`name_denied_table`).
         SdkFailure::AccessDenied => IcebergError::CatalogAccessDenied {
             table: what.to_string(),
-            message: format!("{op}: {detail}"),
+            message: format!("{op} on {what}: {detail}"),
         },
         SdkFailure::Other => IcebergError::Catalog(format!("{op} on {what} failed: {detail}")),
     }
@@ -221,7 +222,9 @@ impl SendCatalogClient for GlueSdkCatalogClient {
             .name(&table_id.table)
             .send()
             .await
-            .map_err(|e| map_sdk_error("Glue GetTable", &what, &e))?;
+            .map_err(|e| {
+                super::name_denied_table(map_sdk_error("Glue GetTable", &what, &e), table_id)
+            })?;
 
         let table = out
             .table()
@@ -326,7 +329,12 @@ impl SendCatalogClient for S3TablesSdkCatalogClient {
             .name(&table_id.table)
             .send()
             .await
-            .map_err(|e| map_sdk_error("S3Tables GetTableMetadataLocation", &what, &e))?;
+            .map_err(|e| {
+                super::name_denied_table(
+                    map_sdk_error("S3Tables GetTableMetadataLocation", &what, &e),
+                    table_id,
+                )
+            })?;
 
         let metadata_location = out
             .metadata_location()
@@ -417,6 +425,36 @@ mod tests {
     }
 
     #[test]
+    fn a_denied_load_names_its_table() {
+        let id = TableIdentifier {
+            namespace: "sales".to_string(),
+            table: "orders".to_string(),
+        };
+        let denied = sdk_catalog_error(
+            "Glue GetTable",
+            "Glue table sales.orders",
+            SdkFailure::AccessDenied,
+            "AccessDeniedException".into(),
+        );
+        match super::super::name_denied_table(denied, &id) {
+            IcebergError::CatalogAccessDenied { table, message } => {
+                assert_eq!(table, "sales.orders");
+                assert!(
+                    message.starts_with("Glue GetTable on Glue table sales.orders"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected CatalogAccessDenied, got {other:?}"),
+        }
+        // Any other error passes through untouched.
+        let other = IcebergError::Catalog("x".into());
+        assert!(matches!(
+            super::super::name_denied_table(other, &id),
+            IcebergError::Catalog(_)
+        ));
+    }
+
+    #[test]
     fn sdk_catalog_errors_name_the_object_and_keep_the_detail() {
         let not_found = sdk_catalog_error(
             "Glue GetTable",
@@ -438,6 +476,10 @@ mod tests {
         match &denied {
             IcebergError::CatalogAccessDenied { table, message } => {
                 assert_eq!(table, "Glue table a.b");
+                assert!(
+                    message.contains("Glue GetTable on Glue table a.b"),
+                    "{message}"
+                );
                 assert!(message.contains("glue:GetTable"), "{message}");
             }
             other => panic!("expected CatalogAccessDenied, got {other:?}"),

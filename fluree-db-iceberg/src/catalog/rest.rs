@@ -239,9 +239,21 @@ impl RestCatalogClient {
 
                 if !status.is_success() {
                     let body = response.text().await.unwrap_or_default();
-                    return Err(IcebergError::Catalog(format!(
-                        "Catalog request failed ({status}): {body}"
-                    )));
+                    let message = format!("Catalog request failed ({status}): {body}");
+                    // A 403, or a 401 that survived the token refresh above, is the
+                    // catalog refusing this principal: typed, so a query reports it as
+                    // `err:catalog/AccessDenied` (403) rather than an internal error.
+                    // The message keeps the "Catalog request failed (<status>)" wording
+                    // hosts already classify verify failures by.
+                    if status == reqwest::StatusCode::UNAUTHORIZED
+                        || status == reqwest::StatusCode::FORBIDDEN
+                    {
+                        return Err(IcebergError::CatalogAccessDenied {
+                            table: path.to_string(),
+                            message,
+                        });
+                    }
+                    return Err(IcebergError::Catalog(message));
                 }
 
                 return response
@@ -392,7 +404,10 @@ impl CatalogClient for RestCatalogClient {
             vec![]
         };
 
-        let response = self.get(&path, &headers).await?;
+        let response = self
+            .get(&path, &headers)
+            .await
+            .map_err(|e| super::name_denied_table(e, table_id))?;
 
         parse_load_table_response(&response)
     }
@@ -469,7 +484,10 @@ impl super::SendCatalogClient for RestCatalogClient {
             vec![]
         };
 
-        let response = self.get(&path, &headers).await?;
+        let response = self
+            .get(&path, &headers)
+            .await
+            .map_err(|e| super::name_denied_table(e, table_id))?;
 
         parse_load_table_response(&response)
     }
@@ -579,6 +597,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refused_load_is_a_typed_denial_naming_the_table() {
+        // 403 on loadTable (and 401 surviving the token refresh, with NoAuth's
+        // no-op refresh) is the catalog refusing this principal.
+        for status in [403, 401] {
+            let server = MockServer::start().await;
+            serve_config(&server, serde_json::json!({})).await;
+            Mock::given(method("GET"))
+                .and(path("/v1/namespaces/db/tables/events"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("not yours"))
+                .mount(&server)
+                .await;
+            let err = loads(&warehouse_client(&server.uri(), None), "db")
+                .await
+                .unwrap_err();
+            match err {
+                IcebergError::CatalogAccessDenied { table, message } => {
+                    assert_eq!(table, "db.events");
+                    // Hosts classify verify failures by this wording; keep it.
+                    assert!(
+                        message.starts_with(&format!("Catalog request failed ({status}")),
+                        "{message}"
+                    );
+                    assert!(message.contains("not yours"), "{message}");
+                }
+                other => panic!("{status}: expected CatalogAccessDenied, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn a_prefix_the_catalog_names_is_used_whole() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -655,8 +703,9 @@ mod tests {
         let err = loads(&warehouse_client(&server.uri(), Some("lake")), "db")
             .await
             .unwrap_err();
+        // Still an error (not "no prefix"), and typed as the catalog's refusal.
         assert!(
-            matches!(&err, IcebergError::Catalog(m) if m.contains("403")),
+            matches!(&err, IcebergError::CatalogAccessDenied { message, .. } if message.contains("403")),
             "{err:?}"
         );
     }

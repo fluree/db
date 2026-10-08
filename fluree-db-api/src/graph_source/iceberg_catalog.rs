@@ -253,7 +253,7 @@ pub async fn browse_iceberg_catalog(
 
     let namespaces = SendCatalogClient::list_namespaces(&*catalog)
         .await
-        .map_err(|e| crate::ApiError::config(format!("Failed to list namespaces: {e}")))?;
+        .map_err(|e| storage_api_error("Failed to list namespaces", e))?;
 
     let mut tables = Vec::new();
     if depth == BrowseDepth::Tables {
@@ -261,7 +261,7 @@ pub async fn browse_iceberg_catalog(
             let ns_tables = SendCatalogClient::list_tables(&*catalog, ns)
                 .await
                 .map_err(|e| {
-                    crate::ApiError::config(format!("Failed to list tables in namespace {ns}: {e}"))
+                    storage_api_error(&format!("Failed to list tables in namespace {ns}"), e)
                 })?;
             for qualified in ns_tables {
                 tables.push(split_qualified_table(ns, &qualified));
@@ -756,7 +756,7 @@ pub async fn preview_iceberg_table(
     let mut load = SendCatalogClient::load_table(&*catalog, &table_id, conn.io.vended_credentials)
         .await
         .map_err(|e| {
-            crate::ApiError::config(format!("Failed to load table {}: {e}", table.qualified()))
+            storage_api_error(&format!("Failed to load table {}", table.qualified()), e)
         })?;
 
     // Inline from a REST `loadTable`, else read from `metadata_location` (Glue /
@@ -940,9 +940,10 @@ pub(crate) fn storage_query_error(
 }
 
 /// Preview/browse-path analogue of [`storage_query_error`]: lift a
-/// storage-read [`IcebergError`](fluree_db_iceberg::IcebergError) into an
-/// [`ApiError`](crate::ApiError). The access-denied case becomes
-/// `ApiError::StorageAccessDenied` (→ HTTP 403); everything else becomes
+/// storage-read or catalog [`IcebergError`](fluree_db_iceberg::IcebergError) into
+/// an [`ApiError`](crate::ApiError). Storage access-denied becomes
+/// `ApiError::StorageAccessDenied` and a catalog's refusal the query path's
+/// `CatalogAccessDenied` (both → HTTP 403); everything else becomes
 /// `ApiError::config("{context}: {err}")`, matching the pre-existing preview
 /// wrapping.
 pub(crate) fn storage_api_error(
@@ -961,6 +962,14 @@ pub(crate) fn storage_api_error(
             region,
             message,
         },
+        // A catalog's refusal (REST 401/403, AWS Glue / S3 Tables access denied)
+        // is the same 403 the query path reports.
+        fluree_db_iceberg::IcebergError::CatalogAccessDenied { table, message } => {
+            crate::ApiError::Query(fluree_db_query::QueryError::CatalogAccessDenied {
+                table,
+                message,
+            })
+        }
         other => crate::ApiError::config(format!("{context}: {other}")),
     }
 }
@@ -1414,6 +1423,39 @@ impl crate::Fluree {
 
 #[cfg(test)]
 mod tests {
+    /// A catalog's refusal (REST 401/403, AWS Glue / S3 Tables access denied) is
+    /// the same typed 403 on the query path and the onboarding path, never an
+    /// internal or config error.
+    #[test]
+    fn a_catalog_denial_lifts_to_a_typed_403_on_both_paths() {
+        let denied = || fluree_db_iceberg::IcebergError::CatalogAccessDenied {
+            table: "sales.orders".to_string(),
+            message: "Catalog request failed (403 Forbidden): not yours".to_string(),
+        };
+        let query = super::storage_query_error("Failed to load table from catalog", denied());
+        match &query {
+            fluree_db_query::QueryError::CatalogAccessDenied { table, message } => {
+                assert_eq!(table, "sales.orders");
+                // Hosts classify verify failures by this wording.
+                assert!(message.contains("Catalog request failed (403"), "{message}");
+            }
+            other => panic!("expected CatalogAccessDenied, got {other:?}"),
+        }
+        assert_eq!(crate::ApiError::Query(query).status_code(), 403);
+        let api = super::storage_api_error("Failed to load table sales.orders", denied());
+        assert_eq!(api.status_code(), 403, "{api:?}");
+        // Anything else keeps its pre-existing wrapping.
+        let other = super::storage_api_error(
+            "Failed to load table sales.orders",
+            fluree_db_iceberg::IcebergError::Catalog("boom".into()),
+        );
+        assert_eq!(
+            other.to_string(),
+            crate::ApiError::config("Failed to load table sales.orders: Catalog error: boom")
+                .to_string()
+        );
+    }
+
     use super::*;
 
     // ── §2 credential-source decision (pure; the full matrix) ──

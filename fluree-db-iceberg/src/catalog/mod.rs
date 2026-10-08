@@ -26,6 +26,24 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 
 /// Response from loading a table, including optional vended credentials.
+/// Name the table a catalog refused access to. A denial is raised where only
+/// the request is known (a REST path, an SDK operation), so each `load_table`
+/// relabels it with the table it was loading; any other error passes through.
+pub(crate) fn name_denied_table(
+    err: crate::IcebergError,
+    table_id: &TableIdentifier,
+) -> crate::IcebergError {
+    match err {
+        crate::IcebergError::CatalogAccessDenied { message, .. } => {
+            crate::IcebergError::CatalogAccessDenied {
+                table: format!("{}.{}", table_id.namespace, table_id.table),
+                message,
+            }
+        }
+        other => other,
+    }
+}
+
 #[derive(Debug)]
 pub struct LoadTableResponse {
     /// S3/file path to the table metadata JSON file

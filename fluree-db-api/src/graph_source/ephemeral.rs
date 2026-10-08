@@ -114,9 +114,10 @@ impl EphemeralR2rmlProvider {
         )
         .await
         .map_err(|e| {
-            QueryError::Internal(format!(
-                "Failed to load table '{table_name}' from catalog: {e}"
-            ))
+            crate::graph_source::iceberg_catalog::storage_query_error(
+                &format!("Failed to load table '{table_name}' from catalog"),
+                e,
+            )
         })?;
 
         // Build S3 storage exactly as the preview/sample paths do: vended creds

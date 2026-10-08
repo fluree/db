@@ -38,7 +38,8 @@ use fluree_db_iceberg::{
 
 use crate::graph_source::config::IcebergConnectionConfig;
 use crate::graph_source::iceberg_catalog::{
-    build_preview_storage, catalog_client, load_response_metadata, TableIdentifier,
+    build_preview_storage, catalog_client, load_response_metadata, storage_api_error,
+    TableIdentifier,
 };
 use crate::{ApiError, Result};
 
@@ -116,7 +117,7 @@ where
     let mut load = SendCatalogClient::load_table(&*catalog, &table_id, conn.io.vended_credentials)
         .await
         .map_err(|e| {
-            ApiError::config(format!("Failed to load table {}: {e}", table.qualified()))
+            storage_api_error(&format!("Failed to load table {}", table.qualified()), e)
         })?;
 
     // Inline from a REST `loadTable`, else read from `metadata_location` (Glue /
