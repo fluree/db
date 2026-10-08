@@ -6093,7 +6093,7 @@ async fn ledger_with_nested_warning_result(
             Nesting::Chain => unreachable!("not used here"),
         };
         let update = format!(
-            r#"PREFIX sh: <http://www.w3.org/ns/shacl#>
+            r"PREFIX sh: <http://www.w3.org/ns/shacl#>
                PREFIX ex: <http://example.org/ns/>
                INSERT DATA {{
                  {inner}
@@ -6101,7 +6101,7 @@ async fn ledger_with_nested_warning_result(
                    sh:targetClass ex:Player ;
                    sh:severity {outer} ;
                    {reach} .
-               }}"#
+               }}"
         );
         drop(ledger);
         fluree
