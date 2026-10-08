@@ -2,6 +2,7 @@ use crate::context::{Container, ContextEntry, ParsedContext, TypeValue};
 use crate::error::{JsonLdError, Result};
 use crate::iri::{self, UnresolvedIriDisposition};
 use serde_json::{json, Map, Value as JsonValue};
+use std::borrow::Cow;
 
 /// Check if a value is a variable (starts with ?)
 fn is_variable(s: &str) -> bool {
@@ -199,10 +200,10 @@ fn parse_node_value(
     value: &JsonValue,
     entry: Option<&ContextEntry>,
     context: &ParsedContext,
-    idx: &[JsonValue],
+    path: &Path<'_>,
     strict: bool,
 ) -> Result<Vec<JsonValue>> {
-    guard_depth(idx)?;
+    guard_depth(path)?;
     let type_val = entry.and_then(|e| e.type_.as_ref());
     let id_val = entry.and_then(|e| e.id.as_deref());
 
@@ -283,24 +284,23 @@ fn parse_node_value(
 
             let mut results = Vec::new();
             for (i, item) in arr.iter().enumerate() {
-                let mut new_idx = idx.to_vec();
-                new_idx.push(json!(i));
+                let item_path = path.index(i);
 
                 if let JsonValue::Array(_) = item {
                     return Err(JsonLdError::NestedSequence {
-                        idx: new_idx.clone(),
+                        idx: item_path.to_vec(),
                     });
                 }
 
                 let expanded = if item.is_object() {
                     let map = item.as_object().unwrap();
                     if map.contains_key("@value") || map.contains_key("value") {
-                        parse_node_value(item, entry, context, &new_idx, strict)?
+                        parse_node_value(item, entry, context, &item_path, strict)?
                     } else {
-                        vec![expand_node_internal(item, context, &new_idx, strict)?]
+                        vec![expand_node_internal(item, context, &item_path, strict)?]
                     }
                 } else {
-                    parse_node_value(item, entry, context, &new_idx, strict)?
+                    parse_node_value(item, entry, context, &item_path, strict)?
                 };
                 results.extend(expanded);
             }
@@ -331,9 +331,8 @@ fn parse_node_value(
             // Check for @list
             if is_list_item(map) {
                 let list_val = map.get("@list").or_else(|| map.get("list")).unwrap();
-                let mut new_idx = idx.to_vec();
-                new_idx.push(json!("@list"));
-                let expanded = parse_node_value(list_val, entry, context, &new_idx, strict)?;
+                let list_path = path.key("@list");
+                let expanded = parse_node_value(list_val, entry, context, &list_path, strict)?;
                 let mut obj = Map::new();
                 obj.insert("@list".to_string(), JsonValue::Array(expanded));
                 return Ok(vec![JsonValue::Object(obj)]);
@@ -342,9 +341,7 @@ fn parse_node_value(
             // Check for @set (flatten it)
             if is_set_item(map) {
                 let set_val = map.get("@set").or_else(|| map.get("set")).unwrap();
-                let mut new_idx = idx.to_vec();
-                new_idx.push(json!("@set"));
-                return parse_node_value(set_val, entry, context, &new_idx, strict);
+                return parse_node_value(set_val, entry, context, &path.key("@set"), strict);
             }
 
             // Check for @value
@@ -393,15 +390,15 @@ fn parse_node_value(
                     if nested.vocab.is_some() {
                         merged.vocab = nested.vocab.clone();
                     }
-                    merged
+                    Cow::Owned(merged)
                 } else {
-                    context.clone()
+                    Cow::Borrowed(context)
                 }
             } else {
-                context.clone()
+                Cow::Borrowed(context)
             };
 
-            Ok(vec![expand_node_internal(value, &ctx, idx, strict)?])
+            Ok(vec![expand_node_internal(value, &ctx, path, strict)?])
         }
     }
 }
@@ -468,11 +465,11 @@ fn parse_value_object(
 }
 
 /// Parse @type values and return expanded types with potentially updated context
-fn parse_type(
+fn parse_type<'c>(
     node_map: &Map<String, JsonValue>,
-    context: &ParsedContext,
+    context: &'c ParsedContext,
     strict: bool,
-) -> Result<(Vec<String>, ParsedContext)> {
+) -> Result<(Vec<String>, Cow<'c, ParsedContext>)> {
     let type_key = &context.type_key;
     let type_id = context.get(type_key).and_then(|e| e.id.clone());
 
@@ -496,7 +493,7 @@ fn parse_type(
         };
 
         // Check for type-dependent sub-contexts
-        let mut updated_context = context.clone();
+        let mut updated_context = Cow::Borrowed(context);
         // Check original (unexpanded) types for sub-context
         let original_types: Vec<&str> = match type_val {
             JsonValue::String(s) => vec![s.as_str()],
@@ -507,6 +504,7 @@ fn parse_type(
         for orig_t in original_types {
             if let Some(entry) = context.get(orig_t) {
                 if let Some(ref sub_ctx) = entry.context {
+                    let updated_context = updated_context.to_mut();
                     updated_context.terms.extend(sub_ctx.terms.clone());
                     if sub_ctx.vocab.is_some() {
                         updated_context.vocab = sub_ctx.vocab.clone();
@@ -517,7 +515,7 @@ fn parse_type(
 
         Ok((types, updated_context))
     } else {
-        Ok((vec![], context.clone()))
+        Ok((vec![], Cow::Borrowed(context)))
     }
 }
 
@@ -539,44 +537,93 @@ fn get_context(node_map: &Map<String, JsonValue>) -> Option<&JsonValue> {
 /// ~64 levels rather than 128. See [`guard_depth`].
 pub(crate) const MAX_EXPAND_DEPTH: usize = 128;
 
-/// Refuse recursion past [`MAX_EXPAND_DEPTH`]. The `idx` path vector gains at
-/// least one element on each recursion edge (an array index or property key,
-/// directly or in the immediate caller), so its length bounds the depth. Both
+/// Refuse recursion past [`MAX_EXPAND_DEPTH`]. The [`Path`] gains at least
+/// one step on each recursion edge (an array index or property key, directly
+/// or in the immediate caller), so its depth bounds the recursion. Both
 /// recursion entry points ([`expand_node_internal`] and [`parse_node_value`])
 /// call this, so the `@list`/`@set` self-recursion in `parse_node_value` —
 /// which never re-enters `expand_node_internal` — is bounded too.
 ///
-/// The bound is on `idx` entries (recursion frames), not user-visible nesting
-/// levels, and the two are not the same: a plain node chain adds one entry per
+/// The bound is on path steps (recursion frames), not user-visible nesting
+/// levels, and the two are not the same: a plain node chain adds one step per
 /// level, so it reaches `MAX_EXPAND_DEPTH` levels, but each `@list`/`@set`
 /// container level adds two (the property key, then the container marker), so
 /// container chains are refused at roughly half that — ~64 user-visible levels.
 /// A container-chain rejection near 64 is expected, not a bug.
-fn guard_depth(idx: &[JsonValue]) -> Result<()> {
-    if idx.len() > MAX_EXPAND_DEPTH {
+fn guard_depth(path: &Path<'_>) -> Result<()> {
+    if path.depth > MAX_EXPAND_DEPTH {
         return Err(JsonLdError::NestingTooDeep);
     }
     Ok(())
+}
+
+/// Where expansion is in the document: the array indexes and property keys
+/// from the root. Each step borrows its parent, so descending costs no
+/// allocation; the steps are collected only to report a
+/// [`JsonLdError::NestedSequence`].
+struct Path<'a> {
+    depth: usize,
+    last: Option<(&'a Path<'a>, Step<'a>)>,
+}
+
+#[derive(Clone, Copy)]
+enum Step<'a> {
+    Index(usize),
+    Key(&'a str),
+}
+
+impl<'a> Path<'a> {
+    const ROOT: Path<'static> = Path {
+        depth: 0,
+        last: None,
+    };
+
+    fn index(&'a self, i: usize) -> Path<'a> {
+        self.then(Step::Index(i))
+    }
+
+    fn key(&'a self, key: &'a str) -> Path<'a> {
+        self.then(Step::Key(key))
+    }
+
+    fn then(&'a self, step: Step<'a>) -> Path<'a> {
+        Path {
+            depth: self.depth + 1,
+            last: Some((self, step)),
+        }
+    }
+
+    /// The steps from the root, as JSON values (an index is a number, a key a
+    /// string).
+    fn to_vec(&self) -> Vec<JsonValue> {
+        let mut steps = Vec::with_capacity(self.depth);
+        let mut at = self;
+        while let Some((parent, step)) = at.last {
+            steps.push(match step {
+                Step::Index(i) => json!(i),
+                Step::Key(k) => json!(k),
+            });
+            at = parent;
+        }
+        steps.reverse();
+        steps
+    }
 }
 
 /// Internal node expansion
 fn expand_node_internal(
     node_map: &JsonValue,
     context: &ParsedContext,
-    idx: &[JsonValue],
+    path: &Path<'_>,
     strict: bool,
 ) -> Result<JsonValue> {
-    guard_depth(idx)?;
+    guard_depth(path)?;
     match node_map {
         JsonValue::Array(arr) => {
             let expanded: Result<Vec<JsonValue>> = arr
                 .iter()
                 .enumerate()
-                .map(|(i, item)| {
-                    let mut new_idx = idx.to_vec();
-                    new_idx.push(json!(i));
-                    expand_node_internal(item, context, &new_idx, strict)
-                })
+                .map(|(i, item)| expand_node_internal(item, context, &path.index(i), strict))
                 .collect();
             Ok(JsonValue::Array(expanded?))
         }
@@ -585,9 +632,9 @@ fn expand_node_internal(
             // Parse local context if present
             let local_context = get_context(map);
             let merged_context = if let Some(lc) = local_context {
-                ParsedContext::parse(Some(context), lc)?
+                Cow::Owned(ParsedContext::parse(Some(context), lc)?)
             } else {
-                context.clone()
+                Cow::Borrowed(context)
             };
 
             // Parse @type and get updated context
@@ -610,7 +657,7 @@ fn expand_node_internal(
                 type_id: type_id.as_deref(),
                 strict,
             };
-            expand_node_entries(map, &keys, idx, false, &mut result)?;
+            expand_node_entries(map, &keys, path, false, &mut result)?;
 
             Ok(JsonValue::Object(result))
         }
@@ -635,7 +682,7 @@ struct NodeKeys<'a> {
 fn expand_node_entries(
     map: &Map<String, JsonValue>,
     keys: &NodeKeys<'_>,
-    idx: &[JsonValue],
+    path: &Path<'_>,
     nested: bool,
     result: &mut Map<String, JsonValue>,
 ) -> Result<()> {
@@ -650,8 +697,7 @@ fn expand_node_entries(
             continue;
         }
 
-        let mut key_idx = idx.to_vec();
-        key_idx.push(json!(k));
+        let key_path = path.key(k);
 
         let (expanded_key, entry) = details_dispatch(k, context, true, strict)?;
 
@@ -665,7 +711,7 @@ fn expand_node_entries(
                     reason: "a nested value cannot carry `@graph`",
                 });
             }
-            let graph_expanded = expand_node_internal(v, context, &key_idx, strict)?;
+            let graph_expanded = expand_node_internal(v, context, &key_path, strict)?;
             result.insert("@graph".to_string(), graph_expanded);
             continue;
         }
@@ -690,7 +736,7 @@ fn expand_node_entries(
         // `@nest` (JSON-LD 1.1): the value's entries are this node's own
         // entries, recursively.
         if expanded_key == "@nest" {
-            expand_nest_value(v, keys, &key_idx, result)?;
+            expand_nest_value(v, keys, &key_path, result)?;
             continue;
         }
 
@@ -703,7 +749,7 @@ fn expand_node_entries(
                     reason: "the value must be a map of reverse properties",
                 });
             }
-            if let JsonValue::Object(props) = expand_node_internal(v, context, &key_idx, strict)? {
+            if let JsonValue::Object(props) = expand_node_internal(v, context, &key_path, strict)? {
                 for (property, values) in props {
                     if property.starts_with('@') {
                         return Err(JsonLdError::InvalidKeywordValue {
@@ -722,7 +768,7 @@ fn expand_node_entries(
         }
 
         // Expand value
-        let expanded_values = parse_node_value(v, entry.as_ref(), context, &key_idx, strict)?;
+        let expanded_values = parse_node_value(v, entry.as_ref(), context, &key_path, strict)?;
 
         // A key whose values expand to nothing is dropped — EXCEPT
         // `@list`: `{"@list": []}` is a value, the empty list, which
@@ -759,10 +805,10 @@ fn expand_node_entries(
 fn expand_nest_value(
     value: &JsonValue,
     keys: &NodeKeys<'_>,
-    idx: &[JsonValue],
+    path: &Path<'_>,
     result: &mut Map<String, JsonValue>,
 ) -> Result<()> {
-    guard_depth(idx)?;
+    guard_depth(path)?;
     let items: Vec<&JsonValue> = match value {
         JsonValue::Array(items) => items.iter().collect(),
         other => vec![other],
@@ -792,7 +838,7 @@ fn expand_nest_value(
                 existing.extend(types.into_iter().map(JsonValue::String));
             }
         }
-        expand_node_entries(nested, keys, idx, true, result)?;
+        expand_node_entries(nested, keys, path, true, result)?;
     }
     Ok(())
 }
@@ -818,17 +864,12 @@ pub(crate) fn node_impl(
     context: &ParsedContext,
     strict: bool,
 ) -> Result<JsonValue> {
-    let idx = vec![];
-
     match node_map {
         JsonValue::Array(arr) => {
             let expanded: Result<Vec<JsonValue>> = arr
                 .iter()
                 .enumerate()
-                .map(|(i, item)| {
-                    let new_idx = vec![json!(i)];
-                    expand_node_internal(item, context, &new_idx, strict)
-                })
+                .map(|(i, item)| expand_node_internal(item, context, &Path::ROOT.index(i), strict))
                 .collect();
             Ok(JsonValue::Array(expanded?))
         }
@@ -858,7 +899,7 @@ pub(crate) fn node_impl(
                 return expand_envelope(map, "graph", graph, context, strict);
             }
 
-            expand_node_internal(node_map, context, &idx, strict)
+            expand_node_internal(node_map, context, &Path::ROOT, strict)
         }
 
         _ => Ok(node_map.clone()),
@@ -878,8 +919,7 @@ fn expand_envelope(
         Some(lc) => ParsedContext::parse(Some(context), lc)?,
         None => context.clone(),
     };
-    let new_idx = vec![json!(graph_key)];
-    expand_node_internal(graph, &merged_context, &new_idx, strict)
+    expand_node_internal(graph, &merged_context, &Path::ROOT.key(graph_key), strict)
 }
 
 /// Expand a JSON-LD node (document).
@@ -1247,6 +1287,37 @@ mod tests {
     #[test]
     fn nesting_below_the_ceiling_expands() {
         crate::expand(&nested_nodes(100)).expect("below-ceiling nesting must expand");
+    }
+
+    /// A node chain expands up to the ceiling and is refused one level past
+    /// it: the bound is exact.
+    #[test]
+    fn nesting_ceiling_is_exact() {
+        crate::expand(&nested_nodes(MAX_EXPAND_DEPTH)).expect("nesting at the ceiling expands");
+        let err = crate::expand(&nested_nodes(MAX_EXPAND_DEPTH + 1)).expect_err("past it");
+        assert!(
+            matches!(err, JsonLdError::NestingTooDeep),
+            "expected NestingTooDeep, got: {err}"
+        );
+    }
+
+    /// An array inside an array is refused with the path to it from the
+    /// document root: array indexes and the keys as written.
+    #[test]
+    fn nested_sequence_reports_its_path() {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [{"@id": "ex:a"}, {"@id": "ex:b", "ex:p": ["x", ["y"]]}]
+        });
+        match crate::expand(&doc).expect_err("a nested array is refused") {
+            JsonLdError::NestedSequence { idx } => {
+                assert_eq!(
+                    idx,
+                    vec![json!("@graph"), json!(1), json!("ex:p"), json!(1)]
+                );
+            }
+            other => panic!("expected NestedSequence, got: {other}"),
+        }
     }
 
     /// A programmatically built value bypasses serde_json's deserialization
