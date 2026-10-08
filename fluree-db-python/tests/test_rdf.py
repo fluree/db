@@ -181,6 +181,92 @@ def test_quads_write_to_a_ledger():
             ledger.insert(quads, format="jsonld")
 
 
+RDF_TYPE = IRI("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
+G = ex("g")
+
+
+def _reifies(reifier, *triple, graph=None):
+    return Quad(reifier, IRI(REIFIES), Triple(*triple), graph)
+
+
+LEDGER_ROUND_TRIPS = {
+    "annotation in a named graph": [
+        Quad(ex("a"), ex("knows"), ex("b"), G),
+        _reifies(BlankNode("r"), ex("a"), ex("knows"), ex("b"), graph=G),
+        Quad(BlankNode("r"), ex("since"), 2020, G),
+    ],
+    "unasserted reification in a named graph": [
+        _reifies(ex("claim"), ex("c"), ex("age"), 30, graph=G),
+        Quad(ex("claim"), ex("by"), ex("d"), G),
+    ],
+    "annotated language-tagged literal": [
+        Quad(ex("a"), ex("name"), LangString("Al", "en"), G),
+        _reifies(ex("r"), ex("a"), ex("name"), LangString("Al", "en"), graph=G),
+    ],
+    "two reifiers of one triple": [
+        Quad(ex("a"), ex("knows"), ex("b")),
+        _reifies(ex("r1"), ex("a"), ex("knows"), ex("b")),
+        _reifies(ex("r2"), ex("a"), ex("knows"), ex("b")),
+    ],
+    "annotated rdf:type": [
+        Quad(ex("a"), RDF_TYPE, ex("Person")),
+        _reifies(ex("r"), ex("a"), RDF_TYPE, ex("Person")),
+    ],
+    "nested triple terms in a named graph": [
+        Quad(ex("doc"), ex("says"), Triple(ex("c"), ex("p"), Triple(ex("e"), ex("q"), "x")), G),
+    ],
+    "strings that need escaping": [
+        Quad(ex("s"), ex("v"), 'quote " backslash \\ newline \n tab \t return \r', G),
+        Quad(ex("s"), ex("w"), "'''single''' and \"\"\"double\"\"\" triples, trailing \\"),
+        Quad(ex("s"), ex("u"), "é 𝄞 \u0000 \u007f"),
+    ],
+    "literals": [
+        Quad(ex("s"), ex("dir"), LangString("مرحبا", "ar--rtl")),
+        Quad(ex("s"), ex("dec"), Decimal("1.50")),
+        Quad(ex("s"), ex("big"), 123456789012345678901234567890),
+        Quad(ex("s"), ex("dbl"), 0.1),
+        Quad(ex("s"), ex("custom"), Literal("x y", EX + "dt")),
+        Quad(ex("s"), ex("bool"), False),
+    ],
+    "non-ASCII IRIs": [Quad(IRI(EX + "é"), ex("p"), IRI(EX + "𝄞"), IRI(EX + "ü"))],
+    "blank nodes in a named graph": [
+        Quad(BlankNode("x"), ex("p"), BlankNode("y"), G),
+        Quad(BlankNode("y"), ex("q"), 1, G),
+    ],
+    "one triple in two graphs": [Quad(ex("a"), ex("p"), ex("b")), Quad(ex("a"), ex("p"), ex("b"), G)],
+}
+
+
+def _shape(quads):
+    """The quads with every blank node alike, for comparing across the
+    relabeling a ledger does."""
+
+    def term(t):
+        if isinstance(t, BlankNode):
+            return "_:"
+        if isinstance(t, Triple):
+            return ("<<", term(t.subject), term(t.predicate), term(t.object))
+        return (type(t).__name__, t)
+
+    return sorted(repr(tuple(term(t) for t in q)) for q in quads)
+
+
+@pytest.mark.parametrize("quads", LEDGER_ROUND_TRIPS.values(), ids=LEDGER_ROUND_TRIPS.keys())
+def test_quads_come_back_out_of_a_ledger_as_they_went_in(quads):
+    with fluree.connect(":memory:") as conn:
+        ledger = conn.create("quads")
+        ledger.insert(quads)
+        stored = fluree.parse(ledger.export(format="nquads", all_graphs=True), "nquads")
+        assert _shape(stored) == _shape(quads)
+
+
+def test_a_ledger_refuses_a_blank_node_graph_name():
+    with fluree.connect(":memory:") as conn:
+        ledger = conn.create("quads")
+        with pytest.raises(InvalidRequestError, match="IRIs, not blank nodes"):
+            ledger.insert([Quad(ex("a"), ex("p"), ex("b"), BlankNode("g"))])
+
+
 def test_a_quad_takes_plain_strings_as_iris():
     quad = Quad(EX + "s", EX + "p", "text", EX + "g")
     assert type(quad.subject) is IRI and type(quad.predicate) is IRI and type(quad.graph) is IRI

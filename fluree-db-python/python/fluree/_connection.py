@@ -1771,7 +1771,7 @@ def _rdf_payload(data: Data, format: Format | None) -> tuple[str, Any]:
     if _rdf.is_quads(data):
         if format is not None:
             raise InvalidRequestError(f"a list of quads is RDF, not {format}")
-        return "turtle", _rdf.serialize(data, "trig")
+        return "turtle", _rdf.ledger_trig(data)
     if isinstance(data, os.PathLike):
         path = Path(data)
         if format is None:
