@@ -78,6 +78,25 @@ def test_a_triple_term_is_not_a_subject_parameter(ledger):
         ledger.query(PREFIXES + "SELECT ?p WHERE { $t ?p ?o }", t=CAROL)
 
 
+def test_a_commit_lists_its_triple_terms(ledger):
+    links = {change.value for change in ledger.changes(1) if change.predicate == REIFIES}
+    assert links == {KNOWS, CAROL}
+
+
+def test_a_change_keeps_blank_nodes_tags_and_nesting():
+    with fluree.connect(":memory:") as conn:
+        ledger = conn.create("nested")
+        commit = ledger.insert(f"""
+            @prefix ex: <{EX}> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            ex:claim rdf:reifies <<( _:someone ex:says <<( ex:dave ex:label "hi"@en )>> )>> .
+        """)
+        (link,) = [c.value for c in ledger.changes(commit.t) if c.predicate == REIFIES]
+        assert type(link.subject) is BlankNode
+        assert link.object == Triple(EX + "dave", EX + "label", LangString("hi", "en"))
+        assert link.object.object.language == "en"
+
+
 def test_a_triple_takes_plain_strings_as_iris():
     triple = Triple(EX + "a", EX + "p", "text")
     assert type(triple.subject) is IRI and type(triple.predicate) is IRI

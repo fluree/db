@@ -522,25 +522,43 @@ pub(crate) fn commit_summary<'py>(
 /// `(subject, predicate, object, assert, graph)`, the object a term tuple.
 /// The flake's IRIs must be whole, not compacted.
 pub(crate) fn flake<'py>(py: Python<'py>, flake: &ResolvedFlake) -> PyResult<Bound<'py, PyTuple>> {
-    let object = if flake.dt == "@id" {
-        ("iri", lexical(&flake.o)).into_pyobject(py)?
-    } else {
-        (
-            "literal",
-            lexical(&flake.o),
-            &flake.dt,
-            flake.lang.as_deref(),
-        )
-            .into_pyobject(py)?
-    };
+    let object = object_term(py, &flake.o, &flake.dt, flake.lang.as_deref())?;
     (&flake.s, &flake.p, object, flake.op, flake.graph.as_deref()).into_pyobject(py)
 }
 
-fn lexical(value: &ResolvedValue) -> String {
-    match value {
+/// A flake's object as a term tuple; a triple term's parts are term tuples too.
+fn object_term<'py>(
+    py: Python<'py>,
+    value: &ResolvedValue,
+    datatype: &str,
+    language: Option<&str>,
+) -> PyResult<Bound<'py, PyTuple>> {
+    let lexical = match value {
+        ResolvedValue::TripleTerm(t) => {
+            return (
+                "triple",
+                node_term(py, &t.s)?,
+                ("iri", t.p.as_str()).into_pyobject(py)?,
+                object_term(py, &t.o, &t.dt, t.lang.as_deref())?,
+            )
+                .into_pyobject(py);
+        }
         ResolvedValue::String(s) | ResolvedValue::Lexical(s) => s.clone(),
         ResolvedValue::Boolean(b) => b.to_string(),
         ResolvedValue::Long(n) => n.to_string(),
         ResolvedValue::Double(d) => d.to_string(),
+    };
+    if datatype == "@id" {
+        node_term(py, &lexical)
+    } else {
+        ("literal", lexical, datatype, language).into_pyobject(py)
+    }
+}
+
+/// A node reference: a blank node when it is `_:label`, else an IRI.
+fn node_term<'py>(py: Python<'py>, id: &str) -> PyResult<Bound<'py, PyTuple>> {
+    match id.strip_prefix("_:") {
+        Some(label) => ("bnode", label).into_pyobject(py),
+        None => ("iri", id).into_pyobject(py),
     }
 }
