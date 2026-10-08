@@ -235,9 +235,11 @@ impl<'a, 'i, S: GraphSink> Reader<'a, 'i, S> {
     /// which neither the source nor an escape may produce a character the
     /// IRIREF production excludes.
     fn iri_text(&mut self) -> Result<String> {
+        let start = self.pos;
         self.pos += 1; // `<`
         let mut iri = String::new();
         loop {
+            let at = self.pos;
             let ch = match self.peek() {
                 None => return Err(self.err("unterminated IRI")),
                 Some(b'>') => {
@@ -258,15 +260,21 @@ impl<'a, 'i, S: GraphSink> Reader<'a, 'i, S> {
                 }
             };
             if ch <= ' ' || matches!(ch, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\') {
-                return Err(self.err(format!("{ch:?} cannot appear in an IRI")));
+                return Err(TurtleError::parse(
+                    at,
+                    format!("{ch:?} cannot appear in an IRI"),
+                ));
             }
             iri.push(ch);
         }
         if !is_absolute_iri(&iri) {
-            return Err(self.err(format!(
-                "<{iri}> is a relative IRI; {} has no base, so every IRI is absolute",
-                self.format.name()
-            )));
+            return Err(TurtleError::parse(
+                start,
+                format!(
+                    "<{iri}> is a relative IRI; {} has no base, so every IRI is absolute",
+                    self.format.name()
+                ),
+            ));
         }
         Ok(iri)
     }
