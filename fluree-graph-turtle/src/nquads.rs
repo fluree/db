@@ -12,6 +12,9 @@
 //! reads both. RDF 1.2 adds triple terms (`<<( s p o )>>`, nestable in
 //! object position) and base directions (`@en--ltr`).
 
+use std::borrow::Cow;
+use std::collections::HashMap;
+
 use fluree_graph_ir::syntax::is_lang_tag_body;
 use fluree_graph_ir::{Datatype, GraphSink, TermId};
 use fluree_vocab::iri::is_absolute_iri;
@@ -58,6 +61,8 @@ struct Reader<'a, 'i, S> {
     format: LineFormat,
     /// `rdf:reifies` as the sink interned it, once a document names it.
     reifies_term: Option<TermId>,
+    /// Every IRI the document has named, so the sink makes each one once.
+    iris: HashMap<Box<str>, TermId>,
 }
 
 /// A statement's object: a term, or the triple term of an
@@ -77,6 +82,7 @@ impl<'a, 'i, S: GraphSink> Reader<'a, 'i, S> {
             sink,
             format,
             reifies_term: None,
+            iris: HashMap::new(),
         })
     }
 
@@ -261,18 +267,50 @@ impl<'a, 'i, S: GraphSink> Reader<'a, 'i, S> {
 
     fn iri_term(&mut self) -> Result<TermId> {
         let iri = self.iri_text()?;
+        if let Some(&id) = self.iris.get(iri.as_ref()) {
+            return Ok(id);
+        }
         let id = self.sink.term_iri(&iri);
         if iri == rdf::REIFIES {
             self.reifies_term = Some(id);
         }
+        self.iris.insert(iri.into(), id);
         Ok(id)
     }
 
     /// `<…>`: an absolute IRI, whose only escapes are `\u` and `\U`, and in
     /// which neither the source nor an escape may produce a character the
-    /// IRIREF production excludes.
-    fn iri_text(&mut self) -> Result<String> {
+    /// IRIREF production excludes. An IRI with no escape is borrowed from
+    /// the input.
+    fn iri_text(&mut self) -> Result<Cow<'i, str>> {
         let start = self.pos;
+        let body = start + 1;
+        let plain = self.bytes[body..]
+            .iter()
+            .position(|&b| !is_plain_iri_byte(b))
+            .map(|len| body + len);
+        let iri = match plain {
+            Some(end) if self.bytes[end] == b'>' => {
+                self.pos = end + 1;
+                Cow::Borrowed(&self.input[body..end])
+            }
+            _ => Cow::Owned(self.escaped_iri_text()?),
+        };
+        if !is_absolute_iri(&iri) {
+            return Err(TurtleError::parse(
+                start,
+                format!(
+                    "<{iri}> is a relative IRI; {} has no base, so every IRI is absolute",
+                    self.format.name()
+                ),
+            ));
+        }
+        Ok(iri)
+    }
+
+    /// [`Self::iri_text`] one character at a time, decoding escapes and
+    /// naming the first character the IRI cannot hold.
+    fn escaped_iri_text(&mut self) -> Result<String> {
         self.pos += 1; // `<`
         let mut iri = String::new();
         loop {
@@ -303,15 +341,6 @@ impl<'a, 'i, S: GraphSink> Reader<'a, 'i, S> {
                 ));
             }
             iri.push(ch);
-        }
-        if !is_absolute_iri(&iri) {
-            return Err(TurtleError::parse(
-                start,
-                format!(
-                    "<{iri}> is a relative IRI; {} has no base, so every IRI is absolute",
-                    self.format.name()
-                ),
-            ));
         }
         Ok(iri)
     }
@@ -398,10 +427,24 @@ impl<'a, 'i, S: GraphSink> Reader<'a, 'i, S> {
     }
 
     /// A double-quoted string on one line, with `ECHAR` and `UCHAR` escapes.
-    fn quoted_string(&mut self) -> Result<String> {
+    fn quoted_string(&mut self) -> Result<Cow<'i, str>> {
         if self.rest().starts_with("\"\"\"") {
             return Err(self.err("long strings (`\"\"\"…\"\"\"`) are Turtle"));
         }
+        let body = self.pos + 1;
+        let end = self.bytes[body..]
+            .iter()
+            .position(|&b| matches!(b, b'"' | b'\\' | b'\n' | b'\r'))
+            .map(|len| body + len);
+        if let Some(end) = end.filter(|&end| self.bytes[end] == b'"') {
+            self.pos = end + 1;
+            return Ok(Cow::Borrowed(&self.input[body..end]));
+        }
+        self.escaped_string().map(Cow::Owned)
+    }
+
+    /// [`Self::quoted_string`] one character at a time, decoding escapes.
+    fn escaped_string(&mut self) -> Result<String> {
         self.pos += 1; // `"`
         let mut value = String::new();
         loop {
@@ -475,4 +518,15 @@ impl<'a, 'i, S: GraphSink> Reader<'a, 'i, S> {
         }
         Ok(word)
     }
+}
+
+/// A byte an IRI holds as it is: not an escape, a delimiter, or a character
+/// IRIREF excludes. Every byte of a multi-byte character is one.
+fn is_plain_iri_byte(b: u8) -> bool {
+    b >= 0x80
+        || (b > b' '
+            && !matches!(
+                b,
+                b'<' | b'>' | b'"' | b'{' | b'}' | b'|' | b'^' | b'`' | b'\\'
+            ))
 }
