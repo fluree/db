@@ -29,6 +29,7 @@ polars = ["polars>=1"]
 
 [project.urls]
 Homepage = "https://flur.ee"
+Documentation = "https://fluree.github.io/db/getting-started/python.html"
 Source = "https://github.com/fluree/db"
 
 [dependency-groups]
