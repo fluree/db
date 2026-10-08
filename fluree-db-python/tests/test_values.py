@@ -8,7 +8,7 @@ from decimal import Decimal
 import pytest
 
 import fluree
-from fluree import IRI, BlankNode, InvalidRequestError, LangString, Literal, Vector
+from fluree import IRI, BlankNode, InvalidRequestError, LangString, Literal, Triple, Vector
 
 EX = "http://example.org/"
 CTX = {"ex": EX}
@@ -25,6 +25,8 @@ VALUES = {
     "big": 2**70,
     "inf": float("inf"),
     "vector": Vector([0.5, 0.25]),
+    "triple": Triple(EX + "alice", EX + "knows", IRI(EX + "bob")),
+    "nested": Triple(EX + "doc", EX + "says", Triple(EX + "carol", EX + "age", 30)),
     "text": "plain",
     "int": 7,
     "bool": True,

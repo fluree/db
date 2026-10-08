@@ -4,7 +4,8 @@ Literals become the Python type their datatype names (``int``, ``float``,
 ``Decimal``, ``datetime``, ...). Anything without a lossless Python type stays
 a :class:`Literal` carrying its lexical form and datatype, so no information
 is dropped. IRIs, blank nodes and language-tagged strings are ``str``
-subclasses: they print and compare like strings but keep what they are.
+subclasses: they print and compare like strings but keep what they are. An
+RDF 1.2 triple term is a :class:`Triple`.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import json
 import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
 RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
@@ -118,6 +119,39 @@ class Literal:
         return self.value
 
 
+@dataclass(frozen=True, slots=True)
+class Triple:
+    """An RDF 1.2 triple term: a triple used as a value, as the object of
+    ``rdf:reifies`` or of any other property, or inside another triple term.
+    It unpacks as ``subject, predicate, object``.
+
+    The subject is an :class:`IRI` or a :class:`BlankNode`, and the predicate
+    an :class:`IRI`; a plain ``str`` in either place is taken as an IRI. The
+    object is any value a property holds, another ``Triple`` included."""
+
+    subject: IRI | BlankNode
+    predicate: IRI
+    object: Any
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.subject, (IRI, BlankNode)):
+            if type(self.subject) is not str:
+                kind = type(self.subject).__name__
+                raise TypeError(f"a triple term's subject is an IRI or a blank node, not a {kind}")
+            object.__setattr__(self, "subject", IRI(self.subject))
+        if not isinstance(self.predicate, IRI):
+            if type(self.predicate) is not str:
+                kind = type(self.predicate).__name__
+                raise TypeError(f"a triple term's predicate is an IRI, not a {kind}")
+            object.__setattr__(self, "predicate", IRI(self.predicate))
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter((self.subject, self.predicate, self.object))
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (Triple, (self.subject, self.predicate, self.object))
+
+
 def _boolean(lexical: str) -> bool:
     if lexical in ("true", "1"):
         return True
@@ -196,6 +230,8 @@ def to_python(cell: tuple[Any, ...] | None) -> Any:
         return IRI(cell[1])
     if kind == "bnode":
         return BlankNode(cell[1])
+    if kind == "triple":
+        return Triple(to_python(cell[1]), to_python(cell[2]), to_python(cell[3]))
     _, lexical, datatype, language = cell
     if language is not None:
         return LangString(lexical, language)
