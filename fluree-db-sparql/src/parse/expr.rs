@@ -890,7 +890,7 @@ fn parse_group_pattern_for_exists(tokens: &mut TokenStream) -> Result<GraphPatte
 /// tracking for free. A nested triple-term object becomes a nested
 /// `TRIPLE(…)`. Blank-node components are rejected: they are not
 /// expressions (negative `bindbnode-tripleterm`).
-fn triple_term_to_expr(tt: TripleTerm) -> Result<Expression, String> {
+pub(crate) fn triple_term_to_expr(tt: TripleTerm) -> Result<Expression, String> {
     let span = tt.span;
     let s = subject_term_to_expr(tt.subject)?;
     let p = predicate_term_to_expr(tt.predicate);
