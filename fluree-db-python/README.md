@@ -370,7 +370,9 @@ ledger.insert(quads)                      # or write them straight to a ledger
   writes such quads back as annotations where the format has them.
 - Literals are Python values, as in query results, so a number's spelling is
   not kept (`"01"` reads as `1`); a float is written in its shortest form
-  (`0.9957`).
+  (`0.9957`). `literals="lexical"` keeps every typed literal but a plain
+  string as a `fluree.Literal` with its spelling, so a document read and
+  written back keeps its literals exactly.
 - Blank nodes keep the document's labels; an anonymous one gets a fresh
   label.
 - `ledger.insert(quads)` and `upsert(quads)` write quads, named graphs

@@ -98,6 +98,32 @@ def test_literals_are_python_values():
     assert values["lead"] == 1
 
 
+def test_lexical_literals_keep_their_spelling():
+    doc = (
+        f'<{EX}s> <{EX}int> "01"^^<{XSD}integer> .\n'
+        f'<{EX}s> <{EX}dbl> "1.0E0"^^<{XSD}double> .\n'
+        f'<{EX}s> <{EX}bool> "1"^^<{XSD}boolean> .\n'
+        f'<{EX}s> <{EX}when> "2020-01-01T00:00:00.000Z"^^<{XSD}dateTime> .\n'
+        f'<{EX}s> <{EX}str> "x" .\n'
+        f'<{EX}s> <{EX}lang> "y"@en .\n'
+        f'<{EX}s> <{EX}says> <<( <{EX}a> <{EX}b> "+2"^^<{XSD}integer> )>> .\n'
+    )
+    quads = fluree.parse(doc, "ntriples", literals="lexical")
+    values = {q.predicate[len(EX) :]: q.object for q in quads}
+    assert values["int"] == Literal("01", XSD + "integer")
+    assert values["bool"] == Literal("1", XSD + "boolean")
+    assert values["str"] == "x" and type(values["str"]) is str
+    assert values["lang"] == LangString("y", "en")
+    assert values["says"].object == Literal("+2", XSD + "integer")
+    assert fluree.serialize(quads, "ntriples") == doc
+    turtle = fluree.serialize(quads, "turtle")
+    assert fluree.parse(turtle, "turtle", literals="lexical") == quads, turtle
+
+    assert fluree.parse(doc, "ntriples")[0].object == 1
+    with pytest.raises(InvalidRequestError, match="literals="):
+        fluree.parse(doc, "ntriples", literals="exact")
+
+
 def test_serialize_round_trips_every_format():
     default = [
         Quad(ex("a"), ex("p"), ex("b")),

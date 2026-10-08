@@ -282,3 +282,20 @@ def to_python(cell: tuple[Any, ...] | None) -> Any:
         except ValueError:
             pass
     return Literal(lexical, datatype)
+
+
+def to_lexical(cell: tuple[Any, ...]) -> Any:
+    """Like :func:`to_python`, but a typed literal other than ``xsd:string``
+    stays a :class:`Literal` with its lexical form, so ``"01"^^xsd:integer``
+    is ``Literal("01", xsd:integer)`` rather than ``1``."""
+    kind = cell[0]
+    if kind == "triple":
+        return Triple(to_lexical(cell[1]), to_lexical(cell[2]), to_lexical(cell[3]))
+    if kind != "literal":
+        return to_python(cell)
+    _, lexical, datatype, language = cell
+    if language is not None:
+        return LangString(lexical, language)
+    if datatype == XSD + "string":
+        return lexical
+    return Literal(lexical, datatype)
