@@ -286,6 +286,9 @@ fn lower_single_branch_inner<E: IriEncoder>(
     // one is seen the enclosing-scope vars are no longer separately visible —
     // whatever the `WITH` carried forward is already reflected in `patterns`.
     let mut narrowed = false;
+    // Imports the last `WITH` carried for correlation without projecting them
+    // (`carry_imports`): they are out of scope after it.
+    let mut hidden: Vec<VarId> = Vec::new();
     for clause in &q.clauses {
         match clause {
             ReadClause::Match(m) => {
@@ -308,9 +311,11 @@ fn lower_single_branch_inner<E: IriEncoder>(
                 patterns.push(Pattern::Optional(inner));
             }
             ReadClause::With(w) => {
-                let subq = lower_with(ctx, w, std::mem::take(&mut patterns))?;
+                let (subq, carried) =
+                    lower_with(ctx, w, std::mem::take(&mut patterns), outer_scope, &hidden)?;
                 patterns.push(Pattern::Subquery(subq));
                 narrowed = true;
+                hidden = carried;
             }
             ReadClause::Unwind(u) => {
                 patterns.push(lower_unwind(ctx, u)?);
@@ -329,7 +334,7 @@ fn lower_single_branch_inner<E: IriEncoder>(
                     outer_scope.to_vec()
                 };
                 for v in visible_vars_from_patterns(ctx, &patterns) {
-                    if !outer_vars.contains(&v) {
+                    if !outer_vars.contains(&v) && !hidden.contains(&v) {
                         outer_vars.push(v);
                     }
                 }
@@ -343,7 +348,7 @@ fn lower_single_branch_inner<E: IriEncoder>(
     }
 
     let (output, ordering, limit, offset, group_keys, aggregates, post_binds) =
-        lower_return(ctx, &q.return_clause, &mut patterns)?;
+        lower_return(ctx, &q.return_clause, &mut patterns, outer_scope)?;
 
     // When the projection mixes aggregates with non-aggregate items,
     // the non-aggregates become GROUP BY keys (Cypher's implicit
@@ -376,6 +381,7 @@ fn lower_return<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     r: &ReturnClause,
     patterns: &mut Vec<Pattern>,
+    imports: &[VarId],
 ) -> Result<LoweredReturn> {
     let mut projection = ProjectionState::new();
     for item in &r.items {
@@ -428,7 +434,7 @@ fn lower_return<E: IriEncoder>(
         if let Some(g) = grouping {
             aggregation = aggregation.with_grouping(g);
         }
-        patterns.push(Pattern::Subquery(aggregation));
+        patterns.push(Pattern::Subquery(carry_imports(aggregation, imports)));
         patterns.extend(post);
         return Ok((
             output,
@@ -1261,18 +1267,34 @@ fn augment_select_with_path_rel_lists<E: IriEncoder>(
     select
 }
 
+/// Returns the subquery and the `imports` it carries without projecting them
+/// (see `carry_imports`), which are out of scope after it. `hidden` holds the
+/// ones an earlier `WITH` carried, which `WITH *` does not bring back.
 fn lower_with<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     w: &WithClause,
     mut inner_patterns: Vec<Pattern>,
-) -> Result<SubqueryPattern> {
+    imports: &[VarId],
+    hidden: &[VarId],
+) -> Result<(SubqueryPattern, Vec<VarId>)> {
     let mut projection = ProjectionState::new();
     for item in &w.items {
         projection.add_item(ctx, &mut inner_patterns, item)?;
     }
     if projection.saw_star {
         projection.expand_star(ctx, &inner_patterns);
+        projection.vars.retain(|v| !hidden.contains(v));
+        projection.group_keys.retain(|v| !hidden.contains(v));
     }
+    let projected = projection.vars.clone();
+    let carried_imports = |sq: SubqueryPattern| {
+        let carried = imports
+            .iter()
+            .copied()
+            .filter(|v| sq.select.contains(v) && !projected.contains(v))
+            .collect();
+        (sq, carried)
+    };
     // Captured before `projection` is partially moved below; used to reject an
     // ORDER BY on a collect() list (sorting a list value is unsound in v1).
     let list_outputs = projection.list_outputs.clone();
@@ -1355,7 +1377,7 @@ fn lower_with<E: IriEncoder>(
         if let Some(g) = grouping {
             aggregation = aggregation.with_grouping(g);
         }
-        let mut stage = vec![Pattern::Subquery(aggregation)];
+        let mut stage = vec![Pattern::Subquery(carry_imports(aggregation, imports))];
         stage.extend(post);
         if let Some(filter) = lowered_where {
             stage.push(Pattern::Filter(filter));
@@ -1376,9 +1398,11 @@ fn lower_with<E: IriEncoder>(
         if w.distinct {
             sq = sq.with_distinct();
         }
+        let sq = carry_imports(sq, imports);
         return match after_slice {
-            Some(after) => filter_after_slice(ctx, sq, &[], after, scoped),
-            None => Ok(sq),
+            Some(after) => filter_after_slice(ctx, sq, &[], after, scoped)
+                .map(|stage| carried_imports(carry_imports(stage, imports))),
+            None => Ok(carried_imports(sq)),
         };
     }
 
@@ -1447,10 +1471,65 @@ fn lower_with<E: IriEncoder>(
     if let Some(g) = grouping {
         sq = sq.with_grouping(g);
     }
+    let sq = carry_imports(sq, imports);
     match after_slice {
-        Some(after) => filter_after_slice(ctx, sq, &carried, after, scoped),
-        None => Ok(sq),
+        Some(after) => filter_after_slice(ctx, sq, &carried, after, scoped)
+            .map(|stage| carried_imports(carry_imports(stage, imports))),
+        None => Ok(carried_imports(sq)),
     }
+}
+
+/// Keep a subquery that this lowering builds inside a `CALL (p) { … }` body
+/// correlated with the imports it reads (`imports` is empty elsewhere).
+///
+/// The CALL seeds its imports for each outer row, but a subquery correlates
+/// with its parent only on what it selects. A `WITH f` after
+/// `MATCH (p)-[:knows]->(f)` selects `f` alone, so it used to run over every
+/// `p` and the CALL crossed each outer row with the whole result. Now the
+/// subquery:
+/// - selects the imports it reads;
+/// - groups by them when it groups, so an aggregate counts per import, as
+///   `lower_call_branch` already does for a grouping `RETURN`;
+/// - pins them, so they are seeded for each row. A slice, a `DISTINCT` and a
+///   zero-match `OPTIONAL` then apply per import, as the CALL's per-row
+///   semantics have it.
+fn carry_imports(mut sq: SubqueryPattern, imports: &[VarId]) -> SubqueryPattern {
+    if imports.is_empty() {
+        return sq;
+    }
+    let mut reads: std::collections::HashSet<VarId> = sq
+        .patterns
+        .iter()
+        .flat_map(Pattern::referenced_vars)
+        .collect();
+    reads.extend(sq.ordering.iter().map(|spec| spec.var));
+    if let Some(g) = &sq.grouping {
+        reads.extend(g.aggregates().filter_map(|spec| spec.function.input_var()));
+        reads.extend(g.binds().flat_map(|(_, expr)| expr.referenced_vars()));
+        if let Some(having) = g.having() {
+            reads.extend(having.referenced_vars());
+        }
+    }
+    let read: Vec<VarId> = imports
+        .iter()
+        .copied()
+        .filter(|v| reads.contains(v))
+        .collect();
+    if read.is_empty() {
+        return sq;
+    }
+    for v in &read {
+        if !sq.select.contains(v) {
+            sq.select.push(*v);
+        }
+        if !sq.pinned_vars.contains(v) {
+            sq.pinned_vars.push(*v);
+        }
+    }
+    if let Some(g) = sq.grouping.take() {
+        sq.grouping = Some(prepend_group_keys(g, &read));
+    }
+    sq
 }
 
 /// A sliced `WITH`'s `WHERE`, lowered for the stage after the slice: the

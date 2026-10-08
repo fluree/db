@@ -2962,6 +2962,12 @@ fn drain_ready_deferred(
 ///    key would scan rather than filter). That is exactly [`must_bind_vars`],
 ///    which this site shares with the VALUES/OPTIONAL barrier so the two
 ///    cannot drift apart.
+/// 3. **Not a pinned import.** A Cypher `CALL (p)` import
+///    ([`SubqueryPattern::pinned_vars`]) is a per-row binding by contract. The
+///    body can nest a sliced, `DISTINCT` or aggregating `WITH` that reads it,
+///    where per-row seeding and one evaluation differ, so the import stays a
+///    correlation input and the CALL waits for its producer. The executor
+///    still evaluates once and hash-joins when the body allows it.
 fn subquery_correlation_vars(
     sq: &SubqueryPattern,
     siblings: &[Pattern],
@@ -3008,7 +3014,7 @@ fn subquery_correlation_vars(
     for (j, p) in siblings.iter().enumerate().take(self_idx) {
         debug_assert!(j < self_idx);
         for v in p.produced_vars() {
-            if select.contains(&v) && !self_produced.contains(&v) {
+            if select.contains(&v) && (!self_produced.contains(&v) || sq.pinned_vars.contains(&v)) {
                 corr.insert(v);
             }
         }

@@ -1764,6 +1764,83 @@ async fn cypher_with_where_filters_after_the_slice() {
     }
 }
 
+/// A `WITH` inside a `CALL (p) { … }` body stays correlated with the import:
+/// the body runs once per outer `p`, so a `WITH f` after `MATCH (p)-[:knows]->(f)`
+/// keeps `p`'s friends only, a slice or a `DISTINCT` applies per `p`, an
+/// aggregate counts per `p` (a friendless `p` counts 0 through `OPTIONAL
+/// MATCH`), and a `WHERE` reads `p`. So does an aggregating `RETURN` that sorts
+/// on an expression. Each of these crossed every outer `p` with the whole body,
+/// or ran the body's slice once for all of them. `p` stays out of scope after a
+/// `WITH` that does not project it.
+#[tokio::test]
+async fn cypher_call_body_with_keeps_the_import() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "grouped-projection/cypher-call-with:main").await;
+    let db = cypher_db(&ledger);
+    let cypher = |query: &'static str| {
+        let (fluree, db) = (&fluree, &db);
+        async move {
+            let rows = fluree
+                .query_cypher(db, query)
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{query}"))
+                .to_jsonld_async(db.as_graph_db_ref())
+                .await
+                .expect("jsonld");
+            normalize_rows(&rows)
+        }
+    };
+    const P: &str = "MATCH (p:P) CALL (p) { ";
+    for (rest, expected) in [
+        (
+            "MATCH (p)-[:knows]->(f) WITH f RETURN f.age AS fa } RETURN p.age, fa",
+            json!([[40, 25], [40, 35], [25, 35], [50, 40], [50, 25], [50, 35]]),
+        ),
+        (
+            "MATCH (p)-[:knows]->(f) WITH f ORDER BY f.age LIMIT 1 RETURN f.age AS fa } \
+             RETURN p.age, fa",
+            json!([[40, 25], [25, 35], [50, 25]]),
+        ),
+        (
+            "MATCH (p)-[:knows]->(f) WITH f ORDER BY f.age DESC LIMIT 1 WHERE f.age > 30 \
+             RETURN f.age AS fa } RETURN p.age, fa",
+            json!([[40, 35], [25, 35], [50, 40]]),
+        ),
+        (
+            "MATCH (p)-[:knows]->(f)-[:knows]->(g) WITH DISTINCT g RETURN g.age AS ga } \
+             RETURN p.age, ga",
+            json!([[40, 35], [50, 25], [50, 35]]),
+        ),
+        (
+            "OPTIONAL MATCH (p)-[:knows]->(f) WITH count(f) AS c RETURN c } RETURN p.age, c",
+            json!([[40, 2], [25, 1], [35, 0], [50, 3]]),
+        ),
+        (
+            "MATCH (f:P) WITH f WHERE f.age > p.age RETURN f.age AS fa } RETURN p.age, fa",
+            json!([[40, 50], [25, 40], [25, 35], [25, 50], [35, 40], [35, 50]]),
+        ),
+        (
+            "MATCH (p)-[:knows]->(f) RETURN count(f) AS c ORDER BY c + 1 } RETURN p.age, c",
+            json!([[40, 2], [25, 1], [50, 3]]),
+        ),
+    ] {
+        let query: &'static str = Box::leak(format!("{P}{rest}").into_boxed_str());
+        assert_eq!(cypher(query).await, normalize_rows(&expected), "{query}");
+    }
+
+    // The import stays out of scope after a WITH that does not project it,
+    // `WITH *` included: a nested CALL cannot import it.
+    for rest in [
+        "MATCH (p)-[:knows]->(f) WITH f CALL (p) { MATCH (p)-[:knows]->(g) RETURN g } \
+         RETURN f.age AS fa } RETURN p.age, fa",
+        "MATCH (p)-[:knows]->(f) WITH f WITH * CALL (p) { MATCH (p)-[:knows]->(g) RETURN g } \
+         RETURN f.age AS fa } RETURN p.age, fa",
+    ] {
+        let query = format!("{P}{rest}");
+        assert!(fluree.query_cypher(&db, &query).await.is_err(), "{query}");
+    }
+}
+
 /// Cypher parity. Cypher makes a non-aggregate RETURN expression a grouping
 /// key, so `RETURN CASE … AS seg, count(e)` groups by the label — SPARQL's
 /// `GROUP BY (IF(…) AS ?seg)`. Grouping by the area first and mapping it after

@@ -402,7 +402,10 @@ ORDER BY / SKIP / LIMIT
   `CALL { … }` with no scope clause runs once and broadcasts its result.
   The body is `MATCH` / `OPTIONAL MATCH` / `WITH` / `UNWIND` / nested `CALL`
   ending in `RETURN` (explicit columns, not `*`); outer rows flow in and the
-  RETURN columns continue downstream. The body may be a `UNION` / `UNION ALL`
+  RETURN columns continue downstream. The body runs once per imported row, so a
+  `WITH` in it slices, deduplicates and aggregates per import: `CALL (p) {
+  MATCH (p)-[:knows]->(f) WITH f ORDER BY f.age LIMIT 1 RETURN f.name AS n }`
+  gives each `p` its youngest friend. The body may be a `UNION` / `UNION ALL`
   of branches with a common column shape (`UNION` dedups per correlation group;
   every branch references the same imports and projects the same columns).
   A correlated aggregating CALL (`CALL (p) { … RETURN count(f) }`) is grouped
