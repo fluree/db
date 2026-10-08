@@ -429,10 +429,12 @@ cancellation, unless that write was the commit itself, which completes;
 ## Concurrency
 
 Engine calls release the GIL, so threads can query in parallel. Several
-processes may share one database directory; a commit that loses a race to
-another process is retried against the new state, a bounded number of times
-before it raises `ConflictError`. Hand writes that contend heavily to
-`transact`, which runs them again on a conflict.
+processes may share one database directory. A connection sees its own
+commits at once and another process's after `ledger.refresh()`, which returns
+the latest `t`. A commit that loses a race to another process is retried
+against the new state, a bounded number of times before it raises
+`ConflictError`. Hand writes that contend heavily to `transact`, which runs
+them again on a conflict.
 
 A process forked after Fluree started in its parent cannot use it: the
 engine's threads do not survive a fork, and the lock state they leave behind

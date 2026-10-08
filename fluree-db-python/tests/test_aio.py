@@ -62,6 +62,7 @@ def test_the_api_end_to_end():
             assert (await people.verify()).healthy
             assert (await people.validate()).conforms
             assert (await people.index_status()).commit_t == (await people.log())[0].t
+            assert await people.refresh() == (await people.log())[0].t
 
             other = await conn.ledger("people:dev")
             assert other.id == "people:dev"

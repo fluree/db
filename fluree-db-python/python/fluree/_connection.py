@@ -734,6 +734,16 @@ class Ledger:
         """The latest state, frozen: every query on it sees the same data."""
         return Snapshot(self._connection._native.snapshot(self._id, None, self._policy), self)
 
+    def refresh(self) -> int:
+        """Catch up with commits made through another connection, such as
+        another process sharing this storage, and return the latest ``t``.
+
+        A connection keeps the state of each ledger it has read: it sees its
+        own commits at once, and another connection's after a refresh. Writes
+        need none, since a commit that meets a newer one is retried against
+        it. A :class:`Snapshot` keeps the state it froze."""
+        return self._connection._native.refresh(self._id)
+
     def at(
         self,
         t: int | None = None,

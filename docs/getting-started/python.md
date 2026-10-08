@@ -79,6 +79,9 @@ A few things differ from the server:
   what the handle sees.
 - **A ledger's query reads that ledger.** A query that names other ledgers
   goes to `conn.query()`.
+- **Another process's commits show after a refresh.** Processes may share
+  one storage directory; a connection sees its own commits at once and
+  another's after `ledger.refresh()`.
 - **Several writes can be one commit.** `with ledger.transaction() as txn:`
   stages writes in any language together, and `ledger.transact(fn)` runs
   read-then-write work again when another commit lands first.

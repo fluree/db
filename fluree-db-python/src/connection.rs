@@ -20,7 +20,7 @@ use fluree_db_api::{
     build_transact_policy_context, export::ExportFormat, ApiError, CommitDetail, CommitReceipt,
     CommitRef, DataSetDb, DropMode, Fluree, FlureeBuilder, FormatterConfig, GovernanceOptions,
     GraphDb, GraphSnapshotQueryBuilder, OwnedStreamQuery, ParsedContext, PolicyContext,
-    QueryExecutionOptions, SparqlParamMap, TimeSpec, Tracker, TxnOperation,
+    QueryExecutionOptions, RefreshOpts, SparqlParamMap, TimeSpec, Tracker, TxnOperation,
 };
 use fluree_db_api::{CommitOpts, GraphPayload, GraphSel, SyncGraphOpts, TxnOpts};
 use fluree_db_core::commit::{TxnMetaEntry, TxnMetaValue};
@@ -836,6 +836,23 @@ impl Connection {
         let fluree = self.fluree.get()?;
         let db = block_on(py, load(fluree, &id, spec, policy.as_ref()))?.map_err(api_error)?;
         Ok(Snapshot::new(&self.fluree, db))
+    }
+
+    /// Catch the cached ledger up with the nameservice head, taking in
+    /// commits made through another connection; the latest `t`.
+    fn refresh(&self, py: Python<'_>, ledger: &str) -> PyResult<i64> {
+        let id = canonical(ledger)?;
+        let fluree = self.fluree.get()?;
+        let refreshed = block_on(py, async {
+            // `refresh` only updates a ledger already in the cache; a cold
+            // load reads the latest head anyway.
+            fluree.ledger_cached(&id).await?;
+            fluree.refresh(&id, RefreshOpts::default()).await
+        })?
+        .map_err(api_error)?;
+        refreshed
+            .map(|r| r.t)
+            .ok_or_else(|| not_found(format!("ledger {ledger:?} does not exist")))
     }
 
     /// Commit summaries, newest first, and the total number of commits.

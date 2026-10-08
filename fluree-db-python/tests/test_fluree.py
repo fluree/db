@@ -270,6 +270,23 @@ def test_file_database_persists(tmp_path):
         assert conn.ledger("kept").query(PREFIX + "ASK { ex:a ex:n 1 }") is True
 
 
+def test_a_refresh_takes_in_another_connections_commits(tmp_path):
+    # Two connections on one directory stand in for two processes sharing it:
+    # each keeps the state of the ledgers it has read.
+    with fluree.connect(tmp_path / "db") as writer, fluree.connect(tmp_path / "db") as reader:
+        written = writer.create("shared")
+        first = written.insert({"@context": CONTEXT, "@id": "ex:a", "ex:n": 1})
+        # Not yet read through this connection, it refreshes to the head too.
+        assert reader.ledger("shared").refresh() == first.t
+        ledger = reader.ledger("shared")
+        assert ledger.query(PREFIX + "ASK { ex:a ex:n 1 }") is True
+
+        second = written.insert({"@context": CONTEXT, "@id": "ex:a", "ex:n": 2})
+        assert ledger.query(PREFIX + "ASK { ex:a ex:n 2 }") is False
+        assert ledger.refresh() == second.t
+        assert ledger.query(PREFIX + "ASK { ex:a ex:n 2 }") is True
+
+
 def test_a_closed_connection_closes_what_was_opened_through_it():
     conn = fluree.connect(":memory:")
     ledger = conn.create("people")

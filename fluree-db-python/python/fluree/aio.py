@@ -461,6 +461,11 @@ class Ledger:
         """The latest state, frozen; see :meth:`fluree.Ledger.snapshot`."""
         return Snapshot(self, await _call(self._sync.snapshot))
 
+    async def refresh(self) -> int:
+        """Catch up with commits made through another connection and return
+        the latest ``t``; see :meth:`fluree.Ledger.refresh`."""
+        return await _call(self._sync.refresh)
+
     async def at(
         self,
         t: int | None = None,
