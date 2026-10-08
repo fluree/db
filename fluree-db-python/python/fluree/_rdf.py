@@ -1,0 +1,90 @@
+"""RDF documents to and from quads, with no ledger involved."""
+
+from __future__ import annotations
+
+import os
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Any, TypeGuard
+from typing import Literal as _Literal
+
+from fluree import _fluree as native
+from fluree._terms import Quad, to_python
+from fluree.errors import InvalidRequestError
+
+RdfFormat = _Literal["turtle", "trig", "ntriples", "nquads"]
+
+_SUFFIXES: dict[str, RdfFormat] = {
+    ".ttl": "turtle",
+    ".trig": "trig",
+    ".nt": "ntriples",
+    ".nq": "nquads",
+}
+
+
+def parse(
+    data: str | os.PathLike[str],
+    format: RdfFormat | None = None,
+    *,
+    base: str | None = None,
+) -> list[Quad]:
+    """The quads of an RDF document: Turtle, TriG, N-Triples or N-Quads.
+
+    ``data`` is the document's text, with its ``format`` given, or a path,
+    whose extension (``.ttl``, ``.trig``, ``.nt``, ``.nq``) gives the format
+    when ``format`` does not. Turtle and TriG resolve relative IRIs against
+    ``base``.
+
+    RDF 1.2 is read whole: a triple term is a :class:`Triple`, and an
+    annotation or reified triple is the quad ``(reifier, rdf:reifies,
+    Triple(...))``, with the annotated triple as a quad of its own. Literals
+    are Python values, as query results are, so a number's spelling is not
+    kept (``"01"`` reads as ``1``). Blank nodes keep the document's labels;
+    an anonymous one (``[]``, a collection, an annotation) gets a fresh
+    label. Malformed input raises :class:`InvalidRequestError` naming the
+    line and column.
+    """
+    if isinstance(data, os.PathLike):
+        path = Path(data)
+        if format is None:
+            format = _SUFFIXES.get(path.suffix.lower())
+            if format is None:
+                raise InvalidRequestError(f"cannot tell the format of {path.name}; pass format=")
+        data = path.read_text(encoding="utf-8")
+    elif format is None:
+        raise InvalidRequestError("pass format= (turtle, trig, ntriples or nquads)")
+    return [
+        Quad(to_python(s), to_python(p), to_python(o), None if g is None else to_python(g))
+        for s, p, o, g in native.parse_rdf(data, format, base)
+    ]
+
+
+def serialize(
+    quads: Iterable[Quad | tuple[Any, ...]],
+    format: RdfFormat,
+    *,
+    prefixes: dict[str, str] | None = None,
+) -> str:
+    """Write quads as an RDF document: Turtle, TriG, N-Triples or N-Quads.
+
+    Each item is a :class:`Quad`, or a ``(subject, predicate, object)`` or
+    ``(subject, predicate, object, graph)`` tuple. Turtle and N-Triples hold
+    the default graph only; a quad in a named graph needs TriG or N-Quads.
+    Turtle and TriG declare ``prefixes`` (``{"ex": "http://example.org/"}``)
+    and write IRIs with them. A quad ``(r, rdf:reifies, Triple(...))`` is
+    written as an annotation where the format has one.
+    """
+    return native.serialize_rdf([_quad(q) for q in quads], format, prefixes)
+
+
+def _quad(item: Quad | tuple[Any, ...]) -> Quad:
+    if isinstance(item, Quad):
+        return item
+    if isinstance(item, tuple) and len(item) in (3, 4):
+        return Quad(*item)
+    raise TypeError(f"a quad is a Quad or a 3- or 4-tuple, not {item!r}")
+
+
+def is_quads(data: Any) -> TypeGuard[list[Quad]]:
+    """Whether ``data`` is a list of quads rather than JSON-LD."""
+    return isinstance(data, list) and bool(data) and all(isinstance(q, Quad) for q in data)

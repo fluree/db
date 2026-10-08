@@ -36,6 +36,9 @@ fluree-db-core = { path = "../fluree-db-core" }
 fluree-db-nameservice = { path = "../fluree-db-nameservice" }
 fluree-db-query = { path = "../fluree-db-query" }
 fluree-db-sparql = { path = "../fluree-db-sparql" }
+fluree-graph-format = { path = "../fluree-graph-format" }
+fluree-graph-ir = { path = "../fluree-graph-ir" }
+fluree-graph-turtle = { path = "../fluree-graph-turtle" }
 fluree-vocab = { path = "../fluree-vocab" }
 pyo3 = "0.29"
 pythonize = "0.29"

@@ -12,7 +12,8 @@ pass the plain values shown.
 ## Data
 
 `str | dict | list | os.PathLike`: JSON-LD (a dict, a list, or JSON text),
-Turtle or TriG text, or a path to a file holding any of them.
+Turtle or TriG text, a path to a file holding any of them, or a list of
+{py:class}`fluree.Quad`.
 
 (type-format)=
 ## Format
@@ -24,6 +25,12 @@ file extension does not settle it.
 ## ExportFormat
 
 `"turtle" | "trig" | "ntriples" | "nquads" | "jsonld"`.
+
+(type-rdfformat)=
+## RdfFormat
+
+`"turtle" | "trig" | "ntriples" | "nquads"`: the formats
+{py:func}`fluree.parse` reads and {py:func}`fluree.serialize` writes.
 
 (type-language)=
 ## Language
