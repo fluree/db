@@ -96,6 +96,7 @@ pub mod policy_builder;
 pub mod policy_view;
 pub mod profile;
 pub mod query;
+pub mod rdf;
 mod rebase;
 pub mod remote_service;
 mod revert;

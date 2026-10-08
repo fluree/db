@@ -22,15 +22,15 @@
 //! write the parsed document back with the N-Triples / N-Quads writer that
 //! serves CONSTRUCT results and compare it with the canonical form.
 //!
-//! [`register_reader_tests`] runs the same test types through the standalone
-//! readers instead: the strict N-Triples / N-Quads reader, and the Turtle
-//! parser's conformant Turtle and TriG.
+//! [`register_reader_tests`] runs the same test types through
+//! `fluree_db_api::rdf` instead: the standalone readers and writers that
+//! `fluree.parse` / `fluree.serialize` and Rust callers use.
 
 use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{bail, ensure, Context, Result};
 use fluree_graph_ir::{Graph, GraphCollectorSink, Term as IrTerm};
-use fluree_graph_turtle::{parse as parse_turtle, Dialect, ParserOptions};
+use fluree_graph_turtle::parse as parse_turtle;
 
 use crate::evaluator::TestEvaluator;
 use crate::files::read_file_to_string;
@@ -40,6 +40,7 @@ use crate::result_format::{
     ir_term_to_rdf_term, reification_triples, trig_dataset, RdfTerm, SparqlResults, Triple,
 };
 use crate::vocab::rdft;
+use fluree_db_api::rdf::{self, PrefixMap, RdfFormat};
 use fluree_graph_ir::Dataset;
 
 const RDF_FIRST: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#first";
@@ -80,21 +81,13 @@ pub fn register_rdf_tests(evaluator: &mut TestEvaluator) {
     evaluator.register(rdft::TEST_TRIG_EVAL, evaluate_trig_eval);
 }
 
-/// The syntaxes the standalone readers take.
-#[derive(Clone, Copy)]
-enum Syntax {
-    Turtle,
-    TriG,
-    NTriples,
-    NQuads,
-}
-
-/// Register every RDF syntax test type against the standalone readers: the
+/// Register every RDF syntax test type against `fluree_db_api::rdf`: the
 /// strict line reader for N-Triples and N-Quads, and the Turtle parser in
 /// its conformant shape (`rdf:first`/`rdf:rest` collections, numeric lexical
-/// forms kept) for Turtle and TriG. Expected results are read the same way.
+/// forms kept) for Turtle and TriG. Expected results are read the same way,
+/// and C14N tests write with `rdf::serialize`.
 pub fn register_reader_tests(evaluator: &mut TestEvaluator) {
-    use Syntax::*;
+    use RdfFormat::*;
     for (positive, negative, syntax) in [
         (
             rdft::TEST_TURTLE_POSITIVE_SYNTAX,
@@ -128,45 +121,25 @@ pub fn register_reader_tests(evaluator: &mut TestEvaluator) {
     });
     evaluator.register(rdft::TEST_TURTLE_EVAL, |t| reader_eval(t, Turtle, NTriples));
     evaluator.register(rdft::TEST_TRIG_EVAL, |t| reader_eval(t, TriG, NQuads));
-    evaluator.register(rdft::TEST_NTRIPLES_POSITIVE_C14N, |t| {
-        let dataset = read(action_url(t)?, NTriples)?;
-        let written = fluree_graph_format::format_ntriples(&dataset.default)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        compare_c14n(t, &written)
-    });
-    evaluator.register(rdft::TEST_NQUADS_POSITIVE_C14N, |t| {
-        let dataset = read(action_url(t)?, NQuads)?;
-        let written =
-            fluree_graph_format::format_nquads(&dataset).map_err(|e| anyhow::anyhow!("{e}"))?;
-        compare_c14n(t, &written)
-    });
+    for (c14n, format) in [
+        (rdft::TEST_NTRIPLES_POSITIVE_C14N, NTriples),
+        (rdft::TEST_NQUADS_POSITIVE_C14N, NQuads),
+    ] {
+        evaluator.register(c14n, move |t| {
+            let dataset = read(action_url(t)?, format)?;
+            compare_c14n(t, &rdf::serialize(&dataset, format, &PrefixMap::default())?)
+        });
+    }
 }
 
-/// The document at `url`, read by the standalone reader for `syntax`;
-/// Turtle and TriG resolve relative IRIs against `url`.
-fn read(url: &str, syntax: Syntax) -> Result<Dataset> {
+/// The document at `url`, read as `format`; Turtle and TriG resolve
+/// relative IRIs against `url`.
+fn read(url: &str, format: RdfFormat) -> Result<Dataset> {
     let content = read_file_to_string(url).with_context(|| format!("Reading {url}"))?;
-    let mut sink = GraphCollectorSink::with_named_graphs();
-    let parsed = match syntax {
-        Syntax::Turtle | Syntax::TriG => {
-            let dialect = match syntax {
-                Syntax::TriG => Dialect::TriG,
-                _ => Dialect::Turtle,
-            };
-            fluree_graph_turtle::parse_with_options(
-                &format!("@base <{url}> .\n{content}"),
-                &mut sink,
-                ParserOptions::conformant().with_dialect(dialect),
-            )
-        }
-        Syntax::NTriples => fluree_graph_turtle::parse_ntriples(&content, &mut sink),
-        Syntax::NQuads => fluree_graph_turtle::parse_nquads(&content, &mut sink),
-    };
-    parsed.with_context(|| format!("Parsing {url}"))?;
-    Ok(sink.into_dataset())
+    rdf::parse(&content, format, Some(url)).with_context(|| format!("Parsing {url}"))
 }
 
-fn reader_syntax(test: &Test, syntax: Syntax, valid: bool) -> Result<()> {
+fn reader_syntax(test: &Test, syntax: RdfFormat, valid: bool) -> Result<()> {
     let url = action_url(test)?;
     match read(url, syntax) {
         Ok(_) if !valid => bail!(
@@ -186,7 +159,7 @@ fn reader_syntax(test: &Test, syntax: Syntax, valid: bool) -> Result<()> {
 }
 
 /// The action read as `syntax` against the result read as `expected`.
-fn reader_eval(test: &Test, syntax: Syntax, expected: Syntax) -> Result<()> {
+fn reader_eval(test: &Test, syntax: RdfFormat, expected: RdfFormat) -> Result<()> {
     let url = action_url(test)?;
     let result_url = test
         .result

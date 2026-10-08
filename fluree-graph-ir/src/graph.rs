@@ -178,6 +178,23 @@ impl Graph {
         self.triples.iter_mut()
     }
 
+    /// Every term of every triple and reifier attachment.
+    pub(crate) fn terms_mut(&mut self) -> impl Iterator<Item = &mut Term> {
+        let triples = self
+            .triples
+            .iter_mut()
+            .flat_map(|t| [&mut t.s, &mut t.p, &mut t.o]);
+        let reifications = self.reifications.iter_mut().flat_map(|r| {
+            [
+                &mut r.reifier,
+                &mut r.triple.s,
+                &mut r.triple.p,
+                &mut r.triple.o,
+            ]
+        });
+        triples.chain(reifications)
+    }
+
     /// Sort triples by SPO for deterministic output
     ///
     /// This enables stable, reproducible formatting regardless of insertion order.

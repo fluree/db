@@ -7,10 +7,10 @@
 //! Unbound cells are `None`.
 
 use crate::error::{fluree_error, invalid_request};
+use fluree_db_api::rdf::{Datatype, Term};
 use fluree_db_api::{CommitRef, ResolvedFlake, ResolvedValue, TimeSpec};
 use fluree_db_core::{CommitSummary, ContentId};
 use fluree_db_sparql::ast::{QueryBody, SelectVariables};
-use fluree_graph_ir::{Datatype, Term};
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
