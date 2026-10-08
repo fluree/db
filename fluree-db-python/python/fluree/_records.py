@@ -226,7 +226,7 @@ def _change(t: int | None, flake: tuple[Any, ...]) -> Change:
         op="assert" if op else "retract",
         subject=_node(s),
         predicate=IRI(p),
-        value=_node(o[1]) if o[0] == "iri" else to_python(o),
+        value=to_python(o),
         graph=None if g is None else IRI(g),
     )
 
