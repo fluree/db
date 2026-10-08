@@ -581,8 +581,8 @@ fn column_to_string(col: &Column, row_idx: usize) -> Option<String> {
         Column::Boolean(v) => v.get(row_idx).and_then(|v| *v).map(|b| b.to_string()),
         Column::Int32(v) => v.get(row_idx).and_then(|v| *v).map(|n| n.to_string()),
         Column::Int64(v) => v.get(row_idx).and_then(|v| *v).map(|n| n.to_string()),
-        Column::Float32(v) => v.get(row_idx).and_then(|v| *v).map(|n| n.to_string()),
-        Column::Float64(v) => v.get(row_idx).and_then(|v| *v).map(|n| n.to_string()),
+        Column::Float32(v) => v.get(row_idx).and_then(|v| *v).map(float_lexical),
+        Column::Float64(v) => v.get(row_idx).and_then(|v| *v).map(float_lexical),
         Column::String(v) => v.get(row_idx).and_then(std::clone::Clone::clone),
         Column::Bytes(v) => v
             .get(row_idx)
@@ -596,6 +596,17 @@ fn column_to_string(col: &Column, row_idx: usize) -> Option<String> {
             .get(row_idx)
             .and_then(|v| *v)
             .map(|n| format_decimal(n, *scale)),
+    }
+}
+
+/// The lexical form of a floating-point cell. Finite values keep Rust's
+/// shortest round-trip form; NaN and the infinities take their XSD spellings
+/// (`NaN`, `INF`, `-INF`), since Rust's own `inf` / `-inf` are not
+/// `xsd:double` lexical forms and would not read back as numbers.
+fn float_lexical<F: fluree_graph_ir::XsdFloat + std::fmt::Display>(n: F) -> String {
+    match n.nonfinite_xsd() {
+        Some(special) => special.to_string(),
+        None => n.to_string(),
     }
 }
 
@@ -1434,5 +1445,33 @@ mod tests {
             materialize_graph_from_batch(&named, &batch, 0).unwrap(),
             Some("http://example.org/g1".to_string())
         );
+    }
+
+    #[test]
+    fn float_cells_render_xsd_lexical_forms() {
+        let doubles = Column::Float64(vec![
+            Some(1.5),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            Some(f64::NAN),
+        ]);
+        let floats = Column::Float32(vec![
+            Some(1.5),
+            Some(f32::INFINITY),
+            Some(f32::NEG_INFINITY),
+            Some(f32::NAN),
+        ]);
+        for col in [doubles, floats] {
+            let rendered: Vec<String> = (0..4)
+                .map(|row| column_to_string(&col, row).unwrap())
+                .collect();
+            assert_eq!(rendered, ["1.5", "INF", "-INF", "NaN"]);
+            for lexical in &rendered {
+                assert!(
+                    fluree_graph_ir::parse_xsd_double(lexical).is_some(),
+                    "{lexical} reads back as an xsd:double"
+                );
+            }
+        }
     }
 }

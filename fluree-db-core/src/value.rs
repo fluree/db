@@ -405,22 +405,28 @@ impl FlakeValue {
         }
     }
 
-    /// Compare two numeric values mathematically.
+    /// Compare two numeric values mathematically: the value comparison of
+    /// XPath `op:numeric-less-than` / `op:numeric-equal` (F&O 3.1 §4.3).
     ///
-    /// Returns `None` if either value is not numeric.
+    /// Returns `None` if either value is not numeric, or either is NaN: NaN is
+    /// incomparable, so every `<`, `>`, `=` with it is false. `+INF` is above
+    /// and `-INF` below every other number, of any numeric type.
     ///
     /// This implements "number is a number" semantics:
     /// - `Long(3) < Double(3.5) < Long(4)`
     /// - Equal values compare as Equal regardless of type
+    ///
+    /// The storage order (`Ord`), which must be total, is [`Self::cmp`]: it
+    /// places NaN after `+INF`.
     pub fn numeric_cmp(&self, other: &Self) -> Option<Ordering> {
+        if let Some(ord) = Self::special_double_cmp(self, other) {
+            return ord;
+        }
         match (self, other) {
             // === Fast paths: same type ===
             (FlakeValue::Long(a), FlakeValue::Long(b)) => Some(a.cmp(b)),
-            (FlakeValue::Double(a), FlakeValue::Double(b)) => {
-                // Handle NaN: use bit comparison as fallback for total ordering
-                a.partial_cmp(b)
-                    .or_else(|| Some(a.to_bits().cmp(&b.to_bits())))
-            }
+            // Neither is NaN or infinite here (handled above).
+            (FlakeValue::Double(a), FlakeValue::Double(b)) => a.partial_cmp(b),
             (FlakeValue::BigInt(a), FlakeValue::BigInt(b)) => Some((**a).cmp(&**b)),
             (FlakeValue::Decimal(a), FlakeValue::Decimal(b)) => {
                 a.partial_cmp(b).or(Some(Ordering::Equal))
@@ -504,10 +510,60 @@ impl FlakeValue {
         }
     }
 
+    /// The cases of [`Self::numeric_cmp`] a non-finite double decides, so the
+    /// arms below only ever see finite doubles. `None` = no special double
+    /// involved; `Some(None)` = incomparable (NaN, or a non-numeric operand).
+    fn special_double_cmp(a: &Self, b: &Self) -> Option<Option<Ordering>> {
+        let special = |v: &Self| match v {
+            FlakeValue::Double(d) if !d.is_finite() => Some(*d),
+            _ => None,
+        };
+        let (sa, sb) = (special(a), special(b));
+        if sa.is_none() && sb.is_none() {
+            return None;
+        }
+        if !a.is_numeric() || !b.is_numeric() {
+            return Some(None);
+        }
+        // `+INF` > everything, `-INF` < everything; a double holds the value,
+        // so two infinities of one sign are equal.
+        let rank = |v: &Self, s: Option<f64>| -> Option<i8> {
+            match s {
+                Some(d) if d.is_nan() => None,
+                Some(d) if d > 0.0 => Some(1),
+                Some(_) => Some(-1),
+                None => {
+                    debug_assert!(v.is_numeric());
+                    Some(0)
+                }
+            }
+        };
+        Some(match (rank(a, sa), rank(b, sb)) {
+            (Some(x), Some(y)) => Some(x.cmp(&y)),
+            _ => None, // NaN on either side
+        })
+    }
+
+    /// The storage order of two numeric values: [`Self::numeric_cmp`], made
+    /// total by placing NaN after `+INF` (all NaNs equal). This is the order
+    /// of index keys ([`crate::value_id::total_cmp_f64`]) and of ORDER BY.
+    fn numeric_total_cmp(&self, other: &Self) -> Option<Ordering> {
+        if !self.is_numeric() || !other.is_numeric() {
+            return None;
+        }
+        let nan = |v: &Self| matches!(v, FlakeValue::Double(d) if d.is_nan());
+        Some(match (nan(self), nan(other)) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => self.numeric_cmp(other)?,
+        })
+    }
+
     /// Check if i64 is exactly representable as f64 (within 2^53)
     fn i64_fits_f64(v: i64) -> bool {
-        const MAX_SAFE: i64 = 1 << 53;
-        v.abs() <= MAX_SAFE
+        const MAX_SAFE: u64 = 1 << 53;
+        v.unsigned_abs() <= MAX_SAFE
     }
 
     /// Compare values of the same type
@@ -517,9 +573,9 @@ impl FlakeValue {
             (FlakeValue::Ref(a), FlakeValue::Ref(b)) => a.cmp(b),
             (FlakeValue::Boolean(a), FlakeValue::Boolean(b)) => a.cmp(b),
             (FlakeValue::Long(a), FlakeValue::Long(b)) => a.cmp(b),
-            (FlakeValue::Double(a), FlakeValue::Double(b)) => a
-                .partial_cmp(b)
-                .unwrap_or_else(|| a.to_bits().cmp(&b.to_bits())),
+            (FlakeValue::Double(a), FlakeValue::Double(b)) => {
+                crate::value_id::total_cmp_f64(*a, *b)
+            }
             (FlakeValue::BigInt(a), FlakeValue::BigInt(b)) => a.cmp(b),
             (FlakeValue::Decimal(a), FlakeValue::Decimal(b)) => {
                 a.partial_cmp(b).unwrap_or(Ordering::Equal)
@@ -579,9 +635,6 @@ impl FlakeValue {
     pub fn canonical_hash(&self) -> u64 {
         use xxhash_rust::xxh64::xxh64;
 
-        // Canonical NaN bit pattern for deterministic hashing (quiet NaN)
-        const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
-
         // Type tag prefixes prevent collisions (e.g., string "true" vs boolean true)
         match self {
             FlakeValue::Null => xxh64(b"\x00null", 0),
@@ -599,14 +652,9 @@ impl FlakeValue {
                 xxh64(&buf, 0)
             }
             FlakeValue::Double(f) => {
-                // CRITICAL: Canonicalize NaN and -0.0/+0.0 for determinism
-                let canonical_bits = if f.is_nan() {
-                    CANONICAL_NAN_BITS // Fixed bit pattern for ALL NaN values
-                } else if *f == 0.0 {
-                    0u64 // Normalize -0.0 to +0.0 (both compare equal)
-                } else {
-                    f.to_bits()
-                };
+                // CRITICAL: Canonicalize NaN and -0.0/+0.0 for determinism —
+                // the same bits the index key and the total order use.
+                let canonical_bits = crate::value_id::canonical_f64_bits(*f);
                 let mut buf = [0u8; 9];
                 buf[0] = 0x03; // type tag
                 buf[1..].copy_from_slice(&canonical_bits.to_le_bytes());
@@ -746,13 +794,7 @@ impl FlakeValue {
                 hasher.update(&[0x0C]); // type tag
                 hasher.update(&(v.len() as u64).to_le_bytes());
                 for f in v.iter() {
-                    let canonical_bits = if f.is_nan() {
-                        CANONICAL_NAN_BITS
-                    } else if *f == 0.0 {
-                        0u64
-                    } else {
-                        f.to_bits()
-                    };
+                    let canonical_bits = crate::value_id::canonical_f64_bits(*f);
                     hasher.update(&canonical_bits.to_le_bytes());
                 }
                 hasher.digest()
@@ -772,9 +814,11 @@ impl FlakeValue {
 
 impl PartialEq for FlakeValue {
     fn eq(&self, other: &Self) -> bool {
-        // For numeric types, use numeric_cmp for value equality
+        // For numeric types, equality by value across numeric types.
         if self.is_numeric() && other.is_numeric() {
-            return self.numeric_cmp(other) == Some(Ordering::Equal);
+            // Storage identity, not XPath `=`: a NaN equals itself here (so a
+            // stored NaN can be found and retracted), as in `Ord` and `Hash`.
+            return self.numeric_total_cmp(other) == Some(Ordering::Equal);
         }
 
         // For temporal types of the same kind, use temporal_cmp
@@ -830,12 +874,10 @@ impl Ord for FlakeValue {
         // 2. Both numeric → compare by mathematical value
         // Equal numeric values return Equal so cmp_object can use dt as tie-breaker
         // "number is a number": equal values are equal regardless of numeric type
-        if self.is_numeric() && other.is_numeric() {
-            if let Some(ord) = self.numeric_cmp(other) {
-                return ord;
-            }
-            // numeric_cmp returned None - shouldn't happen for two numeric values
-            // Fall through to discriminant comparison as defensive measure
+        // Total over every numeric value, NaN included (after +INF), as `Ord`
+        // requires.
+        if let Some(ord) = self.numeric_total_cmp(other) {
+            return ord;
         }
 
         // 3. Both temporal → compare by instant (if same temporal type)
@@ -910,8 +952,12 @@ impl std::hash::Hash for FlakeValue {
                 } else if d.is_infinite() {
                     3u8.hash(state); // infinity tag
                     (*d > 0.0).hash(state); // sign
-                } else if d.fract() == 0.0 && *d >= i64::MIN as f64 && *d <= i64::MAX as f64 {
-                    // Integer-valued double in i64 range: hash as integer
+                } else if d.fract() == 0.0
+                    && *d >= i64::MIN as f64
+                    && *d < 9_223_372_036_854_775_808.0
+                {
+                    // Integer-valued double in i64 range (`i64::MAX as f64`
+                    // rounds up to 2^63, outside it): hash as integer
                     0u8.hash(state); // integer tag
                     BigInt::from(*d as i64).to_signed_bytes_le().hash(state);
                 } else {
@@ -1262,10 +1308,9 @@ pub fn parse_double(value: &serde_json::Value) -> Result<FlakeValue, String> {
                 Err("Cannot convert to double".to_string())
             }
         }
-        serde_json::Value::String(s) => s
-            .parse::<f64>()
+        serde_json::Value::String(s) => fluree_graph_ir::parse_xsd_double(s)
             .map(FlakeValue::Double)
-            .map_err(|e| format!("Invalid double '{s}': {e}")),
+            .ok_or_else(|| format!("Invalid double '{s}': not an xsd:double lexical form")),
         _ => Err("Expected number or string for double".to_string()),
     }
 }
@@ -1653,5 +1698,129 @@ mod tests {
                 "Hash collision detected in test values"
             );
         }
+    }
+
+    /// Double bit patterns whose identity differs from their bits: NaNs with
+    /// every sign and a spread of payloads (quiet and signalling), both zeros,
+    /// both infinities, and a few ordinary values to compare them against.
+    fn special_double_bits() -> Vec<u64> {
+        let mut bits = vec![
+            0x7FF8_0000_0000_0000,
+            0xFFF8_0000_0000_0000,
+            0x7FF0_0000_0000_0001,
+            0xFFF0_0000_0000_0001,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0xFFFF_FFFF_FFFF_FFFF,
+            0.0f64.to_bits(),
+            (-0.0f64).to_bits(),
+            f64::INFINITY.to_bits(),
+            f64::NEG_INFINITY.to_bits(),
+            1.5f64.to_bits(),
+            (-1.5f64).to_bits(),
+            f64::MAX.to_bits(),
+            f64::MIN_POSITIVE.to_bits(),
+        ];
+        for shift in 0..51 {
+            bits.push(0x7FF0_0000_0000_0000 | (1u64 << shift));
+            bits.push(0xFFF0_0000_0000_0000 | (1u64 << shift));
+        }
+        bits
+    }
+
+    /// `FlakeValue`'s equality treats every NaN as one value and -0.0 as 0.0;
+    /// its hash must agree, or hashed sets and maps split one value in two.
+    #[test]
+    fn equal_doubles_hash_equally() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let hash = |v: &FlakeValue| {
+            let mut h = DefaultHasher::new();
+            v.hash(&mut h);
+            h.finish()
+        };
+        let values: Vec<FlakeValue> = special_double_bits()
+            .into_iter()
+            .map(|b| FlakeValue::Double(f64::from_bits(b)))
+            .collect();
+        for a in &values {
+            for b in &values {
+                if a == b {
+                    assert_eq!(hash(a), hash(b), "{a:?} == {b:?}");
+                }
+            }
+        }
+    }
+
+    /// `Long(i64::MIN)` compares with a double by value, like any other
+    /// integer beyond 2^53.
+    #[test]
+    fn long_min_compares_with_doubles() {
+        let min = FlakeValue::Long(i64::MIN);
+        let as_double = FlakeValue::Double(-9_223_372_036_854_775_808.0);
+        assert_eq!(min.numeric_cmp(&as_double), Some(Ordering::Equal));
+        assert_eq!(as_double.numeric_cmp(&min), Some(Ordering::Equal));
+        assert_eq!(
+            min.numeric_cmp(&FlakeValue::Double(0.0)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            FlakeValue::Double(-1e19).numeric_cmp(&min),
+            Some(Ordering::Less)
+        );
+        assert_eq!(min.cmp(&as_double), Ordering::Equal);
+    }
+
+    /// Equality is by value across numeric types (`Long(1) == Double(1.0)`,
+    /// `Double(2^63) == BigInt(2^63)`); equal values must hash equally across
+    /// those types too.
+    #[test]
+    fn equal_numbers_of_different_types_hash_equally() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        use std::str::FromStr;
+        let hash = |v: &FlakeValue| {
+            let mut h = DefaultHasher::new();
+            v.hash(&mut h);
+            h.finish()
+        };
+        let big = |s: &str| FlakeValue::BigInt(Box::new(BigInt::from_str(s).unwrap()));
+        let dec = |s: &str| FlakeValue::Decimal(Box::new(BigDecimal::from_str(s).unwrap()));
+        let two_63 = 9_223_372_036_854_775_808.0_f64;
+        let values = [
+            FlakeValue::Long(0),
+            FlakeValue::Double(0.0),
+            FlakeValue::Double(-0.0),
+            dec("0"),
+            FlakeValue::Long(1),
+            FlakeValue::Double(1.0),
+            dec("1.0"),
+            FlakeValue::Double(2.5),
+            dec("2.5"),
+            dec("2.50"),
+            FlakeValue::Long(1 << 53),
+            FlakeValue::Double((1u64 << 53) as f64),
+            FlakeValue::Long(i64::MAX),
+            FlakeValue::Long(i64::MIN),
+            FlakeValue::Double(-two_63),
+            FlakeValue::Double(two_63),
+            big("9223372036854775808"),
+            dec("9223372036854775808"),
+            FlakeValue::Double(1e19),
+            big("10000000000000000000"),
+            big("-9223372036854775809"),
+        ];
+        let mut equal_pairs = 0;
+        for a in &values {
+            for b in &values {
+                if a == b {
+                    equal_pairs += 1;
+                    assert_eq!(hash(a), hash(b), "{a:?} == {b:?}");
+                }
+            }
+        }
+        assert!(
+            equal_pairs > values.len(),
+            "some cross-type pairs are equal"
+        );
     }
 }

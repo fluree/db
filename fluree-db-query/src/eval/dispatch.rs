@@ -192,6 +192,7 @@ impl Function {
             Function::XsdDateTime => cast::eval_xsd_datetime(args, row, ctx),
             Function::XsdDate => cast::eval_xsd_date(args, row, ctx),
             Function::XsdTime => cast::eval_xsd_time(args, row, ctx),
+            Function::CypherToFloat => cast::eval_cypher_to_float(args, row, ctx),
 
             // Path functions
             Function::PathLength => path::eval_path_length(args, row),

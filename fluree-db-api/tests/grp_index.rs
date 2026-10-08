@@ -9,6 +9,8 @@ mod it_disk_cache_locality;
 mod it_duration_index_roundtrip;
 #[path = "it_fwd_pack_compaction.rs"]
 mod it_fwd_pack_compaction;
+#[path = "it_index_halt.rs"]
+mod it_index_halt;
 #[path = "it_index_sweep.rs"]
 mod it_index_sweep;
 #[path = "it_indexing_fuel.rs"]
@@ -43,3 +45,5 @@ mod it_time_travel_indexing;
 mod it_trigger_index_incremental;
 #[path = "it_typed_literal_index.rs"]
 mod it_typed_literal_index;
+#[path = "it_xsd_double_special_values.rs"]
+mod it_xsd_double_special_values;

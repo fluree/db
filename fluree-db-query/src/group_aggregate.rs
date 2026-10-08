@@ -608,10 +608,11 @@ pub(crate) fn flake_value_to_key(val: &FlakeValue, dtc: &DatatypeConstraint) -> 
             bool_val: None,
             dtc: dtc.clone(),
         },
+        // Every NaN is one value, and -0.0 is 0.0, as in the index's keys.
         FlakeValue::Double(d) => MaterializedLitKey {
             discriminant: 3,
             string_val: None,
-            number_bits: Some(d.to_bits()),
+            number_bits: Some(fluree_db_core::value_id::canonical_f64_bits(*d)),
             bool_val: None,
             dtc: dtc.clone(),
         },
@@ -1803,5 +1804,28 @@ mod tests {
             output_var: VarId(1),
         }];
         assert!(GroupAggregateOperator::all_streamable(&plain_min));
+    }
+
+    /// GROUP BY and COUNT(DISTINCT) key a double by its value: every NaN is
+    /// one key, -0.0 is 0.0, and the infinities stay apart.
+    #[test]
+    fn group_keys_identify_doubles_by_value() {
+        use fluree_db_core::{DatatypeConstraint, Sid};
+        let dt = DatatypeConstraint::Explicit(Sid::xsd_double());
+        let key = |bits: u64| flake_value_to_key(&FlakeValue::Double(f64::from_bits(bits)), &dt);
+        let nan = key(f64::NAN.to_bits());
+        for bits in [
+            0xFFF8_0000_0000_0000u64,
+            0x7FF0_0000_0000_0001,
+            0xFFFF_FFFF_FFFF_FFFF,
+        ] {
+            assert_eq!(key(bits), nan, "{bits:#x}");
+        }
+        assert_eq!(key((-0.0f64).to_bits()), key(0.0f64.to_bits()));
+        assert_ne!(
+            key(f64::INFINITY.to_bits()),
+            key(f64::NEG_INFINITY.to_bits())
+        );
+        assert_ne!(key(f64::INFINITY.to_bits()), nan);
     }
 }

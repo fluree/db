@@ -709,12 +709,7 @@ pub(crate) fn binding_to_numeric(binding: &Binding) -> Option<NumericValue> {
             if *o_kind == ObjKind::NUM_INT.as_u8() {
                 Some(NumericValue::Long(ObjKey::from_u64(*o_key).decode_i64()))
             } else if *o_kind == ObjKind::NUM_F64.as_u8() {
-                let d = ObjKey::from_u64(*o_key).decode_f64();
-                if d.is_nan() {
-                    None
-                } else {
-                    Some(NumericValue::Double(d))
-                }
+                Some(NumericValue::Double(ObjKey::from_u64(*o_key).decode_f64()))
             } else {
                 None
             }
@@ -723,17 +718,14 @@ pub(crate) fn binding_to_numeric(binding: &Binding) -> Option<NumericValue> {
     }
 }
 
+/// NaN and ±INF are numbers like any other double: SUM and AVG are built on
+/// `op:numeric-add` (SPARQL 1.1 §18.5.1.3, §18.5.1.4), so a NaN member makes
+/// the result NaN and `INF + -INF` is NaN.
 pub(crate) fn flake_value_to_numeric(val: &FlakeValue) -> Option<NumericValue> {
     match val {
         FlakeValue::Long(n) => Some(NumericValue::Long(*n)),
         FlakeValue::Boolean(b) => Some(NumericValue::Long(i64::from(*b))),
-        FlakeValue::Double(d) => {
-            if d.is_nan() {
-                None
-            } else {
-                Some(NumericValue::Double(*d))
-            }
-        }
+        FlakeValue::Double(d) => Some(NumericValue::Double(*d)),
         FlakeValue::BigInt(b) => Some(NumericValue::BigInt((**b).clone())),
         FlakeValue::Decimal(d) => Some(NumericValue::Decimal((**d).clone())),
         _ => None,
@@ -746,8 +738,13 @@ pub(crate) fn flake_value_to_numeric(val: &FlakeValue) -> Option<NumericValue> {
 /// precision — see `eval/cast.rs`), so SUM/AVG/etc. would otherwise silently
 /// drop it (`flake_value_to_numeric` has no `String` arm) and return unbound.
 /// Parse the string when the literal's datatype is a numeric XSD type. Yields
-/// `Double` (f64 is exact for f32-sourced values); NaN is dropped like other
-/// non-finite aggregate inputs.
+/// `Double` (f64 is exact for f32-sourced values).
+///
+/// The `xsd:double` lexical space is read, and under `xsd:double` /
+/// `xsd:float` also `inf` / `-inf`, the text an earlier bulk import stored for
+/// INF / -INF. Any other string that is not a number of the datatype
+/// (`"Infinity"`, or `"NaN"` under `xsd:decimal`, which has no NaN) is not
+/// numeric and makes SUM/AVG a type error.
 fn string_lit_to_numeric(
     val: &FlakeValue,
     dtc: &fluree_db_core::DatatypeConstraint,
@@ -755,11 +752,21 @@ fn string_lit_to_numeric(
     let FlakeValue::String(s) = val else {
         return None;
     };
-    if !is_numeric_xsd_datatype(dtc.datatype()) {
+    let dt = dtc.datatype();
+    if !is_numeric_xsd_datatype(dt) {
         return None;
     }
-    let d = s.parse::<f64>().ok()?;
-    (!d.is_nan()).then_some(NumericValue::Double(d))
+    let floating = dt.namespace_code == fluree_vocab::namespaces::XSD
+        && matches!(
+            dt.name.as_ref(),
+            fluree_vocab::xsd_names::FLOAT | fluree_vocab::xsd_names::DOUBLE
+        );
+    let d = fluree_graph_ir::parse_xsd_double(s).or_else(|| {
+        floating
+            .then(|| crate::eval::legacy_import_infinity(s))
+            .flatten()
+    })?;
+    (floating || d.is_finite()).then_some(NumericValue::Double(d))
 }
 
 /// Whether `sid` is a numeric XSD datatype (the family that should accumulate
@@ -1178,6 +1185,101 @@ mod tests {
         let (val, dt) = result.as_lit().expect("empty AVG must be a literal 0");
         assert_eq!(*val, FlakeValue::Long(0));
         assert_eq!(dt.datatype(), &xsd_integer());
+    }
+
+    #[test]
+    fn test_agg_sum_and_avg_add_special_doubles() {
+        // SUM is op:numeric-add and AVG is SUM / COUNT (SPARQL 1.1 §18.5.1.3,
+        // §18.5.1.4): IEEE arithmetic, so a NaN member gives NaN and
+        // INF + -INF is NaN.
+        let dbl = |d: f64| Binding::lit(FlakeValue::Double(d), xsd_double());
+        let encoded = |d: f64| Binding::EncodedLit {
+            o_kind: fluree_db_core::value_id::ObjKind::NUM_F64.as_u8(),
+            o_key: fluree_db_core::value_id::ObjKey::encode_f64(d).as_u64(),
+            p_id: 0,
+            dt_id: 0,
+            lang_id: 0,
+            i_val: i32::MIN,
+            t: 0,
+        };
+        let double_of = |b: Binding| match b.as_lit() {
+            Some((FlakeValue::Double(d), _)) => *d,
+            other => panic!("expected a double, got {other:?}"),
+        };
+        for values in [
+            vec![dbl(1.0), dbl(f64::NAN)],
+            vec![
+                Binding::lit(FlakeValue::Long(1), xsd_integer()),
+                dbl(f64::NAN),
+            ],
+            vec![dbl(1.0), encoded(f64::NAN)],
+            vec![dbl(f64::INFINITY), dbl(f64::NEG_INFINITY)],
+        ] {
+            assert!(double_of(agg_sum(&values)).is_nan(), "SUM {values:?}");
+            assert!(double_of(agg_avg(&values)).is_nan(), "AVG {values:?}");
+        }
+        let values = vec![dbl(f64::INFINITY), encoded(2.5)];
+        assert_eq!(double_of(agg_sum(&values)), f64::INFINITY);
+        assert_eq!(double_of(agg_avg(&values)), f64::INFINITY);
+    }
+
+    #[test]
+    fn test_agg_sum_reads_string_backed_numbers_in_the_xsd_lexical_space() {
+        let typed = |s: &str, dt: Sid| Binding::lit(FlakeValue::String(s.to_string()), dt);
+        let xsd_float = || {
+            Sid::new(
+                fluree_vocab::namespaces::XSD,
+                fluree_vocab::xsd_names::FLOAT,
+            )
+        };
+        // The query-time xsd:float cast is string-backed; its special values
+        // are numbers.
+        let sum = agg_sum(&[typed("NaN", xsd_float()), typed("1.5", xsd_float())]);
+        assert!(matches!(sum.as_lit(), Some((FlakeValue::Double(d), _)) if d.is_nan()));
+        // A spelling outside the lexical space is not a number, and neither is
+        // a special value under a datatype without one: SUM is a type error.
+        for value in [
+            typed("Infinity", xsd_double()),
+            typed("Infinity", xsd_float()),
+            typed("NaN", xsd_decimal()),
+            typed("INF", xsd_integer()),
+            typed("inf", xsd_decimal()),
+        ] {
+            let values = [
+                value.clone(),
+                Binding::lit(FlakeValue::Long(1), xsd_integer()),
+            ];
+            assert!(
+                matches!(agg_sum(&values), Binding::Unbound),
+                "{value:?} must not be summed"
+            );
+        }
+    }
+
+    /// The text an earlier bulk import stored in the index for INF / -INF,
+    /// `inf` / `-inf` under `xsd:double` or `xsd:float`, sums as INF / -INF.
+    #[test]
+    fn test_agg_sum_reads_inf_text_under_double_and_float() {
+        let typed = |s: &str, dt: Sid| Binding::lit(FlakeValue::String(s.to_string()), dt);
+        let xsd_float = || {
+            Sid::new(
+                fluree_vocab::namespaces::XSD,
+                fluree_vocab::xsd_names::FLOAT,
+            )
+        };
+        let one = || Binding::lit(FlakeValue::Long(1), xsd_integer());
+        for (text, dt, expected) in [
+            ("inf", xsd_double(), f64::INFINITY),
+            ("-inf", xsd_double(), f64::NEG_INFINITY),
+            ("inf", xsd_float(), f64::INFINITY),
+            ("-inf", xsd_float(), f64::NEG_INFINITY),
+        ] {
+            let sum = agg_sum(&[typed(text, dt.clone()), one()]);
+            assert!(
+                matches!(sum.as_lit(), Some((FlakeValue::Double(d), _)) if *d == expected),
+                "{text}^^{dt:?}: {sum:?}"
+            );
+        }
     }
 
     #[test]

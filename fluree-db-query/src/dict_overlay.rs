@@ -482,11 +482,9 @@ impl DictOverlay {
                 // decode_f64 over the i64-encoded bits, corrupting the value to a
                 // tiny subnormal. Mirrors value_to_otype_okey and the encode-side
                 // guards in resolver.rs / import_sink.rs. (fluree/db-r#142)
-                match ObjKey::encode_f64(*d) {
-                    Ok(key) => Ok((ObjKind::NUM_F64, key)),
-                    // NaN/Inf can't be order-encoded → NULL sentinel.
-                    Err(_) => Ok((ObjKind::NULL, ObjKey::from_u64(0))),
-                }
+                // Every double, ±INF and NaN included, has the key the index
+                // stores it under.
+                Ok((ObjKind::NUM_F64, ObjKey::encode_f64(*d)))
             }
 
             FlakeValue::Ref(sid) => {

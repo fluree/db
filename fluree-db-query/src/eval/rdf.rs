@@ -270,11 +270,26 @@ pub fn eval_same_term<R: RowAccess>(
     let v2 = args[1].eval_to_comparable(row, ctx)?;
     let same = match (v1, v2) {
         (Some(a), Some(b)) => {
-            a == b || super::compare::resource_iri_eq(&a, &b, ctx).unwrap_or(false)
+            same_term(&a, &b) || super::compare::resource_iri_eq(&a, &b, ctx).unwrap_or(false)
         }
         _ => false,
     };
     Ok(Some(ComparableValue::Bool(same)))
+}
+
+/// Term equality of two evaluated values. Numbers are stored by value, so a
+/// double is the same term as an equal double; every NaN is the one term
+/// `"NaN"^^xsd:double`, which `f64` equality does not see.
+fn same_term(a: &ComparableValue, b: &ComparableValue) -> bool {
+    match (a, b) {
+        (ComparableValue::Double(x), ComparableValue::Double(y)) => {
+            x == y || (x.is_nan() && y.is_nan())
+        }
+        (ComparableValue::Float(x), ComparableValue::Float(y)) => {
+            x == y || (x.is_nan() && y.is_nan())
+        }
+        _ => a == b,
+    }
 }
 
 fn fast_same_term_encoded_ids<R: RowAccess>(

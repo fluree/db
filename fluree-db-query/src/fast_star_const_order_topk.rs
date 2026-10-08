@@ -340,13 +340,18 @@ fn filter_subjects_by_numeric_gt(
     // Only support numeric thresholds used in benchmark filters.
     let (thr_i, thr_d) = match threshold {
         FlakeValue::Long(n) => (*n, *n as f64),
+        // Nothing is greater than NaN (XPath F&O 3.1 §4.3.2).
+        FlakeValue::Double(d) if d.is_nan() => return Ok(Vec::new()),
         FlakeValue::Double(d) => (*d as i64, *d),
         _ => return Ok(Vec::new()),
     };
+    // A threshold below every i64 (e.g. -INF) keeps every integer; the
+    // saturating cast above would otherwise drop i64::MIN.
+    let all_integers = thr_d < i64::MIN as f64;
     let thr_i_key = fluree_db_core::value_id::ObjKey::encode_i64(thr_i).as_u64();
-    let thr_d_key = fluree_db_core::value_id::ObjKey::encode_f64(thr_d)
-        .map_err(|_| QueryError::execution("cannot encode f64 threshold".to_string()))?
-        .as_u64();
+    let thr_d_key = fluree_db_core::value_id::ObjKey::encode_f64(thr_d).as_u64();
+    // NaN's key is the only one above +INF's, and NaN is never greater.
+    let max_d_key = fluree_db_core::value_id::ObjKey::F64_COMPARABLE_MAX.as_u64();
 
     let mut keep: FxHashSet<u64> = FxHashSet::default();
     for_each_subject_row_psot(
@@ -358,8 +363,11 @@ fn filter_subjects_by_numeric_gt(
         |s_id, batch, i| {
             let ot = OType::from_u16(batch.o_type.get_or(i, 0));
             let over_threshold = match ot {
-                OType::XSD_INTEGER => batch.o_key.get(i) > thr_i_key,
-                OType::XSD_DOUBLE => batch.o_key.get(i) > thr_d_key,
+                OType::XSD_INTEGER => all_integers || batch.o_key.get(i) > thr_i_key,
+                OType::XSD_DOUBLE => {
+                    let k = batch.o_key.get(i);
+                    k > thr_d_key && k <= max_d_key
+                }
                 _ => false,
             };
             if over_threshold {

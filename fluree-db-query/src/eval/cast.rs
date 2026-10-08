@@ -166,7 +166,9 @@ fn cast_to_float(v: ComparableValue) -> Option<ComparableValue> {
         ComparableValue::Float(f) => f,
         ComparableValue::BigInt(n) => n.to_f32()?,
         ComparableValue::Decimal(d) => d.to_f64()? as f32,
-        ComparableValue::String(s) => s.parse::<f32>().ok()?,
+        // XPath casts a string through the target type's lexical space
+        // (F&O 3.1 §19.2), so `inf` or `Infinity` is a cast error.
+        ComparableValue::String(s) => fluree_graph_ir::parse_xsd_float(&s)?,
         _ => return None,
     };
     Some(float_typed_literal(f))
@@ -242,10 +244,29 @@ pub fn eval_xsd_double<R: RowAccess>(
     let Some(v) = args[0].eval_to_comparable(row, ctx)? else {
         return Ok(None);
     };
-    Ok(cast_to_double(v))
+    Ok(cast_to_double(v, fluree_graph_ir::parse_xsd_double))
 }
 
-fn cast_to_double(v: ComparableValue) -> Option<ComparableValue> {
+/// Cypher `toFloat(x)`: [`eval_xsd_double`], except that a string reads as
+/// Cypher reads a float, which takes `Infinity`, `-Infinity`, `NaN` and `inf`
+/// alongside the numerals.
+pub fn eval_cypher_to_float<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 1, "toFloat")?;
+    let Some(v) = args[0].eval_to_comparable(row, ctx)? else {
+        return Ok(None);
+    };
+    Ok(cast_to_double(v, |s| s.parse::<f64>().ok()))
+}
+
+/// A value as a double; `parse` reads a string.
+fn cast_to_double(
+    v: ComparableValue,
+    parse: impl Fn(&str) -> Option<f64>,
+) -> Option<ComparableValue> {
     let v = unwrap_typed_literal(v);
     let d: f64 = match v {
         ComparableValue::Bool(b) => {
@@ -260,7 +281,7 @@ fn cast_to_double(v: ComparableValue) -> Option<ComparableValue> {
         ComparableValue::Float(f) => f as f64,
         ComparableValue::BigInt(n) => n.to_f64()?,
         ComparableValue::Decimal(dec) => dec.to_f64()?,
-        ComparableValue::String(s) => s.parse::<f64>().ok()?,
+        ComparableValue::String(s) => parse(&s)?,
         _ => return None,
     };
     Some(ComparableValue::Double(d))
@@ -880,5 +901,37 @@ mod tests {
         assert_eq!(format_f32(1e30), "1.0E30");
         assert_eq!(format_f32(f32::NAN), "NaN");
         assert_eq!(format_f32(f32::NEG_INFINITY), "-INF");
+    }
+
+    // === Cypher toFloat ===
+
+    /// Cypher's `toFloat` reads `Infinity`, `-Infinity`, `NaN` and `inf` as
+    /// Cypher does; the `xsd:double` cast keeps to the XSD lexical space.
+    #[test]
+    fn cypher_to_float_reads_cypher_spellings() {
+        let row = empty_row();
+        let to_float = |s: &str| eval_cypher_to_float(&[string_expr(s)], &row, None).unwrap();
+        let double_of = |v: Option<ComparableValue>| match v {
+            Some(ComparableValue::Double(d)) => Some(d),
+            other => panic!("expected a double, got {other:?}"),
+        };
+        for (lexical, expected) in [
+            ("Infinity", f64::INFINITY),
+            ("-Infinity", f64::NEG_INFINITY),
+            ("inf", f64::INFINITY),
+            ("INF", f64::INFINITY),
+            ("-INF", f64::NEG_INFINITY),
+            ("1.5", 1.5),
+            ("1e400", f64::INFINITY),
+        ] {
+            assert_eq!(double_of(to_float(lexical)), Some(expected), "{lexical}");
+        }
+        assert!(double_of(to_float("NaN")).is_some_and(f64::is_nan));
+        assert_eq!(to_float("abc"), None);
+        assert_eq!(
+            eval_xsd_double(&[string_expr("Infinity")], &row, None).unwrap(),
+            None,
+            "xsd:double keeps to the XSD lexical space"
+        );
     }
 }

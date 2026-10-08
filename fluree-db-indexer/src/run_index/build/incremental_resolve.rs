@@ -509,7 +509,14 @@ pub async fn resolve_incremental_commits_v6(
         for walked in &walked_commits {
             let resolved = shared
                 .resolve_commit_into_chunk(&walked.bytes, &walked.cid.digest_hex(), &mut chunk)
-                .map_err(IncrementalResolveError::Resolve)?;
+                .map_err(|e| {
+                    IncrementalResolveError::Resolve(match e {
+                        ResolverError::Unindexable(msg) => {
+                            ResolverError::Unindexable(format!("commit {}: {msg}", walked.cid))
+                        }
+                        e => e,
+                    })
+                })?;
 
             max_t = max_t.max(walked.t);
             delta_commit_size += resolved.size;

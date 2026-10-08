@@ -161,6 +161,15 @@ pub struct IndexStatusSnapshot {
     pub last_error: Option<String>,
     /// Number of waiters currently attached
     pub waiter_count: usize,
+    /// The last build stopped on committed data it cannot index
+    /// ([`IndexerError::Unindexable`](crate::IndexerError::Unindexable)), and
+    /// `last_error` says why. The same build would stop the same way, so no
+    /// implicit trigger (a commit, a push, a published commit, a catch-up
+    /// sweep) starts one. An explicit request
+    /// ([`IndexerHandle::trigger_explicit`]), a reindex that succeeds, a newer
+    /// index that any process publishes for the ledger, dropping the ledger
+    /// ([`IndexerHandle::cancel`]), or a restart clears it.
+    pub halted: bool,
 }
 
 /// Phase of indexing for a ledger
@@ -227,6 +236,11 @@ struct LedgerIndexState {
     retry_count: u32,
     /// When to retry next (if in backoff)
     next_retry_at: Option<tokio::time::Instant>,
+    /// `Some(index_t)`: halted (see [`IndexStatusSnapshot::halted`]), with
+    /// the nameservice `index_t` the failed build started from. A newer index
+    /// published by any process lifts the halt
+    /// ([`TriggerHandle::clear_superseded_halts`]).
+    halted: Option<i64>,
 }
 
 impl Default for LedgerIndexState {
@@ -240,6 +254,7 @@ impl Default for LedgerIndexState {
             cancelled: false,
             retry_count: 0,
             next_retry_at: None,
+            halted: None,
         }
     }
 }
@@ -253,6 +268,7 @@ impl LedgerIndexState {
             last_index_t: self.last_index_t,
             last_error: self.last_error.clone(),
             waiter_count: self.waiters.len(),
+            halted: self.halted.is_some(),
         }
     }
 
@@ -306,12 +322,15 @@ impl LedgerIndexState {
     /// busy, `wait_for_idle`/`wait_all_idle` → idle), `trigger` re-creates the
     /// entry via `or_default`, and the only retained scalars (`last_index_t`,
     /// `retry_count`, `last_error`) are re-derived or reset on the next cycle.
+    /// A halted entry is kept: its status is the only report of why the
+    /// ledger's index stopped advancing.
     fn is_prunable(&self) -> bool {
         self.phase == IndexPhase::Idle
             && self.waiters.is_empty()
             && self.pending_min_t.is_none()
             && self.next_retry_at.is_none()
             && !self.cancelled
+            && self.halted.is_none()
     }
 
     /// Defensive normalization for the run-loop dispatch site. `process_ledger`
@@ -1014,7 +1033,28 @@ impl TriggerHandle {
     /// then resolves ALL waiters whose min_t is satisfied.
     ///
     /// Fire-and-forget: just drop the returned `IndexCompletion`.
+    ///
+    /// This is an implicit trigger, the kind a commit, a push, a published
+    /// commit event or a catch-up sweep sends. It starts no build for a
+    /// halted ledger ([`IndexStatusSnapshot::halted`]): the completion
+    /// resolves `Failed` with the error that halted it. Only
+    /// [`trigger_explicit`](Self::trigger_explicit) retries a halted ledger.
     pub async fn trigger(&self, ledger_id: &LedgerId, min_t: i64) -> IndexCompletion {
+        self.trigger_inner(ledger_id, min_t, false).await
+    }
+
+    /// [`trigger`](Self::trigger) for an explicit request to index the
+    /// ledger, such as the admin index API: it also retries a halted ledger.
+    pub async fn trigger_explicit(&self, ledger_id: &LedgerId, min_t: i64) -> IndexCompletion {
+        self.trigger_inner(ledger_id, min_t, true).await
+    }
+
+    async fn trigger_inner(
+        &self,
+        ledger_id: &LedgerId,
+        min_t: i64,
+        explicit: bool,
+    ) -> IndexCompletion {
         let ledger_id = ledger_id.clone();
         let (tx, rx) = oneshot::channel();
         let (phase, pending_min_t, waiter_count);
@@ -1023,6 +1063,17 @@ impl TriggerHandle {
             let mut states = self.states.lock().await;
             let state = states.entry(ledger_id.clone()).or_default();
 
+            if state.halted.is_some() && !explicit {
+                let error = state.last_error.clone().unwrap_or_default();
+                let _ = tx.send(IndexOutcome::Failed(error));
+                debug!(
+                    ledger_id = %ledger_id,
+                    requested_min_t = min_t,
+                    "Ledger is halted; only an explicit request starts a build"
+                );
+                return IndexCompletion { receiver: rx };
+            }
+
             // Clear cancelled flag on new trigger
             state.cancelled = false;
 
@@ -1030,6 +1081,9 @@ impl TriggerHandle {
             // This also makes tests and post-commit hooks behave predictably.
             state.retry_count = 0;
             state.next_retry_at = None;
+
+            // Reached for a halted ledger only by an explicit request.
+            state.halted = None;
 
             // Add waiter
             state.waiters.push((min_t, tx));
@@ -1100,6 +1154,7 @@ impl TriggerHandle {
             if let Some(existing) = states.get(ledger_id) {
                 if existing.phase != IndexPhase::Idle
                     || existing.cancelled
+                    || existing.halted.is_some()
                     || existing.has_pending_work()
                 {
                     return false;
@@ -1144,6 +1199,51 @@ impl TriggerHandle {
         })
     }
 
+    /// Clear a ledger's halt after an index was built for it outside this
+    /// worker, by a reindex: the committed data was indexable after all.
+    pub async fn clear_halt(&self, ledger_id: &LedgerId) {
+        let mut states = self.states.lock().await;
+        if let Some(state) = states.get_mut(ledger_id) {
+            if state.halted.is_some() {
+                state.halted = None;
+                state.last_error = None;
+            }
+        }
+    }
+
+    /// Halt `ledger_id` as a build that started from `index_t` and stopped on
+    /// committed data it cannot index would ([`IndexStatusSnapshot::halted`]),
+    /// for tests of what lifts a halt.
+    #[doc(hidden)]
+    pub async fn halt_for_test(&self, ledger_id: &LedgerId, index_t: i64, error: &str) {
+        let mut states = self.states.lock().await;
+        let state = states.entry(ledger_id.clone()).or_default();
+        state.halted = Some(index_t);
+        state.last_error = Some(error.to_string());
+    }
+
+    /// Lift the halt of every ledger whose nameservice `index_t` has moved
+    /// past the one its failed build started from: another process indexed
+    /// it, so the content this worker could not index is no longer in its way.
+    /// The periodic re-sweep calls this with the records it lists.
+    async fn clear_superseded_halts(&self, records: &[NsRecord]) {
+        let mut states = self.states.lock().await;
+        for record in records.iter().filter(|r| !r.retracted) {
+            let Some(state) = states.get_mut(&record.ledger_id) else {
+                continue;
+            };
+            if state.halted.is_some_and(|at| record.index_t > at) {
+                info!(
+                    ledger_id = %record.ledger_id,
+                    index_t = record.index_t,
+                    "Ledger indexed elsewhere since it halted; halt cleared"
+                );
+                state.halted = None;
+                state.last_error = None;
+            }
+        }
+    }
+
     /// Take an exclusive hold on `ledger_id` and drain any build already in
     /// flight, so the caller can write index artifacts without racing one.
     ///
@@ -1158,7 +1258,8 @@ impl TriggerHandle {
     /// a multi-hour reindex is indistinguishable from a hang.
     pub async fn hold_quiesced(&self, ledger_id: &LedgerId) -> Option<MaintenanceGuard> {
         let guard = self.acquire_maintenance(ledger_id)?;
-        self.cancel(ledger_id).await;
+        // The ledger goes on, so a halt stays.
+        self.cancel_inner(ledger_id, false).await;
         self.wait_for_idle(ledger_id).await;
         // A collector pass mid-release on any branch of the ledger finishes
         // first; later passes see the hold and release nothing.
@@ -1172,14 +1273,26 @@ impl TriggerHandle {
     /// - Prevents retries on failure
     /// - Does NOT abort in-progress indexing (it will complete and publish)
     /// - Resolves all waiters whose min_t is NOT yet satisfied as Cancelled
+    /// - Clears a halt ([`IndexStatusSnapshot::halted`]) and its error: this
+    ///   ends the ledger's work, as dropping it does, so a ledger created
+    ///   again under the same id starts without one
     ///
     /// Returns true if there was pending work to cancel.
     pub async fn cancel(&self, ledger_id: &LedgerId) -> bool {
+        self.cancel_inner(ledger_id, true).await
+    }
+
+    /// [`cancel`](Self::cancel), keeping a halt when `forget_halt` is false:
+    /// for maintenance on a ledger that goes on existing.
+    async fn cancel_inner(&self, ledger_id: &LedgerId, forget_halt: bool) -> bool {
         let had_work = {
             let mut states = self.states.lock().await;
             if let Some(state) = states.get_mut(ledger_id) {
                 let had_work = state.has_pending_work();
                 state.cancelled = true;
+                if forget_halt && state.halted.take().is_some() {
+                    state.last_error = None;
+                }
                 // Resolve all waiters as cancelled (they haven't been satisfied)
                 state.resolve_waiters_below(i64::MAX, IndexOutcome::Cancelled);
                 state.pending_min_t = None;
@@ -1288,6 +1401,24 @@ impl IndexerHandle {
     /// [`TriggerHandle::trigger`].
     pub async fn trigger(&self, ledger_id: &LedgerId, min_t: i64) -> IndexCompletion {
         self.trigger.trigger(ledger_id, min_t).await
+    }
+
+    /// Explicitly request indexing, retrying a halted ledger. See
+    /// [`TriggerHandle::trigger_explicit`].
+    pub async fn trigger_explicit(&self, ledger_id: &LedgerId, min_t: i64) -> IndexCompletion {
+        self.trigger.trigger_explicit(ledger_id, min_t).await
+    }
+
+    /// Clear a ledger's halt after a reindex built its index. See
+    /// [`TriggerHandle::clear_halt`].
+    pub async fn clear_halt(&self, ledger_id: &LedgerId) {
+        self.trigger.clear_halt(ledger_id).await;
+    }
+
+    /// See [`TriggerHandle::halt_for_test`].
+    #[doc(hidden)]
+    pub async fn halt_for_test(&self, ledger_id: &LedgerId, index_t: i64, error: &str) {
+        self.trigger.halt_for_test(ledger_id, index_t, error).await;
     }
 
     /// Queue a ledger only if nothing else already owns it. See
@@ -2351,6 +2482,7 @@ impl BackgroundIndexerWorker {
                         state.retry_count = 0;
                         state.next_retry_at = None;
                         state.last_error = None;
+                        state.halted = None;
                     }
                 }
             }
@@ -2369,7 +2501,9 @@ impl BackgroundIndexerWorker {
     /// refuses work once the blocking pool closes) — not a failed build, so
     /// no warning, no backoff, no `last_error`. Waiters resolve `Cancelled`;
     /// the next process start re-derives pending work from `commit_t >
-    /// index_t`. Every other error is a failure and goes to backoff.
+    /// index_t`. Committed data the index cannot hold halts the ledger (see
+    /// [`IndexStatusSnapshot::halted`]). Every other error is a failure and
+    /// goes to backoff.
     async fn on_build_error(
         &self,
         ledger_id: &LedgerId,
@@ -2394,6 +2528,16 @@ impl BackgroundIndexerWorker {
             }
             return;
         }
+        if !error.is_retryable() {
+            warn!(
+                ledger_id = %ledger_id,
+                partial_fuel = ?partial_fuel,
+                error = %error,
+                "Committed data cannot be indexed; ledger halted until an explicit index request"
+            );
+            self.halt(ledger_id, &error.to_string()).await;
+            return;
+        }
         warn!(
             ledger_id = %ledger_id,
             partial_fuel = ?partial_fuel,
@@ -2401,6 +2545,26 @@ impl BackgroundIndexerWorker {
             "Indexing failed, will retry"
         );
         self.schedule_retry(ledger_id, &error.to_string()).await;
+    }
+
+    /// Halt a ledger whose build cannot succeed by running again. Waiters
+    /// resolve `Failed`, and only an explicit request starts another build
+    /// (see [`IndexStatusSnapshot::halted`]).
+    async fn halt(&self, ledger_id: &LedgerId, error: &str) {
+        let mut states = self.states.lock().await;
+        if let Some(state) = states.get_mut(ledger_id) {
+            let outcome = if state.cancelled {
+                IndexOutcome::Cancelled
+            } else {
+                state.last_error = Some(error.to_string());
+                state.halted = Some(state.last_index_t);
+                IndexOutcome::Failed(error.to_string())
+            };
+            state.resolve_waiters_below(i64::MAX, outcome);
+            state.pending_min_t = None;
+            state.next_retry_at = None;
+            state.phase = IndexPhase::Idle;
+        }
     }
 
     /// Schedule a retry with exponential backoff
@@ -2576,6 +2740,7 @@ async fn run_catchup_sweeps(
         };
         gc.ctx.directory.replace(Arc::clone(&records)).await;
 
+        handle.clear_superseded_halts(&records).await;
         for (ledger_id, commit_t) in stalled_ledgers(&records, &last_seen) {
             handle.trigger_if_idle(&ledger_id, commit_t).await;
         }
@@ -3828,6 +3993,27 @@ mod tests {
         assert!(matches!(outcome, IndexOutcome::Cancelled));
     }
 
+    /// Dropping a ledger (`cancel`) clears its halt; a maintenance hold on a
+    /// ledger that goes on keeps it.
+    #[tokio::test]
+    async fn cancel_clears_a_halt_and_a_maintenance_hold_keeps_it() {
+        let handle = maintenance_test_handle();
+        let ledger = id("halted:main");
+
+        handle
+            .halt_for_test(&ledger, 1, "commit x: bad value")
+            .await;
+        let guard = handle.hold_quiesced(&ledger).await.expect("hold");
+        drop(guard);
+        let status = handle.status(&ledger).await.expect("state is kept");
+        assert!(status.halted, "a maintenance hold keeps the halt");
+
+        handle.cancel(&ledger).await;
+        let status = handle.status(&ledger).await;
+        assert!(status.as_ref().is_none_or(|s| !s.halted), "{status:?}");
+        assert!(status.is_none_or(|s| s.last_error.is_none()));
+    }
+
     fn maintenance_test_handle() -> IndexerHandle {
         let (_worker, handle) = BackgroundIndexerWorker::new(
             StorageBackend::Managed(Arc::new(MemoryStorage::new())),
@@ -4147,6 +4333,194 @@ mod tests {
             Some("Storage write error: boom")
         );
         assert_eq!(state.phase, IndexPhase::Pending);
+        assert!(state.halted.is_none());
+    }
+
+    /// A build that stops on committed data it cannot index halts the ledger:
+    /// no backoff is scheduled, waiters resolve `Failed`, and the status
+    /// reports the halt. The periodic sweep and implicit triggers leave it
+    /// halted; an explicit trigger queues a build.
+    #[tokio::test]
+    async fn unindexable_build_halts_the_ledger() {
+        let storage = MemoryStorage::new();
+        let ns = Arc::new(MemoryNameService::new());
+        let (worker, handle) = BackgroundIndexerWorker::new(
+            StorageBackend::Managed(Arc::new(storage)),
+            ns,
+            IndexerConfig::small(),
+        );
+        let ledger = id("test:main");
+        let mut completion = handle.trigger(&ledger, 1).await;
+
+        worker
+            .on_build_error(
+                &ledger,
+                crate::error::IndexerError::Unindexable("commit x: bad value".into()),
+                None,
+            )
+            .await;
+
+        // Resolved by the failure itself, not by a later retry.
+        let failed = completion.try_get().expect("the waiter is resolved");
+        assert!(
+            matches!(&failed, IndexOutcome::Failed(msg) if msg.contains("bad value")),
+            "{failed:?}"
+        );
+        let status = handle.status(&ledger).await.expect("halted state is kept");
+        assert!(status.halted);
+        assert_eq!(status.phase, IndexPhase::Idle);
+        assert!(status.pending_min_t.is_none());
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("Committed data cannot be indexed: commit x: bad value")
+        );
+        {
+            let states = handle.trigger.states.lock().await;
+            let state = states.get(&ledger).expect("state exists");
+            assert!(state.next_retry_at.is_none());
+            assert_eq!(state.retry_count, 0);
+            assert!(!state.is_prunable());
+        }
+
+        // The periodic stalled-ledger sweep does not restart it.
+        assert!(!handle.trigger_if_idle(&ledger, 2).await);
+        assert!(handle
+            .status(&ledger)
+            .await
+            .unwrap()
+            .pending_min_t
+            .is_none());
+
+        // Neither does an implicit trigger: its waiter resolves at once.
+        let mut implicit = handle.trigger(&ledger, 2).await;
+        assert!(matches!(
+            implicit.try_get(),
+            Some(IndexOutcome::Failed(msg)) if msg.contains("bad value")
+        ));
+        let status = handle.status(&ledger).await.unwrap();
+        assert!(status.halted);
+        assert_eq!(status.phase, IndexPhase::Idle);
+        assert!(status.pending_min_t.is_none());
+
+        // An explicit trigger does.
+        let _retry = handle.trigger_explicit(&ledger, 2).await;
+        let status = handle.status(&ledger).await.unwrap();
+        assert!(!status.halted);
+        assert_eq!(status.phase, IndexPhase::Pending);
+        assert_eq!(status.pending_min_t, Some(2));
+    }
+
+    /// A halt holds only while the ledger's index stays where the failed build
+    /// found it. Once any process publishes a newer index, the periodic
+    /// re-sweep lifts the halt.
+    #[tokio::test]
+    async fn a_newer_index_lifts_a_halt() {
+        let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+        let ns = Arc::new(MemoryNameService::new());
+        let ns_dyn: Arc<dyn IndexingNameService> = Arc::clone(&ns) as _;
+        ns.create_ledger("moved:main").unwrap();
+        ns.publish_commit("moved:main", 2, &test_commit_cid(2))
+            .await
+            .unwrap();
+        let config = IndexerConfig::default().with_catchup_interval(Duration::from_millis(20));
+        let (worker, handle) = BackgroundIndexerWorker::new(backend, ns_dyn, config);
+        let ledger = id("moved:main");
+        let _first = handle.trigger(&ledger, 2).await;
+        worker
+            .on_build_error(
+                &ledger,
+                crate::error::IndexerError::Unindexable("commit x: bad value".into()),
+                None,
+            )
+            .await;
+        let run_task = tokio::spawn(worker.run());
+
+        // Sweeps while the index has not moved leave the halt in place.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(handle.status(&ledger).await.unwrap().halted);
+
+        use fluree_db_nameservice::IndexPublisher;
+        let root = ContentId::new(ContentKind::IndexRoot, b"built elsewhere");
+        ns.publish_index("moved:main", 1, &root).await.unwrap();
+        let lifted = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if handle.status(&ledger).await.is_none_or(|s| !s.halted) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        run_task.abort();
+        assert!(lifted, "a newer index must lift the halt");
+    }
+
+    /// With the worker running, implicit triggers on a halted ledger start
+    /// no build: the start-up sweep and five commit-style triggers leave its
+    /// index where it was. One explicit trigger builds it.
+    #[tokio::test]
+    async fn only_an_explicit_trigger_builds_a_halted_ledger() {
+        let storage = MemoryStorage::new();
+        let ns = Arc::new(MemoryNameService::new());
+        let commit = Commit {
+            id: None,
+            t: 1,
+            time: None,
+            flakes: vec![make_flake(1, "ex:alice", 1, "ex:age", 30, 1)],
+            parents: Vec::new(),
+            txn: None,
+            namespace_delta: HashMap::from([(1, "ex:".to_string())]),
+            txn_signature: None,
+            commit_signatures: Vec::new(),
+            txn_meta: Vec::new(),
+            graph_delta: HashMap::new(),
+            ns_split_mode: None,
+        };
+        let cid = store_commit(&storage, &commit).await;
+        ns.publish_commit("test:main", 1, &cid).await.unwrap();
+        let index_t = || async { ns.lookup("test:main").await.unwrap().unwrap().index_t };
+
+        let config = IndexerConfig::small()
+            .with_data_dir(std::env::temp_dir().join("fluree-test-orch-halted-explicit"));
+        let (worker, handle) = BackgroundIndexerWorker::new(
+            StorageBackend::Managed(Arc::new(storage)),
+            Arc::clone(&ns) as Arc<dyn IndexingNameService>,
+            config,
+        );
+        let ledger = id("test:main");
+        let _first = handle.trigger(&ledger, 1).await;
+        worker
+            .on_build_error(
+                &ledger,
+                crate::error::IndexerError::Unindexable("commit x: bad value".into()),
+                None,
+            )
+            .await;
+        let run = tokio::spawn(worker.run());
+
+        for _ in 0..5 {
+            let outcome = handle.trigger(&ledger, 1).await.wait().await;
+            assert!(matches!(outcome, IndexOutcome::Failed(_)), "{outcome:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(index_t().await, 0, "no implicit trigger may build");
+        assert!(handle.status(&ledger).await.unwrap().halted);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            handle.trigger_explicit(&ledger, 1).await.wait(),
+        )
+        .await
+        .expect("the explicit build finishes");
+        assert!(
+            matches!(outcome, IndexOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(index_t().await, 1);
+        // Idle and halt-free, the entry may already be pruned.
+        assert!(handle.status(&ledger).await.is_none_or(|s| !s.halted));
+        run.abort();
     }
 
     #[tokio::test]
@@ -4510,6 +4884,7 @@ mod tests {
             last_index_t: 3,
             last_error: Some("test error".to_string()),
             waiter_count: 2,
+            halted: false,
         };
         let cloned = snapshot.clone();
         assert_eq!(cloned.phase, IndexPhase::Pending);

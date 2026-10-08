@@ -72,6 +72,38 @@ Supported numeric types:
 - **xsd:double**: 64-bit floating point
 - **xsd:float**: 32-bit floating point
 
+#### Special Values: INF, -INF and NaN
+
+`xsd:double` and `xsd:float` include three special values, written `INF` (or
+`+INF`), `-INF` and `NaN`. A numeral too large for the datatype, such as
+`"1e400"^^xsd:double`, is `INF` or `-INF`, as XSD 1.1 specifies. Other
+spellings such as `inf`, `Infinity` or `nan` are not values of these datatypes
+(see [Text That Is Not a Value of Its Datatype](#text-that-is-not-a-value-of-its-datatype)).
+
+One exception keeps existing indexes reading as before. Bulk import in earlier
+versions stored `INF` and `-INF` in the index as the text `inf` and `-inf`.
+Text `inf` or `-inf` under `xsd:double` or `xsd:float` reads as `INF` or
+`-INF` in arithmetic, `SUM`, `AVG` and comparisons inside expressions such as
+`BIND(?v > 1 AS ?b)`. To `isNumeric`, `ORDER BY`, `MIN`/`MAX` and range filters
+such as `FILTER(?v > 1)` it stays text. A full reindex of an index that bulk
+import built stores those values as numbers.
+
+Queries treat the special values as SPARQL specifies:
+
+- `INF` is greater, and `-INF` less, than every other number.
+- No comparison holds for `NaN`: `=`, `<`, `>`, `<=` and `>=` are false and
+  `!=` is true, even between two NaNs. So `FILTER(?v = ?v)` drops NaN values.
+- A `NaN` literal in a pattern, as in `?s ex:v "NaN"^^xsd:double`, matches
+  stored NaN values, because patterns match terms.
+- `SUM` and `AVG` are `NaN` when a member is `NaN`, and `INF + -INF` is `NaN`.
+- `DISTINCT` and `GROUP BY` treat every NaN as one value.
+- `ORDER BY` places `NaN` after `INF` in ascending order. SPARQL leaves that
+  position to the implementation. `MIN` and `MAX` follow `ORDER BY`, so `MAX`
+  is `NaN` when a NaN is present.
+
+JSON-LD query results carry them as the strings `"INF"`, `"-INF"` and
+`"NaN"`, since JSON numbers cannot express them.
+
 ### Boolean Type
 
 ```json

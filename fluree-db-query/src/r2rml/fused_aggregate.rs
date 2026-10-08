@@ -753,7 +753,7 @@ fn accumulate_exact_row(
 }
 
 /// Fold one value's lexical form into the exact accumulator. An unparseable
-/// lexical (`"abc"`, and `"NaN"`/`"inf"` from a float column) returns `false`
+/// lexical (`"abc"`, or a NaN or infinite value from a float column) returns `false`
 /// to escalate: the generic lane materializes it under the exact datatype,
 /// `binding_to_numeric` fails, and `agg_sum`/`agg_avg` poison the group to
 /// unbound (SPARQL §18.5.1, agg-err-01). Silently omitting the row here would
@@ -812,11 +812,11 @@ fn add_exact(d: BigDecimal, sum: &mut i128, scale: &mut i64, count: &mut u64) ->
     }
 }
 
-/// Add one row's floating value to the accumulator. NaN is dropped (neither
-/// summed nor counted), mirroring the standard aggregate pipeline's numeric
-/// coercion, so a NaN value can't poison SUM/AVG or inflate the count. A
-/// physical exact or text column under a double datatype converts, as the
-/// generic path does.
+/// Add one row's floating value to the accumulator. NaN and the infinities are
+/// summed and counted like any other double, as the standard aggregate pipeline
+/// does: SUM is `op:numeric-add` (SPARQL 1.1 §18.5.1.3), so a NaN member makes
+/// the sum NaN. A physical exact or text column under a double datatype
+/// converts, as the generic path does.
 fn accumulate_double_row(col: &Column, row: usize, sum: &mut f64, count: &mut u64) {
     let v: Option<f64> = match col {
         Column::Float64(values) => values.get(row).copied().flatten(),
@@ -835,10 +835,8 @@ fn accumulate_double_row(col: &Column, row: usize, sum: &mut f64, count: &mut u6
         _ => None,
     };
     if let Some(v) = v {
-        if !v.is_nan() {
-            *sum += v;
-            *count += 1;
-        }
+        *sum += v;
+        *count += 1;
     }
 }
 
@@ -7321,23 +7319,37 @@ mod tests {
     }
 
     #[test]
-    fn accumulate_double_row_drops_nan() {
-        // A NaN must be dropped (not summed, not counted), matching the standard
-        // aggregate pipeline — else SUM/AVG poison to NaN and the count inflates.
+    fn accumulate_double_row_sums_nan_and_infinities() {
+        // SUM is op:numeric-add (SPARQL 1.1 §18.5.1.3): a NaN member makes the
+        // sum NaN and is counted, as in the standard aggregate pipeline.
         let col = Column::Float64(vec![Some(1.0), Some(f64::NAN), Some(3.0)]);
         let (mut sum, mut count) = (0.0f64, 0u64);
         for row in 0..3 {
             accumulate_double_row(&col, row, &mut sum, &mut count);
         }
-        assert_eq!(count, 2, "NaN row is not counted");
-        assert_eq!(sum, 4.0, "NaN does not poison the sum");
+        assert_eq!(count, 3, "the NaN row is counted");
+        assert!(sum.is_nan(), "NaN propagates through the sum");
 
         let col32 = Column::Float32(vec![Some(2.0f32), Some(f32::NAN)]);
         let (mut sum, mut count) = (0.0f64, 0u64);
         accumulate_double_row(&col32, 0, &mut sum, &mut count);
         accumulate_double_row(&col32, 1, &mut sum, &mut count);
-        assert_eq!(count, 1);
-        assert_eq!(sum, 2.0);
+        assert_eq!(count, 2);
+        assert!(sum.is_nan());
+
+        // INF + finite = INF; INF + -INF = NaN.
+        let inf = Column::Float64(vec![
+            Some(f64::INFINITY),
+            Some(2.0),
+            Some(f64::NEG_INFINITY),
+        ]);
+        let (mut sum, mut count) = (0.0f64, 0u64);
+        accumulate_double_row(&inf, 0, &mut sum, &mut count);
+        accumulate_double_row(&inf, 1, &mut sum, &mut count);
+        assert_eq!(sum, f64::INFINITY);
+        accumulate_double_row(&inf, 2, &mut sum, &mut count);
+        assert!(sum.is_nan());
+        assert_eq!(count, 3);
     }
 
     #[test]

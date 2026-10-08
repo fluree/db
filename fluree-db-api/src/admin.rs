@@ -295,6 +295,12 @@ pub struct IndexStatusResult {
     pub pending_min_t: Option<i64>,
     /// Last error message (if any)
     pub last_error: Option<String>,
+    /// The last build stopped on committed data it cannot index, so commits
+    /// start no build until an explicit index request
+    /// ([`crate::Fluree::trigger_index`]), a reindex, a newer index from any
+    /// process, dropping the ledger, or a restart; `last_error` says why. See
+    /// [`fluree_db_indexer::IndexStatusSnapshot::halted`].
+    pub halted: bool,
 }
 
 // =============================================================================
@@ -1887,15 +1893,22 @@ impl crate::Fluree {
             .ok_or_else(|| ApiError::NotFound(format!("Ledger not found: {ledger_id}")))?;
 
         // Get indexer status if available
-        let (indexing_enabled, phase, pending_min_t, last_error) = match &self.indexing_mode {
+        let (indexing_enabled, phase, pending_min_t, last_error, halted) = match &self.indexing_mode
+        {
             IndexingMode::Background(handle) => {
                 if let Some(status) = handle.status(&ledger_id).await {
-                    (true, status.phase, status.pending_min_t, status.last_error)
+                    (
+                        true,
+                        status.phase,
+                        status.pending_min_t,
+                        status.last_error,
+                        status.halted,
+                    )
                 } else {
-                    (true, IndexPhase::Idle, None, None)
+                    (true, IndexPhase::Idle, None, None, false)
                 }
             }
-            IndexingMode::Disabled => (false, IndexPhase::Idle, None, None),
+            IndexingMode::Disabled => (false, IndexPhase::Idle, None, None, false),
         };
 
         Ok(IndexStatusResult {
@@ -1906,6 +1919,7 @@ impl crate::Fluree {
             phase,
             pending_min_t,
             last_error,
+            halted,
         })
     }
 
@@ -1978,7 +1992,8 @@ impl crate::Fluree {
             timeout_ms = ?timeout_ms,
             "Queueing index request"
         );
-        let completion = handle.trigger(&ledger_id, min_t).await;
+        // An explicit request: it also retries a halted ledger.
+        let completion = handle.trigger_explicit(&ledger_id, min_t).await;
 
         if let Some(status) = handle.status(&ledger_id).await {
             info!(
@@ -2371,6 +2386,11 @@ impl crate::Fluree {
         self.publisher()?
             .publish_index_allow_equal(&ledger_id, index_result.index_t, &index_result.root_id)
             .await?;
+        // The committed data indexed, so a halt the background indexer
+        // recorded for this ledger no longer holds.
+        if let IndexingMode::Background(handle) = &self.indexing_mode {
+            handle.clear_halt(&ledger_id).await;
+        }
 
         // Reindex can replace a damaged root at the same index t. A cached
         // handle may otherwise keep its old graph registry indefinitely.

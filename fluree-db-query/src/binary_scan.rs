@@ -3848,11 +3848,9 @@ fn value_to_otype_okey(
             // over integer bits, corrupting the value to a tiny subnormal
             // (55000.0 -> 2.71736e-319). Mirrors the encode-side guards in
             // resolver.rs / import_sink.rs. (fluree/db-r#142)
-            match ObjKey::encode_f64(*d) {
-                Ok(key) => Ok((ot, key.as_u64())),
-                // NaN/Inf can't be order-encoded → NULL sentinel.
-                Err(_) => Ok((OType::NULL, 0)),
-            }
+            // Every double, ±INF and NaN included, has the key the index
+            // stores it under, so a bound literal finds its stored triple.
+            Ok((ot, ObjKey::encode_f64(*d).as_u64()))
         }
         FlakeValue::Ref(sid) => {
             let s_id = resolve_subject_v3(sid, store, dict_novelty)?;
@@ -4274,10 +4272,7 @@ pub(crate) fn untyped_numeric_slices(
         let key = if tag.is_integer_type() {
             as_i64.map(|n| ObjKey::encode_i64(n).as_u64())
         } else if tag.is_float_type() {
-            match as_f64 {
-                Some(f) => Some(ObjKey::encode_f64(f).ok()?.as_u64()),
-                None => None,
-            }
+            as_f64.map(|f| ObjKey::encode_f64(f).as_u64())
         } else {
             continue;
         };
@@ -4423,24 +4418,9 @@ pub(crate) fn value_to_otype_okey_simple(
         FlakeValue::Null => Ok((OType::NULL, 0)),
         FlakeValue::Boolean(b) => Ok((OType::XSD_BOOLEAN, *b as u64)),
         FlakeValue::Long(n) => Ok((OType::XSD_INTEGER, ObjKey::encode_i64(*n).as_u64())),
-        FlakeValue::Double(d) => {
-            // Encoding failures are NOT NotFound: the value could still exist in
-            // the base index under a representation we can't compute, so callers
-            // must leave the scan un-narrowed (correctness-preserving) rather
-            // than treating it as provably absent.
-            if d.is_finite() {
-                ObjKey::encode_f64(*d)
-                    .map(|key| (OType::XSD_DOUBLE, key.as_u64()))
-                    .map_err(|_| {
-                        Error::new(ErrorKind::InvalidData, "cannot encode f64 for V6 index")
-                    })
-            } else {
-                Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "non-finite double in bound object",
-                ))
-            }
-        }
+        // Every double, ±INF and NaN included, has its stored key: a bound
+        // object matches the stored term (SPARQL 1.1 §18.3.1).
+        FlakeValue::Double(d) => Ok((OType::XSD_DOUBLE, ObjKey::encode_f64(*d).as_u64())),
         FlakeValue::Ref(sid) => {
             // Resolve via `sid_to_store_s_id`: a fast by-parts lookup, then a
             // fallback that rebuilds the IRI *from the store's own namespace
@@ -4990,7 +4970,7 @@ mod tests {
     }
 
     fn f64_key(f: f64) -> Option<u64> {
-        Some(ObjKey::encode_f64(f).unwrap().as_u64())
+        Some(ObjKey::encode_f64(f).as_u64())
     }
 
     #[test]
