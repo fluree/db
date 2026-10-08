@@ -47,8 +47,8 @@ pub struct ResolvedFlake {
     pub s: String,
     /// Predicate IRI (compact form, e.g. "schema:name")
     pub p: String,
-    /// Object value as a displayable string.
-    /// For refs: compact IRI. For literals: the lexical value.
+    /// Object value. For refs: compact IRI. For literals: the value. For a
+    /// triple term: the triple it names.
     pub o: ResolvedValue,
     /// Datatype IRI (compact form, e.g. "xsd:string") or "@id" for refs
     pub dt: String,
@@ -88,7 +88,8 @@ impl Serialize for ResolvedFlake {
 
 /// Object value that preserves type information for JSON serialization.
 ///
-/// Refs serialize as strings (compact IRIs), numerics as numbers, etc.
+/// Refs serialize as strings (compact IRIs), numerics as numbers, etc.; a
+/// triple term as the tuple of the triple it names.
 #[derive(Clone, Debug)]
 pub enum ResolvedValue {
     /// String or IRI value
@@ -101,6 +102,40 @@ pub enum ResolvedValue {
     Double(f64),
     /// Any other value rendered as its lexical form
     Lexical(String),
+    /// An RDF 1.2 triple term (datatype `f:tripleTerm`)
+    TripleTerm(Box<ResolvedTriple>),
+}
+
+/// An RDF 1.2 triple term, its IRIs resolved as a flake's are.
+///
+/// Serializes as the flake tuple without the operation: `[s, p, o, dt]`, plus
+/// `{"lang": tag}` when the object is language-tagged.
+#[derive(Clone, Debug)]
+pub struct ResolvedTriple {
+    pub s: String,
+    pub p: String,
+    pub o: ResolvedValue,
+    pub dt: String,
+    pub lang: Option<String>,
+}
+
+impl Serialize for ResolvedTriple {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let len = if self.lang.is_some() { 5 } else { 4 };
+        let mut seq = serializer.serialize_seq(Some(len))?;
+        seq.serialize_element(&self.s)?;
+        seq.serialize_element(&self.p)?;
+        seq.serialize_element(&self.o)?;
+        seq.serialize_element(&self.dt)?;
+        if let Some(lang) = &self.lang {
+            seq.serialize_element(&FlakeMeta {
+                lang: Some(lang),
+                i: None,
+                graph: None,
+            })?;
+        }
+        seq.end()
+    }
 }
 
 impl Serialize for ResolvedValue {
@@ -111,6 +146,7 @@ impl Serialize for ResolvedValue {
             ResolvedValue::Long(n) => serializer.serialize_i64(*n),
             ResolvedValue::Double(d) => serializer.serialize_f64(*d),
             ResolvedValue::Lexical(s) => serializer.serialize_str(s),
+            ResolvedValue::TripleTerm(t) => t.serialize(serializer),
         }
     }
 }
@@ -447,6 +483,23 @@ fn resolve_object_and_dt(
         FlakeValue::String(s) => {
             let dt = compact_dt(compactor, dt_sid)?;
             Ok((ResolvedValue::String(s.clone()), dt))
+        }
+        FlakeValue::TripleTerm(t) => {
+            let dt = compact_dt(compactor, dt_sid)?;
+            let resolve = |sid| {
+                compactor.compact_sid_for_display(sid).map_err(|e| {
+                    ApiError::internal(format!("Failed to resolve triple term IRI: {e}"))
+                })
+            };
+            let (o, o_dt) = resolve_object_and_dt(compactor, &t.o, &t.dt)?;
+            let triple = ResolvedTriple {
+                s: resolve(&t.s)?,
+                p: resolve(&t.p)?,
+                o,
+                dt: o_dt,
+                lang: t.lang.clone(),
+            };
+            Ok((ResolvedValue::TripleTerm(Box::new(triple)), dt))
         }
         // All other types: render as lexical string
         other => {
