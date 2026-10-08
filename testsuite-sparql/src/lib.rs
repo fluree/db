@@ -32,9 +32,30 @@ use sparql_handlers::register_sparql_tests;
 /// JSON report is written to that path. Use `--test-threads=1` when generating
 /// reports to avoid concurrent writes to the same file.
 pub fn check_testsuite(manifest_url: &str, ignored_tests: &[&str]) -> Result<()> {
+    check_with(manifest_url, ignored_tests, |evaluator| {
+        register_sparql_tests(evaluator);
+        rdf_handlers::register_rdf_tests(evaluator);
+    })
+}
+
+/// [`check_testsuite`] for an RDF syntax manifest, read by the standalone
+/// readers instead of the ingest paths; see
+/// [`rdf_handlers::register_reader_tests`].
+pub fn check_rdf_reader_suite(manifest_url: &str, ignored_tests: &[&str]) -> Result<()> {
+    check_with(
+        manifest_url,
+        ignored_tests,
+        rdf_handlers::register_reader_tests,
+    )
+}
+
+fn check_with(
+    manifest_url: &str,
+    ignored_tests: &[&str],
+    register: impl FnOnce(&mut TestEvaluator),
+) -> Result<()> {
     let mut evaluator = TestEvaluator::default();
-    register_sparql_tests(&mut evaluator);
-    rdf_handlers::register_rdf_tests(&mut evaluator);
+    register(&mut evaluator);
 
     let manifest = TestManifest::new([manifest_url]);
     let results = evaluator.evaluate(manifest)?;
