@@ -2374,10 +2374,13 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string | Yes | Graph source name (no colons) |
-| `mode` | string | No | `"rest"` (default) or `"direct"` |
+| `mode` | string | No | `"rest"` (default), `"direct"`, `"glue"` (AWS Glue Data Catalog), or `"s3tables"` (AWS S3 Tables); case-insensitive |
 | `catalog_uri` | string | REST mode | REST catalog URI |
-| `table` | string | No | Table identifier (`namespace.table`); required for REST mode if not specified in R2RML mapping |
+| `table` | string | No | Table identifier (`namespace.table`; for Glue, `<database>.<table>`); required for REST, Glue and S3 Tables modes if not specified in R2RML mapping |
 | `table_location` | string | Direct mode | S3 URI (`s3://bucket/path/to/table`) |
+| `region` | string | No | AWS region of the Glue / S3 Tables API (Glue and S3 Tables modes) |
+| `catalog_id` | string | No | Glue catalog id for cross-account access (Glue mode; default: the caller's account) |
+| `table_bucket_arn` | string | S3 Tables mode | S3 Tables table-bucket ARN (`arn:aws:s3tables:<region>:<account>:bucket/<name>`) |
 | `r2rml` | string | Yes | R2RML mapping source (storage address or path) |
 | `r2rml_type` | string | No | Mapping media type (e.g., `"text/turtle"`); inferred from extension |
 | `branch` | string | No | Branch name (default: `"main"`) |
@@ -2394,8 +2397,13 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
 **Validation rules:**
 - `name` must not be empty or contain `:`
 - `r2rml` is required (defines how table rows become RDF triples)
+- `mode` must be one of `rest`, `direct`, `glue`, `s3tables` (any case)
 - REST mode requires `catalog_uri`; requires `table` unless specified in R2RML mapping's `rr:tableName`
 - Direct mode requires `table_location` (must start with `s3://` or `s3a://`)
+- Glue mode requires `table` unless specified in R2RML mapping's `rr:tableName`; `region` and `catalog_id` are optional
+- S3 Tables mode requires `table_bucket_arn` (a well-formed S3 Tables bucket ARN, any AWS partition) and `table` unless specified in R2RML mapping's `rr:tableName`; a `region` that contradicts the ARN's region is refused
+- `region` and `s3_region` must be AWS region codes (e.g. `us-east-1`) in Glue and S3 Tables modes
+- Glue and S3 Tables modes read with the server's ambient AWS credentials; vended credentials are turned off for them
 - OAuth2 fields must all be provided together (url + id + secret)
 
 **Example — REST catalog with R2RML:**
@@ -2436,14 +2444,26 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
 }
 ```
 
+**Example — AWS Glue Data Catalog:**
+
+```json
+{
+  "name": "warehouse-orders",
+  "mode": "glue",
+  "region": "us-east-1",
+  "table": "sales.orders",
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ..."
+}
+```
+
 **Response (`201 Created`):**
 
 | Field | Type | Present | Description |
 |-------|------|---------|-------------|
 | `graph_source_id` | string | Always | Created ID (e.g., `"warehouse-orders:main"`) |
 | `table_identifier` | string | Always | Table identifier or derived from location |
-| `catalog_uri` | string | Always | Catalog URI or S3 location |
-| `connection_tested` | boolean | Always | Whether catalog connection was verified (always `false` for direct mode) |
+| `catalog_uri` | string | Always | REST catalog URI, Direct table location, Glue catalog id (`aws-glue` for the caller's own account), or S3 Tables bucket ARN |
+| `connection_tested` | boolean | Always | Whether catalog connection was verified (tested for REST mode only; always `false` for Direct, Glue and S3 Tables) |
 | `mapping_source` | string | Always | R2RML mapping source |
 | `triples_map_count` | integer | Always | Number of TriplesMap definitions found |
 | `mapping_validated` | boolean | Always | Whether mapping was parsed and compiled successfully |

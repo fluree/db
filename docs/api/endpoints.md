@@ -3058,10 +3058,13 @@ POST http://localhost:8090/v1/fluree/iceberg/map
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | string | Graph source name (required) |
-| `mode` | string | `rest` (default) or `direct` |
+| `mode` | string | `rest` (default), `direct`, `glue` (AWS Glue Data Catalog), or `s3tables` (AWS S3 Tables); case-insensitive |
 | `catalog_uri` | string | REST catalog URI (required in `rest` mode) |
-| `table` | string | Table identifier `namespace.table` (required in `rest` mode) |
+| `table` | string | Table identifier `namespace.table` (for `glue`, `<database>.<table>`). Required in `rest`, `glue` and `s3tables` modes unless `r2rml` is given, whose `rr:tableName` entries then name the tables |
 | `table_location` | string | S3 table location (required in `direct` mode) |
+| `region` | string | AWS region of the Glue / S3 Tables API (`glue`, `s3tables`). Glue falls back to `s3_region`, then the server's AWS region chain; S3 Tables defaults to the ARN's region and refuses a contradicting `region`. Must be an AWS region code |
+| `catalog_id` | string | Glue catalog id for cross-account access (`glue`; default: the server identity's own account) |
+| `table_bucket_arn` | string | S3 Tables table-bucket ARN, `arn:aws:s3tables:<region>:<account>:bucket/<name>` (required in `s3tables` mode) |
 | `r2rml` | string | Inline R2RML mapping (Turtle/JSON-LD). Omit to auto-generate a direct mapping. |
 | `r2rml_type` | string | Media type of `r2rml` (`text/turtle`, `application/ld+json`) |
 | `branch` | string | Branch name (default: `main`) |
@@ -3071,13 +3074,29 @@ POST http://localhost:8090/v1/fluree/iceberg/map
 | `auth_google_metadata` | bool | Use the GCE/GKE metadata server (Workload Identity) for catalog auth, minting + auto-refreshing tokens — for Google Iceberg REST catalogs (BigLake). Overrides `auth_bearer`. Only works when running on GCP. |
 | `auth_google_scopes` | string | Optional OAuth scopes for `auth_google_metadata` (default `cloud-platform`) |
 | `warehouse` | string | Warehouse identifier |
-| `no_vended_credentials` | bool | Disable vended credentials |
-| `s3_region`, `s3_endpoint`, `s3_path_style` | | S3 overrides for `direct` mode |
+| `no_vended_credentials` | bool | Disable vended credentials (`rest` mode; `direct`, `glue` and `s3tables` never use them) |
+| `s3_region`, `s3_endpoint`, `s3_path_style` | | S3 overrides for the table's file reads, in every mode. In `glue` / `s3tables`, `s3_region` defaults to the catalog's region |
 | `order_by` | string | Latest-by-key ordering column for materialization (int/date/timestamp) |
 | `delete_column` | string | Column that marks a row as a delete (tombstone) during materialization |
 | `delete_values` | (string\|null)[] | Values of `delete_column` that mean "deleted"; a `null` entry matches a NULL column (null-payload delete). Required when `delete_column` is set. |
 | `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
 | `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
+
+In `glue` and `s3tables` modes the catalog is called through the native AWS SDK, and both the catalog call and the S3 reads use the server's ambient AWS credential chain:
+
+```json
+{
+  "name": "warehouse-orders",
+  "mode": "glue",
+  "region": "us-east-1",
+  "catalog_id": "123456789012",
+  "table": "sales.orders",
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
+  "r2rml_type": "text/turtle"
+}
+```
+
+For S3 Tables, send `"mode": "s3tables"` with `"table_bucket_arn": "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics"` in place of `catalog_id` (and usually no `region`). See [Iceberg → Catalog Modes](../graph-sources/iceberg.md#catalog-modes).
 
 **Response:**
 
@@ -3103,7 +3122,7 @@ See also the CLI wrapper: [fluree iceberg map](../cli/iceberg.md).
 
 ### POST {api_base_url}/iceberg/catalog/verify
 
-Checks that a REST-catalog connection's credentials can read a table's storage, through the same credential decision and storage path a query uses. It lists the current snapshot's manifests (the `metadata/` prefix) and stats its first data file (the `data/` prefix), without reading data. It is read-only and admin-protected.
+Checks that a catalog connection's credentials (`rest`, `glue` or `s3tables` mode) can read a table's storage, through the same credential decision and storage path a query uses. It lists the current snapshot's manifests (the `metadata/` prefix) and stats its first data file (the `data/` prefix), without reading data. When the catalog returns no inline table metadata (AWS Glue and S3 Tables never do), the metadata file at `metadata_location` is read from storage first, with the same credentials. It is read-only and admin-protected.
 
 The body takes the `iceberg/map` connection fields and a `table` (`"NAMESPACE.NAME"`, in the catalog's casing). The answer is a [verify response](#verify-response).
 
@@ -3117,7 +3136,7 @@ The body takes the `iceberg/map` connection fields and a `table` (`"NAMESPACE.NA
 |---|---|---|
 | The table can be read | `200` | `"readable": true` |
 | The table cannot be read | `200` | `"readable": false`, the reason in `error` |
-| The request cannot be made | `400` | An error: `@type` `err:api/BadRequest` for a body that is not valid JSON or lacks a required field, or `err:system/ConfigError` for an unusable connection (a connection URL the server refuses, an unresolvable secret; for Iceberg, also Direct catalog mode or a catalog that returns no inline table metadata) |
+| The request cannot be made | `400` | An error: `@type` `err:api/BadRequest` for a body that is not valid JSON or lacks a required field, or `err:system/ConfigError` for an unusable connection (a connection URL the server refuses, an unresolvable secret; for Iceberg, also Direct catalog mode) |
 | The admin token is missing or invalid | `401` | An error |
 
 "Cannot be read" covers every reason that belongs to the table rather than to the request:

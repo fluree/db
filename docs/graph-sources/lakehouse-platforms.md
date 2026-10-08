@@ -17,6 +17,7 @@ The option reference is in [Delta Lake tables](delta.md) and
 | Databricks **external** tables, by path, without Unity Catalog | [Delta source](#databricks-external-tables), by path | Your own credentials for that S3 bucket or ADLS container |
 | Databricks tables with Iceberg reads (UniForm) or managed Iceberg tables | [Iceberg REST source](#databricks-through-the-iceberg-rest-endpoint) | A Databricks service principal (or a personal access token); storage credentials are vended per request |
 | Delta tables on S3 | Delta source, by path — see [Delta Lake tables](delta.md#credentials) | AWS credentials in the environment, or the instance / container role |
+| Iceberg tables in the AWS Glue Data Catalog, or in an AWS S3 Tables table bucket | [Iceberg source](iceberg.md#catalog-modes) with `--mode glue` or `--mode s3tables` | The ambient AWS credential chain, for both the catalog call and the S3 reads (see [AWS Credentials](iceberg.md#aws-credentials)); no vended credentials, so Lake Formation–vended access is not supported yet |
 
 Everything Fabric stores in OneLake is a Delta table, whichever Fabric engine
 wrote it, so OneLake is always the Delta route. Iceberg tables on Azure storage

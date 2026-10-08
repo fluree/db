@@ -18,7 +18,7 @@ In Fluree, this enables querying Iceberg tables as if they were RDF graphs.
 
 Use `R2rmlCreateConfig` to register a graph source that combines:
 
-- an Iceberg table (REST catalog or Direct S3), and
+- an Iceberg table (REST catalog, Direct S3, AWS Glue Data Catalog, or AWS S3 Tables — see [Catalog Modes](iceberg.md#catalog-modes)), and
 - an R2RML mapping (Turtle) that materializes table rows into RDF triples.
 
 If you use **Direct S3** mode, Fluree resolves the current Iceberg metadata by reading `metadata/version-hint.text` under the configured `table_location`, then loading the metadata file referenced by the hint. The Iceberg table layout must already exist at that location.
