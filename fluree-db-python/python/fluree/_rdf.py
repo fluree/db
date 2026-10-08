@@ -9,7 +9,7 @@ from typing import Any, TypeGuard
 from typing import Literal as _Literal
 
 from fluree import _fluree as native
-from fluree._terms import Quad, to_python
+from fluree._terms import BlankNode, Quad, to_python
 from fluree.errors import InvalidRequestError
 
 RdfFormat = _Literal["turtle", "trig", "ntriples", "nquads"]
@@ -83,6 +83,15 @@ def _quad(item: Quad | tuple[Any, ...]) -> Quad:
     if isinstance(item, tuple) and len(item) in (3, 4):
         return Quad(*item)
     raise TypeError(f"a quad is a Quad or a 3- or 4-tuple, not {item!r}")
+
+
+def ledger_trig(quads: list[Quad]) -> str:
+    """``quads`` as the TriG a ledger write takes. A ledger names its graphs
+    with IRIs, so a blank-node graph name is refused here, naming the quad."""
+    for quad in quads:
+        if isinstance(quad.graph, BlankNode):
+            raise InvalidRequestError(f"a ledger's named graphs are IRIs, not blank nodes: {quad!r}")
+    return serialize(quads, "trig")
 
 
 def is_quads(data: Any) -> TypeGuard[list[Quad]]:
