@@ -167,8 +167,8 @@ pub struct IndexStatusSnapshot {
     /// implicit trigger (a commit, a push, a published commit, a catch-up
     /// sweep) starts one. An explicit request
     /// ([`IndexerHandle::trigger_explicit`]), a reindex that succeeds, a newer
-    /// index that any process publishes for the ledger, or a restart clears
-    /// it.
+    /// index that any process publishes for the ledger, dropping the ledger
+    /// ([`IndexerHandle::cancel`]), or a restart clears it.
     pub halted: bool,
 }
 
@@ -1258,7 +1258,8 @@ impl TriggerHandle {
     /// a multi-hour reindex is indistinguishable from a hang.
     pub async fn hold_quiesced(&self, ledger_id: &LedgerId) -> Option<MaintenanceGuard> {
         let guard = self.acquire_maintenance(ledger_id)?;
-        self.cancel(ledger_id).await;
+        // The ledger goes on, so a halt stays.
+        self.cancel_inner(ledger_id, false).await;
         self.wait_for_idle(ledger_id).await;
         // A collector pass mid-release on any branch of the ledger finishes
         // first; later passes see the hold and release nothing.
@@ -1272,14 +1273,26 @@ impl TriggerHandle {
     /// - Prevents retries on failure
     /// - Does NOT abort in-progress indexing (it will complete and publish)
     /// - Resolves all waiters whose min_t is NOT yet satisfied as Cancelled
+    /// - Clears a halt ([`IndexStatusSnapshot::halted`]) and its error: this
+    ///   ends the ledger's work, as dropping it does, so a ledger created
+    ///   again under the same id starts without one
     ///
     /// Returns true if there was pending work to cancel.
     pub async fn cancel(&self, ledger_id: &LedgerId) -> bool {
+        self.cancel_inner(ledger_id, true).await
+    }
+
+    /// [`cancel`](Self::cancel), keeping a halt when `forget_halt` is false:
+    /// for maintenance on a ledger that goes on existing.
+    async fn cancel_inner(&self, ledger_id: &LedgerId, forget_halt: bool) -> bool {
         let had_work = {
             let mut states = self.states.lock().await;
             if let Some(state) = states.get_mut(ledger_id) {
                 let had_work = state.has_pending_work();
                 state.cancelled = true;
+                if forget_halt && state.halted.take().is_some() {
+                    state.last_error = None;
+                }
                 // Resolve all waiters as cancelled (they haven't been satisfied)
                 state.resolve_waiters_below(i64::MAX, IndexOutcome::Cancelled);
                 state.pending_min_t = None;
@@ -3978,6 +3991,27 @@ mod tests {
         // Now completion should resolve as cancelled
         let outcome = completion.wait().await;
         assert!(matches!(outcome, IndexOutcome::Cancelled));
+    }
+
+    /// Dropping a ledger (`cancel`) clears its halt; a maintenance hold on a
+    /// ledger that goes on keeps it.
+    #[tokio::test]
+    async fn cancel_clears_a_halt_and_a_maintenance_hold_keeps_it() {
+        let handle = maintenance_test_handle();
+        let ledger = id("halted:main");
+
+        handle
+            .halt_for_test(&ledger, 1, "commit x: bad value")
+            .await;
+        let guard = handle.hold_quiesced(&ledger).await.expect("hold");
+        drop(guard);
+        let status = handle.status(&ledger).await.expect("state is kept");
+        assert!(status.halted, "a maintenance hold keeps the halt");
+
+        handle.cancel(&ledger).await;
+        let status = handle.status(&ledger).await;
+        assert!(status.as_ref().is_none_or(|s| !s.halted), "{status:?}");
+        assert!(status.is_none_or(|s| s.last_error.is_none()));
     }
 
     fn maintenance_test_handle() -> IndexerHandle {
