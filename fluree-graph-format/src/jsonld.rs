@@ -454,19 +454,23 @@ impl SubjectData {
             // Check if this predicate is a list (any triple has list_index)
             let is_list = triples.iter().any(|(idx, _)| idx.is_some());
 
-            // Handle rdf:type specially. `@type` cannot carry an annotation,
-            // so an annotated type is written as an `rdf:type` property.
+            // Handle rdf:type specially. `@type` holds only IRIs and blank
+            // nodes and cannot carry an annotation, so an annotated type, or
+            // one that is a literal or a triple term, is written as an
+            // `rdf:type` property.
             if pred_iri == dt_iri::RDF_TYPE && config.type_handling.use_at_type() {
                 for (_, triple) in &triples {
-                    match reifiers.get(triple) {
-                        Some(rs) => {
-                            let obj = term_to_object(&triple.o, config, bnode_renamer);
-                            let obj = annotate(obj, rs, bnode_renamer, config)?;
-                            let pred_key = config.compact_vocab_iri(&pred_iri);
-                            add_property(&mut node, &pred_key, obj);
-                        }
-                        None => add_type_value(&mut node, &triple.o, config, bnode_renamer),
+                    let reified = reifiers.get(triple);
+                    if reified.is_none() && matches!(triple.o, Term::Iri(_) | Term::BlankNode(_)) {
+                        add_type_value(&mut node, &triple.o, config, bnode_renamer);
+                        continue;
                     }
+                    let mut obj = term_to_object(&triple.o, config, bnode_renamer);
+                    if let Some(rs) = reified {
+                        obj = annotate(obj, rs, bnode_renamer, config)?;
+                    }
+                    let pred_key = config.compact_vocab_iri(&pred_iri);
+                    add_property(&mut node, &pred_key, obj);
                 }
                 continue;
             }
@@ -675,7 +679,8 @@ fn add_type_value(
     let type_iri = match object {
         Term::Iri(iri) => config.compact_vocab_iri(iri),
         Term::BlankNode(id) => bnode_renamer.rename(id),
-        Term::Literal { .. } | Term::TripleTerm(_) => return, // Types should be IRIs
+        // Written as an `rdf:type` property instead (see `into_jsonld_node`).
+        Term::Literal { .. } | Term::TripleTerm(_) => return,
     };
 
     match node.get_mut("@type") {
