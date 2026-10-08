@@ -361,6 +361,19 @@ text = fluree.serialize(quads, "trig", prefixes={"ex": NEW})
 ledger.insert(quads)                      # or write them straight to a ledger
 ```
 
+JSON-LD reads from a dict or list as well as from text:
+
+```python
+quads = fluree.parse({
+    "@context": {"ex": "http://example.org/"},
+    "@id": "ex:alice",
+    "ex:knows": {"@id": "ex:bob", "@annotation": {"ex:since": 2020}},
+})
+# alice knows bob, plus (_:b1, rdf:reifies, Triple(alice, knows, bob))
+# and (_:b1, ex:since, 2020)
+text = fluree.serialize(quads, "jsonld", prefixes={"ex": "http://example.org/"})
+```
+
 - A path (a `Path`, not a `str`, which is the document's text) gives its
   format by extension (`.ttl`, `.trig`, `.nt`, `.nq`, `.jsonld`, `.json`);
   text needs `format=`, and a dict or list is JSON-LD. Turtle, TriG and
@@ -372,15 +385,24 @@ ledger.insert(quads)                      # or write them straight to a ledger
   writes these as `@annotation` on a value, a node's `@reifies`, and
   `{"@id": {"@id": s, p: o}}`, and a named graph as `{"@id": g, "@graph":
   [...]}`.
-- Literals are Python values, as in query results, so a number's spelling is
-  not kept (`"01"` reads as `1`); a float is written in its shortest form
-  (`0.9957`). `literals="lexical"` keeps every typed literal but a plain
-  string as a `fluree.Literal` with its spelling, so a document read and
-  written back keeps its literals exactly.
+- Literals are Python values, as in query results, so neither a number's
+  spelling nor a narrower datatype is kept (`"01"^^xsd:long` reads as `1`
+  and is written back as `xsd:integer`); a float is written in its shortest
+  form (`0.9957`). `literals="lexical"` keeps every typed literal but a plain
+  string as a `fluree.Literal` with its spelling and datatype, so a document
+  read and written back keeps its literals exactly.
 - Blank nodes keep the document's labels; an anonymous one gets a fresh
   label.
+- JSON-LD contexts must be given inline: a `@context` URL is not fetched,
+  and a string context is taken as the vocabulary IRI (`"https://schema.org/"`
+  makes `name` `https://schema.org/name`). A property with no context entry is
+  an error rather than dropped.
 - `ledger.insert(quads)` and `upsert(quads)` write quads, named graphs
   included.
+
+[RDF documents](https://fluree.github.io/db/reference/rdf-documents.html) in
+the Fluree documentation shows how each syntax writes named graphs,
+annotations, reified triples and triple terms.
 
 ## rdflib
 
