@@ -1751,19 +1751,27 @@ impl Fluree {
         // subjects records no subject set, which the ring reads as touching
         // everything: a stage computed before it stages again rather than
         // re-basing over it unvalidated. That is a shape, the class
-        // hierarchy shapes target through, or anything in a named graph,
-        // where shapes and the ledger's config live. Attachment changes also
-        // affect a delete's cascade beyond its own subjects: an upsert can
-        // attach an annotation while its unchanged base edge cancels out of
-        // the staged flakes, leaving only the annotation subject here.
+        // hierarchy shapes target through, a property's uniqueness
+        // declaration (`f:enforceUnique`, which uniqueness reads from the
+        // data as well as from a constraints source), or anything in a named
+        // graph, where shapes and the ledger's config live. Attachment
+        // changes also affect a delete's cascade beyond its own subjects: an
+        // upsert can attach an annotation while its unchanged base edge
+        // cancels out of the staged flakes, leaving only the annotation
+        // subject here.
+        let enforce_unique = fluree_vocab::config_iris::ENFORCE_UNIQUE
+            .strip_prefix(fluree_vocab::fluree::DB)
+            .expect("a Fluree vocabulary IRI");
         let changes_dependencies = staged.iter().any(|flake| {
-            use fluree_vocab::namespaces::{RDFS, SHACL};
+            use fluree_vocab::namespaces::{FLUREE_DB, RDFS, SHACL};
             flake.g.is_some()
                 || fluree_db_core::is_reserved_reifies_predicate(&flake.p)
                 || flake.p.namespace_code == SHACL
                 || matches!(&flake.o, fluree_db_core::FlakeValue::Ref(o) if o.namespace_code == SHACL)
                 || (flake.p.namespace_code == RDFS
                     && matches!(flake.p.name.as_ref(), "subClassOf" | "subPropertyOf"))
+                || (flake.p.namespace_code == FLUREE_DB
+                    && flake.p.name.as_ref() == enforce_unique)
         });
         let touched: Option<Arc<FxHashSet<Sid>>> = (!changes_dependencies
             && staged.len() <= crate::ledger_manager::MAX_FOOTPRINT_FLAKES)
