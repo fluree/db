@@ -1554,8 +1554,8 @@ fn aux_reads(p: &Pattern) -> Vec<VarId> {
 /// The variables a plain `WITH`'s sliced rows carry for the `WHERE` after the
 /// slice: what it reads (an `exists { … }` body included, so the body still
 /// correlates with them) that the clause's body binds and `select` does not
-/// already hold. openCypher's `WHERE` after a plain `WITH` sees the variables
-/// before it; in one level it saw them because the filter ran in the body.
+/// already hold. A `WHERE` after a plain `WITH` sees the variables before it,
+/// as it does with no slice, where the filter runs in the clause's body.
 fn carried_into_where(
     (filter, post): &AfterSlice,
     body: &[Pattern],
