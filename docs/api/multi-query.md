@@ -510,9 +510,10 @@ Response (HTTP 200):
 ```
 
 A sub-query that fails while it runs is reported in `errors` like this. A
-SPARQL sub-query that does not parse is different: the envelope cannot tell
+SPARQL sub-query that does not parse is different. The envelope cannot tell
 which ledgers it reads, so the whole envelope is refused with `400 Bad
-Request` and the parser's error, as a single query would be.
+Request` and the parser's error. A single query that does not parse is
+refused the same way.
 
 ---
 

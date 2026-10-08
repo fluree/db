@@ -347,10 +347,8 @@ pub fn apply_snapshot_to_sparql(sparql: &str, snapshot: &EnvelopeSnapshot) -> St
         return sparql.to_string();
     };
 
-    // Collect (span, replacement) pairs. Each member is read as the engine's
-    // dataset conversion reads it (a full IRI as written, a prefixed name as
-    // `prefix:local`), so a member is pinned exactly when validation counted
-    // its ledger, whichever form names it. The replacement is always a full
+    // Collect (span, replacement) pairs. A member is read as written (a full
+    // IRI as is, a prefixed name as `prefix:local`); the replacement is a full
     // IRI naming the same ledger.
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     for iri in ds.default_graphs.iter().chain(ds.named_graphs.iter()) {
@@ -529,8 +527,8 @@ mod tests {
         assert!(out.contains("FROM NAMED <ledgerB@t:99>"));
     }
 
-    /// A prefixed name in `FROM` names the ledger written there (`mq:p2`), so
-    /// it is pinned like the bracketed IRI of the same ledger.
+    /// A prefixed name in `FROM` (`mq:p2`) is pinned like the bracketed IRI of
+    /// the same ledger.
     #[test]
     fn sparql_prefixed_from_is_pinned_as_the_ledger_it_names() {
         let snap = snapshot(&[("mq:p1", 3), ("mq:p2", 7)]);

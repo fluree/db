@@ -279,9 +279,8 @@ async fn multi_query_with_token_outside_scope_sparql_returns_404() {
 // The ledgers a SPARQL sub-query reads
 // =============================================================================
 
-/// A SPARQL sub-query's dataset is the one the engine resolves: a prefixed
-/// name in `FROM` names the ledger written there, so the envelope's read check
-/// covers it as it covers a bracketed IRI.
+/// A prefixed name in `FROM` is read-checked like a bracketed IRI naming the
+/// same ledger.
 #[tokio::test]
 async fn multi_query_sparql_sibling_scope_matches_resolved_dataset() {
     let (_tmp, state) = data_auth_state().await;

@@ -444,9 +444,8 @@ async fn multi_query_sub_query_min_t_covers_every_ledger_it_reads() {
     );
 }
 
-/// A SPARQL sub-query that does not parse names no dataset the envelope can
-/// check or pin, so the envelope is refused with the parser's error, as a
-/// single query would be.
+/// A SPARQL sub-query that does not parse refuses the whole envelope with the
+/// parser's error.
 #[tokio::test]
 async fn multi_query_sparql_sibling_that_does_not_parse_is_refused() {
     let (_tmp, state) = test_state().await;

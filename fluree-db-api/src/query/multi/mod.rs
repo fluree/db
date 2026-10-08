@@ -288,9 +288,8 @@ pub enum MultiQueryValidationError {
     JsonLdBodyNotObject { alias: String },
     #[error("sub-query '{alias}': SPARQL query body must be a string")]
     SparqlBodyNotString { alias: String },
-    /// The SPARQL text does not parse, or its dataset clause cannot be read,
-    /// so the envelope cannot tell which ledgers the sub-query reads.
-    /// `message` is the error the query engine reports for the same text.
+    /// The SPARQL text does not parse, or its dataset clause cannot be read.
+    /// `message` is that error.
     #[error("sub-query '{alias}': {message}")]
     SparqlUnreadable { alias: String, message: String },
     #[error(
@@ -316,15 +315,13 @@ pub enum MultiQueryValidationError {
     HistoryQueryInEnvelope { alias: String },
 }
 
-/// The ledgers an envelope reads, as validation found them.
+/// The ledgers an envelope reads.
 #[derive(Debug, Clone, Default)]
 pub struct EnvelopeLedgers {
     /// Every distinct ledger the sub-queries read (canonical id, temporal
-    /// suffix and graph fragment stripped). Snapshot resolution pins exactly
-    /// these, and the envelope-wide bounds and read checks count them.
+    /// suffix and graph fragment stripped).
     pub distinct: BTreeSet<String>,
-    /// Per SPARQL sub-query, by alias: each member of its dataset, read from
-    /// the text the dispatcher runs with the engine's own dataset conversion.
+    /// Per SPARQL sub-query, by alias: the members of its dataset.
     pub sparql: IndexMap<String, Vec<SubqueryLedger>>,
 }
 
@@ -351,9 +348,8 @@ pub fn validate_envelope(
     validate_envelope_ledgers(req, bounds).map(|ledgers| ledgers.distinct)
 }
 
-/// [`validate_envelope`], returning the ledgers each SPARQL sub-query reads as
-/// well as the distinct set. A host that checks the envelope's ledgers, or
-/// waits on them, reads them from here so it sees the set the envelope pins.
+/// [`validate_envelope`], also returning the members of each SPARQL
+/// sub-query's dataset.
 pub fn validate_envelope_ledgers(
     req: &MultiQueryRequest,
     bounds: &MultiQueryBounds,
@@ -546,14 +542,9 @@ fn validate_jsonld_subquery(
     Ok(())
 }
 
-/// The members of a SPARQL sub-query's dataset, as the engine will read them.
-///
-/// Reads the text the dispatcher runs ([`sparql_subquery_text`]), parsed as
-/// every SPARQL entry point parses it and converted by the engine's own
-/// dataset conversion, so the ledgers the envelope counts, checks and pins are
-/// the ledgers the sub-query reads, whatever spelling names them. Text that
-/// does not parse cleanly is refused here with the engine's own error: with no
-/// dataset to read, the envelope cannot pin or check the sub-query.
+/// The members of a SPARQL sub-query's dataset, read from its
+/// [`sparql_subquery_text`]. Text that does not parse cleanly, or whose dataset
+/// clause cannot be read, is an error.
 fn validate_sparql_subquery(
     alias: &str,
     sq: &MultiQuerySubquery,
@@ -624,10 +615,8 @@ fn sparql_dataset_clause(
     }
 }
 
-/// The text a SPARQL sub-query runs as: its own text with the envelope
-/// context's `PREFIX` / `BASE` directives applied ([`apply_sparql_context`]).
-/// Validation reads the sub-query's dataset from this text and the dispatcher
-/// runs it, so the two read one dataset.
+/// A SPARQL sub-query's text with the envelope context's `PREFIX` / `BASE`
+/// directives applied.
 pub fn sparql_subquery_text(sparql: &str, envelope_context: Option<&JsonValue>) -> String {
     match envelope_context {
         Some(context) => {
@@ -1484,8 +1473,7 @@ mod tests {
         assert!(distinct.contains("ledgerC:main"));
     }
 
-    /// A prefixed name in `FROM` names the ledger written there, as the
-    /// engine reads it; the envelope counts, checks and pins that ledger.
+    /// A prefixed name in `FROM` counts as the ledger written there.
     #[test]
     fn distinct_ledger_set_counts_prefixed_sparql_from_names() {
         let req = envelope_with(
@@ -1506,7 +1494,7 @@ mod tests {
     }
 
     /// A SPARQL sub-query that does not parse is refused with the parser's
-    /// error rather than run without a known dataset.
+    /// error.
     #[test]
     fn rejects_sparql_subquery_that_does_not_parse() {
         for text in [
@@ -1639,7 +1627,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // SPARQL sub-query members (AST-based, engine's dataset conversion)
+    // SPARQL sub-query members
     // -------------------------------------------------------------------------
 
     fn sparql_members(text: &str) -> Vec<SubqueryLedger> {
@@ -1686,8 +1674,7 @@ mod tests {
         assert_eq!(pin_count(&sparql_members(text)), 0);
     }
 
-    /// Members are read with the engine's conversion: a fragment or a pin on
-    /// the member does not change which ledger it names.
+    /// A fragment or a pin on a member does not change which ledger it names.
     #[test]
     fn sparql_members_name_the_ledger_the_engine_reads() {
         let members = sparql_members(
@@ -1708,8 +1695,8 @@ mod tests {
         );
     }
 
-    /// The envelope context's `PREFIX` / `BASE` reach the text the members are
-    /// read from, as they reach the text the dispatcher runs.
+    /// The envelope context's `PREFIX` / `BASE` apply to the text the members
+    /// are read from.
     #[test]
     fn sparql_members_are_read_from_the_text_the_dispatcher_runs() {
         let context = json!({ "ex": "http://example.org/" });

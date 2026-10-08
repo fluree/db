@@ -528,10 +528,8 @@ pub(crate) fn parse_and_validate_sparql(sparql: &str) -> Result<fluree_db_sparql
     Ok(ast)
 }
 
-/// Parse SPARQL text the way every query entry point does: an error-severity
-/// diagnostic refuses the text even when the parser's error recovery produced
-/// an AST. Callers that read a query's dataset before it runs (the multi-query
-/// envelope) parse with this so they read the AST the engine will run.
+/// Parse a SPARQL query. Return an error if the parser produced any
+/// error-severity diagnostic, even when error recovery still produced an AST.
 pub(crate) fn parse_sparql_strict(sparql: &str) -> Result<fluree_db_sparql::SparqlAst> {
     let parse_output = fluree_db_sparql::parse_sparql(sparql);
 

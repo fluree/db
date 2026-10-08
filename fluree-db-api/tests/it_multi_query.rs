@@ -341,8 +341,8 @@ async fn multi_query_partial_failure_per_alias_via_in_process_api() {
 
 #[tokio::test]
 async fn multi_query_sparql_sub_query_that_does_not_parse_is_refused_via_in_process_api() {
-    // A SPARQL sub-query that does not parse names no dataset the envelope
-    // can check or pin, so the envelope is refused with the parser's error.
+    // A SPARQL sub-query that does not parse refuses the whole envelope with
+    // the parser's error.
     let fluree = Arc::new(FlureeBuilder::memory().build_memory());
     ignore_ledgers(seed_two_ledgers(&fluree).await);
 

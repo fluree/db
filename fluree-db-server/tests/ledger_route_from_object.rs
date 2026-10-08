@@ -1,8 +1,7 @@
-//! On the ledger-scoped JSON-LD routes, a single `from` object is read as the
-//! query parser reads it — one source, named by `@id` or else `id` — and
-//! compared with the route's ledger by canonical ledger id. Every spelling of
-//! the route's ledger is accepted, no spelling of another ledger is, and an
-//! object that names no source is refused in every execution lane.
+//! On the ledger-scoped JSON-LD routes, a single `from` object names one
+//! source, by `@id` or else `id`. Every spelling of the route's ledger is
+//! accepted, no spelling of another ledger is, and an object that names no
+//! source is refused in every execution lane.
 
 use axum::body::Body;
 use fluree_db_server::{routes::build_router, AppState, ServerConfig, TelemetryConfig};
@@ -149,7 +148,7 @@ fn cases() -> Vec<(JsonValue, Expect)> {
             json!({ "from": { "@id": "urn:fluree:other:main" } }),
             Mismatch,
         ),
-        // `id`, which the parser reads when there is no `@id`.
+        // `id`, when there is no `@id`.
         (json!({ "from": { "id": "own:main" } }), Own),
         (json!({ "from": { "id": "own" } }), Own),
         (json!({ "from": { "id": "own:main", "t": 1 } }), Own),
@@ -163,7 +162,7 @@ fn cases() -> Vec<(JsonValue, Expect)> {
             json!({ "from": { "id": "other:main", "unknown": 1 } }),
             Mismatch,
         ),
-        // Both keys: `@id` names the source, as in the parser.
+        // Both keys: `@id` names the source.
         (
             json!({ "from": { "@id": "own:main", "id": "other:main" } }),
             Own,

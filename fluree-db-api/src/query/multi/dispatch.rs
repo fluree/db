@@ -785,7 +785,7 @@ async fn execute_subquery(
             let sparql = sub.query.as_str().unwrap_or_default();
 
             // SPARQL has no inner JSON-LD context — directives come
-            // from the envelope context only. Validation read this
+            // from the envelope context only. Validation reads this
             // sub-query's dataset from the same text.
             let text = sparql_subquery_text(sparql, envelope_context);
             let with_snapshot = apply_snapshot_to_sparql(&text, snapshot);

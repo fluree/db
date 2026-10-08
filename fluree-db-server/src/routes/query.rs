@@ -2454,12 +2454,9 @@ pub(crate) fn normalize_ledger_scoped_from(ledger_id: &str, query: &mut JsonValu
             }
         }
         JsonValue::Object(ref m) => {
-            // Object form must name this ledger (time/graph selectors ok). Read
-            // it as the dataset parser reads it — one source, named by `@id`
-            // or else `id` — and compare canonical ledger ids, as the read
-            // checks do, so every spelling of this ledger passes and no
-            // spelling of another one does. An object that names no source is
-            // refused here, whichever lane the query would take.
+            // Object form must name this ledger, by `@id` or else `id`, in any
+            // spelling of its id (time/graph selectors ok). An object that
+            // names no source is refused.
             let sources = DatasetSpec::default_graph_sources(&from_val)
                 .map_err(|e| ServerError::bad_request(e.to_string()))?;
             let path_id = crate::error::scope_id(ledger_id)?;
@@ -2479,9 +2476,8 @@ pub(crate) fn normalize_ledger_scoped_from(ledger_id: &str, query: &mut JsonValu
             }
         }
         JsonValue::Array(_) => {
-            // Allow arrays only if caller explicitly provides ledger refs per-entry.
-            // (Graph-only entries are ambiguous in this endpoint.)
-            // Mismatch will be enforced by the connection parsing path if present.
+            // An array is the multi-ledger form, as on `/query`: it may name
+            // other ledgers.
         }
         _ => {}
     }
@@ -4748,8 +4744,7 @@ fn collect_multi_query_min_t_requirements(
                         .or(sub_min_t);
                     // The envelope already applied any `Fluree-Min-T` header to
                     // every distinct ledger. Per alias: each member's own `@t:`
-                    // pin, and the alias's min-t on every member — the members
-                    // validation read, which are the ledgers the envelope pins.
+                    // pin, and the alias's min-t on every member.
                     for member in ledgers.sparql.get(alias).into_iter().flatten() {
                         if let Some(TimeSpec::AtT(t)) = member.at {
                             merge_min_t_requirement(&mut requirements, &member.ledger, t);
@@ -4869,8 +4864,8 @@ pub async fn multi_query(
 
             // Validation — we re-run it inside the api crate's dispatcher,
             // but pre-validating here gives us the ledgers the envelope reads
-            // (the set its snapshot pins) for the bearer-scope check and the
-            // freshness wait before any execution starts.
+            // for the bearer-scope check and the freshness wait before any
+            // execution starts.
             let envelope_ledgers =
                 match fluree_db_api::query::multi::validate_envelope_ledgers(&envelope, &bounds) {
                     Ok(ledgers) => ledgers,
