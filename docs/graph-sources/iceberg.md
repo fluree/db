@@ -762,6 +762,13 @@ target. The materializer enforces what it can and documents the rest:
   Materializing makes the guard *more* important, not less: a query returning
   deleted rows is a transient wrong answer, but a materialized twin commits them
   as state and advances the watermark past the window.
+- **Credentials are decided exactly as on the query path**, for `materialize`
+  and `track` alike, incremental scans included. A REST source with vended
+  credentials on whose catalog vends none is refused with
+  `err:catalog/CredentialsNotVended`, never read with the server's own AWS
+  identity; and catalog auth held as a reference (an `auth_bearer_env` /
+  `oauth2_client_secret_env` variable, or an embedder's secret reference) is
+  resolved as it is for a query.
 - **Foreign-key (`rr:refObjectMap`) edges are not materialized.** The virtual
   query path resolves them at query time; the materializer does not yet index
   parent tables, so FK edges are absent from the twin (each pass logs a warning
@@ -1012,6 +1019,8 @@ export AWS_REGION=us-east-1
 
 REST catalog mode also supports vended credentials (credentials issued by the catalog). Direct, Glue and S3 Tables modes use only the ambient AWS credential chain (env vars, `~/.aws/credentials` and `~/.aws/config` including `AWS_PROFILE` and SSO, IAM roles); Glue and S3 Tables use it for the catalog call as well as the S3 reads.
 
+**Scope the server's identity.** In `direct`, `glue` and `s3tables` modes a server reads with its **own** ambient AWS identity, not the caller's, so anyone allowed to map a graph source on that server can read any table that identity can reach. Scope the server's IAM role, and the Lake Formation grants and bucket policies behind it, to the tables the server should serve. (A REST source with vended credentials turned off also reads its files with that identity.)
+
 **Regions and endpoints (Glue, S3 Tables):**
 
 - The Glue API is called in `--region` (JSON `region`), else `--s3-region`, else the AWS SDK's region chain (`AWS_REGION`, the profile's region, instance metadata). The S3 Tables API is called in the table bucket ARN's region; a `--region` that contradicts the ARN is refused. ARNs in every AWS partition (`aws`, `aws-cn`, `aws-us-gov`) are accepted.
@@ -1223,7 +1232,7 @@ triples map a scan skipped because its predicates were hidden.
 |---|---|
 | `… Table not found: Glue table sales.nope not found: …EntityNotFoundException…` | No such Glue database or table in this catalog and region. Check the `<database>.<table>` name, `--region`, and (for another account's catalog) `--catalog-id`. |
 | ``… Glue table sales.t is not an Iceberg table (table_type=EXTERNAL_TABLE): it has no `metadata_location` parameter`` | The Glue table is a Hive / Parquet table, not an Iceberg one. Only tables that carry `metadata_location` can be mapped; catalog browse lists only those. |
-| A query fails with HTTP `403`, `@type` `err:catalog/AccessDenied`: `Catalog denied access to … Glue table sales.orders …` | The ambient AWS identity may not call the catalog operation (for example `glue:GetTable`, or `s3tables:GetTableMetadataLocation`), or a Lake Formation grant is missing. |
+| A query fails with HTTP `403`, `@type` `err:catalog/AccessDenied`: `Catalog denied access to table 'sales.orders': …` | The catalog refused this principal the table. For a REST catalog, the bearer or OAuth2 token lacks access to the table, or the role it acts as lacks grants on it: the catalog's `loadTable` answered `403`, or `401` again after one token refresh, and its reply follows as `Catalog request failed (403 …): …` (or `(401 …)`). For Glue and S3 Tables, the ambient AWS identity may not call the catalog operation (for example `glue:GetTable`, or `s3tables:GetTableMetadataLocation`), or a Lake Formation grant is missing. |
 | A query fails with HTTP `403`, `@type` `err:storage/AccessDenied`: `Storage access denied for s3://…` | The catalog answered, but the identity cannot read the table's files in S3. Glue tables readable only with Lake Formation–vended credentials are not supported yet ([#1456](https://github.com/fluree/db/issues/1456)). |
 | `Vended credentials are not supported with the Glue catalog …` (or `S3 Tables catalog`) | A stored config sets `io.vended_credentials: true`; these modes read with the ambient chain only. Set it to `false` (the CLI and server do so automatically). |
 | `… is not an AWS region (expected e.g. us-east-1)` | `--region` / `--s3-region` must be an AWS region code. |
@@ -1235,16 +1244,20 @@ To try the Glue mode without an AWS account, `scripts/glue-local/` in the reposi
 
 ### Schema Mismatch
 
-```json
-{
-  "error": "SchemaMismatchError",
-  "message": "Column 'order_date' not found in Iceberg table"
-}
-```
+Mapping a source compiles the R2RML mapping (a mapping that does not parse or compile is refused with HTTP `400`: `Failed to parse R2RML Turtle: …` or `Failed to compile R2RML mapping: …`), but does not check its table and column names against the tables. To check them before saving or querying, send the mapping to `POST {api_base_url}/iceberg/r2rml/validate` with the connection fields of [`/iceberg/map`](../api/endpoints.md#post-api_base_urlicebergmap) and the mapping as inline Turtle in `r2rml`. It is read-only and admin-protected, and answers `200` whether or not the mapping is sound: `compiled_ok` is `false` for a mapping that does not compile, and each entry of `diagnostics` has a `severity`, a `code`, and the `table`, `column` and `message` it concerns:
 
-**Solutions:**
-- Update R2RML mapping configuration (if the mapping references missing columns)
-- Verify table name and catalog
+| `code` | `severity` | `message` |
+|---|---|---|
+| `compileError` | `error` | `R2RML mapping failed to compile: …` |
+| `tableNotFound` | `error` | `Table 'sales.orders' referenced by TriplesMap <…> was not found in the live catalog schema.` When the catalog could not load the table, its reason follows in parentheses. |
+| `columnNotFound` | `error` | `Column 'order_date' referenced by the mapping does not exist in table 'sales.orders'.` |
+| `casingMismatch` | `warning` | `Column 'ORDER_DATE' does not match the live schema's casing; the schema spells it 'order_date'. Iceberg field names are case-sensitive — fix the casing to match.` |
+| `joinTypeMismatch` | `error` | `Join key type mismatch: child column '…' is … but parent column '…' is …; the join will never match.` |
+| `noSafeSubjectKey` | `warning` | `Subject-key column '…' is nullable (…); rows with a NULL value here produce no subject and are silently dropped. …` |
+
+Fix the names in the mapping to match the table (Iceberg column names are case-sensitive), or the table identifier and catalog when the table itself is not found.
+
+At query time a column the table does not have is read like a NULL: the triples it would supply are not produced, and a row whose subject template names it produces no subject, so the query returns fewer results instead of failing. Only when none of the columns a scan needs exist does the query fail, with HTTP `400` `err:db/InvalidQuery`: `None of the projected columns [...] exist in table schema. Available: [...]`.
 
 ### Slow Queries
 

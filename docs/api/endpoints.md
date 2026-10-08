@@ -3061,12 +3061,12 @@ POST http://localhost:8090/v1/fluree/iceberg/map
 | `mode` | string | `rest` (default), `direct`, `glue` (AWS Glue Data Catalog), or `s3tables` (AWS S3 Tables); case-insensitive |
 | `catalog_uri` | string | REST catalog URI (required in `rest` mode) |
 | `table` | string | Table identifier `namespace.table` (for `glue`, `<database>.<table>`). Required in `rest`, `glue` and `s3tables` modes unless `r2rml` is given, whose `rr:tableName` entries then name the tables |
-| `table_location` | string | S3 table location (required in `direct` mode) |
+| `table_location` | string | Table location (required in `direct` mode): an `s3://` / `s3a://` URI, or a `file://` URI or absolute local path under a root listed in `FLUREE_ICEBERG_LOCAL_ROOTS` (see [Enabling local tables](../graph-sources/iceberg.md#enabling-local-tables)) |
 | `region` | string | AWS region of the Glue / S3 Tables API (`glue`, `s3tables`). Glue falls back to `s3_region`, then the server's AWS region chain; S3 Tables defaults to the ARN's region and refuses a contradicting `region`. Must be an AWS region code |
 | `catalog_id` | string | Glue catalog id for cross-account access (`glue`; default: the server identity's own account) |
 | `table_bucket_arn` | string | S3 Tables table-bucket ARN, `arn:aws:s3tables:<region>:<account>:bucket/<name>` (required in `s3tables` mode) |
-| `r2rml` | string | Inline R2RML mapping (Turtle/JSON-LD). Omit to auto-generate a direct mapping. |
-| `r2rml_type` | string | Media type of `r2rml` (`text/turtle`, `application/ld+json`) |
+| `r2rml` | string | Inline R2RML mapping content, in Turtle. Omit to register a plain Iceberg source with no mapping. |
+| `r2rml_type` | string | Media type of `r2rml`; default `text/turtle`. JSON-LD mappings are refused (`R2RML mapping must be in Turtle format. JSON-LD is not yet supported.`) |
 | `branch` | string | Branch name (default: `main`) |
 | `auth_bearer` | string | Static bearer token for catalog auth (does not refresh — a Google OAuth token will expire after ~1h). Stored with the graph source |
 | `auth_bearer_env` | string | In place of `auth_bearer`: the name of an environment variable of the server holding the token, so the token is not stored. The name must be listed in [`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning); any other is refused with 400 |
@@ -3098,6 +3098,8 @@ In `glue` and `s3tables` modes the catalog is called through the native AWS SDK,
 
 For S3 Tables, send `"mode": "s3tables"` with `"table_bucket_arn": "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics"` in place of `catalog_id` (and usually no `region`). See [Iceberg → Catalog Modes](../graph-sources/iceberg.md#catalog-modes).
 
+In `direct`, `glue` and `s3tables` modes the server reads with its own AWS identity, not the caller's, so anyone allowed to call this endpoint can map any table that identity can reach. Scope the server's IAM role (and its Lake Formation grants and bucket policies) to the tables it should serve; see [Iceberg → AWS Credentials](../graph-sources/iceberg.md#aws-credentials).
+
 **Response:**
 
 ```json
@@ -3114,9 +3116,11 @@ For S3 Tables, send `"mode": "s3tables"` with `"table_bucket_arn": "arn:aws:s3ta
 
 **Status Codes:**
 - `201 Created` — graph source created
-- `400 Bad Request` — missing required fields or invalid R2RML
+- `400 Bad Request` — missing required fields, or an `r2rml` that does not parse or compile
 - `401/403` — admin auth required
-- `500 Internal Server Error` — catalog connection or mapping failure
+- `500 Internal Server Error` — the graph source could not be published
+
+A REST catalog that cannot be reached does not fail the request; the response carries `connection_tested: false`.
 
 See also the CLI wrapper: [fluree iceberg map](../cli/iceberg.md).
 
@@ -3572,6 +3576,8 @@ Materialize a graph source into a native ledger (so BM25 / vector / reasoning ca
 ```
 
 `committed: false` means a no-delta poll (nothing changed since the watermark). `from_snapshot_id`/`to_snapshot_id` are populated for single-table mappings (multi-table watermarks live per `(source, target, table)` in the shared `fluree_materialize_state:main` state ledger, not in the target).
+
+The source is read with the same credentials a query of it would use, on full and incremental reads alike (and so by `track`): a REST source with vended credentials on whose catalog vends none is refused with `err:catalog/CredentialsNotVended` rather than read with the server's own AWS identity.
 
 **Status Codes:** `200 OK`; `400` invalid request / config; `401/403` admin auth; `500` scan or commit failure.
 
