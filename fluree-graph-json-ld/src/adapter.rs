@@ -10,17 +10,19 @@
 //! - Handles `@type` → `rdf:type` conversion
 //! - Handles language-tagged strings and typed literals
 //! - Handles `@json` typed values with canonical normalization
+//! - Handles `@reverse` and `@included`
+//! - RDF 1.2: a triple term is `{"@id": {"@id": s, p: o}}`; `@annotation` on
+//!   a value makes each annotation node a reifier of the triple the value
+//!   completes; a node's `@reifies` makes the node a reifier of the triple it
+//!   names, without asserting it
 //!
-//! # Limitations
+//! # Named graphs
 //!
-//! - **`@graph`**: dropped, not flattened. Every `@`-prefixed key except
-//!   `@type` is skipped, so the contents of a `@graph` entry never reach the
-//!   sink at all. Emitting them correctly needs the quad protocol
-//!   ([`fluree_graph_ir::GraphSink::supports_quads`] /
-//!   [`fluree_graph_ir::GraphSink::emit_quad`]); until this adapter uses it,
-//!   the behavior stays as-is rather than being silently folded into the
-//!   default graph.
-//! - **`@reverse`**: Reverse properties are not yet supported
+//! A node with `@graph` names a graph holding the nodes in it, emitted as
+//! quads to a sink that [supports
+//! them](fluree_graph_ir::GraphSink::supports_quads). A sink that does not
+//! gets none of that graph's contents, rather than them folded into its
+//! default graph.
 //!
 //! # Example
 //!
@@ -116,11 +118,11 @@ pub fn to_graph_events<S: GraphSink>(expanded: &Value, sink: &mut S) -> Result<(
     match expanded {
         Value::Array(arr) => {
             for item in arr {
-                process_node(item, sink, None)?;
+                process_node(item, sink, None, None)?;
             }
         }
         Value::Object(_) => {
-            process_node(expanded, sink, None)?;
+            process_node(expanded, sink, None, None)?;
         }
         _ => {
             return Err(AdapterError::InvalidStructure(
@@ -131,7 +133,49 @@ pub fn to_graph_events<S: GraphSink>(expanded: &Value, sink: &mut S) -> Result<(
     Ok(())
 }
 
-/// Process a single node in the expanded JSON-LD
+/// `s p o` in `graph`, or in the default graph.
+fn emit<S: GraphSink>(
+    sink: &mut S,
+    (s, p, o): (TermId, TermId, TermId),
+    graph: Option<TermId>,
+) -> Result<()> {
+    match graph {
+        None => sink.emit_triple(s, p, o)?,
+        Some(g) => sink.emit_quad(s, p, o, g)?,
+    }
+    Ok(())
+}
+
+/// `reifier` reifies `s p o` in `graph`, or in the default graph.
+fn emit_reification<S: GraphSink>(
+    sink: &mut S,
+    (s, p, o): (TermId, TermId, TermId),
+    reifier: TermId,
+    graph: Option<TermId>,
+) -> Result<()> {
+    if !sink.supports_reified_triples() {
+        return Err(AdapterError::InvalidStructure(
+            "this destination does not hold reifiers (@annotation, @reifies)".to_string(),
+        ));
+    }
+    match graph {
+        None => sink.emit_reified_triple(s, p, o, reifier)?,
+        Some(g) => sink.emit_quad_reified_triple(s, p, o, reifier, g)?,
+    }
+    Ok(())
+}
+
+/// A node or blank-node reference: `_:label` or an IRI.
+fn node_term<S: GraphSink>(id: &str, sink: &mut S) -> TermId {
+    if id.starts_with("_:") {
+        sink.term_blank(Some(strip_blank_prefix(id)))
+    } else {
+        sink.term_iri(id)
+    }
+}
+
+/// Process a single node in the expanded JSON-LD, its statements going to
+/// `graph` (the default graph when `None`).
 ///
 /// If `forced_subject` is provided, it will be used as the subject instead of
 /// deriving one from `@id`. This is used for embedded nodes without `@id` to
@@ -140,6 +184,7 @@ fn process_node<S: GraphSink>(
     node: &Value,
     sink: &mut S,
     forced_subject: Option<TermId>,
+    graph: Option<TermId>,
 ) -> Result<TermId> {
     let obj = node.as_object().ok_or_else(|| {
         AdapterError::InvalidStructure("Expected node to be an object".to_string())
@@ -152,11 +197,7 @@ fn process_node<S: GraphSink>(
         let id_str = id_val
             .as_str()
             .ok_or_else(|| AdapterError::InvalidStructure("@id must be a string".to_string()))?;
-        if id_str.starts_with("_:") {
-            sink.term_blank(Some(strip_blank_prefix(id_str)))
-        } else {
-            sink.term_iri(id_str)
-        }
+        node_term(id_str, sink)
     } else {
         // Anonymous blank node
         sink.term_blank(None)
@@ -164,49 +205,94 @@ fn process_node<S: GraphSink>(
 
     // Process each predicate-object pair
     for (key, value) in obj {
-        // Skip JSON-LD keywords except @type
-        if key.starts_with('@') && key != "@type" {
-            continue;
-        }
-
-        // Handle @type specially (maps to rdf:type)
-        if key == "@type" {
-            let rdf_type_id = sink.term_iri(rdf::TYPE);
-
-            let types = match value {
-                Value::Array(arr) => arr.iter().collect::<Vec<_>>(),
-                _ => vec![value],
-            };
-
-            for type_val in types {
-                if let Some(type_iri) = type_val.as_str() {
-                    let object_id = sink.term_iri(type_iri);
-                    sink.emit_triple(subject_id, rdf_type_id, object_id)?;
-                }
-            }
-            continue;
-        }
-
-        // Regular predicate (expanded IRI)
-        let predicate_id = sink.term_iri(key);
-
-        // Process values (always an array in expanded form)
         let values = match value {
             Value::Array(arr) => arr.iter().collect::<Vec<_>>(),
             _ => vec![value],
         };
-
-        for val in values {
-            match process_value(val, sink)? {
-                ProcessedValue::Single(object_id) => {
-                    sink.emit_triple(subject_id, predicate_id, object_id)?;
-                }
-                ProcessedValue::List(items) => {
-                    for (index, object_id) in items {
-                        sink.emit_list_item(subject_id, predicate_id, object_id, index)?;
+        match key.as_str() {
+            // Handle @type specially (maps to rdf:type)
+            "@type" => {
+                let rdf_type_id = sink.term_iri(rdf::TYPE);
+                for type_val in values {
+                    if let Some(type_iri) = type_val.as_str() {
+                        let object_id = node_term(type_iri, sink);
+                        emit(sink, (subject_id, rdf_type_id, object_id), graph)?;
                     }
                 }
-                ProcessedValue::None => {}
+            }
+            // A named graph: this node names it. A sink that cannot hold
+            // named graphs gets none of it rather than the graph folded into
+            // its default graph.
+            "@graph" if sink.supports_quads() => {
+                for item in values {
+                    process_node(item, sink, None, Some(subject_id))?;
+                }
+            }
+            "@reifies" => {
+                for reified in values {
+                    let triple = triple_parts(reified, sink, graph)?;
+                    emit_reification(sink, triple, subject_id, graph)?;
+                }
+            }
+            "@included" => {
+                for item in values {
+                    process_node(item, sink, None, graph)?;
+                }
+            }
+            "@reverse" => {
+                for reverse in values {
+                    let Some(reverse) = reverse.as_object() else {
+                        continue;
+                    };
+                    for (property, objects) in reverse {
+                        let predicate_id = sink.term_iri(property);
+                        for object in as_values(objects) {
+                            let ProcessedValue::Single(object_id) =
+                                process_value(object, sink, graph)?
+                            else {
+                                return Err(AdapterError::InvalidStructure(
+                                    "an @reverse value is a node".to_string(),
+                                ));
+                            };
+                            emit(sink, (object_id, predicate_id, subject_id), graph)?;
+                        }
+                    }
+                }
+            }
+            // Skip the other JSON-LD keywords
+            key if key.starts_with('@') => {}
+            // Regular predicate (expanded IRI)
+            key => {
+                let predicate_id = sink.term_iri(key);
+                for val in values {
+                    match process_value(val, sink, graph)? {
+                        ProcessedValue::Single(object_id) => {
+                            let triple = (subject_id, predicate_id, object_id);
+                            emit(sink, triple, graph)?;
+                            annotate(val, triple, sink, graph)?;
+                        }
+                        ProcessedValue::List(items) => {
+                            for (index, object_id) in items {
+                                match graph {
+                                    None => sink.emit_list_item(
+                                        subject_id,
+                                        predicate_id,
+                                        object_id,
+                                        index,
+                                    )?,
+                                    Some(g) => sink.emit_quad_list_item(
+                                        subject_id,
+                                        predicate_id,
+                                        object_id,
+                                        index,
+                                        g,
+                                    )?,
+                                }
+                            }
+                        }
+                        ProcessedValue::None => {}
+                    }
+                }
             }
         }
     }
@@ -214,18 +300,74 @@ fn process_node<S: GraphSink>(
     Ok(subject_id)
 }
 
+fn as_values(value: &Value) -> Vec<&Value> {
+    match value {
+        Value::Array(arr) => arr.iter().collect(),
+        _ => vec![value],
+    }
+}
+
+/// The `@annotation` on the value of `triple`: each annotation node is a
+/// reifier of the triple (its `@id`, or a fresh blank node), described by
+/// the node's own properties.
+fn annotate<S: GraphSink>(
+    value: &Value,
+    triple: (TermId, TermId, TermId),
+    sink: &mut S,
+    graph: Option<TermId>,
+) -> Result<()> {
+    let Some(annotations) = value.get("@annotation") else {
+        return Ok(());
+    };
+    for annotation in as_values(annotations) {
+        let reifier = process_node(annotation, sink, None, graph)?;
+        emit_reification(sink, triple, reifier, graph)?;
+    }
+    Ok(())
+}
+
+/// The triple a `@reifies` value names: a node with an `@id` and one
+/// property, `{"@id": s, p: o}`, as a triple term's `@id` holds it.
+fn triple_parts<S: GraphSink>(
+    reified: &Value,
+    sink: &mut S,
+    graph: Option<TermId>,
+) -> Result<(TermId, TermId, TermId)> {
+    let invalid = |msg: &str| AdapterError::InvalidStructure(format!("@reifies: {msg}"));
+    let reified = reified
+        .as_object()
+        .ok_or_else(|| invalid("its value is a node naming a triple"))?;
+    let parts = crate::triple_term::triple_term_parts(reified).map_err(invalid)?;
+    let subject = parts
+        .subject
+        .as_str()
+        .ok_or_else(|| invalid("@id must name the subject"))?;
+    let subject = node_term(subject, sink);
+    let predicate = sink.term_iri(parts.predicate);
+    let ProcessedValue::Single(object) = process_value(parts.object, sink, graph)? else {
+        return Err(invalid("its object must be a reference or a value"));
+    };
+    Ok((subject, predicate, object))
+}
+
 /// Process a value and return the processed result
-fn process_value<S: GraphSink>(value: &Value, sink: &mut S) -> Result<ProcessedValue> {
+fn process_value<S: GraphSink>(
+    value: &Value,
+    sink: &mut S,
+    graph: Option<TermId>,
+) -> Result<ProcessedValue> {
     match value {
         Value::Object(obj) => {
             if let Some(Value::Object(term)) = obj.get("@id") {
-                if obj.len() > 1 {
+                if obj.keys().any(|k| k != "@id" && k != "@annotation") {
                     return Err(AdapterError::InvalidStructure(
                         "a triple term ({\"@id\": {...}}) is a value and cannot carry properties"
                             .to_string(),
                     ));
                 }
-                return Ok(ProcessedValue::Single(process_triple_term(term, sink)?));
+                return Ok(ProcessedValue::Single(process_triple_term(
+                    term, sink, graph,
+                )?));
             }
             // Check for @id (reference to another node)
             if let Some(id_val) = obj.get("@id") {
@@ -233,19 +375,14 @@ fn process_value<S: GraphSink>(value: &Value, sink: &mut S) -> Result<ProcessedV
                 // asserts its own triples (JSON-LD embedded-node semantics);
                 // recurse so they aren't silently dropped. A `{"@id": ...}`
                 // singleton is a pure reference.
-                if obj.len() > 1 {
-                    let subject_id = process_node(value, sink, None)?;
+                if obj.keys().any(|k| k != "@id" && k != "@annotation") {
+                    let subject_id = process_node(value, sink, None, graph)?;
                     return Ok(ProcessedValue::Single(subject_id));
                 }
                 let id_str = id_val.as_str().ok_or_else(|| {
                     AdapterError::InvalidStructure("@id must be a string".to_string())
                 })?;
-                let term_id = if id_str.starts_with("_:") {
-                    sink.term_blank(Some(strip_blank_prefix(id_str)))
-                } else {
-                    sink.term_iri(id_str)
-                };
-                return Ok(ProcessedValue::Single(term_id));
+                return Ok(ProcessedValue::Single(node_term(id_str, sink)));
             }
 
             // Check for @value (literal)
@@ -255,14 +392,19 @@ fn process_value<S: GraphSink>(value: &Value, sink: &mut S) -> Result<ProcessedV
 
             // Check for @list
             if let Some(list_val) = obj.get("@list") {
-                return process_list(list_val, sink);
+                if obj.contains_key("@annotation") {
+                    return Err(AdapterError::InvalidStructure(
+                        "an @annotation names one triple, and a @list is several".to_string(),
+                    ));
+                }
+                return process_list(list_val, sink, graph);
             }
 
             // Nested/embedded node without @id - allocate blank node first,
             // then process the node using that same blank node as subject.
             // This ensures the object edge and embedded node triples share identity.
             let subject_id = sink.term_blank(None);
-            process_node(value, sink, Some(subject_id))?;
+            process_node(value, sink, Some(subject_id), graph)?;
             Ok(ProcessedValue::Single(subject_id))
         }
         // Direct scalar values (shouldn't happen in properly expanded JSON-LD)
@@ -297,6 +439,7 @@ fn process_value<S: GraphSink>(value: &Value, sink: &mut S) -> Result<ProcessedV
 fn process_triple_term<S: GraphSink>(
     term: &serde_json::Map<String, Value>,
     sink: &mut S,
+    graph: Option<TermId>,
 ) -> Result<TermId> {
     let invalid = |msg: &str| AdapterError::InvalidStructure(format!("triple term: {msg}"));
     if !sink.supports_triple_terms() {
@@ -304,12 +447,11 @@ fn process_triple_term<S: GraphSink>(
     }
     let parts = crate::triple_term::triple_term_parts(term).map_err(invalid)?;
     let subject = match parts.subject.as_str() {
-        Some(id) if id.starts_with("_:") => sink.term_blank(Some(strip_blank_prefix(id))),
-        Some(id) => sink.term_iri(id),
+        Some(id) => node_term(id, sink),
         None => return Err(invalid("@id must name the subject")),
     };
     let predicate = parts.predicate;
-    let ProcessedValue::Single(object) = process_value(parts.object, sink)? else {
+    let ProcessedValue::Single(object) = process_value(parts.object, sink, graph)? else {
         return Err(invalid("its object must be a reference or a value"));
     };
     let predicate = sink.term_iri(predicate);
@@ -317,7 +459,11 @@ fn process_triple_term<S: GraphSink>(
 }
 
 /// Process a @list value and return the list items with indices
-fn process_list<S: GraphSink>(list_val: &Value, sink: &mut S) -> Result<ProcessedValue> {
+fn process_list<S: GraphSink>(
+    list_val: &Value,
+    sink: &mut S,
+    graph: Option<TermId>,
+) -> Result<ProcessedValue> {
     let items = match list_val {
         Value::Array(arr) => arr,
         _ => {
@@ -339,7 +485,7 @@ fn process_list<S: GraphSink>(list_val: &Value, sink: &mut S) -> Result<Processe
 
     for (index, item) in items.iter().enumerate() {
         // Process each list item as a single value (lists cannot be nested directly)
-        match process_list_item(item, sink)? {
+        match process_list_item(item, sink, graph)? {
             Some(term_id) => {
                 indexed_items.push((index as i32, term_id));
             }
@@ -353,7 +499,11 @@ fn process_list<S: GraphSink>(list_val: &Value, sink: &mut S) -> Result<Processe
 }
 
 /// Process a single list item (cannot return a list, only single values)
-fn process_list_item<S: GraphSink>(value: &Value, sink: &mut S) -> Result<Option<TermId>> {
+fn process_list_item<S: GraphSink>(
+    value: &Value,
+    sink: &mut S,
+    graph: Option<TermId>,
+) -> Result<Option<TermId>> {
     match value {
         Value::Object(obj) => {
             // Check for @id (reference to another node)
@@ -361,11 +511,7 @@ fn process_list_item<S: GraphSink>(value: &Value, sink: &mut S) -> Result<Option
                 let id_str = id_val.as_str().ok_or_else(|| {
                     AdapterError::InvalidStructure("@id must be a string".to_string())
                 })?;
-                return Ok(Some(if id_str.starts_with("_:") {
-                    sink.term_blank(Some(strip_blank_prefix(id_str)))
-                } else {
-                    sink.term_iri(id_str)
-                }));
+                return Ok(Some(node_term(id_str, sink)));
             }
 
             // Check for @value (literal)
@@ -385,7 +531,7 @@ fn process_list_item<S: GraphSink>(value: &Value, sink: &mut S) -> Result<Option
 
             // Embedded node in list - allocate blank node and process
             let subject_id = sink.term_blank(None);
-            process_node(value, sink, Some(subject_id))?;
+            process_node(value, sink, Some(subject_id), graph)?;
             Ok(Some(subject_id))
         }
         // Direct scalar values
@@ -418,15 +564,17 @@ fn process_literal<S: GraphSink>(
     obj: &serde_json::Map<String, Value>,
     sink: &mut S,
 ) -> Result<ProcessedValue> {
-    // Check for @type (datatype)
-    let datatype = if let Some(type_val) = obj.get("@type") {
-        if let Some(type_iri) = type_val.as_str() {
-            Datatype::from_iri(type_iri)
-        } else {
-            Datatype::xsd_string()
-        }
-    } else {
-        Datatype::xsd_string()
+    // Check for @type (datatype). With none, a JSON number or boolean has
+    // the datatype JSON-LD gives it (JSON-LD 1.1 § Object to RDF Conversion):
+    // xsd:integer for a whole number, xsd:double for any other, xsd:boolean.
+    let datatype = match obj.get("@type").and_then(Value::as_str) {
+        Some(type_iri) => Datatype::from_iri(type_iri),
+        None => match val {
+            Value::Number(n) if n.is_i64() || n.is_u64() => Datatype::xsd_integer(),
+            Value::Number(_) => Datatype::xsd_double(),
+            Value::Bool(_) => Datatype::xsd_boolean(),
+            _ => Datatype::xsd_string(),
+        },
     };
 
     // Check for @language
@@ -455,7 +603,10 @@ fn process_literal<S: GraphSink>(
             // BigDecimal (same as a string @value). Going through f64 here
             // both corrupts the value and loses the declared datatype, since
             // term_literal_value re-infers xsd:double from the Double.
-            if datatype.as_iri() == fluree_vocab::xsd::DECIMAL {
+            // So must an integer too large for i64, which f64 would round.
+            if datatype.as_iri() == fluree_vocab::xsd::DECIMAL
+                || (datatype.as_iri() == fluree_vocab::xsd::INTEGER && !n.is_i64() && n.is_u64())
+            {
                 return Ok(ProcessedValue::Single(sink.term_literal(
                     &n.to_string(),
                     datatype,
