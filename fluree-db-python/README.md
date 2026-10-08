@@ -2,7 +2,9 @@
 
 Python package for [Fluree](https://flur.ee), a graph database with time travel,
 history, and fine-grained policy. The engine runs in your Python process — there
-is no server to start. The [Fluree documentation](https://fluree.github.io/db/getting-started/python.html)
+is no server to start. The [API reference](https://fluree.github.io/db/python/api/fluree/)
+documents every class and method, and the
+[Fluree documentation](https://fluree.github.io/db/getting-started/python.html)
 covers concepts, query languages and configuration; its queries run unchanged
 through `ledger.query()`.
 

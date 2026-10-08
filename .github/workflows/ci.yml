@@ -405,6 +405,15 @@ jobs:
           ../venv-314/bin/pip install mypy pandas-stubs polars
           ../venv-314/bin/python -m mypy
 
+      # Published by docs.yml. Strict, so a docstring reference that resolves
+      # nowhere fails here rather than rendering as plain text.
+      - name: Build the API reference
+        if: runner.os == 'Linux'
+        working-directory: fluree-db-python
+        run: |
+          ../venv-314/bin/pip install -r docs/requirements.txt
+          ../venv-314/bin/python -m sphinx -n -W --keep-going -q -b html docs "$RUNNER_TEMP/python-api"
+
   # Executes the browser build (the wasm32 job only proves it compiles).
   # 1. The playground binding runs create → insert → query → format inside a
   #    dedicated worker in headless Chrome (wasm-bindgen-test, assertions on

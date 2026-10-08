@@ -3,9 +3,9 @@
 The `fluree` package runs the Fluree engine inside your Python process: no
 server to start, and the same engine the server and CLI run. This page gets
 you started and shows how the rest of this book reads from Python. The
-package's [README](https://github.com/fluree/db/blob/main/fluree-db-python/README.md),
-which is also its PyPI page, covers every part of the Python API, and each
-class and method carries its documentation for `help()` and your editor.
+[Python documentation](https://fluree.github.io/db/python/) has a guide to the
+whole package and its API reference, and each class and method carries its
+documentation for `help()` and your editor.
 
 ## Install
 
@@ -100,9 +100,10 @@ async with fluree.aio.connect("./data") as conn:
 
 ## Next steps
 
-- The package [README](https://github.com/fluree/db/blob/main/fluree-db-python/README.md)
-  for the whole Python API: results, transactions, Cypher, search, graph
-  sources, branches, errors, logging and concurrency.
+- The [Python guide](https://fluree.github.io/db/python/guide.html) for the
+  whole package (results, transactions, Cypher, search, graph sources,
+  branches, errors, logging and concurrency) and the
+  [API reference](https://fluree.github.io/db/python/api/fluree/).
 - [Concepts](../concepts/) for how Fluree works.
 - [Guides](../guides/) for task-oriented recipes; their queries run
   unchanged through `ledger.query()`.
