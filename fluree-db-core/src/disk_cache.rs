@@ -20,14 +20,6 @@ const DEFAULT_LAMBDA_TMP_WARN_SLACK_BYTES: u64 = 64 * 1024 * 1024;
 static CACHE_REGISTRY: Lazy<Mutex<HashMap<PathBuf, Weak<DiskArtifactCache>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// Single-flight for stores that forbid a plaintext cache: coalesces
-/// concurrent fetches of one artifact like the cached path does, but never
-/// reads or writes a cache directory — it is not registered and never
-/// creates one. Flights are keyed by the path the cache would have used, so
-/// they are exactly as narrow as the cached ones.
-static UNCACHED_FLIGHTS: Lazy<Arc<DiskArtifactCache>> =
-    Lazy::new(|| Arc::new(DiskArtifactCache::detached()));
-
 /// Sentinel for "no configured budget" — fall back to auto-detect.
 const BUDGET_UNSET: u64 = u64::MAX;
 
@@ -58,19 +50,127 @@ fn configured_or_auto(available: u64) -> u64 {
 /// coalesced waiters neither re-fetch nor re-allocate the payload; the per-caller
 /// `Vec` copy happens only at the API boundary. Errors are shared but never
 /// cached — the in-flight entry is removed on completion so the next caller
-/// retries (see [`DiskArtifactCache::coalesced_fetch`]).
+/// retries (see [`Flights::run`]).
 type FlightResult = std::result::Result<Arc<[u8]>, Arc<io::Error>>;
 
-/// A single in-flight fetch that concurrent callers for the same cache target
-/// can wait on instead of issuing their own remote read.
+/// A single in-flight fetch that concurrent callers for the same key can wait
+/// on instead of issuing their own remote read.
 #[derive(Debug)]
 struct Flight {
     /// Generation token guarding removal against ABA: a stale guard (from a
     /// cancelled leader) must not evict a newer flight started for the same
-    /// target by a different leader.
+    /// key by a different leader.
     generation: u64,
     /// Broadcast handle waiters `subscribe()` to; the leader sends exactly once.
     tx: broadcast::Sender<FlightResult>,
+}
+
+/// Single-flight coordination: concurrent callers with one key share one fetch
+/// and its outcome, errors included. A key must therefore name everything the
+/// outcome depends on, or one caller's failure answers another's read.
+///
+/// This is process-local (it does not coordinate across containers).
+///
+/// - the map lock is never held across `.await`;
+/// - the slot is cleared on completion *and* on drop, so a cancelled or
+///   panicked leader cannot orphan it (waiters then observe a closed channel
+///   and retry rather than hang);
+/// - errors are propagated to current waiters but never cached — the slot is
+///   gone by then, so the next caller retries.
+#[derive(Debug)]
+pub struct Flights<K> {
+    inflight: Mutex<HashMap<K, Flight>>,
+    next_generation: AtomicU64,
+}
+
+impl<K> Default for Flights<K> {
+    fn default() -> Self {
+        Self {
+            inflight: Mutex::new(HashMap::new()),
+            next_generation: AtomicU64::new(0),
+        }
+    }
+}
+
+impl<K: Clone + Eq + std::hash::Hash> Flights<K> {
+    /// Run `fetch`, or, while a flight for `key` is already running, wait for
+    /// its outcome instead.
+    pub async fn run<F, Fut>(self: &Arc<Self>, key: K, fetch: F) -> io::Result<Vec<u8>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = io::Result<Vec<u8>>>,
+    {
+        loop {
+            // Decide leader vs waiter under the lock; release it before awaiting.
+            let role = {
+                let mut map = self.inflight.lock();
+                match map.get(&key) {
+                    Some(flight) => FlightRole::Waiter(flight.tx.subscribe()),
+                    None => {
+                        let (tx, _rx) = broadcast::channel(1);
+                        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+                        map.insert(
+                            key.clone(),
+                            Flight {
+                                generation,
+                                tx: tx.clone(),
+                            },
+                        );
+                        FlightRole::Leader { generation, tx }
+                    }
+                }
+            };
+
+            match role {
+                FlightRole::Waiter(mut rx) => match rx.recv().await {
+                    Ok(Ok(bytes)) => return Ok(bytes.to_vec()),
+                    Ok(Err(err)) => return Err(io::Error::new(err.kind(), err.to_string())),
+                    // Leader finished without publishing (cancelled/panicked).
+                    // Its guard has cleared the slot, so retry as a fresh caller
+                    // rather than wait on a result that will never arrive.
+                    Err(_) => continue,
+                },
+                FlightRole::Leader { generation, tx } => {
+                    // Clears the slot on completion or on early return /
+                    // cancellation (drop). Generation-checked, so it never
+                    // evicts a newer flight for the same key.
+                    let guard = FlightGuard {
+                        flights: Arc::clone(self),
+                        key: key.clone(),
+                        generation,
+                    };
+                    let outcome = fetch().await;
+
+                    // Clear the slot before waking waiters so callers arriving
+                    // after this point start a fresh flight (and hit whatever
+                    // the leader wrote) instead of subscribing to a finished one.
+                    drop(guard);
+
+                    // Wake waiters that subscribed before removal. Skip the
+                    // shared allocation entirely when nobody is waiting.
+                    if tx.receiver_count() > 0 {
+                        let payload: FlightResult = match &outcome {
+                            Ok(bytes) => Ok(Arc::from(bytes.as_slice())),
+                            Err(err) => Err(Arc::new(io::Error::new(err.kind(), err.to_string()))),
+                        };
+                        let _ = tx.send(payload);
+                    }
+                    return outcome;
+                }
+            }
+        }
+    }
+
+    /// Remove the in-flight entry for `key` iff it is still the flight with
+    /// `generation`. The generation check keeps removal ABA-safe: a stale guard
+    /// from a cancelled leader must not evict a newer flight a different leader
+    /// started for the same key.
+    fn finish(&self, key: &K, generation: u64) {
+        let mut map = self.inflight.lock();
+        if map.get(key).is_some_and(|f| f.generation == generation) {
+            map.remove(key);
+        }
+    }
 }
 
 /// Whether this caller leads the flight (does the fetch) or waits on a leader.
@@ -85,16 +185,16 @@ enum FlightRole {
 /// RAII guard that clears a leader's in-flight slot on completion or on drop,
 /// so a cancelled or panicked leader cannot orphan the slot (which would wedge
 /// every later waiter on it). Removal is generation-checked, so it never evicts
-/// a newer flight for the same target.
-struct FlightGuard {
-    cache: Arc<DiskArtifactCache>,
-    target: PathBuf,
+/// a newer flight for the same key.
+struct FlightGuard<K: Clone + Eq + std::hash::Hash> {
+    flights: Arc<Flights<K>>,
+    key: K,
     generation: u64,
 }
 
-impl Drop for FlightGuard {
+impl<K: Clone + Eq + std::hash::Hash> Drop for FlightGuard<K> {
     fn drop(&mut self) {
-        self.cache.finish_flight(&self.target, self.generation);
+        self.flights.finish(&self.key, self.generation);
     }
 }
 
@@ -104,12 +204,9 @@ pub struct DiskArtifactCache {
     budget_bytes: u64,
     /// Shared with the background scan that sizes the directory.
     state: Arc<Mutex<DiskArtifactCacheState>>,
-    /// Per-target single-flight coordination: coalesces concurrent remote
-    /// fetches for the same cache target into one `cs.get` + one tmp-file write.
-    /// Keyed by the resolved cache-target path (narrow: same content + same
-    /// destination). Never held across `.await`.
-    inflight: Mutex<HashMap<PathBuf, Flight>>,
-    next_flight_generation: AtomicU64,
+    /// Coalesces concurrent fetches for one cache target into one remote read
+    /// and one tmp-file write, for [`Self::coalesced_fetch`].
+    flights: Arc<Flights<PathBuf>>,
 }
 
 #[derive(Debug, Default)]
@@ -157,9 +254,9 @@ pub fn try_read_cached_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
 
 /// `NotFound` — and `Unsupported`, which is what every `std::fs` call returns
 /// on wasm32-unknown-unknown — are cache MISSES that must fall through to the
-/// authoritative CAS fetch, not errors. `fetch_cached_bytes*` apply `?` to
-/// this result before attempting the fetch, so anything mapped to `Err` here
-/// aborts the read outright.
+/// authoritative CAS fetch, not errors: a coalesced fetch's leader checks the
+/// entry through this before fetching, and anything mapped to `Err` here
+/// would fail the read outright.
 fn read_result_as_cache_outcome(res: io::Result<Vec<u8>>) -> io::Result<Option<Vec<u8>>> {
     match res {
         Ok(bytes) => Ok(Some(bytes)),
@@ -251,17 +348,6 @@ impl DiskArtifactCache {
         cache
     }
 
-    /// A cache with no directory and no budget, used only for its flights.
-    fn detached() -> Self {
-        Self {
-            root: PathBuf::new(),
-            budget_bytes: 0,
-            state: Arc::new(Mutex::new(DiskArtifactCacheState::default())),
-            inflight: Mutex::new(HashMap::new()),
-            next_flight_generation: AtomicU64::new(0),
-        }
-    }
-
     fn new(root: PathBuf) -> Self {
         if let Err(err) = fs::create_dir_all(&root) {
             tracing::warn!(
@@ -273,8 +359,7 @@ impl DiskArtifactCache {
                 root,
                 budget_bytes: 0,
                 state: Arc::new(Mutex::new(DiskArtifactCacheState::default())),
-                inflight: Mutex::new(HashMap::new()),
-                next_flight_generation: AtomicU64::new(0),
+                flights: Arc::default(),
             };
         }
 
@@ -336,8 +421,7 @@ impl DiskArtifactCache {
             root,
             budget_bytes,
             state: Arc::new(Mutex::new(DiskArtifactCacheState::default())),
-            inflight: Mutex::new(HashMap::new()),
-            next_flight_generation: AtomicU64::new(0),
+            flights: Arc::default(),
         }
     }
 
@@ -348,9 +432,13 @@ impl DiskArtifactCache {
             root,
             budget_bytes,
             state: Arc::new(Mutex::new(DiskArtifactCacheState::default())),
-            inflight: Mutex::new(HashMap::new()),
-            next_flight_generation: AtomicU64::new(0),
+            flights: Arc::default(),
         }
+    }
+
+    /// The directory this cache keeps its entries in.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// The disk byte budget. `0` means disk caching is disabled (writes are
@@ -465,7 +553,7 @@ impl DiskArtifactCache {
     /// An absent entry is the common case — most released CIDs were never
     /// cached — and is not an error. Untracked totals stay untracked so the
     /// next capacity check rescans rather than trusting a partial figure.
-    fn evict_entry(&self, path: &Path) {
+    pub(crate) fn evict_entry(&self, path: &Path) {
         let Ok(metadata) = fs::metadata(path) else {
             return;
         };
@@ -626,35 +714,16 @@ impl DiskArtifactCache {
         }
     }
 
-    /// Remove the in-flight entry for `target` iff it is still the flight with
-    /// `generation`. The generation check keeps removal ABA-safe: a stale guard
-    /// from a cancelled leader must not evict a newer flight a different leader
-    /// started for the same target.
-    fn finish_flight(&self, target: &Path, generation: u64) {
-        let mut map = self.inflight.lock();
-        if map.get(target).is_some_and(|f| f.generation == generation) {
-            map.remove(target);
-        }
-    }
-
     /// Coalesce concurrent remote fetches that target the same cache path so
     /// only ONE `fetch` runs per `target` at a time; other callers await the
     /// shared result instead of each issuing their own S3 GET and tmp-file
-    /// write. This is process-local (it does not coordinate across containers).
+    /// write (see [`Flights`]).
     ///
     /// `fetch` is the leader's remote read (e.g. `cs.get(id)` mapped to io).
     /// Only the leader runs it. After winning the flight the leader double-
     /// checks disk (a just-finished prior flight may have written the file),
     /// then on a miss fetches once, writes the cache atomically, and wakes
     /// waiters with the shared bytes.
-    ///
-    /// Safety properties:
-    /// - the in-flight map lock is never held across `.await`;
-    /// - the slot is cleared on completion *and* on drop, so a cancelled or
-    ///   panicked leader cannot orphan it (waiters then observe a closed channel
-    ///   and retry rather than hang);
-    /// - errors are propagated to current waiters but never cached — the slot is
-    ///   gone by then, so the next caller retries.
     pub async fn coalesced_fetch<F, Fut>(
         self: &Arc<Self>,
         target: PathBuf,
@@ -664,278 +733,289 @@ impl DiskArtifactCache {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = io::Result<Vec<u8>>>,
     {
-        self.coalesce(target, true, fetch).await
+        self.flights
+            .run(target.clone(), || self.fill(&target, fetch))
+            .await
     }
 
-    /// [`Self::coalesced_fetch`], with `persist == false` touching no disk:
-    /// the leader neither re-checks nor writes `target`, only fetches.
-    async fn coalesce<F, Fut>(
-        self: &Arc<Self>,
-        target: PathBuf,
-        persist: bool,
-        fetch: F,
-    ) -> io::Result<Vec<u8>>
+    /// The leader's half of a coalesced fetch: `target`'s bytes, fetched and
+    /// written unless a prior flight has just written them.
+    async fn fill<F, Fut>(&self, target: &Path, fetch: F) -> io::Result<Vec<u8>>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = io::Result<Vec<u8>>>,
     {
-        loop {
-            // Decide leader vs waiter under the lock; release it before awaiting.
-            let role = {
-                let mut map = self.inflight.lock();
-                match map.get(&target) {
-                    Some(flight) => FlightRole::Waiter(flight.tx.subscribe()),
-                    None => {
-                        let (tx, _rx) = broadcast::channel(1);
-                        let generation =
-                            self.next_flight_generation.fetch_add(1, Ordering::Relaxed);
-                        map.insert(
-                            target.clone(),
-                            Flight {
-                                generation,
-                                tx: tx.clone(),
-                            },
-                        );
-                        FlightRole::Leader { generation, tx }
-                    }
-                }
-            };
+        // The disk re-check is an OPTIMIZATION only. A cache miss (`Ok(None)`)
+        // OR a transient read error (`Err`, e.g. EIO / fd exhaustion on the
+        // local file) both fall through to the authoritative remote fetch — we
+        // must not let one caller's disk hiccup broadcast a failure to the
+        // whole coalesced batch, since the fetch path can satisfy everyone.
+        if let Some(bytes) = try_read_cached_bytes(target).ok().flatten() {
+            return Ok(bytes);
+        }
+        let bytes = fetch().await?;
+        self.best_effort_write(target, &bytes);
+        Ok(bytes)
+    }
+}
 
-            match role {
-                FlightRole::Waiter(mut rx) => match rx.recv().await {
-                    Ok(Ok(bytes)) => return Ok(bytes.to_vec()),
-                    Ok(Err(err)) => return Err(io::Error::new(err.kind(), err.to_string())),
-                    // Leader finished without publishing (cancelled/panicked).
-                    // Its guard has cleared the slot, so retry as a fresh caller
-                    // rather than wait on a result that will never arrive.
-                    Err(_) => continue,
-                },
-                FlightRole::Leader { generation, tx } => {
-                    // Clears the slot on completion or on early return /
-                    // cancellation (drop). Generation-checked, so it never
-                    // evicts a newer flight for the same target.
-                    let guard = FlightGuard {
-                        cache: Arc::clone(self),
-                        target: target.clone(),
-                        generation,
-                    };
+// ============================================================================
+// CachedContentStore
+// ============================================================================
 
-                    // Double-check disk after winning: a prior flight for the
-                    // same target may have just completed its atomic write.
-                    //
-                    // The disk re-check is an OPTIMIZATION only. A cache miss
-                    // (`Ok(None)`) OR a transient read error (`Err`, e.g. EIO /
-                    // fd exhaustion on the local file) both fall through to the
-                    // authoritative remote fetch — we must not let one caller's
-                    // disk hiccup broadcast a failure to the whole coalesced
-                    // batch, since the fetch path can satisfy everyone.
-                    let cached = if persist {
-                        try_read_cached_bytes(&target).ok().flatten()
-                    } else {
-                        None
-                    };
-                    let outcome: io::Result<Vec<u8>> = match cached {
-                        Some(bytes) => Ok(bytes),
-                        None => match fetch().await {
-                            Ok(bytes) => {
-                                if persist {
-                                    self.best_effort_write(&target, &bytes);
-                                }
-                                Ok(bytes)
-                            }
-                            Err(err) => Err(err),
-                        },
-                    };
+/// A remote [`ContentStore`] fronted by the disk artifact cache.
+///
+/// The cache is a property of how a store stack is assembled, not something
+/// readers consult: [`crate::StorageBackend::with_disk_cache`] wraps the
+/// stores whose reads leave the machine, and every read through the wrapper
+/// is served from the inner store's local tier, then this cache, then a
+/// fetch that writes the cache. A local store is never wrapped, so it is
+/// never copied into the cache.
+///
+/// Built [`uncached`](Self::uncached) (for a store whose bytes may not sit
+/// on disk in plaintext) it still coalesces concurrent fetches of one object,
+/// and writes nothing.
+///
+/// Entries are keyed by CID alone, so every store over one directory shares
+/// them. Fetches are not: a waiter takes the leader's outcome without running
+/// its own read, so a flight is shared only by stores reading one storage
+/// with one key, in one namespace. Otherwise a child branch's miss would fail
+/// its parent's concurrent read, and a store that cannot decrypt would receive
+/// another's plaintext.
+#[derive(Debug, Clone)]
+pub struct CachedContentStore {
+    inner: Arc<dyn ContentStore>,
+    disk: Option<Arc<DiskArtifactCache>>,
+    flights: Arc<StoreFlights>,
+    /// The namespace `inner` reads, which scopes its flights in `flights`.
+    scope: Arc<str>,
+}
 
-                    // Clear the slot before waking waiters so callers arriving
-                    // after this point start a fresh flight (and hit the now-
-                    // written cache) instead of subscribing to a finished one.
-                    drop(guard);
+/// In-flight fetches of the stores one backend hands out, keyed by namespace
+/// and object; see [`CachedContentStore`].
+pub type StoreFlights = Flights<(Arc<str>, ContentId)>;
 
-                    // Wake waiters that subscribed before removal. Skip the
-                    // shared allocation entirely when nobody is waiting.
-                    if tx.receiver_count() > 0 {
-                        let payload: FlightResult = match &outcome {
-                            Ok(bytes) => Ok(Arc::from(bytes.as_slice())),
-                            Err(err) => Err(Arc::new(io::Error::new(err.kind(), err.to_string()))),
-                        };
-                        let _ = tx.send(payload);
-                    }
-                    return outcome;
-                }
-            }
+impl CachedContentStore {
+    /// Front `inner` with the cache directory `cache` serves.
+    pub fn new(inner: Arc<dyn ContentStore>, cache: Arc<DiskArtifactCache>) -> Self {
+        Self::in_backend(inner, Some(cache), Arc::default(), "")
+    }
+
+    /// Coalesce `inner`'s fetches without touching disk.
+    pub fn uncached(inner: Arc<dyn ContentStore>) -> Self {
+        Self::in_backend(inner, None, Arc::default(), "")
+    }
+
+    /// The store a backend hands out for `namespace`: `flights` belongs to
+    /// the backend and is shared by every store it hands out.
+    pub(crate) fn in_backend(
+        inner: Arc<dyn ContentStore>,
+        disk: Option<Arc<DiskArtifactCache>>,
+        flights: Arc<StoreFlights>,
+        namespace: &str,
+    ) -> Self {
+        Self {
+            inner,
+            disk,
+            flights,
+            scope: Arc::from(namespace),
+        }
+    }
+
+    fn entry(&self, id: &ContentId) -> Option<PathBuf> {
+        self.disk
+            .as_ref()
+            .map(|cache| cache.root.join(id.to_string()))
+    }
+
+    /// `id` from the inner store, one fetch per object in flight in this
+    /// store's namespace. The leader writes `entry` unless a prior flight has
+    /// just written it.
+    async fn fetch(&self, id: &ContentId, entry: Option<&Path>) -> crate::error::Result<Vec<u8>> {
+        let key = (Arc::clone(&self.scope), id.clone());
+        let fetch = || async {
+            self.inner
+                .get(id)
+                .await
+                .map(ContentBytes::into_vec)
+                .map_err(storage_to_io_error)
+        };
+        match (&self.disk, entry) {
+            (Some(cache), Some(path)) => self.flights.run(key, || cache.fill(path, fetch)).await,
+            _ => self.flights.run(key, fetch).await,
+        }
+        .map_err(io_to_storage_error)
+    }
+
+    /// Drop `id`'s cache entry. Called after the inner store released it,
+    /// never before: evicting first leaves a window where a concurrent reader
+    /// refills the entry from a store that still holds the blob. A fetch
+    /// already in flight may still write the entry after this; consumers
+    /// that must not act on a released object tolerate one.
+    fn evict(&self, id: &ContentId) {
+        if let (Some(cache), Some(path)) = (&self.disk, self.entry(id)) {
+            cache.evict_entry(&path);
         }
     }
 }
 
-/// Whether `cs`'s artifacts belong in the disk cache at all.
-///
-/// The rule every reader and writer of the cache follows. A local copy pays
-/// off only when the store's reads leave the machine — a store on local disk
-/// or in memory is already as fast as the cache would be — and is allowed
-/// only when the store's bytes may sit outside it in plaintext.
-pub fn uses_disk_cache(cs: &dyn ContentStore) -> bool {
-    cs.is_remote() && cs.permits_plaintext_cache()
-}
-
-/// Whether a copy of `id` belongs in the disk cache: [`uses_disk_cache`],
-/// and the store does not already serve it locally (a remote store's local
-/// tier).
-pub fn needs_disk_copy(cs: &dyn ContentStore, id: &ContentId) -> bool {
-    uses_disk_cache(cs) && !matches!(cs.get_local(id), Ok(Some(_)))
-}
-
-/// Copy `bytes`, which `cs` holds as `id`, into the cache at `cache_dir` when
-/// [`needs_disk_copy`] says a copy is worth having, returning whether it
-/// tried. Best effort: a failed write only costs a later fetch.
-pub fn seed_disk_cache(
-    cs: &dyn ContentStore,
-    id: &ContentId,
-    cache_dir: &Path,
-    bytes: &[u8],
-) -> bool {
-    if !needs_disk_copy(cs, id) {
-        return false;
-    }
-    DiskArtifactCache::for_dir(cache_dir).best_effort_write(&cache_dir.join(id.to_string()), bytes);
-    true
-}
-
-/// Drop `id` from every disk cache this process holds open.
-///
-/// Callers delete an object from storage and then call this. A cache entry
-/// that outlives its blob still reads back, so anything deciding what storage
-/// holds from a cached read sees a deleted object as present — the index-chain
-/// walk ends at a root storage no longer holds, and a stale entry hides that
-/// ending.
-///
-/// Best effort, and narrower than "no entry outlives its blob":
-///
-/// - it reaches this process's caches, so a delete by another process leaves
-///   that process's entry behind,
-/// - a crash between the delete and this call leaves the entry behind, where
-///   it survives restarts and goes only when the cache exceeds its budget,
-/// - it is reached through [`ContentStore::release`], and not every delete
-///   goes that way: the index sweep reclaims orphans by address, through
-///   [`crate::storage::Storage::delete`], because its plan comes from a
-///   storage listing and has no CID to evict by. Those entries stay behind
-///   the same way a crash leaves them. The sweep can afford that because an
-///   orphan is, by construction, a blob no index chain reaches, so no walk
-///   reads its entry afterwards,
-/// - a fetch already in flight for `id` writes its result when it completes,
-///   which can be after this call. Eviction removes an entry; it cannot
-///   cancel the read that is about to replace it.
-/// - it drops entries keyed by CID ([`fetch_cached_bytes_cid`]). Entries
-///   [`fetch_cached_bytes`] keys by digest and extension would need a
-///   directory scan per call to find, which a release loop cannot afford, so
-///   they are left to budget eviction.
-///
-/// Consumers that must not act on a released object therefore still need to
-/// tolerate one, rather than treating this as a guarantee.
-pub fn evict_cached_cid(id: &ContentId) {
-    // Snapshot before touching the filesystem: a release loop runs many of
-    // these concurrently and the registry lock is process-global.
-    //
-    // Registered directories outlive the cache instances that opened them —
-    // callers build a `DiskArtifactCache` per fetch and drop it — so the entry
-    // to remove is found by directory, and the instance is used only when one
-    // still happens to be open.
-    let caches: Vec<(PathBuf, Option<Arc<DiskArtifactCache>>)> = CACHE_REGISTRY
-        .lock()
-        .iter()
-        .map(|(dir, cache)| (dir.clone(), cache.upgrade()))
-        .collect();
-
-    for (dir, cache) in caches {
-        let path = dir.join(id.to_string());
-        match cache {
-            // A live instance tracks its own byte total, so go through it and
-            // keep the budget accounting in step.
-            Some(cache) => cache.evict_entry(&path),
-            // Nothing holds this directory open, so no total needs adjusting;
-            // whichever instance opens it next rescans from disk.
-            None => match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => tracing::debug!(
-                    cache_dir = %dir.display(),
-                    error = %err,
-                    "failed to evict cache entry for a released object"
-                ),
-            },
+/// A cache entry's bytes. Read failures are misses: the entry is a copy, and
+/// the inner store is the authority.
+#[cfg(not(target_arch = "wasm32"))]
+fn read_entry(path: &Path) -> Option<ContentBytes> {
+    // SAFETY: entries land by renaming a staged file into place
+    // (`write_atomic`) and are only ever unlinked after that.
+    match unsafe { ContentBytes::open(path) } {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::debug!(path = %path.display(), error = %err, "unreadable cache entry; fetching");
+            None
         }
     }
 }
 
-/// Read `id` straight from the store, touching no cache path: the read path
-/// for every store [`uses_disk_cache`] keeps out of the cache. For one that
-/// decrypts on read, its bytes must not land in the cache directory, and a
-/// stale plaintext entry from an earlier unencrypted run must not be
-/// consulted either. Concurrent readers of one artifact still share a single
-/// fetch, keyed by `target` — the path the cache would have used.
-async fn fetch_uncached(
-    cs: &dyn ContentStore,
-    id: &ContentId,
-    target: PathBuf,
-) -> io::Result<Vec<u8>> {
-    UNCACHED_FLIGHTS
-        .coalesce(target, false, || async {
-            cs.get(id)
-                .await
-                .map(ContentBytes::into_vec)
-                .map_err(storage_to_io_error)
-        })
-        .await
+#[cfg(target_arch = "wasm32")]
+fn read_entry(_path: &Path) -> Option<ContentBytes> {
+    None
 }
 
-// Both return `fetch_through_cache`'s future rather than awaiting it: an
-// extra `async fn` layer here pushes some callers' future types past the
-// compiler's layout depth limit.
-pub fn fetch_cached_bytes<'a>(
-    cs: &'a dyn ContentStore,
-    id: &'a ContentId,
-    cache_dir: &'a Path,
-    ext: &str,
-) -> impl std::future::Future<Output = io::Result<Vec<u8>>> + 'a {
-    let cached = cache_dir.join(format!("{}.{}", id.digest_hex(), ext));
-    fetch_through_cache(cs, id, cache_dir, cached)
+/// `range` of a cache entry, read positionally; `None` when the entry is
+/// absent or unreadable.
+#[cfg(not(target_arch = "wasm32"))]
+fn read_entry_range(path: &Path, range: std::ops::Range<u64>) -> Option<Vec<u8>> {
+    let file = fs::File::open(path).ok()?;
+    let len = range.end.saturating_sub(range.start) as usize;
+    let mut buf = vec![0u8; len];
+    #[cfg(unix)]
+    let n = {
+        use std::os::unix::fs::FileExt;
+        file.read_at(&mut buf, range.start).ok()?
+    };
+    #[cfg(not(unix))]
+    let n = {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = file;
+        file.seek(SeekFrom::Start(range.start)).ok()?;
+        file.read(&mut buf).ok()?
+    };
+    buf.truncate(n);
+    Some(buf)
 }
 
-pub fn fetch_cached_bytes_cid<'a>(
-    cs: &'a dyn ContentStore,
-    id: &'a ContentId,
-    cache_dir: &'a Path,
-) -> impl std::future::Future<Output = io::Result<Vec<u8>>> + 'a {
-    let cached = cache_dir.join(id.to_string());
-    fetch_through_cache(cs, id, cache_dir, cached)
+#[cfg(target_arch = "wasm32")]
+fn read_entry_range(_path: &Path, _range: std::ops::Range<u64>) -> Option<Vec<u8>> {
+    None
 }
 
-/// Read `id` from the store's local tier when it has one, else through the
-/// disk cache entry `cached` when [`uses_disk_cache`] allows, else straight
-/// from the store.
-async fn fetch_through_cache(
-    cs: &dyn ContentStore,
-    id: &ContentId,
-    cache_dir: &Path,
-    cached: PathBuf,
-) -> io::Result<Vec<u8>> {
-    if let Some(bytes) = cs.get_local(id).map_err(storage_to_io_error)? {
-        return Ok(bytes.into_vec());
+fn io_to_storage_error(e: io::Error) -> crate::error::Error {
+    match e.kind() {
+        io::ErrorKind::NotFound => crate::error::Error::not_found(e.to_string()),
+        _ => crate::error::Error::storage(e.to_string()),
     }
-    if !uses_disk_cache(cs) {
-        return fetch_uncached(cs, id, cached).await;
+}
+
+#[async_trait::async_trait]
+impl ContentStore for CachedContentStore {
+    async fn has(&self, id: &ContentId) -> crate::error::Result<bool> {
+        self.inner.has(id).await
     }
-    if let Some(bytes) = try_read_cached_bytes(&cached)? {
-        return Ok(bytes);
+
+    async fn get(&self, id: &ContentId) -> crate::error::Result<ContentBytes> {
+        if let Some(bytes) = self.inner.get_local(id)? {
+            return Ok(bytes);
+        }
+        let Some(path) = self.entry(id) else {
+            return self.fetch(id, None).await.map(Into::into);
+        };
+        if let Some(bytes) = read_entry(&path) {
+            return Ok(bytes);
+        }
+        let bytes = self.fetch(id, Some(&path)).await?;
+        // Read back the entry just written, so a large object is held as a
+        // mapping (page cache) rather than heap.
+        Ok(read_entry(&path).unwrap_or_else(|| bytes.into()))
     }
-    DiskArtifactCache::for_dir(cache_dir)
-        .coalesced_fetch(cached, || async {
-            cs.get(id)
-                .await
-                .map(ContentBytes::into_vec)
-                .map_err(storage_to_io_error)
-        })
-        .await
+
+    fn get_local(&self, id: &ContentId) -> crate::error::Result<Option<ContentBytes>> {
+        if let Some(bytes) = self.inner.get_local(id)? {
+            return Ok(Some(bytes));
+        }
+        Ok(self.entry(id).and_then(|path| read_entry(&path)))
+    }
+
+    async fn get_range(
+        &self,
+        id: &ContentId,
+        range: std::ops::Range<u64>,
+    ) -> crate::error::Result<Vec<u8>> {
+        if let Some(bytes) = self
+            .entry(id)
+            .and_then(|path| read_entry_range(&path, range.clone()))
+        {
+            return Ok(bytes);
+        }
+        self.inner.get_range(id, range).await
+    }
+
+    fn supports_ranged_reads(&self) -> bool {
+        self.inner.supports_ranged_reads()
+    }
+
+    async fn put(&self, kind: crate::ContentKind, bytes: &[u8]) -> crate::error::Result<ContentId> {
+        self.inner.put(kind, bytes).await
+    }
+
+    async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> crate::error::Result<()> {
+        self.inner.put_with_id(id, bytes).await
+    }
+
+    async fn prefetch(&self, id: &ContentId) -> crate::error::Result<()> {
+        let Some(path) = self.entry(id) else {
+            return Ok(());
+        };
+        if path.exists() || self.inner.get_local(id)?.is_some() {
+            return Ok(());
+        }
+        self.fetch(id, Some(&path)).await.map(drop)
+    }
+
+    fn keep_local(&self, id: &ContentId, bytes: &[u8]) {
+        let (Some(cache), Some(path)) = (&self.disk, self.entry(id)) else {
+            return;
+        };
+        if matches!(self.inner.get_local(id), Ok(Some(_))) {
+            return;
+        }
+        cache.best_effort_write(&path, bytes);
+    }
+
+    async fn release(&self, id: &ContentId) -> crate::error::Result<()> {
+        let released = self.inner.release(id).await;
+        self.evict(id);
+        released
+    }
+
+    async fn release_many(&self, ids: &[ContentId]) -> Vec<(ContentId, crate::error::Error)> {
+        let failures = self.inner.release_many(ids).await;
+        // Every id, failed or not: a failed release may have deleted some of
+        // the blob's addresses, and a needless eviction only costs a refetch.
+        for id in ids {
+            self.evict(id);
+        }
+        failures
+    }
+
+    fn miss_register(&self) -> Option<&crate::storage::residency::MissRegister> {
+        self.inner.miss_register()
+    }
+
+    fn query_guard(&self) -> Option<crate::storage::residency::InFlightGuard> {
+        self.inner.query_guard()
+    }
+
+    async fn sync(&self) -> crate::error::Result<()> {
+        self.inner.sync().await
+    }
 }
 
 #[cfg(test)]
@@ -945,8 +1025,7 @@ mod tests {
 
     /// wasm32-unknown-unknown returns `Unsupported` from every `std::fs`
     /// call. That MUST read as a cache miss (fall through to CAS fetch), not
-    /// an error — `fetch_cached_bytes*` apply `?` to this result before ever
-    /// reaching the fetch.
+    /// an error.
     #[test]
     fn unsupported_read_is_a_miss_not_an_error() {
         let miss = read_result_as_cache_outcome(Err(io::Error::new(
@@ -1081,44 +1160,6 @@ mod tests {
 
     /// A released object's entry must go, or a later read sees a blob storage
     /// no longer holds.
-    #[tokio::test]
-    async fn evicting_a_cid_removes_its_cached_entry() {
-        let dir = temp_cache_dir("evict-cid");
-        let data = vec![7u8; 128];
-        let id = ContentId::new(crate::ContentKind::IndexRoot, &data);
-        let store = CountingStore {
-            data: data.clone(),
-            gets: Arc::new(AtomicUsize::new(0)),
-            delay: Duration::ZERO,
-            permits_plaintext_cache: true,
-            remote: true,
-            local: false,
-        };
-
-        fetch_cached_bytes_cid(&store, &id, &dir).await.unwrap();
-        let cached = dir.join(id.to_string());
-        assert!(cached.exists(), "fetch should have populated the cache");
-
-        evict_cached_cid(&id);
-
-        assert!(
-            !cached.exists(),
-            "released CID still readable from the cache"
-        );
-    }
-
-    /// Most released CIDs were never cached, so an absent entry is the common
-    /// path, not an error.
-    #[test]
-    fn evicting_an_uncached_cid_is_silent() {
-        let dir = temp_cache_dir("evict-absent");
-        // Registers the cache so the eviction has somewhere to look.
-        let _cache = DiskArtifactCache::for_dir(&dir);
-        let id = ContentId::new(crate::ContentKind::IndexRoot, b"never-cached");
-
-        evict_cached_cid(&id);
-    }
-
     /// Eviction and writes share the byte accounting, so a released entry does
     /// not leave the budget overstated.
     #[test]
@@ -1383,16 +1424,30 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    /// Counting content store: records `get` calls and can delay to widen the
-    /// concurrency window.
-    #[derive(Debug)]
+    /// A remote store whose fetches count. `local` makes it serve its bytes
+    /// locally instead; `watch` records whether that path existed when a
+    /// release reached the store.
+    #[derive(Debug, Default)]
     struct CountingStore {
         data: Vec<u8>,
-        gets: Arc<AtomicUsize>,
+        gets: AtomicUsize,
         delay: Duration,
-        permits_plaintext_cache: bool,
-        remote: bool,
         local: bool,
+        watch: Option<PathBuf>,
+        watched_at_release: std::sync::atomic::AtomicBool,
+    }
+
+    impl CountingStore {
+        fn remote(data: &[u8]) -> Self {
+            Self {
+                data: data.to_vec(),
+                ..Self::default()
+            }
+        }
+
+        fn gets(&self) -> usize {
+            self.gets.load(Ordering::SeqCst)
+        }
     }
 
     #[async_trait::async_trait]
@@ -1400,10 +1455,13 @@ mod tests {
         async fn has(&self, _id: &ContentId) -> crate::error::Result<bool> {
             Ok(true)
         }
-        async fn get(&self, _id: &ContentId) -> crate::error::Result<crate::storage::ContentBytes> {
+        async fn get(&self, _id: &ContentId) -> crate::error::Result<ContentBytes> {
             self.gets.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
             Ok(self.data.clone().into())
+        }
+        fn get_local(&self, _id: &ContentId) -> crate::error::Result<Option<ContentBytes>> {
+            Ok(self.local.then(|| self.data.clone().into()))
         }
         async fn put(
             &self,
@@ -1416,18 +1474,11 @@ mod tests {
             unimplemented!("put_with_id not needed for cache tests")
         }
         async fn release(&self, _id: &ContentId) -> crate::error::Result<()> {
+            if let Some(path) = &self.watch {
+                self.watched_at_release
+                    .store(path.exists(), Ordering::SeqCst);
+            }
             Ok(())
-        }
-        fn permits_plaintext_cache(&self) -> bool {
-            self.permits_plaintext_cache
-        }
-
-        fn is_remote(&self) -> bool {
-            self.remote
-        }
-
-        fn get_local(&self, _id: &ContentId) -> crate::error::Result<Option<ContentBytes>> {
-            Ok(self.local.then(|| self.data.clone().into()))
         }
     }
 
@@ -1450,219 +1501,166 @@ mod tests {
         out
     }
 
-    fn store(remote: bool, permits_plaintext_cache: bool, local: bool) -> CountingStore {
-        CountingStore {
-            data: b"bytes".to_vec(),
-            gets: Arc::new(AtomicUsize::new(0)),
-            delay: Duration::ZERO,
-            permits_plaintext_cache,
-            remote,
-            local,
-        }
+    fn cached(store: Arc<CountingStore>, dir: &Path) -> CachedContentStore {
+        CachedContentStore::new(store, DiskArtifactCache::for_dir(dir))
     }
 
-    #[test]
-    fn only_remote_plaintext_artifacts_without_a_local_file_need_a_disk_copy() {
-        let id = ContentId::new(crate::ContentKind::IndexLeaf, b"leaf");
-        assert!(needs_disk_copy(&store(true, true, false), &id));
-        assert!(
-            !needs_disk_copy(&store(false, true, false), &id),
-            "local store"
-        );
-        assert!(
-            !needs_disk_copy(&store(true, false, false), &id),
-            "decrypting store"
-        );
-        assert!(
-            !needs_disk_copy(&store(true, true, true), &id),
-            "a remote store's local tier"
-        );
-    }
-
-    #[test]
-    fn seeding_writes_only_what_needs_a_disk_copy() {
-        let dir = temp_cache_dir("seed");
-        let id = ContentId::new(crate::ContentKind::IndexLeaf, b"leaf");
-
-        assert!(!seed_disk_cache(
-            &store(false, true, false),
-            &id,
-            &dir,
-            b"bytes"
-        ));
-        assert!(regular_files_under(&dir).is_empty());
-
-        assert!(seed_disk_cache(
-            &store(true, true, false),
-            &id,
-            &dir,
-            b"bytes"
-        ));
-        assert_eq!(fs::read(dir.join(id.to_string())).unwrap(), b"bytes");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// A store in memory is read directly: fetching through the cache helpers
-    /// writes nothing to the cache directory.
+    /// A fetch fills the entry, and every later read — whole, local or a
+    /// range — is served from it.
     #[tokio::test]
-    async fn fetch_from_a_local_store_writes_nothing_to_the_cache() {
-        let dir = temp_cache_dir("local-store");
-        let store = crate::storage::MemoryContentStore::new();
-        let id = store
-            .put(crate::ContentKind::IndexLeaf, b"bytes")
-            .await
-            .unwrap();
-        for _ in 0..2 {
-            assert_eq!(
-                fetch_cached_bytes_cid(&store, &id, &dir).await.unwrap(),
-                b"bytes"
-            );
-            assert_eq!(
-                fetch_cached_bytes(&store, &id, &dir, "nba").await.unwrap(),
-                b"bytes"
-            );
-        }
-        assert!(regular_files_under(&dir).is_empty());
+    async fn a_fetched_object_is_served_from_its_entry() {
+        let dir = temp_cache_dir("wrapper-entry");
+        let data = vec![5u8; 128];
+        let id = ContentId::new(crate::ContentKind::IndexLeaf, &data);
+        let inner = Arc::new(CountingStore::remote(&data));
+        let store = cached(Arc::clone(&inner), &dir);
+
+        assert!(store.get_local(&id).unwrap().is_none(), "nothing local yet");
+        assert_eq!(store.get(&id).await.unwrap(), data);
+        assert!(dir.join(id.to_string()).exists());
+        assert_eq!(store.get(&id).await.unwrap(), data);
+        assert_eq!(store.get_local(&id).unwrap().unwrap(), data);
+        assert_eq!(store.get_range(&id, 8..16).await.unwrap(), &data[8..16]);
+        assert_eq!(inner.gets(), 1, "one fetch serves every read after it");
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A store that decrypts on read must leave nothing in the cache
-    /// directory: neither the CID-keyed nor the extension-keyed fetch may
-    /// spill its plaintext, and a second fetch goes back to the store.
+    /// Bytes the inner store serves locally are never copied: a mixed stack
+    /// can be fronted whole without caching its local routes.
     #[tokio::test]
-    async fn fetch_bypasses_disk_cache_when_store_forbids_plaintext() {
-        let dir = temp_cache_dir("e2e-no-plaintext-spill");
-        let data = vec![7u8; 128];
-        let id = ContentId::new(crate::ContentKind::IndexRoot, &data);
-        let gets = Arc::new(AtomicUsize::new(0));
-        let store = CountingStore {
-            data: data.clone(),
-            gets: Arc::clone(&gets),
-            delay: Duration::ZERO,
-            permits_plaintext_cache: false,
-            remote: true,
-            local: false,
-        };
-
-        for _ in 0..2 {
-            let bytes = fetch_cached_bytes_cid(&store, &id, &dir).await.unwrap();
-            assert_eq!(bytes, data);
-            let bytes = fetch_cached_bytes(&store, &id, &dir, "nba").await.unwrap();
-            assert_eq!(bytes, data);
-        }
-
-        assert_eq!(
-            gets.load(Ordering::SeqCst),
-            4,
-            "every read must hit the store"
-        );
-        assert!(
-            regular_files_under(&dir).is_empty(),
-            "no artifact may be written to the cache directory"
-        );
-
-        // Non-vacuity: the same flow with a permitting store does populate the cache.
-        let permitting = CountingStore {
-            data: data.clone(),
-            gets: Arc::new(AtomicUsize::new(0)),
-            delay: Duration::ZERO,
-            permits_plaintext_cache: true,
-            remote: true,
-            local: false,
-        };
-        fetch_cached_bytes_cid(&permitting, &id, &dir)
-            .await
-            .unwrap();
-        assert_eq!(regular_files_under(&dir).len(), 1);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn fetch_cached_bytes_cid_coalesces_concurrent_callers() {
-        let dir = temp_cache_dir("e2e-coalesce");
-        let data = vec![42u8; 256];
-        let id = ContentId::new(crate::ContentKind::IndexRoot, &data);
-        let gets = Arc::new(AtomicUsize::new(0));
-        let store = Arc::new(CountingStore {
-            data: data.clone(),
-            gets: Arc::clone(&gets),
-            delay: Duration::from_millis(100),
-            permits_plaintext_cache: true,
-            remote: true,
-            local: false,
+    async fn bytes_the_inner_store_serves_locally_are_not_copied() {
+        let dir = temp_cache_dir("wrapper-local");
+        let id = ContentId::new(crate::ContentKind::IndexLeaf, b"local");
+        let inner = Arc::new(CountingStore {
+            local: true,
+            ..CountingStore::remote(b"local")
         });
+        let store = cached(Arc::clone(&inner), &dir);
+
+        assert_eq!(store.get(&id).await.unwrap(), b"local");
+        assert_eq!(store.get_local(&id).unwrap().unwrap(), b"local");
+        store.keep_local(&id, b"local");
+        store.prefetch(&id).await.unwrap();
+        assert_eq!(inner.gets(), 0);
+        assert!(regular_files_under(&dir).is_empty(), "nothing was copied");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A release reaches the store before the entry goes: evicting first
+    /// leaves a window where a concurrent reader refills the entry from a
+    /// store that still holds the blob.
+    #[tokio::test]
+    async fn release_deletes_then_evicts() {
+        let dir = temp_cache_dir("wrapper-release");
+        let data = vec![6u8; 64];
+        let id = ContentId::new(crate::ContentKind::IndexRoot, &data);
+        let entry = dir.join(id.to_string());
+        let inner = Arc::new(CountingStore {
+            watch: Some(entry.clone()),
+            ..CountingStore::remote(&data)
+        });
+        let store = cached(Arc::clone(&inner), &dir);
+
+        store.get(&id).await.unwrap();
+        assert!(entry.exists());
+        store.release(&id).await.unwrap();
+        assert!(
+            inner.watched_at_release.load(Ordering::SeqCst),
+            "the entry must still exist when the store releases the blob"
+        );
+        assert!(
+            !entry.exists(),
+            "a released blob stays readable from the cache"
+        );
+
+        // The same for a batch, and an id never cached is not an error.
+        store.get(&id).await.unwrap();
+        let never = ContentId::new(crate::ContentKind::IndexRoot, b"never cached");
+        assert!(store.release_many(&[id.clone(), never]).await.is_empty());
+        assert!(!entry.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Seeding writes the entry a later read is served from; a prefetch
+    /// fetches once and leaves an existing entry alone.
+    #[tokio::test]
+    async fn keep_local_and_prefetch_fill_the_entry() {
+        let dir = temp_cache_dir("wrapper-seed");
+        let seeded = ContentId::new(crate::ContentKind::IndexLeaf, b"seeded");
+        let inner = Arc::new(CountingStore::remote(b"seeded"));
+        let store = cached(Arc::clone(&inner), &dir);
+
+        store.keep_local(&seeded, b"seeded");
+        assert_eq!(store.get(&seeded).await.unwrap(), b"seeded");
+        assert_eq!(inner.gets(), 0, "a seeded object is not fetched");
+
+        let prefetched = ContentId::new(crate::ContentKind::IndexLeaf, b"prefetched");
+        store.prefetch(&prefetched).await.unwrap();
+        store.prefetch(&prefetched).await.unwrap();
+        assert_eq!(inner.gets(), 1);
+        assert!(store.get_local(&prefetched).unwrap().is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Without a directory — a store whose bytes may not sit on disk in
+    /// plaintext — concurrent readers of one cold object still share one
+    /// fetch, nothing is written, an entry left by an earlier run is never
+    /// read, and the next read goes back to the store.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_uncached_store_coalesces_without_touching_disk() {
+        let dir = temp_cache_dir("wrapper-uncached");
+        let data = vec![9u8; 256];
+        let id = ContentId::new(crate::ContentKind::IndexRoot, &data);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(id.to_string()), b"stale plaintext").unwrap();
+        let inner = Arc::new(CountingStore {
+            delay: Duration::from_millis(100),
+            ..CountingStore::remote(&data)
+        });
+        let store = Arc::new(CachedContentStore::uncached(Arc::clone(&inner) as _));
 
         let mut handles = Vec::new();
         for _ in 0..8 {
             let store = Arc::clone(&store);
-            let dir = dir.clone();
             let id = id.clone();
-            handles.push(tokio::spawn(async move {
-                fetch_cached_bytes_cid(store.as_ref(), &id, &dir).await
-            }));
+            handles.push(tokio::spawn(async move { store.get(&id).await }));
         }
         for h in handles {
             assert_eq!(h.await.unwrap().unwrap(), data);
         }
-        // End to end: eight concurrent callers, one underlying S3 GET.
-        assert_eq!(
-            gets.load(Ordering::SeqCst),
-            1,
-            "concurrent callers for the same CID should coalesce into one get"
-        );
-        // Subsequent calls hit the disk cache (still one get total).
-        assert_eq!(
-            fetch_cached_bytes_cid(store.as_ref(), &id, &dir)
-                .await
-                .unwrap(),
-            data
-        );
-        assert_eq!(gets.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.gets(), 1, "concurrent readers share one fetch");
+        assert!(store.get_local(&id).unwrap().is_none());
+        store.keep_local(&id, &data);
+        store.prefetch(&id).await.unwrap();
+        assert_eq!(regular_files_under(&dir).len(), 1, "only the stale entry");
+        store.get(&id).await.unwrap();
+        assert_eq!(inner.gets(), 2, "nothing is retained");
+        let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A store that forbids a plaintext cache keeps the single-flight: eight
-    /// concurrent readers of one cold artifact share one `get`, and the cache
-    /// directory is never created. Once the flight ends, the next read goes
-    /// back to the store.
+    /// Concurrent readers of one cold object share one fetch with a cache
+    /// directory too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn uncached_fetch_coalesces_concurrent_callers_without_touching_disk() {
-        let dir = temp_cache_dir("uncached-coalesce");
-        let data = vec![9u8; 256];
+    async fn a_cached_store_coalesces_concurrent_readers() {
+        let dir = temp_cache_dir("wrapper-coalesce");
+        let data = vec![42u8; 256];
         let id = ContentId::new(crate::ContentKind::IndexRoot, &data);
-        let gets = Arc::new(AtomicUsize::new(0));
-        let store = Arc::new(CountingStore {
-            data: data.clone(),
-            gets: Arc::clone(&gets),
+        let inner = Arc::new(CountingStore {
             delay: Duration::from_millis(100),
-            permits_plaintext_cache: false,
-            remote: true,
-            local: false,
+            ..CountingStore::remote(&data)
         });
+        let store = Arc::new(cached(Arc::clone(&inner), &dir));
 
         let mut handles = Vec::new();
-        for i in 0..8 {
+        for _ in 0..8 {
             let store = Arc::clone(&store);
-            let dir = dir.clone();
             let id = id.clone();
-            handles.push(tokio::spawn(async move {
-                if i % 2 == 0 {
-                    fetch_cached_bytes_cid(store.as_ref(), &id, &dir).await
-                } else {
-                    fetch_cached_bytes(store.as_ref(), &id, &dir, "nba").await
-                }
-            }));
+            handles.push(tokio::spawn(async move { store.get(&id).await }));
         }
         for h in handles {
             assert_eq!(h.await.unwrap().unwrap(), data);
         }
-        // One flight per cache key: the CID-keyed and extension-keyed reads
-        // are separate targets, as they are on the cached path.
-        assert_eq!(gets.load(Ordering::SeqCst), 2);
-        assert!(!dir.exists(), "no cache directory may be created");
-
-        fetch_cached_bytes_cid(store.as_ref(), &id, &dir)
-            .await
-            .unwrap();
-        assert_eq!(gets.load(Ordering::SeqCst), 3, "nothing is retained");
+        assert_eq!(inner.gets(), 1);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

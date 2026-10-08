@@ -237,7 +237,7 @@ impl<'a> ExportBuilder<'a> {
         {
             Some(store) => store,
             None => {
-                let mut store = BinaryIndexStore::empty(self.fluree.binary_store_cache_dir());
+                let mut store = BinaryIndexStore::empty();
                 store
                     .augment_namespace_codes(&ledger.snapshot.shared_namespaces())
                     .map_err(io_err)?;

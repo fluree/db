@@ -30,7 +30,6 @@ async fn apply_index<S: Storage + Clone + 'static>(
     root_id: &fluree_db_core::ContentId,
     ledger_id: &str,
     storage: &S,
-    cache_dir: &std::path::Path,
 ) {
     let root_address = fluree_db_core::storage::content_address(
         storage.storage_method(),
@@ -47,7 +46,7 @@ async fn apply_index<S: Storage + Clone + 'static>(
         storage.clone(),
         ledger_id,
     ));
-    let store = BinaryIndexStore::load_from_root_bytes(cs, &bytes, cache_dir, None)
+    let store = BinaryIndexStore::load_from_root_bytes(cs, &bytes, None)
         .await
         .expect("load binary index");
     let arc_store = Arc::new(store);
@@ -3036,7 +3035,6 @@ async fn class_property_type_distribution_tracked() {
 async fn large_dataset_statistics_accuracy() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let path = tmp.path().to_string_lossy().to_string();
-    let cache_dir = tmp.path().to_path_buf();
 
     let mut fluree = FlureeBuilder::file(path)
         .build()
@@ -3115,7 +3113,6 @@ async fn large_dataset_statistics_accuracy() {
                         .backend()
                         .admin_storage_cloned()
                         .expect("test uses managed backend"),
-                    &cache_dir,
                 )
                 .await;
             }

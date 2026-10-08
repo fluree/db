@@ -54,7 +54,6 @@ use fluree_db_nameservice::{
 use futures::FutureExt;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -841,14 +840,12 @@ impl GcPassContext {
         gc: &GcGuard,
         in_flight: InFlightBuild,
     ) -> Result<crate::gc::CleanGarbageResult> {
-        let cache_dir = self.config.artifact_cache_dir();
         let store = self.backend.content_store(ledger_id);
         let config = crate::gc::CleanGarbageConfig {
             max_old_indexes: Some(self.config.gc_max_old_indexes),
             min_time_garbage_mins: Some(self.config.gc_min_time_mins),
             // `None` sets no ceiling: the age guard always holds.
             hard_max_old_indexes: self.config.gc_hard_max_old_indexes,
-            artifact_cache_dir: Some(cache_dir.clone()),
             ..Default::default()
         };
         let Some(plan) = crate::gc::plan_garbage(store.as_ref(), root_id, &config).await? else {
@@ -869,7 +866,6 @@ impl GcPassContext {
             self.nameservice.as_ref(),
             ledger_id,
             siblings.as_deref(),
-            Some(&cache_dir),
         )
         .await
     }
@@ -988,10 +984,6 @@ impl std::fmt::Debug for TriggerHandle {
 #[derive(Clone)]
 pub struct IndexerHandle {
     trigger: TriggerHandle,
-    /// Where this worker's builds and collector cache index artifacts, so
-    /// maintenance run from outside the worker reads through the same cache
-    /// rather than a directory of its own.
-    artifact_cache_dir: Arc<Path>,
     /// Holding this Arc bumps the shutdown trigger's strong count;
     /// dropping the last clone fires the worker's `shutdown_rx`.
     _shutdown: Arc<ShutdownTrigger>,
@@ -1001,7 +993,6 @@ impl std::fmt::Debug for IndexerHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IndexerHandle")
             .field("trigger", &self.trigger)
-            .field("artifact_cache_dir", &self.artifact_cache_dir)
             .finish()
     }
 }
@@ -1302,11 +1293,6 @@ impl IndexerHandle {
         self.trigger.acquire_maintenance(ledger_id)
     }
 
-    /// Where this worker caches index artifacts on local disk.
-    pub fn artifact_cache_dir(&self) -> &Path {
-        &self.artifact_cache_dir
-    }
-
     /// Take an exclusive hold and drain in-flight work. See
     /// [`TriggerHandle::hold_quiesced`].
     pub async fn hold_quiesced(&self, ledger_id: &LedgerId) -> Option<MaintenanceGuard> {
@@ -1502,7 +1488,6 @@ impl BackgroundIndexerWorker {
         };
         let handle = IndexerHandle {
             trigger: trigger.clone(),
-            artifact_cache_dir: Arc::from(config.artifact_cache_dir()),
             _shutdown: shutdown,
         };
 

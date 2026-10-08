@@ -802,22 +802,41 @@ mod tests {
         assert!(raw.len() > plaintext.len()); // Encrypted data is larger
     }
 
-    #[test]
-    fn encrypted_storage_forbids_plaintext_cache() {
-        use fluree_db_core::{ContentStore, Storage, StorageContentStore};
+    /// The disk cache is attached where a store stack is assembled, from
+    /// the storage's answers; type erasure must not lose them. An encrypted
+    /// remote stack gets its fetches coalesced and nothing written to disk;
+    /// the same stack without the key is cached (the non-vacuity control).
+    #[tokio::test]
+    async fn an_encrypted_remote_backend_writes_nothing_to_the_disk_cache() {
+        use fluree_db_core::{ContentKind, Storage, StorageBackend};
         use std::sync::Arc;
 
         let plain = MemoryStorage::new();
         assert!(plain.permits_plaintext_cache());
-
-        let encrypted = EncryptedStorage::new(plain, test_provider());
+        let encrypted = EncryptedStorage::new(plain.clone(), test_provider());
         assert!(!encrypted.permits_plaintext_cache());
-
-        // The answer must survive type erasure and the content-store bridge,
-        // which is how the binary-index reader sees the storage.
         let erased: Arc<dyn Storage> = Arc::new(encrypted);
         assert!(!erased.permits_plaintext_cache());
-        let cs = StorageContentStore::new(erased, "db:main", "memory");
-        assert!(!cs.permits_plaintext_cache());
+
+        for encrypt in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let remote = MemoryStorage::new().simulating_remote();
+            let storage: Arc<dyn Storage> = if encrypt {
+                Arc::new(EncryptedStorage::new(remote, test_provider()))
+            } else {
+                Arc::new(remote)
+            };
+            let backend = StorageBackend::Managed(storage).with_disk_cache(dir.path());
+            let cs = backend.content_store("db:main");
+            let id = cs.put(ContentKind::IndexLeaf, b"leaf bytes").await.unwrap();
+            assert_eq!(cs.get(&id).await.unwrap(), b"leaf bytes");
+
+            let written = std::fs::read_dir(dir.path()).unwrap().count();
+            if encrypt {
+                assert_eq!(written, 0, "plaintext spilled to the disk cache");
+            } else {
+                assert_eq!(written, 1, "a plaintext remote read is cached");
+            }
+        }
     }
 }

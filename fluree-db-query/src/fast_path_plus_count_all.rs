@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn missing_predicate_count_tracks_novelty_lifecycle() {
-        let store = Arc::new(BinaryIndexStore::empty(std::env::temp_dir()));
+        let store = Arc::new(BinaryIndexStore::empty());
         let snapshot = LedgerSnapshot::genesis("missing-path:main");
         let vars = VarRegistry::new();
         let predicate = Sid::new(0, "http://example.org/edge");

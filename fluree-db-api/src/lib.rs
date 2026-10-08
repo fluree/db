@@ -1428,7 +1428,50 @@ fn is_indexing_enabled(config: &ConnectionConfig) -> bool {
         .unwrap_or(true)
 }
 
-/// Build IndexerConfig from connection defaults, falling back to defaults.
+/// Front `backend`'s remote stores with the disk artifact cache in the ledger
+/// cache config's directory (or the default one). Applied by every
+/// constructor that takes a backend, and again where one is handed to the
+/// indexer; applying it twice changes nothing, and every application over one
+/// directory shares one cache.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn with_artifact_cache(
+    backend: StorageBackend,
+    ledger_cache_config: Option<&LedgerManagerConfig>,
+) -> StorageBackend {
+    match ledger_cache_config {
+        Some(config) => backend.with_disk_cache(&config.cache_dir),
+        None => backend.with_disk_cache(&LedgerManagerConfig::default().cache_dir),
+    }
+}
+
+/// Index builds stage plaintext under the indexer's `data_dir`, the system
+/// temp directory when none is set. Over encrypted storage that copy sits
+/// outside the encryption, so say so.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn warn_if_staging_plaintext(
+    backend: &StorageBackend,
+    config: &fluree_db_indexer::IndexerConfig,
+) {
+    let encrypted = backend
+        .admin_storage()
+        .is_some_and(|storage| !storage.permits_plaintext_cache());
+    if encrypted && config.data_dir.is_none() {
+        tracing::warn!(
+            "encrypted storage: index build staging defaults to the system temp directory; \
+             set IndexerConfig::data_dir to a directory on an encrypted volume"
+        );
+    }
+}
+
+/// wasm32 has no filesystem to cache to.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn with_artifact_cache(
+    backend: StorageBackend,
+    _ledger_cache_config: Option<&LedgerManagerConfig>,
+) -> StorageBackend {
+    backend
+}
+
 fn build_indexer_config(config: &ConnectionConfig) -> wasm_compat::IndexerConfig {
     let mut indexer_config = wasm_compat::IndexerConfig::default();
 
@@ -3075,6 +3118,7 @@ impl FlureeBuilder {
         nameservice: Arc<dyn fluree_db_nameservice::ReadWriteNameService>,
         attachment_provider_cell: &indexer_attachment_provider::LedgerManagerCell,
     ) -> tx::IndexingMode {
+        let backend = &with_artifact_cache(backend.clone(), self.ledger_cache_config.as_ref());
         if let Some(ref idx_config) = self.indexing_config {
             // Attach an api-side full-text config provider so each index
             // build refreshes `fulltext_configured_properties` from the
@@ -3089,11 +3133,6 @@ impl FlureeBuilder {
                     backend: backend.clone(),
                     nameservice: ns_for_provider,
                     leaflet_cache: Arc::new(fluree_db_binary_index::LeafletCache::with_max_mb(64)),
-                    cache_dir: self
-                        .ledger_cache_config
-                        .as_ref()
-                        .map(|config| config.cache_dir.clone())
-                        .unwrap_or_else(|| LedgerManagerConfig::default().cache_dir),
                 },
             ) as Arc<dyn fluree_db_indexer::FulltextConfigProvider>;
             // Attach an api-side attachment-events provider so the
@@ -3116,6 +3155,7 @@ impl FlureeBuilder {
                 Arc::new(crate::indexer_attachment_provider::LedgerManagerWarmCache {
                     manager: Arc::clone(attachment_provider_cell),
                 }) as Arc<dyn fluree_db_indexer::WarmCacheSource>;
+            warn_if_staging_plaintext(backend, &idx_config.indexer_config);
             let indexer_config = idx_config
                 .indexer_config
                 .clone()
@@ -3168,6 +3208,7 @@ impl FlureeBuilder {
             attachment_provider_cell,
         } = parts;
         let (backend, nameservice) = apply_remote_mounts(backend, nameservice, remote_mounts);
+        let backend = with_artifact_cache(backend, ledger_cache_config.as_ref());
         let leaflet_cache = make_leaflet_cache(&config);
         let governance_cache = std::sync::Arc::new(cross_ledger::GovernanceCache::new());
 
@@ -3593,7 +3634,7 @@ impl Fluree {
         let leaflet_cache = make_leaflet_cache(&config);
         Self {
             config,
-            backend,
+            backend: with_artifact_cache(backend, None),
             nameservice_mode: nameservice,
             leaflet_cache,
             governance_cache: std::sync::Arc::new(cross_ledger::GovernanceCache::new()),
@@ -3616,23 +3657,9 @@ impl Fluree {
         nameservice: NameServiceMode,
         indexing_mode: tx::IndexingMode,
     ) -> Self {
-        let leaflet_cache = make_leaflet_cache(&config);
-        Self {
-            config,
-            backend: StorageBackend::Managed(Arc::new(storage)),
-            nameservice_mode: nameservice,
-            leaflet_cache,
-            governance_cache: std::sync::Arc::new(cross_ledger::GovernanceCache::new()),
-            indexing_mode,
-            index_config: server_defaults::default_index_config(),
-            r2rml_cache: std::sync::Arc::new(graph_source::R2rmlCache::with_defaults()),
-            event_bus: Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024)),
-            ledger_manager: None,
-            remote_service: None,
-            #[cfg(feature = "iceberg")]
-            secret_resolver: None,
-            key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
-        }
+        let mut fluree = Self::new(config, storage, nameservice);
+        fluree.indexing_mode = indexing_mode;
+        fluree
     }
 
     /// Set the indexing mode
@@ -3867,7 +3894,6 @@ impl Fluree {
                 backend: self.backend.clone(),
                 nameservice: self.nameservice_mode.as_arc_reader(),
                 leaflet_cache: Arc::clone(&self.leaflet_cache),
-                cache_dir: self.binary_store_cache_dir(),
             },
         )
     }
@@ -3951,11 +3977,10 @@ impl Fluree {
 }
 
 impl Fluree {
-    /// Resolve the binary-store disk cache directory for this instance.
-    ///
-    /// When ledger caching is enabled, binary-store reloads must use the
-    /// manager's configured cache dir so post-commit namespace repair attaches
-    /// into the same on-disk layout as normal ledger loads.
+    /// The disk artifact cache directory for this instance: the one its
+    /// remote content stores read through, which the Iceberg graph sources
+    /// share for their data files and catalog cache.
+    #[cfg(feature = "iceberg")]
     pub(crate) fn binary_store_cache_dir(&self) -> std::path::PathBuf {
         self.ledger_manager
             .as_ref()
@@ -5451,6 +5476,42 @@ mod tests {
         commit.insert(index_addr, b"misplaced".to_vec());
         index.remove(index_addr);
         assert!(tiered.get_local(index_addr).unwrap().is_none());
+    }
+
+    /// Every constructor that takes a storage fronts a remote one with the
+    /// disk cache, as the builder does; local storage is left as it is.
+    #[test]
+    #[cfg(feature = "native")]
+    fn every_constructor_fronts_remote_storage_with_the_disk_cache() {
+        let ns = || {
+            NameServiceMode::ReadWrite(Arc::new(
+                fluree_db_nameservice::memory::MemoryNameService::new(),
+            ))
+        };
+        let remote = || MemoryStorage::new().simulating_remote();
+        let built = [
+            Fluree::new(ConnectionConfig::default(), remote(), ns()),
+            Fluree::from_backend(
+                ConnectionConfig::default(),
+                StorageBackend::Managed(Arc::new(remote())),
+                ns(),
+            ),
+            Fluree::with_indexing_mode(
+                ConnectionConfig::default(),
+                remote(),
+                ns(),
+                tx::IndexingMode::Disabled,
+            ),
+        ];
+        for fluree in built {
+            assert!(
+                matches!(fluree.backend(), StorageBackend::Cached(_)),
+                "{:?}",
+                fluree.backend()
+            );
+        }
+        let local = Fluree::new(ConnectionConfig::default(), MemoryStorage::new(), ns());
+        assert!(matches!(local.backend(), StorageBackend::Managed(_)));
     }
 
     #[tokio::test]

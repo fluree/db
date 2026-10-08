@@ -904,7 +904,6 @@ pub async fn run_collector_and_fork_drop_scenario(
                 ledger_id: fluree_db_api::LedgerId::parse(&ledger_id).unwrap(),
                 index_head_id: head,
             }],
-            None,
         )
         .await
         .expect("walk chain");

@@ -4981,7 +4981,7 @@ mod tests {
         value: FlakeValue,
         arena_is_current: bool,
     ) -> Option<Vec<ObjectSlice>> {
-        let store = BinaryIndexStore::empty(std::env::temp_dir());
+        let store = BinaryIndexStore::empty();
         untyped_numeric_slices(&store, 0, Some(7), observed, &value, arena_is_current)
     }
 

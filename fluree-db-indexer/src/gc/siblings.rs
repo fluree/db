@@ -12,7 +12,6 @@ use crate::gc::{BranchIndexHead, SharedBlobPolicy};
 use fluree_db_core::{ContentId, LedgerId, StorageBackend};
 use fluree_db_nameservice::{NameServiceLookup, NsRecord};
 use std::collections::{BTreeSet, HashSet};
-use std::path::Path;
 
 /// The other branches of `ledger_id`'s ledger, as the sweep and the collector
 /// need them: every record sharing the ledger name except `ledger_id` itself,
@@ -50,7 +49,6 @@ pub fn siblings_of(records: &[NsRecord], ledger_id: &LedgerId) -> Vec<BranchInde
 pub async fn shared_refs_of_branches(
     backend: &StorageBackend,
     branches: &[BranchIndexHead],
-    artifact_cache_dir: Option<&Path>,
 ) -> Result<HashSet<ContentId>> {
     let mut refs = HashSet::new();
     for branch in branches {
@@ -58,7 +56,7 @@ pub async fn shared_refs_of_branches(
             continue;
         };
         let store = backend.content_store(&branch.ledger_id);
-        let mut walk = PrevIndexChainWalk::new(store.as_ref(), head, artifact_cache_dir);
+        let mut walk = PrevIndexChainWalk::new(store.as_ref(), head);
         while let Some(entry) = walk.next_entry().await? {
             refs.extend(
                 entry
@@ -113,14 +111,13 @@ pub async fn shared_blob_policy_for(
     backend: &StorageBackend,
     siblings: &[BranchIndexHead],
     ledger_id: &LedgerId,
-    artifact_cache_dir: Option<&Path>,
 ) -> SharedBlobPolicy {
     if siblings.is_empty() {
         return SharedBlobPolicy::Release {
             referenced_elsewhere: HashSet::new(),
         };
     }
-    match shared_refs_of_branches(backend, siblings, artifact_cache_dir).await {
+    match shared_refs_of_branches(backend, siblings).await {
         Ok(referenced_elsewhere) => {
             tracing::debug!(
                 ledger_id = %ledger_id,
@@ -290,7 +287,6 @@ mod tests {
                 ledger_id: id("db:dev"),
                 index_head_id: Some(dev_t3),
             }],
-            None,
         )
         .await
         .unwrap();
@@ -315,7 +311,7 @@ mod tests {
 
         let alone = vec![record("db:main", None, false)];
         assert!(matches!(
-            shared_blob_policy_for(&backend, &siblings_of(&alone, &id("db:main")), &id("db:main"), None).await,
+            shared_blob_policy_for(&backend, &siblings_of(&alone, &id("db:main")), &id("db:main")).await,
             SharedBlobPolicy::Release { referenced_elsewhere } if referenced_elsewhere.is_empty()
         ));
 
@@ -330,7 +326,6 @@ mod tests {
                 &backend,
                 &siblings_of(&with_unreadable, &id("db:main")),
                 &id("db:main"),
-                None
             )
             .await,
             SharedBlobPolicy::Defer

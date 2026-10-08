@@ -7,7 +7,6 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::OnceLock;
@@ -36,7 +35,6 @@ use crate::format::index_root::{IndexRoot, OTypeTableEntry};
 use crate::format::leaf::DecodedLeafDirV3;
 use crate::format::run_record::RunSortOrder;
 
-use super::artifact_cache::{fetch_cached_bytes, fetch_cached_bytes_cid, uses_disk_cache};
 use super::leaflet_cache::LeafletCache;
 
 const HOT_REMOTE_LEAF_PROMOTION_TOUCHES: usize = 2;
@@ -249,18 +247,35 @@ fn storage_io_error(e: fluree_db_core::Error) -> io::Error {
     }
 }
 
-/// A file in the disk artifact cache, or `None` when it is not there.
-#[cfg(not(target_arch = "wasm32"))]
-fn map_file(path: &Path) -> io::Result<Option<ContentBytes>> {
-    // SAFETY: disk-cache entries land by renaming a staged file into place
-    // and are only ever unlinked after that.
-    unsafe { ContentBytes::open(path) }
-}
-
-/// wasm32 has no filesystem: the disk cache never holds anything.
-#[cfg(target_arch = "wasm32")]
-fn map_file(_path: &Path) -> io::Result<Option<ContentBytes>> {
-    Ok(None)
+/// [`ContentStore::prefetch`] every distinct id in `ids`, concurrently up to
+/// the permits `budget` has free, holding a permit per fetch. Returns how
+/// many ids were asked for. Failures are logged and skipped: a prefetch only
+/// saves the sync read a fetch.
+async fn prefetch_all(
+    cs: &Arc<dyn ContentStore>,
+    ids: impl IntoIterator<Item = ContentId>,
+    budget: &Arc<tokio::sync::Semaphore>,
+    what: &'static str,
+) -> usize {
+    use futures::stream::StreamExt;
+    let mut seen = std::collections::HashSet::new();
+    let targets: Vec<ContentId> = ids
+        .into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .collect();
+    let count = targets.len();
+    let width = budget.available_permits().max(1);
+    futures::stream::iter(targets)
+        .for_each_concurrent(width, |cid| async move {
+            let Ok(_permit) = budget.acquire().await else {
+                return;
+            };
+            if let Err(e) = cs.prefetch(&cid).await {
+                tracing::debug!(%cid, error = %e, what, "prefetch failed; continuing");
+            }
+        })
+        .await;
+    count
 }
 
 /// Index store — reads FLI3/FBR3/FHS1 artifacts via FIR6 root.
@@ -290,10 +305,6 @@ pub struct BinaryIndexStore {
     /// narrowing the gap between what is measured and what ships.
     #[cfg(any(target_arch = "wasm32", feature = "residency"))]
     residency_mode: bool,
-    cache_dir: PathBuf,
-    /// Shared disk artifact cache — kept alive here so the global `CACHE_REGISTRY`
-    /// weak ref survives across calls, avoiding repeated dir scans on every write.
-    disk_cache: Arc<super::artifact_cache::DiskArtifactCache>,
     leaflet_cache: Option<Arc<LeafletCache>>,
     /// Remote leaf metadata cache keyed by leaf CID.
     ///
@@ -351,7 +362,7 @@ impl BinaryIndexStore {
     /// `DictNovelty` alongside it, and to seed the namespace table with
     /// [`Self::augment_namespace_codes`] from the snapshot's
     /// `shared_namespaces()` so ID→IRI resolution can complete.
-    pub fn empty(cache_dir: PathBuf) -> Self {
+    pub fn empty() -> Self {
         Self {
             store_id: NEXT_STORE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             dicts: DictionarySet {
@@ -376,8 +387,6 @@ impl BinaryIndexStore {
             #[cfg(any(target_arch = "wasm32", feature = "residency"))]
             residency_mode: false,
             cas: None,
-            disk_cache: crate::read::artifact_cache::DiskArtifactCache::for_dir(&cache_dir),
-            cache_dir,
             leaflet_cache: None,
             remote_leaf_metadata: RwLock::new(HashMap::new()),
             remote_leaf_open_counts: RwLock::new(HashMap::new()),
@@ -396,21 +405,19 @@ impl BinaryIndexStore {
     pub async fn load_from_root_bytes(
         cs: Arc<dyn ContentStore>,
         bytes: &[u8],
-        cache_dir: &Path,
         leaflet_cache: Option<Arc<LeafletCache>>,
     ) -> io::Result<Self> {
         let root = IndexRoot::decode(bytes)?;
-        Self::load_from_root_v6(cs, &root, cache_dir, leaflet_cache).await
+        Self::load_from_root_v6(cs, &root, leaflet_cache).await
     }
 
     /// Load from a parsed IndexRoot.
     pub async fn load_from_root_v6(
         cs: Arc<dyn ContentStore>,
         root: &IndexRoot,
-        cache_dir: &Path,
         leaflet_cache: Option<Arc<LeafletCache>>,
     ) -> io::Result<Self> {
-        Self::load_from_root_v6_reusing(cs, root, cache_dir, leaflet_cache, None).await
+        Self::load_from_root_v6_reusing(cs, root, leaflet_cache, None).await
     }
 
     /// [`Self::load_from_root_v6`] for a reload of the same ledger: every
@@ -428,19 +435,16 @@ impl BinaryIndexStore {
     pub async fn load_from_root_v6_reusing(
         cs: Arc<dyn ContentStore>,
         root: &IndexRoot,
-        cache_dir: &Path,
         leaflet_cache: Option<Arc<LeafletCache>>,
         prev: Option<&BinaryIndexStore>,
     ) -> io::Result<Self> {
         tracing::debug!("BinaryIndexStore::load_from_root_v6 starting");
-        fluree_db_core::disk_cache::ensure_cache_dir(cache_dir)?;
         let phase = Instant::now();
 
         // ── Dict loading ──────────────────────────────────────────────────────────────
         let dicts = build_dictionary_set(
             Arc::clone(&cs),
             root,
-            cache_dir,
             leaflet_cache.as_ref(),
             prev.map(|p| &p.dicts),
         )
@@ -450,13 +454,9 @@ impl BinaryIndexStore {
         let phase = Instant::now();
 
         // ── Per-graph specialty arenas ───────────────────────────────
-        let mut per_graph_arenas = load_per_graph_arenas(
-            Arc::clone(&cs),
-            &root.graph_arenas,
-            cache_dir,
-            leaflet_cache.as_ref(),
-        )
-        .await?;
+        let mut per_graph_arenas =
+            load_per_graph_arenas(Arc::clone(&cs), &root.graph_arenas, leaflet_cache.as_ref())
+                .await?;
 
         let arenas_us = phase.elapsed().as_micros() as u64;
         let phase = Instant::now();
@@ -492,8 +492,7 @@ impl BinaryIndexStore {
                 let branch = match carried {
                     Some(branch) => branch,
                     None => {
-                        let branch_bytes =
-                            fetch_cached_bytes_cid(cs.as_ref(), branch_cid, cache_dir).await?;
+                        let branch_bytes = cs.get(branch_cid).await.map_err(storage_io_error)?;
                         Arc::new(read_branch_from_bytes(&branch_bytes)?)
                     }
                 };
@@ -548,7 +547,6 @@ impl BinaryIndexStore {
             .map(|(i, e)| (e.o_type, i))
             .collect();
 
-        let disk_cache = super::artifact_cache::DiskArtifactCache::for_dir(cache_dir);
         Ok(Self {
             store_id: NEXT_STORE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             dicts,
@@ -558,8 +556,6 @@ impl BinaryIndexStore {
             #[cfg(any(target_arch = "wasm32", feature = "residency"))]
             residency_mode: cs.miss_register().is_some(),
             cas: Some(cs),
-            cache_dir: cache_dir.to_path_buf(),
-            disk_cache,
             leaflet_cache,
             remote_leaf_metadata: RwLock::new(HashMap::new()),
             remote_leaf_open_counts: RwLock::new(HashMap::new()),
@@ -645,15 +641,13 @@ impl BinaryIndexStore {
             && Arc::ptr_eq(&self.dicts.prefix_trie, &other.dicts.prefix_trie)
     }
 
-    /// Best-effort concurrent prewarm of the remote leaves a `[min_key, max_key]`
+    /// Best-effort concurrent prewarm of the leaves a `[min_key, max_key]`
     /// scan over `order` will touch. Routes via the same `BranchManifest` +
     /// comparator the read path uses, so the warmed leaves are exactly those the
-    /// scan reads. Only warms the disk cache — results are byte-identical.
-    ///
-    /// Only for a store the disk cache serves (see `uses_disk_cache`); leaves
-    /// that resolve to a local path are skipped too (a local read is already
-    /// cheap). Bounded by the shared `budget`; per-leaf failures are logged
-    /// and ignored — the scan fetches them the old way.
+    /// scan reads. Warms the store's local tier ([`ContentStore::prefetch`],
+    /// which a local store ignores) — results are byte-identical. Bounded by
+    /// the shared `budget`; per-leaf failures are logged and ignored — the
+    /// scan fetches them the old way.
     pub async fn prefetch_leaves_for_range(
         &self,
         g_id: GraphId,
@@ -663,62 +657,24 @@ impl BinaryIndexStore {
         budget: &Arc<tokio::sync::Semaphore>,
     ) {
         use crate::format::run_record_v2::cmp_v2_for_order;
-        use futures::stream::StreamExt;
 
         let Some(cs) = self.cas.as_ref() else {
             return;
         };
-        if !uses_disk_cache(cs.as_ref()) {
-            return;
-        }
         let Some(branch) = self.branch_for_order(g_id, order) else {
             return;
         };
 
         let cmp = cmp_v2_for_order(order);
         let range = branch.find_leaves_in_range(min_key, max_key, cmp);
-
-        let mut seen: std::collections::HashSet<ContentId> = std::collections::HashSet::new();
-        let mut targets: Vec<ContentId> = Vec::new();
-        for entry in &branch.leaves[range] {
-            let cid = &entry.leaf_cid;
-            if matches!(cs.get_local(cid), Ok(Some(_))) {
-                continue;
-            }
-            if seen.insert(cid.clone()) {
-                targets.push(cid.clone());
-            }
-        }
-
-        if targets.is_empty() {
-            return;
-        }
-
-        let width = budget.available_permits().max(1);
-        let target_count = targets.len();
-        let cache_dir = self.cache_dir.clone();
-
-        futures::stream::iter(targets)
-            .for_each_concurrent(width, |cid| {
-                let budget = Arc::clone(budget);
-                let cache_dir = cache_dir.clone();
-                let cs = Arc::clone(cs);
-                async move {
-                    let Ok(_permit) = budget.acquire().await else {
-                        return;
-                    };
-                    if let Err(e) = fetch_cached_bytes_cid(cs.as_ref(), &cid, &cache_dir).await {
-                        tracing::debug!(%cid, error = %e, "range leaf prefetch failed; continuing");
-                    }
-                }
-            })
-            .await;
-
+        let targets = branch.leaves[range]
+            .iter()
+            .map(|entry| entry.leaf_cid.clone());
+        let warmed = prefetch_all(cs, targets, budget, "range leaf").await;
         tracing::debug!(
             g_id,
             ?order,
-            leaves = target_count,
-            width,
+            leaves = warmed,
             "leaf range prefetch complete"
         );
     }
@@ -807,79 +763,34 @@ impl BinaryIndexStore {
     /// of `(ns_code, suffix)` reverse lookups will touch. Encodes keys exactly as
     /// [`Self::find_subject_id_by_parts`] does (`subject_reverse_key` over the same
     /// `subject_reverse_tree`), so the warmed leaves are precisely those a
-    /// subsequent serial `reverse_lookup` reads. Only warms the disk cache —
-    /// lookup results are byte-identical.
-    ///
-    /// Remote-only: skipped if there is no CAS, the store is not one the disk
-    /// cache serves, or the reverse tree has no disk cache dir (a local or
-    /// in-memory read is already cheap). Bounded by the
-    /// shared `budget`; per-leaf failures are logged and ignored — the serial
-    /// lookup fetches them the old way.
+    /// subsequent serial `reverse_lookup` reads. Warms the store's local tier
+    /// ([`ContentStore::prefetch`]) — lookup results are byte-identical.
+    /// Bounded by the shared `budget`; per-leaf failures are logged and
+    /// ignored — the serial lookup fetches them the old way.
     pub async fn prefetch_subject_reverse_leaves(
         &self,
         parts: &[(u16, String)],
         budget: &Arc<tokio::sync::Semaphore>,
     ) {
-        use futures::stream::StreamExt;
-
         let Some(cs) = self.cas.as_ref() else {
             return;
         };
         let Some(tree) = self.dicts.subject_reverse_tree.as_ref() else {
             return;
         };
-        let Some(cache_dir) = tree.disk_cache_dir().map(Path::to_path_buf) else {
-            return;
-        };
-        if !uses_disk_cache(cs.as_ref()) {
-            return;
-        }
-
         let keys: Vec<Vec<u8>> = parts
             .iter()
             .map(|(ns_code, suffix)| {
                 crate::dict::reverse_leaf::subject_reverse_key(*ns_code, suffix.as_bytes())
             })
             .collect();
-
-        let mut seen: std::collections::HashSet<ContentId> = std::collections::HashSet::new();
-        let mut targets: Vec<ContentId> = Vec::new();
-        for address in tree.touched_leaf_addresses(keys.iter().map(Vec::as_slice)) {
-            if let Some(cid) = tree.leaf_cid(address) {
-                if seen.insert(cid.clone()) {
-                    targets.push(cid.clone());
-                }
-            }
-        }
-
-        if targets.is_empty() {
-            return;
-        }
-
-        let width = budget.available_permits().max(1);
-        let target_count = targets.len();
-
-        futures::stream::iter(targets)
-            .for_each_concurrent(width, |cid| {
-                let budget = Arc::clone(budget);
-                let cache_dir = cache_dir.clone();
-                let cs = Arc::clone(cs);
-                async move {
-                    let Ok(_permit) = budget.acquire().await else {
-                        return;
-                    };
-                    if let Err(e) = fetch_cached_bytes_cid(cs.as_ref(), &cid, &cache_dir).await {
-                        tracing::debug!(%cid, error = %e, "subject reverse leaf prefetch failed; continuing");
-                    }
-                }
-            })
-            .await;
-
-        tracing::debug!(
-            leaves = target_count,
-            width,
-            "subject reverse leaf prefetch complete"
-        );
+        let targets: Vec<ContentId> = tree
+            .touched_leaf_addresses(keys.iter().map(Vec::as_slice))
+            .into_iter()
+            .filter_map(|address| tree.leaf_cid(address).cloned())
+            .collect();
+        let warmed = prefetch_all(cs, targets, budget, "subject reverse leaf").await;
+        tracing::debug!(leaves = warmed, "subject reverse leaf prefetch complete");
     }
 
     fn note_remote_leaf_open(&self, leaf_cid: &ContentId) -> usize {
@@ -945,9 +856,9 @@ impl BinaryIndexStore {
         self.fetch_whole_leaf(leaf_cid, leaf_id)
     }
 
-    /// A leaf's bytes when they are on this machine: the shared cache entry,
-    /// the store's local tier, or a copy an earlier open promoted into the
-    /// disk cache. `None` means the leaf has to be fetched.
+    /// A leaf's bytes when they are on this machine: the shared cache entry
+    /// or the store's local tier (for a remote store, its disk cache). `None`
+    /// means the leaf has to be fetched.
     ///
     /// Bytes the store already shares (memory storage) are returned as they
     /// are; caching them again would charge the budget for memory the store
@@ -969,15 +880,8 @@ impl BinaryIndexStore {
         {
             return Ok(Some(bytes));
         }
-        let bytes = match cs.get_local(leaf_cid).map_err(storage_io_error)? {
-            Some(bytes) => bytes,
-            None if uses_disk_cache(cs.as_ref()) => {
-                match map_file(&self.cache_dir.join(leaf_cid.to_string()))? {
-                    Some(bytes) => bytes,
-                    None => return Ok(None),
-                }
-            }
-            None => return Ok(None),
+        let Some(bytes) = cs.get_local(leaf_cid).map_err(storage_io_error)? else {
+            return Ok(None);
         };
         if matches!(bytes, ContentBytes::Shared(_)) {
             return Ok(Some(bytes));
@@ -1001,34 +905,17 @@ impl BinaryIndexStore {
             .cas
             .as_ref()
             .ok_or_else(|| io::Error::other("no content store"))?;
-
         if let Some(bytes) = cs.get_local(leaf_cid).map_err(storage_io_error)? {
             return Ok(bytes);
         }
-
-        // Check cache, for a store the cache serves at all. Any other store
-        // gets nothing written there, and nothing left there by an earlier
-        // run is consulted.
-        let persist = uses_disk_cache(cs.as_ref());
-        let cache_path = self.cache_dir.join(leaf_cid.to_string());
-        if persist {
-            match std::fs::read(&cache_path) {
-                Ok(bytes) => return Ok(bytes.into()),
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err),
-            }
-        }
-
-        // Fetch from CAS via sync bridge: capture the Tokio handle on the caller's
-        // sync bridge: run the async CAS request without deadlocking current-thread runtimes.
+        // Fetch over the sync→async bridge without deadlocking current-thread
+        // runtimes.
         let cs = Arc::clone(cs);
         let cid = leaf_cid.clone();
-        let cache_path_owned = cache_path.clone();
-        let disk_cache = Arc::clone(&self.disk_cache);
         let timeout = cas_sync_timeout();
-        let data = run_sync_on_runtime(async move {
+        run_sync_on_runtime(async move {
             let fut = cs.get(&cid);
-            let data = if let Some(dur) = timeout {
+            if let Some(dur) = timeout {
                 tokio::time::timeout(dur, fut)
                     .await
                     .map_err(|_| {
@@ -1038,24 +925,12 @@ impl BinaryIndexStore {
                             cid
                         ))
                     })?
-                    .map_err(|e| io::Error::other(format!("CAS fetch failed: {e}")))?
+                    .map_err(|e| io::Error::other(format!("CAS fetch failed: {e}")))
             } else {
                 fut.await
-                    .map_err(|e| io::Error::other(format!("CAS fetch failed: {e}")))?
-            };
-            if persist {
-                disk_cache.best_effort_write(&cache_path_owned, &data);
+                    .map_err(|e| io::Error::other(format!("CAS fetch failed: {e}")))
             }
-            Ok(data)
-        })?;
-        // Read back the copy just written, so a large leaf is held as a
-        // mapping (page cache) rather than heap.
-        if persist {
-            if let Ok(Some(local)) = map_file(&cache_path) {
-                return Ok(local);
-            }
-        }
-        Ok(data)
+        })
     }
 
     /// Fetch a remote leaf whole and keep it in the cache, so later opens
@@ -1168,10 +1043,8 @@ impl BinaryIndexStore {
                 dir.clone(),
                 dir.payload_base as u64,
                 leaf_id,
-                Arc::new(ContentStoreRangeFetcher::new(
-                    Arc::clone(cs),
-                    self.cache_dir.clone(),
-                )) as Arc<dyn super::leaf_access::RangeReadFetcher>,
+                Arc::new(ContentStoreRangeFetcher::new(Arc::clone(cs)))
+                    as Arc<dyn super::leaf_access::RangeReadFetcher>,
                 sc_cid,
             )));
         }
@@ -1184,10 +1057,7 @@ impl BinaryIndexStore {
             touch_count,
             "binary leaf open"
         );
-        let fetcher = Arc::new(ContentStoreRangeFetcher::new(
-            Arc::clone(cs),
-            self.cache_dir.clone(),
-        ));
+        let fetcher = Arc::new(ContentStoreRangeFetcher::new(Arc::clone(cs)));
 
         let (dir, payload_base) = fetch_header_and_directory(fetcher.as_ref(), leaf_cid)?;
         self.remote_leaf_metadata
@@ -1292,7 +1162,7 @@ impl BinaryIndexStore {
             return crate::format::leaf::decode_leaf_dir_v3_with_base(&bytes, &header)
                 .map(Arc::new);
         }
-        let fetcher = ContentStoreRangeFetcher::new(Arc::clone(cs), self.cache_dir.clone());
+        let fetcher = ContentStoreRangeFetcher::new(Arc::clone(cs));
         let (dir, _payload_base) =
             super::leaf_access::fetch_header_and_directory(&fetcher, leaf_cid)?;
         Ok(Arc::new(dir))
@@ -3143,7 +3013,6 @@ impl BinaryGraphView {
 async fn build_dictionary_set(
     cs: Arc<dyn ContentStore>,
     root: &IndexRoot,
-    cache_dir: &Path,
     leaflet_cache: Option<&Arc<LeafletCache>>,
     prev: Option<&DictionarySet>,
 ) -> io::Result<DictionarySet> {
@@ -3172,7 +3041,6 @@ async fn build_dictionary_set(
     for (ns_code, ns_refs) in &root.dict_refs.forward_packs.subject_fwd_ns_packs {
         let reader = ForwardPackReader::from_pack_refs_reusing(
             Arc::clone(&cs),
-            cache_dir,
             ns_refs,
             KIND_SUBJECT_FWD,
             *ns_code,
@@ -3190,7 +3058,6 @@ async fn build_dictionary_set(
             &cs,
             &root.dict_refs.subject_reverse,
             leaflet_cache,
-            Some(cache_dir),
             prev.and_then(|p| p.subject_reverse_tree.as_ref()),
         )
         .await?,
@@ -3201,7 +3068,6 @@ async fn build_dictionary_set(
     let phase = Instant::now();
     let string_forward_packs = ForwardPackReader::from_pack_refs_reusing(
         Arc::clone(&cs),
-        cache_dir,
         &root.dict_refs.forward_packs.string_fwd_packs,
         KIND_STRING_FWD,
         0,
@@ -3217,7 +3083,6 @@ async fn build_dictionary_set(
             &cs,
             &root.dict_refs.string_reverse,
             leaflet_cache,
-            Some(cache_dir),
             prev.and_then(|p| p.string_reverse_tree.as_ref()),
         )
         .await?,
@@ -3341,26 +3206,6 @@ async fn build_dictionary_set(
 // Arena loading (reuses V5 infrastructure)
 // ============================================================================
 
-/// Where a vector shard's bytes come from: the store's local tier, else the
-/// disk cache — which counts as present only for a store the cache serves,
-/// so a stale shard left there by an earlier run is fetched afresh rather
-/// than served.
-fn vector_shard_source(
-    cs: &dyn ContentStore,
-    shard_cid: &ContentId,
-    cache_dir: &Path,
-) -> crate::arena::vector::ShardSource {
-    let cid_hash = LeafletCache::cid_cache_key(&shard_cid.to_bytes());
-    let cache_path = cache_dir.join(format!("{shard_cid}.vas"));
-    let on_disk = uses_disk_cache(cs) && cache_path.exists();
-    crate::arena::vector::ShardSource {
-        cid_hash,
-        cid: Some(shard_cid.clone()),
-        path: cache_path,
-        on_disk: std::sync::atomic::AtomicBool::new(on_disk),
-    }
-}
-
 /// Per-graph arenas (before injection into GraphIndex).
 struct LoadedArenas {
     numbig: HashMap<u32, crate::arena::numbig::NumBigArena>,
@@ -3374,7 +3219,6 @@ struct LoadedArenas {
 async fn load_per_graph_arenas(
     cs: Arc<dyn ContentStore>,
     graph_arenas: &[crate::format::wire_helpers::GraphArenaRefs],
-    cache_dir: &Path,
     leaflet_cache: Option<&Arc<LeafletCache>>,
 ) -> io::Result<HashMap<GraphId, LoadedArenas>> {
     let mut result = HashMap::new();
@@ -3383,7 +3227,7 @@ async fn load_per_graph_arenas(
         let mut numbig = HashMap::new();
         for (p_id, cid) in &ga.numbig {
             let phase = Instant::now();
-            let bytes = fetch_cached_bytes(cs.as_ref(), cid, cache_dir, "nba").await?;
+            let bytes = cs.get(cid).await.map_err(storage_io_error)?;
             let read_us = phase.elapsed().as_micros() as u64;
             let phase = Instant::now();
             let arena = crate::arena::numbig::read_numbig_arena_from_bytes(&bytes)?;
@@ -3401,14 +3245,13 @@ async fn load_per_graph_arenas(
 
         let mut vectors = HashMap::new();
         for entry in &ga.vectors {
-            let manifest_bytes =
-                fetch_cached_bytes(cs.as_ref(), &entry.manifest, cache_dir, "vam").await?;
+            let manifest_bytes = cs.get(&entry.manifest).await.map_err(storage_io_error)?;
             let manifest = crate::arena::vector::read_vector_manifest(&manifest_bytes)?;
 
             let shard_sources: Vec<_> = entry
                 .shards
                 .iter()
-                .map(|shard_cid| vector_shard_source(cs.as_ref(), shard_cid, cache_dir))
+                .map(|shard_cid| crate::arena::vector::ShardSource::new(shard_cid.clone()))
                 .collect();
 
             // LazyVectorArena needs a LeafletCache for shard caching and
@@ -3432,8 +3275,7 @@ async fn load_per_graph_arenas(
         // native-only); the provider map stays empty. SEAM(wasm).
         #[cfg(not(target_arch = "wasm32"))]
         for sp_ref in &ga.spatial {
-            let root_bytes =
-                fetch_cached_bytes(cs.as_ref(), &sp_ref.root_cid, cache_dir, "spr").await?;
+            let root_bytes = cs.get(&sp_ref.root_cid).await.map_err(storage_io_error)?;
             let spatial_root: fluree_db_spatial::SpatialIndexRoot =
                 serde_json::from_slice(&root_bytes).map_err(|e| {
                     io::Error::new(io::ErrorKind::InvalidData, format!("spatial root: {e}"))
@@ -3445,8 +3287,8 @@ async fn load_per_graph_arenas(
                 .into_iter()
                 .chain(sp_ref.leaflets.iter())
             {
-                let bytes = fetch_cached_bytes(cs.as_ref(), cid, cache_dir, "spa").await?;
-                blob_cache.insert(cid.digest_hex(), bytes);
+                let bytes = cs.get(cid).await.map_err(storage_io_error)?;
+                blob_cache.insert(cid.digest_hex(), bytes.into_vec());
             }
             let blob_cache = Arc::new(blob_cache);
 
@@ -3469,8 +3311,7 @@ async fn load_per_graph_arenas(
 
         let mut fulltext = HashMap::new();
         for ft_ref in &ga.fulltext {
-            let bytes =
-                fetch_cached_bytes(cs.as_ref(), &ft_ref.arena_cid, cache_dir, "fta").await?;
+            let bytes = cs.get(&ft_ref.arena_cid).await.map_err(storage_io_error)?;
             let arena = crate::arena::fulltext::FulltextArena::decode(&bytes)?;
             fulltext.insert((ft_ref.p_id, ft_ref.lang_id), Arc::new(arena));
         }
@@ -3500,12 +3341,11 @@ async fn load_per_graph_arenas(
 /// `BinaryIndexStore::get_leaf_bytes_sync()`.
 struct ContentStoreRangeFetcher {
     cs: Arc<dyn ContentStore>,
-    cache_dir: PathBuf,
 }
 
 impl ContentStoreRangeFetcher {
-    fn new(cs: Arc<dyn ContentStore>, cache_dir: PathBuf) -> Self {
-        Self { cs, cache_dir }
+    fn new(cs: Arc<dyn ContentStore>) -> Self {
+        Self { cs }
     }
 }
 
@@ -3541,54 +3381,18 @@ impl ContentStoreRangeFetcher {
         Ok(bytes[start..end].to_vec())
     }
 
+    /// Only leaves the store does not serve locally reach this fetcher:
+    /// local ones are opened whole, or have their directory decoded in
+    /// place. A remote store's disk cache serves the range from its copy.
     fn fetch_range_native(
         &self,
         id: &ContentId,
         range: std::ops::Range<u64>,
     ) -> io::Result<Vec<u8>> {
-        fn read_range_from_file(
-            path: &Path,
-            range: std::ops::Range<u64>,
-        ) -> io::Result<Option<Vec<u8>>> {
-            let file = match std::fs::File::open(path) {
-                Ok(file) => file,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-                Err(err) => return Err(err),
-            };
-            let len = (range.end - range.start) as usize;
-            let mut buf = vec![0u8; len];
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::FileExt;
-                let n = file.read_at(&mut buf, range.start)?;
-                buf.truncate(n);
-            }
-            #[cfg(not(unix))]
-            {
-                use std::io::{Read, Seek, SeekFrom};
-                let mut file = file;
-                file.seek(SeekFrom::Start(range.start))?;
-                let n = file.read(&mut buf)?;
-                buf.truncate(n);
-            }
-            Ok(Some(buf))
-        }
-
-        // Only leaves the store does not serve locally reach this fetcher:
-        // local ones are opened whole, or have their directory decoded in
-        // place. A copy promoted into the disk cache is read positionally.
-        if uses_disk_cache(self.cs.as_ref()) {
-            let cache_path = self.cache_dir.join(id.to_string());
-            if let Some(buf) = read_range_from_file(&cache_path, range.clone())? {
-                return Ok(buf);
-            }
-        }
-
-        // Remote CAS: use async get_range via sync bridge.
         let cs = Arc::clone(&self.cs);
         let cid = id.clone();
         let timeout = cas_sync_timeout();
-        let bytes = run_sync_on_runtime(async move {
+        run_sync_on_runtime(async move {
             let fut = cs.get_range(&cid, range.clone());
             if let Some(dur) = timeout {
                 tokio::time::timeout(dur, fut)
@@ -3606,8 +3410,7 @@ impl ContentStoreRangeFetcher {
                 fut.await
                     .map_err(|e| io::Error::other(format!("CAS range fetch failed: {e}")))
             }
-        })?;
-        Ok(bytes)
+        })
     }
 }
 
@@ -3619,6 +3422,7 @@ pub(crate) mod tests {
     use fluree_db_core::o_type::OType;
     use fluree_db_core::subject_id::SubjectId;
     use fluree_db_core::MemoryContentStore;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 
     use crate::dict::builder;
@@ -3634,7 +3438,6 @@ pub(crate) mod tests {
         inner: MemoryContentStore,
         get_calls: Arc<AtomicUsize>,
         range_calls: Arc<AtomicUsize>,
-        permits_plaintext_cache: bool,
         ranged: bool,
     }
 
@@ -3644,7 +3447,6 @@ pub(crate) mod tests {
                 inner: MemoryContentStore::new(),
                 get_calls: Arc::new(AtomicUsize::new(0)),
                 range_calls: Arc::new(AtomicUsize::new(0)),
-                permits_plaintext_cache: true,
                 ranged: true,
             }
         }
@@ -3653,14 +3455,6 @@ pub(crate) mod tests {
         fn without_ranged_reads() -> Self {
             Self {
                 ranged: false,
-                ..Self::new()
-            }
-        }
-
-        /// Answers like a store that decrypts on read.
-        fn forbidding_plaintext_cache() -> Self {
-            Self {
-                permits_plaintext_cache: false,
                 ..Self::new()
             }
         }
@@ -3709,14 +3503,6 @@ pub(crate) mod tests {
             self.inner.get_range(id, range).await
         }
 
-        fn permits_plaintext_cache(&self) -> bool {
-            self.permits_plaintext_cache
-        }
-
-        fn is_remote(&self) -> bool {
-            true
-        }
-
         fn supports_ranged_reads(&self) -> bool {
             self.ranged && self.inner.supports_ranged_reads()
         }
@@ -3763,8 +3549,8 @@ pub(crate) mod tests {
     /// Delegates to the production [`BinaryIndexStore::empty`] and re-attaches
     /// the CAS handle plus the `max_t` these tests assume, so there is one
     /// definition of "field-complete and empty" to keep current.
-    pub(crate) fn empty_store(cs: Arc<dyn ContentStore>, cache_dir: PathBuf) -> BinaryIndexStore {
-        let mut store = BinaryIndexStore::empty(cache_dir);
+    pub(crate) fn empty_store(cs: Arc<dyn ContentStore>) -> BinaryIndexStore {
+        let mut store = BinaryIndexStore::empty();
         #[cfg(any(target_arch = "wasm32", feature = "residency"))]
         {
             store.residency_mode = cs.miss_register().is_some();
@@ -3863,14 +3649,6 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl ContentStore for FailNthContentStore {
-        fn permits_plaintext_cache(&self) -> bool {
-            self.inner.permits_plaintext_cache()
-        }
-
-        fn is_remote(&self) -> bool {
-            self.inner.is_remote()
-        }
-
         fn supports_ranged_reads(&self) -> bool {
             self.inner.supports_ranged_reads()
         }
@@ -3931,8 +3709,7 @@ pub(crate) mod tests {
         })
         .expect("seed leaf");
 
-        let cache_dir = temp_cache_dir();
-        let binary_store = Arc::new(empty_store(Arc::new(store.clone()), cache_dir.clone()));
+        let binary_store = Arc::new(empty_store(Arc::new(store.clone())));
         let branch = Arc::new(crate::format::branch::BranchManifest {
             leaves: vec![crate::format::branch::LeafEntry {
                 first_key: info.first_key,
@@ -3967,7 +3744,6 @@ pub(crate) mod tests {
             }
         }
         let cas_calls = store.cas_calls();
-        let _ = std::fs::remove_dir_all(cache_dir);
         (rows, errors, cas_calls)
     }
 
@@ -4052,9 +3828,8 @@ pub(crate) mod tests {
         }
         let leaf_cids: Vec<ContentId> = entries.iter().map(|e| e.leaf_cid.clone()).collect();
 
-        let cache_dir = temp_cache_dir();
         let cs: Arc<dyn ContentStore> = Arc::clone(&store) as Arc<dyn ContentStore>;
-        let binary_store = Arc::new(empty_store(cs, cache_dir.clone()));
+        let binary_store = Arc::new(empty_store(cs));
         assert!(
             binary_store.residency_mode(),
             "a register-bearing store must put the read path in residency mode"
@@ -4114,7 +3889,6 @@ pub(crate) mod tests {
             }
         }
         assert_eq!(rows, 10, "both leaves' rows after one fetch round");
-        let _ = std::fs::remove_dir_all(cache_dir);
     }
 
     /// One leaf-open miss on a large routed scan registers a BOUNDED
@@ -4166,9 +3940,8 @@ pub(crate) mod tests {
         }
         let leaf_cids: Vec<ContentId> = entries.iter().map(|e| e.leaf_cid.clone()).collect();
 
-        let cache_dir = temp_cache_dir();
         let cs: Arc<dyn ContentStore> = Arc::clone(&store) as Arc<dyn ContentStore>;
-        let binary_store = Arc::new(empty_store(cs, cache_dir.clone()));
+        let binary_store = Arc::new(empty_store(cs));
         let branch = Arc::new(crate::format::branch::BranchManifest { leaves: entries });
         let mut cursor = BinaryCursor::scan_all(
             Arc::clone(&binary_store),
@@ -4199,7 +3972,6 @@ pub(crate) mod tests {
             !want_cids.contains(&&leaf_cids[EXPECTED_WINDOW]),
             "leaf {EXPECTED_WINDOW} is past the window and must not be registered"
         );
-        let _ = std::fs::remove_dir_all(cache_dir);
     }
 
     /// F8: the novelty reverse-leaf prefetcher must pin exactly the routed
@@ -4257,8 +4029,7 @@ pub(crate) mod tests {
             },
         );
 
-        let cache_dir = temp_cache_dir();
-        let mut binary_store = empty_store(Arc::clone(&cs), cache_dir.clone());
+        let mut binary_store = empty_store(Arc::clone(&cs));
         binary_store.dicts.subject_reverse_tree = Some(Arc::new(tree));
         let binary_store = Arc::new(binary_store);
 
@@ -4317,96 +4088,16 @@ pub(crate) mod tests {
             "pure hits must not record wants: {} pending",
             register.len()
         );
-        let _ = std::fs::remove_dir_all(cache_dir);
-    }
-
-    /// Each disk-cache read path, given a cache entry left by an earlier run
-    /// under the same CID: a permitting store serves it (the control that
-    /// makes the other half non-vacuous), a store that decrypts on read
-    /// ignores it and serves its own bytes.
-    #[test]
-    fn stale_cache_entries_are_served_only_when_plaintext_cache_permitted() {
-        use crate::read::leaf_access::RangeReadFetcher;
-        const STALE: &[u8] = b"stale plaintext left by an earlier run";
-
-        for permits in [true, false] {
-            let store = if permits {
-                CountingContentStore::new()
-            } else {
-                CountingContentStore::forbidding_plaintext_cache()
-            };
-            let leaf_bytes = build_test_leaf_bytes();
-            let leaf_cid = run_sync_on_runtime({
-                let store = store.clone();
-                let leaf_bytes = leaf_bytes.clone();
-                async move {
-                    store
-                        .put(ContentKind::IndexLeaf, &leaf_bytes)
-                        .await
-                        .map_err(|e| io::Error::other(e.to_string()))
-                }
-            })
-            .expect("store leaf bytes");
-            let cs: Arc<dyn ContentStore> = Arc::new(store.clone());
-            let cache_dir = temp_cache_dir();
-            std::fs::write(cache_dir.join(leaf_cid.to_string()), STALE).unwrap();
-            let shard_path = cache_dir.join(format!("{leaf_cid}.vas"));
-            std::fs::write(&shard_path, STALE).unwrap();
-            let binary_store = empty_store(Arc::clone(&cs), cache_dir.clone());
-            let expected: &[u8] = if permits { STALE } else { &leaf_bytes };
-
-            assert_eq!(
-                binary_store.get_leaf_bytes_sync(&leaf_cid).unwrap(),
-                expected,
-                "get_leaf_bytes_sync, permits={permits}"
-            );
-            assert_eq!(
-                &*binary_store.get_leaf_bytes_shared(&leaf_cid).unwrap(),
-                expected,
-                "get_leaf_bytes_shared, permits={permits}"
-            );
-            let fetcher = ContentStoreRangeFetcher::new(Arc::clone(&cs), cache_dir.clone());
-            assert_eq!(
-                fetcher.fetch_range(&leaf_cid, 0..8).unwrap(),
-                &expected[..8],
-                "range fetch, permits={permits}"
-            );
-            let shard = vector_shard_source(cs.as_ref(), &leaf_cid, &cache_dir);
-            assert_eq!(
-                shard.on_disk.load(AtomicOrdering::Acquire),
-                permits,
-                "vector shard counted as on disk, permits={permits}"
-            );
-            // The stale entry is not a valid leaf: a permitting store fails
-            // to open it, a forbidding one never looks and opens its own.
-            let opened = binary_store.open_leaf_handle(&leaf_cid, None, false);
-            assert_eq!(
-                opened.is_ok(),
-                !permits,
-                "open_leaf_handle, permits={permits}"
-            );
-            if !permits {
-                assert_eq!(
-                    std::fs::read(cache_dir.join(leaf_cid.to_string())).unwrap(),
-                    STALE,
-                    "a forbidding store must not overwrite the cache either"
-                );
-            }
-            let _ = std::fs::remove_dir_all(cache_dir);
-        }
     }
 
     /// A store whose range reads fetch the whole object (encrypted remote
-    /// storage, which also keeps nothing in the disk cache) gets each leaf
+    /// storage, assembled without a disk cache) gets each leaf
     /// fetched whole on its first open, full or directory-only, and the
     /// fetched bytes serve every later open.
     #[test]
     fn leaves_of_a_store_without_ranged_reads_are_fetched_whole_once() {
         for dir_first in [false, true] {
-            let store = CountingContentStore {
-                permits_plaintext_cache: false,
-                ..CountingContentStore::without_ranged_reads()
-            };
+            let store = CountingContentStore::without_ranged_reads();
             let leaf_bytes = build_test_leaf_bytes();
             let leaf_cid = run_sync_on_runtime({
                 let store = store.clone();
@@ -4418,8 +4109,7 @@ pub(crate) mod tests {
                 }
             })
             .expect("store leaf bytes");
-            let cache_dir = temp_cache_dir();
-            let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+            let mut binary_store = empty_store(Arc::new(store.clone()));
             binary_store.leaflet_cache = Some(Arc::new(LeafletCache::with_max_mb(4)));
 
             if dir_first {
@@ -4442,7 +4132,6 @@ pub(crate) mod tests {
                 1,
                 "dir_first={dir_first}: one whole fetch serves every open"
             );
-            let _ = std::fs::remove_dir_all(cache_dir);
         }
     }
 
@@ -4461,7 +4150,12 @@ pub(crate) mod tests {
         })
         .expect("store leaf bytes");
         let cache_dir = temp_cache_dir();
-        let binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+        let binary_store = empty_store(Arc::new(
+            fluree_db_core::disk_cache::CachedContentStore::new(
+                Arc::new(store.clone()),
+                fluree_db_core::disk_cache::DiskArtifactCache::for_dir(&cache_dir),
+            ),
+        ));
 
         let handle = binary_store
             .open_leaf_handle(&leaf_cid, None, false)
@@ -4532,8 +4226,7 @@ pub(crate) mod tests {
         std::fs::write(&leaf_path, &leaf_bytes).expect("write local leaf file");
         store.local.write().insert(leaf_cid.clone(), leaf_path);
 
-        let cache_dir = temp_cache_dir();
-        let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+        let mut binary_store = empty_store(Arc::new(store.clone()));
         binary_store.leaflet_cache = Some(Arc::new(LeafletCache::with_max_mb(4)));
 
         // The first open resolves the file and maps it into the shared cache.
@@ -4560,7 +4253,6 @@ pub(crate) mod tests {
         assert_eq!(store.cas_calls.load(AtomicOrdering::Relaxed), 0);
 
         let _ = std::fs::remove_dir_all(local_dir);
-        let _ = std::fs::remove_dir_all(cache_dir);
     }
 
     #[test]
@@ -4577,8 +4269,7 @@ pub(crate) mod tests {
             }
         })
         .expect("store leaf bytes");
-        let cache_dir = temp_cache_dir();
-        let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+        let mut binary_store = empty_store(Arc::new(store.clone()));
         binary_store.leaflet_cache = Some(Arc::new(LeafletCache::with_max_mb(4)));
 
         let dir = binary_store
@@ -4615,8 +4306,6 @@ pub(crate) mod tests {
         assert_eq!(handle.dir().entries.len(), dir.entries.len());
         assert_eq!(handle.dir().entries[0].row_count, dir.entries[0].row_count);
         assert_eq!(handle.dir().payload_base, dir.payload_base);
-
-        let _ = std::fs::remove_dir_all(cache_dir);
     }
 
     /// Content store whose blobs resolve to local files. `get`/`get_range`
@@ -4643,14 +4332,6 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl ContentStore for LocalFileContentStore {
-        fn permits_plaintext_cache(&self) -> bool {
-            self.inner.permits_plaintext_cache()
-        }
-
-        fn is_remote(&self) -> bool {
-            false
-        }
-
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             self.inner.has(id).await
         }
@@ -4723,14 +4404,6 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl ContentStore for ResidentContentStore {
-        fn permits_plaintext_cache(&self) -> bool {
-            true
-        }
-
-        fn is_remote(&self) -> bool {
-            false
-        }
-
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             self.inner.has(id).await
         }
@@ -4791,8 +4464,7 @@ pub(crate) mod tests {
             }
         })
         .expect("store leaf bytes");
-        let cache_dir = temp_cache_dir();
-        let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+        let mut binary_store = empty_store(Arc::new(store.clone()));
 
         // Without a leaflet cache, then with one: a full open, a
         // directory-only open and whole-leaf bytes all borrow the resident
@@ -4847,13 +4519,6 @@ pub(crate) mod tests {
             binary_store.remote_leaf_metadata.read().is_empty(),
             "a resident leaf must not take the remote range-read path"
         );
-        assert!(
-            std::fs::read_dir(&cache_dir)
-                .map(|entries| entries.count() == 0)
-                .unwrap_or(true),
-            "nothing of a resident leaf lands in the disk cache"
-        );
-        let _ = std::fs::remove_dir_all(cache_dir);
     }
 
     #[test]
@@ -4878,8 +4543,7 @@ pub(crate) mod tests {
         std::fs::write(&leaf_path, &leaf_bytes).expect("write local leaf file");
         store.local.write().insert(leaf_cid.clone(), leaf_path);
 
-        let cache_dir = temp_cache_dir();
-        let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+        let mut binary_store = empty_store(Arc::new(store.clone()));
 
         // No leaflet cache: every open must still resolve via the local file.
         let dir = binary_store
@@ -4919,7 +4583,6 @@ pub(crate) mod tests {
         );
 
         let _ = std::fs::remove_dir_all(local_dir);
-        let _ = std::fs::remove_dir_all(cache_dir);
     }
 
     #[test]
@@ -4929,11 +4592,7 @@ pub(crate) mod tests {
         // Neither special namespace has a prefix: its stored name is the IRI.
         for ns_code in [namespaces::EMPTY, namespaces::OVERFLOW] {
             for initialized in [true, false] {
-                let cache_dir = temp_cache_dir();
-                let mut store = Arc::new(empty_store(
-                    Arc::new(MemoryContentStore::new()),
-                    cache_dir.clone(),
-                ));
+                let mut store = Arc::new(empty_store(Arc::new(MemoryContentStore::new())));
                 let iri = "https://example.org/product/new?x=1&y=2";
                 let mut dn = if initialized {
                     DictNovelty::with_watermarks(vec![], 0)
@@ -4967,7 +4626,6 @@ pub(crate) mod tests {
                     );
                 let persisted = BinaryGraphView::new(store, 0);
                 assert_eq!(persisted.resolve_subject_iri(s_id).unwrap(), iri);
-                let _ = std::fs::remove_dir_all(cache_dir);
             }
         }
     }
@@ -4976,8 +4634,7 @@ pub(crate) mod tests {
     fn subject_decodes_are_memoized_per_view() {
         use fluree_db_core::tracking::{Tracker, TrackingOptions};
 
-        let cache_dir = temp_cache_dir();
-        let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache_dir.clone());
+        let mut store = empty_store(Arc::new(MemoryContentStore::new()));
         store.dicts.namespace_codes =
             Arc::new(HashMap::from([(100, "https://example.org/".to_string())]));
         store.dicts.subject_forward_packs.insert(
@@ -5014,7 +4671,6 @@ pub(crate) mod tests {
             assert_eq!(view.resolve_subject_sid(s_id).unwrap(), sid);
         }
         assert_eq!(tracker.current_micro_fuel().unwrap(), fuel_after_sid);
-        let _ = std::fs::remove_dir_all(cache_dir);
     }
 
     #[test]
@@ -5022,8 +4678,7 @@ pub(crate) mod tests {
         use fluree_db_core::dict_novelty::DictNovelty;
 
         for initialized in [true, false] {
-            let cache_dir = temp_cache_dir();
-            let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache_dir.clone());
+            let mut store = empty_store(Arc::new(MemoryContentStore::new()));
             store.dicts.namespace_codes = Arc::new(HashMap::from([
                 (100, "https://example.org/".to_string()),
                 (namespaces::BLANK_NODE, "_:".to_string()),
@@ -5056,14 +4711,12 @@ pub(crate) mod tests {
             assert!(err.to_string().contains("no namespace prefix for code=102"));
             let missing = SubjectId::new(namespaces::OVERFLOW, 999).as_u64();
             assert!(view.resolve_subject_iri(missing).is_err());
-            let _ = std::fs::remove_dir_all(cache_dir);
         }
     }
 
     #[test]
     fn find_subject_id_uses_full_iri_fallback_when_store_has_it() {
-        let cache_dir = temp_cache_dir();
-        let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache_dir);
+        let mut store = empty_store(Arc::new(MemoryContentStore::new()));
 
         let full_iri = "https://dblp.org/streams/conf/IEEEpact";
         let s_id = SubjectId::new(namespaces::OVERFLOW, 7).as_u64();
@@ -5097,9 +4750,8 @@ pub(crate) mod tests {
     fn decode_value_from_kind_dt_past_payload_width_is_null() {
         use fluree_db_core::o_type::OType;
 
-        let cache_dir = temp_cache_dir();
         let cs: Arc<dyn ContentStore> = Arc::new(CountingContentStore::new());
-        let store = empty_store(cs, cache_dir);
+        let store = empty_store(cs);
 
         for dt in [OType::MAX_PAYLOAD + 1, u16::MAX] {
             let o_kind = ObjKind::LEX_ID.as_u8();
@@ -5122,9 +4774,8 @@ pub(crate) mod tests {
     fn decode_value_from_kind_num_int_with_float_datatype() {
         use fluree_db_core::ids::DatatypeDictId;
 
-        let cache_dir = temp_cache_dir();
         let cs: Arc<dyn ContentStore> = Arc::new(CountingContentStore::new());
-        let store = empty_store(cs, cache_dir);
+        let store = empty_store(cs);
 
         let int_key = ObjKey::encode_i64(1_350_000).as_u64();
 

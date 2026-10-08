@@ -11,7 +11,6 @@
 use fluree_db_core::clock::Instant;
 use std::collections::HashMap;
 use std::io;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -19,7 +18,7 @@ use super::branch::DictBranch;
 use super::reverse_leaf::ReverseLeaf;
 
 use crate::read::leaflet_cache::LeafletCache;
-use fluree_db_core::{ContentId, ContentStore};
+use fluree_db_core::{ContentBytes, ContentId, ContentStore};
 
 /// Leaf data source for demand-loading.
 #[derive(Debug)]
@@ -37,33 +36,7 @@ pub enum LeafSource {
     InMemory(HashMap<String, Arc<[u8]>>),
 }
 
-/// A copy of `cid` an earlier fetch left in the disk cache. A store the
-/// cache does not serve gets nothing from it: nothing left there by an
-/// earlier run is consulted.
-fn read_disk_cached_leaf(
-    cs: &dyn ContentStore,
-    disk_cache_dir: Option<&PathBuf>,
-    cid: &ContentId,
-) -> io::Result<Option<Vec<u8>>> {
-    let Some(cache_dir) = disk_cache_dir else {
-        return Ok(None);
-    };
-    if !crate::read::artifact_cache::uses_disk_cache(cs) {
-        return Ok(None);
-    }
-    let cache_path = cache_dir.join(cid.to_string());
-    match std::fs::read(&cache_path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err),
-    }
-}
-
-fn fetch_remote_leaf_bytes(
-    cs: Arc<dyn ContentStore>,
-    cid: ContentId,
-    disk_cache_dir: Option<PathBuf>,
-) -> io::Result<Vec<u8>> {
+fn fetch_remote_leaf_bytes(cs: Arc<dyn ContentStore>, cid: ContentId) -> io::Result<ContentBytes> {
     // DictTreeReader is sync, but ContentStore::get is async. Bridge via the
     // shared `run_sync_on_runtime` helper, which uses
     // `block_in_place(handle.block_on)` on a multi-thread runtime (so a
@@ -78,16 +51,9 @@ fn fetch_remote_leaf_bytes(
     let timeout = crate::read::binary_index_store::cas_sync_timeout();
     crate::read::binary_index_store::run_sync_on_runtime(async move {
         let fetch = async {
-            if let Some(cache_dir) = disk_cache_dir {
-                crate::read::artifact_cache::fetch_cached_bytes_cid(cs.as_ref(), &cid, &cache_dir)
-                    .await
-                    .map_err(|e| io::Error::other(e.to_string()))
-            } else {
-                cs.get(&cid)
-                    .await
-                    .map(fluree_db_core::ContentBytes::into_vec)
-                    .map_err(|e| io::Error::other(e.to_string()))
-            }
+            cs.get(&cid)
+                .await
+                .map_err(|e| io::Error::other(e.to_string()))
         };
         // Optional per-fetch ceiling (FLUREE_CAS_SYNC_TIMEOUT_MS): a stalled
         // dict-leaf fetch self-aborts instead of blocking.
@@ -115,9 +81,6 @@ pub struct DictTreeReader {
     /// reload matches on to reuse this reader whole.
     branch_cid: Option<ContentId>,
     leaf_source: LeafSource,
-    /// Optional disk-backed artifact cache directory for whole remote dict leaves.
-    /// Used in remote/object-store environments to avoid repeated full-blob fetches.
-    disk_cache_dir: Option<PathBuf>,
     /// Shared global cache for dict leaf blobs. Content-addressed leaves
     /// use `xxh3_128(cas_address)` as the cache key — immutable, no
     /// epoch/time dimension needed.
@@ -137,7 +100,6 @@ impl DictTreeReader {
             branch,
             branch_cid: None,
             leaf_source,
-            disk_cache_dir: None,
             global_cache: None,
             disk_reads: AtomicU64::new(0),
             local_file_reads: AtomicU64::new(0),
@@ -161,7 +123,6 @@ impl DictTreeReader {
             branch,
             branch_cid: None,
             leaf_source,
-            disk_cache_dir: None,
             global_cache: Some(cache),
             disk_reads: AtomicU64::new(0),
             local_file_reads: AtomicU64::new(0),
@@ -181,7 +142,6 @@ impl DictTreeReader {
             branch,
             branch_cid: None,
             leaf_source: LeafSource::InMemory(arc_leaves),
-            disk_cache_dir: None,
             global_cache: None,
             disk_reads: AtomicU64::new(0),
             local_file_reads: AtomicU64::new(0),
@@ -199,9 +159,8 @@ impl DictTreeReader {
         cs: &Arc<dyn ContentStore>,
         refs: &crate::format::wire_helpers::DictTreeRefs,
         leaflet_cache: Option<&Arc<LeafletCache>>,
-        disk_cache_dir: Option<&std::path::Path>,
     ) -> io::Result<Self> {
-        Self::load_refs(cs, refs, leaflet_cache, disk_cache_dir).await
+        Self::load_refs(cs, refs, leaflet_cache).await
     }
 
     /// [`Self::from_refs`] for a reload: returns `prev` itself when it was
@@ -211,7 +170,6 @@ impl DictTreeReader {
         cs: &Arc<dyn ContentStore>,
         refs: &crate::format::wire_helpers::DictTreeRefs,
         leaflet_cache: Option<&Arc<LeafletCache>>,
-        disk_cache_dir: Option<&std::path::Path>,
         prev: Option<&Arc<DictTreeReader>>,
     ) -> io::Result<Arc<Self>> {
         if let Some(prev) = prev {
@@ -221,12 +179,11 @@ impl DictTreeReader {
                 (None, None) => true,
                 _ => false,
             };
-            let same_dir = prev.disk_cache_dir.as_deref() == disk_cache_dir;
-            if same_branch && same_cache && same_dir {
+            if same_branch && same_cache {
                 return Ok(Arc::clone(prev));
             }
         }
-        let reader = Self::load_refs(cs, refs, leaflet_cache, disk_cache_dir).await?;
+        let reader = Self::load_refs(cs, refs, leaflet_cache).await?;
         Ok(Arc::new(reader))
     }
 
@@ -234,7 +191,6 @@ impl DictTreeReader {
         cs: &Arc<dyn ContentStore>,
         refs: &crate::format::wire_helpers::DictTreeRefs,
         leaflet_cache: Option<&Arc<LeafletCache>>,
-        disk_cache_dir: Option<&std::path::Path>,
     ) -> io::Result<Self> {
         let branch_bytes = cs
             .get(&refs.branch)
@@ -258,18 +214,12 @@ impl DictTreeReader {
             None => Self::new(branch, leaf_source),
         };
         reader.branch_cid = Some(refs.branch.clone());
-        reader.disk_cache_dir = disk_cache_dir.map(std::path::Path::to_path_buf);
         Ok(reader)
     }
 
     /// Attach a global cache to this reader.
     pub fn set_cache(&mut self, cache: Option<Arc<LeafletCache>>) {
         self.global_cache = cache;
-    }
-
-    /// Attach or clear the disk-backed artifact cache directory.
-    pub fn set_disk_cache_dir(&mut self, cache_dir: Option<PathBuf>) {
-        self.disk_cache_dir = cache_dir;
     }
 
     /// The underlying branch manifest.
@@ -371,13 +321,6 @@ impl DictTreeReader {
             LeafSource::Cas { cids, .. } => cids.get(address),
             LeafSource::InMemory(_) => None,
         }
-    }
-
-    /// The disk-backed artifact cache directory this reader reads prewarmed
-    /// leaves from, if configured. A prefetch must write to this same dir for
-    /// `load_leaf` to find the bytes.
-    pub fn disk_cache_dir(&self) -> Option<&std::path::Path> {
-        self.disk_cache_dir.as_deref()
     }
 
     /// Batched reverse lookup: find IDs by key bytes while loading each touched
@@ -599,7 +542,7 @@ impl DictTreeReader {
     }
 
     /// One leaf from the content store: its local bytes when the store has
-    /// them, else a promoted copy in the disk cache, else a fetch over the
+    /// them (for a remote store, its disk cache), else a fetch over the
     /// sync→async bridge.
     fn load_cas_leaf(
         &self,
@@ -617,25 +560,18 @@ impl DictTreeReader {
             }
             return Ok(bytes.into_shared());
         }
-        if let Some(bytes) = read_disk_cached_leaf(cs.as_ref(), self.disk_cache_dir.as_ref(), cid)?
-        {
-            self.disk_reads.fetch_add(1, Ordering::Relaxed);
-            self.local_file_reads.fetch_add(1, Ordering::Relaxed);
-            return Ok(Arc::from(bytes));
-        }
         tracing::debug!(address, %cid, "dict tree: remote leaf fetch starting");
         self.disk_reads.fetch_add(1, Ordering::Relaxed);
         self.remote_fetches.fetch_add(1, Ordering::Relaxed);
         let fetch_started = Instant::now();
-        let bytes =
-            fetch_remote_leaf_bytes(Arc::clone(cs), cid.clone(), self.disk_cache_dir.clone())?;
+        let bytes = fetch_remote_leaf_bytes(Arc::clone(cs), cid.clone())?;
         tracing::debug!(
             address,
             bytes = bytes.len(),
             elapsed_ms = fetch_started.elapsed().as_millis() as u64,
             "dict tree: remote leaf fetch complete"
         );
-        Ok(Arc::from(bytes))
+        Ok(bytes.into_shared())
     }
 
     /// Total entries across all leaves.
@@ -703,6 +639,7 @@ mod tests {
     use super::*;
     use crate::dict::builder;
     use crate::dict::reverse_leaf::ReverseEntry;
+    use std::path::PathBuf;
 
     fn build_reverse_reader(entries: Vec<ReverseEntry>) -> DictTreeReader {
         let result =
@@ -745,14 +682,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ContentStore for CountingFileStore {
-        fn permits_plaintext_cache(&self) -> bool {
-            true
-        }
-
-        fn is_remote(&self) -> bool {
-            false
-        }
-
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             Ok(self.paths.lock().contains_key(id))
         }
@@ -868,7 +797,7 @@ mod tests {
         grown.extend(high.iter().cloned());
         let refs_v2 = stored_tree(&store, &grown).await;
 
-        let v1 = DictTreeReader::from_refs_reusing(&cs, &refs_v1, None, None, None)
+        let v1 = DictTreeReader::from_refs_reusing(&cs, &refs_v1, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -879,7 +808,7 @@ mod tests {
         assert_eq!(v1.reverse_lookup(b"c").unwrap(), Some(2));
         assert_eq!(store.resolves.load(Ordering::Relaxed), 1);
 
-        let same = DictTreeReader::from_refs_reusing(&cs, &refs_v1, None, None, Some(&v1))
+        let same = DictTreeReader::from_refs_reusing(&cs, &refs_v1, None, Some(&v1))
             .await
             .unwrap();
         assert!(
@@ -887,7 +816,7 @@ mod tests {
             "an unchanged branch cid must hand back the previous reader"
         );
 
-        let v2 = DictTreeReader::from_refs_reusing(&cs, &refs_v2, None, None, Some(&v1))
+        let v2 = DictTreeReader::from_refs_reusing(&cs, &refs_v2, None, Some(&v1))
             .await
             .unwrap();
         assert!(!Arc::ptr_eq(&v2, &v1));
@@ -897,116 +826,6 @@ mod tests {
         assert_eq!(v2.reverse_lookup(b"p").unwrap(), Some(103));
 
         let _ = std::fs::remove_dir_all(&store.dir);
-    }
-
-    /// In-memory remote store (no local paths) whose plaintext-cache answer
-    /// is set by the test.
-    #[derive(Debug)]
-    struct RemoteStore {
-        inner: fluree_db_core::MemoryContentStore,
-        permits_plaintext_cache: bool,
-    }
-
-    #[async_trait::async_trait]
-    impl ContentStore for RemoteStore {
-        async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
-            self.inner.has(id).await
-        }
-        async fn get(
-            &self,
-            id: &ContentId,
-        ) -> fluree_db_core::Result<fluree_db_core::ContentBytes> {
-            self.inner.get(id).await
-        }
-        async fn put(
-            &self,
-            kind: fluree_db_core::ContentKind,
-            bytes: &[u8],
-        ) -> fluree_db_core::Result<ContentId> {
-            self.inner.put(kind, bytes).await
-        }
-        async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> fluree_db_core::Result<()> {
-            self.inner.put_with_id(id, bytes).await
-        }
-        async fn release(&self, id: &ContentId) -> fluree_db_core::Result<()> {
-            self.inner.release(id).await
-        }
-        fn permits_plaintext_cache(&self) -> bool {
-            self.permits_plaintext_cache
-        }
-
-        fn is_remote(&self) -> bool {
-            true
-        }
-    }
-
-    /// A disk-cache entry left under a leaf's CID by an earlier run — here a
-    /// valid leaf mapping the same key to a different id — is served only by
-    /// a store that permits a plaintext cache; one that decrypts on read
-    /// fetches its own leaf.
-    #[test]
-    fn stale_disk_cached_leaf_is_ignored_when_plaintext_cache_forbidden() {
-        let tree = |id_offset: u64| {
-            let entries = ["a", "b", "c"]
-                .iter()
-                .enumerate()
-                .map(|(i, k)| ReverseEntry {
-                    key: k.as_bytes().to_vec(),
-                    id: id_offset + i as u64,
-                })
-                .collect();
-            builder::build_reverse_tree(entries, builder::DEFAULT_TARGET_LEAF_BYTES).unwrap()
-        };
-        let current = tree(0);
-        let stale = tree(1000);
-        assert_eq!(current.leaves.len(), 1);
-        assert_eq!(stale.leaves.len(), 1);
-
-        for permits in [true, false] {
-            let store = Arc::new(RemoteStore {
-                inner: fluree_db_core::MemoryContentStore::new(),
-                permits_plaintext_cache: permits,
-            });
-            let cs: Arc<dyn ContentStore> = store.clone();
-            let cid = crate::read::binary_index_store::run_sync_on_runtime({
-                let cs = Arc::clone(&cs);
-                let bytes = current.leaves[0].bytes.clone();
-                async move {
-                    cs.put(
-                        fluree_db_core::ContentKind::DictBlob {
-                            dict: fluree_db_core::DictKind::SubjectReverse,
-                        },
-                        &bytes,
-                    )
-                    .await
-                    .map_err(|e| io::Error::other(e.to_string()))
-                }
-            })
-            .unwrap();
-
-            static N: AtomicU64 = AtomicU64::new(0);
-            let cache_dir = std::env::temp_dir().join(format!(
-                "fluree_dict_reader_stale_{}_{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&cache_dir).unwrap();
-            std::fs::write(cache_dir.join(cid.to_string()), &stale.leaves[0].bytes).unwrap();
-
-            let mut cids = HashMap::new();
-            cids.insert(current.branch.leaves[0].address.clone(), cid);
-            let mut reader =
-                DictTreeReader::new(current.branch.clone(), LeafSource::Cas { cs, cids });
-            reader.set_disk_cache_dir(Some(cache_dir.clone()));
-
-            let expected = if permits { 1002 } else { 2 };
-            assert_eq!(
-                reader.reverse_lookup(b"c").unwrap(),
-                Some(expected),
-                "permits={permits}"
-            );
-            let _ = std::fs::remove_dir_all(&cache_dir);
-        }
     }
 
     /// In-memory store that hands its leaves out shared, as memory storage
@@ -1052,12 +871,6 @@ mod tests {
         }
         async fn release(&self, id: &ContentId) -> fluree_db_core::Result<()> {
             self.inner.release(id).await
-        }
-        fn permits_plaintext_cache(&self) -> bool {
-            true
-        }
-        fn is_remote(&self) -> bool {
-            false
         }
         fn get_local(
             &self,

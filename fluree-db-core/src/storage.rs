@@ -675,19 +675,6 @@ pub trait ContentStore: Debug + Send + Sync {
         Ok(None)
     }
 
-    /// Whether bytes returned by [`Self::get`] may be persisted unencrypted
-    /// outside this store — see [`StorageRead::permits_plaintext_cache`],
-    /// including why there is no default. The disk artifact cache consults
-    /// this, through [`crate::disk_cache::uses_disk_cache`], before reading or
-    /// writing an artifact in its directory.
-    fn permits_plaintext_cache(&self) -> bool;
-
-    /// Whether [`Self::get`] leaves the machine — see
-    /// [`StorageRead::is_remote`], including why there is no default.
-    /// Callers deciding whether to use the disk artifact cache go through
-    /// [`crate::disk_cache::uses_disk_cache`] rather than reading this.
-    fn is_remote(&self) -> bool;
-
     /// The store's residency miss register, if it participates in the sync
     /// residency tier.
     ///
@@ -758,6 +745,22 @@ pub trait ContentStore: Debug + Send + Sync {
         Ok(full[start..end].to_vec())
     }
 
+    /// Warm the store's local tier with `id` ahead of sync reads, so they
+    /// find it without a fetch. A hint: a store with no tier to warm does
+    /// nothing, which is the default.
+    async fn prefetch(&self, id: &ContentId) -> Result<()> {
+        let _ = id;
+        Ok(())
+    }
+
+    /// Offer `bytes`, just written as `id`, to the store's local tier for
+    /// reads about to follow in this process: an index build seeds what its
+    /// readers open next. A hint, never required for correctness; a store
+    /// with nowhere to keep them ignores it, which is the default.
+    fn keep_local(&self, id: &ContentId, bytes: &[u8]) {
+        let _ = (id, bytes);
+    }
+
     /// Whether [`Self::get_range`] reads only the requested bytes. When it
     /// does not — the default `get_range` fetches the whole object, and so
     /// does any store that must decrypt the whole object — readers fetch an
@@ -803,14 +806,6 @@ impl ContentStore for Arc<dyn ContentStore> {
         self.as_ref().get_local(id)
     }
 
-    fn permits_plaintext_cache(&self) -> bool {
-        self.as_ref().permits_plaintext_cache()
-    }
-
-    fn is_remote(&self) -> bool {
-        self.as_ref().is_remote()
-    }
-
     fn miss_register(&self) -> Option<&residency::MissRegister> {
         self.as_ref().miss_register()
     }
@@ -833,6 +828,14 @@ impl ContentStore for Arc<dyn ContentStore> {
 
     fn supports_ranged_reads(&self) -> bool {
         self.as_ref().supports_ranged_reads()
+    }
+
+    fn keep_local(&self, id: &ContentId, bytes: &[u8]) {
+        self.as_ref().keep_local(id, bytes);
+    }
+
+    async fn prefetch(&self, id: &ContentId) -> Result<()> {
+        self.as_ref().prefetch(id).await
     }
 }
 
@@ -1040,14 +1043,6 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
             }
         }
 
-        // After the deletes, never before: evicting first leaves a window
-        // where a concurrent reader repopulates the entry from storage that
-        // still holds the blob. Runs even when a delete failed — the blob may
-        // be partly gone by then, and a needless eviction only costs a refetch.
-        // Off-native there is no disk cache to hold a stale entry.
-        #[cfg(feature = "native")]
-        crate::disk_cache::evict_cached_cid(id);
-
         deleted
     }
 
@@ -1065,12 +1060,6 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         }
 
         let failed = self.storage.delete_many(&addresses).await;
-
-        // Deletes before evictions, for the reason `release` gives.
-        #[cfg(feature = "native")]
-        for id in ids {
-            crate::disk_cache::evict_cached_cid(id);
-        }
 
         // One failure per id, the first address that failed.
         let mut seen = std::collections::HashSet::new();
@@ -1111,14 +1100,6 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
             Some(legacy) => self.storage.get_local(&legacy),
             None => Ok(None),
         }
-    }
-
-    fn permits_plaintext_cache(&self) -> bool {
-        self.storage.permits_plaintext_cache()
-    }
-
-    fn is_remote(&self) -> bool {
-        self.storage.is_remote()
     }
 
     fn supports_ranged_reads(&self) -> bool {
@@ -1225,6 +1206,31 @@ pub enum StorageBackend {
     /// Namespace-routed composition: mounted alias prefixes read through
     /// their own backend, everything else uses the default backend.
     Routed(Arc<RoutedBackend>),
+    /// A remote backend whose content stores are fronted by the disk
+    /// artifact cache; see [`StorageBackend::with_disk_cache`].
+    #[cfg(any(feature = "native", target_arch = "wasm32"))]
+    Cached(Arc<CachedBackend>),
+}
+
+/// A backend whose content stores read through
+/// [`CachedContentStore`](crate::disk_cache::CachedContentStore).
+#[cfg(any(feature = "native", target_arch = "wasm32"))]
+pub struct CachedBackend {
+    inner: StorageBackend,
+    /// `None` when the backend's bytes may not sit on disk in plaintext.
+    disk: Option<Arc<crate::disk_cache::DiskArtifactCache>>,
+    /// This backend's in-flight fetches, never shared with another backend.
+    flights: Arc<crate::disk_cache::StoreFlights>,
+}
+
+#[cfg(any(feature = "native", target_arch = "wasm32"))]
+impl Debug for CachedBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedBackend")
+            .field("inner", &self.inner)
+            .field("cache_dir", &self.disk.as_ref().map(|cache| cache.root()))
+            .finish()
+    }
 }
 
 /// Namespace-prefix routing table for [`StorageBackend::Routed`].
@@ -1290,6 +1296,80 @@ impl StorageBackend {
             StorageBackend::Routed(routed) => {
                 routed.backend_for(namespace_id).content_store(namespace_id)
             }
+            #[cfg(any(feature = "native", target_arch = "wasm32"))]
+            StorageBackend::Cached(cached) => {
+                Arc::new(crate::disk_cache::CachedContentStore::in_backend(
+                    cached.inner.content_store(namespace_id),
+                    cached.disk.clone(),
+                    Arc::clone(&cached.flights),
+                    namespace_id,
+                ))
+            }
+        }
+    }
+
+    /// Front every remote store in this backend with the disk artifact cache
+    /// in `cache_dir`; local stores are left as they are, and the directory
+    /// is not created unless something is cached in it.
+    ///
+    /// This is the one place that asks whether a storage is remote: a disk
+    /// copy only pays off when reads leave the machine, and is only allowed
+    /// when the bytes may sit outside the storage in plaintext. A remote
+    /// storage that decrypts on read still gets its fetches coalesced, among
+    /// its own readers only. An append-only content store (IPFS) is remote
+    /// and returns the bytes at rest. Applying it twice changes nothing.
+    #[cfg(any(feature = "native", target_arch = "wasm32"))]
+    pub fn with_disk_cache(self, cache_dir: &std::path::Path) -> Self {
+        use crate::disk_cache::DiskArtifactCache;
+        match self {
+            StorageBackend::Managed(storage) if !storage.is_remote() => {
+                StorageBackend::Managed(storage)
+            }
+            StorageBackend::Managed(storage) => {
+                let disk = storage
+                    .permits_plaintext_cache()
+                    .then(|| DiskArtifactCache::for_dir(cache_dir));
+                StorageBackend::Cached(Arc::new(CachedBackend {
+                    inner: StorageBackend::Managed(storage),
+                    disk,
+                    flights: Arc::default(),
+                }))
+            }
+            StorageBackend::Permanent(store) => StorageBackend::Cached(Arc::new(CachedBackend {
+                inner: StorageBackend::Permanent(store),
+                disk: Some(DiskArtifactCache::for_dir(cache_dir)),
+                flights: Arc::default(),
+            })),
+            StorageBackend::Routed(routed) => StorageBackend::Routed(Arc::new(RoutedBackend {
+                default: routed.default.clone().with_disk_cache(cache_dir),
+                mounts: routed
+                    .mounts
+                    .iter()
+                    .map(|(prefix, backend)| {
+                        (prefix.clone(), backend.clone().with_disk_cache(cache_dir))
+                    })
+                    .collect(),
+            })),
+            cached @ StorageBackend::Cached(_) => cached,
+        }
+    }
+
+    /// This backend with every disk-cache wrapper removed: reads go to the
+    /// storage itself. For checks that must observe what the storage holds,
+    /// not a copy taken earlier.
+    pub fn without_disk_cache(&self) -> Self {
+        match self {
+            StorageBackend::Managed(_) | StorageBackend::Permanent(_) => self.clone(),
+            StorageBackend::Routed(routed) => StorageBackend::Routed(Arc::new(RoutedBackend {
+                default: routed.default.without_disk_cache(),
+                mounts: routed
+                    .mounts
+                    .iter()
+                    .map(|(prefix, backend)| (prefix.clone(), backend.without_disk_cache()))
+                    .collect(),
+            })),
+            #[cfg(any(feature = "native", target_arch = "wasm32"))]
+            StorageBackend::Cached(cached) => cached.inner.without_disk_cache(),
         }
     }
 
@@ -1302,6 +1382,8 @@ impl StorageBackend {
             StorageBackend::Managed(storage) => Some(storage.as_ref()),
             StorageBackend::Permanent(_) => None,
             StorageBackend::Routed(routed) => routed.default.admin_storage(),
+            #[cfg(any(feature = "native", target_arch = "wasm32"))]
+            StorageBackend::Cached(cached) => cached.inner.admin_storage(),
         }
     }
 
@@ -1314,6 +1396,8 @@ impl StorageBackend {
             StorageBackend::Managed(storage) => Some(Arc::clone(storage)),
             StorageBackend::Permanent(_) => None,
             StorageBackend::Routed(routed) => routed.default.admin_storage_cloned(),
+            #[cfg(any(feature = "native", target_arch = "wasm32"))]
+            StorageBackend::Cached(cached) => cached.inner.admin_storage_cloned(),
         }
     }
 }
@@ -1324,6 +1408,8 @@ impl Debug for StorageBackend {
             StorageBackend::Managed(s) => f.debug_tuple("Managed").field(s).finish(),
             StorageBackend::Permanent(s) => f.debug_tuple("Permanent").field(s).finish(),
             StorageBackend::Routed(s) => f.debug_tuple("Routed").field(s).finish(),
+            #[cfg(any(feature = "native", target_arch = "wasm32"))]
+            StorageBackend::Cached(s) => f.debug_tuple("Cached").field(s).finish(),
         }
     }
 }
@@ -1334,6 +1420,8 @@ impl Clone for StorageBackend {
             StorageBackend::Managed(s) => StorageBackend::Managed(Arc::clone(s)),
             StorageBackend::Permanent(s) => StorageBackend::Permanent(Arc::clone(s)),
             StorageBackend::Routed(s) => StorageBackend::Routed(Arc::clone(s)),
+            #[cfg(any(feature = "native", target_arch = "wasm32"))]
+            StorageBackend::Cached(s) => StorageBackend::Cached(Arc::clone(s)),
         }
     }
 }
@@ -1430,6 +1518,27 @@ impl ContentStore for BranchedContentStore {
         self.branch_store.put_with_id(id, bytes).await
     }
 
+    /// Writes land in the branch's own store, so it is the one to keep them.
+    fn keep_local(&self, id: &ContentId, bytes: &[u8]) {
+        self.branch_store.keep_local(id, bytes);
+    }
+
+    /// Warms whichever store in the ancestry holds `id`, as `get` reads it.
+    async fn prefetch(&self, id: &ContentId) -> Result<()> {
+        match self.branch_store.prefetch(id).await {
+            Err(crate::error::Error::NotFound(_)) if !self.parents.is_empty() => {}
+            other => return other,
+        }
+        let mut last_err = None;
+        for parent in &self.parents {
+            match Box::pin(parent.prefetch(id)).await {
+                Ok(()) => return Ok(()),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| crate::error::Error::not_found(id.to_string())))
+    }
+
     async fn release(&self, id: &ContentId) -> Result<()> {
         self.branch_store.release(id).await
     }
@@ -1448,22 +1557,6 @@ impl ContentStore for BranchedContentStore {
             }
         }
         Ok(None)
-    }
-
-    /// A read may be served by any ancestor, so every store in the
-    /// ancestry must permit the spill.
-    fn permits_plaintext_cache(&self) -> bool {
-        self.branch_store.permits_plaintext_cache()
-            && self
-                .parents
-                .iter()
-                .all(ContentStore::permits_plaintext_cache)
-    }
-
-    /// A read may be served by any ancestor, so one remote store in the
-    /// ancestry makes the whole chain remote.
-    fn is_remote(&self) -> bool {
-        self.branch_store.is_remote() || self.parents.iter().any(ContentStore::is_remote)
     }
 
     /// A read may be served by any ancestor, so every store in the ancestry
@@ -1879,40 +1972,128 @@ mod tests {
     use super::*;
     use crate::content_kind::DictKind;
     use crate::storage::memory::MemoryStorage;
+    use std::sync::Mutex;
 
     const LEDGER: &str = "mydb:main";
 
-    /// Releasing a blob must take its cached copy with it. A cache entry that
-    /// outlives its blob reads back as a live object, so a caller deciding
-    /// what storage holds — the index-chain walk, which ends at a root storage
-    /// no longer has — would not see the ending.
-    #[cfg(feature = "native")]
+    /// Holds `held` and records which hints reach it.
+    #[derive(Debug, Default)]
+    struct HintRecorder {
+        held: Vec<ContentId>,
+        ranged: bool,
+        kept: Mutex<Vec<ContentId>>,
+        prefetched: Mutex<Vec<ContentId>>,
+    }
+
+    impl HintRecorder {
+        fn holding(id: &ContentId) -> Arc<Self> {
+            Arc::new(Self {
+                held: vec![id.clone()],
+                ranged: true,
+                ..Self::default()
+            })
+        }
+
+        fn kept(&self) -> Vec<ContentId> {
+            self.kept.lock().unwrap().clone()
+        }
+
+        fn prefetched(&self) -> Vec<ContentId> {
+            self.prefetched.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ContentStore for HintRecorder {
+        async fn has(&self, id: &ContentId) -> Result<bool> {
+            Ok(self.held.contains(id))
+        }
+        async fn get(&self, id: &ContentId) -> Result<ContentBytes> {
+            self.get_local(id)?
+                .ok_or_else(|| crate::error::Error::not_found(id.to_string()))
+        }
+        fn get_local(&self, id: &ContentId) -> Result<Option<ContentBytes>> {
+            Ok(self.held.contains(id).then(|| b"held".to_vec().into()))
+        }
+        async fn put(&self, _kind: ContentKind, _bytes: &[u8]) -> Result<ContentId> {
+            unimplemented!()
+        }
+        async fn put_with_id(&self, _id: &ContentId, _bytes: &[u8]) -> Result<()> {
+            unimplemented!()
+        }
+        async fn release(&self, _id: &ContentId) -> Result<()> {
+            unimplemented!()
+        }
+        fn supports_ranged_reads(&self) -> bool {
+            self.ranged
+        }
+        fn keep_local(&self, id: &ContentId, _bytes: &[u8]) {
+            self.kept.lock().unwrap().push(id.clone());
+        }
+        async fn prefetch(&self, id: &ContentId) -> Result<()> {
+            if !self.held.contains(id) {
+                return Err(crate::error::Error::not_found(id.to_string()));
+            }
+            self.prefetched.lock().unwrap().push(id.clone());
+            Ok(())
+        }
+    }
+
+    /// Every hint passes through the `Arc<dyn ContentStore>` impl: its
+    /// defaults would otherwise drop them without a trace.
     #[tokio::test]
-    async fn releasing_a_blob_evicts_its_cached_copy() {
-        let storage = MemoryStorage::new().simulating_remote();
-        let store = content_store_for(storage.clone(), LEDGER);
-        let bytes = b"root bytes";
-        let id = store.put(ContentKind::IndexRoot, bytes).await.unwrap();
+    async fn an_arc_dyn_store_forwards_every_hint() {
+        async fn hints<S: ContentStore>(store: &S, id: &ContentId) {
+            assert!(store.supports_ranged_reads());
+            assert!(store.get_local(id).unwrap().is_some());
+            store.keep_local(id, b"bytes");
+            store.prefetch(id).await.unwrap();
+        }
+        let id = ContentId::new(ContentKind::IndexLeaf, b"leaf");
+        let recorder = HintRecorder::holding(&id);
+        let store: Arc<dyn ContentStore> = recorder.clone();
+        hints(&store, &id).await;
+        assert_eq!(recorder.kept(), vec![id.clone()]);
+        assert_eq!(recorder.prefetched(), vec![id]);
+    }
 
-        let cache_dir = std::env::temp_dir().join(format!(
-            "fluree-release-evicts-test-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&cache_dir);
-        crate::disk_cache::fetch_cached_bytes_cid(&store, &id, &cache_dir)
-            .await
-            .unwrap();
-        let cached = cache_dir.join(id.to_string());
-        assert!(cached.exists(), "the fetch should have populated the cache");
-
-        store.release(&id).await.unwrap();
-
-        assert!(
-            !cached.exists(),
-            "a released blob is still readable from the disk cache"
+    /// A branched store keeps writes in the branch's own store, warms the
+    /// ancestor that holds the object, serves local bytes from any ancestor,
+    /// and reads ranges natively only when every ancestor does.
+    #[tokio::test]
+    async fn a_branched_store_routes_every_hint() {
+        let own = ContentId::new(ContentKind::IndexLeaf, b"own");
+        let inherited = ContentId::new(ContentKind::IndexLeaf, b"inherited");
+        let absent = ContentId::new(ContentKind::IndexLeaf, b"absent");
+        let branch = HintRecorder::holding(&own);
+        let parent = HintRecorder::holding(&inherited);
+        let store = BranchedContentStore::with_parents(
+            branch.clone(),
+            vec![BranchedContentStore::leaf(parent.clone())],
         );
-        let _ = std::fs::remove_dir_all(&cache_dir);
+
+        assert!(store.supports_ranged_reads());
+        assert!(store.get_local(&inherited).unwrap().is_some());
+        store.keep_local(&inherited, b"bytes");
+        assert_eq!(branch.kept(), vec![inherited.clone()]);
+        assert!(parent.kept().is_empty());
+
+        store.prefetch(&own).await.unwrap();
+        store.prefetch(&inherited).await.unwrap();
+        assert_eq!(branch.prefetched(), vec![own]);
+        assert_eq!(parent.prefetched(), vec![inherited]);
+        assert!(matches!(
+            store.prefetch(&absent).await,
+            Err(crate::error::Error::NotFound(_))
+        ));
+
+        let unranged = BranchedContentStore::with_parents(
+            branch,
+            vec![BranchedContentStore::leaf(
+                Arc::new(HintRecorder::default()),
+            )],
+        );
+        assert!(!unranged.supports_ranged_reads());
     }
 
     /// Memory storage is keyed by address while readers ask by CID: the

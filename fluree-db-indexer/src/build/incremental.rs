@@ -89,46 +89,46 @@ impl Phase2FetchStats {
     }
 }
 
-/// Seed the read-through artifact cache with bytes this build just uploaded,
-/// so the first reader does not re-fetch them — when the store is one the
-/// cache serves at all (see `uses_disk_cache`).
+/// Offer bytes this build just uploaded to the store's local tier, so the
+/// first reader does not fetch them back ([`ContentStore::keep_local`]; a
+/// store with no tier to keep them in ignores it).
 fn cache_artifact_bytes(
     content_store: &dyn ContentStore,
-    cache_dir: &std::path::Path,
     cid: &ContentId,
     bytes: &[u8],
     artifact_kind: &'static str,
 ) {
-    if fluree_db_binary_index::read::artifact_cache::seed_disk_cache(
-        content_store,
-        cid,
-        cache_dir,
-        bytes,
-    ) {
-        tracing::trace!(
-            %cid,
-            artifact_kind,
-            bytes = bytes.len(),
-            cache_dir = %cache_dir.display(),
-            "V6 incremental: seeded artifact cache"
-        );
-    }
+    content_store.keep_local(cid, bytes);
+    tracing::trace!(
+        %cid,
+        artifact_kind,
+        bytes = bytes.len(),
+        "V6 incremental: offered artifact to the local tier"
+    );
 }
 
 async fn fetch_cached_index_bytes(
     content_store: &dyn ContentStore,
     cid: &ContentId,
-    cache_dir: &std::path::Path,
     context: impl Into<String>,
 ) -> Result<Vec<u8>> {
     let context = context.into();
-    fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(
-        content_store,
-        cid,
-        cache_dir,
-    )
-    .await
-    .map_err(|e| IndexerError::StorageRead(format!("{context}: {e}")))
+    content_store
+        .get(cid)
+        .await
+        .map(fluree_db_core::ContentBytes::into_vec)
+        .map_err(|e| IndexerError::StorageRead(format!("{context}: {e}")))
+}
+
+/// `id`'s bytes, and whether the store already had them locally.
+async fn fetch_noting_local(
+    content_store: &dyn ContentStore,
+    id: &ContentId,
+) -> fluree_db_core::Result<(Vec<u8>, bool)> {
+    if let Some(bytes) = content_store.get_local(id)? {
+        return Ok((bytes.into_vec(), true));
+    }
+    Ok((content_store.get(id).await?.into_vec(), false))
 }
 
 async fn upload_dict_blob_cached(
@@ -136,10 +136,9 @@ async fn upload_dict_blob_cached(
     dict: fluree_db_core::DictKind,
     bytes: &[u8],
     msg: &'static str,
-    cache_dir: &std::path::Path,
 ) -> Result<ContentId> {
     let cid = super::upload::upload_dict_blob(content_store, dict, bytes, msg).await?;
-    cache_artifact_bytes(content_store, cache_dir, &cid, bytes, "dict_blob");
+    cache_artifact_bytes(content_store, &cid, bytes, "dict_blob");
     Ok(cid)
 }
 
@@ -174,7 +173,6 @@ async fn run_update_branch(
     tracker: fluree_db_core::tracking::Tracker,
     upload_budget: Arc<Semaphore>,
     upload_buffer: usize,
-    cache_dir: std::path::PathBuf,
     warm_cache: Option<Arc<LeafletCache>>,
 ) -> std::result::Result<(BranchUpdateMeta, Phase2FetchStatsSnapshot), IndexerError> {
     let parent_span = tracing::Span::current();
@@ -218,15 +216,10 @@ async fn run_update_branch(
     let leaf_pairs: Vec<(ContentId, Vec<u8>)> = stream::iter(leaf_cids)
         .map(|cid| async {
             let _permit = upload_budget.acquire().await.expect("upload budget open");
-            let cached_before = cache_dir.join(cid.to_string()).exists();
             let started = Instant::now();
-            let bytes = fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(
-                content_store.as_ref(),
-                &cid,
-                &cache_dir,
-            )
-            .await
-            .map_err(|e| IndexerError::StorageRead(format!("prefetch leaf {cid}: {e}")))?;
+            let (bytes, cached_before) = fetch_noting_local(content_store.as_ref(), &cid)
+                .await
+                .map_err(|e| IndexerError::StorageRead(format!("prefetch leaf {cid}: {e}")))?;
             stats.leaf_fetches.fetch_add(1, Ordering::Relaxed);
             stats
                 .leaf_fetch_ms
@@ -250,16 +243,9 @@ async fn run_update_branch(
     let sidecar_pairs: Vec<(ContentId, Option<Vec<u8>>)> = stream::iter(sidecar_cids)
         .map(|cid| async {
             let _permit = upload_budget.acquire().await.expect("upload budget open");
-            let cached_before = cache_dir.join(cid.to_string()).exists();
             let started = Instant::now();
-            match fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(
-                content_store.as_ref(),
-                &cid,
-                &cache_dir,
-            )
-            .await
-            {
-                Ok(bytes) => {
+            match fetch_noting_local(content_store.as_ref(), &cid).await {
+                Ok((bytes, cached_before)) => {
                     stats.sidecar_fetches.fetch_add(1, Ordering::Relaxed);
                     stats
                         .sidecar_fetch_ms
@@ -276,7 +262,7 @@ async fn run_update_branch(
                 }
                 // A sidecar listed in the manifest may not exist in storage;
                 // treat NotFound as "absent", same as the previous path.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(fluree_db_core::Error::NotFound(_)) => {
                     stats.sidecar_absent.fetch_add(1, Ordering::Relaxed);
                     Ok((cid, None))
                 }
@@ -333,7 +319,6 @@ async fn run_update_branch(
     let uploader = {
         let content_store = content_store.as_ref();
         let tracker = &tracker;
-        let cache_dir = &cache_dir;
         let warm_cache = warm_cache.as_ref();
         async move {
             let mut totals = LeafUploadCounts::default();
@@ -342,7 +327,6 @@ async fn run_update_branch(
                     content_store,
                     tracker,
                     upload_budget_ref,
-                    cache_dir,
                     blob,
                     warm_cache,
                 )
@@ -368,8 +352,7 @@ async fn run_update_branch(
         leaf_bytes = upload_totals.leaf_bytes,
         sidecars = upload_totals.sidecar_count,
         sidecar_bytes = upload_totals.sidecar_bytes,
-        cache_dir = %cache_dir.display(),
-        "V6 Phase 2 streamed upload complete; seeded artifact cache"
+        "V6 Phase 2 streamed upload complete; offered artifacts to the local tier"
     );
 
     Ok((meta, stats.snapshot()))
@@ -437,7 +420,6 @@ async fn execute_phase2_task(
     tracker: fluree_db_core::tracking::Tracker,
     upload_budget: Arc<Semaphore>,
     upload_buffer: usize,
-    cache_dir: std::path::PathBuf,
 ) -> Result<Phase2TaskOutput> {
     let Phase2Task {
         seq,
@@ -487,7 +469,6 @@ async fn execute_phase2_task(
                 tracker.clone(),
                 Arc::clone(&upload_budget),
                 upload_buffer,
-                cache_dir.clone(),
                 warm_cache.clone(),
             )
             .await?;
@@ -534,7 +515,6 @@ async fn execute_phase2_task(
                 upload_budget.as_ref(),
                 upload_buffer,
                 new_leaf_blobs,
-                &cache_dir,
             )
             .await?;
             Phase2TaskOutput {
@@ -553,7 +533,6 @@ async fn execute_phase2_task(
             let branch_bytes = fetch_cached_index_bytes(
                 content_store.as_ref(),
                 &branch_cid,
-                &cache_dir,
                 format!("fetch V3 branch g_id={g_id} {order:?}"),
             )
             .await?;
@@ -568,7 +547,6 @@ async fn execute_phase2_task(
                 tracker.clone(),
                 Arc::clone(&upload_budget),
                 upload_buffer,
-                cache_dir.clone(),
                 warm_cache.clone(),
             )
             .await?;
@@ -579,7 +557,6 @@ async fn execute_phase2_task(
             debug_assert!(branch_cid == meta.branch_cid);
             cache_artifact_bytes(
                 &*content_store,
-                &cache_dir,
                 &branch_cid,
                 &meta.branch_bytes,
                 "index_branch",
@@ -622,7 +599,6 @@ async fn execute_phase2_task(
                 upload_budget.as_ref(),
                 upload_buffer,
                 new_leaf_blobs,
-                &cache_dir,
             )
             .await?;
             let branch_cid = content_store
@@ -630,13 +606,7 @@ async fn execute_phase2_task(
                 .await
                 .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
             debug_assert!(branch_cid == expected_branch_cid);
-            cache_artifact_bytes(
-                &*content_store,
-                &cache_dir,
-                &branch_cid,
-                &branch_bytes,
-                "index_branch",
-            );
+            cache_artifact_bytes(&*content_store, &branch_cid, &branch_bytes, "index_branch");
             Phase2TaskOutput {
                 seq,
                 g_id,
@@ -700,9 +670,6 @@ pub async fn incremental_index(
         "starting incremental index build"
     );
 
-    let cache_dir = config.artifact_cache_dir();
-    let _ = std::fs::create_dir_all(&cache_dir);
-
     // Single global S3 budget shared across the whole fold: the reconcile
     // leaf prefetch (Phase 1), and the Phase 2 leaf prefetch + leaf/sidecar
     // uploads all acquire from this one semaphore, so total in-flight S3 reads
@@ -715,7 +682,6 @@ pub async fn incremental_index(
         base_root_id: base_root_id.clone(),
         head_commit_id,
         from_t,
-        artifact_cache_dir: Some(cache_dir.clone()),
         max_commit_bytes: config.incremental_max_commit_bytes,
         fulltext_configured_properties: config.fulltext_configured_properties.clone(),
         pending_commit_cids: config.pending_commit_cids.clone(),
@@ -863,7 +829,6 @@ pub async fn incremental_index(
     let phase2_results = stream::iter(phase2_tasks)
         .map(|task| {
             let content_store = content_store.clone();
-            let cache_dir = cache_dir.clone();
             let task_tracker = tracker.clone();
             let task_budget = Arc::clone(&upload_budget);
             async move {
@@ -874,7 +839,6 @@ pub async fn incremental_index(
                     task_tracker,
                     task_budget,
                     upload_buffer,
-                    cache_dir,
                 )
                 .await
             }
@@ -1382,7 +1346,6 @@ pub async fn incremental_index(
                         dict_kind,
                         &bytes,
                         "incremental V6 numbig arena uploaded",
-                        &cache_dir,
                     )
                     .await?;
 
@@ -1436,7 +1399,6 @@ pub async fn incremental_index(
                         let old_manifest_bytes = fetch_cached_index_bytes(
                             content_store.as_ref(),
                             &existing.manifest,
-                            &cache_dir,
                             "read existing vector manifest",
                         )
                         .await?;
@@ -1513,7 +1475,6 @@ pub async fn incremental_index(
                                     let old_last_bytes = fetch_cached_index_bytes(
                                         content_store.as_ref(),
                                         &old_last_cid,
-                                        &cache_dir,
                                         "read vector last shard",
                                     )
                                     .await?;
@@ -1550,7 +1511,6 @@ pub async fn incremental_index(
                                         dict_kind,
                                         &shard_bytes,
                                         "incremental V6 vector last shard replaced",
-                                        &cache_dir,
                                     )
                                     .await?;
 
@@ -1581,7 +1541,6 @@ pub async fn incremental_index(
                                 dict_kind,
                                 &shard_bytes,
                                 "incremental V6 vector shard uploaded",
-                                &cache_dir,
                             )
                             .await?;
                             shard_info.cas = shard_cid.to_string();
@@ -1616,7 +1575,6 @@ pub async fn incremental_index(
                             dict_kind,
                             &manifest_json,
                             "incremental V6 vector manifest uploaded",
-                            &cache_dir,
                         )
                         .await?;
 
@@ -1646,7 +1604,6 @@ pub async fn incremental_index(
                                 dict_kind,
                                 &shard_bytes,
                                 "incremental V6 vector shard uploaded",
-                                &cache_dir,
                             )
                             .await?;
                             shard_info.cas = shard_cid.to_string();
@@ -1674,7 +1631,6 @@ pub async fn incremental_index(
                             dict_kind,
                             &manifest_json,
                             "incremental V6 vector manifest uploaded",
-                            &cache_dir,
                         )
                         .await?;
 
@@ -1761,7 +1717,6 @@ pub async fn incremental_index(
                         let blob = fetch_cached_index_bytes(
                             content_store.as_ref(),
                             &ft_ref.arena_cid,
-                            &cache_dir,
                             format!(
                                 "fulltext incremental: prior arena fetch for (g_id={g_id}, p_id={p_id}, lang_id={lang_id}) cid={}",
                                 ft_ref.arena_cid
@@ -1808,13 +1763,7 @@ pub async fn incremental_index(
                         .map_err(|e| {
                             IndexerError::StorageWrite(format!("fulltext CAS write: {e}"))
                         })?;
-                    cache_artifact_bytes(
-                        &*content_store,
-                        &cache_dir,
-                        &arena_cid,
-                        &blob,
-                        "fulltext_arena",
-                    );
+                    cache_artifact_bytes(&*content_store, &arena_cid, &blob, "fulltext_arena");
 
                     let new_ref = FulltextArenaRef {
                         p_id,
@@ -1904,7 +1853,6 @@ pub async fn incremental_index(
                         let root_bytes = fetch_cached_index_bytes(
                             content_store.as_ref(),
                             &sp_ref.root_cid,
-                            &cache_dir,
                             format!("spatial root load for g{g_id}:p{p_id}"),
                         )
                         .await?;
@@ -1922,7 +1870,6 @@ pub async fn incremental_index(
                             let bytes = fetch_cached_index_bytes(
                                 content_store.as_ref(),
                                 cid,
-                                &cache_dir,
                                 "spatial blob fetch",
                             )
                             .await?;
@@ -1932,7 +1879,6 @@ pub async fn incremental_index(
                             let bytes = fetch_cached_index_bytes(
                                 content_store.as_ref(),
                                 leaflet_cid,
-                                &cache_dir,
                                 "spatial leaflet fetch",
                             )
                             .await?;
@@ -2013,13 +1959,7 @@ pub async fn incremental_index(
                             .put(ContentKind::SpatialIndex, blob_bytes)
                             .await
                             .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                        cache_artifact_bytes(
-                            &*content_store,
-                            &cache_dir,
-                            &cid,
-                            blob_bytes,
-                            "spatial_blob",
-                        );
+                        cache_artifact_bytes(&*content_store, &cid, blob_bytes, "spatial_blob");
                     }
 
                     // Build CIDs.
@@ -2030,13 +1970,7 @@ pub async fn incremental_index(
                         .put(ContentKind::SpatialIndex, &root_json)
                         .await
                         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                    cache_artifact_bytes(
-                        &*content_store,
-                        &cache_dir,
-                        &root_cid,
-                        &root_json,
-                        "spatial_root",
-                    );
+                    cache_artifact_bytes(&*content_store, &root_cid, &root_json, "spatial_root");
                     let manifest_cid =
                         ContentId::from_hex_digest(spatial_codec, &write_result.manifest_address)
                             .ok_or_else(|| {
@@ -2143,7 +2077,6 @@ pub async fn incremental_index(
             match fetch_cached_index_bytes(
                 content_store.as_ref(),
                 cid,
-                &cache_dir,
                 format!("sketch blob {cid}"),
             )
             .await
@@ -2285,7 +2218,7 @@ pub async fn incremental_index(
         .await?
         {
             Some((cid, bytes)) => {
-                cache_artifact_bytes(&*content_store, &cache_dir, &cid, &bytes, "stats_sketch");
+                cache_artifact_bytes(&*content_store, &cid, &bytes, "stats_sketch");
                 Some(cid)
             }
             None => None,
@@ -2417,7 +2350,6 @@ pub async fn incremental_index(
                     match fluree_db_binary_index::read::binary_index_store::BinaryIndexStore::load_from_root_v6(
                         content_store.clone(),
                         base_root,
-                        &cache_dir,
                         None,
                     )
                     .await
@@ -3723,7 +3655,6 @@ pub async fn incremental_index(
             match fluree_db_binary_index::read::binary_index_store::BinaryIndexStore::load_from_root_v6(
                 content_store.clone(),
                 base_root,
-                &cache_dir,
                 None,
             )
             .await
@@ -4023,13 +3954,7 @@ pub async fn incremental_index(
         .put(ContentKind::IndexRoot, &root_bytes)
         .await
         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-    cache_artifact_bytes(
-        &*content_store,
-        &cache_dir,
-        &root_id,
-        &root_bytes,
-        "index_root",
-    );
+    cache_artifact_bytes(&*content_store, &root_id, &root_bytes, "index_root");
 
     tracing::debug!(
         %root_id,
@@ -4494,7 +4419,6 @@ async fn upload_one_leaf_blob(
     content_store: &dyn ContentStore,
     tracker: &fluree_db_core::tracking::Tracker,
     upload_budget: &Semaphore,
-    cache_dir: &std::path::Path,
     blob: NewLeafBlob,
     warm_cache: Option<&Arc<LeafletCache>>,
 ) -> Result<LeafUploadCounts> {
@@ -4512,13 +4436,7 @@ async fn upload_one_leaf_blob(
         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
     crate::fuel::charge_extra_leaflets(tracker, info.re_encoded_leaflet_count)?;
     debug_assert!(leaf_cid == info.leaf_cid);
-    cache_artifact_bytes(
-        content_store,
-        cache_dir,
-        &leaf_cid,
-        &info.leaf_bytes,
-        "index_leaf",
-    );
+    cache_artifact_bytes(content_store, &leaf_cid, &info.leaf_bytes, "index_leaf");
     counts.leaf_bytes = info.leaf_bytes.len() as u64;
 
     // Warm-on-write (co-located only): seed the shared read cache with the
@@ -4550,13 +4468,7 @@ async fn upload_one_leaf_blob(
         if let Some(expected) = &info.sidecar_cid {
             debug_assert!(&sidecar_cid == expected);
         }
-        cache_artifact_bytes(
-            content_store,
-            cache_dir,
-            &sidecar_cid,
-            sc_bytes,
-            "history_sidecar",
-        );
+        cache_artifact_bytes(content_store, &sidecar_cid, sc_bytes, "history_sidecar");
         counts.sidecar_bytes = sc_bytes.len() as u64;
         counts.sidecar_count = 1;
     }
@@ -4624,7 +4536,6 @@ async fn upload_leaf_blobs(
     upload_budget: &Semaphore,
     upload_buffer: usize,
     blobs: Vec<NewLeafBlob>,
-    cache_dir: &std::path::Path,
 ) -> Result<()> {
     let leaf_total = blobs.len();
     // The global semaphore is the real concurrency cap; bound the in-flight
@@ -4632,9 +4543,7 @@ async fn upload_leaf_blobs(
     // large fresh build.
     let buffer = upload_buffer.max(1);
     let totals = stream::iter(blobs)
-        .map(|blob| {
-            upload_one_leaf_blob(content_store, tracker, upload_budget, cache_dir, blob, None)
-        })
+        .map(|blob| upload_one_leaf_blob(content_store, tracker, upload_budget, blob, None))
         .buffer_unordered(buffer)
         .try_fold(LeafUploadCounts::default(), |mut acc, c| async move {
             acc.leaf_bytes += c.leaf_bytes;
@@ -4648,8 +4557,7 @@ async fn upload_leaf_blobs(
         leaf_bytes = totals.leaf_bytes,
         sidecars = totals.sidecar_count,
         sidecar_bytes = totals.sidecar_bytes,
-        cache_dir = %cache_dir.display(),
-        "V6 Phase 2 upload complete; seeded artifact cache"
+        "V6 Phase 2 upload complete; offered artifacts to the local tier"
     );
     Ok(())
 }

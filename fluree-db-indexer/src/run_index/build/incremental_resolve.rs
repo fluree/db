@@ -13,7 +13,6 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -35,22 +34,13 @@ use crate::run_index::resolve::resolver::{RebuildChunk, ResolverError, SharedRes
 async fn fetch_cached_or_get(
     cs: &dyn ContentStore,
     cid: &ContentId,
-    cache_dir: Option<&Path>,
     context: impl Into<String>,
 ) -> Result<Vec<u8>, IncrementalResolveError> {
     let context = context.into();
-    match cache_dir {
-        Some(cache_dir) => {
-            fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(cs, cid, cache_dir)
-                .await
-                .map_err(|e| IncrementalResolveError::RootLoad(format!("{context}: {e}")))
-        }
-        None => cs
-            .get(cid)
-            .await
-            .map(fluree_db_core::ContentBytes::into_vec)
-            .map_err(|e| IncrementalResolveError::RootLoad(format!("{context}: {e}"))),
-    }
+    cs.get(cid)
+        .await
+        .map(fluree_db_core::ContentBytes::into_vec)
+        .map_err(|e| IncrementalResolveError::RootLoad(format!("{context}: {e}")))
 }
 
 // ============================================================================
@@ -131,8 +121,6 @@ pub struct IncrementalResolveConfig {
     pub head_commit_id: ContentId,
     /// Only include commits with `t > from_t` (typically `root.index_t`).
     pub from_t: i64,
-    /// Optional disk-backed artifact cache directory for remote dict leaves.
-    pub artifact_cache_dir: Option<std::path::PathBuf>,
     /// Maximum cumulative commit bytes to load during the commit-chain walk.
     /// If exceeded, incremental resolution aborts so the caller can fall back
     /// to a full rebuild. `None` means unlimited.
@@ -231,7 +219,6 @@ pub async fn resolve_incremental_commits_v6(
         let bytes = fetch_cached_or_get(
             cs.as_ref(),
             &config.base_root_id,
-            config.artifact_cache_dir.as_deref(),
             format!("failed to load FIR6 root {}", config.base_root_id),
         )
         .await?;
@@ -260,22 +247,12 @@ pub async fn resolve_incremental_commits_v6(
     // 3. Load subject + string reverse dict trees (same DictRefs as V5).
     let (subject_tree, string_tree, t_dict_load_ms) = {
         let t0 = Instant::now();
-        let subject_tree = DictTreeReader::from_refs(
-            &cs,
-            &root.dict_refs.subject_reverse,
-            None,
-            config.artifact_cache_dir.as_deref(),
-        )
-        .await
-        .map_err(|e| IncrementalResolveError::DictTreeLoad(format!("subject reverse: {e}")))?;
-        let string_tree = DictTreeReader::from_refs(
-            &cs,
-            &root.dict_refs.string_reverse,
-            None,
-            config.artifact_cache_dir.as_deref(),
-        )
-        .await
-        .map_err(|e| IncrementalResolveError::DictTreeLoad(format!("string reverse: {e}")))?;
+        let subject_tree = DictTreeReader::from_refs(&cs, &root.dict_refs.subject_reverse, None)
+            .await
+            .map_err(|e| IncrementalResolveError::DictTreeLoad(format!("subject reverse: {e}")))?;
+        let string_tree = DictTreeReader::from_refs(&cs, &root.dict_refs.string_reverse, None)
+            .await
+            .map_err(|e| IncrementalResolveError::DictTreeLoad(format!("string reverse: {e}")))?;
         (subject_tree, string_tree, t0.elapsed().as_millis() as u64)
     };
 
@@ -320,7 +297,6 @@ pub async fn resolve_incremental_commits_v6(
                 let bytes = fetch_cached_or_get(
                     cs.as_ref(),
                     cid,
-                    config.artifact_cache_dir.as_deref(),
                     format!("numbig arena load for g_id={}, p_id={}", ga.g_id, p_id),
                 )
                 .await?;
@@ -345,7 +321,6 @@ pub async fn resolve_incremental_commits_v6(
                 let manifest_bytes = fetch_cached_or_get(
                     cs.as_ref(),
                     &vref.manifest,
-                    config.artifact_cache_dir.as_deref(),
                     format!(
                         "vector manifest load for g_id={}, p_id={}",
                         ga.g_id, vref.p_id
@@ -419,7 +394,6 @@ pub async fn resolve_incremental_commits_v6(
                 let bytes = fetch_cached_or_get(
                     cs.as_ref(),
                     &cid,
-                    config.artifact_cache_dir.as_deref(),
                     format!(
                         "vector shard load for g_id={g_id}, p_id={p_id}, cid={}",
                         shard_info.cas
@@ -449,16 +423,11 @@ pub async fn resolve_incremental_commits_v6(
                 .insert(*p_id, arena);
         }
         if !shared.vectors.is_empty() {
-            seed_vector_fact_handles(
-                Arc::clone(&cs),
-                &root,
-                &mut shared,
-                config.artifact_cache_dir.as_deref(),
-            )
-            .await
-            .map_err(|e| {
-                IncrementalResolveError::RootLoad(format!("vector fact-handle seed: {e}"))
-            })?;
+            seed_vector_fact_handles(Arc::clone(&cs), &root, &mut shared)
+                .await
+                .map_err(|e| {
+                    IncrementalResolveError::RootLoad(format!("vector fact-handle seed: {e}"))
+                })?;
         }
         t0.elapsed().as_millis() as u64
     } else {
@@ -992,7 +961,6 @@ async fn seed_vector_fact_handles(
     cs: Arc<dyn ContentStore>,
     root: &fluree_db_binary_index::format::index_root::IndexRoot,
     shared: &mut SharedResolverState,
-    cache_dir: Option<&std::path::Path>,
 ) -> io::Result<()> {
     use fluree_db_binary_index::format::run_record::RunSortOrder;
     use fluree_db_binary_index::read::binary_cursor::BinaryCursor;
@@ -1000,13 +968,7 @@ async fn seed_vector_fact_handles(
     use fluree_db_binary_index::read::column_types::{BinaryFilter, ColumnProjection, ColumnSet};
     use fluree_db_core::o_type::OType;
 
-    let cache_dir = cache_dir
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(std::env::temp_dir);
-
-    let store = Arc::new(
-        BinaryIndexStore::load_from_root_v6(Arc::clone(&cs), root, &cache_dir, None).await?,
-    );
+    let store = Arc::new(BinaryIndexStore::load_from_root_v6(Arc::clone(&cs), root, None).await?);
 
     // Walk every graph that has vector arenas; for each, scan SPOT for
     // VECTOR_ID rows and decode (s_ns_code, s_name, p_id, o_i, value) →
@@ -1087,30 +1049,17 @@ async fn seed_vector_fact_handles(
     Ok(())
 }
 
-/// Fetch one commit blob, honoring the optional artifact cache.
+/// Fetch one commit blob.
 async fn fetch_commit_bytes(
     cs: &dyn ContentStore,
     cid: &ContentId,
-    cache_dir: Option<&Path>,
 ) -> Result<Vec<u8>, IncrementalResolveError> {
-    match cache_dir {
-        Some(cache_dir) => {
-            fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(cs, cid, cache_dir)
-                .await
-                .map_err(|e| {
-                    IncrementalResolveError::CommitChain(format!(
-                        "failed to load commit {cid}: {e}"
-                    ))
-                })
-        }
-        None => cs
-            .get(cid)
-            .await
-            .map(fluree_db_core::ContentBytes::into_vec)
-            .map_err(|e| {
-                IncrementalResolveError::CommitChain(format!("failed to load commit {cid}: {e}"))
-            }),
-    }
+    cs.get(cid)
+        .await
+        .map(fluree_db_core::ContentBytes::into_vec)
+        .map_err(|e| {
+            IncrementalResolveError::CommitChain(format!("failed to load commit {cid}: {e}"))
+        })
 }
 
 /// Validate that `pending` is the exact, gap-free set of commits in
@@ -1139,7 +1088,6 @@ async fn walk_commit_chain_since(
     let head_id = &config.head_commit_id;
     let from_t = config.from_t;
     let max_commit_bytes = config.max_commit_bytes;
-    let cache_dir = config.artifact_cache_dir.as_deref();
     let pending_commit_cids = config.pending_commit_cids.as_deref();
     let fetch_concurrency = config.commit_fetch_concurrency;
     let walk_started = Instant::now();
@@ -1154,13 +1102,9 @@ async fn walk_commit_chain_since(
             // Order-preserving `buffered(k)`: results arrive in t-ascending
             // order, so the byte-budget check below aborts deterministically
             // (over-reading up to k-1 in-flight before the abort is fine).
-            // Fetch via the async `cs.get` (NOT `fetch_cached_bytes_cid`): for local
-            // FileStorage the cache's `resolve_local_path` shortcut is a blocking
-            // `std::fs::read`, which serializes under `buffered` on a single task.
-            // `cs.get` is `tokio::fs::read` (local) / async network (S3) — both overlap
-            // under `buffered(k)`. Commit bodies are read once per fold then GC'd, so
-            // skipping the artifact cache here costs nothing. (cache_dir is still
-            // used by the serial fallback path below.)
+            // Fetch via the async `cs.get`, which is `tokio::fs::read` (local) or
+            // async network (S3): both overlap under `buffered(k)`, where a sync
+            // local read would serialize on a single task.
             let mut stream = futures::stream::iter(pending.iter().cloned())
                 .map(|(t, cid)| async move {
                     let bytes = cs.get(&cid).await.map_err(|e| {
@@ -1248,7 +1192,7 @@ async fn walk_commit_chain_since(
             }
         }
 
-        let bytes = fetch_commit_bytes(cs, &cid, cache_dir).await?;
+        let bytes = fetch_commit_bytes(cs, &cid).await?;
         cumulative_bytes += bytes.len();
         commits.push(WalkedCommit { cid, t, bytes });
     }
@@ -1304,13 +1248,13 @@ fn derive_reconcile_keys(chunk: &RebuildChunk) -> (Vec<Vec<u8>>, Vec<&[u8]>) {
 }
 
 /// Best-effort concurrent prewarm of the reverse-tree leaves the sync reconcile
-/// will touch. Computes the distinct remote leaf CIDs (subject ∪ string) and
-/// fetches them into each reader's disk artifact cache so `load_leaf` hits a
-/// warm cache instead of a serial `block_on` S3 fetch per leaf.
+/// will touch. Computes the distinct leaf CIDs (subject ∪ string) and warms
+/// the store's local tier with them ([`ContentStore::prefetch`]; a local store
+/// ignores it), so `load_leaf` finds them instead of a serial `block_on` S3
+/// fetch per leaf.
 ///
-/// Correctness: this only writes leaf bytes into the same disk cache dir the
-/// readers already read from. It never changes lookup results. Any per-leaf
-/// failure is ignored — the sync path fetches that leaf the old way.
+/// Correctness: it never changes lookup results. Any per-leaf failure is
+/// ignored — the sync path fetches that leaf the old way.
 ///
 /// Bounded: every fetch acquires a permit from the shared `s3_budget` (the one
 /// global in-flight S3 cap for the whole fold) and the stream width is capped at
@@ -1324,24 +1268,13 @@ async fn prefetch_reconcile_leaves(
 ) {
     let (subject_keys, string_keys) = derive_reconcile_keys(chunk);
 
-    // Distinct (cache_dir, cid) pairs to prewarm, deduped by cid string across
-    // both trees. Only a store the disk cache serves, with a configured disk
-    // cache dir, qualifies: a local or in-memory read is already cheap, and
-    // the prefetch cannot warm what `load_leaf` does not read from disk.
-    if !fluree_db_binary_index::read::artifact_cache::uses_disk_cache(cs) {
-        return;
-    }
-    let mut seen_cids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut targets: Vec<(std::path::PathBuf, ContentId)> = Vec::new();
-
+    let mut seen: std::collections::HashSet<ContentId> = std::collections::HashSet::new();
+    let mut targets: Vec<ContentId> = Vec::new();
     let mut collect = |tree: &DictTreeReader, keys: Vec<&[u8]>| {
-        let Some(cache_dir) = tree.disk_cache_dir().map(std::path::Path::to_path_buf) else {
-            return;
-        };
         for address in tree.touched_leaf_addresses(keys) {
             if let Some(cid) = tree.leaf_cid(address) {
-                if seen_cids.insert(cid.to_string()) {
-                    targets.push((cache_dir.clone(), cid.clone()));
+                if seen.insert(cid.clone()) {
+                    targets.push(cid.clone());
                 }
             }
         }
@@ -1363,20 +1296,12 @@ async fn prefetch_reconcile_leaves(
     let target_count = targets.len();
 
     futures::stream::iter(targets)
-        .for_each_concurrent(width, |(cache_dir, cid)| {
-            let s3_budget = Arc::clone(s3_budget);
-            async move {
-                let Ok(_permit) = s3_budget.acquire().await else {
-                    return;
-                };
-                if let Err(e) =
-                    fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(
-                        cs, &cid, &cache_dir,
-                    )
-                    .await
-                {
-                    tracing::debug!(%cid, error = %e, "reconcile leaf prefetch failed; continuing");
-                }
+        .for_each_concurrent(width, |cid| async move {
+            let Ok(_permit) = s3_budget.acquire().await else {
+                return;
+            };
+            if let Err(e) = cs.prefetch(&cid).await {
+                tracing::debug!(%cid, error = %e, "reconcile leaf prefetch failed; continuing");
             }
         })
         .await;

@@ -30,7 +30,6 @@ use fluree_db_core::storage::ContentStore;
 use fluree_db_core::ContentId;
 use futures::stream::StreamExt;
 use std::collections::HashSet;
-use std::path::Path;
 
 /// CIDs per batch release. Matches the S3 `DeleteObjects` maximum, so on an
 /// object store a batch is one request.
@@ -190,11 +189,10 @@ async fn load_manifest_nodes(
     store: &dyn ContentStore,
     garbage_id: &ContentId,
     manifest_t: i64,
-    cache_dir: Option<&Path>,
     now_ms: i64,
     min_age_ms: i64,
 ) -> Option<Vec<String>> {
-    let bytes = match get_cached_or_remote(store, garbage_id, cache_dir).await {
+    let bytes = match read_bytes(store, garbage_id).await {
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::debug!(
@@ -307,7 +305,6 @@ pub struct GarbagePlan {
     retained: HashSet<ContentId>,
     unnameable_indexes: usize,
     keep_count: usize,
-    cache_dir: Option<std::path::PathBuf>,
 }
 
 /// Clean garbage from old index versions.
@@ -412,10 +409,8 @@ pub async fn plan_garbage(
     let min_age_ms = min_age_mins as i64 * 60 * 1000;
     let now_ms = current_timestamp_ms();
     let started = std::time::Instant::now();
-    let cache_dir = config.artifact_cache_dir.as_deref();
-
     // 1. Walk prev_index chain to collect all index versions (tolerant of missing roots)
-    let index_chain = walk_prev_index_chain_cs_cached(store, current_root_id, cache_dir).await?;
+    let index_chain = walk_prev_index_chain_cs(store, current_root_id).await?;
     tracing::debug!(
         root_id = %current_root_id,
         chain_len = index_chain.len(),
@@ -481,15 +476,8 @@ pub async fn plan_garbage(
 
         match &manifest_entry.garbage_id {
             Some(garbage_id) => {
-                match load_manifest_nodes(
-                    store,
-                    garbage_id,
-                    manifest_entry.t,
-                    cache_dir,
-                    now_ms,
-                    age_floor_ms,
-                )
-                .await
+                match load_manifest_nodes(store, garbage_id, manifest_entry.t, now_ms, age_floor_ms)
+                    .await
                 {
                     Some(items) => named.extend(items),
                     None => break,
@@ -533,7 +521,6 @@ pub async fn plan_garbage(
         retained,
         unnameable_indexes,
         keep_count,
-        cache_dir: config.artifact_cache_dir.clone(),
     }))
 }
 
@@ -657,7 +644,7 @@ impl GarbagePlan {
         if *head == self.snapshot_head {
             return Ok(published_since);
         }
-        let mut walk = PrevIndexChainWalk::new(store, head, self.cache_dir.as_deref());
+        let mut walk = PrevIndexChainWalk::new(store, head);
         while let Some(entry) = walk.next_entry().await? {
             if entry.root_id == self.snapshot_head {
                 break;
@@ -689,7 +676,6 @@ pub async fn release_garbage_plan(
     nameservice: &(impl fluree_db_nameservice::NameServiceLookup + ?Sized),
     ledger_id: &fluree_db_core::LedgerId,
     sibling_candidates: Option<&[fluree_db_core::LedgerId]>,
-    cache_dir: Option<&Path>,
 ) -> Result<CleanGarbageResult> {
     let head = nameservice
         .lookup(ledger_id)
@@ -703,9 +689,7 @@ pub async fn release_garbage_plan(
     let shared_blobs = match sibling_candidates {
         Some(candidates) => {
             match super::current_sibling_heads(nameservice, ledger_id, candidates).await {
-                Ok(siblings) => {
-                    super::shared_blob_policy_for(backend, &siblings, ledger_id, cache_dir).await
-                }
+                Ok(siblings) => super::shared_blob_policy_for(backend, &siblings, ledger_id).await,
                 Err(e) => {
                     tracing::warn!(
                         ledger_id = %ledger_id,
@@ -722,8 +706,7 @@ pub async fn release_garbage_plan(
     plan.release(store.as_ref(), &head, &shared_blobs).await
 }
 
-/// Collect the whole prev-index chain, newest root first, reading storage
-/// directly.
+/// Collect the whole prev-index chain, newest root first.
 ///
 /// See [`PrevIndexChainWalk::next_entry`] for how the walk ends, and prefer
 /// the walk itself where each root can be consumed and dropped.
@@ -731,39 +714,16 @@ pub(crate) async fn walk_prev_index_chain_cs(
     store: &dyn ContentStore,
     current_root_id: &ContentId,
 ) -> Result<Vec<IndexChainEntry>> {
-    walk_prev_index_chain_cs_cached(store, current_root_id, None).await
-}
-
-async fn get_cached_or_remote(
-    store: &dyn ContentStore,
-    id: &ContentId,
-    cache_dir: Option<&Path>,
-) -> Result<Vec<u8>> {
-    match cache_dir {
-        Some(cache_dir) => Ok(
-            fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(
-                store, id, cache_dir,
-            )
-            .await
-            .map_err(|e| crate::error::IndexerError::StorageRead(e.to_string()))?,
-        ),
-        None => Ok(store.get(id).await?.into_vec()),
-    }
-}
-
-pub(crate) async fn walk_prev_index_chain_cs_cached(
-    store: &dyn ContentStore,
-    current_root_id: &ContentId,
-    cache_dir: Option<&Path>,
-) -> Result<Vec<IndexChainEntry>> {
-    let mut walk = PrevIndexChainWalk::new(store, current_root_id, cache_dir);
+    let mut walk = PrevIndexChainWalk::new(store, current_root_id);
     let mut chain = Vec::new();
-
     while let Some(entry) = walk.next_entry().await? {
         chain.push(entry);
     }
-
     Ok(chain)
+}
+
+async fn read_bytes(store: &dyn ContentStore, id: &ContentId) -> Result<Vec<u8>> {
+    Ok(store.get(id).await?.into_vec())
 }
 
 /// A prev-index chain walk in progress, newest root first.
@@ -775,7 +735,6 @@ pub(crate) async fn walk_prev_index_chain_cs_cached(
 /// history.
 pub(crate) struct PrevIndexChainWalk<'a> {
     store: &'a dyn ContentStore,
-    cache_dir: Option<&'a Path>,
     /// The root to read next, or `None` once the chain has ended.
     next_id: Option<ContentId>,
     /// Whether any root has been yielded, which decides how an unreadable
@@ -784,14 +743,9 @@ pub(crate) struct PrevIndexChainWalk<'a> {
 }
 
 impl<'a> PrevIndexChainWalk<'a> {
-    pub(crate) fn new(
-        store: &'a dyn ContentStore,
-        head_id: &ContentId,
-        cache_dir: Option<&'a Path>,
-    ) -> Self {
+    pub(crate) fn new(store: &'a dyn ContentStore, head_id: &ContentId) -> Self {
         Self {
             store,
-            cache_dir,
             next_id: Some(head_id.clone()),
             yielded: false,
         }
@@ -808,9 +762,10 @@ impl<'a> PrevIndexChainWalk<'a> {
     /// which artifacts are unreferenced would treat everything past the
     /// unreadable root as garbage.
     ///
-    /// A `cache_dir` weakens that ending. A cached copy of a released root
-    /// reads back, so the walk never learns storage has dropped it and
-    /// continues into a chain the collector already truncated. Callers that
+    /// A store fronted by a disk cache weakens that ending. A cached copy of
+    /// a released root can read back — a release only evicts what went
+    /// through that store — so the walk never learns storage has dropped it
+    /// and continues into a chain the collector already truncated. Callers that
     /// must not act on a released root have to establish existence
     /// themselves — see `gc::sweep::chain_cas_ids`, which reads a failed
     /// expansion plus an absent root as the ending this walk missed.
@@ -820,7 +775,7 @@ impl<'a> PrevIndexChainWalk<'a> {
         };
 
         let read_started = std::time::Instant::now();
-        let bytes = match get_cached_or_remote(self.store, &current_id, self.cache_dir).await {
+        let bytes = match read_bytes(self.store, &current_id).await {
             Ok(bytes) => bytes,
             Err(e) => return self.end_of_chain_or_error(&current_id, e).await,
         };
@@ -828,7 +783,6 @@ impl<'a> PrevIndexChainWalk<'a> {
             root_id = %current_id,
             bytes = bytes.len(),
             elapsed_ms = read_started.elapsed().as_millis() as u64,
-            from_cache_enabled = self.cache_dir.is_some(),
             "GC loaded prev-index root"
         );
 

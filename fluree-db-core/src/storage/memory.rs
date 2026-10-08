@@ -261,16 +261,6 @@ impl MemoryContentStore {
 
 #[async_trait]
 impl ContentStore for MemoryContentStore {
-    /// Reads return exactly the bytes at rest.
-    fn permits_plaintext_cache(&self) -> bool {
-        true
-    }
-
-    /// Reads are served from memory.
-    fn is_remote(&self) -> bool {
-        false
-    }
-
     async fn has(&self, id: &ContentId) -> Result<bool> {
         Ok(self.data.read().contains_key(id))
     }
