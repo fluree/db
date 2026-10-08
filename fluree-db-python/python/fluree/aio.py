@@ -49,6 +49,8 @@ from fluree._connection import (
     SelectLanguage,
 )
 from fluree._params import _params
+from fluree._rdf import RdfFormat
+from fluree._terms import Quad
 from fluree._results import Record, Result
 from fluree._sources import MaterializeResult
 from fluree._records import (
@@ -67,7 +69,17 @@ from fluree._records import (
     VerifyReport,
 )
 
-__all__ = ["Connection", "GraphSource", "Ledger", "RowStream", "Snapshot", "Transaction", "connect"]
+__all__ = [
+    "Connection",
+    "GraphSource",
+    "Ledger",
+    "RowStream",
+    "Snapshot",
+    "Transaction",
+    "connect",
+    "parse",
+    "serialize",
+]
 
 T = TypeVar("T")
 
@@ -119,6 +131,28 @@ def connect(
         return Connection(await _call(fluree.connect, path, config=config, indexing=indexing))
 
     return _Opening(open)
+
+
+async def parse(
+    data: str | os.PathLike[str],
+    format: RdfFormat | None = None,
+    *,
+    base: str | None = None,
+) -> list[Quad]:
+    """The quads of an RDF document; see :func:`fluree.parse`. The file is
+    read and the document parsed on a worker thread."""
+    return await _call(fluree.parse, data, format, base=base)
+
+
+async def serialize(
+    quads: Iterable[Quad | tuple[Any, ...]],
+    format: RdfFormat,
+    *,
+    prefixes: dict[str, str] | None = None,
+) -> str:
+    """Quads written as an RDF document; see :func:`fluree.serialize`. The
+    document is written on a worker thread."""
+    return await _call(fluree.serialize, quads, format, prefixes=prefixes)
 
 
 class Connection:

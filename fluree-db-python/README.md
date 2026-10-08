@@ -345,6 +345,8 @@ N-Triples and N-Quads with no ledger involved, as lists of `fluree.Quad`
 graph). Here a document's IRIs move to a new namespace:
 
 ```python
+from pathlib import Path
+
 OLD, NEW = "http://old.example/", "http://new.example/"
 
 def move(term):
@@ -354,13 +356,14 @@ def move(term):
         return fluree.Triple(*map(move, term))
     return term
 
-quads = [fluree.Quad(*map(move, q)) for q in fluree.parse("data.trig")]
+quads = [fluree.Quad(*map(move, q)) for q in fluree.parse(Path("data.trig"))]
 text = fluree.serialize(quads, "trig", prefixes={"ex": NEW})
 ledger.insert(quads)                      # or write them straight to a ledger
 ```
 
-- A path's extension gives its format (`.ttl`, `.trig`, `.nt`, `.nq`); text
-  needs `format=`. Turtle and TriG resolve relative IRIs against `base=`.
+- A path (a `Path`, not a `str`, which is the document's text) gives its
+  format by extension (`.ttl`, `.trig`, `.nt`, `.nq`); text needs `format=`.
+  Turtle and TriG resolve relative IRIs against `base=`.
 - RDF 1.2 is read whole. A triple term is a `fluree.Triple`, and an
   annotation or a reified triple is the quad `(reifier, rdf:reifies,
   Triple(...))`, the annotated triple being a quad of its own. `serialize`
@@ -464,7 +467,8 @@ async with fluree.aio.connect("./data") as conn:
         await txn.insert({...})
 ```
 
-Each call runs on a worker thread while the event loop carries on.
+Each call runs on a worker thread while the event loop carries on, as do
+`fluree.aio.parse()` and `fluree.aio.serialize()`.
 Cancelling a task that awaits a query (`asyncio.timeout`, a client that
 disconnects) stops the query in the engine; a write already under way still
 completes. Cancelled inside `async with ledger.transaction()`, the block waits
