@@ -1185,8 +1185,6 @@ fn validate_structural_constraint<'a>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ValidationResult>>> + Send + 'a>>
 {
     Box::pin(async move {
-        use crate::compile::Severity;
-
         let mut results = Vec::new();
 
         match constraint {
@@ -1254,10 +1252,7 @@ fn validate_structural_constraint<'a>(
                     active,
                 )
                 .await?;
-                let has_violations = nested_results
-                    .iter()
-                    .any(|r| r.severity == Severity::Violation);
-                if has_violations {
+                if !conforms(&nested_results) {
                     results.push(ValidationResult {
                         focus_node: FocusNode::Node(focus_node.clone()),
                         result_path: None,
@@ -1291,13 +1286,11 @@ fn validate_structural_constraint<'a>(
                     active,
                 )
                 .await?;
-                // If the nested shape has NO violations, that's a violation of sh:not.
-                // An "unresolved shape" violation from validate_nested_shape counts as
-                // a violation (the shape didn't match), so sh:not is satisfied.
-                let has_violations = nested_results
-                    .iter()
-                    .any(|r| r.severity == Severity::Violation);
-                if !has_violations {
+                // If the focus node conforms to the nested shape, that's a
+                // violation of sh:not. An "unresolved shape" result from
+                // validate_nested_shape counts against conformance (the shape
+                // didn't match), so sh:not is satisfied.
+                if conforms(&nested_results) {
                     results.push(ValidationResult {
                         focus_node: FocusNode::Node(focus_node.clone()),
                         result_path: None,
@@ -1320,7 +1313,7 @@ fn validate_structural_constraint<'a>(
             }
 
             NodeConstraint::And(nested_shapes) => {
-                // sh:and - ALL nested shapes must match (no violations).
+                // sh:and - the focus node must conform to ALL nested shapes.
                 // Per spec, a failed conjunction produces ONE result per value
                 // node (= the focus node) with sh:value = focus; the nested
                 // violations' messages are aggregated for diagnostics.
@@ -1336,10 +1329,8 @@ fn validate_structural_constraint<'a>(
                         active,
                     )
                     .await?;
-                    for r in nested_results {
-                        if r.severity == Severity::Violation {
-                            failure_messages.push(r.message);
-                        }
+                    if !conforms(&nested_results) {
+                        failure_messages.extend(nested_results.into_iter().map(|r| r.message));
                     }
                 }
                 if !failure_messages.is_empty() {
@@ -1362,7 +1353,7 @@ fn validate_structural_constraint<'a>(
             }
 
             NodeConstraint::Or(nested_shapes) => {
-                // sh:or - at least ONE nested shape must match (have no violations)
+                // sh:or - the focus node must conform to at least ONE nested shape
                 let mut any_conforms = false;
                 let mut all_messages = Vec::new();
 
@@ -1377,18 +1368,13 @@ fn validate_structural_constraint<'a>(
                         active,
                     )
                     .await?;
-                    let has_violations = nested_results
-                        .iter()
-                        .any(|r| r.severity == Severity::Violation);
-                    if !has_violations {
+                    if conforms(&nested_results) {
                         any_conforms = true;
                         break;
                     }
                     // Collect messages for reporting if none match
                     for r in nested_results {
-                        if r.severity == Severity::Violation {
-                            all_messages.push(format!("{}: {}", nested.id.name, r.message));
-                        }
+                        all_messages.push(format!("{}: {}", nested.id.name, r.message));
                     }
                 }
 
@@ -1430,10 +1416,7 @@ fn validate_structural_constraint<'a>(
                         active,
                     )
                     .await?;
-                    let has_violations = nested_results
-                        .iter()
-                        .any(|r| r.severity == Severity::Violation);
-                    if !has_violations {
+                    if conforms(&nested_results) {
                         conforming_count += 1;
                         conforming_shapes.push(nested.id.name.clone());
                     }
@@ -2513,15 +2496,24 @@ async fn check_value_against_nested_shape<'a>(
         let nested_results =
             validate_nested_shape(db, sid, nested, parent_shape, all_shapes, class_ctx, active)
                 .await?;
-        let has_violations = nested_results
-            .iter()
-            .any(|r| r.severity == Severity::Violation);
-        return Ok(!has_violations);
+        return Ok(conforms(&nested_results));
     }
 
     // Literal value with no value_constraints — can't evaluate meaningfully.
     // Treat as non-conforming (the nested shape presumably expects something specific).
     Ok(false)
+}
+
+/// Whether a node conforms to a nested shape (`sh:node`, `sh:not`, `sh:and`,
+/// `sh:or`, `sh:xone`, `sh:qualifiedValueShape`), given the results of
+/// validating it against that shape. Every result counts, whatever its
+/// severity: SHACL §3.5 says a node conforms to a shape when validating it
+/// there reports no result, and §2.1.4 has severity only categorize results.
+/// The severity that decides a write is the outermost reporting shape's, on
+/// the result it reports. A constraint that cannot run is not a result. It is
+/// decided at that same outermost severity (`ClassMembershipCtx::failure_severity`).
+fn conforms(nested_results: &[ValidationResult]) -> bool {
+    nested_results.is_empty()
 }
 
 /// Replace IRI refs with their full-IRI string form for the string facets

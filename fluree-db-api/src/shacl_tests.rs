@@ -6042,6 +6042,193 @@ async fn shacl_nested_constraint_failure_takes_the_outer_severity() {
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
 }
 
+/// What the inner shape of [`ledger_with_nested_warning_result`] checks.
+#[derive(Clone, Copy, Debug)]
+enum InnerCheck {
+    /// An `sh:sparql` constraint (the inner shape's only constraint).
+    Sparql,
+    /// A Warning property shape: `ex:score` at least 10. Its results take its
+    /// own severity, not the node shape's.
+    Property,
+}
+
+/// An inner Warning shape that reports a result for a node scoring under 10,
+/// reached from an outer shape on `ex:Player` at `outer` severity through
+/// `nesting`. Written with SPARQL UPDATE when `via_sparql`, JSON-LD otherwise.
+async fn ledger_with_nested_warning_result(
+    fluree: &crate::Fluree,
+    ledger_id: &str,
+    nesting: Nesting,
+    outer: &str,
+    check: InnerCheck,
+    via_sparql: bool,
+) -> crate::LedgerState {
+    const SELECT: &str =
+        "SELECT $this WHERE { $this <http://example.org/ns/score> ?s FILTER(?s < 10) }";
+    let ledger = fluree.create_ledger(ledger_id).await.unwrap();
+    if via_sparql {
+        let inner = match check {
+            InnerCheck::Sparql => format!(
+                r#"ex:InnerShape a sh:NodeShape ; sh:severity sh:Warning ;
+                     sh:sparql ex:InnerShape-sparql .
+                   ex:InnerShape-sparql sh:message "inner result" ; sh:select "{SELECT}" ."#
+            ),
+            InnerCheck::Property => "ex:InnerShape a sh:NodeShape ; sh:severity sh:Warning ; \
+                 sh:property [ sh:path ex:score ; sh:minInclusive 10 ; sh:severity sh:Warning ] ."
+                .to_string(),
+        };
+        let reach = match nesting {
+            Nesting::Node => "sh:node ex:InnerShape".to_string(),
+            Nesting::Not => "sh:not ex:InnerShape".to_string(),
+            Nesting::And => "sh:and ( ex:InnerShape )".to_string(),
+            Nesting::Or => "sh:or ( ex:InnerShape )".to_string(),
+            Nesting::Xone => "sh:xone ( ex:InnerShape )".to_string(),
+            Nesting::PropertyNode => format!(
+                "sh:property [ sh:path ex:friend ; sh:node ex:InnerShape ; sh:severity {outer} ]"
+            ),
+            Nesting::Qualified => format!(
+                "sh:property [ sh:path ex:friend ; sh:qualifiedValueShape ex:InnerShape ; \
+                 sh:qualifiedMinCount 1 ; sh:severity {outer} ]"
+            ),
+            Nesting::Chain => unreachable!("not used here"),
+        };
+        let update = format!(
+            r#"PREFIX sh: <http://www.w3.org/ns/shacl#>
+               PREFIX ex: <http://example.org/ns/>
+               INSERT DATA {{
+                 {inner}
+                 ex:OuterShape a sh:NodeShape ;
+                   sh:targetClass ex:Player ;
+                   sh:severity {outer} ;
+                   {reach} .
+               }}"#
+        );
+        drop(ledger);
+        fluree
+            .graph(ledger_id)
+            .transact()
+            .sparql_update(&update)
+            .commit()
+            .await
+            .expect("shapes via SPARQL UPDATE");
+        return fluree.ledger(ledger_id).await.expect("ledger");
+    }
+    let mut inner_shape = json!({
+        "@id": "ex:InnerShape",
+        "@type": "sh:NodeShape",
+        "sh:severity": {"@id": "sh:Warning"}
+    });
+    match check {
+        InnerCheck::Sparql => {
+            inner_shape["sh:sparql"] = json!({
+                "@id": "ex:InnerShape-sparql",
+                "sh:message": "inner result",
+                "sh:select": SELECT
+            });
+        }
+        InnerCheck::Property => {
+            inner_shape["sh:property"] = json!({
+                "sh:path": {"@id": "ex:score"},
+                "sh:minInclusive": 10,
+                "sh:severity": {"@id": "sh:Warning"}
+            });
+        }
+    }
+    let inner_ref = json!({"@id": "ex:InnerShape"});
+    let mut outer_shape = json!({
+        "@id": "ex:OuterShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Player"},
+        "sh:severity": {"@id": outer}
+    });
+    let list = json!({"@list": [inner_ref.clone()]});
+    match nesting {
+        Nesting::Node => outer_shape["sh:node"] = inner_ref,
+        Nesting::Not => outer_shape["sh:not"] = inner_ref,
+        Nesting::And => outer_shape["sh:and"] = list,
+        Nesting::Or => outer_shape["sh:or"] = list,
+        Nesting::Xone => outer_shape["sh:xone"] = list,
+        Nesting::PropertyNode => {
+            outer_shape["sh:property"] = json!({
+                "sh:path": {"@id": "ex:friend"},
+                "sh:node": inner_ref,
+                "sh:severity": {"@id": outer}
+            });
+        }
+        Nesting::Qualified => {
+            outer_shape["sh:property"] = json!({
+                "sh:path": {"@id": "ex:friend"},
+                "sh:qualifiedValueShape": inner_ref,
+                "sh:qualifiedMinCount": 1,
+                "sh:severity": {"@id": outer}
+            });
+        }
+        Nesting::Chain => unreachable!("not used here"),
+    }
+    let shapes = json!({
+        "@context": shacl_context(),
+        "@graph": [inner_shape, outer_shape]
+    });
+    fluree.upsert(ledger, &shapes).await.unwrap().ledger
+}
+
+/// A nested shape's results count toward conformance whatever their severity
+/// (SHACL §3.5: a node conforms to a shape when validating it there reports no
+/// result; §2.1.4: severity only categorizes results). The inner shape is a
+/// Warning shape whose check, an `sh:sparql` constraint or a property shape,
+/// reports a result for `ex:p1` (score 5) or its friend (score 1).
+///
+/// So the node, or the friend, does not conform to it. `sh:node`, `sh:and`,
+/// `sh:or`, `sh:xone`, and `sh:node` or `sh:qualifiedValueShape` on a property
+/// shape report under the outer shape: a Violation outer shape rejects the
+/// write, a Warning one logs it. `sh:not` is satisfied, so the write commits.
+/// Before, only Violation results counted: the Warning inner shape conformed,
+/// so the Violation cells committed and `sh:not` rejected.
+#[tokio::test]
+async fn shacl_nested_warning_results_count_toward_conformance() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let nestings = [
+        Nesting::Node,
+        Nesting::Not,
+        Nesting::And,
+        Nesting::Or,
+        Nesting::Xone,
+        Nesting::PropertyNode,
+        Nesting::Qualified,
+    ];
+    let mut wrong: Vec<String> = Vec::new();
+    for via_sparql in [false, true] {
+        for check in [InnerCheck::Sparql, InnerCheck::Property] {
+            for nesting in nestings {
+                for (i, outer) in ["sh:Violation", "sh:Warning"].into_iter().enumerate() {
+                    let ledger_id =
+                        format!("shacl/nested-warning-{nesting:?}-{check:?}-{i}-{via_sparql}:main")
+                            .to_lowercase();
+                    let ledger = ledger_with_nested_warning_result(
+                        &fluree, &ledger_id, nesting, outer, check, via_sparql,
+                    )
+                    .await;
+                    let commits = matches!(nesting, Nesting::Not) || outer == "sh:Warning";
+                    let outcome = insert_friends(&fluree, ledger, "ex:p1", &["ex:f1"]).await;
+                    let cell = format!(
+                        "{nesting:?}, {check:?} inner, outer {outer}, SPARQL-defined {via_sparql}"
+                    );
+                    match (outcome, commits) {
+                        (Ok(_), true) => {}
+                        (Err(ApiError::Transact(TransactError::ShaclViolation(_))), false) => {}
+                        (outcome, _) => wrong.push(format!(
+                            "{cell}: expected {}, got {:?}",
+                            if commits { "a commit" } else { "a violation" },
+                            outcome.map(|_| ())
+                        )),
+                    }
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
 /// Insert an `ex:Player` with the given friends, each scoring 1.
 async fn insert_friends(
     fluree: &crate::Fluree,
