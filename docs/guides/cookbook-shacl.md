@@ -319,6 +319,15 @@ ex:PersonShape a sh:NodeShape ;
   ] .
 ```
 
+A node conforms to a referenced shape only when validating it there reports
+nothing, whatever the severity of what it reports (SHACL §3.5). This holds for
+`sh:node`, `sh:not`, `sh:and`, `sh:or`, `sh:xone` and `sh:qualifiedValueShape`
+alike. So a Warning shape referenced through `sh:node` still makes a node fail
+`sh:node`, and its result is reported under the referencing shape, at that
+shape's severity: a Violation outer shape rejects the write, and a Warning one
+logs it. A constraint that cannot run is reported at the outermost referencing
+shape's severity too.
+
 Recursive references are safe: a shape may reference itself (directly or via a
 chain), and validation over cyclic data (e.g. a mutual `ex:knows` graph)
 terminates — a node already being validated against a shape higher in the
@@ -428,11 +437,15 @@ entries (followed through `owl:imports`) — or simply write full IRIs.
 The spec's **pre-binding restrictions** are enforced: the query must be a
 SELECT and must not use `MINUS`, `SERVICE`, `VALUES`, reassign `$this`
 (`BIND (… AS $this)`), or use a sub-`SELECT` that fails to project `$this`
-(including `SELECT *`). A query that breaks these — or does not parse — is a
-validation *failure*: transactions on focus nodes the shape targets are
-rejected with the reason, scoped to that shape rather than wedging the
-ledger. `$shapesGraph` / `$currentShape` (optional per spec) are not
-supported.
+(including `SELECT *`). A query that breaks these, does not parse, or
+cannot be planned (for example, it projects a variable that is neither a
+`GROUP BY` key nor an aggregate) is a validation *failure*, reported with
+the reason and scoped to that shape rather than wedging the ledger. It
+follows the shape's `sh:severity` and the graph's validation mode, as a
+result does: on a Violation shape in a reject-mode graph, transactions on
+focus nodes the shape targets are rejected; on a Warning or Info shape, or
+in a warn-mode graph, the failure is logged and the transaction commits.
+`$shapesGraph` / `$currentShape` (optional per spec) are not supported.
 
 Like every other constraint, `sh:sparql` runs at transaction staging time
 against the staged view — the query sees the transaction's writes exactly as

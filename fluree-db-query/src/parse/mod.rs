@@ -253,8 +253,20 @@ fn parse_query_ast_internal(
             nested_counter,
             object_var_parsing,
         )?;
-        // LIMIT 1 for efficiency — only need to know if any solution exists
-        query.options.limit = Some(1);
+        // `groupBy` / `having` group the level, which changes the answer: `ask`
+        // is then true when some group passes `having` (a `having` that rejects
+        // every group is false), as in SPARQL ASK.
+        let (having, having_aggregates) =
+            options::parse_having_with_aggregates(obj, filter_data::parse_filter_expr)?;
+        query.options.group_by = options::parse_group_by(obj)?;
+        query.options.having = having;
+        query.options.aggregates = having_aggregates;
+        parse_top_level_values(obj, &ctx, &mut query)?;
+        where_clause::resolve_atoms_outside_where(&mut query, &ctx);
+        // `ask` is true when a solution remains after `offset` and `limit`
+        // (`limit: 0` is false); one is enough, so the limit is at most 1.
+        query.options.offset = options::parse_offset(obj)?;
+        query.options.limit = Some(options::parse_limit(obj)?.map_or(1, |limit| limit.min(1)));
         // ASK returns before `parse_options` runs, so opts that the
         // executor cares about have to be parsed inline. Currently
         // just `includeSystemFacts`; extend here as more land.
@@ -305,14 +317,7 @@ fn parse_query_ast_internal(
         }
     }
 
-    // Parse top-level VALUES (optional) - mirrors the `:values` initial solution seed.
-    if let Some(values_val) = obj.get("values") {
-        if !values_val.is_null() {
-            let values_pat = values::parse_values_clause(values_val, &ctx)?;
-            // Place VALUES first so it seeds the pipeline before WHERE patterns.
-            query.patterns.insert(0, values_pat);
-        }
-    }
+    parse_top_level_values(obj, &ctx, &mut query)?;
 
     // Parse where clause.
     //
@@ -576,11 +581,30 @@ fn parse_construct_query(
 
     query.construct_template = Some(ast::UnresolvedConstructTemplate::new(template_patterns));
 
+    parse_top_level_values(obj, ctx, &mut query)?;
+
     // Parse query options (limit, offset, orderBy, etc.)
     // Note: groupBy with CONSTRUCT will error at format time (Binding::Grouped unsupported)
     query.options = options::parse_options(obj, filter_data::parse_filter_expr)?;
 
     Ok((query, SelectMode::Construct))
+}
+
+/// Parse a query's top-level `values` (optional), the initial solution seed
+/// (mirrors `:values`), for every query form: `select`, `ask` and `construct`.
+fn parse_top_level_values(
+    obj: &serde_json::Map<String, JsonValue>,
+    ctx: &JsonLdParseCtx,
+    query: &mut UnresolvedQuery,
+) -> Result<()> {
+    if let Some(values_val) = obj.get("values") {
+        if !values_val.is_null() {
+            let values_pat = values::parse_values_clause(values_val, ctx)?;
+            // Place VALUES first so it seeds the pipeline before WHERE patterns.
+            query.patterns.insert(0, values_pat);
+        }
+    }
+    Ok(())
 }
 
 /// Parse a CONSTRUCT template (explicit form)
@@ -848,7 +872,7 @@ fn parse_select_string(
         // `(as (- (max ?u) (min ?u)) ?spread)`). Each one is hoisted into
         // `aggregates` with a synthetic output var and the call is rewritten
         // to reference that var; the surrounding expression then lowers as a
-        // post-aggregation bind via `lower_select_expr_bind`.
+        // post-aggregation bind (`lower::lower_select_computations`).
         let mut inner_tok = list[1].clone();
         hoist_inline_aggregates(&mut inner_tok, aggregates)?;
         let expr = filter_sexpr::expr_from_sexpr_token(&inner_tok)?;
@@ -1464,7 +1488,14 @@ pub fn parse_query<E: IriEncoder>(
     strict_override: Option<bool>,
 ) -> Result<Query> {
     let (ast, select_mode) = parse_query_ast(json, strict_override)?;
-    lower_query(ast, encoder, vars, select_mode)
+    let mut query = lower_query(ast, encoder, vars, select_mode)?;
+    // The JSON-LD query surface projects a variable its grouping does not
+    // produce as a per-group list (documented in `docs/query/jsonld-query.md`).
+    // Only the top-level output may: a subquery's projection cannot carry it.
+    query
+        .output
+        .set_ungrouped_projection(crate::ir::UngroupedProjection::PerGroupList);
+    Ok(query)
 }
 
 /// Parse a filter expression value and lower it to a Expression.
@@ -3683,16 +3714,14 @@ mod tests {
         let encoder = encode::MemoryEncoder::with_common_namespaces();
         let query = parse_query(&json, &encoder, &mut vars, None).unwrap();
 
-        let agg = query
-            .grouping
-            .as_ref()
-            .and_then(|g| g.aggregation())
-            .expect("aggregation phase present");
+        let grouping = query.grouping.as_ref().expect("grouping phase present");
+        let agg = grouping.aggregation().expect("aggregation phase present");
         // One aggregate, one post-aggregation BIND.
         assert_eq!(agg.aggregates.len(), 1);
-        assert_eq!(agg.binds.len(), 1);
+        let binds = grouping.bind_list();
+        assert_eq!(binds.len(), 1);
         let adjusted_var = vars.get("?adjusted").expect("?adjusted registered");
-        assert_eq!(agg.binds[0].0, adjusted_var);
+        assert_eq!(binds[0].0, adjusted_var);
     }
 
     #[test]
@@ -3840,18 +3869,16 @@ mod tests {
         let query = parse_query(&json, &encoder, &mut vars, None).unwrap();
 
         // One aggregate, two post-aggregation BINDs (in select order).
-        let agg = query
-            .grouping
-            .as_ref()
-            .and_then(|g| g.aggregation())
-            .expect("aggregation phase present");
+        let grouping = query.grouping.as_ref().expect("grouping phase present");
+        let agg = grouping.aggregation().expect("aggregation phase present");
         assert_eq!(agg.aggregates.len(), 1);
-        assert_eq!(agg.binds.len(), 2);
+        let binds = grouping.bind_list();
+        assert_eq!(binds.len(), 2);
 
         let adjusted_var = vars.get("?adjusted").expect("?adjusted registered");
         let again_var = vars.get("?again").expect("?again registered");
-        assert_eq!(agg.binds[0].0, adjusted_var);
-        assert_eq!(agg.binds[1].0, again_var);
+        assert_eq!(binds[0].0, adjusted_var);
+        assert_eq!(binds[1].0, again_var);
 
         // No leaked Pattern::Bind for these — they must NOT have been
         // pre-aggregation.

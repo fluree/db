@@ -1365,15 +1365,6 @@ pub fn pattern_shares_variables(pattern: &Pattern, bound_vars: &HashSet<VarId>) 
         .any(|v| bound_vars.contains(v))
 }
 
-/// Variables some pattern of `patterns` may bind (see [`must_bind_vars`] for
-/// the ones bound on every row).
-fn produced_vars_of(patterns: &[Pattern]) -> HashSet<VarId> {
-    patterns
-        .iter()
-        .flat_map(super::ir::Pattern::produced_vars)
-        .collect()
-}
-
 /// Try to nest a deferred pattern into a compound pattern's inner lists.
 ///
 /// Returns `true` if the pattern was nested, `false` if the pattern is not
@@ -1392,7 +1383,7 @@ fn try_nest_deferred(compound: &mut Pattern, deferred: &DeferredPattern) -> bool
         Pattern::Union(branches) => {
             let produced_in_every_branch = branches
                 .iter()
-                .map(|b| produced_vars_of(b))
+                .map(|b| crate::ir::pattern::produced_vars_of(b))
                 .reduce(|mut union_vars, branch_vars| {
                     union_vars.retain(|v| branch_vars.contains(v));
                     union_vars
@@ -2971,6 +2962,12 @@ fn drain_ready_deferred(
 ///    key would scan rather than filter). That is exactly [`must_bind_vars`],
 ///    which this site shares with the VALUES/OPTIONAL barrier so the two
 ///    cannot drift apart.
+/// 3. **Not a pinned import.** A Cypher `CALL (p)` import
+///    ([`SubqueryPattern::pinned_vars`]) is a per-row binding by contract. The
+///    body can nest a sliced, `DISTINCT` or aggregating `WITH` that reads it,
+///    where per-row seeding and one evaluation differ, so the import stays a
+///    correlation input and the CALL waits for its producer. The executor
+///    still evaluates once and hash-joins when the body allows it.
 fn subquery_correlation_vars(
     sq: &SubqueryPattern,
     siblings: &[Pattern],
@@ -3017,7 +3014,7 @@ fn subquery_correlation_vars(
     for (j, p) in siblings.iter().enumerate().take(self_idx) {
         debug_assert!(j < self_idx);
         for v in p.produced_vars() {
-            if select.contains(&v) && !self_produced.contains(&v) {
+            if select.contains(&v) && (!self_produced.contains(&v) || sq.pinned_vars.contains(&v)) {
                 corr.insert(v);
             }
         }
@@ -3287,9 +3284,9 @@ mod tests {
                         function: AggregateFn::Avg(input, InputSemantics::List),
                         output_var: average,
                     }),
-                    binds: vec![],
                 }),
                 having: None,
+                binds: vec![],
             }),
         );
         let pipeline = Pattern::Subquery(
@@ -6922,9 +6919,13 @@ mod tests {
 
     /// A grouped sub-SELECT: `SELECT <select> { <body> } GROUP BY <group_key>`.
     fn grouped_sq(select: Vec<VarId>, group_key: VarId, body: Vec<Pattern>) -> Pattern {
-        Pattern::Subquery(crate::ir::SubqueryPattern::new(select, body).with_grouping(
-            crate::ir::Grouping::assemble(vec![group_key], vec![], vec![], None).unwrap(),
-        ))
+        Pattern::Subquery(
+            crate::ir::SubqueryPattern::new(select, body).with_grouping(
+                crate::ir::Grouping::assemble(vec![group_key], vec![], vec![], None)
+                    .expect("valid grouping")
+                    .unwrap(),
+            ),
+        )
     }
 
     #[test]
@@ -7163,6 +7164,7 @@ mod tests {
             vec![],
             None,
         )
+        .expect("valid grouping")
         .expect("aggregate present")
     }
 

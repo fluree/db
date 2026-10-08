@@ -711,22 +711,26 @@ async fn sparql_construct_nested_property_lists_stay_distinct() {
     }
 }
 
-/// P4 negative guardrail (W2BC): CONSTRUCT has no aggregation stage, so an
-/// inline-aggregate ORDER BY (e.g. `ORDER BY COUNT(?h)`) cannot be hoisted and
-/// the query is rejected rather than mis-executed.
+/// An inline-aggregate ORDER BY (`ORDER BY COUNT(?h)`) groups a CONSTRUCT level
+/// (SPARQL 1.1 §18.2.4.1): one implicit group, whose solution binds no template
+/// variable (neither is a GROUP BY key), so every template triple is skipped
+/// and the graph is empty. It used to be refused, when CONSTRUCT had no
+/// grouping stage.
 #[tokio::test]
-async fn sparql_construct_aggregate_order_by_is_rejected() {
+async fn sparql_construct_aggregate_order_by_groups() {
     let (fluree, ledger) = seed_people().await;
     let db = support::graphdb_from_ledger(&ledger);
 
     let sparql = "PREFIX person: <http://example.org/Person#> \
          CONSTRUCT { ?s person:handle ?h } \
          WHERE { ?s person:handle ?h } ORDER BY (COUNT(?h))";
-    let result = db.query(&fluree).sparql(sparql).execute_formatted().await;
-    assert!(
-        result.is_err(),
-        "CONSTRUCT + inline-aggregate ORDER BY must be rejected, got: {result:#?}"
-    );
+    let result = db
+        .query(&fluree)
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .expect("CONSTRUCT with an aggregate ORDER BY");
+    assert_eq!(result["@graph"], serde_json::json!([]), "{result:#}");
 }
 
 /// §16.2: the template is instantiated once per SOLUTION (the sequence, not
@@ -1770,4 +1774,101 @@ mod annotations_and_graphs {
         );
         assert!(nq.contains(&format!("<{EX}g2> .")), "{nq}");
     }
+}
+
+/// The `@id`s of a CONSTRUCT / DESCRIBE result graph, sorted, each with its
+/// number of values.
+fn graph_subjects(v: &JsonValue) -> Vec<(String, usize)> {
+    let mut subjects: Vec<(String, usize)> = v
+        .get("@graph")
+        .and_then(JsonValue::as_array)
+        .expect("a JSON-LD @graph")
+        .iter()
+        .map(|node| {
+            let id = node.get("@id").and_then(JsonValue::as_str).expect("@id");
+            (
+                id.to_string(),
+                count_graph_values(&json!({"@graph": [node]})),
+            )
+        })
+        .collect();
+    subjects.sort();
+    subjects
+}
+
+/// A trailing VALUES clause after CONSTRUCT (both forms) and DESCRIBE joins
+/// the WHERE's solutions (the grammar allows one after every query form); it
+/// was a parse error. The JSON-LD `construct` takes `values`, which it ignored.
+/// Of the people, jdoe, bbob, jbob and fbueller have a full name; bbob and
+/// jbob have a friend.
+#[tokio::test]
+async fn construct_and_describe_read_a_trailing_values() {
+    let (fluree, ledger) = seed_people().await;
+    let db = support::graphdb_from_ledger(&ledger);
+    const P: &str = "PREFIX person: <http://example.org/Person#> PREFIX ex: <http://example.org/> ";
+    let jdoe = "http://example.org/jdoe".to_string();
+    let bbob = "http://example.org/bbob".to_string();
+    let jbob = "http://example.org/jbob".to_string();
+    for (body, expected) in [
+        (
+            "CONSTRUCT { ?s ex:label ?n } WHERE { ?s person:fullName ?n } \
+             VALUES ?s { ex:jdoe ex:bbob }",
+            vec![(bbob.clone(), 1), (jdoe.clone(), 1)],
+        ),
+        (
+            "CONSTRUCT WHERE { ?s person:fullName ?n } VALUES ?n { \"Jenny Bob\" }",
+            vec![(jbob.clone(), 1)],
+        ),
+        (
+            "CONSTRUCT { ?s ex:label ?n } WHERE { ?s person:fullName ?n } \
+             ORDER BY ?n LIMIT 1 VALUES ?s { ex:jdoe ex:jbob }",
+            vec![(jdoe.clone(), 1)],
+        ),
+        (
+            "CONSTRUCT { ?s ex:many true } WHERE { ?s person:favNums ?x } GROUP BY ?s \
+             HAVING (COUNT(?x) > 1) VALUES ?s { ex:jdoe ex:bbob }",
+            vec![(jdoe.clone(), 1)],
+        ),
+        // DESCRIBE: each described node's outgoing triples (jdoe: type,
+        // handle, full name, four favorite numbers; bbob: type, handle, full
+        // name, friend, one favorite number).
+        ("DESCRIBE ?s VALUES ?s { ex:jdoe }", vec![(jdoe.clone(), 7)]),
+        (
+            "DESCRIBE ?s WHERE { ?s person:friend ?f } VALUES ?f { ex:jbob }",
+            vec![(bbob.clone(), 5)],
+        ),
+    ] {
+        let query = format!("{P}{body}");
+        let out = db
+            .query(&fluree)
+            .sparql(&query)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{query}"));
+        let subjects: Vec<(String, usize)> = graph_subjects(&out)
+            .into_iter()
+            .map(|(id, n)| (id.replace("ex:", "http://example.org/"), n))
+            .collect();
+        assert_eq!(subjects, expected, "{query}\n{out:#}");
+    }
+
+    // The JSON-LD twin.
+    let query = json!({
+        "@context": context_people(),
+        "where": [{"@id": "?s", "person:fullName": "?n"}],
+        "construct": [{"@id": "?s", "label": "?n"}],
+        "values": ["?s", [{"@id": "ex:jdoe"}, {"@id": "ex:bbob"}]]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{query}"));
+    let actual = normalize_construct(result.to_construct(&ledger.snapshot).expect("to_construct"));
+    let expected = normalize_construct(json!({
+        "@context": context_people(),
+        "@graph": [
+            {"@id": "ex:bbob", "label": ["Billy Bob"]},
+            {"@id": "ex:jdoe", "label": ["Jane Doe"]}
+        ]
+    }));
+    assert_eq!(actual, expected);
 }

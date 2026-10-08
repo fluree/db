@@ -117,7 +117,7 @@ fn lower_policy_query(
 
     let mut patterns = query.patterns;
     if let Some(values) = query.post_values {
-        patterns.push(values);
+        patterns.extend(values.to_patterns());
     }
     Ok(patterns)
 }

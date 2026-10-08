@@ -99,6 +99,8 @@ ASK {
 }
 ```
 
+ASK is `true` when a solution remains after its solution modifiers and a trailing `VALUES` clause: `GROUP BY` / `HAVING` count the groups that pass, `OFFSET 1` needs a second solution, and `LIMIT 0` is always `false`. `ORDER BY` cannot change the answer.
+
 ### DESCRIBE Queries
 
 Return RDF description of resources:
@@ -424,6 +426,16 @@ GROUP BY (SUBSTR(?name, 1, 1) AS ?initial)
 
 The expression is evaluated per row and bound to the alias variable before grouping. Any SPARQL expression is supported, including function calls, arithmetic, and type casts.
 
+**SELECT expressions in a grouped query** are evaluated once per group, after aggregation, in SELECT order (SPARQL 1.1 §18.2.4.4); the ones `HAVING` reads run before it, the rest after it. They may read GROUP BY keys, aggregate results and earlier SELECT aliases:
+
+```sparql
+SELECT (IF(?area = "Net", "network", "other") AS ?segment) (COUNT(?e) AS ?n)
+WHERE { ?e ex:area ?area }
+GROUP BY ?area
+```
+
+returns one row per `?area`. A query groups when it has a `GROUP BY` or an aggregate anywhere in SELECT, HAVING or ORDER BY; `SELECT *` of such a query projects its GROUP BY keys (none, without a `GROUP BY`). An aggregate cannot read an alias of the same SELECT clause (it is bound after aggregation): aggregate the expression itself, e.g. `COUNT(IF(…))`.
+
 ### HAVING
 
 Filter grouped results:
@@ -436,6 +448,8 @@ WHERE {
 GROUP BY ?category
 HAVING (COUNT(?product) > 10)
 ```
+
+`HAVING` can read the SELECT clause's aliases: an aggregate's alias, such as `?count` above, and an expression's alias (`(COUNT(?product) + 1 AS ?n) … HAVING (?n > 10)`), whose expression is evaluated once, before `HAVING`. SPARQL 1.1 evaluates SELECT expressions after `HAVING`, which leaves such an alias unbound there; reading it is a Fluree extension that many engines share (see [compatibility](../reference/compatibility.md)). In `HAVING` and `ORDER BY`, a variable that is neither a GROUP BY key nor inside an aggregate means `SAMPLE(?v)`, an arbitrary value from the group (§18.2.4.1). On a query that does not group, `HAVING` filters the solutions (§18.2.4.2).
 
 ### Aggregation Functions
 

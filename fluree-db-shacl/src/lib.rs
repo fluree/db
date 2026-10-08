@@ -144,7 +144,7 @@ pub use constraints::{Constraint, NodeConstraint};
 pub use error::{Result, ShaclError};
 pub use path::PropertyPath;
 pub use report_text::{format_violations, unresolved_sid, violations_of};
-pub use sparql::SparqlConstraint;
+pub use sparql::{ConstraintFailure, ConstraintFailures, SparqlConstraint};
 pub use validate::{
     CrossLedgerMembership, FocusNode, ShaclEngine, ValidationReport, ValidationResult,
 };

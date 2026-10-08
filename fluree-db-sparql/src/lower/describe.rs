@@ -75,11 +75,25 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             }]);
         }
 
-        // 2) WHERE-derived targets (DESCRIBE ?x WHERE { ... } / DESCRIBE * WHERE { ... })
-        if let Some(where_clause) = &describe.where_clause {
-            // Lower WHERE clause patterns first (so variable IDs are registered).
-            let where_patterns = self.lower_graph_pattern(&where_clause.pattern)?;
-
+        // 2) WHERE-derived targets (DESCRIBE ?x WHERE { ... } / DESCRIBE * WHERE { ... }).
+        // A trailing VALUES clause joins the WHERE's solutions right after it,
+        // as in a sub-SELECT (DESCRIBE never groups); without a WHERE it joins
+        // the one empty solution (`DESCRIBE ?x VALUES ?x { <a> <b> }`).
+        let where_patterns = match (&describe.where_clause, describe.values.as_deref()) {
+            (None, None) => None,
+            (where_clause, values) => {
+                // Lower WHERE clause patterns first (so variable IDs are registered).
+                let mut patterns = match where_clause {
+                    Some(where_clause) => self.lower_graph_pattern(&where_clause.pattern)?,
+                    None => Vec::new(),
+                };
+                if let Some(values) = values {
+                    patterns.extend(self.lower_graph_pattern(values)?);
+                }
+                Some(patterns)
+            }
+        };
+        if let Some(where_patterns) = where_patterns {
             let target_vars = self.describe_target_vars(&describe.target, &where_patterns);
             if !target_vars.is_empty() {
                 let mut subq = SubqueryPattern::new(target_vars.clone(), where_patterns);

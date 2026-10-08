@@ -53,7 +53,9 @@ pub enum ParseError {
     InvalidGroupBy,
 
     /// Invalid orderBy clause
-    #[error("orderBy must be an array of objects with 'var' field")]
+    #[error(
+        "orderBy takes variables: \"?x\", \"(desc ?x)\", [\"desc\", \"?x\"] or          {{\"var\": \"?x\", \"direction\": \"desc\"}}; to sort on an expression or an          aggregate, select it under an alias, (as <expr> ?k), and order by ?k"
+    )]
     InvalidOrderBy,
 
     /// Invalid limit value

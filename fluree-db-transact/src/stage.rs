@@ -3789,8 +3789,14 @@ pub async fn validate_view_with_shacl(
     // `cross_ledger_db` is a live handle into a model ledger holding the
     // controlled vocabulary (cross-ledger `f:shapesSource`), consulted on
     // demand for `sh:class` membership.
+    // An `sh:sparql` constraint that cannot run is recorded with its shape's
+    // severity (the outermost reporting shape's, when its shape is checked as
+    // a nested shape) rather than raised, so severity and the graph's mode
+    // apply to it as they do to a result (below).
+    let constraint_failures = std::sync::Arc::new(fluree_db_shacl::ConstraintFailures::default());
     let engine = ShaclEngine::from_shared_cache(shacl_cache, hierarchy)
-        .with_membership_graphs(membership_g_ids.to_vec());
+        .with_membership_graphs(membership_g_ids.to_vec())
+        .with_constraint_failures(std::sync::Arc::clone(&constraint_failures));
     let enabled_graphs: Option<HashSet<GraphId>> =
         per_graph_policy.map(|m| m.keys().copied().collect());
     let report = validate_staged_nodes(
@@ -3803,21 +3809,60 @@ pub async fn validate_view_with_shacl(
     )
     .await?;
 
+    // A graph's validation mode. When per_graph_policy is None, every graph
+    // is in Reject mode.
+    let mode_of = |g_id: Option<GraphId>| match (per_graph_policy, g_id) {
+        (Some(m), Some(g_id)) => m
+            .get(&g_id)
+            .map(|p| p.mode)
+            .unwrap_or(fluree_db_core::ledger_config::ValidationMode::Reject),
+        _ => fluree_db_core::ledger_config::ValidationMode::Reject,
+    };
+
+    // A constraint that cannot run, on a Violation shape in a Reject-mode
+    // graph, fails the transaction with the constraint's error (fail closed);
+    // on a Warning or Info shape, or in a Warn-mode graph, it is logged and
+    // the transaction goes on, as a result there would.
+    // The constraint fails the same way for every focus node it ran on: log
+    // each distinct failure once, with the number of focus nodes.
+    let mut logged: Vec<(fluree_db_shacl::ConstraintFailure, usize)> = Vec::new();
+    for failure in constraint_failures.take() {
+        let fatal = failure.severity == fluree_db_shacl::Severity::Violation
+            && matches!(
+                mode_of(Some(failure.graph_id)),
+                fluree_db_core::ledger_config::ValidationMode::Reject
+            );
+        if fatal {
+            return Err(failure.into_error().into());
+        }
+        match logged.iter_mut().find(|(seen, _)| {
+            seen.constraint == failure.constraint
+                && seen.message == failure.message
+                && seen.graph_id == failure.graph_id
+        }) {
+            Some((_, focus_nodes)) => *focus_nodes += 1,
+            None => logged.push((failure, 1)),
+        }
+    }
+    for (failure, focus_nodes) in logged {
+        tracing::warn!(
+            constraint = %failure.constraint,
+            severity = ?failure.severity,
+            graph = failure.graph_id,
+            focus_nodes,
+            message = %failure.message,
+            "sh:sparql constraint could not run (non-violation severity or warn-mode graph, continuing)"
+        );
+    }
+
     // Split violations by the graph's configured mode. `graph_id` on each
     // result was tagged during the per-graph loop in validate_staged_nodes.
-    // When per_graph_policy is None, every violation defaults to Reject.
     let mut outcome = ShaclValidationOutcome::default();
     for r in report.results {
         if r.severity != fluree_db_shacl::Severity::Violation {
             continue;
         }
-        let mode = match (per_graph_policy, r.graph_id) {
-            (Some(m), Some(g_id)) => m
-                .get(&g_id)
-                .map(|p| p.mode)
-                .unwrap_or(fluree_db_core::ledger_config::ValidationMode::Reject),
-            _ => fluree_db_core::ledger_config::ValidationMode::Reject,
-        };
+        let mode = mode_of(r.graph_id);
         match mode {
             fluree_db_core::ledger_config::ValidationMode::Reject => {
                 outcome.reject_violations.push(r);

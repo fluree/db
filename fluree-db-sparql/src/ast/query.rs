@@ -402,6 +402,33 @@ impl SolutionModifiers {
         Self::default()
     }
 
+    /// Whether a query level with this SELECT clause and these modifiers
+    /// groups (SPARQL 1.1 §18.2.4.1): it has a GROUP BY, or an aggregate
+    /// anywhere in its SELECT, HAVING or ORDER BY. The one definition that
+    /// validation (V4) and lowering share.
+    pub fn level_groups(&self, variables: &SelectVariables) -> bool {
+        if self.group_by.is_some() {
+            return true;
+        }
+        let in_select = match variables {
+            SelectVariables::Star => false,
+            SelectVariables::Explicit(items) => items.iter().any(|item| match item {
+                SelectVariable::Var(_) => false,
+                SelectVariable::Expr { expr, .. } => expr.contains_aggregate(),
+            }),
+        };
+        let in_having = self
+            .having
+            .as_ref()
+            .is_some_and(|h| h.conditions.iter().any(Expression::contains_aggregate));
+        let in_order_by = self.order_by.as_ref().is_some_and(|o| {
+            o.conditions
+                .iter()
+                .any(|c| matches!(&c.expr, OrderExpr::Expr(e) if e.contains_aggregate()))
+        });
+        in_select || in_having || in_order_by
+    }
+
     /// Set the ORDER BY clause.
     pub fn with_order_by(mut self, order_by: OrderByClause) -> Self {
         self.order_by = Some(order_by);
@@ -556,8 +583,10 @@ pub struct ConstructQuery {
     pub dataset: Option<DatasetClause>,
     /// WHERE clause
     pub where_clause: WhereClause,
-    /// Solution modifiers (ORDER BY, LIMIT, OFFSET - no GROUP BY/HAVING for CONSTRUCT)
+    /// Solution modifiers (GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET)
     pub modifiers: SolutionModifiers,
+    /// Post-query VALUES clause (ValuesClause in SPARQL grammar, after SolutionModifier).
+    pub values: Option<Box<GraphPattern>>,
     /// Source span
     pub span: SourceSpan,
 }
@@ -575,6 +604,7 @@ impl ConstructQuery {
             dataset: None,
             where_clause,
             modifiers,
+            values: None,
             span,
         }
     }
@@ -628,8 +658,11 @@ pub struct AskQuery {
     pub dataset: Option<DatasetClause>,
     /// WHERE clause
     pub where_clause: WhereClause,
-    /// Solution modifiers (limited - typically none for ASK)
+    /// Solution modifiers: GROUP BY, HAVING, LIMIT and OFFSET decide whether
+    /// a solution remains
     pub modifiers: SolutionModifiers,
+    /// Post-query VALUES clause (ValuesClause in SPARQL grammar, after SolutionModifier).
+    pub values: Option<Box<GraphPattern>>,
     /// Source span
     pub span: SourceSpan,
 }
@@ -641,6 +674,7 @@ impl AskQuery {
             dataset: None,
             where_clause,
             modifiers: SolutionModifiers::new(),
+            values: None,
             span,
         }
     }
@@ -665,6 +699,8 @@ pub struct DescribeQuery {
     pub where_clause: Option<WhereClause>,
     /// Solution modifiers
     pub modifiers: SolutionModifiers,
+    /// Post-query VALUES clause (ValuesClause in SPARQL grammar, after SolutionModifier).
+    pub values: Option<Box<GraphPattern>>,
     /// Byte offset just after the describe targets: where a dataset clause
     /// belongs when the query has neither one nor a WHERE clause to precede.
     pub dataset_offset: usize,
@@ -680,6 +716,7 @@ impl DescribeQuery {
             dataset: None,
             where_clause: None,
             modifiers: SolutionModifiers::new(),
+            values: None,
             dataset_offset: span.end,
             span,
         }

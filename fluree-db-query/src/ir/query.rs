@@ -147,6 +147,27 @@ impl ConstructTemplate {
     pub fn referenced_vars(&self) -> HashSet<VarId> {
         self.var_iter().collect()
     }
+
+    /// Rename `old` to `new` in the patterns, graph names and reifiers.
+    pub fn substitute_var(&mut self, old: VarId, new: VarId) {
+        let rename = |r: &mut Ref| {
+            if r.as_var() == Some(old) {
+                *r = Ref::Var(new);
+            }
+        };
+        for pattern in &mut self.patterns {
+            pattern.substitute_var(old, new);
+        }
+        for graph in self.graphs.iter_mut().flatten() {
+            rename(graph);
+        }
+        for reification in &mut self.reifications {
+            rename(&mut reification.reifier);
+        }
+        if self.bnode_vars.remove(&old) {
+            self.bnode_vars.insert(new);
+        }
+    }
 }
 
 /// A restriction applied to a SELECT query's result stream.
@@ -167,15 +188,33 @@ pub enum Restriction {
     One,
 }
 
+/// What a grouped SELECT may do with a projected variable its grouping neither
+/// keys, aggregates nor binds.
+///
+/// It is a property of the top-level output only. A sub-query's projection is a
+/// bare `Vec<VarId>` ([`super::SubqueryPattern`]), so it cannot carry
+/// [`Self::PerGroupList`]: a per-group list never crosses a sub-query boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UngroupedProjection {
+    /// A plan error (the SPARQL rule, SPARQL 1.1 §11.4, and Cypher's).
+    #[default]
+    Reject,
+    /// Rendered as a per-group list: the documented JSON-LD query behavior.
+    /// Set only by the JSON-LD user-query entry point.
+    PerGroupList,
+}
+
 /// Describes what the query produces.
 #[derive(Debug, Clone)]
 pub enum QueryOutput {
     /// SELECT — projects rows from the algebra. The `projection` carries
     /// column structure (and per-column hydration); `restriction` carries the
-    /// optional `selectDistinct` / `selectOne` modifier.
+    /// optional `selectDistinct` / `selectOne` modifier; `ungrouped` what a
+    /// grouped query may do with a projected variable it does not group.
     Select {
         projection: Projection,
         restriction: Option<Restriction>,
+        ungrouped: UngroupedProjection,
     },
     /// CONSTRUCT — template patterns instantiated with bindings.
     Construct(ConstructTemplate),
@@ -188,6 +227,7 @@ impl QueryOutput {
         Self::Select {
             projection: Projection::Tuple(vars.into_iter().map(Column::Var).collect()),
             restriction,
+            ungrouped: UngroupedProjection::Reject,
         }
     }
 
@@ -211,6 +251,7 @@ impl QueryOutput {
         Self::Select {
             projection: Projection::Wildcard,
             restriction: None,
+            ungrouped: UngroupedProjection::Reject,
         }
     }
 
@@ -220,6 +261,26 @@ impl QueryOutput {
         Self::Select {
             projection: Projection::Wildcard,
             restriction: Some(Restriction::Distinct),
+            ungrouped: UngroupedProjection::Reject,
+        }
+    }
+
+    /// What a grouped query may do with a projected variable it does not
+    /// group. [`UngroupedProjection::Reject`] for every non-SELECT output.
+    pub fn ungrouped_projection(&self) -> UngroupedProjection {
+        match self {
+            QueryOutput::Select { ungrouped, .. } => *ungrouped,
+            _ => UngroupedProjection::Reject,
+        }
+    }
+
+    /// Set what a grouped SELECT may do with a projected variable it does not
+    /// group. [`UngroupedProjection::PerGroupList`] is the JSON-LD query
+    /// surface's; an output that cannot carry a list (SPARQL-results rows)
+    /// sets [`UngroupedProjection::Reject`]. No effect on other outputs.
+    pub fn set_ungrouped_projection(&mut self, policy: UngroupedProjection) {
+        if let QueryOutput::Select { ungrouped, .. } = self {
+            *ungrouped = policy;
         }
     }
 
@@ -327,6 +388,76 @@ impl QueryOutput {
     }
 }
 
+/// A query's trailing `VALUES` clause (SPARQL's `ValuesClause` after the
+/// solution modifiers) and the binds the query level generated, which read it.
+///
+/// The VALUES joins after the WHERE operator tree and before grouping (a
+/// deliberate deviation from SPARQL 1.1 §18.2.4.3, which joins it after HAVING:
+/// here it restricts the aggregates' input). `then` holds the level's generated
+/// binds (GROUP BY expressions, aggregate inputs, and SELECT expressions placed
+/// before grouping), evaluated in order after the join, so they read its
+/// variables, as a sub-SELECT's binds do (its VALUES is spliced right after its
+/// WHERE). Kept out of `patterns` so the WHERE planner cannot reorder the join
+/// relative to OPTIONAL/UNION.
+#[derive(Debug, Clone)]
+pub struct PostValues {
+    /// The VALUES block's variables, in column order.
+    pub vars: Vec<VarId>,
+    /// Its rows, one binding per variable (`Binding::Unbound` for UNDEF).
+    pub rows: Vec<Vec<crate::binding::Binding>>,
+    /// Binds evaluated in order after the join.
+    pub then: Vec<(VarId, super::Expression)>,
+}
+
+impl PostValues {
+    /// A VALUES block with no binds after it.
+    pub fn new(vars: Vec<VarId>, rows: Vec<Vec<crate::binding::Binding>>) -> Self {
+        Self {
+            vars,
+            rows,
+            then: Vec::new(),
+        }
+    }
+
+    /// The variables bound once the join and its binds have run.
+    pub fn produced_vars(&self) -> Vec<VarId> {
+        self.vars
+            .iter()
+            .copied()
+            .chain(self.then.iter().map(|(var, _)| *var))
+            .collect()
+    }
+
+    /// Rename `old` to `new` in the VALUES columns and the binds.
+    pub fn substitute_var(&mut self, old: VarId, new: VarId) {
+        for var in &mut self.vars {
+            if *var == old {
+                *var = new;
+            }
+        }
+        for (var, expr) in &mut self.then {
+            if *var == old {
+                *var = new;
+            }
+            expr.substitute_var(old, new);
+        }
+    }
+
+    /// The clause as WHERE patterns, in evaluation order: the VALUES block,
+    /// then its binds.
+    pub fn to_patterns(&self) -> Vec<Pattern> {
+        std::iter::once(Pattern::Values {
+            vars: self.vars.clone(),
+            rows: self.rows.clone(),
+        })
+        .chain(self.then.iter().map(|(var, expr)| Pattern::Bind {
+            var: *var,
+            expr: expr.clone(),
+        }))
+        .collect()
+    }
+}
+
 /// Resolved query ready for execution.
 ///
 /// This is the canonical query IR — produced by parsing/lowering, consumed
@@ -361,12 +492,9 @@ pub struct Query {
     pub offset: Option<usize>,
     /// Reasoning configuration (RDFS/OWL/datalog modes, schema bundle).
     pub reasoning: ReasoningConfig,
-    /// Post-query VALUES clause (SPARQL `ValuesClause` after `SolutionModifier`).
-    ///
-    /// Stored separately from `patterns` so the WHERE-clause planner does not
-    /// reorder it relative to OPTIONAL/UNION/etc.  Applied as a final inner-join
-    /// constraint after the WHERE operator tree is fully built.
-    pub post_values: Option<Pattern>,
+    /// The trailing VALUES clause and the binds after it ([`PostValues`]),
+    /// applied after the WHERE operator tree is fully built.
+    pub post_values: Option<PostValues>,
     /// When true, scan operators bypass the **variable-predicate**
     /// filter that hides Fluree-system predicates (`f:reifies*` in
     /// every graph; the broader `f:` namespace in the default graph).

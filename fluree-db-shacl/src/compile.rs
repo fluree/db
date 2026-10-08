@@ -156,6 +156,18 @@ pub struct ShapeCompiler {
     /// Built `sh:sparql` constraints by attachment subject (filled by
     /// `build_sparql_constraints`, consumed by `finalize`)
     built_sparql: HashMap<Sid, Vec<Arc<crate::sparql::SparqlConstraint>>>,
+    /// Shape metadata whose subject no shape map held when its flake was
+    /// processed (see `claim_metadata`).
+    unclaimed_metadata: HashMap<Sid, ShapeMetadata>,
+}
+
+/// `sh:severity`, `sh:message`, `sh:name` and `sh:description` of one subject.
+#[derive(Default)]
+struct ShapeMetadata {
+    severity: Option<Severity>,
+    message: Option<String>,
+    name: Option<String>,
+    description: Option<String>,
 }
 
 /// Intermediate representation during compilation
@@ -173,17 +185,12 @@ struct ShapeData {
     node_shapes: Vec<Sid>,
     /// sh:not - reference to a shape that must NOT match
     not_shape: Option<Sid>,
-    /// sh:and - reference to RDF list head (expanded during list processing)
-    and_list: Option<Sid>,
-    /// sh:and - expanded shape references
+    /// sh:and - shape references (an RDF list head among them is expanded
+    /// during list processing)
     and_shapes: Vec<Sid>,
-    /// sh:or - reference to RDF list head (expanded during list processing)
-    or_list: Option<Sid>,
-    /// sh:or - expanded shape references
+    /// sh:or - shape references, as for `and_shapes`
     or_shapes: Vec<Sid>,
-    /// sh:xone - reference to RDF list head (expanded during list processing)
-    xone_list: Option<Sid>,
-    /// sh:xone - expanded shape references
+    /// sh:xone - shape references, as for `and_shapes`
     xone_shapes: Vec<Sid>,
     severity: Severity,
     name: Option<String>,
@@ -246,6 +253,7 @@ impl ShapeCompiler {
             decl_namespace: HashMap::new(),
             owl_imports: HashMap::new(),
             built_sparql: HashMap::new(),
+            unclaimed_metadata: HashMap::new(),
         }
     }
 
@@ -412,6 +420,8 @@ impl ShapeCompiler {
             // resolve; a plain-predicate path resolves trivially on any graph.
             compiler.resolve_paths(*db).await?;
         }
+
+        compiler.claim_metadata();
 
         // Implicit class targets: a subject targets its own instances only when
         // it is *both* a declared shape and typed as a class. When no shapes were
@@ -673,74 +683,51 @@ impl ShapeCompiler {
             }
         }
 
-        // Collect logical constraint list heads
-        let mut and_lists: Vec<(Sid, Sid)> = Vec::new();
-        let mut or_lists: Vec<(Sid, Sid)> = Vec::new();
-        let mut xone_lists: Vec<(Sid, Sid)> = Vec::new();
-
-        for (shape_id, shape_data) in &self.shapes {
-            if let Some(list_head) = &shape_data.and_list {
-                and_lists.push((shape_id.clone(), list_head.clone()));
-            }
-            if let Some(list_head) = &shape_data.or_list {
-                or_lists.push((shape_id.clone(), list_head.clone()));
-            }
-            if let Some(list_head) = &shape_data.xone_list {
-                xone_lists.push((shape_id.clone(), list_head.clone()));
-            }
-        }
-
-        // Expand sh:and lists
-        for (shape_id, list_head) in and_lists {
-            let values = traverse_rdf_list(db, &list_head, &rdf_first, &rdf_rest, &rdf_nil).await?;
-            let shape_refs: Vec<Sid> = values
-                .into_iter()
-                .filter_map(|v| {
-                    if let FlakeValue::Ref(sid) = v {
-                        Some(sid)
+        // sh:and / sh:or / sh:xone members. A JSON-LD @list or a Turtle
+        // collection arrives as one flake per member; an RDF collection
+        // stored as an rdf:first / rdf:rest spine (as a SPARQL UPDATE writes
+        // `( … )`) arrives as one flake whose object is the spine's head.
+        // A member that heads a list in this graph is replaced by the list's
+        // members, as for sh:ignoredProperties.
+        let logical: Vec<Sid> = self
+            .shapes
+            .iter()
+            .filter(|(_, sd)| {
+                !(sd.and_shapes.is_empty() && sd.or_shapes.is_empty() && sd.xone_shapes.is_empty())
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for shape_id in logical {
+            let Some(sd) = self.shapes.get_mut(&shape_id) else {
+                continue;
+            };
+            let mut lists = [
+                std::mem::take(&mut sd.and_shapes),
+                std::mem::take(&mut sd.or_shapes),
+                std::mem::take(&mut sd.xone_shapes),
+            ];
+            for members in &mut lists {
+                let mut expanded = Vec::with_capacity(members.len());
+                for member in members.drain(..) {
+                    let values =
+                        traverse_rdf_list(db, &member, &rdf_first, &rdf_rest, &rdf_nil).await?;
+                    if values.is_empty() {
+                        // Not a list head in this graph — a shape reference.
+                        expanded.push(member);
                     } else {
-                        None
+                        expanded.extend(values.into_iter().filter_map(|v| match v {
+                            FlakeValue::Ref(sid) => Some(sid),
+                            _ => None,
+                        }));
                     }
-                })
-                .collect();
-            if let Some(shape_data) = self.shapes.get_mut(&shape_id) {
-                shape_data.and_shapes = shape_refs;
+                }
+                *members = expanded;
             }
-        }
-
-        // Expand sh:or lists
-        for (shape_id, list_head) in or_lists {
-            let values = traverse_rdf_list(db, &list_head, &rdf_first, &rdf_rest, &rdf_nil).await?;
-            let shape_refs: Vec<Sid> = values
-                .into_iter()
-                .filter_map(|v| {
-                    if let FlakeValue::Ref(sid) = v {
-                        Some(sid)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if let Some(shape_data) = self.shapes.get_mut(&shape_id) {
-                shape_data.or_shapes = shape_refs;
-            }
-        }
-
-        // Expand sh:xone lists
-        for (shape_id, list_head) in xone_lists {
-            let values = traverse_rdf_list(db, &list_head, &rdf_first, &rdf_rest, &rdf_nil).await?;
-            let shape_refs: Vec<Sid> = values
-                .into_iter()
-                .filter_map(|v| {
-                    if let FlakeValue::Ref(sid) = v {
-                        Some(sid)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if let Some(shape_data) = self.shapes.get_mut(&shape_id) {
-                shape_data.xone_shapes = shape_refs;
+            let [and_shapes, or_shapes, xone_shapes] = lists;
+            if let Some(sd) = self.shapes.get_mut(&shape_id) {
+                sd.and_shapes = and_shapes;
+                sd.or_shapes = or_shapes;
+                sd.xone_shapes = xone_shapes;
             }
         }
 
@@ -1052,6 +1039,8 @@ impl ShapeCompiler {
                         ps.severity = severity;
                     } else if let Some(ns) = self.shapes.get_mut(&flake.s) {
                         ns.severity = severity;
+                    } else {
+                        self.unclaimed(&flake.s).severity = Some(severity);
                     }
                 }
             }
@@ -1061,6 +1050,8 @@ impl ShapeCompiler {
                         ps.message = Some(msg.clone());
                     } else if let Some(ns) = self.shapes.get_mut(&flake.s) {
                         ns.message = Some(msg.clone());
+                    } else {
+                        self.unclaimed(&flake.s).message = Some(msg.clone());
                     }
                     // Also tracked by subject for sh:sparql constraint nodes,
                     // which live outside the shape maps.
@@ -1076,6 +1067,8 @@ impl ShapeCompiler {
                         ps.name = Some(n.clone());
                     } else if let Some(ns) = self.shapes.get_mut(&flake.s) {
                         ns.name = Some(n.clone());
+                    } else {
+                        self.unclaimed(&flake.s).name = Some(n.clone());
                     }
                 }
             }
@@ -1088,6 +1081,8 @@ impl ShapeCompiler {
                         ps.description = Some(d.clone());
                     } else if let Some(ns) = self.shapes.get_mut(&flake.s) {
                         ns.description = Some(d.clone());
+                    } else {
+                        self.unclaimed(&flake.s).description = Some(d.clone());
                     }
                 }
             }
@@ -1169,6 +1164,48 @@ impl ShapeCompiler {
 
     fn get_or_create_shape(&mut self, id: &Sid) -> &mut ShapeData {
         self.shapes.entry(id.clone()).or_default()
+    }
+
+    fn unclaimed(&mut self, id: &Sid) -> &mut ShapeMetadata {
+        self.unclaimed_metadata.entry(id.clone()).or_default()
+    }
+
+    /// Give each shape the metadata recorded before it was registered.
+    ///
+    /// Predicates are scanned in a fixed order, and the metadata arms only
+    /// write to a subject a shape map already holds. A node shape registered
+    /// later (by its `rdf:type sh:NodeShape`, after the scan, typically one
+    /// whose only constraint is `sh:sparql`, or by a predicate in a later
+    /// graph) would otherwise lose them and compile as a Violation shape with
+    /// no message. Routed as the arms route (property shape first); a value
+    /// the subject already has, written once it was registered, stays.
+    fn claim_metadata(&mut self) {
+        for (id, meta) in std::mem::take(&mut self.unclaimed_metadata) {
+            let (severity, message, name, description) =
+                if let Some(ps) = self.property_shapes.get_mut(&id) {
+                    (
+                        &mut ps.severity,
+                        &mut ps.message,
+                        &mut ps.name,
+                        &mut ps.description,
+                    )
+                } else if let Some(ns) = self.shapes.get_mut(&id) {
+                    (
+                        &mut ns.severity,
+                        &mut ns.message,
+                        &mut ns.name,
+                        &mut ns.description,
+                    )
+                } else {
+                    continue;
+                };
+            if *severity == Severity::Violation {
+                *severity = meta.severity.unwrap_or(Severity::Violation);
+            }
+            *message = message.take().or(meta.message);
+            *name = name.take().or(meta.name);
+            *description = description.take().or(meta.description);
+        }
     }
 
     fn get_or_create_property_shape(&mut self, id: &Sid) -> &mut PropertyShapeData {

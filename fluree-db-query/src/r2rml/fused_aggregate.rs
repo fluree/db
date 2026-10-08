@@ -373,6 +373,11 @@ fn fused_r2rml_agg_enabled() -> bool {
     *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_FUSED_R2RML_AGG"))
 }
 
+/// The routing stamp the fused operator records at open: `Proceed` when it
+/// folds from column batches, `Fallback(GateDeclined)` when its open-time
+/// gates send the query to the fallback pipeline.
+pub const FUSED_R2RML_AGGREGATE_SITE: &str = "fused_r2rml_aggregate";
+
 /// Detect the fused shape: a single `GRAPH { triples }` block feeding an
 /// aggregation (implicit, or GROUP BY) of only `COUNT` / `SUM` / `AVG`, with no
 /// HAVING, post-binds, FILTER, ordering, or slicing. Whether the graph is
@@ -407,7 +412,7 @@ pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan>
     // projection check below still rejects any HAVING that lifts an aggregate not
     // present in the SELECT projection (that query stays on the generic path — the
     // conservative admission line). Post-aggregate BINDs are not foldable.
-    if !aggregation.binds.is_empty() {
+    if query.grouping.as_ref()?.binds().next().is_some() {
         return None;
     }
 
@@ -1749,8 +1754,13 @@ impl Operator for FusedR2rmlAggregateOperator {
         } else {
             None
         };
+        use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
         if self.resolved.is_none() {
             tracing::debug!("fused R2RML aggregate: gates failed, using fallback pipeline");
+            stamp_fast_path(
+                FUSED_R2RML_AGGREGATE_SITE,
+                FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
+            );
             self.use_fallback = true;
             self.fallback.open(ctx).await?;
         } else {
@@ -1758,6 +1768,7 @@ impl Operator for FusedR2rmlAggregateOperator {
                 aggs = self.aggregates.len(),
                 "fused R2RML aggregate: folding from column batches"
             );
+            stamp_fast_path(FUSED_R2RML_AGGREGATE_SITE, FastPathOutcome::Proceed);
         }
         self.state = OperatorState::Open;
         Ok(())
@@ -5641,7 +5652,8 @@ mod tests {
             output: QueryOutput::select_all(vec![out]),
             patterns,
             reasoning: ReasoningConfig::default(),
-            grouping: Grouping::assemble(group_by, vec![agg], vec![], None),
+            grouping: Grouping::assemble(group_by, vec![agg], vec![], None)
+                .expect("valid grouping"),
             ordering: Vec::new(),
             order_binds: Vec::new(),
             limit: None,
@@ -6837,7 +6849,7 @@ mod tests {
             output: QueryOutput::select_all(vec![g, c]),
             patterns: vec![graph_triple(s, o)],
             reasoning: ReasoningConfig::default(),
-            grouping: Grouping::assemble(vec![g], vec![agg], vec![], None),
+            grouping: Grouping::assemble(vec![g], vec![agg], vec![], None).expect("valid grouping"),
             ordering: Vec::new(),
             order_binds: Vec::new(),
             limit: None,
@@ -6868,7 +6880,8 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             // HAVING references the projected aggregate ?c (no synthetic extra) →
             // outs == projected → fused.
-            grouping: Grouping::assemble(vec![g], vec![agg], vec![], Some(Expression::Var(c))),
+            grouping: Grouping::assemble(vec![g], vec![agg], vec![], Some(Expression::Var(c)))
+                .expect("valid grouping"),
             ordering: Vec::new(),
             order_binds: Vec::new(),
             limit: None,
@@ -6907,7 +6920,8 @@ mod tests {
                 vec![agg, agg2],
                 vec![],
                 Some(Expression::Var(c2)),
-            ),
+            )
+            .expect("valid grouping"),
             ordering: Vec::new(),
             order_binds: Vec::new(),
             limit: None,
@@ -7305,7 +7319,8 @@ mod tests {
                 output: QueryOutput::select_all(vec![out]),
                 patterns: vec![graph_triple(s, o)],
                 reasoning: ReasoningConfig::default(),
-                grouping: Grouping::assemble(vec![], vec![agg], vec![], None),
+                grouping: Grouping::assemble(vec![], vec![agg], vec![], None)
+                    .expect("valid grouping"),
                 ordering: Vec::new(),
                 order_binds: Vec::new(),
                 limit: None,

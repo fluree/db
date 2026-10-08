@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use crate::ast::annotation::{AnnotationVerb, ReifierId};
-use crate::ast::query::{ConstructQuery, ConstructTemplate};
+use crate::ast::query::{ConstructQuery, ConstructTemplate, SelectClause, SelectVariables};
 use crate::ast::{GraphName, SubjectTerm, Term};
 
 use fluree_db_query::ir::triple::{Ref, TriplePattern};
@@ -16,13 +16,13 @@ use fluree_db_query::ir::{
 use fluree_db_query::parse::encode::IriEncoder;
 
 use super::select::BaseModifiers;
-use super::{LowerError, LoweringContext, Result};
+use super::{post_values_then, LowerError, LoweringContext, Result};
 
 impl<E: IriEncoder> LoweringContext<'_, E> {
     /// Lower a CONSTRUCT query to a Query.
     pub(super) fn lower_construct(&mut self, construct: &ConstructQuery) -> Result<Query> {
         // Lower WHERE clause patterns
-        let patterns = self.lower_graph_pattern(&construct.where_clause.pattern)?;
+        let mut patterns = self.lower_graph_pattern(&construct.where_clause.pattern)?;
 
         // Lower the template. For the "CONSTRUCT WHERE { ... }" shorthand the
         // WHERE clause's triples (and their edge annotations) are the template.
@@ -47,22 +47,53 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             })
             .collect();
 
-        // Lower solution modifiers (CONSTRUCT supports ORDER BY, LIMIT, OFFSET but not GROUP BY/HAVING)
+        // Solution modifiers. GROUP BY, HAVING and an aggregate ORDER BY group
+        // the level (§18.2.4.1): the template is then instantiated once per
+        // group that passes HAVING. The level lowers like a SELECT level that
+        // projects nothing.
+        let select = SelectClause {
+            modifier: None,
+            variables: SelectVariables::Explicit(Vec::new()),
+            span: construct.span,
+        };
+        let values = self.lower_trailing_values(construct.values.as_deref(), &mut patterns)?;
+        let level = self.lower_select_level(
+            &select,
+            &construct.modifiers,
+            &mut patterns,
+            values.as_ref(),
+        )?;
+        let post_values = post_values_then(values, level.binds, &mut patterns);
         let BaseModifiers {
             limit,
             offset,
             ordering,
             order_binds,
-            deferred_order_exprs,
-        } = self.lower_base_modifiers(&construct.modifiers)?;
+            // Lowered into `order_binds` with the level; always empty here.
+            deferred_order_exprs: _,
+        } = level.base;
 
-        // CONSTRUCT has no aggregation stage here, so an inline-aggregate ORDER BY
-        // (e.g. `ORDER BY DESC(COUNT(?x))`) cannot be hoisted/lowered.
-        if !deferred_order_exprs.is_empty() {
-            return Err(LowerError::unsupported_form(
-                "aggregate ORDER BY in CONSTRUCT",
-                construct.span,
-            ));
+        // A group solution binds the grouping's keys only (CONSTRUCT has no
+        // SELECT expressions, so no aggregate outputs or binds reach the
+        // template): any other template variable is unbound in it, and the
+        // template triples that read it are skipped (§16.2). Rename those to
+        // variables nothing binds; template blank nodes are minted per row.
+        if let Some(grouping) = &level.grouping {
+            let produced: std::collections::HashSet<_> = grouping
+                .group_by_vars()
+                .chain(grouping.aggregates().map(|spec| spec.output_var))
+                .chain(grouping.binds().map(|(var, _)| *var))
+                .collect();
+            let unbound: std::collections::HashSet<_> = construct_template
+                .var_iter()
+                .filter(|v| !produced.contains(v) && !construct_template.bnode_vars.contains(v))
+                .collect();
+            for var in unbound {
+                let fresh = self
+                    .vars
+                    .get_or_insert(&format!("?__construct_unbound_{}", self.vars.len()));
+                construct_template.substitute_var(var, fresh);
+            }
         }
 
         let ctx = self.build_jsonld_context()?;
@@ -74,12 +105,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             output: QueryOutput::Construct(construct_template),
             patterns,
             reasoning: self.reasoning_config()?,
-            grouping: None,
+            grouping: level.grouping,
             ordering,
             order_binds,
             limit,
             offset,
-            post_values: None,
+            post_values,
             include_system_facts: false,
             union_default_graph: None,
             cypher_vocab: None,

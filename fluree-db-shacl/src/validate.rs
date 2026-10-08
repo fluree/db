@@ -99,6 +99,28 @@ struct ClassMembershipCtx<'a> {
     /// only installed when a cancellation is present, so without one a
     /// constraint body runs unbounded. `None` outside a request scope.
     cancellation: Option<&'a fluree_db_core::QueryCancellation>,
+    /// Where an `sh:sparql` constraint that cannot run is recorded instead
+    /// of raised. See [`ShaclEngine::with_constraint_failures`].
+    failures: Option<&'a crate::sparql::ConstraintFailures>,
+    /// While a nested shape is checked for conformance (`sh:node`, `sh:not`,
+    /// `sh:and`, `sh:or`, `sh:xone`, `sh:qualifiedValueShape`), the severity of
+    /// the outermost shape that reports the result: an `sh:sparql` constraint
+    /// inside that cannot run is recorded with it, as the nested shape's own
+    /// results surface only through that shape's. `None` outside nesting. Set
+    /// by [`ClassMembershipCtx::reported_under`].
+    failure_severity: Option<Severity>,
+}
+
+impl ClassMembershipCtx<'_> {
+    /// This context for checking a nested shape whose result `severity`
+    /// reports. The outermost reporting shape wins: a severity already set by
+    /// an enclosing nesting stays.
+    fn reported_under(self, severity: Severity) -> Self {
+        Self {
+            failure_severity: self.failure_severity.or(Some(severity)),
+            ..self
+        }
+    }
 }
 
 /// SHACL validation engine
@@ -124,6 +146,8 @@ pub struct ShaclEngine {
     /// Cooperative cancellation handed to `sh:sparql` constraint queries.
     /// See [`ShaclEngine::with_cancellation`].
     cancellation: Option<fluree_db_core::QueryCancellation>,
+    /// See [`ShaclEngine::with_constraint_failures`].
+    constraint_failures: Option<Arc<crate::sparql::ConstraintFailures>>,
 }
 
 impl ShaclEngine {
@@ -137,6 +161,7 @@ impl ShaclEngine {
             membership_g_ids: Vec::new(),
             class_cache: Mutex::new(HashMap::new()),
             cancellation: None,
+            constraint_failures: None,
         }
     }
 
@@ -151,6 +176,7 @@ impl ShaclEngine {
             membership_g_ids: Vec::new(),
             class_cache: Mutex::new(HashMap::new()),
             cancellation: None,
+            constraint_failures: None,
         }
     }
 
@@ -165,6 +191,7 @@ impl ShaclEngine {
             membership_g_ids: Vec::new(),
             class_cache: Mutex::new(HashMap::new()),
             cancellation: None,
+            constraint_failures: None,
         }
     }
 
@@ -235,6 +262,7 @@ impl ShaclEngine {
             membership_g_ids: Vec::new(),
             class_cache: Mutex::new(HashMap::new()),
             cancellation: None,
+            constraint_failures: None,
         })
     }
 
@@ -264,6 +292,21 @@ impl ShaclEngine {
     #[must_use]
     pub fn with_cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
         self.cancellation = Some(cancellation);
+        self
+    }
+
+    /// Record an `sh:sparql` constraint that cannot run (its query does not
+    /// parse, lower or plan) in `failures`, with its shape's severity (or,
+    /// when the shape is checked as a nested shape, the outermost reporting
+    /// shape's), instead of raising it; validation continues with the shape's other
+    /// constraints. For a caller that applies severity and validation mode to
+    /// such a failure (the transaction path). Without it the failure is
+    /// raised as `ShaclError::SparqlConstraint`.
+    pub fn with_constraint_failures(
+        mut self,
+        failures: Arc<crate::sparql::ConstraintFailures>,
+    ) -> Self {
+        self.constraint_failures = Some(failures);
         self
     }
 
@@ -378,6 +421,8 @@ impl ShaclEngine {
             hierarchy: self.hierarchy.as_ref(),
             iri_encoder,
             cancellation: self.cancellation.as_ref(),
+            failures: self.constraint_failures.as_deref(),
+            failure_severity: None,
         };
         let active = ActiveShapeChecks::default();
         for shape in applicable_shapes {
@@ -449,6 +494,8 @@ impl ShaclEngine {
             hierarchy: self.hierarchy.as_ref(),
             iri_encoder,
             cancellation: self.cancellation.as_ref(),
+            failures: self.constraint_failures.as_deref(),
+            failure_severity: None,
         };
         // Class-target focus nodes are constant across the shape loop (same
         // `db`, same hierarchy), so memoize them per class: several shapes
@@ -804,10 +851,12 @@ fn validate_shape<'a>(
             results.extend(node_results);
         }
 
-        // Validate structural constraints (closed, logical)
+        // Validate structural constraints (closed, logical). The nested shapes
+        // they check report through this shape's results.
+        let nested_ctx = class_ctx.map(|c| c.reported_under(shape.severity));
         for constraint in &shape.structural_constraints {
             let constraint_results = validate_structural_constraint(
-                db, focus_node, constraint, shape, all_shapes, class_ctx, active,
+                db, focus_node, constraint, shape, all_shapes, nested_ctx, active,
             )
             .await?;
             results.extend(constraint_results);
@@ -826,6 +875,8 @@ fn validate_shape<'a>(
                 crate::sparql::SparqlConstraintCtx {
                     iri_encoder: class_ctx.and_then(|c| c.iri_encoder),
                     cancellation: class_ctx.and_then(|c| c.cancellation),
+                    failures: class_ctx.and_then(|c| c.failures),
+                    failure_severity: class_ctx.and_then(|c| c.failure_severity),
                 },
             )
             .await?;
@@ -887,7 +938,9 @@ async fn validate_literal_focus<'a>(
         }
     }
 
-    // Structural constraints: test the literal against the nested shapes.
+    // Structural constraints: test the literal against the nested shapes,
+    // which report through this shape's results.
+    let nested_ctx = class_ctx.map(|c| c.reported_under(shape.severity));
     for constraint in &shape.structural_constraints {
         let conforms_to = |nested: &'a std::sync::Arc<crate::constraints::NestedShape>| {
             check_value_against_nested_shape(
@@ -898,7 +951,7 @@ async fn validate_literal_focus<'a>(
                 nested,
                 shape,
                 all_shapes,
-                class_ctx,
+                nested_ctx,
                 active,
             )
         };
@@ -1132,8 +1185,6 @@ fn validate_structural_constraint<'a>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ValidationResult>>> + Send + 'a>>
 {
     Box::pin(async move {
-        use crate::compile::Severity;
-
         let mut results = Vec::new();
 
         match constraint {
@@ -1201,10 +1252,7 @@ fn validate_structural_constraint<'a>(
                     active,
                 )
                 .await?;
-                let has_violations = nested_results
-                    .iter()
-                    .any(|r| r.severity == Severity::Violation);
-                if has_violations {
+                if !conforms(&nested_results) {
                     results.push(ValidationResult {
                         focus_node: FocusNode::Node(focus_node.clone()),
                         result_path: None,
@@ -1238,13 +1286,11 @@ fn validate_structural_constraint<'a>(
                     active,
                 )
                 .await?;
-                // If the nested shape has NO violations, that's a violation of sh:not.
-                // An "unresolved shape" violation from validate_nested_shape counts as
-                // a violation (the shape didn't match), so sh:not is satisfied.
-                let has_violations = nested_results
-                    .iter()
-                    .any(|r| r.severity == Severity::Violation);
-                if !has_violations {
+                // If the focus node conforms to the nested shape, that's a
+                // violation of sh:not. An "unresolved shape" result from
+                // validate_nested_shape counts against conformance (the shape
+                // didn't match), so sh:not is satisfied.
+                if conforms(&nested_results) {
                     results.push(ValidationResult {
                         focus_node: FocusNode::Node(focus_node.clone()),
                         result_path: None,
@@ -1267,7 +1313,7 @@ fn validate_structural_constraint<'a>(
             }
 
             NodeConstraint::And(nested_shapes) => {
-                // sh:and - ALL nested shapes must match (no violations).
+                // sh:and - the focus node must conform to ALL nested shapes.
                 // Per spec, a failed conjunction produces ONE result per value
                 // node (= the focus node) with sh:value = focus; the nested
                 // violations' messages are aggregated for diagnostics.
@@ -1283,10 +1329,8 @@ fn validate_structural_constraint<'a>(
                         active,
                     )
                     .await?;
-                    for r in nested_results {
-                        if r.severity == Severity::Violation {
-                            failure_messages.push(r.message);
-                        }
+                    if !conforms(&nested_results) {
+                        failure_messages.extend(nested_results.into_iter().map(|r| r.message));
                     }
                 }
                 if !failure_messages.is_empty() {
@@ -1309,7 +1353,7 @@ fn validate_structural_constraint<'a>(
             }
 
             NodeConstraint::Or(nested_shapes) => {
-                // sh:or - at least ONE nested shape must match (have no violations)
+                // sh:or - the focus node must conform to at least ONE nested shape
                 let mut any_conforms = false;
                 let mut all_messages = Vec::new();
 
@@ -1324,18 +1368,13 @@ fn validate_structural_constraint<'a>(
                         active,
                     )
                     .await?;
-                    let has_violations = nested_results
-                        .iter()
-                        .any(|r| r.severity == Severity::Violation);
-                    if !has_violations {
+                    if conforms(&nested_results) {
                         any_conforms = true;
                         break;
                     }
                     // Collect messages for reporting if none match
                     for r in nested_results {
-                        if r.severity == Severity::Violation {
-                            all_messages.push(format!("{}: {}", nested.id.name, r.message));
-                        }
+                        all_messages.push(format!("{}: {}", nested.id.name, r.message));
                     }
                 }
 
@@ -1377,10 +1416,7 @@ fn validate_structural_constraint<'a>(
                         active,
                     )
                     .await?;
-                    let has_violations = nested_results
-                        .iter()
-                        .any(|r| r.severity == Severity::Violation);
-                    if !has_violations {
+                    if conforms(&nested_results) {
                         conforming_count += 1;
                         conforming_shapes.push(nested.id.name.clone());
                     }
@@ -1791,6 +1827,10 @@ async fn validate_property_shape<'a>(
     active: &'a ActiveShapeChecks,
 ) -> Result<Vec<ValidationResult>> {
     let mut results = Vec::new();
+    // The nested shapes this property shape checks (`sh:node`, the logical
+    // constraints, `sh:qualifiedValueShape`) report through its results; its
+    // own `sh:sparql` constraints are unaffected unless it is itself nested.
+    let class_ctx = class_ctx.map(|c| c.reported_under(prop_shape.severity));
 
     // A path that never compiled surfaces here (only for focus nodes this shape
     // actually targets) rather than as a ledger-wide compile failure.
@@ -1828,6 +1868,8 @@ async fn validate_property_shape<'a>(
                 crate::sparql::SparqlConstraintCtx {
                     iri_encoder: class_ctx.and_then(|c| c.iri_encoder),
                     cancellation: class_ctx.and_then(|c| c.cancellation),
+                    failures: class_ctx.and_then(|c| c.failures),
+                    failure_severity: class_ctx.and_then(|c| c.failure_severity),
                 },
             )
             .await?,
@@ -2454,15 +2496,24 @@ async fn check_value_against_nested_shape<'a>(
         let nested_results =
             validate_nested_shape(db, sid, nested, parent_shape, all_shapes, class_ctx, active)
                 .await?;
-        let has_violations = nested_results
-            .iter()
-            .any(|r| r.severity == Severity::Violation);
-        return Ok(!has_violations);
+        return Ok(conforms(&nested_results));
     }
 
     // Literal value with no value_constraints — can't evaluate meaningfully.
     // Treat as non-conforming (the nested shape presumably expects something specific).
     Ok(false)
+}
+
+/// Whether a node conforms to a nested shape (`sh:node`, `sh:not`, `sh:and`,
+/// `sh:or`, `sh:xone`, `sh:qualifiedValueShape`), given the results of
+/// validating it against that shape. Every result counts, whatever its
+/// severity: SHACL §3.5 says a node conforms to a shape when validating it
+/// there reports no result, and §2.1.4 has severity only categorize results.
+/// The severity that decides a write is the outermost reporting shape's, on
+/// the result it reports. A constraint that cannot run is not a result. It is
+/// decided at that same outermost severity (`ClassMembershipCtx::failure_severity`).
+fn conforms(nested_results: &[ValidationResult]) -> bool {
+    nested_results.is_empty()
 }
 
 /// Replace IRI refs with their full-IRI string form for the string facets

@@ -42,13 +42,68 @@ use crate::error::{Result, ShaclError};
 use crate::validate::{FocusNode, ValidationResult};
 use fluree_db_core::{FlakeValue, GraphDbRef, Sid};
 use fluree_db_query::{
-    execute, Binding, ContextConfig, ExecutableQuery, ExecutionContext, Pattern, VarId, VarRegistry,
+    execute, Binding, ContextConfig, ExecutableQuery, ExecutionContext, Pattern, QueryError, VarId,
+    VarRegistry,
 };
 use fluree_db_sparql::ast::pattern::{GraphPattern, SubSelect};
-use fluree_db_sparql::ast::query::{GroupCondition, SelectVariable, SelectVariables};
+use fluree_db_sparql::ast::query::{
+    GroupCondition, SelectVariable, SelectVariables, SolutionModifiers,
+};
 use fluree_db_sparql::{parse_sparql, QueryBody, SparqlAst};
 use fluree_vocab::shacl as sh_vocab;
 use std::sync::Arc;
+
+/// A `sh:sparql` constraint that could not run: its query does not parse,
+/// lower or plan, or it uses `$PATH` where nothing can bind it.
+///
+/// Raised as [`ShaclError::SparqlConstraint`] unless the validation pass
+/// collects failures ([`ConstraintFailures`]), in which case it is recorded
+/// with the severity of the shape that owns the constraint (of the outermost
+/// reporting shape, when that shape is checked as a nested shape) and the
+/// graph being validated, and the pass goes on to the shape's other
+/// constraints.
+/// The transaction path then decides by severity and the graph's validation
+/// mode: a Violation in a reject-mode graph fails the transaction with the
+/// same error; anything else is logged.
+#[derive(Debug, Clone)]
+pub struct ConstraintFailure {
+    /// The constraint's IRI.
+    pub constraint: String,
+    /// Why it could not run.
+    pub message: String,
+    /// The severity of the shape that owns the constraint, or, when that
+    /// shape is checked as a nested shape, of the outermost shape that reports
+    /// its result.
+    pub severity: Severity,
+    /// The graph being validated.
+    pub graph_id: fluree_db_core::GraphId,
+}
+
+impl ConstraintFailure {
+    /// The error the failure raises when nothing collects it.
+    pub fn into_error(self) -> ShaclError {
+        ShaclError::SparqlConstraint {
+            constraint: self.constraint,
+            message: self.message,
+        }
+    }
+}
+
+/// Collects the [`ConstraintFailure`]s of one validation pass (see
+/// `ShaclEngine::with_constraint_failures`).
+#[derive(Debug, Default)]
+pub struct ConstraintFailures(parking_lot::Mutex<Vec<ConstraintFailure>>);
+
+impl ConstraintFailures {
+    fn record(&self, failure: ConstraintFailure) {
+        self.0.lock().push(failure);
+    }
+
+    /// The failures recorded so far, in the order they occurred.
+    pub fn take(&self) -> Vec<ConstraintFailure> {
+        std::mem::take(&mut *self.0.lock())
+    }
+}
 
 /// A compiled `sh:sparql` constraint, attached to a node or property shape.
 #[derive(Debug, Clone)]
@@ -142,7 +197,7 @@ fn analyze_select(text: &str) -> std::result::Result<Arc<SparqlAst>, String> {
             .join("; ");
         return Err(format!("invalid sh:select query: {msg}"));
     }
-    let ast = out
+    let mut ast = out
         .ast
         .ok_or_else(|| "invalid sh:select query".to_string())?;
 
@@ -165,7 +220,60 @@ fn analyze_select(text: &str) -> std::result::Result<Arc<SparqlAst>, String> {
         }
     }
     check_pattern(&select.where_clause.pattern)?;
+    if let QueryBody::Select(select) = &mut ast.body {
+        group_by_pre_bound(&select.select.variables, &mut select.modifiers);
+        group_by_pre_bound_in(&mut select.where_clause.pattern);
+    }
     Ok(Arc::new(ast))
+}
+
+/// The pre-bound variables a query can project (`$shapesGraph` and
+/// `$currentShape` are rejected above).
+const PRE_BOUND: [&str; 2] = ["this", "PATH"];
+
+/// A pre-bound variable is constant within one evaluation, so grouping by it
+/// changes no group. Add each one a level projects to that level's GROUP BY
+/// when it is missing: otherwise the level projects a variable its grouping
+/// does not produce, which the planner rejects, and every sub-SELECT here
+/// projects `$this`. A level without GROUP BY needs nothing: with an aggregate
+/// it already groups by the variables it projects beside the aggregates.
+fn group_by_pre_bound(variables: &SelectVariables, modifiers: &mut SolutionModifiers) {
+    let (SelectVariables::Explicit(items), Some(group_by)) = (variables, &mut modifiers.group_by)
+    else {
+        return;
+    };
+    for item in items {
+        let SelectVariable::Var(var) = item else {
+            continue;
+        };
+        let keyed = group_by
+            .conditions
+            .iter()
+            .any(|c| matches!(c, GroupCondition::Var(key) if key.name == var.name));
+        if PRE_BOUND.contains(&var.name.as_ref()) && !keyed {
+            group_by.conditions.push(GroupCondition::Var(var.clone()));
+        }
+    }
+}
+
+/// [`group_by_pre_bound`] for every sub-SELECT the restriction walk visits.
+fn group_by_pre_bound_in(pattern: &mut GraphPattern) {
+    match pattern {
+        GraphPattern::Group { patterns, .. } => patterns.iter_mut().for_each(group_by_pre_bound_in),
+        GraphPattern::Optional { pattern, .. } | GraphPattern::Graph { pattern, .. } => {
+            group_by_pre_bound_in(pattern);
+        }
+        GraphPattern::Union { left, right, .. } => {
+            group_by_pre_bound_in(left);
+            group_by_pre_bound_in(right);
+        }
+        GraphPattern::SubSelect { query, .. } => {
+            let query = &mut **query;
+            group_by_pre_bound(&query.variables, &mut query.modifiers);
+            group_by_pre_bound_in(&mut query.pattern);
+        }
+        _ => {}
+    }
 }
 
 /// Reject assignment to `$this` in a SELECT clause (`... AS $this`).
@@ -268,9 +376,17 @@ fn inject_bindings(patterns: &mut Vec<Pattern>, bound: &[(VarId, Sid)]) {
                 inject_bindings(&mut sq.patterns, bound);
                 // The restriction walk guarantees the sub-SELECT projects
                 // $this explicitly; $PATH may not be projected, so extend
-                // the projection to keep the injected binding joinable.
+                // the projection to keep the injected binding joinable. Not
+                // past a grouping that does not produce it: a grouped level
+                // cannot project a variable it does not group by (its value
+                // is the same constant on both sides of the join anyway).
                 for (var, _) in bound {
-                    if !sq.select.contains(var) {
+                    let grouped_out = sq.grouping.as_ref().is_some_and(|g| {
+                        !g.group_by_vars().any(|key| key == *var)
+                            && !g.aggregates().any(|spec| spec.output_var == *var)
+                            && !g.binds().any(|(out, _)| out == var)
+                    });
+                    if !sq.select.contains(var) && !grouped_out {
                         sq.select.push(*var);
                     }
                 }
@@ -418,9 +534,111 @@ pub(crate) struct SparqlConstraintCtx<'a> {
     /// Request deadline and per-query memory ceiling. `None` leaves the
     /// constraint body unbounded — see [`crate::ShaclEngine::with_cancellation`].
     pub cancellation: Option<&'a fluree_db_core::QueryCancellation>,
+    /// Where a constraint that cannot run is recorded instead of raised
+    /// ([`ConstraintFailure`]). `None` raises it.
+    pub failures: Option<&'a ConstraintFailures>,
+    /// The severity a recorded failure takes in place of the owning shape's,
+    /// when the shape is checked as a nested shape: the outermost reporting
+    /// shape's. Results keep the owning shape's severity, which the nested
+    /// conformance check reads.
+    pub failure_severity: Option<Severity>,
 }
 
+/// Whether an error of a constraint's query ends the validation whatever the
+/// constraint's severity: the request's budgets (fuel, deadline, memory), its
+/// access to storage, catalogs and policy, the state of the data, and internal
+/// faults. The others are the constraint's own query failing to run, which the
+/// shape's severity and the graph's mode decide ([`ConstraintFailure`]). The
+/// match names every variant, so a new error must be placed here.
+fn raised_whatever_the_severity(e: &QueryError) -> bool {
+    match e {
+        QueryError::FuelLimitExceeded(_)
+        | QueryError::Cancelled { .. }
+        | QueryError::MemoryBudgetExceeded { .. }
+        | QueryError::ResourceLimit(_)
+        | QueryError::NeedFetch(_)
+        | QueryError::StorageAccessDenied { .. }
+        | QueryError::CatalogCredentialsNotVended { .. }
+        | QueryError::CatalogAccessDenied { .. }
+        | QueryError::Policy(_)
+        | QueryError::TimeRangeNotCovered { .. }
+        | QueryError::SnapshotNotFound { .. }
+        | QueryError::NoSnapshotAtTime { .. }
+        | QueryError::R2rml(_)
+        | QueryError::Core(_)
+        | QueryError::Batch(_)
+        | QueryError::Internal(_)
+        | QueryError::DictionaryLookup(_)
+        | QueryError::OperatorNotOpened
+        | QueryError::OperatorAlreadyOpened
+        | QueryError::OperatorClosed => true,
+        QueryError::InvalidQuery(_)
+        | QueryError::VariableNotFound(_)
+        | QueryError::InvalidFilter(_)
+        | QueryError::InvalidExpression(_)
+        | QueryError::UnsupportedFeature(_)
+        | QueryError::R2rmlUnsupportedPattern { .. }
+        | QueryError::Arithmetic(_)
+        | QueryError::Comparison(_) => false,
+        // The caller names the variables first (`QueryError::name_variables`),
+        // which turns an `UngroupedRead` into the `InvalidQuery` above; an
+        // unnamed one gets the same answer.
+        QueryError::UngroupedRead(_) => false,
+        // Constructed nowhere today. Both would describe the constraint's own
+        // query (no index serves its pattern; a mode it asks for), not the
+        // request.
+        QueryError::NoSuitableIndex | QueryError::UnsupportedMode(_) => false,
+    }
+}
+
+/// Run one `sh:sparql` constraint for `focus`: each solution is a result.
+///
+/// A constraint that cannot run (its query does not parse, lower or plan, or
+/// fails for a reason of its own) is raised as [`ShaclError::SparqlConstraint`],
+/// or recorded in `exec.failures` with the shape's `severity` when the pass
+/// collects failures (no results, and the pass continues). The request's
+/// budgets, storage access and internal faults are always raised
+/// ([`raised_whatever_the_severity`]).
 pub(crate) async fn validate_sparql_constraint(
+    db: GraphDbRef<'_>,
+    focus: &Sid,
+    constraint: &SparqlConstraint,
+    fallback_path: Option<&Sid>,
+    severity: Severity,
+    source_shape: &Sid,
+    exec: SparqlConstraintCtx<'_>,
+) -> Result<Vec<ValidationResult>> {
+    let outcome = run_sparql_constraint(
+        db,
+        focus,
+        constraint,
+        fallback_path,
+        severity,
+        source_shape,
+        exec,
+    )
+    .await;
+    match (outcome, exec.failures) {
+        (
+            Err(ShaclError::SparqlConstraint {
+                constraint,
+                message,
+            }),
+            Some(failures),
+        ) => {
+            failures.record(ConstraintFailure {
+                constraint,
+                message,
+                severity: exec.failure_severity.unwrap_or(severity),
+                graph_id: db.g_id,
+            });
+            Ok(Vec::new())
+        }
+        (outcome, _) => outcome,
+    }
+}
+
+async fn run_sparql_constraint(
     db: GraphDbRef<'_>,
     focus: &Sid,
     constraint: &SparqlConstraint,
@@ -433,13 +651,21 @@ pub(crate) async fn validate_sparql_constraint(
         return Ok(Vec::new());
     }
 
+    let iri = |sid: &Sid| {
+        db.snapshot
+            .decode_sid(sid)
+            .unwrap_or_else(|| sid.to_string())
+    };
+    // Every failure names the constraint and the shape that owns it.
+    let constraint_failure = |message: String| ShaclError::SparqlConstraint {
+        constraint: iri(&constraint.source),
+        message: format!("on shape {}: {message}", iri(source_shape)),
+    };
+
     let ast = constraint
         .parsed
         .as_ref()
-        .map_err(|e| ShaclError::SparqlConstraint {
-            constraint: constraint.source.clone(),
-            message: e.clone(),
-        })?;
+        .map_err(|e| constraint_failure(e.clone()))?;
 
     // Lower against the staged registry when one is provided, else the data
     // snapshot — a fresh `VarRegistry` per call keeps compiled shapes
@@ -450,10 +676,8 @@ pub(crate) async fn validate_sparql_constraint(
         Some(encoder) => fluree_db_sparql::lower_sparql(ast, &encoder, &mut vars),
         None => fluree_db_sparql::lower_sparql(ast, db.snapshot, &mut vars),
     };
-    let mut query = lowered.map_err(|e| ShaclError::SparqlConstraint {
-        constraint: constraint.source.clone(),
-        message: format!("failed to lower sh:select query: {e}"),
-    })?;
+    let mut query =
+        lowered.map_err(|e| constraint_failure(format!("failed to lower sh:select query: {e}")))?;
 
     // Lowered variables register under their `?`-prefixed surface name.
     let this_var = vars.get_or_insert("?this");
@@ -477,12 +701,11 @@ pub(crate) async fn validate_sparql_constraint(
         // $PATH is only meaningful on a property shape with a plain
         // predicate path; bind it exactly like $this.
         let Some(path) = fallback_path else {
-            return Err(ShaclError::SparqlConstraint {
-                constraint: constraint.source.clone(),
-                message: "$PATH is only supported in sh:sparql constraints on property shapes \
-                          with a plain predicate path"
+            return Err(constraint_failure(
+                "$PATH is only supported in sh:sparql constraints on property shapes with a \
+                 plain predicate path"
                     .to_string(),
-            });
+            ));
         };
         bound.push((vars.get_or_insert("?PATH"), path.clone()));
     }
@@ -504,7 +727,21 @@ pub(crate) async fn validate_sparql_constraint(
             ..Default::default()
         },
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        let e = e.name_variables(&vars);
+        if raised_whatever_the_severity(&e) {
+            ShaclError::QueryError(e)
+        } else {
+            // A query that cannot run (the planner rejects it, or it reads a
+            // variable nothing binds) is a broken constraint: a validation
+            // failure naming the shape, like a query that does not parse.
+            constraint_failure(match e {
+                QueryError::InvalidQuery(message) => message,
+                other => other.to_string(),
+            })
+        }
+    })?;
 
     // Decode context for late-materialized (encoded) bindings.
     let ctx = ExecutionContext::from_graph_db_ref(db, &vars);
@@ -578,4 +815,156 @@ pub(crate) async fn validate_sparql_constraint(
         }
     }
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::raised_whatever_the_severity;
+    use fluree_db_core::storage::residency::{FetchKind, NeedFetch};
+    use fluree_db_core::{ContentId, ContentKind, QueryCancellationReason};
+    use fluree_db_query::binding::BatchError;
+    use fluree_db_query::eval::{ArithmeticError, ComparisonError};
+    use fluree_db_query::QueryError;
+
+    /// The classification table: for each `QueryError` variant, its pattern,
+    /// the class it must get, and its representatives. The same patterns also
+    /// form a `match` over a `&QueryError` with no wildcard, so a new variant
+    /// fails to compile here until it has an entry, and with it a class and a
+    /// representative; each representative must match its own pattern.
+    macro_rules! classification {
+        ($($pat:pat => $raised:expr, [$($rep:expr),+ $(,)?];)+) => {{
+            fn entry(e: &QueryError) -> &'static str {
+                match e {
+                    $($pat => stringify!($pat),)+
+                }
+            }
+            let mut rows: Vec<(&'static str, QueryError, bool)> = Vec::new();
+            $($(
+                let rep: QueryError = $rep;
+                assert!(
+                    matches!(&rep, $pat),
+                    "{rep:?} is not a {}",
+                    stringify!($pat)
+                );
+                rows.push((entry(&rep), rep, $raised));
+            )+)+
+            rows
+        }};
+    }
+
+    /// `true`: the request's budgets (fuel, deadline, memory, cancellation),
+    /// its access to storage, catalogs, graph sources and policy, the state of
+    /// the data and internal faults fail the write whatever the shape's
+    /// severity and the graph's mode. `false`: the constraint's own query
+    /// cannot run, and severity and mode decide.
+    #[test]
+    fn constraint_query_errors_are_classified_by_variant() {
+        let s = String::new;
+        let rows = classification! {
+            QueryError::FuelLimitExceeded(_) => true, [
+                QueryError::FuelLimitExceeded(fluree_db_core::FuelExceededError {
+                    used_micro_fuel: 2,
+                    limit_micro_fuel: 1,
+                }),
+            ];
+            QueryError::Cancelled { .. } => true, [
+                QueryError::Cancelled { reason: QueryCancellationReason::Timeout },
+                QueryError::Cancelled { reason: QueryCancellationReason::ClientDisconnected },
+            ];
+            QueryError::MemoryBudgetExceeded { .. } => true, [
+                QueryError::MemoryBudgetExceeded { used_bytes: 2, budget_bytes: 1 },
+            ];
+            QueryError::ResourceLimit(_) => true, [QueryError::ResourceLimit(s())];
+            QueryError::NeedFetch(_) => true, [
+                QueryError::NeedFetch(NeedFetch::new(
+                    ContentId::new(ContentKind::Commit, b"leaf"),
+                    FetchKind::IndexLeaf,
+                )),
+            ];
+            QueryError::StorageAccessDenied { .. } => true, [
+                QueryError::StorageAccessDenied {
+                    bucket: s(),
+                    key: s(),
+                    region: None,
+                    message: s(),
+                },
+            ];
+            QueryError::CatalogCredentialsNotVended { .. } => true, [
+                QueryError::CatalogCredentialsNotVended { catalog_uri: s() },
+            ];
+            QueryError::CatalogAccessDenied { .. } => true, [
+                QueryError::CatalogAccessDenied { table: s(), message: s() },
+            ];
+            QueryError::Policy(_) => true, [QueryError::Policy(s())];
+            QueryError::TimeRangeNotCovered { .. } => true, [
+                QueryError::TimeRangeNotCovered { requested_t: 1, base_t: 2 },
+            ];
+            QueryError::SnapshotNotFound { .. } => true, [
+                QueryError::SnapshotNotFound { table: s(), snapshot_id: 1 },
+            ];
+            QueryError::NoSnapshotAtTime { .. } => true, [
+                QueryError::NoSnapshotAtTime { table: s(), requested: s(), oldest: None },
+            ];
+            QueryError::R2rml(_) => true, [
+                QueryError::R2rml(fluree_db_r2rml::R2rmlError::Parse(s())),
+            ];
+            QueryError::Core(_) => true, [
+                QueryError::Core(fluree_db_core::Error::Storage(s())),
+            ];
+            QueryError::Batch(_) => true, [
+                QueryError::Batch(BatchError::ColumnLengthMismatch {
+                    expected: 1,
+                    got: 2,
+                    column: 0,
+                }),
+            ];
+            QueryError::Internal(_) => true, [QueryError::Internal(s())];
+            QueryError::DictionaryLookup(_) => true, [QueryError::DictionaryLookup(s())];
+            QueryError::OperatorNotOpened => true, [QueryError::OperatorNotOpened];
+            QueryError::OperatorAlreadyOpened => true, [QueryError::OperatorAlreadyOpened];
+            QueryError::OperatorClosed => true, [QueryError::OperatorClosed];
+            QueryError::InvalidQuery(_) => false, [QueryError::InvalidQuery(s())];
+            QueryError::UngroupedRead(_) => false, [
+                QueryError::UngroupedRead(fluree_db_query::ir::UngroupedRead {
+                    var: fluree_db_query::VarId(0),
+                    stage: fluree_db_query::ir::ReadStage::UnboundAggregateInput,
+                }),
+            ];
+            QueryError::VariableNotFound(_) => false, [QueryError::VariableNotFound(s())];
+            QueryError::NoSuitableIndex => false, [QueryError::NoSuitableIndex];
+            QueryError::InvalidFilter(_) => false, [QueryError::InvalidFilter(s())];
+            QueryError::InvalidExpression(_) => false, [QueryError::InvalidExpression(s())];
+            QueryError::UnsupportedMode(_) => false, [QueryError::UnsupportedMode(s())];
+            QueryError::UnsupportedFeature(_) => false, [QueryError::UnsupportedFeature(s())];
+            QueryError::R2rmlUnsupportedPattern { .. } => false, [
+                QueryError::R2rmlUnsupportedPattern { detail: s() },
+            ];
+            QueryError::Arithmetic(_) => false, [
+                QueryError::Arithmetic(ArithmeticError::DivideByZero),
+            ];
+            QueryError::Comparison(_) => false, [
+                QueryError::Comparison(ComparisonError::TypeMismatch {
+                    operator: "<",
+                    left_type: "a",
+                    right_type: "b",
+                }),
+            ];
+        };
+
+        let wrong: Vec<String> = rows
+            .iter()
+            .filter(|(_, error, raised)| raised_whatever_the_severity(error) != *raised)
+            .map(|(entry, _, raised)| {
+                format!(
+                    "{entry} must be {}",
+                    if *raised {
+                        "raised whatever the severity"
+                    } else {
+                        "the constraint's own failure"
+                    }
+                )
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
 }
