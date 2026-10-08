@@ -10,6 +10,7 @@ use crate::error::{fluree_error, invalid_request};
 use fluree_db_api::{CommitRef, ResolvedFlake, ResolvedValue, TimeSpec};
 use fluree_db_core::{CommitSummary, ContentId};
 use fluree_db_sparql::ast::{QueryBody, SelectVariables};
+use fluree_graph_ir::{Datatype, Term};
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
@@ -243,6 +244,84 @@ fn triple_node(obj: &Bound<'_, PyAny>) -> PyResult<serde_json::Map<String, JsonV
     node.insert("@id".to_owned(), JsonValue::String(id));
     node.insert(predicate, object);
     Ok(node)
+}
+
+/// A Python RDF value as a graph term: what [`to_jsonld`] stores for it,
+/// as a term an RDF writer can write. A `Triple` becomes a triple term.
+pub(crate) fn ir_term(obj: &Bound<'_, PyAny>) -> PyResult<Term> {
+    let py = obj.py();
+    if obj.is_instance(term_class(py, &TRIPLE_CLASS, "Triple")?)? {
+        return Ok(Term::triple(
+            ir_term(&obj.getattr("subject")?)?,
+            ir_term(&obj.getattr("predicate")?)?,
+            ir_term(&obj.getattr("object")?)?,
+        ));
+    }
+    if let Ok(b) = obj.cast::<PyBool>() {
+        return Ok(Term::boolean(b.is_true()));
+    }
+    if obj.is_instance_of::<PyInt>() {
+        return Ok(match obj.extract::<i64>() {
+            Ok(i) => Term::integer(i),
+            Err(_) => Term::typed(obj.str()?.to_str()?, Datatype::xsd_integer()),
+        });
+    }
+    if obj.is_instance_of::<PyFloat>() {
+        let value: f64 = obj.extract()?;
+        // Python's repr is the shortest spelling that reads back as this
+        // float, which is usually how the source wrote it: `0.9957` rather
+        // than the canonical `9.957E-1`.
+        let lexical = if value.is_nan() {
+            "NaN".to_string()
+        } else if value.is_infinite() {
+            if value > 0.0 { "INF" } else { "-INF" }.to_string()
+        } else {
+            obj.repr()?.to_string()
+        };
+        return Ok(Term::typed(lexical, Datatype::xsd_double()));
+    }
+    if let Ok(text) = obj.cast::<PyString>() {
+        let text = text.to_str()?;
+        if obj.is_instance(term_class(py, &IRI_CLASS, "IRI")?)? {
+            return Ok(Term::iri(text));
+        }
+        if obj.is_instance(term_class(py, &BLANK_NODE_CLASS, "BlankNode")?)? {
+            return Ok(Term::blank(text));
+        }
+        if obj.is_instance(term_class(py, &LANG_STRING_CLASS, "LangString")?)? {
+            let language: String = obj.getattr("language")?.extract()?;
+            return Ok(Term::lang_string(text, language));
+        }
+        return Ok(Term::string(text));
+    }
+    // Everything else as its JSON-LD value: a typed `@value`, or an `@id`
+    // for a Cypher node.
+    let json = match convert(obj, Values::Rdf)? {
+        JsonValue::Object(map) => map,
+        other => return Err(PyTypeError::new_err(format!("{other} is not an RDF term"))),
+    };
+    if let Some(id) = json.get("@id").and_then(JsonValue::as_str) {
+        return Ok(match id.strip_prefix("_:") {
+            Some(label) => Term::blank(label),
+            None => Term::iri(id),
+        });
+    }
+    match (
+        json.get("@value"),
+        json.get("@type").and_then(JsonValue::as_str),
+    ) {
+        (Some(value), Some(datatype)) => {
+            let lexical = match value {
+                JsonValue::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            Ok(Term::typed(lexical, Datatype::from_iri(datatype)))
+        }
+        _ => Err(PyTypeError::new_err(format!(
+            "a {} is not an RDF term",
+            obj.get_type().name()?
+        ))),
+    }
 }
 
 fn typed(lexical: String, datatype: &str) -> JsonValue {

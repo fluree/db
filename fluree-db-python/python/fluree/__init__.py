@@ -52,7 +52,8 @@ from fluree._sources import (
     S3Tables,
     Unity,
 )
-from fluree._terms import IRI, BlankNode, LangString, Literal, Triple, Vector
+from fluree._rdf import RdfFormat, parse, serialize
+from fluree._terms import IRI, BlankNode, LangString, Literal, Quad, Triple, Vector
 from fluree.errors import (
     ConflictError,
     FlureeError,
@@ -98,7 +99,9 @@ __all__ = [
     "Path",
     "PermissionDeniedError",
     "QueryProfile",
+    "Quad",
     "QueryTimeoutError",
+    "RdfFormat",
     "RebaseResult",
     "Record",
     "Relationship",
@@ -120,6 +123,8 @@ __all__ = [
     "Vector",
     "VerifyReport",
     "connect",
+    "parse",
+    "serialize",
     "set_log_level",
     "__version__",
 ]

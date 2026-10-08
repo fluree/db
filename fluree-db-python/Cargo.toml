@@ -29,6 +29,9 @@ extension = [
     "dep:fluree-db-nameservice",
     "dep:fluree-db-query",
     "dep:fluree-db-sparql",
+    "dep:fluree-graph-format",
+    "dep:fluree-graph-ir",
+    "dep:fluree-graph-turtle",
     "dep:fluree-vocab",
     "dep:pyo3",
     "dep:pythonize",
@@ -58,6 +61,9 @@ fluree-db-core = { path = "../fluree-db-core", optional = true }
 fluree-db-nameservice = { path = "../fluree-db-nameservice", optional = true }
 fluree-db-query = { path = "../fluree-db-query", optional = true }
 fluree-db-sparql = { path = "../fluree-db-sparql", optional = true }
+fluree-graph-format = { path = "../fluree-graph-format", optional = true }
+fluree-graph-ir = { path = "../fluree-graph-ir", optional = true }
+fluree-graph-turtle = { path = "../fluree-graph-turtle", optional = true }
 fluree-vocab = { path = "../fluree-vocab", optional = true }
 pyo3 = { version = "0.29", optional = true }
 pythonize = { version = "0.29", optional = true }

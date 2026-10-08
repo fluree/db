@@ -5,7 +5,8 @@ Literals become the Python type their datatype names (``int``, ``float``,
 a :class:`Literal` carrying its lexical form and datatype, so no information
 is dropped. IRIs, blank nodes and language-tagged strings are ``str``
 subclasses: they print and compare like strings but keep what they are. An
-RDF 1.2 triple term is a :class:`Triple`.
+RDF 1.2 triple term is a :class:`Triple`, and a statement in a dataset a
+:class:`Quad`.
 """
 
 from __future__ import annotations
@@ -134,22 +135,61 @@ class Triple:
     object: Any
 
     def __post_init__(self) -> None:
-        if not isinstance(self.subject, (IRI, BlankNode)):
-            if type(self.subject) is not str:
-                kind = type(self.subject).__name__
-                raise TypeError(f"a triple term's subject is an IRI or a blank node, not a {kind}")
-            object.__setattr__(self, "subject", IRI(self.subject))
-        if not isinstance(self.predicate, IRI):
-            if type(self.predicate) is not str:
-                kind = type(self.predicate).__name__
-                raise TypeError(f"a triple term's predicate is an IRI, not a {kind}")
-            object.__setattr__(self, "predicate", IRI(self.predicate))
+        object.__setattr__(self, "subject", _node(self.subject, "triple term's subject"))
+        object.__setattr__(self, "predicate", _iri(self.predicate, "triple term's predicate"))
 
     def __iter__(self) -> Iterator[Any]:
         return iter((self.subject, self.predicate, self.object))
 
     def __reduce__(self) -> tuple[Any, ...]:
         return (Triple, (self.subject, self.predicate, self.object))
+
+
+@dataclass(frozen=True, slots=True)
+class Quad:
+    """A statement in a dataset: ``subject predicate object`` in ``graph``,
+    or in the default graph when ``graph`` is ``None``. It unpacks as
+    ``subject, predicate, object, graph``.
+
+    The subject and graph are an :class:`IRI` or a :class:`BlankNode`, and
+    the predicate an :class:`IRI`; a plain ``str`` in any of them is taken as
+    an IRI. The object is any value a property holds. A claim about a triple
+    is the quad ``(claim, rdf:reifies, Triple(...))``."""
+
+    subject: IRI | BlankNode
+    predicate: IRI
+    object: Any
+    graph: IRI | BlankNode | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "subject", _node(self.subject, "quad's subject"))
+        object.__setattr__(self, "predicate", _iri(self.predicate, "quad's predicate"))
+        if self.graph is not None:
+            object.__setattr__(self, "graph", _node(self.graph, "quad's graph"))
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter((self.subject, self.predicate, self.object, self.graph))
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (Quad, (self.subject, self.predicate, self.object, self.graph))
+
+
+def _node(value: Any, role: str) -> IRI | BlankNode:
+    """``value`` as an IRI or blank node; a plain ``str`` is an IRI."""
+    if isinstance(value, (IRI, BlankNode)):
+        return value
+    if type(value) is str:
+        return IRI(value)
+    raise TypeError(f"a {role} is an IRI or a blank node, not a {type(value).__name__}")
+
+
+def _iri(value: Any, role: str) -> IRI:
+    """``value`` as an IRI; a plain ``str`` is one."""
+    if isinstance(value, IRI):
+        return value
+    if type(value) is str:
+        return IRI(value)
+    raise TypeError(f"a {role} is an IRI, not a {type(value).__name__}")
 
 
 def _boolean(lexical: str) -> bool:
