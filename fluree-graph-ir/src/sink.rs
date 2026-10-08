@@ -11,8 +11,9 @@
 //! - Future: `FlureeIngestSink`: Converts events to transaction IR
 //! - Future: `StreamingSink`: Writes triples directly to output
 
-use crate::{Dataset, Datatype, Graph, LiteralValue, Term, Triple};
+use crate::{BlankId, Dataset, Datatype, Graph, LiteralValue, Term, Triple};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 /// Error returned by a [`GraphSink`] when it cannot accept an event.
 ///
@@ -515,11 +516,40 @@ impl GraphCollectorSink {
     }
 
     /// Consume the sink and return the default graph and every named graph.
+    ///
+    /// Anonymous blank nodes (`[]`, collections, annotations) are labeled
+    /// `bN` here, or `bN_k` when the document wrote `_:bN` itself, so the
+    /// dataset can be written back in any RDF syntax. While parsing they are
+    /// `-bN`, a label no document can write (see [`GraphSink::term_blank`]).
     pub fn into_dataset(self) -> Dataset {
-        Dataset {
+        let mut dataset = Dataset {
             default: self.graph,
             named: self.named.unwrap_or_default(),
+        };
+        if self.blank_counter == 0 {
+            return dataset;
         }
+        let names: Vec<BlankId> = (1..=self.blank_counter)
+            .map(|n| {
+                let mut name = format!("b{n}");
+                let mut k = 0;
+                while self.blank_labels.contains_key(&name) {
+                    k += 1;
+                    name = format!("b{n}_{k}");
+                }
+                BlankId::new(name)
+            })
+            .collect();
+        dataset.default.terms_mut().for_each(|t| relabel(t, &names));
+        dataset.named = std::mem::take(&mut dataset.named)
+            .into_iter()
+            .map(|(mut name, mut graph)| {
+                relabel(&mut name, &names);
+                graph.terms_mut().for_each(|t| relabel(t, &names));
+                (name, graph)
+            })
+            .collect();
+        dataset
     }
 
     /// The named graph `graph`, noting its rewind point the first time the
@@ -604,6 +634,34 @@ impl GraphCollectorSink {
         self.literal_slots.push(id.0);
         self.literal_cursor = self.literal_slots.len();
         id
+    }
+}
+
+/// Give a minted `-bN` blank node in `term` its final label `names[N - 1]`.
+fn relabel(term: &mut Term, names: &[BlankId]) {
+    fn minted(term: &Term) -> bool {
+        match term {
+            Term::BlankNode(id) => id.as_str().starts_with('-'),
+            Term::TripleTerm(t) => t.iter().any(minted),
+            Term::Iri(_) | Term::Literal { .. } => false,
+        }
+    }
+    match term {
+        Term::BlankNode(id) => {
+            let n = id
+                .as_str()
+                .strip_prefix("-b")
+                .and_then(|n| n.parse::<usize>().ok());
+            if let Some(name) = n.and_then(|n| names.get(n.wrapping_sub(1))) {
+                *id = name.clone();
+            }
+        }
+        Term::TripleTerm(t) if t.iter().any(minted) => {
+            Arc::make_mut(t)
+                .iter_mut()
+                .for_each(|part| relabel(part, names));
+        }
+        Term::TripleTerm(_) | Term::Iri(_) | Term::Literal { .. } => {}
     }
 }
 
@@ -1269,6 +1327,41 @@ mod tests {
             !minted_label.starts_with(|c: char| c.is_alphanumeric() || c == '_'),
             "a mint that can lex as BLANK_NODE_LABEL can collide: {minted_label}"
         );
+    }
+
+    /// `into_dataset` relabels every mint, wherever it sits, to a label a
+    /// document can write, stepping past the labels the document used.
+    #[test]
+    fn a_dataset_labels_mints_apart_from_the_documents_labels() {
+        let mut sink = GraphCollectorSink::with_named_graphs();
+        let p = sink.term_iri("http://ex/p");
+        let (b1, b1_1) = (sink.term_blank(Some("b1")), sink.term_blank(Some("b1_1")));
+        let (m1, m2, m3) = (
+            sink.term_blank(None),
+            sink.term_blank(None),
+            sink.term_blank(None),
+        );
+        let nested = sink.term_triple(m2, p, b1).unwrap();
+        sink.emit_triple(m1, p, nested).unwrap();
+        sink.emit_reified_triple(b1, p, b1_1, m2).unwrap();
+        sink.emit_quad(m2, p, m1, m3).unwrap();
+        sink.end_statement();
+
+        let dataset = sink.into_dataset();
+        let blank = Term::blank;
+        let default: Vec<_> = dataset.default.iter().cloned().collect();
+        assert_eq!(
+            default,
+            [Triple::new(
+                blank("b1_2"),
+                Term::iri("http://ex/p"),
+                Term::triple(blank("b2"), Term::iri("http://ex/p"), blank("b1")),
+            )]
+        );
+        assert_eq!(dataset.default.reifications()[0].reifier, blank("b2"));
+        assert_eq!(dataset.default.reifications()[0].triple.o, blank("b1_1"));
+        let named = &dataset.named[&blank("b3")];
+        assert_eq!(named.iter().next().unwrap().s, blank("b2"));
     }
 
     // =====================================================================
