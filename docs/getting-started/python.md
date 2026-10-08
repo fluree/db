@@ -47,7 +47,8 @@ with fluree.connect("./data") as conn:          # or fluree.connect(":memory:")
 ```
 
 `conn.ledger("people")` opens an existing ledger. Results come back as Python
-values: `int`, `Decimal`, `datetime`, `str`, and `fluree.IRI` for IRIs. A
+values: `int`, `Decimal`, `datetime`, `str`, `fluree.IRI` for IRIs, and
+`fluree.Triple` for RDF 1.2 triple terms. A
 result converts to a DataFrame with `to_pandas()` or `to_polars()`.
 
 ## Reading this book from Python

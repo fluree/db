@@ -50,7 +50,7 @@ from fluree._sources import (
     OAuth2,
     Unity,
 )
-from fluree._terms import IRI, BlankNode, LangString, Literal, Vector
+from fluree._terms import IRI, BlankNode, LangString, Literal, Triple, Vector
 from fluree.errors import (
     ConflictError,
     FlureeError,
@@ -108,6 +108,7 @@ __all__ = [
     "Snapshot",
     "SweepResult",
     "Transaction",
+    "Triple",
     "UniqueConstraintError",
     "Unity",
     "ValidationReport",

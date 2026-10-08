@@ -74,10 +74,18 @@ with fluree.connect("./data") as conn:          # or fluree.connect(":memory:")
 A property value in a JSON-LD dict may be any value a query returns, and
 reads back as it went in: a `fluree.IRI` or `BlankNode` is a reference to that
 node, a `LangString` keeps its tag, a `Literal` its datatype, and a `Decimal`,
-`datetime`, `date` or `time` its XSD type. `fluree.Vector` and numpy arrays
-are embedding vectors. The same values work as query parameters and in JSON-LD
-`where` patterns. Keyword entries (`@id`, `@type`, `@context`) take plain
-strings.
+`datetime`, `date` or `time` its XSD type. A `fluree.Triple` is an RDF 1.2
+triple term, and `fluree.Vector` and numpy arrays are embedding vectors. The
+same values work as query parameters and in JSON-LD `where` patterns. Keyword
+entries (`@id`, `@type`, `@context`) take plain strings, except `"@reifies"`,
+which takes the `Triple` a node is about; that records a claim without
+asserting the triple:
+
+```python
+ex = "http://example.org/"
+ledger.insert({"@id": ex + "claim1", ex + "source": fluree.IRI(ex + "wiki"),
+               "@reifies": fluree.Triple(ex + "carol", ex + "age", 30)})
+```
 
 To make several writes one commit, use a transaction. Each write applies over
 the ones before it and is checked as it is staged; queries on the transaction
@@ -127,7 +135,9 @@ frozen view that every query sees identically.
 - Literals are Python values (`int`, `float`, `Decimal`, `datetime`, `str`,
   ...); IRIs are `fluree.IRI` and language-tagged strings
   `fluree.LangString`, both `str` subclasses. A literal with no lossless
-  Python type stays a `fluree.Literal`.
+  Python type stays a `fluree.Literal`. An RDF 1.2 triple term, such as the
+  `?t` of `?r rdf:reifies ?t`, is a `fluree.Triple(subject, predicate,
+  object)`, which unpacks like a tuple.
 - SPARQL `ASK` returns a `bool`, `CONSTRUCT` a JSON-LD document; JSON-LD
   queries (a `dict`) return their JSON result as Python objects.
 - `select()` is `query()` for tables: it takes a SPARQL `SELECT` or a Cypher
@@ -153,13 +163,13 @@ frozen view that every query sees identically.
                name="Alice", min=21)
   ```
 
-  A value is an `IRI`, `LangString`, `Literal` or `Vector`, a Python `str`,
-  `int`, `float`, `bool`, `Decimal`, `datetime`, `date` or `time`, a Cypher
-  `Node` (its `element_id`), or a `BlankNode` a query returned. A `BlankNode`
-  built from any other label raises `InvalidRequestError`: written in the
-  query, it would match every node. So does a parameter the query never
-  mentions, rather than leaving a misspelt variable unbound. JSON-LD queries
-  take none.
+  A value is an `IRI`, `LangString`, `Literal`, `Triple` or `Vector`, a
+  Python `str`, `int`, `float`, `bool`, `Decimal`, `datetime`, `date` or
+  `time`, a Cypher `Node` (its `element_id`), or a `BlankNode` a query
+  returned. A `BlankNode` built from any other label raises
+  `InvalidRequestError`: written in the query, it would match every node. So
+  does a parameter the query never mentions, rather than leaving a misspelt
+  variable unbound. JSON-LD queries take none.
 
 ### Cypher
 
