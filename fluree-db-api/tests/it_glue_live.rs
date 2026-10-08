@@ -1,13 +1,14 @@
 //! Env-gated live integration tests: the AWS Glue onboarding/introspection
 //! surface (catalog browse + table preview) via the public API — the paths that
-//! used to hard-reject Glue. SKIP unless `FLUREE_GLUE_IT_DATABASE` is set (no
-//! live dependency in CI). Requires ambient AWS credentials.
+//! used to hard-reject Glue. `#[ignore]`d (out of the default `cargo test` set,
+//! so CI's `--all-features` run never reports a do-nothing PASS) AND skipped
+//! unless `FLUREE_GLUE_IT_DATABASE` is set. Requires ambient AWS credentials.
 //!
-//! Run (matches the sandbox harness):
+//! Run:
 //! ```
-//! AWS_PROFILE=aj-sandbox AWS_REGION=us-east-1 \
+//! AWS_PROFILE=<profile> AWS_REGION=us-east-1 \
 //!   FLUREE_GLUE_IT_DATABASE=enterprise_dw FLUREE_GLUE_IT_TABLE=dim_store \
-//!   cargo test -p fluree-db-api --features iceberg --test it_glue_live -- --nocapture
+//!   cargo test -p fluree-db-api --features iceberg --test it_glue_live -- --ignored --nocapture
 //! ```
 #![cfg(feature = "iceberg")]
 
@@ -27,6 +28,7 @@ fn conn() -> IcebergConnectionConfig {
 }
 
 #[tokio::test]
+#[ignore = "Live AWS Glue. Set FLUREE_GLUE_IT_DATABASE (+ FLUREE_GLUE_IT_TABLE) and ambient AWS credentials."]
 async fn glue_browse_lists_database_and_tables() {
     let Some(db) = env("FLUREE_GLUE_IT_DATABASE") else {
         eprintln!("skip glue_browse: set FLUREE_GLUE_IT_DATABASE");
@@ -52,6 +54,7 @@ async fn glue_browse_lists_database_and_tables() {
 }
 
 #[tokio::test]
+#[ignore = "Live AWS Glue. Set FLUREE_GLUE_IT_DATABASE + FLUREE_GLUE_IT_TABLE and ambient AWS credentials."]
 async fn glue_preview_returns_schema() {
     let Some(namespace) = env("FLUREE_GLUE_IT_DATABASE") else {
         eprintln!("skip glue_preview: set FLUREE_GLUE_IT_DATABASE + FLUREE_GLUE_IT_TABLE");

@@ -8,14 +8,14 @@
 //! Glue:
 //! ```
 //! MODE=glue GLUE_DB=enterprise_dw GLUE_TABLE=dim_geography \
-//!   AWS_PROFILE=aj-sandbox AWS_REGION=us-east-1 \
+//!   AWS_PROFILE=<profile> AWS_REGION=us-east-1 \
 //!   cargo run --example read_glue -p fluree-db-iceberg --features aws
 //! ```
 //! S3 Tables:
 //! ```
 //! MODE=s3tables S3TABLES_ARN=arn:aws:s3tables:us-east-1:ACCT:bucket/NAME \
 //!   NS=enterprise_dw TABLE=dim_geography \
-//!   AWS_PROFILE=aj-sandbox AWS_REGION=us-east-1 \
+//!   AWS_PROFILE=<profile> AWS_REGION=us-east-1 \
 //!   cargo run --example read_glue -p fluree-db-iceberg --features aws
 //! ```
 

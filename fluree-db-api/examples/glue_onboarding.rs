@@ -3,7 +3,7 @@
 //!
 //! Run:
 //! ```
-//! AWS_PROFILE=aj-sandbox AWS_REGION=us-east-1 \
+//! AWS_PROFILE=<profile> AWS_REGION=us-east-1 \
 //!   cargo run --example glue_onboarding -p fluree-db-api --features iceberg
 //! ```
 

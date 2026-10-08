@@ -1,14 +1,14 @@
 //! Env-gated live integration tests: AWS Glue Data Catalog + S3 Tables Iceberg
 //! reads via the native AWS SDK. These need a live catalog + ambient AWS
-//! credentials, so — like `it_gcs_sdk_reads.rs` — they SKIP unless the relevant
-//! env vars are set (no live dependency in CI).
+//! credentials, so — like `it_gcs_sdk_reads.rs` — they are `#[ignore]`d AND skip
+//! unless the relevant env vars are set (no live dependency in CI).
 //!
-//! Glue (matches the sandbox harness):
+//! Glue:
 //! ```
-//! AWS_PROFILE=aj-sandbox AWS_REGION=us-east-1 \
+//! AWS_PROFILE=<profile> AWS_REGION=us-east-1 \
 //!   FLUREE_GLUE_IT_DATABASE=enterprise_dw FLUREE_GLUE_IT_TABLE=dim_store \
 //!   FLUREE_GLUE_IT_EXPECT_ROWS=300 \
-//!   cargo test -p fluree-db-iceberg --features aws --test it_glue_sdk_reads -- --nocapture
+//!   cargo test -p fluree-db-iceberg --features aws --test it_glue_sdk_reads -- --ignored --nocapture
 //! ```
 //! S3 Tables:
 //! ```
@@ -72,6 +72,7 @@ async fn read_rows(catalog: Box<dyn SendCatalogClient>, table_id: TableIdentifie
 }
 
 #[tokio::test]
+#[ignore = "Live AWS Glue. Set FLUREE_GLUE_IT_DATABASE + FLUREE_GLUE_IT_TABLE and ambient AWS credentials."]
 async fn glue_catalog_reads_rows() {
     let Some(namespace) = env("FLUREE_GLUE_IT_DATABASE") else {
         eprintln!(
@@ -95,6 +96,7 @@ async fn glue_catalog_reads_rows() {
 }
 
 #[tokio::test]
+#[ignore = "Live AWS S3 Tables. Set FLUREE_S3TABLES_IT_ARN (+ _NS / _TABLE) and ambient AWS credentials."]
 async fn s3tables_catalog_reads_rows() {
     let Some(arn) = env("FLUREE_S3TABLES_IT_ARN") else {
         eprintln!("skip s3tables_catalog_reads_rows: set FLUREE_S3TABLES_IT_ARN");
