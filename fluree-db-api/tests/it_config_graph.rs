@@ -728,6 +728,124 @@ async fn a_merge_carrying_config_written_on_another_branch_is_refused() {
     }
 }
 
+/// A merge may not change the target's own config or txn-meta graph with
+/// what another branch wrote there: on the branch, the target's system graph
+/// IRIs name ordinary graphs, so a value written (or deleted) there is data,
+/// not a change to the target's config. A fast-forward and a general merge
+/// are refused (409), the preview says so, and the target's config is
+/// untouched, also into a target whose config governs no writes.
+#[tokio::test]
+async fn a_merge_changing_the_targets_system_graph_from_another_branch_is_refused() {
+    let edits = [
+        (
+            "a setting replaced",
+            true,
+            "config",
+            "DELETE DATA { GRAPH <CFG> { <urn:config:shacl> f:shaclEnabled true } } ;
+             INSERT DATA { GRAPH <CFG> { <urn:config:shacl> f:shaclEnabled false } }",
+        ),
+        (
+            "a setting deleted",
+            true,
+            "config",
+            "DELETE DATA { GRAPH <CFG> { <urn:config:shacl> f:shaclEnabled true } }",
+        ),
+        (
+            "commit metadata written",
+            true,
+            "txn-meta",
+            "INSERT DATA { GRAPH <TXN> { <urn:x:commit> f:message \"from dev\" } }",
+        ),
+        (
+            "commit metadata written, into a target that governs no writes",
+            false,
+            "txn-meta",
+            "INSERT DATA { GRAPH <TXN> { <urn:x:commit> f:message \"from dev\" } }",
+        ),
+    ];
+    for (i, (what, governed, role, edit)) in edits.into_iter().enumerate() {
+        for fast_forward in [true, false] {
+            let fluree = FlureeBuilder::memory().build_memory();
+            let name = format!("it-config-branch-target-{i}-{fast_forward}");
+            let ledger = fluree.create_ledger(&name).await.unwrap();
+            let main_id = format!("{name}:main");
+            let main_cfg = config_graph_iri(&main_id);
+            let main_txn = fluree_db_core::graph_registry::txn_meta_graph_iri(&main_id);
+            let main = fluree
+                .stage_owned(ledger)
+                .upsert_turtle(&format!(
+                    "@prefix f: <https://ns.flur.ee/db#> . @prefix ex: <http://example.org/> .
+                     ex:seed ex:p 1 .
+                     GRAPH <{main_cfg}> {{ <urn:config:main> a f:LedgerConfig ;
+                       f:shaclDefaults <urn:config:shacl> . <urn:config:shacl> f:shaclEnabled {governed} . }}"
+                ))
+                .execute()
+                .await
+                .expect("main's config")
+                .ledger;
+            fluree
+                .create_branch(&name, "dev", None, None)
+                .await
+                .unwrap();
+            fluree
+                .graph(&format!("{name}:dev"))
+                .transact()
+                .sparql_update(&format!(
+                    "PREFIX f: <https://ns.flur.ee/db#> {}",
+                    edit.replace("CFG", &main_cfg).replace("TXN", &main_txn)
+                ))
+                .commit()
+                .await
+                .unwrap_or_else(|e| panic!("{what}: an ordinary graph on dev: {e}"));
+            if !fast_forward {
+                fluree
+                    .insert(main, &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:x", "ex:p": 2}))
+                    .await
+                    .unwrap();
+            }
+            let case = format!("{what}/{fast_forward}");
+            let preview = fluree
+                .merge_preview_with(
+                    &name,
+                    "dev",
+                    None,
+                    fluree_db_api::MergePreviewOpts::default(),
+                )
+                .await
+                .expect("preview");
+            assert!(!preview.mergeable, "{case}: the preview refuses");
+            let err = fluree
+                .merge_branch(
+                    &name,
+                    "dev",
+                    None,
+                    fluree_db_api::ConflictStrategy::default(),
+                )
+                .await
+                .expect_err(&case);
+            assert_eq!(err.status_code(), 409, "{case}: {err}");
+            let message = err.to_string();
+            let graph = if role == "config" {
+                &main_cfg
+            } else {
+                &main_txn
+            };
+            assert!(
+                message.contains(&format!("this branch's {role} graph")) && message.contains(graph),
+                "{case}: {message}"
+            );
+            let view = fluree.db(&main_id).await.unwrap();
+            assert_eq!(
+                view.ledger_config()
+                    .and_then(|c| c.shacl.as_ref())
+                    .and_then(|s| s.enabled),
+                Some(governed),
+                "{case}: main's config is untouched"
+            );
+        }
+    }
+}
+
 /// A merge may not split one of the target's config groups. After the fork
 /// the target links a group from its config graph, and the branch writes the
 /// group's field in the default graph (through JSON-LD, or SPARQL). Each

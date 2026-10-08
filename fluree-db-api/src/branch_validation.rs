@@ -331,10 +331,7 @@ impl crate::Fluree {
         if !view.has_staged() {
             return Ok(BranchOpValidation::default());
         }
-        if let Some(refusal) = self
-            .other_branch_system_graph_write(view, new_graph_iris, op)
-            .await?
-        {
+        if let Some(refusal) = self.system_graph_write(view, new_graph_iris, op).await? {
             return Ok(BranchOpValidation {
                 rejection: Some(Rejection::Config(refusal)),
             });
@@ -404,22 +401,54 @@ impl crate::Fluree {
 }
 
 impl crate::Fluree {
-    /// Why a branch operation may not write another branch's system graph,
-    /// if it does: config (or commit metadata) written on a branch is named
-    /// for that branch (`urn:fluree:<name>:<branch>#config`) and configures
-    /// that branch only, so carried to another branch it would land in an
-    /// ordinary graph, never as that branch's config. A branch the target
-    /// was created from (directly or not) is the exception: its system
-    /// graphs are already ordinary graphs on the target, copied at the fork.
+    /// Why a branch operation may not write a system graph, if it does.
+    ///
+    /// A merge stages what another branch wrote, so it may not change the
+    /// target's own config or txn-meta graph at all (asserting or
+    /// retracting): the target's system graph IRIs name ordinary graphs on
+    /// every other branch, and what a branch writes there is data, written
+    /// under that branch's rules, not a change to the target's config or
+    /// commit metadata. Config is changed on the branch it configures.
+    ///
+    /// No branch operation may write another branch's system graph: config
+    /// (or commit metadata) written on a branch is named for that branch
+    /// (`urn:fluree:<name>:<branch>#config`) and configures that branch
+    /// only, so carried to another branch it would land in an ordinary
+    /// graph, never as that branch's config. A branch the target was created
+    /// from (directly or not) is the exception: its system graphs are
+    /// already ordinary graphs on the target, copied at the fork.
     /// Retractions (a revert cleaning such a graph up) are allowed.
-    async fn other_branch_system_graph_write(
+    async fn system_graph_write(
         &self,
         view: &StagedLedger,
         new_graph_iris: &HashMap<GraphId, String>,
         op: &str,
     ) -> Result<Option<String>> {
+        use fluree_db_core::graph_registry::{CONFIG_GRAPH_ID, TXN_META_GRAPH_ID};
         let base = view.base();
         let ledger_id = base.snapshot.ledger_id.to_string();
+        if op == "merge" {
+            let own = view
+                .staged_flakes_by_graph()
+                .map(|(g_id, _)| g_id)
+                .find(|g_id| matches!(*g_id, CONFIG_GRAPH_ID | TXN_META_GRAPH_ID));
+            if let Some(g_id) = own {
+                let role = if g_id == CONFIG_GRAPH_ID {
+                    "config"
+                } else {
+                    "txn-meta"
+                };
+                return Ok(Some(format!(
+                    "the merge would change this branch's {role} graph <{}> with what the \
+                     source branch wrote to it as an ordinary graph; change this branch's \
+                     {role} on this branch itself",
+                    base.snapshot
+                        .graph_registry
+                        .iri_for_graph_id(g_id)
+                        .unwrap_or_default()
+                )));
+            }
+        }
         let mut written: BTreeSet<GraphId> = BTreeSet::new();
         for (g_id, flake) in view.staged_flakes_by_graph() {
             if flake.op && g_id != fluree_db_core::DEFAULT_GRAPH_ID {
@@ -483,8 +512,8 @@ pub(crate) struct FastForwardBase {
 /// Whether the adopted change carries anything the staged-config guard
 /// checks on a branch operation: a config field ([`crate::config_vocab::is_config_field`],
 /// the config reader's vocabulary), a type in the `f:` vocabulary, a write
-/// to the target's config graph, or a write to another branch's system graph
-/// of this ledger. Every refusal the guard can make needs one of them, so a
+/// to the target's config or txn-meta graph, or a write to another branch's
+/// system graph of this ledger. Every refusal the guard can make needs one of them, so a
 /// change without any (data, edge annotations included) is accepted
 /// unchecked into a target that governs no writes.
 fn carries_config_settings(
@@ -496,12 +525,19 @@ fn carries_config_settings(
     // The adopted commits' own namespace codes, so a config graph first
     // written on the source still encodes as its flakes do. A conflicting
     // delta is the merge's to refuse; it cannot make the change config-free.
-    let config_graph = match ns.adopt_delta_for_persistence(&data.namespace_delta) {
-        Ok(()) => ns.lookup_sid_for_iri(&fluree_db_core::config_graph_iri(
-            &target.snapshot.ledger_id,
-        )),
-        Err(_) => return true,
-    };
+    if ns
+        .adopt_delta_for_persistence(&data.namespace_delta)
+        .is_err()
+    {
+        return true;
+    }
+    let own_system_graphs: Vec<Sid> = [
+        fluree_db_core::config_graph_iri(&target.snapshot.ledger_id),
+        fluree_db_core::graph_registry::txn_meta_graph_iri(&target.snapshot.ledger_id),
+    ]
+    .iter()
+    .filter_map(|iri| ns.lookup_sid_for_iri(iri))
+    .collect();
     let ledger_id = target.snapshot.ledger_id.to_string();
     let mut graphs_seen: std::collections::HashSet<&Sid> = std::collections::HashSet::new();
     data.flakes.iter().any(|flake| {
@@ -511,7 +547,7 @@ fn carries_config_settings(
                 && matches!(&flake.o, fluree_db_core::FlakeValue::Ref(o)
                     if o.namespace_code == FLUREE_DB))
             || flake.g.as_ref().is_some_and(|g| {
-                flake.g == config_graph
+                own_system_graphs.contains(g)
                     || (graphs_seen.insert(g)
                         && ns.get_prefix(g.namespace_code).is_some_and(|prefix| {
                             let iri = format!("{prefix}{}", g.name);
