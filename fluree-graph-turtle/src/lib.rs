@@ -34,6 +34,7 @@
 pub mod adapter;
 pub mod error;
 pub mod lex;
+pub mod nquads;
 pub mod options;
 pub mod parser;
 pub mod splitter;
@@ -41,6 +42,7 @@ pub mod splitter;
 pub use adapter::graph_to_transaction_json;
 pub use error::{Result, TurtleError};
 pub use lex::{tokenize, Lexer, StreamingLexer, Token, TokenKind};
+pub use nquads::{parse_nquads, parse_ntriples};
 pub use options::{CollectionStyle, Dialect, NumericStyle, ParserOptions};
 pub use parser::{
     parse, parse_trig, parse_with_options, parse_with_prefixes_base,

@@ -65,6 +65,10 @@ pub mod rdf {
     /// rdf:langString IRI
     pub const LANG_STRING: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
 
+    /// rdf:dirLangString IRI (RDF 1.2: a language-tagged string with a base
+    /// direction)
+    pub const DIR_LANG_STRING: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#dirLangString";
+
     /// rdf:JSON IRI
     pub const JSON: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON";
 
