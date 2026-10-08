@@ -30,7 +30,7 @@ import asyncio
 import datetime as _dt
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Iterable, Mapping
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 
 import fluree
 from fluree import _connection as _sync
@@ -138,10 +138,11 @@ async def parse(
     format: RdfFormat | None = None,
     *,
     base: str | None = None,
+    literals: Literal["value", "lexical"] = "value",
 ) -> list[Quad]:
     """The quads of an RDF document; see :func:`fluree.parse`. The file is
     read and the document parsed on a worker thread."""
-    return await _call(fluree.parse, data, format, base=base)
+    return await _call(fluree.parse, data, format, base=base, literals=literals)
 
 
 async def serialize(

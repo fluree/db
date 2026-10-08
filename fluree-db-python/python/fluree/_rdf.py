@@ -9,7 +9,7 @@ from typing import Any, TypeGuard
 from typing import Literal as _Literal
 
 from fluree import _fluree as native
-from fluree._terms import BlankNode, Quad, to_python
+from fluree._terms import BlankNode, Quad, to_lexical, to_python
 from fluree.errors import InvalidRequestError
 
 RdfFormat = _Literal["turtle", "trig", "ntriples", "nquads"]
@@ -27,6 +27,7 @@ def parse(
     format: RdfFormat | None = None,
     *,
     base: str | None = None,
+    literals: _Literal["value", "lexical"] = "value",
 ) -> list[Quad]:
     """The quads of an RDF document: Turtle, TriG, N-Triples or N-Quads.
 
@@ -39,7 +40,10 @@ def parse(
     annotation or reified triple is the quad ``(reifier, rdf:reifies,
     Triple(...))``, with the annotated triple as a quad of its own. Literals
     are Python values, as query results are, so a number's spelling is not
-    kept (``"01"`` reads as ``1``). Blank nodes keep the document's labels;
+    kept (``"01"`` reads as ``1``); with ``literals="lexical"`` every typed
+    literal but a plain string is a :class:`Literal` with its lexical form,
+    and :func:`serialize` writes it back as it was. Blank nodes keep the
+    document's labels;
     an anonymous one (``[]``, a collection, an annotation) gets a fresh
     label. Malformed input raises :class:`InvalidRequestError` naming the
     line and column.
@@ -53,8 +57,11 @@ def parse(
         data = path.read_text(encoding="utf-8")
     elif format is None:
         raise InvalidRequestError("pass format= (turtle, trig, ntriples or nquads)")
+    if literals not in ("value", "lexical"):
+        raise InvalidRequestError(f"literals= is 'value' or 'lexical', not {literals!r}")
+    term = to_python if literals == "value" else to_lexical
     return [
-        Quad(to_python(s), to_python(p), to_python(o), None if g is None else to_python(g))
+        Quad(term(s), term(p), term(o), None if g is None else term(g))
         for s, p, o, g in native.parse_rdf(data, format, base)
     ]
 
