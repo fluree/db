@@ -281,7 +281,7 @@ pub use iceberg_sample::{sample_column_values, sample_iceberg_rows};
 #[cfg(feature = "iceberg")]
 pub(crate) use iceberg_catalog::table_schema_from_metadata;
 #[cfg(feature = "iceberg")]
-pub(crate) use r2rml::{catalog_client_cache_key, mapping_source_of};
+pub(crate) use r2rml::{catalog_table_metadata, mapping_source_of, shared_catalog_client};
 
 #[cfg(feature = "iceberg")]
 pub use iceberg_generate::{

@@ -1642,8 +1642,8 @@ fn info_count_budget_ms() -> u64 {
 }
 
 /// Fetch best-effort per-table row counts (and the first table's snapshot id) for
-/// a virtual Iceberg dataset, sharing ONE REST catalog client across a bounded
-/// concurrent fan-out.
+/// a virtual Iceberg dataset, sharing ONE catalog client (REST, AWS Glue, or AWS S3
+/// Tables) across a bounded concurrent fan-out.
 ///
 /// The prior path built a fresh client AND OAuth provider (empty token cache) per
 /// table inside a SERIAL loop — a redundant token exchange + `loadTable` per
@@ -1653,11 +1653,13 @@ fn info_count_budget_ms() -> u64 {
 /// (keyed by the SAME config fingerprint), and the per-table `loadTable`s run with
 /// bounded concurrency.
 ///
-/// Metadata-only: `loadTable` returns the snapshot-summary row count; no
+/// Metadata-only: the count is the snapshot summary of the table metadata — inline
+/// in a REST `loadTable`, else from the query path's caches, else one read of the
+/// metadata file (AWS Glue / S3 Tables return only its location); no
 /// manifest-list, manifest, or Parquet/data file is read. Every step is
 /// best-effort — a parse / auth / load / metadata failure drops only that table's
 /// count (logged at debug), never the whole response. A Direct-catalog source (no
-/// REST client) returns no counts.
+/// catalog) returns no counts.
 /// One table's `loadTable` outcome for the virtual-info fan-out:
 /// `(table name, summary row count if present, snapshot id, MoR-approximate?)`.
 #[cfg(feature = "iceberg")]
@@ -1670,68 +1672,30 @@ async fn fetch_virtual_table_row_counts(
     cfg: &fluree_db_iceberg::IcebergGsConfig,
     tables: &[String],
 ) -> (HashMap<String, i64>, Option<i64>, Vec<String>) {
-    use fluree_db_iceberg::catalog::{
-        parse_table_identifier, RestCatalogClient, RestCatalogConfig, SendCatalogClient,
-    };
-    use fluree_db_iceberg::config::CatalogConfig;
+    use fluree_db_iceberg::catalog::{parse_table_identifier, SendCatalogClient};
     use futures::StreamExt;
     use std::sync::Arc;
 
-    // Only a REST catalog has a client (and token) worth sharing; a Direct
-    // (table-location) source has no catalog to query for counts.
-    let CatalogConfig::Rest {
-        uri,
-        warehouse,
-        auth,
-        ..
-    } = &cfg.catalog
-    else {
-        return (HashMap::new(), None, Vec::new());
-    };
-
-    // Reuse (or warm) the process-wide REST client under the SAME cache key the
-    // scan path uses, so `/info` and query execution share one OAuth token +
-    // connection pool (see graph_source::r2rml::catalog_client_cache_key).
-    let cache = fluree.r2rml_cache();
-    let client_fp =
-        crate::graph_source::catalog_client_cache_key(&record.graph_source_id, &record.config);
-    let catalog: Arc<dyn SendCatalogClient> = match cache.catalog_client(&client_fp) {
-        Some(c) => c,
-        None => {
-            // Hydrate any SecretRef auth INSIDE the miss arm — after `client_fp`
-            // was computed over the raw config (same ordering discipline as the
-            // scan path). Best-effort: a resolver failure just omits counts, like
-            // every other failure in this display-only path.
-            let hydrated_auth = match auth.hydrate(fluree.secret_resolver()).await {
-                Ok(a) => a,
-                Err(e) => {
-                    tracing::debug!(error = %e, "virtual ledger-info: auth secret resolution failed; counts omitted");
-                    return (HashMap::new(), None, Vec::new());
-                }
-            };
-            let auth_provider = match hydrated_auth.create_provider_arc() {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::debug!(error = %e, "virtual ledger-info: auth provider build failed; counts omitted");
-                    return (HashMap::new(), None, Vec::new());
-                }
-            };
-            let catalog_config = RestCatalogConfig {
-                uri: uri.clone(),
-                warehouse: warehouse.clone(),
-                ..Default::default()
-            };
-            match RestCatalogClient::new(catalog_config, auth_provider) {
-                Ok(client) => {
-                    let client: Arc<dyn SendCatalogClient> = Arc::new(client);
-                    cache.put_catalog_client(client_fp, Arc::clone(&client));
-                    client
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "virtual ledger-info: catalog client build failed; counts omitted");
-                    return (HashMap::new(), None, Vec::new());
-                }
-            }
+    // Every catalog-backed source (REST, AWS Glue, AWS S3 Tables) is counted
+    // through the SAME process-wide client the scan path uses
+    // (graph_source::shared_catalog_client, keyed by catalog_client_cache_key), so
+    // `/info` and query execution share one OAuth token / SDK client + connection
+    // pool, warmed by whichever runs first. A Direct (table-location) source has no
+    // catalog to ask. Best-effort: a client that cannot be built just omits counts,
+    // like every other failure in this display-only path.
+    let catalog = match crate::graph_source::shared_catalog_client(
+        fluree,
+        &record.graph_source_id,
+        &record.config,
+        cfg,
+    )
+    .await
+    {
+        Ok(Some(catalog)) => catalog,
+        Ok(None) => return (HashMap::new(), None, Vec::new()),
+        Err(e) => {
+            tracing::debug!(error = %e, "virtual ledger-info: catalog client build failed; counts omitted");
+            return (HashMap::new(), None, Vec::new());
         }
     };
 
@@ -1749,7 +1713,7 @@ async fn fetch_virtual_table_row_counts(
                     let id = parse_table_identifier(&table).ok()?;
                     let api_id = crate::graph_source::TableIdentifier::new(id.namespace, id.table);
                     let catalog_table_id = api_id.to_catalog();
-                    let load = match SendCatalogClient::load_table(
+                    let mut load = match SendCatalogClient::load_table(
                         &*catalog,
                         &catalog_table_id,
                         vended,
@@ -1762,7 +1726,20 @@ async fn fetch_virtual_table_row_counts(
                             return None;
                         }
                     };
-                    let metadata = load.metadata.as_ref()?;
+                    // Inline (REST), else the caches a query filled, else one read of
+                    // the metadata file (Glue / S3 Tables return a location only).
+                    let metadata = match crate::graph_source::catalog_table_metadata(
+                        fluree, cfg, &mut load,
+                    )
+                    .await
+                    {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::debug!(table = %table, error = %e, "virtual ledger-info: table metadata unreadable; count omitted");
+                            return None;
+                        }
+                    };
+                    let metadata = metadata.as_ref();
                     // MoR rider (F-AUD-1): the snapshot-summary `total-records` this
                     // count derives from OVER-COUNTS a merge-on-read table (it does not
                     // subtract position/equality deletes, which Fluree recognizes but
