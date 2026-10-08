@@ -18,6 +18,8 @@
 //!   metadata file next to the committed one is never read (100, not 0);
 //! - one source joins two Glue tables named by its mapping (200);
 //! - a table missing from Glue and a non-Iceberg (Hive) Glue table fail clearly;
+//! - materialize scans (full, incremental from a snapshot, pinned to one) and a
+//!   time-pinned query read the snapshots Glue's metadata names;
 //! - browse lists the Glue database and only its Iceberg tables; preview reads
 //!   the schema from the metadata file (Glue returns no inline metadata).
 //!
@@ -37,10 +39,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use fluree_db_api::{
-    browse_iceberg_catalog, preview_iceberg_table, BrowseDepth, FlureeBuilder,
+    browse_iceberg_catalog, preview_iceberg_table, BrowseDepth, FlureeBuilder, FlureeR2rmlProvider,
     IcebergConnectionConfig, IcebergCreateConfig, R2rmlCreateConfig, R2rmlMappingInput, StatsTier,
     TableIdentifier,
 };
+use futures::TryStreamExt;
 
 const REGION: &str = "us-east-1";
 
@@ -92,6 +95,26 @@ fn load_fixture() -> Fixture {
         database: text(&json, "database"),
         tables,
     }
+}
+
+/// The parent of a fixture table's current snapshot (the state before its last
+/// append), read from the fixture's own copy of the metadata Glue points at.
+fn parent_snapshot(fixture: &Fixture, table: &str) -> i64 {
+    let (_, _, _, parameters) = fixture
+        .tables
+        .iter()
+        .find(|(name, ..)| name == table)
+        .expect("fixture table");
+    let location = &parameters["metadata_location"];
+    let key = location
+        .strip_prefix(&format!("s3://{}/", fixture.bucket))
+        .expect("metadata in the fixture bucket");
+    let json = std::fs::read_to_string(fixture_dir().join("objects").join(key))
+        .expect("read fixture metadata");
+    let metadata =
+        fluree_db_iceberg::metadata::TableMetadata::from_json_str(&json).expect("parse metadata");
+    let current = metadata.current_snapshot().expect("current snapshot");
+    current.parent_snapshot_id.expect("two appends")
 }
 
 fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -398,6 +421,55 @@ async fn glue_catalog_mode_reads_tables_resolved_through_glue() {
         .await,
         Ok(200),
     );
+    // Materialize / incremental scans and a time-pinned query over Glue: `orders`
+    // is two appends of 100 rows, so a dropped pin or window reads all 200.
+    let first = parent_snapshot(&fixture, "orders");
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    let orders_table = format!("{db}.orders");
+    let scanned = |from: Option<i64>, to: Option<i64>| {
+        let provider = &provider;
+        let orders_table = &orders_table;
+        async move {
+            let scan = provider
+                .scan_for_materialize_stream("orders:main", orders_table, &[], from, to, None)
+                .await
+                .map_err(|e| e.to_string())?;
+            let batches: Vec<_> = scan.stream.try_collect().await.map_err(|e| e.to_string())?;
+            Ok::<usize, String>(batches.iter().map(|b| b.num_rows).sum())
+        }
+    };
+    expect(
+        "materialize: a full scan reads the current snapshot",
+        scanned(None, None).await,
+        Ok(200),
+    );
+    expect(
+        "materialize: an incremental scan reads only the last append",
+        scanned(Some(first), None).await,
+        Ok(100),
+    );
+    expect(
+        "materialize: a scan pinned to the first snapshot reads its rows",
+        scanned(None, Some(first)).await,
+        Ok(100),
+    );
+    let pinned = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": format!("orders:main@snapshot:{first}"),
+        "select": ["?s"],
+        "where": {"@id": "?s", "@type": "ex:Order"},
+    });
+    expect(
+        "a query pinned to the first snapshot",
+        fluree
+            .query_from()
+            .jsonld(&pinned)
+            .execute_formatted()
+            .await
+            .map(|rows| rows.as_array().map_or(0, Vec::len))
+            .map_err(|e| e.to_string()),
+        Ok(100),
+    );
     expect(
         "a table missing from Glue fails clearly",
         rows(
@@ -424,6 +496,25 @@ async fn glue_catalog_mode_reads_tables_resolved_through_glue() {
         .await,
         Err("is not an Iceberg table"),
     );
+
+    // `/info` for a Glue source: the catalog object and the per-table row count
+    // (read from the metadata file Glue points at; Glue returns none inline).
+    match fluree.ledger_info("customers:main").execute().await {
+        Ok(info) => {
+            let source = &info["source"];
+            let count = source["table-row-counts"][format!("{db}.customers")].as_i64();
+            let kind = source["catalog"]["type"].as_str();
+            let ok = count == Some(50) && kind == Some("glue");
+            eprintln!(
+                "{} info: catalog={kind:?} customers={count:?}",
+                if ok { "pass" } else { "FAIL" }
+            );
+            if !ok {
+                failures.push(format!("info: {source}"));
+            }
+        }
+        Err(e) => failures.push(format!("info: {e}")),
+    }
 
     // Onboarding: browse lists the database and only its Iceberg tables.
     match browse_iceberg_catalog(glue_connection(&endpoint), BrowseDepth::Tables).await {
