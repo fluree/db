@@ -36,14 +36,15 @@ use std::collections::{BTreeMap, HashMap};
 /// ```
 /// An RDF 1.2 reifier attachment: `reifier` reifies `triple`.
 ///
-/// Fluree's edge-annotation model reifies *asserted* edges, so the base
-/// triple is always present in the graph's triple list as well; this record
-/// only carries the attachment. The reifier's own description (an
-/// annotation body such as `{| ex:confidence 0.9 |}`) is ordinary triples
-/// with `reifier` as their subject.
+/// This record only carries the attachment. The triple is asserted when the
+/// graph's triple list also holds it, as an annotation (`s p o {| … |}`)
+/// makes it; a reified triple (`<< s p o >>`, `r rdf:reifies <<( s p o )>>`)
+/// leaves it unasserted. The reifier's own description (an annotation body
+/// such as `{| ex:confidence 0.9 |}`) is ordinary triples with `reifier` as
+/// their subject.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Reification {
-    /// The reified (and asserted) base triple.
+    /// The reified triple, asserted only when the graph also holds it.
     pub triple: Triple,
     /// The reifier: an IRI or a blank node.
     pub reifier: Term,
