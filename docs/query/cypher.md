@@ -408,9 +408,11 @@ ORDER BY / SKIP / LIMIT
   gives each `p` its youngest friend. The body may be a `UNION` / `UNION ALL`
   of branches with a common column shape (`UNION` dedups per correlation group;
   every branch references the same imports and projects the same columns).
-  A correlated aggregating CALL (`CALL (p) { … RETURN count(f) }`) is grouped
-  per import, so an import with **zero inner matches yields no row** — wrap the
-  inner `MATCH` in `OPTIONAL MATCH` to retain it as a `0`. **Scope is strict:**
+  An aggregate in a correlated CALL body (`CALL (p) { … RETURN count(f) }`, or
+  `WITH count(f) AS c` inside it) is grouped per import, so an import with
+  **zero inner matches yields no row**, even for an aggregate with no grouping
+  key — wrap the inner `MATCH` in `OPTIONAL MATCH` to retain it as a `0` (or
+  `[]` for `collect`). **Scope is strict:**
   every import must already be bound outside, a RETURN may not re-bind any
   outer name, and the body may not reuse an outer variable's name internally
   without importing it (rename it, or add it to the scope clause, or use
