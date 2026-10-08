@@ -253,6 +253,59 @@ async fn commit_show_without_policy_returns_all_flakes() {
 }
 
 #[tokio::test]
+async fn commit_show_resolves_triple_terms() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/commit-show-triple-terms:main";
+    let turtle = r#"
+        @prefix ex: <http://example.org/> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        ex:claim rdf:reifies <<( ex:carol ex:says <<( ex:dave ex:label "hi"@en )>> )>> .
+    "#;
+    let t = fluree
+        .insert_turtle(genesis_ledger(&fluree, ledger_id), turtle)
+        .await
+        .expect("insert")
+        .ledger
+        .t();
+
+    let detail = fluree
+        .graph(ledger_id)
+        .commit_t(t)
+        .execute()
+        .await
+        .expect("commit show");
+    let link = detail
+        .flakes
+        .iter()
+        .find(|f| f.p.ends_with("reifies"))
+        .expect("the rdf:reifies link");
+    // A triple term is the flake tuple it names, without the operation.
+    let ex = |name: &str| format!("http://example.org/{name}");
+    let triple_term = "https://ns.flur.ee/db#tripleTerm";
+    assert_eq!(
+        serde_json::to_value(link).unwrap(),
+        json!([
+            ex("claim"),
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies",
+            [
+                ex("carol"),
+                ex("says"),
+                [
+                    ex("dave"),
+                    ex("label"),
+                    "hi",
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString",
+                    {"lang": "en"}
+                ],
+                triple_term
+            ],
+            triple_term,
+            true
+        ])
+    );
+}
+
+#[tokio::test]
 async fn commit_show_with_identity_filters_flakes_by_policy() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/commit-show-policy-filter:main";

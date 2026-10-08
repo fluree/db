@@ -60,6 +60,10 @@ Each flake is a tuple: `[subject, predicate, object, datatype, operation]`
 - `operation`: `true` = assert (added), `false` = retract (removed)
 - Ref objects use `"@id"` as the datatype
 - When metadata is present (language tag, list index, or named graph), a 6th element is appended: `{"lang": "en", "i": 0, "graph": "ex:myGraph"}`
+- An RDF 1.2 triple term (datatype `f:tripleTerm`), such as the object of an
+  `rdf:reifies` link, is itself a tuple: the triple it names, as
+  `[subject, predicate, object, datatype]` with `{"lang": "en"}` appended for
+  a language-tagged object. Its object may be another triple term.
 
 ## Examples
 

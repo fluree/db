@@ -533,7 +533,7 @@ Authorization: Bearer <token>   (when data auth is enabled)
 }
 ```
 
-Each flake is a tuple: `[subject, predicate, object, datatype, operation]`. Operation `true` = assert (added), `false` = retract (removed). When metadata is present (language tag, list index, or named graph), a 6th element is appended.
+Each flake is a tuple: `[subject, predicate, object, datatype, operation]`. Operation `true` = assert (added), `false` = retract (removed). When metadata is present (language tag, list index, or named graph), a 6th element is appended. An RDF 1.2 triple term object (datatype `f:tripleTerm`) is itself a tuple, the triple it names: `[subject, predicate, object, datatype]`, with `{"lang": ...}` appended for a language-tagged object.
 
 **Policy filtering:** Flakes are filtered by the caller's data-auth identity (extracted from the Bearer token) and the server's configured `default_policy_class`. When neither is present, all flakes are returned (root/admin access). Flakes the caller cannot read are silently omitted — the `asserts` and `retracts` counts reflect only the visible flakes. Unlike the query endpoints, show does not accept per-request policy overrides via headers or request body.
 
