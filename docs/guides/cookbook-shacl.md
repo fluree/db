@@ -319,6 +319,15 @@ ex:PersonShape a sh:NodeShape ;
   ] .
 ```
 
+A node conforms to a referenced shape only when validating it there reports
+nothing, whatever the severity of what it reports (SHACL §3.5). This holds for
+`sh:node`, `sh:not`, `sh:and`, `sh:or`, `sh:xone` and `sh:qualifiedValueShape`
+alike. So a Warning shape referenced through `sh:node` still makes a node fail
+`sh:node`, and its result is reported under the referencing shape, at that
+shape's severity: a Violation outer shape rejects the write, and a Warning one
+logs it. A constraint that cannot run is reported at the outermost referencing
+shape's severity too.
+
 Recursive references are safe: a shape may reference itself (directly or via a
 chain), and validation over cyclic data (e.g. a mutual `ex:knows` graph)
 terminates — a node already being validated against a shape higher in the
