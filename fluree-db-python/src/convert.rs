@@ -345,6 +345,25 @@ pub(crate) fn iri<'py>(py: Python<'py>, iri: &str) -> PyResult<Bound<'py, PyAny>
     term_class(py, &IRI_CLASS, "IRI")?.call1((iri,))
 }
 
+/// Whether `obj` is exactly a `fluree.IRI` or a `fluree.BlankNode`.
+pub(crate) fn is_node(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let (py, class) = (obj.py(), obj.get_type());
+    Ok(class.is(term_class(py, &IRI_CLASS, "IRI")?)
+        || class.is(term_class(py, &BLANK_NODE_CLASS, "BlankNode")?))
+}
+
+/// Whether `obj` is exactly a `fluree.Triple`.
+pub(crate) fn is_triple(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(obj
+        .get_type()
+        .is(term_class(obj.py(), &TRIPLE_CLASS, "Triple")?))
+}
+
+/// `label` as a `fluree.BlankNode`.
+pub(crate) fn blank_node<'py>(py: Python<'py>, label: &str) -> PyResult<Bound<'py, PyAny>> {
+    term_class(py, &BLANK_NODE_CLASS, "BlankNode")?.call1((label,))
+}
+
 fn term_class<'py>(
     py: Python<'py>,
     cell: &'static PyOnceLock<Py<PyType>>,

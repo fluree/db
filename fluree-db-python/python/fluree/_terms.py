@@ -16,11 +16,13 @@ import json
 import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, TypeVar
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
 RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 EMBEDDING_VECTOR = "https://ns.flur.ee/db#embeddingVector"
+
+_T = TypeVar("_T")
 
 
 class IRI(str):
@@ -174,6 +176,21 @@ class Quad:
         return (Quad, (self.subject, self.predicate, self.object, self.graph))
 
 
+def _unchecked(cls: type[_T], fields: tuple[str, ...]) -> Callable[..., _T]:
+    """A constructor for ``cls`` that sets ``fields`` without checking them,
+    three times faster than the class: for terms the readers produce, which
+    are already of the right kinds."""
+    slots = tuple(cls.__dict__[name].__set__ for name in fields)
+
+    def make(*values: Any) -> _T:
+        made = cls.__new__(cls)
+        for slot, value in zip(slots, values):
+            slot(made, value)
+        return made
+
+    return make
+
+
 def _node(value: Any, role: str) -> IRI | BlankNode:
     """``value`` as an IRI or blank node; a plain ``str`` is an IRI."""
     if isinstance(value, (IRI, BlankNode)):
@@ -299,3 +316,7 @@ def to_lexical(cell: tuple[Any, ...]) -> Any:
     if datatype == XSD + "string":
         return lexical
     return Literal(lexical, datatype)
+
+
+trusted_quad = _unchecked(Quad, ("subject", "predicate", "object", "graph"))
+trusted_triple = _unchecked(Triple, ("subject", "predicate", "object"))

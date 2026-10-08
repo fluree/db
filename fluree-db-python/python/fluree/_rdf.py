@@ -9,7 +9,7 @@ from typing import Any, TypeGuard
 from typing import Literal as _Literal
 
 from fluree import _fluree as native
-from fluree._terms import BlankNode, Quad, to_lexical, to_python
+from fluree._terms import BlankNode, Quad, to_lexical, to_python, trusted_quad, trusted_triple
 from fluree.errors import InvalidRequestError
 
 RdfFormat = _Literal["turtle", "trig", "ntriples", "nquads"]
@@ -59,11 +59,16 @@ def parse(
         raise InvalidRequestError("pass format= (turtle, trig, ntriples or nquads)")
     if literals not in ("value", "lexical"):
         raise InvalidRequestError(f"literals= is 'value' or 'lexical', not {literals!r}")
-    term = to_python if literals == "value" else to_lexical
-    return [
-        Quad(term(s), term(p), term(o), None if g is None else term(g))
-        for s, p, o, g in native.parse_rdf(data, format, base)
-    ]
+    literal = to_python if literals == "value" else to_lexical
+
+    def value(term: Any) -> Any:
+        if type(term) is not tuple:
+            return term
+        if term[0] == "triple":
+            return trusted_triple(term[1], term[2], value(term[3]))
+        return literal(term)
+
+    return [trusted_quad(s, p, value(o), g) for s, p, o, g in native.parse_rdf(data, format, base)]
 
 
 def serialize(
@@ -81,7 +86,7 @@ def serialize(
     and write IRIs with them. A quad ``(r, rdf:reifies, Triple(...))`` is
     written as an annotation where the format has one.
     """
-    return native.serialize_rdf([_quad(q) for q in quads], format, prefixes)
+    return native.serialize_rdf([q if type(q) is Quad else _quad(q) for q in quads], format, prefixes)
 
 
 def _quad(item: Quad | tuple[Any, ...]) -> Quad:
