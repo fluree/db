@@ -428,20 +428,29 @@ cancellation, unless that write was the commit itself, which completes;
 
 ## Concurrency
 
-Engine calls release the GIL, so threads can query in parallel. Several
-processes may share one database directory; a commit that loses a race to
-another process is retried against the new state, a bounded number of times
-before it raises `ConflictError`. Hand writes that contend heavily to
-`transact`, which runs them again on a conflict.
+Engine calls release the GIL, so threads can query in parallel, and each
+thread's writes land on the latest commit. A transaction that read the ledger
+raises `ConflictError` when another write lands before it commits; hand such
+work to `transact`, which runs it again.
+
+One process owns a database directory, through one connection that its
+threads share. A second process, or a second connection, that opens the same
+directory is not coordinated with the first: it does not see the first's
+commits, and both index and clean up the same files. To share a database
+across processes, run a Fluree server and send their requests to it.
+`":memory:"` connections and directories of their own have no such limit.
 
 A process forked after Fluree started in its parent cannot use it: the
 engine's threads do not survive a fork, and the lock state they leave behind
 is unsafe to reuse, so the child raises `FlureeError` rather than risk a
-crash. Use the `spawn` or `forkserver` start method for a `multiprocessing`
-pool (`multiprocessing.get_context("spawn")`; Python before 3.14 defaults to
-`fork` on Linux), or fork before Fluree is first used, as gunicorn does
-unless the app is preloaded. A connection opened before the fork raises
-`FlureeError` in the child too, and is left alone when the child exits.
+crash. A connection opened before the fork raises `FlureeError` in the child
+too, and is left alone when the child exits. For a `multiprocessing` pool,
+use the `spawn` or `forkserver` start method
+(`multiprocessing.get_context("spawn")`; Python before 3.14 defaults to
+`fork` on Linux), and have each process that uses Fluree open a database of
+its own. Serve a web app from one worker process with threads or asyncio
+(gunicorn `--workers 1 --threads 8`, or one uvicorn worker), not several
+workers on one directory.
 
 ## Development
 
