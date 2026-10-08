@@ -18,6 +18,8 @@ JSON-LD or Turtle and query it with SPARQL or JSON-LD::
             print(name, age)
 """
 
+from importlib.metadata import version as _version
+
 from fluree._connection import Connection, Ledger, QueryProfile, Snapshot, Transaction, connect
 from fluree._graph import Node, Path, Relationship
 from fluree._records import (
@@ -37,7 +39,6 @@ from fluree._records import (
     ValidationResult,
     VerifyReport,
 )
-from fluree._fluree import __version__
 from fluree._logging import set_log_level
 from fluree._results import Record, Result, RowStream
 from fluree._sources import (
@@ -61,6 +62,9 @@ from fluree.errors import (
     ShaclViolationError,
     UniqueConstraintError,
 )
+
+# The package's version: the engine's, or a Python-only release's own.
+__version__ = _version("fluree")
 
 __all__ = [
     "AzureServicePrincipal",
