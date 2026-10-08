@@ -104,6 +104,7 @@ pub(crate) mod runtime_dicts;
 pub mod server_defaults;
 pub(crate) mod sparql_lang;
 mod time_resolve;
+mod transaction;
 pub mod tx;
 pub mod tx_builder;
 #[cfg(feature = "shacl")]
@@ -219,6 +220,7 @@ pub use rebase::{
 };
 pub use revert::{RevertReport, RevertSelection, StagedRevert};
 pub use revert_preview::{RevertConflictSummary, RevertPreview, RevertPreviewOpts};
+pub use transaction::{CypherReturn, Savepoint, Transaction, TransactionOptions, TxnOperation};
 pub use tx::{
     IndexingMode, IndexingStatus, StageResult, TrackedTransactionInput, TransactResult,
     TransactResultRef,
@@ -363,7 +365,7 @@ pub use fluree_db_transact::{
 // Re-export SPARQL types (product feature; always enabled)
 pub use fluree_db_sparql::{
     lower_sparql, parse_sparql, validate as validate_sparql, Capabilities as SparqlCapabilities,
-    Diagnostic as SparqlDiagnostic, LowerError as SparqlLowerError,
+    Diagnostic as SparqlDiagnostic, LowerError as SparqlLowerError, ParamMap as SparqlParamMap,
     ParseOutput as SparqlParseOutput, Prologue as SparqlPrologue, QueryBody as SparqlQueryBody,
     Severity as SparqlSeverity, SourceSpan as SparqlSourceSpan, SparqlAst,
     UpdateOperation as SparqlUpdateOperation,
@@ -897,6 +899,10 @@ where
         self.commit.permits_plaintext_cache() && self.index.permits_plaintext_cache()
     }
 
+    fn is_remote(&self) -> bool {
+        self.commit.is_remote() || self.index.is_remote()
+    }
+
     /// Both tiers encrypted under the same key set rotate as one store.
     /// Otherwise there is no single key set to rotate to: `None`. In-repo
     /// builds encrypt above the tiers instead, where this is not consulted.
@@ -1136,6 +1142,10 @@ impl StorageRead for AddressIdentifierResolverStorage {
         self.route(address).resolve_local_path(address)
     }
 
+    fn resolve_local_bytes(&self, address: &str) -> Option<Arc<[u8]>> {
+        self.route(address).resolve_local_bytes(address)
+    }
+
     fn permits_plaintext_cache(&self) -> bool {
         // No address to route on — permit only if every routable storage does.
         self.default.permits_plaintext_cache()
@@ -1143,6 +1153,14 @@ impl StorageRead for AddressIdentifierResolverStorage {
                 .identifier_map
                 .values()
                 .all(fluree_db_core::StorageRead::permits_plaintext_cache)
+    }
+
+    fn is_remote(&self) -> bool {
+        self.default.is_remote()
+            || self
+                .identifier_map
+                .values()
+                .any(fluree_db_core::StorageRead::is_remote)
     }
 
     /// The default storage's admin. Every write and every listing goes to

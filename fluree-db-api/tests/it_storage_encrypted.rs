@@ -359,11 +359,12 @@ async fn build_client_file_honours_key_and_spills_no_plaintext() {
     );
 }
 
-/// Memory storage has no local path, so its readers go through the disk
-/// cache: an unencrypted client populates it (which is what makes the
-/// encrypted assertion non-vacuous), an encrypted one leaves it empty.
+/// Memory storage is never disk-cached, encrypted or not, and the key is still
+/// honoured. That encryption keeps a cached store's plaintext off disk is
+/// pinned on remote storage, where a cache exists:
+/// `it_disk_cache_locality::encrypted_remote_storage_writes_nothing_to_the_disk_cache`.
 #[tokio::test]
-async fn build_client_memory_honours_key_and_bypasses_disk_cache() {
+async fn build_client_memory_honours_key_and_writes_no_disk_cache() {
     async fn cached_files_for(key: Option<&str>) -> Vec<std::path::PathBuf> {
         let data = tempfile::TempDir::new().expect("tempdir");
         let cache = tempfile::TempDir::new().expect("tempdir");
@@ -386,17 +387,14 @@ async fn build_client_memory_honours_key_and_bypasses_disk_cache() {
         files
     }
 
-    let plain = cached_files_for(None).await;
-    assert!(
-        !plain.is_empty(),
-        "unencrypted reads should populate the disk cache"
-    );
-
-    let encrypted = cached_files_for(Some(KEY_B64)).await;
-    assert!(
-        encrypted.is_empty(),
-        "encrypted reads spilled plaintext to the disk cache: {encrypted:?}"
-    );
+    for key in [None, Some(KEY_B64)] {
+        let files = cached_files_for(key).await;
+        assert!(
+            files.is_empty(),
+            "memory storage wrote to the disk cache (encrypted: {}): {files:?}",
+            key.is_some()
+        );
+    }
 }
 
 /// The S3 branch of the JSON-LD parser carries `AES256Key` like the file

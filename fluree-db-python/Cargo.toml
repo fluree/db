@@ -1,0 +1,50 @@
+[package]
+name = "fluree-db-python"
+version.workspace = true
+edition.workspace = true
+# The repository's LICENSE, which maturin puts in the wheel; the license
+# expression (BUSL-1.1) comes from pyproject.toml.
+license-file = "../LICENSE"
+repository.workspace = true
+description = "Native core of the `fluree` Python package"
+# Distributed as the `fluree` wheel (built by maturin), not on crates.io.
+publish = false
+
+[lib]
+name = "_fluree"
+crate-type = ["cdylib"]
+# The tests are pytest suites under tests/; a Rust test harness for an
+# extension module would have to link libpython, which CI does not provide.
+test = false
+doctest = false
+
+[dependencies]
+bytes = "1"
+# The engine features the CLI ships with (fluree-db-cli's default set, less
+# its server): S3/DynamoDB storage, SHACL, Iceberg / SQL / Delta graph
+# sources, and GraphQL.
+fluree-db-api = { path = "../fluree-db-api", features = [
+    "native",
+    "shacl",
+    "aws",
+    "iceberg",
+    "sql",
+    "delta",
+    "graphql",
+] }
+fluree-db-core = { path = "../fluree-db-core" }
+fluree-db-nameservice = { path = "../fluree-db-nameservice" }
+fluree-db-query = { path = "../fluree-db-query" }
+fluree-db-sparql = { path = "../fluree-db-sparql" }
+fluree-vocab = { path = "../fluree-vocab" }
+pyo3 = "0.29"
+pythonize = "0.29"
+serde = { workspace = true }
+serde_json = { workspace = true }
+stacker = "0.1"
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

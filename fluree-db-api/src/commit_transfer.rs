@@ -2086,7 +2086,13 @@ impl Fluree {
         self.create_ledger(new_ledger_id).await?;
 
         match self.restore_into_created(new_ledger_id, reader).await {
-            Ok(result) => Ok(result),
+            Ok(result) => {
+                // `create_ledger` cached the empty genesis state, and the
+                // restore then moved the heads underneath it; drop that handle
+                // so the next read loads the restored ledger.
+                self.disconnect_ledger(new_ledger_id).await;
+                Ok(result)
+            }
             Err(e) => {
                 // Roll back so we never leave a ledger whose head points at
                 // partially-ingested data. `restore_ledger` only reaches here

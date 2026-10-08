@@ -110,7 +110,7 @@ pub struct IndexerConfig {
     /// Even if an index exceeds `gc_max_old_indexes`, it won't be deleted until
     /// it's at least this old. This prevents deleting indexes that concurrent
     /// queries might still be using.
-    /// Default: 30 minutes
+    /// Default: 15 minutes
     pub gc_min_time_mins: u32,
 
     /// Retained old index versions past which `gc_min_time_mins` is overridden

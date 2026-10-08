@@ -87,7 +87,8 @@ fn upsert_payload_id(txn_json: &JsonValue, named_graphs: &[NamedGraphBlock]) -> 
 ///    (namespace adoption, policy, SHACL, uniqueness) — per-op validation is a
 ///    documented semantics choice (see `stage_transaction_from_txns`);
 /// 2. its flakes fold into the merged set re-stamped to the final commit `t`
-///    (`base.t() + 1`), last-wins per fact identity `(g, s, p, o, dt, m)`;
+///    (`base.t() + 1`), last-wins per fact identity `(g, s, p, o, dt, m)`,
+///    less the facts a later operation reversed (see [`Self::finish`]);
 /// 3. (when `advance`) the flakes overlay onto the state as committed novelty
 ///    (a commit-record-less "virtual commit",
 ///    [`LedgerState::apply_staged_flakes_for_sequential_staging`]) so the next
@@ -101,6 +102,10 @@ pub(crate) struct SequentialStager {
     original: LedgerState,
     final_t: i64,
     folded: Vec<fluree_db_core::Flake>,
+    /// The op each folded fact was FIRST staged with, by `folded` index. A
+    /// fact whose first and last ops differ may net to no change; see
+    /// [`Self::finish`].
+    first_ops: Vec<bool>,
     fold_index: HashMap<SequentialFactKey, usize>,
     /// Simulated sequential per-op graph-id assignment, so the merged view's
     /// routing matches the ids each op's staging (and each intermediate
@@ -146,6 +151,7 @@ impl SequentialStager {
             original: ledger.clone(),
             final_t,
             folded: Vec::new(),
+            first_ops: Vec::new(),
             fold_index: HashMap::new(),
             sim_registry: ledger.snapshot.graph_registry.clone(),
             merged_graph_iris: Vec::new(),
@@ -179,13 +185,29 @@ impl SequentialStager {
         tracker: Option<&Tracker>,
         advance: bool,
     ) -> Result<usize> {
+        self.stage_with(advance, |state| {
+            fluree.stage_transaction_from_txn(state, txn, index_config, policy, tracker)
+        })
+        .await
+    }
+
+    /// [`Self::stage`] for an operation staged by any staging entry point:
+    /// `stage` receives the virtual state and returns its [`StageResult`].
+    /// A stage that fails, or whose future is dropped, leaves the stager as
+    /// it was.
+    pub(crate) async fn stage_with<F, Fut>(&mut self, advance: bool, stage: F) -> Result<usize>
+    where
+        F: FnOnce(LedgerState) -> Fut,
+        Fut: std::future::Future<Output = Result<StageResult>>,
+    {
         let state = self
             .current
-            .take()
+            .clone()
             .expect("virtual state consumed by a final non-advancing stage");
-        let result = fluree
-            .stage_transaction_from_txn(state, txn, index_config, policy, tracker)
-            .await?;
+        let result = stage(state).await?;
+        // Released before the apply below, whose copy-on-write would
+        // otherwise deep-copy everything this pre-operation state shares.
+        self.current = None;
         // The staged delta, which includes graphs `GRAPH ?g` templates resolved
         // to; needed to advance the virtual state between operations.
         let graph_iris: Vec<String> = result.graph_delta.values().cloned().collect();
@@ -231,6 +253,7 @@ impl SequentialStager {
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert(self.folded.len());
+                    self.first_ops.push(merged.op);
                     self.folded.push(merged);
                 }
             }
@@ -256,10 +279,50 @@ impl SequentialStager {
         Ok(staged_count)
     }
 
+    /// Drop the folded facts that a later operation reversed back to how the
+    /// ORIGINAL base had them: asserted then retracted when the base lacks
+    /// the fact, or retracted then re-asserted when it has it. Last-wins
+    /// alone would commit the final op — a retraction of a fact the ledger
+    /// never held, for `INSERT x ; DELETE x`. Only facts whose first and last
+    /// ops differ are looked up; the base decides because staging does not
+    /// filter an assert of a fact already present (or a retract of one
+    /// absent), so the first op does not say what the base held.
+    async fn drop_reversed_facts(&mut self) -> Result<()> {
+        let mut keep = vec![true; self.folded.len()];
+        for (i, flake) in self.folded.iter().enumerate() {
+            if flake.op == self.first_ops[i] {
+                continue;
+            }
+            let key =
+                fluree_db_core::ConflictKey::new(flake.s.clone(), flake.p.clone(), flake.g.clone());
+            let in_base = crate::rebase::current_asserted_for_key(&self.original, &key)
+                .await?
+                .iter()
+                .any(|f| f.o == flake.o && f.dt == flake.dt && f.m == flake.m);
+            keep[i] = flake.op != in_base;
+        }
+        if keep.iter().all(|k| *k) {
+            return Ok(());
+        }
+        let mut keep = keep.into_iter();
+        self.folded.retain(|_| keep.next().unwrap_or(true));
+        Ok(())
+    }
+
     /// Merge every staged operation into one [`StageResult`] over the
     /// ORIGINAL base. Valid with zero staged operations (an all-no-op run):
     /// the result is an empty staged view.
-    pub(crate) fn finish(self) -> Result<StageResult> {
+    pub(crate) async fn finish(mut self) -> Result<StageResult> {
+        let graphs_staged: FxHashSet<Option<Sid>> =
+            self.folded.iter().map(|flake| flake.g.clone()).collect();
+        self.drop_reversed_facts().await?;
+        let graphs_kept: FxHashSet<Option<Sid>> =
+            self.folded.iter().map(|flake| flake.g.clone()).collect();
+        // Graphs whose every staged fact a later operation reversed.
+        let netted_away: FxHashSet<Sid> = graphs_staged
+            .difference(&graphs_kept)
+            .filter_map(Clone::clone)
+            .collect();
         let mut ns_registry = match self.last_ns_registry {
             Some(reg) => reg,
             None => NamespaceRegistry::from_db(&self.original.snapshot),
@@ -289,6 +352,11 @@ impl SequentialStager {
                 graph_delta.insert(g_id, iri.clone());
             }
         }
+        // A graph the request introduced and then emptied again is not
+        // registered, as a reversed fact in the default graph is not
+        // committed. The ids here are the simulation's; the commit registers
+        // graphs by IRI, so leaving one out renumbers nothing.
+        graph_delta.retain(|_, iri| !netted_away.contains(&ns_registry.sid_for_iri(iri)));
 
         let view = StagedLedger::new(self.original, self.folded, &reverse_graph)?;
         Ok(StageResult {
@@ -1374,11 +1442,43 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
         );
     }
     if !reject_violations.is_empty() {
+        // The structured results name every identifier in full, as
+        // `validate` reports them; the message compacts them for reading.
+        let full = crate::format::IriCompactor::from_namespaces(violation_namespaces(view, &ctx));
+        let results = crate::validate::report_results(&reject_violations, &|sid| {
+            full.compact_id_sid(sid)
+                .unwrap_or_else(|_| fluree_db_shacl::unresolved_sid(sid))
+        });
         return Err(fluree_db_transact::TransactError::ShaclViolation(
-            format_violations(&reject_violations, &compactor),
+            fluree_db_transact::ShaclViolations::new(
+                format_violations(&reject_violations, &compactor),
+                results,
+            ),
         ));
     }
     Ok(true)
+}
+
+/// The namespaces a violation's identifiers resolve against: the snapshot's
+/// plus those the operation introduced and has not committed yet.
+#[cfg(feature = "shacl")]
+fn violation_namespaces(
+    view: &StagedLedger,
+    ctx: &StagedShaclContext<'_>,
+) -> std::sync::Arc<std::collections::HashMap<u16, String>> {
+    let base = view.base().snapshot.shared_namespaces();
+    match ctx.uncommitted_namespaces {
+        Some(uncommitted) if !uncommitted.is_empty() => {
+            let mut merged = (*base).clone();
+            merged.extend(
+                uncommitted
+                    .iter()
+                    .map(|(code, prefix)| (*code, prefix.clone())),
+            );
+            std::sync::Arc::new(merged)
+        }
+        _ => base,
+    }
 }
 
 /// Build the compactor that renders identifiers in violation messages.
@@ -1396,20 +1496,7 @@ fn violation_iri_compactor(
 ) -> crate::format::IriCompactor {
     use crate::format::IriCompactor;
 
-    let base = view.base().snapshot.shared_namespaces();
-    let namespace_codes = match ctx.uncommitted_namespaces {
-        Some(uncommitted) if !uncommitted.is_empty() => {
-            let mut merged = (*base).clone();
-            merged.extend(
-                uncommitted
-                    .iter()
-                    .map(|(code, prefix)| (*code, prefix.clone())),
-            );
-            std::sync::Arc::new(merged)
-        }
-        _ => base,
-    };
-
+    let namespace_codes = violation_namespaces(view, ctx);
     match ctx
         .txn_context
         .and_then(|raw| crate::ParsedContext::parse(None, raw).ok())
@@ -1976,7 +2063,13 @@ async fn enforce_unique_constraints(
                     })
                     .unwrap_or_else(|| format!("g_id={g_id}"))
             };
-            let value_str = format!("{o:?}");
+            let value_str = match o {
+                fluree_db_core::FlakeValue::String(s) => s.clone(),
+                fluree_db_core::FlakeValue::Ref(sid) => {
+                    snapshot.decode_sid(sid).unwrap_or_else(|| sid.to_string())
+                }
+                other => other.to_string(),
+            };
 
             // Pick two subjects for the error message
             let mut subj_iter = seen_subjects.iter();
@@ -3246,9 +3339,10 @@ impl crate::Fluree {
     ///    SHACL — no deferred constraints);
     /// 2. fold its flakes into the merged set, re-stamped to the final
     ///    commit `t` (`base.t() + 1`), last-wins per fact identity
-    ///    `(g, s, p, o, dt, m)` — so `INSERT x ; DELETE x` nets to the
-    ///    retract and `DELETE x ; INSERT x` nets to the assert, matching
-    ///    ordered application;
+    ///    `(g, s, p, o, dt, m)`, and a fact a later operation reversed back
+    ///    to how the base had it dropped — so `INSERT x ; DELETE x` commits
+    ///    nothing for a new `x` and `DELETE x ; INSERT x` nothing for an
+    ///    existing one, matching ordered application;
     /// 3. overlay them onto the state as committed novelty (a commit-
     ///    record-less "virtual commit",
     ///    [`LedgerState::apply_staged_flakes_for_sequential_staging`]) so
@@ -3296,7 +3390,7 @@ impl crate::Fluree {
                 .stage(self, txn, index_config, policy, tracker, advance)
                 .await?;
         }
-        stager.finish()
+        stager.finish().await
     }
 
     /// Stage a transaction with policy enforcement + tracking (opts.meta / opts.max-fuel).

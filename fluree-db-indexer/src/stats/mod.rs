@@ -31,7 +31,7 @@ pub use id_hook::{
     stats_record_from_v2, GraphPropertyKey, IdPropertyHll, IdStatsHook, IdStatsResult, StatsRecord,
 };
 pub use schema_extractor::{SchemaEntry, SchemaExtractor};
-pub use sketch_cas::{load_sketch_blob, HllPropertyEntry, HllSketchBlob};
+pub use sketch_cas::{HllPropertyEntry, HllSketchBlob, SketchDecodeError};
 
 use fluree_db_core::Flake;
 use fluree_db_core::{GraphStatsEntry, PrefixTrie, PropertyStatEntry};

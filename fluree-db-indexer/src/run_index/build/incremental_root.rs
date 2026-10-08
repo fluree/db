@@ -214,7 +214,15 @@ impl IncrementalRootBuilder {
     }
 
     /// Update HLL sketch ref.
+    ///
+    /// **GC note**: Records the old sketch CID as replaced unless the new
+    /// root still references it.
     pub fn set_sketch_ref(&mut self, cid: Option<ContentId>) {
+        if let Some(old) = self.root.sketch_ref.take() {
+            if cid.as_ref() != Some(&old) {
+                self.replaced_cids.push(old);
+            }
+        }
         self.root.sketch_ref = cid;
     }
 
@@ -346,6 +354,31 @@ mod tests {
         let (root, garbage) = b.build();
         assert!(root.legacy_annotation_arena.is_none());
         assert_eq!(garbage, blobs);
+    }
+
+    #[test]
+    fn set_sketch_ref_retires_the_superseded_sketch() {
+        let old = ContentId::new(ContentKind::StatsSketch, b"sketch-t1");
+        let new = ContentId::new(ContentKind::StatsSketch, b"sketch-t2");
+        let mut root = minimal_root();
+        root.sketch_ref = Some(old.clone());
+        let mut b = IncrementalRootBuilder::from_old_root(root, "test");
+        b.set_sketch_ref(Some(new.clone()));
+        let (root, garbage) = b.build();
+        assert_eq!(root.sketch_ref, Some(new));
+        assert_eq!(garbage, vec![old]);
+    }
+
+    #[test]
+    fn set_sketch_ref_keeps_an_unchanged_sketch_out_of_garbage() {
+        let same = ContentId::new(ContentKind::StatsSketch, b"sketch");
+        let mut root = minimal_root();
+        root.sketch_ref = Some(same.clone());
+        let mut b = IncrementalRootBuilder::from_old_root(root, "test");
+        b.set_sketch_ref(Some(same.clone()));
+        let (root, garbage) = b.build();
+        assert_eq!(root.sketch_ref, Some(same));
+        assert!(garbage.is_empty(), "live sketch must not be garbage");
     }
 
     #[test]

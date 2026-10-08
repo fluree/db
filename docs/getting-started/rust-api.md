@@ -393,6 +393,44 @@ async fn main() -> Result<()> {
 }
 ```
 
+#### Parameters
+
+`params` binds variables to values: each named variable (`?name` or `$name`,
+the same variable) is replaced by its value wherever it appears — subqueries,
+`OPTIONAL`, `FILTER`s and update templates included — before the query is
+planned, so it runs exactly as if the value had been written inline. Values
+take the JSON-LD forms: a JSON string, number or boolean; `{"@id": iri}`;
+`{"@value": v, "@type": datatype}` (`"@type": "@id"` reads `v` as an IRI);
+`{"@value": s, "@language": tag}`; and an embedding vector as its numbers,
+`{"@value": [0.1, 0.2], "@type": "https://ns.flur.ee/db#embeddingVector"}`.
+IRIs are full IRIs — neither the query's `PREFIX`es nor a `@context` apply. A
+blank node is the `_:fdb-…` id a query returned for a stored node; any other
+label is refused, since written inline it would be a variable and match every
+node.
+
+```rust
+let params = json!({ "name": "Alice", "min": 21 });
+let result = fluree.graph("mydb:main")
+    .query()
+    .sparql("PREFIX schema: <http://schema.org/>
+             SELECT ?person WHERE { ?person schema:name $name ; schema:age ?age FILTER(?age > $min) }")
+    .params(params.as_object().unwrap().clone())
+    .execute_formatted()
+    .await?;
+```
+
+A projected parameter stays a column holding its value. A parameter the query
+never mentions is an error — its misspelt variable would otherwise be unbound
+and match everything — as is one the query assigns itself (`BIND`, `VALUES`,
+`AS`), one used inside a remote `SERVICE` (whose body is sent as written), and
+any parameter on a JSON-LD query. Without parameters nothing changes: the
+query is not rewritten at all.
+
+The same parameters go on `QueryExecutionOptions::with_params`,
+`Fluree::explain_sparql_with_params`, a transact builder's
+`sparql_update_with_params(sparql, &params)`, and
+`TxnOperation::SparqlUpdate(sparql, Some(params))`.
+
 ### Streaming Query Results (NDJSON)
 
 The buffered `.query()` paths above collect the whole result set into a
@@ -652,7 +690,80 @@ async fn main() -> Result<()> {
 }
 ```
 
-**Note:** `StagedGraph` currently supports querying only. Staging on top of a staged transaction and committing from a `StagedGraph` are not yet supported.
+`StagedGraph` is a read-only preview of one transaction. To stage several
+writes, read between them, and commit them as one commit, use a
+`Transaction`.
+
+### Multi-Write Transactions
+
+`Fluree::begin_transaction` opens a transaction at the ledger's current head.
+Each `stage` applies its write over the ones before it (an update's `WHERE`
+sees an earlier insert), and is validated as it is staged: a write that fails
+to parse, is denied by policy, or violates SHACL returns an error and is left
+out, and the transaction carries on without it. `db()` reads the staged state.
+`commit` writes everything as one commit, keeping only the net change: a fact
+one write adds and a later one removes is not committed. If another commit
+lands first, a transaction that was never read is re-based over it when they
+touched different subjects, and otherwise staged again on the new head, under
+the policy the ledger has then. One that was read through `db()` fails with
+`TransactError::CommitConflict` instead — its writes may rest on what it read —
+and should be run again. A write that fails to stage doesn't count as a read:
+if what you stage next depends on that error, read the transaction through
+`db()` first.
+
+```rust
+use fluree_db_api::{CommitOpts, FlureeBuilder, Result, TransactionOptions, TxnOperation};
+use serde_json::json;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await?;
+
+    let mut txn = fluree
+        .begin_transaction("mydb:main", TransactionOptions::default())
+        .await?;
+    txn.stage(TxnOperation::Insert(json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:alice", "ex:age": 30
+    })))
+    .await?;
+    txn.stage(TxnOperation::SparqlUpdate(
+        "PREFIX ex: <http://example.org/ns/> \
+         DELETE { ex:alice ex:age ?a } INSERT { ex:alice ex:age ?b } \
+         WHERE { ex:alice ex:age ?a BIND(?a + 1 AS ?b) }"
+            .into(),
+        None, // parameters
+    ))
+    .await?;
+
+    let staged = txn.db().await?; // alice is 31 here; the ledger is unchanged
+    let result = txn.commit(CommitOpts::default()).await?;
+    println!("committed t={}", result.receipt.t);
+    Ok(())
+}
+```
+
+`TransactionOptions` sets what the transaction runs under: `governance`
+checks every write against that policy; `tracking` accounts for fuel, time and
+policy across every operation, so a `max_fuel` limit bounds the transaction as
+a whole and the tally comes back with the commit; `index_config` sets the
+novelty limits the commit is held to. `stage_cypher(query, params)` stages a
+Cypher write alongside the other operations — its `MATCH` and `MERGE` see
+them — and returns the rows of its `RETURN`, if any. Receiving those rows
+counts as reading the transaction, as `db()` does. Dropping a `Transaction`
+discards it.
+
+`savepoint()` marks the operations staged so far, and `rollback_to(savepoint)`
+discards the ones after it. The operations before the savepoint are staged
+again, so values computed as they stage — `NOW()`, `UUID()`, `STRUUID()`, a
+SPARQL update's blank nodes — can change; JSON-LD, Turtle and Cypher blank
+nodes keep their identities. Rolling back past a savepoint discards it, and
+returning to it later is an error.
+
+`commit` commits on the process's own write path, as Bolt's explicit
+transactions do, so transactions are for local-commit deployments: a Raft or
+peer host must not offer them to its clients.
 
 ### Export Data
 

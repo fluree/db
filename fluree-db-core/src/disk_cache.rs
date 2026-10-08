@@ -102,7 +102,8 @@ impl Drop for FlightGuard {
 pub struct DiskArtifactCache {
     root: PathBuf,
     budget_bytes: u64,
-    state: Mutex<DiskArtifactCacheState>,
+    /// Shared with the background scan that sizes the directory.
+    state: Arc<Mutex<DiskArtifactCacheState>>,
     /// Per-target single-flight coordination: coalesces concurrent remote
     /// fetches for the same cache target into one `cs.get` + one tmp-file write.
     /// Keyed by the resolved cache-target path (narrow: same content + same
@@ -114,6 +115,15 @@ pub struct DiskArtifactCache {
 #[derive(Debug, Default)]
 struct DiskArtifactCacheState {
     tracked_bytes: Option<u64>,
+    /// A background scan is sizing the directory; see
+    /// [`DiskArtifactCache::known_bytes`].
+    scanning: bool,
+    /// Entries written (positive) and evicted (negative) while that scan
+    /// runs, reconciled with what it saw.
+    pending: Vec<(PathBuf, i64)>,
+    /// Test hook: the background scan waits for this before walking.
+    #[cfg(test)]
+    scan_hold: Option<std::sync::mpsc::Receiver<()>>,
 }
 
 #[derive(Debug)]
@@ -186,6 +196,13 @@ fn create_dir_result_as_cache_outcome(res: io::Result<()>) -> io::Result<()> {
     }
 }
 
+#[cfg(test)]
+fn directory_bytes(root: &Path) -> io::Result<u64> {
+    Ok(scan_cache_entries(root)?
+        .into_iter()
+        .fold(0u64, |acc, entry| acc.saturating_add(entry.bytes)))
+}
+
 fn scan_cache_entries(root: &Path) -> io::Result<Vec<CacheEntry>> {
     let mut stack = vec![root.to_path_buf()];
     let mut entries = Vec::new();
@@ -239,7 +256,7 @@ impl DiskArtifactCache {
         Self {
             root: PathBuf::new(),
             budget_bytes: 0,
-            state: Mutex::new(DiskArtifactCacheState::default()),
+            state: Arc::new(Mutex::new(DiskArtifactCacheState::default())),
             inflight: Mutex::new(HashMap::new()),
             next_flight_generation: AtomicU64::new(0),
         }
@@ -255,7 +272,7 @@ impl DiskArtifactCache {
             return Self {
                 root,
                 budget_bytes: 0,
-                state: Mutex::new(DiskArtifactCacheState::default()),
+                state: Arc::new(Mutex::new(DiskArtifactCacheState::default())),
                 inflight: Mutex::new(HashMap::new()),
                 next_flight_generation: AtomicU64::new(0),
             };
@@ -318,7 +335,7 @@ impl DiskArtifactCache {
         Self {
             root,
             budget_bytes,
-            state: Mutex::new(DiskArtifactCacheState::default()),
+            state: Arc::new(Mutex::new(DiskArtifactCacheState::default())),
             inflight: Mutex::new(HashMap::new()),
             next_flight_generation: AtomicU64::new(0),
         }
@@ -330,7 +347,7 @@ impl DiskArtifactCache {
         Self {
             root,
             budget_bytes,
-            state: Mutex::new(DiskArtifactCacheState::default()),
+            state: Arc::new(Mutex::new(DiskArtifactCacheState::default())),
             inflight: Mutex::new(HashMap::new()),
             next_flight_generation: AtomicU64::new(0),
         }
@@ -348,26 +365,99 @@ impl DiskArtifactCache {
             .saturating_div(CACHE_EVICT_DENOMINATOR)
     }
 
+    /// The directory's size, scanning it now if it is not yet known.
+    #[cfg(test)]
     fn current_bytes(&self) -> io::Result<u64> {
-        let mut state = self.state.lock();
-        if let Some(bytes) = state.tracked_bytes {
+        if let Some(bytes) = self.state.lock().tracked_bytes {
             return Ok(bytes);
         }
-        let bytes = scan_cache_entries(&self.root)?
-            .into_iter()
-            .fold(0u64, |acc, entry| acc.saturating_add(entry.bytes));
-        state.tracked_bytes = Some(bytes);
+        let bytes = directory_bytes(&self.root)?;
+        self.set_current_bytes(bytes);
         Ok(bytes)
     }
 
-    fn set_current_bytes(&self, bytes: u64) {
-        self.state.lock().tracked_bytes = Some(bytes);
+    /// The directory's size if it is known. If not, starts sizing it on a
+    /// background thread and returns `None`.
+    ///
+    /// Walking a large shared cache takes seconds; done inline, under the
+    /// state lock, it stalls the async worker that writes first and every
+    /// writer queued on the lock. Writes made meanwhile skip the budget check
+    /// and are counted into the scan's total when it lands.
+    fn known_bytes(&self) -> Option<u64> {
+        let mut state = self.state.lock();
+        if state.tracked_bytes.is_some() || state.scanning {
+            return state.tracked_bytes;
+        }
+        state.scanning = true;
+        state.pending.clear();
+        #[cfg(test)]
+        let hold = state.scan_hold.take();
+        drop(state);
+
+        let root = self.root.clone();
+        let shared = Arc::clone(&self.state);
+        let scan = move || {
+            #[cfg(test)]
+            if let Some(hold) = hold {
+                let _ = hold.recv();
+            }
+            let scanned = scan_cache_entries(&root);
+            let mut state = shared.lock();
+            match scanned {
+                // A synchronous scan or eviction that set the size meanwhile
+                // is more recent than this one.
+                Ok(entries) if state.tracked_bytes.is_none() => {
+                    let seen: std::collections::HashSet<&Path> =
+                        entries.iter().map(|e| e.path.as_path()).collect();
+                    let mut total: i64 = entries.iter().map(|e| e.bytes as i64).sum();
+                    // A write the walk already saw is in `total`; an eviction
+                    // counts only against an entry it saw.
+                    for (path, delta) in &state.pending {
+                        if (*delta > 0) != seen.contains(path.as_path()) {
+                            total = total.saturating_add(*delta);
+                        }
+                    }
+                    state.tracked_bytes = Some(total.max(0) as u64);
+                }
+                Ok(_) => {}
+                Err(err) => tracing::debug!(
+                    cache_dir = %root.display(),
+                    error = %err,
+                    "failed to size the disk cache; the next write retries"
+                ),
+            }
+            state.scanning = false;
+            state.pending.clear();
+        };
+        // No threads on wasm32, where the cache never writes (budget 0).
+        #[cfg(target_arch = "wasm32")]
+        scan();
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Err(err) = std::thread::Builder::new()
+            .name("fluree-cache-size".into())
+            .spawn(scan)
+        {
+            tracing::debug!(error = %err, "failed to start the disk cache size scan");
+            self.state.lock().scanning = false;
+        }
+        None
     }
 
-    fn note_write(&self, bytes: u64) {
+    fn set_current_bytes(&self, bytes: u64) {
         let mut state = self.state.lock();
-        let current = state.tracked_bytes.unwrap_or(0);
-        state.tracked_bytes = Some(current.saturating_add(bytes));
+        state.tracked_bytes = Some(bytes);
+        state.pending.clear();
+    }
+
+    fn note_write(&self, path: &Path, bytes: u64) {
+        let mut state = self.state.lock();
+        match state.tracked_bytes {
+            Some(current) => state.tracked_bytes = Some(current.saturating_add(bytes)),
+            None if state.scanning => state.pending.push((path.to_path_buf(), bytes as i64)),
+            // Untracked: the next capacity check sizes the directory, this
+            // write included.
+            None => {}
+        }
     }
 
     /// Drop one entry, keeping the byte accounting in step.
@@ -386,6 +476,8 @@ impl DiskArtifactCache {
                 let mut state = self.state.lock();
                 if let Some(tracked) = state.tracked_bytes {
                     state.tracked_bytes = Some(tracked.saturating_sub(bytes));
+                } else if state.scanning {
+                    state.pending.push((path.to_path_buf(), -(bytes as i64)));
                 }
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -449,7 +541,9 @@ impl DiskArtifactCache {
             return Ok(());
         }
 
-        let current = self.current_bytes()?;
+        let Some(current) = self.known_bytes() else {
+            return Ok(());
+        };
         if current.saturating_add(incoming_bytes) <= self.budget_bytes {
             return Ok(());
         }
@@ -501,7 +595,7 @@ impl DiskArtifactCache {
         }
 
         match Self::write_atomic(target, bytes) {
-            Ok(true) => self.note_write(bytes.len() as u64),
+            Ok(true) => self.note_write(target, bytes.len() as u64),
             Ok(false) => {}
             Err(err) if is_disk_full(&err) => {
                 if let Err(evict_err) = self.evict_until(self.low_water_mark()) {
@@ -513,7 +607,7 @@ impl DiskArtifactCache {
                     return;
                 }
                 match Self::write_atomic(target, bytes) {
-                    Ok(true) => self.note_write(bytes.len() as u64),
+                    Ok(true) => self.note_write(target, bytes.len() as u64),
                     Ok(false) => {}
                     Err(retry_err) => tracing::warn!(
                         cache_dir = %self.root.display(),
@@ -674,8 +768,37 @@ impl DiskArtifactCache {
     }
 }
 
-pub fn best_effort_cache_bytes_to_path(cache_dir: &Path, target: &Path, bytes: &[u8]) {
-    DiskArtifactCache::for_dir(cache_dir).best_effort_write(target, bytes);
+/// Whether `cs`'s artifacts belong in the disk cache at all.
+///
+/// The rule every reader and writer of the cache follows. A local copy pays
+/// off only when the store's reads leave the machine — a store on local disk
+/// or in memory is already as fast as the cache would be — and is allowed
+/// only when the store's bytes may sit outside it in plaintext.
+pub fn uses_disk_cache(cs: &dyn ContentStore) -> bool {
+    cs.is_remote() && cs.permits_plaintext_cache()
+}
+
+/// Whether a copy of `id` belongs in the disk cache: [`uses_disk_cache`],
+/// and the store does not already hold it as a local file (a remote store's
+/// local tier).
+pub fn needs_disk_copy(cs: &dyn ContentStore, id: &ContentId) -> bool {
+    uses_disk_cache(cs) && cs.resolve_local_path(id).is_none()
+}
+
+/// Copy `bytes`, which `cs` holds as `id`, into the cache at `cache_dir` when
+/// [`needs_disk_copy`] says a copy is worth having, returning whether it
+/// tried. Best effort: a failed write only costs a later fetch.
+pub fn seed_disk_cache(
+    cs: &dyn ContentStore,
+    id: &ContentId,
+    cache_dir: &Path,
+    bytes: &[u8],
+) -> bool {
+    if !needs_disk_copy(cs, id) {
+        return false;
+    }
+    DiskArtifactCache::for_dir(cache_dir).best_effort_write(&cache_dir.join(id.to_string()), bytes);
+    true
 }
 
 /// Drop `id` from every disk cache this process holds open.
@@ -744,12 +867,12 @@ pub fn evict_cached_cid(id: &ContentId) {
     }
 }
 
-/// Read `id` straight from the store, touching no cache path. This is the
-/// whole read path for a store that decrypts on read: its bytes must not
-/// land in the cache directory, and a stale plaintext entry from an earlier
-/// unencrypted run must not be consulted either. Concurrent readers of one
-/// artifact still share a single fetch, keyed by `target` — the path the
-/// cache would have used.
+/// Read `id` straight from the store, touching no cache path: the read path
+/// for every store [`uses_disk_cache`] keeps out of the cache. For one that
+/// decrypts on read, its bytes must not land in the cache directory, and a
+/// stale plaintext entry from an earlier unencrypted run must not be
+/// consulted either. Concurrent readers of one artifact still share a single
+/// fetch, keyed by `target` — the path the cache would have used.
 async fn fetch_uncached(
     cs: &dyn ContentStore,
     id: &ContentId,
@@ -770,77 +893,58 @@ fn kind_name(id: &ContentId) -> String {
     )
 }
 
-pub async fn fetch_cached_bytes(
-    cs: &dyn ContentStore,
-    id: &ContentId,
-    cache_dir: &Path,
-    ext: &str,
-) -> io::Result<Vec<u8>> {
+// Both return `fetch_through_cache`'s future rather than awaiting it: an
+// extra `async fn` layer here pushes some callers' future types past the
+// compiler's layout depth limit.
+pub fn fetch_cached_bytes<'a>(
+    cs: &'a dyn ContentStore,
+    id: &'a ContentId,
+    cache_dir: &'a Path,
+    ext: &'a str,
+) -> impl std::future::Future<Output = io::Result<Vec<u8>>> + 'a {
     let cached = cache_dir.join(format!("{}.{}", id.digest_hex(), ext));
-    if !cs.permits_plaintext_cache() {
-        return fetch_uncached(cs, id, cached).await;
-    }
-    let cache = DiskArtifactCache::for_dir(cache_dir);
-
-    if let Some(local_path) = cs.resolve_local_path(id) {
-        if let Some(bytes) = try_read_cached_bytes(&local_path)? {
-            crate::io_stats::record(|| ext, "local", bytes.len());
-            return Ok(bytes);
-        }
-        tracing::debug!(
-            path = %local_path.display(),
-            "local artifact path disappeared during read; falling back to remote fetch"
-        );
-        return cache
-            .coalesced_fetch(cached, || async {
-                cs.get(id).await.map_err(storage_to_io_error)
-            })
-            .await;
-    }
-
-    if let Some(bytes) = try_read_cached_bytes(&cached)? {
-        crate::io_stats::record(|| ext, "cache", bytes.len());
-        return Ok(bytes);
-    }
-    cache
-        .coalesced_fetch(cached, || async {
-            cs.get(id).await.map_err(storage_to_io_error)
-        })
-        .await
+    fetch_through_cache(cs, id, cache_dir, cached, Some(ext))
 }
 
-pub async fn fetch_cached_bytes_cid(
+pub fn fetch_cached_bytes_cid<'a>(
+    cs: &'a dyn ContentStore,
+    id: &'a ContentId,
+    cache_dir: &'a Path,
+) -> impl std::future::Future<Output = io::Result<Vec<u8>>> + 'a {
+    let cached = cache_dir.join(id.to_string());
+    fetch_through_cache(cs, id, cache_dir, cached, None)
+}
+
+/// Read `id` from the store's own local file when it has one, else through
+/// the disk cache entry `cached` when [`uses_disk_cache`] allows, else
+/// straight from the store. I/O accounting labels the read by `ext`, or by
+/// the CID's content kind without one.
+async fn fetch_through_cache(
     cs: &dyn ContentStore,
     id: &ContentId,
     cache_dir: &Path,
+    cached: PathBuf,
+    ext: Option<&str>,
 ) -> io::Result<Vec<u8>> {
-    let cached = cache_dir.join(id.to_string());
-    if !cs.permits_plaintext_cache() {
-        return fetch_uncached(cs, id, cached).await;
-    }
-    let cache = DiskArtifactCache::for_dir(cache_dir);
-
+    let kind = || ext.map_or_else(|| kind_name(id), str::to_string);
     if let Some(local_path) = cs.resolve_local_path(id) {
         if let Some(bytes) = try_read_cached_bytes(&local_path)? {
-            crate::io_stats::record(|| kind_name(id), "local", bytes.len());
+            crate::io_stats::record(kind, "local", bytes.len());
             return Ok(bytes);
         }
         tracing::debug!(
             path = %local_path.display(),
-            "local artifact path disappeared during read; falling back to remote fetch"
+            "local artifact path disappeared during read; fetching from the store"
         );
-        return cache
-            .coalesced_fetch(cached, || async {
-                cs.get(id).await.map_err(storage_to_io_error)
-            })
-            .await;
     }
-
+    if !uses_disk_cache(cs) {
+        return fetch_uncached(cs, id, cached).await;
+    }
     if let Some(bytes) = try_read_cached_bytes(&cached)? {
-        crate::io_stats::record(|| kind_name(id), "cache", bytes.len());
+        crate::io_stats::record(kind, "cache", bytes.len());
         return Ok(bytes);
     }
-    cache
+    DiskArtifactCache::for_dir(cache_dir)
         .coalesced_fetch(cached, || async {
             cs.get(id).await.map_err(storage_to_io_error)
         })
@@ -959,6 +1063,35 @@ mod tests {
         assert_eq!(cache.current_bytes().unwrap(), 300);
     }
 
+    /// The first write sizes the directory off the writer's thread: a large
+    /// shared cache took seconds to walk inline, under the state lock, which
+    /// stalled the async worker writing first and every writer behind it.
+    #[test]
+    fn first_write_does_not_wait_for_the_size_scan() {
+        let dir = temp_cache_dir("background-scan");
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
+        fs::write(dir.join("existing.leaf"), [0u8; 300]).unwrap();
+        let (release, hold) = std::sync::mpsc::channel();
+        cache.state.lock().scan_hold = Some(hold);
+
+        // Returns with the scan still held: the size is not known yet.
+        cache.best_effort_write(&dir.join("new.leaf"), &[0u8; 100]);
+        assert!(dir.join("new.leaf").exists());
+        assert_eq!(cache.state.lock().tracked_bytes, None);
+
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while cache.state.lock().scanning {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "size scan never landed"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The walk saw the new entry too; it is counted once.
+        assert_eq!(cache.state.lock().tracked_bytes, Some(400));
+    }
+
     /// A released object's entry must go, or a later read sees a blob storage
     /// no longer holds.
     #[tokio::test]
@@ -971,6 +1104,8 @@ mod tests {
             gets: Arc::new(AtomicUsize::new(0)),
             delay: Duration::ZERO,
             permits_plaintext_cache: true,
+            remote: true,
+            local_path: None,
         };
 
         fetch_cached_bytes_cid(&store, &id, &dir).await.unwrap();
@@ -1269,6 +1404,8 @@ mod tests {
         gets: Arc<AtomicUsize>,
         delay: Duration,
         permits_plaintext_cache: bool,
+        remote: bool,
+        local_path: Option<PathBuf>,
     }
 
     #[async_trait::async_trait]
@@ -1297,6 +1434,14 @@ mod tests {
         fn permits_plaintext_cache(&self) -> bool {
             self.permits_plaintext_cache
         }
+
+        fn is_remote(&self) -> bool {
+            self.remote
+        }
+
+        fn resolve_local_path(&self, _id: &ContentId) -> Option<PathBuf> {
+            self.local_path.clone()
+        }
     }
 
     fn regular_files_under(root: &Path) -> Vec<PathBuf> {
@@ -1318,6 +1463,86 @@ mod tests {
         out
     }
 
+    fn store(
+        remote: bool,
+        permits_plaintext_cache: bool,
+        local_path: Option<PathBuf>,
+    ) -> CountingStore {
+        CountingStore {
+            data: b"bytes".to_vec(),
+            gets: Arc::new(AtomicUsize::new(0)),
+            delay: Duration::ZERO,
+            permits_plaintext_cache,
+            remote,
+            local_path,
+        }
+    }
+
+    #[test]
+    fn only_remote_plaintext_artifacts_without_a_local_file_need_a_disk_copy() {
+        let id = ContentId::new(crate::ContentKind::IndexLeaf, b"leaf");
+        assert!(needs_disk_copy(&store(true, true, None), &id));
+        assert!(
+            !needs_disk_copy(&store(false, true, None), &id),
+            "local store"
+        );
+        assert!(
+            !needs_disk_copy(&store(true, false, None), &id),
+            "decrypting store"
+        );
+        assert!(
+            !needs_disk_copy(&store(true, true, Some(PathBuf::from("/tier/leaf"))), &id),
+            "a remote store's local tier"
+        );
+    }
+
+    #[test]
+    fn seeding_writes_only_what_needs_a_disk_copy() {
+        let dir = temp_cache_dir("seed");
+        let id = ContentId::new(crate::ContentKind::IndexLeaf, b"leaf");
+
+        assert!(!seed_disk_cache(
+            &store(false, true, None),
+            &id,
+            &dir,
+            b"bytes"
+        ));
+        assert!(regular_files_under(&dir).is_empty());
+
+        assert!(seed_disk_cache(
+            &store(true, true, None),
+            &id,
+            &dir,
+            b"bytes"
+        ));
+        assert_eq!(fs::read(dir.join(id.to_string())).unwrap(), b"bytes");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A store in memory is read directly: fetching through the cache helpers
+    /// writes nothing to the cache directory.
+    #[tokio::test]
+    async fn fetch_from_a_local_store_writes_nothing_to_the_cache() {
+        let dir = temp_cache_dir("local-store");
+        let store = crate::storage::MemoryContentStore::new();
+        let id = store
+            .put(crate::ContentKind::IndexLeaf, b"bytes")
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                fetch_cached_bytes_cid(&store, &id, &dir).await.unwrap(),
+                b"bytes"
+            );
+            assert_eq!(
+                fetch_cached_bytes(&store, &id, &dir, "nba").await.unwrap(),
+                b"bytes"
+            );
+        }
+        assert!(regular_files_under(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// A store that decrypts on read must leave nothing in the cache
     /// directory: neither the CID-keyed nor the extension-keyed fetch may
     /// spill its plaintext, and a second fetch goes back to the store.
@@ -1332,6 +1557,8 @@ mod tests {
             gets: Arc::clone(&gets),
             delay: Duration::ZERO,
             permits_plaintext_cache: false,
+            remote: true,
+            local_path: None,
         };
 
         for _ in 0..2 {
@@ -1357,6 +1584,8 @@ mod tests {
             gets: Arc::new(AtomicUsize::new(0)),
             delay: Duration::ZERO,
             permits_plaintext_cache: true,
+            remote: true,
+            local_path: None,
         };
         fetch_cached_bytes_cid(&permitting, &id, &dir)
             .await
@@ -1376,6 +1605,8 @@ mod tests {
             gets: Arc::clone(&gets),
             delay: Duration::from_millis(100),
             permits_plaintext_cache: true,
+            remote: true,
+            local_path: None,
         });
 
         let mut handles = Vec::new();
@@ -1421,6 +1652,8 @@ mod tests {
             gets: Arc::clone(&gets),
             delay: Duration::from_millis(100),
             permits_plaintext_cache: false,
+            remote: true,
+            local_path: None,
         });
 
         let mut handles = Vec::new();

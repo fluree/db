@@ -205,13 +205,19 @@ impl DataSetDb {
     /// `t` (per-view), and policy enforcement is carried via `GraphRef::policy_enforcer`.
     pub(crate) fn as_runtime_dataset(&self) -> fluree_db_query::DataSet<'_> {
         let mut ds = fluree_db_query::DataSet::new();
+        // A history range's views are loaded at the ledger head; its `to`
+        // bounds what the scans may read.
+        let graph_t = |view: &GraphDb| match self.history_range {
+            Some((_, to_t)) => view.t.min(to_t),
+            None => view.t,
+        };
 
         for view in &self.default {
             let mut graph = fluree_db_query::GraphRef::new(
                 view.snapshot.as_ref(),
                 view.graph_id,
                 view.overlay.as_ref(),
-                view.t,
+                graph_t(view),
                 Arc::clone(&view.ledger_id),
             );
             graph.policy_enforcer = view.policy_enforcer().cloned();
@@ -227,7 +233,7 @@ impl DataSetDb {
                 view.snapshot.as_ref(),
                 view.graph_id,
                 view.overlay.as_ref(),
-                view.t,
+                graph_t(view),
                 Arc::clone(&view.ledger_id),
             );
             graph.policy_enforcer = view.policy_enforcer().cloned();

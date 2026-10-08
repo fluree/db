@@ -43,6 +43,10 @@ impl StorageRead for RootReadCounting {
         self.inner.permits_plaintext_cache()
     }
 
+    fn is_remote(&self) -> bool {
+        self.inner.is_remote()
+    }
+
     fn encryption_admin(&self) -> Option<Arc<dyn fluree_db_core::EncryptionAdmin>> {
         self.inner.encryption_admin()
     }

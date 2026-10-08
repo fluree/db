@@ -1784,6 +1784,10 @@ mod tests {
             true
         }
 
+        fn is_remote(&self) -> bool {
+            false
+        }
+
         fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
             None
         }
@@ -1940,6 +1944,10 @@ mod tests {
     impl fluree_db_core::StorageRead for FlakyCasStorage {
         fn permits_plaintext_cache(&self) -> bool {
             self.inner.permits_plaintext_cache()
+        }
+
+        fn is_remote(&self) -> bool {
+            self.inner.is_remote()
         }
 
         fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {

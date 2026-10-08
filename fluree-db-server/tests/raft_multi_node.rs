@@ -705,7 +705,9 @@ async fn delegated_policy_survives_follower_forwarding_and_the_raft_command_queu
         if allow {
             assert_eq!(status, StatusCode::OK, "{body}");
         } else {
-            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert_eq!(body["status"], 403, "{body}");
+            assert_eq!(body["@type"], "err:policy/AccessDenied", "{body}");
             assert!(
                 body.to_string().contains("Delegated Raft write denied"),
                 "{body}"

@@ -28,7 +28,7 @@ fn shacl_context() -> JsonValue {
 /// text is identical either way, and the text is what these tests are about.
 fn shacl_violation_message(err: ApiError) -> String {
     match err {
-        ApiError::Transact(TransactError::ShaclViolation(message)) => message,
+        ApiError::Transact(TransactError::ShaclViolation(message)) => message.to_string(),
         ApiError::Http {
             status: 400,
             message,
@@ -5279,4 +5279,50 @@ async fn shacl_sparql_invalid_query_fails_closed() {
         message.contains("MINUS"),
         "expected pre-binding restriction error naming MINUS, got: {message}"
     );
+}
+
+/// A rejected transaction carries each violation resolved to full IRIs, as
+/// `validate` reports them, alongside the readable message.
+#[tokio::test]
+async fn violation_carries_resolved_results() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let ledger = fluree
+        .create_ledger("shacl/violation-results:main")
+        .await
+        .unwrap();
+    let shape = json!({
+        "@context": context.clone(),
+        "@id": "ex:UserShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:User"},
+        "sh:property": [{"sh:path": {"@id": "schema:name"}, "sh:minCount": 1}]
+    });
+    let ledger = fluree.upsert(ledger, &shape).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger,
+            &json!({"@context": context, "@id": "ex:alex", "@type": "ex:User"}),
+        )
+        .await
+        .unwrap_err();
+
+    let ApiError::Transact(TransactError::ShaclViolation(violations)) = err else {
+        panic!("expected SHACL violation, got {err:?}");
+    };
+    assert!(violations.contains("Focus node: ex:alex"), "{violations}");
+    let [result] = violations.results() else {
+        panic!("expected one result, got {:?}", violations.results());
+    };
+    assert_eq!(result.focus_node, json!("http://example.org/ns/alex"));
+    assert_eq!(
+        result.result_path.as_deref(),
+        Some("http://schema.org/name")
+    );
+    assert_eq!(result.source_shape, "http://example.org/ns/UserShape");
+    assert_eq!(
+        result.constraint_component,
+        "http://www.w3.org/ns/shacl#MinCountConstraintComponent"
+    );
+    assert_eq!(result.severity, "http://www.w3.org/ns/shacl#Violation");
 }

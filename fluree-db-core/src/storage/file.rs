@@ -1272,6 +1272,11 @@ impl StorageRead for FileStorage {
         true
     }
 
+    /// Reads are local files, which readers map or read in place.
+    fn is_remote(&self) -> bool {
+        false
+    }
+
     fn encryption_admin(&self) -> Option<std::sync::Arc<dyn crate::EncryptionAdmin>> {
         None
     }
@@ -1575,9 +1580,10 @@ impl StorageRead for FileStorage {
                     if is_tmp_artifact(&entry.file_name().to_string_lossy()) {
                         continue;
                     }
-                    // Convert back to relative path from base
+                    // Convert back to relative path from base, as an address
+                    // path: one with `\` would read to a sweep as an orphan.
                     if let Ok(relative) = path.strip_prefix(&self.base_path) {
-                        let relative_str = relative.to_string_lossy().to_string();
+                        let relative_str = super::address_path(relative);
                         // Check if it matches the file prefix (if any)
                         if file_prefix.is_empty() || relative_str.starts_with(path_prefix) {
                             // Return as fluree:file:// address
@@ -2531,6 +2537,23 @@ mod tests {
 
         let listed = storage.list_prefix("d").await.unwrap();
         assert_eq!(listed, vec!["fluree:file://d/real.json".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_prefix_addresses_separate_with_slashes() {
+        let (_dir, storage) = storage();
+        storage
+            .write_bytes("fluree:file://d/e/real.json", b"v")
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.list_prefix("d").await.unwrap(),
+            vec!["fluree:file://d/e/real.json".to_string()]
+        );
+        assert_eq!(
+            storage.list_prefix("d/e/re").await.unwrap(),
+            vec!["fluree:file://d/e/real.json".to_string()]
+        );
     }
 
     #[tokio::test]

@@ -1373,10 +1373,12 @@ fn parse_expanded_object_with_ctx(
         })
         .transpose()?;
     // A node with no `@graph` of its own takes the default: the update's
-    // template default (top-level `graph`) or an enclosing wrapper's graph.
+    // template default (top-level `graph`), an enclosing wrapper's graph, or
+    // the graph of the node it is nested in.
     let graph_from_template_default = node_graph.is_none()
         && ctx.default_graph.is_some()
         && ctx.default_graph_is_template_default;
+    let own_graph = node_graph.clone();
     let node_graph = node_graph.or_else(|| ctx.default_graph.clone());
     let place = |t: TripleTemplate| match &node_graph {
         Some(graph) if graph_from_template_default => {
@@ -1396,7 +1398,32 @@ fn parse_expanded_object_with_ctx(
         TemplateTerm::BlankNode(format!("_:b{n}"))
     };
 
-    // Parse each predicate-object pair
+    // Nodes nested in this one belong to its graph, as an embedded node object
+    // does in JSON-LD.
+    let outer = own_graph.map(|graph| {
+        (
+            ctx.default_graph.replace(graph),
+            std::mem::replace(&mut ctx.default_graph_is_template_default, false),
+        )
+    });
+    let parsed = parse_node_properties(obj, &subject, &place, ctx, &mut templates);
+    if let Some((default_graph, is_template_default)) = outer {
+        ctx.default_graph = default_graph;
+        ctx.default_graph_is_template_default = is_template_default;
+    }
+    parsed?;
+
+    Ok((subject, templates))
+}
+
+/// The triples for each predicate-object pair of a node object.
+fn parse_node_properties(
+    obj: &serde_json::Map<String, Value>,
+    subject: &TemplateTerm,
+    place: &dyn Fn(TripleTemplate) -> TripleTemplate,
+    ctx: &mut TemplateParseCtx<'_>,
+    templates: &mut Vec<TripleTemplate>,
+) -> Result<()> {
     for (key, value) in obj {
         // Skip JSON-LD keywords except @type which becomes rdf:type
         if key == "@id" || key == "@context" || key == "@graph" {
@@ -1450,7 +1477,7 @@ fn parse_expanded_object_with_ctx(
             TemplateTerm::Sid(ctx.ns_registry.sid_for_iri(key))
         };
 
-        let parsed_values = parse_expanded_objects_with_ctx(value, ctx, &mut templates)?;
+        let parsed_values = parse_expanded_objects_with_ctx(value, ctx, templates)?;
 
         for parsed_value in parsed_values {
             let mut template = place(TripleTemplate::new(
@@ -1467,8 +1494,7 @@ fn parse_expanded_object_with_ctx(
             templates.push(template);
         }
     }
-
-    Ok((subject, templates))
+    Ok(())
 }
 
 fn resolve_graph_selector_str_for_templates(

@@ -2517,7 +2517,7 @@ WHERE {
 
 **How it works:** When the `iceberg` feature is compiled, `query_from()` and `graph().query()` automatically call `.with_r2rml()`, which constructs a `FlureeR2rmlProvider` that can resolve graph source names to R2RML mappings and route triple patterns through the Iceberg scan engine. The `NameService` trait requires `GraphSourceLookup` (read-only graph source discovery), so graph source resolution is always available at the nameservice layer.
 
-**Known limitation:** `FROM <ledger>, <graph-source>` with bare WHERE patterns (no GRAPH wrapper) — the graph source participates in the dataset but bare triple patterns only scan native indexes. Use explicit `GRAPH <gs:main> { ... }` for the graph source part in mixed-source queries.
+A graph source cannot share the default graph with a ledger: `FROM <ledger> FROM <graph-source>` is refused with an error naming the form that works. Name the graph source with `FROM NAMED <gs:main>` and read it inside `GRAPH <gs:main> { ... }`.
 
 ### Authentication
 

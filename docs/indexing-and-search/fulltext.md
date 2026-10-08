@@ -416,7 +416,7 @@ Each language becomes its own arena; queries automatically look up the right one
 
 ## The `fulltext()` Scoring Function
 
-The `fulltext()` function computes a BM25 relevance score for a bound text value against a query string. Use it in `bind` expressions within JSON-LD queries.
+The `fulltext()` function computes a BM25 relevance score for a bound text value against a query string. Use it in `bind` expressions in JSON-LD queries, or in `BIND` in SPARQL (see [SPARQL Support](#sparql-support)).
 
 ### Basic usage
 
@@ -698,29 +698,28 @@ Expected results (ordered by relevance):
 
 ### Inserting data
 
-Fulltext annotation works in SPARQL UPDATE today using the `^^f:fullText` typed literal syntax (see the Turtle/SPARQL insertion examples above).
+Annotate values in SPARQL UPDATE (and Turtle) with the `^^f:fullText` typed literal, as in the insertion examples above, or configure the property with [`f:fullTextDefaults`](#configured-full-text-properties-ffulltextdefaults) and insert plain strings.
 
 ### Querying
 
-The `fulltext()` scoring function is currently available in **JSON-LD Query only**. SPARQL query support is planned for a future release, with anticipated syntax like:
+`fulltext()` is a SPARQL function, used in `BIND` like the vector similarity functions:
 
 ```sparql
 PREFIX ex: <http://example.org/>
-PREFIX f: <https://ns.flur.ee/db#>
 
 SELECT ?title ?score
 WHERE {
   ?doc a ex:Article ;
        ex:content ?content ;
        ex:title ?title .
-  BIND(f:fulltext(?content, "Rust programming") AS ?score)
+  BIND(fulltext(?content, "Rust programming") AS ?score)
   FILTER(?score > 0)
 }
 ORDER BY DESC(?score)
 LIMIT 10
 ```
 
-This mirrors the pattern established by inline vector similarity functions (`dotProduct`, `cosineSimilarity`, `euclideanDistance`), which also support JSON-LD Query today with SPARQL planned.
+It scores exactly as the JSON-LD form does, over indexed and unindexed documents alike, for both `@fulltext` values and `f:fullTextDefaults` properties. The name is case-insensitive (`fulltext`, `FULLTEXT`, `full_text`), and the namespaced `f:fulltext(...)` (`<https://ns.flur.ee/db#fulltext>`) is the same function.
 
 ## Related Documentation
 

@@ -1,0 +1,116 @@
+name: Python release
+
+# Builds the `fluree` Python wheels for the platforms the CLI ships on, tests
+# each one installed into a clean environment, and publishes them to PyPI.
+# The same version tags as the CLI release trigger it, and the wheels carry
+# the workspace version, so `v4.3.0` publishes `fluree` 4.3.0. A pre-release
+# tag (`v4.3.0-rc.1`) publishes a PyPI pre-release (4.3.0rc1).
+#
+# Publishing uses PyPI trusted publishing: PyPI trusts this workflow, run in
+# the `pypi` environment, so no token is stored. That environment admits only
+# `v*` tags, only a tag push publishes, and only when the tag names the
+# version the wheels carry. Run it by hand (workflow_dispatch) to build and
+# test the wheels without publishing.
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: wheel (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The CLI release's runners (dist-workspace.toml): the release
+          # profile's fat-LTO link runs out of memory on the default 16 GB
+          # hosted runners.
+          - target: x86_64-unknown-linux-gnu
+            runner: ci-cd-large
+          - target: aarch64-unknown-linux-gnu
+            runner: asset-publisher-8-core
+          - target: aarch64-apple-darwin
+            runner: macos-14-xlarge
+          - target: x86_64-pc-windows-msvc
+            runner: standalone-release-windows-x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    steps:
+      - name: Enable long paths
+        run: git config --global core.longpaths true
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        id: py310
+        with:
+          python-version: "3.10"
+      - uses: actions/setup-python@v7
+        id: py314
+        with:
+          python-version: "3.14"
+
+      # One abi3 wheel per platform serves every CPython >= 3.10. Linux wheels
+      # build in the manylinux_2_28 image so they install on glibc 2.28+
+      # (RHEL 8, Debian 11, Ubuntu 20.04 and later); maturin refuses a wheel
+      # that needs a newer glibc than its tag claims.
+      - name: Build the wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --locked --manifest-path fluree-db-python/Cargo.toml --out dist
+          target: ${{ matrix.target }}
+          manylinux: "2_28"
+          rust-toolchain: "1.97.0"
+
+      # PyPI never takes a version twice, so a tag on the wrong commit must
+      # not publish whatever version that commit carries.
+      - name: The tag names the version being built
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          py="${{ steps.py314.outputs.python-path }}"
+          "$py" -m pip install --quiet packaging
+          "$py" -c 'import glob, os, sys; from packaging.version import Version as V; tag = V(os.environ["GITHUB_REF_NAME"].removeprefix("v")); built = {V(os.path.basename(w).split("-")[1]) for w in glob.glob("dist/*.whl")}; sys.exit(0 if built == {tag} else f"tag {tag} does not match the wheel version {sorted(map(str, built))}")'
+
+      - name: Test the wheel on Python 3.10 and 3.14
+        shell: bash
+        run: |
+          py="${{ steps.py314.outputs.python-path }}"
+          "$py" -c 'import glob, zipfile; names = zipfile.ZipFile(glob.glob("dist/*.whl")[0]).namelist(); assert any(n.endswith(".dist-info/licenses/LICENSE") for n in names), "the wheel carries no LICENSE"'
+          for py in "${{ steps.py310.outputs.python-path }}" "${{ steps.py314.outputs.python-path }}"; do
+            rm -rf venv && "$py" -m venv venv
+            bin=venv/bin; [ "$RUNNER_OS" = Windows ] && bin=venv/Scripts
+            "$bin/python" -m pip install dist/*.whl pytest pandas polars
+            "$bin/python" -m pytest -q fluree-db-python/tests
+          done
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: wheel-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish:
+    name: publish to PyPI
+    needs: wheels
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/p/fluree
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      # Pinned: this step holds the OIDC token PyPI trusts.
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

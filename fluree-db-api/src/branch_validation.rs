@@ -28,7 +28,7 @@ use std::collections::{BTreeSet, HashMap};
 #[derive(Clone, Debug, Default)]
 pub(crate) struct BranchOpValidation {
     /// Formatted violation report, `None` when the view conforms.
-    pub(crate) report: Option<String>,
+    pub(crate) report: Option<fluree_db_transact::ShaclViolations>,
 }
 
 impl BranchOpValidation {
@@ -49,7 +49,10 @@ impl BranchOpValidation {
             None => Ok(()),
             #[cfg(feature = "shacl")]
             Some(report) => {
-                Err(fluree_db_transact::TransactError::ShaclViolation(describe(report)).into())
+                let message = describe(report.message().to_string());
+                let report =
+                    fluree_db_transact::ShaclViolations::new(message, report.results().to_vec());
+                Err(fluree_db_transact::TransactError::ShaclViolation(report).into())
             }
             // Without the feature no validator runs, so no report is ever
             // produced; keep the match total without naming a variant that
@@ -57,7 +60,7 @@ impl BranchOpValidation {
             #[cfg(not(feature = "shacl"))]
             Some(report) => Err(crate::error::ApiError::internal(format!(
                 "SHACL violation reported without the shacl feature: {}",
-                describe(report)
+                describe(report.to_string())
             ))),
         }
     }

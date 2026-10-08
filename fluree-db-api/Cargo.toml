@@ -361,6 +361,13 @@ required-features = ["native"]
 name = "it_fastpath_1863_regression"
 path = "tests/it_fastpath_1863_regression.rs"
 
+# Own binary: asserts the geo_search routing stamp through a captured
+# subscriber, which concurrently running tests would disturb.
+[[test]]
+name = "it_geo_search_routing"
+path = "tests/it_geo_search_routing.rs"
+required-features = ["native"]
+
 # Own binary: toggles the process-global fast-path kill switch.
 [[test]]
 name = "it_datetime_component_presence"

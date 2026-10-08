@@ -98,6 +98,7 @@ impl Fluree {
         options: &QueryExecutionOptions,
     ) -> Result<StreamQueryPlan> {
         let input = input.as_input();
+        let params = options.sparql_params(&input)?;
 
         let (vars, mut parsed) = match &input {
             QueryInput::JsonLd(json) => crate::query::helpers::parse_jsonld_query(
@@ -112,6 +113,7 @@ impl Fluree {
                     sparql,
                     &db.snapshot,
                     db.default_context.as_ref(),
+                    params,
                 )?
             }
         };
@@ -186,7 +188,7 @@ impl Fluree {
         );
 
         let (var_names, head_vars) = sparql::compute_head(&meta);
-        let compactor = IriCompactor::new(graph.snapshot.shared_namespaces(), &meta.context);
+        let compactor = row_compactor(graph.snapshot.shared_namespaces(), &meta.context);
 
         // Head first: flushes an immediate first byte and starts the idle clock
         // fresh before any (potentially slow) batch pull.
@@ -339,7 +341,7 @@ impl Fluree {
         sparql: &str,
         qc_opts: &crate::GovernanceOptions,
     ) -> Result<DataSetDb> {
-        let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
+        let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
         let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
         if spec.is_empty() {
             return Err(ApiError::query(
@@ -378,6 +380,7 @@ impl Fluree {
             .primary()
             .ok_or_else(|| ApiError::query("Dataset has no graphs for query execution"))?;
         let input = input.as_input();
+        let params = options.sparql_params(&input)?;
 
         let (vars, mut parsed) = match &input {
             QueryInput::JsonLd(json) => crate::query::helpers::parse_jsonld_query(
@@ -390,6 +393,7 @@ impl Fluree {
                 sparql,
                 &primary.snapshot,
                 primary.default_context.as_ref(),
+                params,
             )?,
         };
 
@@ -458,7 +462,7 @@ impl Fluree {
             primary.binary_graph(),
         );
         let (var_names, head_vars) = sparql::compute_head(&meta);
-        let compactor = IriCompactor::new(primary.snapshot.shared_namespaces(), &meta.context);
+        let compactor = row_compactor(primary.snapshot.shared_namespaces(), &meta.context);
 
         if tx
             .send(Bytes::from(ndjson_stream::head_record(&var_names)))
@@ -562,6 +566,17 @@ impl BatchSink for CollectSink {
         self.batches.push(batch);
         Ok(())
     }
+}
+
+/// The compactor for streamed rows. Rows are the `bindings` entries `/query`
+/// returns, so they take its SPARQL-results profile: absolute IRIs, since a
+/// row carries no prefix map to expand a compact one against.
+fn row_compactor(
+    namespaces: std::sync::Arc<std::collections::HashMap<u16, String>>,
+    context: &crate::ParsedContext,
+) -> IriCompactor {
+    IriCompactor::new(namespaces, context)
+        .with_absolute_iris(crate::format::FormatterConfig::sparql_json().absolute_iris)
 }
 
 /// Reject query shapes the streaming endpoint does not support.

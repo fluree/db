@@ -142,6 +142,8 @@ pub struct DropNamedGraphReport {
     /// Current commit `t` for the branch after the drop. Equal to the
     /// pre-drop `t` when `committed = false`.
     pub t: i64,
+    /// The drop commit's id; `None` when `committed = false`.
+    pub commit_id: Option<ContentId>,
 }
 
 /// Options for [`Fluree::sync_named_graph`].
@@ -153,6 +155,8 @@ pub struct SyncGraphOpts {
     /// graph. Off by default so a truncated or accidentally-empty export
     /// cannot silently wipe the graph.
     pub allow_empty: bool,
+    /// Recorded as the commit's `f:message`.
+    pub message: Option<String>,
 }
 
 /// Report of a [`Fluree::sync_named_graph`] call.
@@ -176,6 +180,8 @@ pub struct SyncGraphReport {
     /// Whether a new commit was created. `false` when the payload matched
     /// the graph exactly, and always `false` for a dry run.
     pub committed: bool,
+    /// The new commit, when `committed`.
+    pub commit_id: Option<fluree_db_core::ContentId>,
     /// Whether this was a dry run (staged and counted, nothing committed).
     pub dry_run: bool,
     /// Current commit `t` for the branch after the call. Equal to the
@@ -1025,6 +1031,7 @@ impl crate::Fluree {
             retracted,
             committed,
             t: new_t,
+            commit_id: committed.then(|| result.receipt.commit_id.clone()),
         })
     }
 
@@ -1167,15 +1174,25 @@ impl crate::Fluree {
                 asserted,
                 retracted,
                 committed: false,
+                commit_id: None,
                 dry_run: true,
                 t: staged_against_t,
             });
         }
 
+        let mut commit_opts = fluree_db_transact::CommitOpts::default();
+        if let Some(message) = opts.message {
+            commit_opts = commit_opts.with_txn_meta(vec![fluree_db_core::TxnMetaEntry::new(
+                fluree_vocab::namespaces::FLUREE_DB,
+                "message",
+                fluree_db_core::TxnMetaValue::string(message),
+            )]);
+        }
         let mut builder = self
             .stage(&handle)
             .sync_graph_payload(graph.clone(), payload, opts.allow_empty)
-            .txn_opts(txn_opts);
+            .txn_opts(txn_opts)
+            .commit_opts(commit_opts);
         if let Some(policy) = policy {
             builder = builder.policy(policy);
         }
@@ -1209,6 +1226,7 @@ impl crate::Fluree {
             asserted: result.receipt.assert_count,
             retracted: result.receipt.retract_count,
             committed,
+            commit_id: committed.then_some(result.receipt.commit_id),
             dry_run: false,
             t,
         })
@@ -1485,7 +1503,7 @@ impl crate::Fluree {
     /// Delete the branch-scoped storage artifacts for a single branch.
     ///
     /// Enumerates the per-branch subprefixes (`commit/`, `txn/`, `index/`,
-    /// `config/`). Cross-branch `@shared/dicts/` is **not** touched here —
+    /// `config/`, `blob/`). Cross-branch `@shared/dicts/` is **not** touched here —
     /// `drop_ledger` cleans it up via [`drop_shared_artifacts`] once every
     /// branch has been dropped.
     ///
@@ -1530,12 +1548,14 @@ impl crate::Fluree {
         // must hit each one separately. `index/` covers index roots, garbage,
         // and all object subkinds (branches, leaves, dicts when per-branch);
         // `config/` covers the LedgerConfig blob and the default-context blob,
-        // both stored as `ContentKind::LedgerConfig`.
+        // both stored as `ContentKind::LedgerConfig`; `blob/` holds every kind
+        // with no layout of its own, which includes the edge-annotation arenas.
         let subprefixes = vec![
             format!("fluree:{storage_method}://{branch_prefix}/commit/"),
             format!("fluree:{storage_method}://{branch_prefix}/txn/"),
             format!("fluree:{storage_method}://{branch_prefix}/index/"),
             format!("fluree:{storage_method}://{branch_prefix}/config/"),
+            format!("fluree:{storage_method}://{branch_prefix}/blob/"),
         ];
 
         let mut total = 0usize;

@@ -38,7 +38,7 @@ use crate::format::index_root::{IndexRoot, OTypeTableEntry};
 use crate::format::leaf::DecodedLeafDirV3;
 use crate::format::run_record::RunSortOrder;
 
-use super::artifact_cache::{fetch_cached_bytes, fetch_cached_bytes_cid};
+use super::artifact_cache::{fetch_cached_bytes, fetch_cached_bytes_cid, uses_disk_cache};
 use super::leaflet_cache::LeafletCache;
 
 const HOT_REMOTE_LEAF_PROMOTION_TOUCHES: usize = 2;
@@ -246,16 +246,12 @@ struct GraphIndex {
 static NEXT_STORE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whole-leaf bytes: a shared memory mapping when the leaf is local
-/// (saving the per-call open/read/copy), or an owned buffer for remote
-/// leaves.
+/// (saving the per-call open/read/copy), a shared view of bytes the store
+/// already holds in memory (`resolve_cached_bytes`), or an owned buffer
+/// for remote leaves.
 pub enum SharedLeafBytes {
     Mmap(Arc<memmap2::Mmap>),
     Owned(Vec<u8>),
-    /// Zero-copy view of the content store's resident tier
-    /// (`resolve_cached_bytes`). Compiled only for residency-capable builds
-    /// (wasm32, or native with the `residency` feature) so default native
-    /// match sites and layout stay exactly as they were.
-    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
     Shared(Arc<[u8]>),
 }
 
@@ -265,7 +261,6 @@ impl std::ops::Deref for SharedLeafBytes {
         match self {
             SharedLeafBytes::Mmap(mmap) => mmap,
             SharedLeafBytes::Owned(bytes) => bytes,
-            #[cfg(any(target_arch = "wasm32", feature = "residency"))]
             SharedLeafBytes::Shared(bytes) => bytes,
         }
     }
@@ -674,9 +669,10 @@ impl BinaryIndexStore {
     /// comparator the read path uses, so the warmed leaves are exactly those the
     /// scan reads. Only warms the disk cache — results are byte-identical.
     ///
-    /// Remote-only: no CAS, or leaves that resolve to a local path, are skipped
-    /// (a local read is already cheap). Bounded by the shared `budget`; per-leaf
-    /// failures are logged and ignored — the scan fetches them the old way.
+    /// Only for a store the disk cache serves (see `uses_disk_cache`); leaves
+    /// that resolve to a local path are skipped too (a local read is already
+    /// cheap). Bounded by the shared `budget`; per-leaf failures are logged
+    /// and ignored — the scan fetches them the old way.
     pub async fn prefetch_leaves_for_range(
         &self,
         g_id: GraphId,
@@ -691,6 +687,9 @@ impl BinaryIndexStore {
         let Some(cs) = self.cas.as_ref() else {
             return;
         };
+        if !uses_disk_cache(cs.as_ref()) {
+            return;
+        }
         let Some(branch) = self.branch_for_order(g_id, order) else {
             return;
         };
@@ -957,7 +956,7 @@ impl BinaryIndexStore {
         if let Some(cs) = self.cas.as_ref() {
             let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
             let mut local = cs.resolve_local_path(leaf_cid);
-            if local.is_none() && cs.permits_plaintext_cache() {
+            if local.is_none() && uses_disk_cache(cs.as_ref()) {
                 let promoted = self.cache_dir.join(leaf_cid.to_string());
                 if promoted.exists() {
                     local = Some(promoted);
@@ -982,6 +981,9 @@ impl BinaryIndexStore {
                     Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                     Err(err) => return Err(err),
                 }
+            }
+            if let Some(bytes) = cs.resolve_cached_bytes(leaf_cid) {
+                return Ok(SharedLeafBytes::Shared(bytes));
             }
         }
         self.get_leaf_bytes_sync(leaf_cid)
@@ -1019,10 +1021,16 @@ impl BinaryIndexStore {
             }
         }
 
-        // Check cache. A store that decrypts on read gets no disk cache:
-        // nothing is written there, and nothing left there by an earlier run
-        // is consulted.
-        let persist = cs.permits_plaintext_cache();
+        // Bytes the store holds in memory: one copy into the owned buffer
+        // this returns. The shared readers borrow them instead.
+        if let Some(bytes) = cs.resolve_cached_bytes(leaf_cid) {
+            return Ok(bytes.to_vec());
+        }
+
+        // Check cache, for a store the cache serves at all. Any other store
+        // gets nothing written there, and nothing left there by an earlier
+        // run is consulted.
+        let persist = uses_disk_cache(cs.as_ref());
         let cache_path = self.cache_dir.join(leaf_cid.to_string());
         if persist {
             match std::fs::read(&cache_path) {
@@ -1068,6 +1076,8 @@ impl BinaryIndexStore {
     /// Open a leaf for reading, choosing the optimal access strategy.
     ///
     /// - Local filesystem: returns `FullBlobLeafHandle` (OS page cache is optimal)
+    /// - Held in memory by the store: returns `SharedBlobLeafHandle` (borrowed,
+    ///   no copy)
     /// - Cached locally: returns `FullBlobLeafHandle` (read from disk cache)
     /// - Remote (S3/etc): returns `RangeReadLeafHandle` (header+dir only, lazy
     ///   column fetch via byte-range reads)
@@ -1147,10 +1157,16 @@ impl BinaryIndexStore {
             return self.open_mmapped_leaf(&local_path, leaf_id, sidecar_cid, need_replay);
         }
 
+        // Fast path 1b: the store holds the bytes in memory — borrow them,
+        // with the directory shared through the cache as for a mapped leaf.
+        if let Some(bytes) = cs.resolve_cached_bytes(leaf_cid) {
+            return self.leaf_handle_from_resident(bytes, leaf_id, sidecar_cid, need_replay);
+        }
+
         // Fast path 2: locally cached (remote-promoted) — same mmap path; a
         // missing cache file falls through to the range-read paths below.
-        // Skipped for a store that forbids a plaintext copy outside it.
-        if cs.permits_plaintext_cache() {
+        // Skipped for a store the cache does not serve.
+        if uses_disk_cache(cs.as_ref()) {
             let cache_path = self.cache_dir.join(leaf_cid.to_string());
             match self.open_mmapped_leaf(&cache_path, leaf_id, sidecar_cid, need_replay) {
                 Ok(handle) => return Ok(handle),
@@ -1300,6 +1316,34 @@ impl BinaryIndexStore {
         Ok(Box::new(super::leaf_access::MmapLeafHandle::new(
             mmap, dir, sidecar, leaf_id,
         )))
+    }
+
+    /// Build the handle for a leaf whose bytes the store holds in memory,
+    /// sharing the decoded directory through the cache.
+    fn leaf_handle_from_resident(
+        &self,
+        bytes: Arc<[u8]>,
+        leaf_id: u128,
+        sidecar_cid: Option<&ContentId>,
+        need_replay: bool,
+    ) -> io::Result<Box<dyn super::leaf_access::LeafHandle>> {
+        let decode = || {
+            let header = crate::format::leaf::decode_leaf_header_v3(&bytes)?;
+            crate::format::leaf::decode_leaf_dir_v3_with_base(&bytes, &header).map(Arc::new)
+        };
+        let dir = if let Some(cache) = &self.leaflet_cache {
+            cache.try_get_or_load_leaf_dir(leaf_id, decode)?
+        } else {
+            decode()?
+        };
+        let sidecar = if need_replay {
+            self.fetch_sidecar_bytes_sync(sidecar_cid)?.map(Arc::from)
+        } else {
+            None
+        };
+        Ok(Box::new(
+            super::leaf_access::SharedBlobLeafHandle::with_dir(bytes, dir, sidecar, leaf_id),
+        ))
     }
 
     /// Callers that may need `load_columns` must use [`Self::open_leaf_handle`].
@@ -3562,9 +3606,9 @@ async fn build_dictionary_set(
 // ============================================================================
 
 /// Where a vector shard's bytes come from: its local CAS file when one
-/// exists, else the disk cache — which counts as present only when the store
-/// permits a plaintext copy outside it, so a stale shard left there by an
-/// earlier unencrypted run is fetched afresh rather than served.
+/// exists, else the disk cache — which counts as present only for a store the
+/// cache serves, so a stale shard left there by an earlier run is fetched
+/// afresh rather than served.
 fn vector_shard_source(
     cs: &dyn ContentStore,
     shard_cid: &ContentId,
@@ -3580,7 +3624,7 @@ fn vector_shard_source(
         };
     }
     let cache_path = cache_dir.join(format!("{shard_cid}.vas"));
-    let on_disk = cs.permits_plaintext_cache() && cache_path.exists();
+    let on_disk = uses_disk_cache(cs) && cache_path.exists();
     crate::arena::vector::ShardSource {
         cid_hash,
         cid: Some(shard_cid.clone()),
@@ -3825,8 +3869,15 @@ impl ContentStoreRangeFetcher {
             }
         }
 
-        // Check cache, unless the store forbids a plaintext copy outside it.
-        if self.cs.permits_plaintext_cache() {
+        // Bytes the store holds in memory: slice them.
+        if let Some(bytes) = self.cs.resolve_cached_bytes(id) {
+            let start = (range.start as usize).min(bytes.len());
+            let end = (range.end as usize).min(bytes.len());
+            return Ok(bytes[start..end].to_vec());
+        }
+
+        // Check cache, for a store the cache serves.
+        if uses_disk_cache(self.cs.as_ref()) {
             let cache_path = self.cache_dir.join(id.to_string());
             if let Some(buf) = read_range_from_file(&cache_path, range.clone())? {
                 fluree_db_core::io_stats::record(kind, "cache-range", buf.len());
@@ -3948,6 +3999,10 @@ pub(crate) mod tests {
 
         fn permits_plaintext_cache(&self) -> bool {
             self.permits_plaintext_cache
+        }
+
+        fn is_remote(&self) -> bool {
+            true
         }
     }
 
@@ -4094,6 +4149,10 @@ pub(crate) mod tests {
     impl ContentStore for FailNthContentStore {
         fn permits_plaintext_cache(&self) -> bool {
             self.inner.permits_plaintext_cache()
+        }
+
+        fn is_remote(&self) -> bool {
+            self.inner.is_remote()
         }
 
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
@@ -4816,6 +4875,10 @@ pub(crate) mod tests {
             self.inner.permits_plaintext_cache()
         }
 
+        fn is_remote(&self) -> bool {
+            false
+        }
+
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             self.inner.has(id).await
         }
@@ -4850,6 +4913,146 @@ pub(crate) mod tests {
             self.local_path_calls.fetch_add(1, AtomicOrdering::Relaxed);
             self.local.read().get(id).cloned()
         }
+    }
+
+    /// A store that holds its blobs in memory and hands them out shared, as
+    /// `MemoryStorage` does through the bridge. Every fetch counts.
+    #[derive(Debug, Clone)]
+    struct ResidentContentStore {
+        inner: CountingContentStore,
+        resident: Arc<RwLock<HashMap<ContentId, Arc<[u8]>>>>,
+    }
+
+    impl ResidentContentStore {
+        fn new() -> Self {
+            Self {
+                inner: CountingContentStore::new(),
+                resident: Arc::new(RwLock::new(HashMap::new())),
+            }
+        }
+
+        async fn put_resident(&self, kind: ContentKind, bytes: &[u8]) -> ContentId {
+            let cid = self.inner.put(kind, bytes).await.expect("put");
+            self.resident.write().insert(cid.clone(), Arc::from(bytes));
+            cid
+        }
+    }
+
+    #[async_trait]
+    impl ContentStore for ResidentContentStore {
+        fn permits_plaintext_cache(&self) -> bool {
+            true
+        }
+
+        fn is_remote(&self) -> bool {
+            false
+        }
+
+        async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
+            self.inner.has(id).await
+        }
+
+        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+            self.inner.get(id).await
+        }
+
+        async fn put(&self, kind: ContentKind, bytes: &[u8]) -> fluree_db_core::Result<ContentId> {
+            self.inner.put(kind, bytes).await
+        }
+
+        async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> fluree_db_core::Result<()> {
+            self.inner.put_with_id(id, bytes).await
+        }
+
+        async fn release(&self, id: &ContentId) -> fluree_db_core::Result<()> {
+            self.inner.release(id).await
+        }
+
+        async fn get_range(
+            &self,
+            id: &ContentId,
+            range: std::ops::Range<u64>,
+        ) -> fluree_db_core::Result<Vec<u8>> {
+            self.inner.get_range(id, range).await
+        }
+
+        fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
+            self.resident.read().get(id).cloned()
+        }
+    }
+
+    #[test]
+    fn resident_leaves_open_without_fetching_or_copying() {
+        let store = ResidentContentStore::new();
+        let leaf_bytes = build_test_leaf_bytes();
+        let leaf_cid = run_sync_on_runtime({
+            let store = store.clone();
+            let leaf_bytes = leaf_bytes.clone();
+            async move {
+                io::Result::Ok(
+                    store
+                        .put_resident(ContentKind::IndexLeaf, &leaf_bytes)
+                        .await,
+                )
+            }
+        })
+        .expect("store leaf bytes");
+        let cache_dir = temp_cache_dir();
+        let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+
+        // Without a leaflet cache, then with one: a full open, a
+        // directory-only open and whole-leaf bytes all borrow the resident
+        // blob, so the store sees no fetch of any kind and nothing lands in
+        // the disk cache.
+        for cache in [None, Some(Arc::new(LeafletCache::with_max_mb(4)))] {
+            binary_store.leaflet_cache = cache;
+            for _ in 0..2 {
+                let handle = binary_store
+                    .open_leaf_handle(&leaf_cid, None, false)
+                    .expect("resident open");
+                assert_eq!(handle.dir().entries[0].row_count, 5);
+                let dir = binary_store
+                    .open_leaf_dir(&leaf_cid)
+                    .expect("resident dir open");
+                assert_eq!(dir.entries.len(), 1);
+                let shared = binary_store
+                    .get_leaf_bytes_shared(&leaf_cid)
+                    .expect("resident bytes");
+                let resident = store.resolve_cached_bytes(&leaf_cid).unwrap();
+                assert!(
+                    matches!(shared, SharedLeafBytes::Shared(ref bytes) if Arc::ptr_eq(bytes, &resident)),
+                    "whole-leaf bytes must be the store's own allocation"
+                );
+                assert_eq!(
+                    binary_store
+                        .get_leaf_bytes_sync(&leaf_cid)
+                        .expect("owned copy"),
+                    leaf_bytes,
+                    "an owned copy is taken from the resident bytes"
+                );
+            }
+        }
+        assert_eq!(
+            store.inner.get_calls(),
+            0,
+            "resident leaves must not be fetched"
+        );
+        assert_eq!(
+            store.inner.range_calls(),
+            0,
+            "resident leaves must not be range-read"
+        );
+        assert!(
+            binary_store.remote_leaf_metadata.read().is_empty(),
+            "a resident leaf must not take the remote range-read path"
+        );
+        assert!(
+            std::fs::read_dir(&cache_dir)
+                .map(|entries| entries.count() == 0)
+                .unwrap_or(true),
+            "nothing of a resident leaf lands in the disk cache"
+        );
+        let _ = std::fs::remove_dir_all(cache_dir);
     }
 
     #[test]

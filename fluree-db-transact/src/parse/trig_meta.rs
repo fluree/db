@@ -961,6 +961,20 @@ impl<'a> TrigMetaParser<'a> {
     // fresh reifier, `<<( … )>>` is a value only in object position, and star
     // constructs inside an annotation body are deferred.
 
+    /// An anonymous blank node or a collection, which this block parser does
+    /// not read: say which construct and what to write instead, where the
+    /// token alone (`'['`) left the fix to guess.
+    fn unsupported_in_block_error(&self) -> TransactError {
+        let construct = match self.current().kind {
+            TokenKind::LBracket | TokenKind::Anon => "anonymous blank nodes ('[ … ]')",
+            _ => "collections ('( … )')",
+        };
+        TransactError::Parse(format!(
+            "{construct} are not supported inside a TriG GRAPH block here; give the node \
+             a label such as _:b1 and state its properties as triples of their own"
+        ))
+    }
+
     fn triple_term_value_error(&self) -> TransactError {
         TransactError::Parse(
             "a triple term ('<<( … )>>') is a value and cannot be a subject".to_string(),
@@ -1240,6 +1254,9 @@ impl<'a> TrigMetaParser<'a> {
             }
             TokenKind::ReifiedTripleStart => self.parse_reified_triple(),
             TokenKind::TripleTermStart => Err(self.triple_term_value_error()),
+            TokenKind::LBracket | TokenKind::Anon | TokenKind::LParen | TokenKind::Nil => {
+                Err(self.unsupported_in_block_error())
+            }
             _ => Err(TransactError::Parse(format!(
                 "expected subject, found {}",
                 self.current().kind
@@ -1413,6 +1430,9 @@ impl<'a> TrigMetaParser<'a> {
                 }
                 let (s, p, o) = self.parse_triple_term_parts()?;
                 Ok(ObjectValue::TripleTerm(Box::new((s, p, o))))
+            }
+            TokenKind::LBracket | TokenKind::Anon | TokenKind::LParen | TokenKind::Nil => {
+                Err(self.unsupported_in_block_error())
             }
             _ => Err(TransactError::Parse(format!(
                 "expected object, found {}",
@@ -2689,6 +2709,31 @@ GRAPH <http://example.org/products> {
                 .unwrap_or_else(|e| panic!("{e}: {}", unwrapped.turtle));
             assert_eq!(sink.into_graph().len(), 3, "{}", unwrapped.turtle);
             assert!(unwrapped.mixes_default_and_named);
+        }
+    }
+
+    #[test]
+    fn test_anonymous_blank_nodes_and_collections_in_a_block_name_the_construct() {
+        // The block parser reads neither; the error says which construct it
+        // met and how to write it, not just the token.
+        for (body, construct) in [
+            ("ex:a ex:b [ ex:c ex:d ] .", "anonymous blank nodes"),
+            ("ex:a ex:b [] .", "anonymous blank nodes"),
+            ("[ ex:c ex:d ] ex:b ex:e .", "anonymous blank nodes"),
+            ("ex:a ex:b ( ex:c ) .", "collections"),
+            ("ex:a ex:b () .", "collections"),
+            ("( ex:c ) ex:b ex:e .", "collections"),
+        ] {
+            let mut ns = test_registry();
+            let input =
+                format!("@prefix ex: <http://example.org/> .\nGRAPH <urn:g> {{ {body} }}\n");
+            let err = extract_trig_txn_meta(&input, &mut ns)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(construct) && err.contains("_:b1"),
+                "{body}: {err}"
+            );
         }
     }
 

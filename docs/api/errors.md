@@ -136,19 +136,23 @@ Authentication is required but not provided or invalid.
 
 #### 403 Forbidden
 
-Authentication succeeded but authorization failed.
+The server understood the request but refused the operation under its access policy.
 
 **Common Causes:**
 - Insufficient permissions for operation
 - Policy denies access
 - Ledger access restricted
 
+A write rejected by a modify policy returns `403` with
+`@type: "err:policy/AccessDenied"`, and `error` carries the policy's
+`f:exMessage` when it has one. Malformed transactions still return `400`.
+
 **Example:**
 ```json
 {
-  "error": "access denied (403)",
+  "error": "Employees may not modify document content.",
   "status": 403,
-  "@type": "err:db/Forbidden"
+  "@type": "err:policy/AccessDenied"
 }
 ```
 

@@ -183,7 +183,7 @@ async fn configured_model_policy_controls_delegated_reads_and_writes() {
                 if allowed {
                     StatusCode::OK
                 } else {
-                    StatusCode::BAD_REQUEST
+                    StatusCode::FORBIDDEN
                 },
                 "{control}: {result}"
             );
@@ -920,7 +920,7 @@ async fn controller_selects_dynamic_policies_without_changing_credential() {
     );
 
     for (class, expected) in [
-        ("EmployeeClass", StatusCode::BAD_REQUEST),
+        ("EmployeeClass", StatusCode::FORBIDDEN),
         ("ManagerClass", StatusCode::OK),
     ] {
         let mut update = modify_public_doc_content_body();
@@ -1141,7 +1141,7 @@ async fn scope_only_preserves_delimited_output_and_ledger_write_defaults() {
             modify_public_doc_content_body().to_string(),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
         assert!(
             body.to_string().contains("Employees may not modify"),
             "{body}"
@@ -1164,7 +1164,7 @@ async fn anonymous_transaction_policy_headers_apply_without_tracking() {
         // No tracking headers or opts: the employee header must still restrict
         // this write. A body selection takes precedence over that default.
         for (body_class, expected) in [
-            (None, StatusCode::BAD_REQUEST),
+            (None, StatusCode::FORBIDDEN),
             (Some("http://example.org/ManagerClass"), StatusCode::OK),
         ] {
             let mut body = modify_public_doc_content_body();
@@ -1186,7 +1186,7 @@ async fn anonymous_transaction_policy_headers_apply_without_tracking() {
                 .unwrap();
             let (status, body) = json_body(response).await;
             assert_eq!(status, expected, "{mode:?}: {body}");
-            if expected == StatusCode::BAD_REQUEST {
+            if expected == StatusCode::FORBIDDEN {
                 assert!(
                     body.to_string().contains("Employees may not modify"),
                     "{body}"
@@ -1369,7 +1369,7 @@ async fn authority_alone_authenticates_and_missing_request_context_denies() {
         "<http://example.org/new> <http://schema.org/name> \"New\" .".into(),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{result}");
     // Omitting auth still supports the private-server direct-option contract.
     let (status, result) = query_docs_tri_state(app, ledger, None, None, None).await;
     assert_eq!(status, StatusCode::OK, "{result}");
@@ -1433,7 +1433,7 @@ async fn missing_controller_selection_with_locked_defaults_denies() {
         "<http://example.org/blocked> <http://schema.org/name> \"Blocked\" .".into(),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{result}");
 
     // A fixed empty selection must not acquire the identity's or config's grants.
     let fixed = delegated_token(

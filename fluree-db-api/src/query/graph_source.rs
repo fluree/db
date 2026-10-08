@@ -106,7 +106,7 @@ impl Fluree {
         sparql: &str,
     ) -> Result<QueryResult> {
         // See `query_graph_source` above — no default-context injection here.
-        let (vars, parsed) = parse_sparql_to_ir(sparql, &ledger.snapshot, None)?;
+        let (vars, parsed) = parse_sparql_to_ir(sparql, &ledger.snapshot, None, None)?;
         let executable = ExecutableQuery::simple(parsed.clone());
 
         let r2rml_provider = crate::r2rml_provider!(self);

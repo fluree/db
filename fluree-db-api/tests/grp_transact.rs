@@ -7,6 +7,8 @@ mod it_cached_handle_cow_cancel;
 mod it_cached_handle_cow_recovery;
 #[path = "it_concurrent_update_reconcile.rs"]
 mod it_concurrent_update_reconcile;
+#[path = "it_cypher_txn.rs"]
+mod it_cypher_txn;
 #[path = "it_default_graph_name.rs"]
 mod it_default_graph_name;
 #[path = "it_enforce_unique_upsert_indexed.rs"]
@@ -43,6 +45,8 @@ mod it_transact_update_indexed;
 mod it_transact_upsert;
 #[path = "it_transact_upsert_indexed.rs"]
 mod it_transact_upsert_indexed;
+#[path = "it_transaction.rs"]
+mod it_transaction;
 #[path = "it_trig_insert.rs"]
 mod it_trig_insert;
 #[path = "it_turtle_empty_collection.rs"]
