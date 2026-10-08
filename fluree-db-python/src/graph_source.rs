@@ -5,8 +5,9 @@ use crate::convert::to_json;
 use crate::error::{api_error, invalid_request};
 use crate::runtime::block_on;
 use fluree_db_api::{
-    CatalogMode, DeltaAzureFields, DeltaCreateConfig, DeltaUnityFields, DropMode, Fluree,
-    R2rmlCreateConfig, SqlAuthConfig, SqlConfigValue, SqlCreateConfig,
+    CatalogMode, CatalogModeArgs, DeltaAzureFields, DeltaCreateConfig, DeltaUnityFields, DropMode,
+    Fluree, IcebergCreateConfig, R2rmlCreateConfig, R2rmlMappingInput, SqlAuthConfig,
+    SqlConfigValue, SqlCreateConfig,
 };
 use fluree_db_nameservice::GraphSourceType;
 use pyo3::prelude::*;
@@ -32,6 +33,8 @@ pub(crate) struct Common {
 pub(crate) struct IcebergSpec {
     table_location: Option<String>,
     catalog_uri: Option<String>,
+    glue: Option<GlueSpec>,
+    s3_tables: Option<S3TablesSpec>,
     table: Option<String>,
     warehouse: Option<String>,
     auth: Option<Py<PyAny>>,
@@ -40,6 +43,22 @@ pub(crate) struct IcebergSpec {
     s3_endpoint: Option<String>,
     s3_path_style: bool,
     order_by: Option<String>,
+}
+
+/// An AWS Glue Data Catalog (`fluree.Glue`).
+#[derive(FromPyObject)]
+#[pyo3(from_item_all)]
+pub(crate) struct GlueSpec {
+    region: Option<String>,
+    catalog_id: Option<String>,
+}
+
+/// An AWS S3 Tables table bucket (`fluree.S3Tables`).
+#[derive(FromPyObject)]
+#[pyo3(from_item_all)]
+pub(crate) struct S3TablesSpec {
+    table_bucket_arn: String,
+    region: Option<String>,
 }
 
 #[derive(FromPyObject)]
@@ -121,21 +140,45 @@ pub(crate) fn map_iceberg<'py>(
     common: Common,
     spec: IcebergSpec,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let mut config = match (&spec.table_location, &spec.catalog_uri) {
-        (Some(location), None) => {
-            R2rmlCreateConfig::new_direct(&common.name, location, common.mapping)
-        }
-        (None, Some(uri)) => R2rmlCreateConfig::new(
-            &common.name,
-            uri,
-            spec.table.clone().unwrap_or_default(),
-            common.mapping,
-        ),
+    // Exactly one place the tables are found; which one names the catalog mode.
+    let mode = match (
+        &spec.table_location,
+        &spec.catalog_uri,
+        &spec.glue,
+        &spec.s3_tables,
+    ) {
+        (Some(_), None, None, None) => "direct",
+        (None, Some(_), None, None) => "rest",
+        (None, None, Some(_), None) => "glue",
+        (None, None, None, Some(_)) => "s3tables",
         _ => {
             return Err(invalid_request(
-                "give a table_location (direct) or a catalog_uri (REST catalog), not both",
+                "give exactly one of a table_location (direct), a catalog_uri (REST catalog), \
+                 glue (AWS Glue Data Catalog) or s3_tables (AWS S3 Tables)",
             ))
         }
+    };
+    // The same parse the CLI and server use: the mapping names the tables, so a
+    // catalog mode needs no `table` of its own.
+    let mode_args = CatalogModeArgs {
+        mode,
+        catalog_uri: spec.catalog_uri.as_deref(),
+        table_location: spec.table_location.as_deref(),
+        region: spec
+            .glue
+            .as_ref()
+            .and_then(|g| g.region.as_deref())
+            .or_else(|| spec.s3_tables.as_ref().and_then(|t| t.region.as_deref())),
+        catalog_id: spec.glue.as_ref().and_then(|g| g.catalog_id.as_deref()),
+        table_bucket_arn: spec.s3_tables.as_ref().map(|t| t.table_bucket_arn.as_str()),
+    };
+    let iceberg =
+        IcebergCreateConfig::from_mode(&common.name, mode_args, spec.table.as_deref(), true)
+            .map_err(|e| invalid_request(e.message(str::to_string)))?;
+    let mut config = R2rmlCreateConfig {
+        iceberg,
+        mapping: R2rmlMappingInput::Content(common.mapping),
+        mapping_media_type: None,
     };
     let rest = spec.catalog_uri.is_some();
     if let CatalogMode::Rest(catalog) = &mut config.iceberg.connection.catalog_mode {

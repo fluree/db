@@ -43,7 +43,9 @@ from fluree._terms import IRI, to_python
 from fluree._sources import (
     Auth,
     AzureServicePrincipal,
+    Glue,
     GraphSource,
+    S3Tables,
     Unity,
     _auth,
     _common,
@@ -239,6 +241,8 @@ class Connection:
         *,
         table_location: str | None = None,
         catalog_uri: str | None = None,
+        glue: Glue | None = None,
+        s3_tables: S3Tables | None = None,
         table: str | None = None,
         warehouse: str | None = None,
         auth: Auth | None = None,
@@ -254,24 +258,33 @@ class Connection:
         """Register Iceberg tables as graph source ``name``, mapped to RDF by
         ``mapping`` (R2RML, as Turtle text or a path to a Turtle file).
 
-        Read one table directly from ``table_location`` — an ``s3://`` prefix,
-        or a local ``file://`` path (local paths must lie under a directory
-        named in the ``FLUREE_ICEBERG_LOCAL_ROOTS`` environment variable,
-        set before the process first reads a table) — or through a REST
-        catalog at ``catalog_uri``, where the mapping's table names
-        (or ``table``) name the tables, with ``warehouse`` and ``auth``
-        (:class:`Bearer` or :class:`OAuth2`). The catalog's vended
-        credentials are used unless ``vended_credentials`` is false;
-        otherwise S3 access uses the usual AWS environment and the
+        Give exactly one place the tables are found. Read one table directly
+        from ``table_location`` — an ``s3://`` prefix, or a local ``file://``
+        path (local paths must lie under a directory named in the
+        ``FLUREE_ICEBERG_LOCAL_ROOTS`` environment variable, set before the
+        process first reads a table). Or find them through a catalog, where
+        the mapping's table names (or ``table``) name the tables: a REST
+        catalog at ``catalog_uri``, with ``warehouse`` and ``auth``
+        (:class:`Bearer` or :class:`OAuth2`); an AWS Glue Data Catalog
+        (:class:`Glue`); or an AWS S3 Tables table bucket
+        (:class:`S3Tables`). A REST catalog's vended credentials are used
+        unless ``vended_credentials`` is false; otherwise, and always for
+        Glue and S3 Tables, S3 access uses the usual AWS environment and the
         ``s3_*`` settings.
 
         ``order_by`` names the column that orders a key's rows, latest
         winning, for :meth:`GraphSource.materialize`. ``model`` names a
         ledger whose policies and class hierarchy govern the source.
         """
+        if glue is not None and not isinstance(glue, Glue):
+            raise TypeError(f"glue is a fluree.Glue, not {type(glue).__name__}")
+        if s3_tables is not None and not isinstance(s3_tables, S3Tables):
+            raise TypeError(f"s3_tables is a fluree.S3Tables, not {type(s3_tables).__name__}")
         spec = {
             "table_location": table_location,
             "catalog_uri": catalog_uri,
+            "glue": None if glue is None else glue._json(),
+            "s3_tables": None if s3_tables is None else s3_tables._json(),
             "table": table,
             "warehouse": warehouse,
             "auth": _auth(auth),
