@@ -21,12 +21,16 @@
 //! `nquads_to_trig`, as bulk import does. Canonicalization (C14N) tests
 //! write the parsed document back with the N-Triples / N-Quads writer that
 //! serves CONSTRUCT results and compare it with the canonical form.
+//!
+//! [`register_reader_tests`] runs the same test types through the standalone
+//! readers instead: the strict N-Triples / N-Quads reader, and the Turtle
+//! parser's conformant Turtle and TriG.
 
 use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{bail, ensure, Context, Result};
 use fluree_graph_ir::{Graph, GraphCollectorSink, Term as IrTerm};
-use fluree_graph_turtle::parse as parse_turtle;
+use fluree_graph_turtle::{parse as parse_turtle, Dialect, ParserOptions};
 
 use crate::evaluator::TestEvaluator;
 use crate::files::read_file_to_string;
@@ -74,6 +78,135 @@ pub fn register_rdf_tests(evaluator: &mut TestEvaluator) {
         negative_dataset_syntax(t, trig_action)
     });
     evaluator.register(rdft::TEST_TRIG_EVAL, evaluate_trig_eval);
+}
+
+/// The syntaxes the standalone readers take.
+#[derive(Clone, Copy)]
+enum Syntax {
+    Turtle,
+    TriG,
+    NTriples,
+    NQuads,
+}
+
+/// Register every RDF syntax test type against the standalone readers: the
+/// strict line reader for N-Triples and N-Quads, and the Turtle parser in
+/// its conformant shape (`rdf:first`/`rdf:rest` collections, numeric lexical
+/// forms kept) for Turtle and TriG. Expected results are read the same way.
+pub fn register_reader_tests(evaluator: &mut TestEvaluator) {
+    use Syntax::*;
+    for (positive, negative, syntax) in [
+        (
+            rdft::TEST_TURTLE_POSITIVE_SYNTAX,
+            rdft::TEST_TURTLE_NEGATIVE_SYNTAX,
+            Turtle,
+        ),
+        (
+            rdft::TEST_TRIG_POSITIVE_SYNTAX,
+            rdft::TEST_TRIG_NEGATIVE_SYNTAX,
+            TriG,
+        ),
+        (
+            rdft::TEST_NTRIPLES_POSITIVE_SYNTAX,
+            rdft::TEST_NTRIPLES_NEGATIVE_SYNTAX,
+            NTriples,
+        ),
+        (
+            rdft::TEST_NQUADS_POSITIVE_SYNTAX,
+            rdft::TEST_NQUADS_NEGATIVE_SYNTAX,
+            NQuads,
+        ),
+    ] {
+        evaluator.register(positive, move |t| reader_syntax(t, syntax, true));
+        evaluator.register(negative, move |t| reader_syntax(t, syntax, false));
+    }
+    evaluator.register(rdft::TEST_TURTLE_NEGATIVE_EVAL, |t| {
+        reader_syntax(t, Turtle, false)
+    });
+    evaluator.register(rdft::TEST_TRIG_NEGATIVE_EVAL, |t| {
+        reader_syntax(t, TriG, false)
+    });
+    evaluator.register(rdft::TEST_TURTLE_EVAL, |t| reader_eval(t, Turtle, NTriples));
+    evaluator.register(rdft::TEST_TRIG_EVAL, |t| reader_eval(t, TriG, NQuads));
+    evaluator.register(rdft::TEST_NTRIPLES_POSITIVE_C14N, |t| {
+        let dataset = read(action_url(t)?, NTriples)?;
+        let written = fluree_graph_format::format_ntriples(&dataset.default)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        compare_c14n(t, &written)
+    });
+    evaluator.register(rdft::TEST_NQUADS_POSITIVE_C14N, |t| {
+        let dataset = read(action_url(t)?, NQuads)?;
+        let written =
+            fluree_graph_format::format_nquads(&dataset).map_err(|e| anyhow::anyhow!("{e}"))?;
+        compare_c14n(t, &written)
+    });
+}
+
+/// The document at `url`, read by the standalone reader for `syntax`;
+/// Turtle and TriG resolve relative IRIs against `url`.
+fn read(url: &str, syntax: Syntax) -> Result<Dataset> {
+    let content = read_file_to_string(url).with_context(|| format!("Reading {url}"))?;
+    let mut sink = GraphCollectorSink::with_named_graphs();
+    let parsed = match syntax {
+        Syntax::Turtle | Syntax::TriG => {
+            let dialect = match syntax {
+                Syntax::TriG => Dialect::TriG,
+                _ => Dialect::Turtle,
+            };
+            fluree_graph_turtle::parse_with_options(
+                &format!("@base <{url}> .\n{content}"),
+                &mut sink,
+                ParserOptions::conformant().with_dialect(dialect),
+            )
+        }
+        Syntax::NTriples => fluree_graph_turtle::parse_ntriples(&content, &mut sink),
+        Syntax::NQuads => fluree_graph_turtle::parse_nquads(&content, &mut sink),
+    };
+    parsed.with_context(|| format!("Parsing {url}"))?;
+    Ok(sink.into_dataset())
+}
+
+fn reader_syntax(test: &Test, syntax: Syntax, valid: bool) -> Result<()> {
+    let url = action_url(test)?;
+    match read(url, syntax) {
+        Ok(_) if !valid => bail!(
+            "Negative syntax test failed — reader accepted an invalid document.\n\
+             Test: {}\nFile: {url}",
+            test.id
+        ),
+        Err(e) if valid => Err(e).with_context(|| {
+            format!(
+                "Positive syntax test failed — reader rejected a valid document.\n\
+                 Test: {}\nFile: {url}",
+                test.id
+            )
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// The action read as `syntax` against the result read as `expected`.
+fn reader_eval(test: &Test, syntax: Syntax, expected: Syntax) -> Result<()> {
+    let url = action_url(test)?;
+    let result_url = test
+        .result
+        .as_deref()
+        .with_context(|| format!("{}: evaluation test has no mf:result", test.id))?;
+    let actual = read(url, syntax).with_context(|| {
+        format!(
+            "Evaluation test failed — reader rejected the action document.\n\
+             Test: {}\nFile: {url}",
+            test.id
+        )
+    })?;
+    let expected = read(result_url, expected).with_context(|| {
+        format!(
+            "Evaluation test failed — could not read the expected dataset.\n\
+             Test: {}\nFile: {result_url}",
+            test.id
+        )
+    })?;
+    compare_datasets(test, url, &expected, &actual)
 }
 
 /// A TriG action, relative IRIs resolved against its manifest URL.
@@ -134,13 +267,18 @@ fn evaluate_trig_eval(test: &Test) -> Result<()> {
             test.id
         )
     })?;
+    compare_datasets(test, url, &expected, &actual)
+}
+
+/// Graph names in order, then each graph up to blank-node isomorphism.
+fn compare_datasets(test: &Test, url: &str, expected: &Dataset, actual: &Dataset) -> Result<()> {
     let names = |d: &Dataset| d.named.keys().map(ir_term_to_rdf_term).collect::<Vec<_>>();
     let as_graphs = |d: &Dataset| {
         std::iter::once(graph_to_rdf_triples(&d.default))
             .chain(d.named.values().map(graph_to_rdf_triples))
             .collect::<Vec<_>>()
     };
-    let (expected_names, actual_names) = (names(&expected), names(&actual));
+    let (expected_names, actual_names) = (names(expected), names(actual));
     ensure!(
         expected_names.len() == actual_names.len()
             && expected_names
@@ -152,7 +290,7 @@ fn evaluate_trig_eval(test: &Test) -> Result<()> {
          expected {expected_names:?}\nactual {actual_names:?}",
         test.id
     );
-    for (expected, actual) in as_graphs(&expected).into_iter().zip(as_graphs(&actual)) {
+    for (expected, actual) in as_graphs(expected).into_iter().zip(as_graphs(actual)) {
         let expected = SparqlResults::Graph(expected);
         let actual = SparqlResults::Graph(actual);
         if !are_results_isomorphic(&expected, &actual) {

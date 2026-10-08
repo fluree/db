@@ -677,3 +677,41 @@ pub const RDF12_TRIG: &[&str] = &[
     "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-trig/eval#trig12-annotation-04",
     "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-trig/eval#trig12-reified-triples-annotation-01",
 ];
+
+// The standalone readers (`*_reader` suites): the strict N-Triples / N-Quads
+// reader, and the Turtle parser's conformant Turtle and TriG (spine
+// collections, numeric lexical forms kept), each reading its expected
+// results the same way.
+
+pub const RDF11_TURTLE_READER: &[&str] = &[
+    // the Turtle lexer, as in RDF11_TURTLE: `\u` escapes in IRIREF that decode
+    // to forbidden characters are accepted (3); PN_LOCAL with interior dots
+    // (1)
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-eval-bad-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-eval-bad-02",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-eval-bad-03",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-syntax-ln-dots",
+];
+
+pub const RDF12_TURTLE_SYNTAX_READER: &[&str] = &[];
+
+pub const RDF12_TURTLE_EVAL_READER: &[&str] = &[
+    // annotation-of-annotation, deferred as in RDF12_TURTLE_EVAL (2)
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-annotation-04",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-reified-triples-annotation-01",
+];
+
+pub const RDF12_NTRIPLES_READER: &[&str] = &[];
+
+pub const RDF12_NQUADS_READER: &[&str] = &[];
+
+pub const RDF12_TRIG_READER: &[&str] = &[
+    // the Turtle lexer, as in RDF11_TURTLE_READER (4)
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-eval-bad-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-eval-bad-02",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-eval-bad-03",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-syntax-ln-dots",
+    // annotation-of-annotation, deferred as in RDF12_TURTLE_EVAL (2)
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-trig/eval#trig12-annotation-04",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-trig/eval#trig12-reified-triples-annotation-01",
+];
