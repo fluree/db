@@ -281,6 +281,7 @@
   - [JSON-LD connection configuration](reference/connection-config-jsonld.md)
   - [Standards and feature flags](reference/compatibility.md)
   - [Graph identities and naming](reference/graph-identities.md)
+  - [RDF documents: parse and serialize](reference/rdf-documents.md)
   - [OWL & RDFS support](reference/owl-rdfs-support.md)
   - [Crate map](reference/crate-map.md)
   - [License FAQ](reference/license-faq.md)

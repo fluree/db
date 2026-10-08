@@ -822,7 +822,7 @@ See also: [CLI export](../cli/export.md) for command-line usage.
 
 ### Parse and Serialize RDF
 
-`fluree_db_api::rdf` reads and writes RDF documents with no ledger involved: a document becomes a `Dataset` (a default graph and named graphs) and a `Dataset` becomes a document.
+`fluree_db_api::rdf` reads and writes RDF documents with no ledger involved: a document becomes a `Dataset` (a default graph and named graphs) and a `Dataset` becomes a document. [RDF documents](../reference/rdf-documents.md) shows how each syntax writes RDF 1.2 and lists the JSON-LD limits.
 
 ```rust
 use fluree_db_api::rdf::{self, Dataset, PrefixMap, RdfFormat, Term};
