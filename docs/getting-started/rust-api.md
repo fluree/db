@@ -1271,7 +1271,7 @@ async fn main() -> Result<()> {
 `validation` is present for every non-fast-forward preview unless
 `MergePreviewOpts::include_validation` is `false`, and for a fast-forward
 when the target's config enables SHACL or uniqueness, or the commits it
-adopts carry config settings (a field the config reader reads, a type in the `f:` vocabulary, or a write to a config or txn-meta graph of this ledger): the merge checks them
+adopts carry config settings (a field the config reader reads, or a write to a config or txn-meta graph of this ledger): the merge checks them
 against the target's config as it is before the merge. Any other
 fast-forward carries none.
 

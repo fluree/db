@@ -509,18 +509,18 @@ pub(crate) struct FastForwardBase {
     pub(crate) config: crate::tx::ConfigRead,
 }
 
-/// Whether the adopted change carries anything the staged-config guard
-/// checks on a branch operation: a config field ([`crate::config_vocab::is_config_field`],
-/// the config reader's vocabulary), a type in the `f:` vocabulary, a write
-/// to the target's config or txn-meta graph, or a write to another branch's
-/// system graph of this ledger. Every refusal the guard can make needs one of them, so a
-/// change without any (data, edge annotations included) is accepted
-/// unchecked into a target that governs no writes.
+/// Whether the adopted change carries anything a branch operation's config
+/// checks can refuse: a config field ([`crate::config_vocab::is_config_field`],
+/// the config reader's vocabulary) for the split-group and second-value
+/// checks, or a write to the target's config or txn-meta graph or to another
+/// branch's system graph of this ledger. Every such refusal needs one of
+/// them (a config typed outside the config graph is refused only where it is
+/// written), so a change without any (data, edge annotations included) is
+/// accepted unchecked into a target that governs no writes.
 fn carries_config_settings(
     target: &LedgerState,
     data: &crate::commit_data::CollectedCommitData,
 ) -> bool {
-    use fluree_vocab::namespaces::{FLUREE_DB, RDF};
     let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&target.snapshot);
     // The adopted commits' own namespace codes, so a config graph first
     // written on the source still encodes as its flakes do. A conflicting
@@ -542,10 +542,6 @@ fn carries_config_settings(
     let mut graphs_seen: std::collections::HashSet<&Sid> = std::collections::HashSet::new();
     data.flakes.iter().any(|flake| {
         crate::config_vocab::is_config_field(&flake.p)
-            || (flake.p.namespace_code == RDF
-                && &*flake.p.name == fluree_vocab::rdf_names::TYPE
-                && matches!(&flake.o, fluree_db_core::FlakeValue::Ref(o)
-                    if o.namespace_code == FLUREE_DB))
             || flake.g.as_ref().is_some_and(|g| {
                 own_system_graphs.contains(g)
                     || (graphs_seen.insert(g)
