@@ -1641,6 +1641,18 @@ async fn cypher_with_where_filters_after_the_slice() {
              WHERE exists { (p)-[:likes]->(f) } RETURN fa",
             json!([]),
         ),
+        // `f` is carried too: free, it would match Alice's like of Carol on
+        // both of her rows. A body variable of its own (`g`) is free.
+        (
+            "MATCH (p:P)-[:knows]->(f) WITH p.age AS a ORDER BY a, f.age LIMIT 3 \
+             WHERE exists { (p)-[:likes]->(f) } RETURN a",
+            json!([[40]]),
+        ),
+        (
+            "MATCH (p:P)-[:knows]->(f) WITH p.age AS a ORDER BY a, f.age LIMIT 3 \
+             WHERE exists { (p)-[:likes]->(g) } RETURN a",
+            json!([[40], [40]]),
+        ),
         // Aggregating, one level.
         (
             "MATCH (p:P)-[:knows]->(f) WITH p, count(f) AS c ORDER BY c DESC LIMIT 2 \
