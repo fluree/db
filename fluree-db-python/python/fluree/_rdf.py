@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Iterable
 from pathlib import Path
@@ -12,43 +13,53 @@ from fluree import _fluree as native
 from fluree._terms import BlankNode, Quad, to_lexical, to_python, trusted_quad, trusted_triple
 from fluree.errors import InvalidRequestError
 
-RdfFormat = _Literal["turtle", "trig", "ntriples", "nquads"]
+RdfFormat = _Literal["turtle", "trig", "ntriples", "nquads", "jsonld"]
 
 _SUFFIXES: dict[str, RdfFormat] = {
     ".ttl": "turtle",
     ".trig": "trig",
     ".nt": "ntriples",
     ".nq": "nquads",
+    ".jsonld": "jsonld",
+    ".json": "jsonld",
 }
 
 
 def parse(
-    data: str | os.PathLike[str],
+    data: str | os.PathLike[str] | dict[str, Any] | list[Any],
     format: RdfFormat | None = None,
     *,
     base: str | None = None,
     literals: _Literal["value", "lexical"] = "value",
 ) -> list[Quad]:
-    """The quads of an RDF document: Turtle, TriG, N-Triples or N-Quads.
+    """The quads of an RDF document: Turtle, TriG, N-Triples, N-Quads or
+    JSON-LD.
 
-    ``data`` is the document's text, with its ``format`` given, or a path,
-    whose extension (``.ttl``, ``.trig``, ``.nt``, ``.nq``) gives the format
-    when ``format`` does not. Turtle and TriG resolve relative IRIs against
-    ``base``.
+    ``data`` is the document's text, with its ``format`` given; a path,
+    whose extension (``.ttl``, ``.trig``, ``.nt``, ``.nq``, ``.jsonld``,
+    ``.json``) gives the format when ``format`` does not; or a JSON-LD
+    document as a dict or list. Turtle, TriG and JSON-LD resolve relative
+    IRIs against ``base``.
 
     RDF 1.2 is read whole: a triple term is a :class:`Triple`, and an
     annotation or reified triple is the quad ``(reifier, rdf:reifies,
-    Triple(...))``, with the annotated triple as a quad of its own. Literals
-    are Python values, as query results are, so a number's spelling is not
-    kept (``"01"`` reads as ``1``); with ``literals="lexical"`` every typed
-    literal but a plain string is a :class:`Literal` with its lexical form,
-    and :func:`serialize` writes it back as it was. Blank nodes keep the
-    document's labels;
-    an anonymous one (``[]``, a collection, an annotation) gets a fresh
-    label. Malformed input raises :class:`InvalidRequestError` naming the
-    line and column.
+    Triple(...))``, with the annotated triple as a quad of its own. In
+    JSON-LD these are ``@annotation`` on a value, a node's ``@reifies``, and
+    ``{"@id": {"@id": s, p: o}}``; a named graph is a node's ``@graph``.
+
+    Literals are Python values, as query results are, so a number's
+    spelling is not kept (``"01"`` reads as ``1``); with
+    ``literals="lexical"`` every typed literal but a plain string is a
+    :class:`Literal` with its lexical form, and :func:`serialize` writes it
+    back as it was. Blank nodes keep the document's labels; an anonymous one
+    (``[]``, a collection, an annotation) gets a fresh label. Malformed input
+    raises :class:`InvalidRequestError` naming the line and column.
     """
-    if isinstance(data, os.PathLike):
+    if isinstance(data, (dict, list)):
+        if format not in (None, "jsonld"):
+            raise InvalidRequestError(f"a dict or list is JSON-LD, not {format}")
+        data, format = json.dumps(data), "jsonld"
+    elif isinstance(data, os.PathLike):
         path = Path(data)
         if format is None:
             format = _SUFFIXES.get(path.suffix.lower())
@@ -56,7 +67,7 @@ def parse(
                 raise InvalidRequestError(f"cannot tell the format of {path.name}; pass format=")
         data = path.read_text(encoding="utf-8")
     elif format is None:
-        raise InvalidRequestError("pass format= (turtle, trig, ntriples or nquads)")
+        raise InvalidRequestError("pass format= (turtle, trig, ntriples, nquads or jsonld)")
     if literals not in ("value", "lexical"):
         raise InvalidRequestError(f"literals= is 'value' or 'lexical', not {literals!r}")
     literal = to_python if literals == "value" else to_lexical
@@ -77,13 +88,15 @@ def serialize(
     *,
     prefixes: dict[str, str] | None = None,
 ) -> str:
-    """Write quads as an RDF document: Turtle, TriG, N-Triples or N-Quads.
+    """Write quads as an RDF document: Turtle, TriG, N-Triples, N-Quads or
+    JSON-LD.
 
     Each item is a :class:`Quad`, or a ``(subject, predicate, object)`` or
     ``(subject, predicate, object, graph)`` tuple. Turtle and N-Triples hold
-    the default graph only; a quad in a named graph needs TriG or N-Quads.
-    Turtle and TriG declare ``prefixes`` (``{"ex": "http://example.org/"}``)
-    and write IRIs with them. A quad ``(r, rdf:reifies, Triple(...))`` is
+    the default graph only; a quad in a named graph needs TriG, N-Quads or
+    JSON-LD. Turtle and TriG declare ``prefixes``
+    (``{"ex": "http://example.org/"}``) and write IRIs with them, and JSON-LD
+    makes them its ``@context``. A quad ``(r, rdf:reifies, Triple(...))`` is
     written as an annotation where the format has one.
     """
     return native.serialize_rdf([q if type(q) is Quad else _quad(q) for q in quads], format, prefixes)
