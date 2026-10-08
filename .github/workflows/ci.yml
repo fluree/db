@@ -335,6 +335,85 @@ jobs:
       - name: Runtime smoke (wasm32 under Node)
         run: node wasm-probe/run-node.mjs
 
+  python:
+    # The `fluree` Python package is tested by pytest (its Rust lib is
+    # `test = false`), so no job above runs its tests. One abi3 wheel per OS
+    # the package ships on (python-release.yml), tested on the oldest and
+    # newest supported Pythons. A debug build: the release profile's LTO costs
+    # minutes and buys nothing for a test run. Windows runs here so a
+    # Unix-only assumption fails a PR, not a release.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            rustflags: "-C link-arg=-fuse-ld=mold"
+          # mold is Linux-only; clear the workflow-level linker flag.
+          - os: macos-15
+            rustflags: ""
+          - os: windows-2025
+            rustflags: ""
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - if: runner.os == 'Linux'
+        uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: python
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-python@v7
+        id: py310
+        with:
+          python-version: "3.10"
+      - uses: actions/setup-python@v7
+        id: py314
+        with:
+          python-version: "3.14"
+
+      - name: Build the wheel
+        shell: bash
+        run: |
+          py="${{ steps.py314.outputs.python-path }}"
+          "$py" -m pip install "maturin>=1.9,<2"
+          "$py" -m maturin build --locked --manifest-path fluree-db-python/Cargo.toml --out dist
+          "$py" -c 'import glob, zipfile; names = zipfile.ZipFile(glob.glob("dist/*.whl")[0]).namelist(); assert any(n.endswith(".dist-info/licenses/LICENSE") for n in names), "the wheel carries no LICENSE"'
+
+      - name: Test on Python 3.10 and 3.14
+        shell: bash
+        run: |
+          for v in 310 314; do
+            [ $v = 310 ] && py="${{ steps.py310.outputs.python-path }}" || py="${{ steps.py314.outputs.python-path }}"
+            "$py" -m venv "venv-$v"
+            bin="venv-$v/bin"; [ "$RUNNER_OS" = Windows ] && bin="venv-$v/Scripts"
+            "$bin/python" -m pip install dist/*.whl pytest pandas polars
+            "$bin/python" -m pytest fluree-db-python/tests
+          done
+
+      # The package ships `py.typed`, so its annotations are part of the API.
+      - name: Type-check the package
+        if: runner.os == 'Linux'
+        working-directory: fluree-db-python
+        run: |
+          ../venv-314/bin/pip install mypy pandas-stubs polars
+          ../venv-314/bin/python -m mypy
+
+      # Published by docs.yml. Strict, so a docstring reference that resolves
+      # nowhere fails here rather than rendering as plain text.
+      - name: Build the API reference
+        if: runner.os == 'Linux'
+        working-directory: fluree-db-python
+        run: |
+          ../venv-314/bin/pip install -r docs/requirements.txt
+          ../venv-314/bin/python -m sphinx -n -W --keep-going -q -b html docs "$RUNNER_TEMP/python-api"
+
   # Executes the browser build (the wasm32 job only proves it compiles).
   # 1. The playground binding runs create → insert → query → format inside a
   #    dedicated worker in headless Chrome (wasm-bindgen-test, assertions on

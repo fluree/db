@@ -66,6 +66,7 @@
   - [Quickstart: query data (JSON-LD Query + SPARQL)](getting-started/quickstart-query.md)
   - [Tutorial: end-to-end (search, time travel, branching, policies)](getting-started/tutorial-end-to-end.md)
   - [Using Fluree as a Rust library](getting-started/rust-api.md)
+  - [Using Fluree from Python](getting-started/python.md)
 
 - [Concepts](concepts/README.md)
   - [Ledgers and the nameservice](concepts/ledgers-and-nameservice.md)
