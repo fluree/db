@@ -133,9 +133,39 @@ def test_serialize_round_trips_every_format():
         Quad(ex("doc"), ex("says"), Triple(ex("c"), ex("p"), LangString("x", "fr"))),
     ]
     named = [*default, Quad(ex("a"), ex("p"), ex("c"), ex("g")), Quad(ex("a"), ex("p"), 1, BlankNode("g2"))]
-    for format, quads in [("ntriples", default), ("turtle", default), ("nquads", named), ("trig", named)]:
+    for format, quads in [
+        ("ntriples", default),
+        ("turtle", default),
+        ("nquads", named),
+        ("trig", named),
+        ("jsonld", named),
+    ]:
         text = fluree.serialize(quads, format, prefixes={"ex": EX})
         assert set(fluree.parse(text, format)) == set(quads), f"{format}:\n{text}"
+
+
+def test_json_ld_reads_as_a_dict_a_path_or_text(tmp_path):
+    doc = {
+        "@context": {"ex": EX},
+        "@graph": [
+            {"@id": "ex:g", "@graph": [{"@id": "ex:a", "ex:age": {"@value": 3, "@annotation": {"ex:by": "x"}}}]},
+            {"@id": "ex:claim", "@reifies": {"@id": "ex:c", "ex:p": {"@id": "ex:d"}}},
+        ],
+    }
+    quads = fluree.parse(doc)
+    assert Quad(ex("a"), ex("age"), 3, ex("g")) in quads
+    reifier = next(q.subject for q in quads if q.object == Triple(ex("a"), ex("age"), 3))
+    assert Quad(reifier, ex("by"), "x", ex("g")) in quads
+    assert Quad(ex("claim"), IRI(REIFIES), Triple(ex("c"), ex("p"), ex("d"))) in quads
+
+    path = tmp_path / "data.jsonld"
+    path.write_text(fluree.serialize(quads, "jsonld", prefixes={"ex": EX}))
+    assert '"ex": "http://example.org/"' in path.read_text()
+    assert set(fluree.parse(path)) == set(quads)
+    with pytest.raises(InvalidRequestError, match="JSON-LD, not turtle"):
+        fluree.parse(doc, "turtle")
+    with pytest.raises(InvalidRequestError, match="line 1"):
+        fluree.parse('{"@id": ', "jsonld")
 
 
 def test_a_reification_of_an_asserted_triple_is_written_as_an_annotation():

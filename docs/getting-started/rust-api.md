@@ -856,7 +856,8 @@ fn main() -> Result<(), rdf::RdfError> {
 }
 ```
 
-- **Formats:** `RdfFormat` is Turtle, TriG, N-Triples or N-Quads. It parses from a name (`"trig"`, `"n-quads"`, …) and `RdfFormat::from_extension` maps `.ttl`, `.trig`, `.nt` and `.nq`.
+- **Formats:** `RdfFormat` is Turtle, TriG, N-Triples, N-Quads or JSON-LD. It parses from a name (`"trig"`, `"n-quads"`, `"json-ld"`, …) and `RdfFormat::from_extension` maps `.ttl`, `.trig`, `.nt`, `.nq`, `.jsonld` and `.json`.
+- **JSON-LD:** a named graph is a `{"@id": g, "@graph": [...]}` node, an annotation is `@annotation` on a value, a reified triple is a node's `@reifies`, and a triple term is `{"@id": {"@id": s, p: o}}`. `serialize` writes the prefixes as the `@context` and compacts IRIs with them. An IRI that stays relative after expansion (a property with no context entry, say) is refused.
 - **Reading:** Turtle and TriG follow the W3C grammars, resolving relative IRIs against the `base` argument. N-Triples and N-Quads are read strictly: absolute IRIs, and one statement per line. Literals keep their lexical form.
 - **RDF 1.2:** a triple term is a `Term::TripleTerm`. An annotation or reified triple is a reification of its graph (`Graph::reifications`), and an annotation also asserts its triple. Writers write a reification of an asserted triple as an annotation where the format has one.
 - **Blank nodes:** blank nodes keep the document's labels. An anonymous one (`[]`, a collection, an annotation) is labeled `bN` apart from them, so a parsed dataset can be written in any format.

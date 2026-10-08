@@ -70,7 +70,7 @@ transaction body goes to `insert()`, `upsert()` or `update()`:
 | [Full-text](../indexing-and-search/fulltext.md) and [vector](../indexing-and-search/vector-search.md) search | `ledger.set_full_text(...)`, `fluree.Vector`, and the query functions |
 | [Graph sources](../graph-sources/overview.md): Iceberg, Delta, SQL | `conn.map_iceberg(...)`, `conn.map_delta(...)`, `conn.map_sql(...)` |
 | Export, and [archives](../operations/pack-archive-restore.md) | `ledger.export(...)`, `ledger.archive(path)`, `conn.restore(path, name)` |
-| Turtle, TriG, N-Triples and N-Quads documents, with no ledger | `fluree.parse(...)` and `fluree.serialize(...)`, as `fluree.Quad`s |
+| Turtle, TriG, N-Triples, N-Quads and JSON-LD documents, with no ledger | `fluree.parse(...)` and `fluree.serialize(...)`, as `fluree.Quad`s |
 | [Connection configuration](../reference/connection-config-jsonld.md) (S3, DynamoDB, encryption) | `fluree.connect(config={...})` |
 
 A few things differ from the server:

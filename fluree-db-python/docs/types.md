@@ -29,7 +29,7 @@ file extension does not settle it.
 (type-rdfformat)=
 ## RdfFormat
 
-`"turtle" | "trig" | "ntriples" | "nquads"`: the formats
+`"turtle" | "trig" | "ntriples" | "nquads" | "jsonld"`: the formats
 {py:func}`fluree.parse` reads and {py:func}`fluree.serialize` writes.
 
 (type-language)=

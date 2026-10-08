@@ -134,7 +134,7 @@ def connect(
 
 
 async def parse(
-    data: str | os.PathLike[str],
+    data: str | os.PathLike[str] | dict[str, Any] | list[Any],
     format: RdfFormat | None = None,
     *,
     base: str | None = None,

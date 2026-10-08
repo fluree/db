@@ -340,7 +340,7 @@ never widen what a governed handle sees.
 ## RDF documents
 
 `fluree.parse()` and `fluree.serialize()` read and write Turtle, TriG,
-N-Triples and N-Quads with no ledger involved, as lists of `fluree.Quad`
+N-Triples, N-Quads and JSON-LD with no ledger involved, as lists of `fluree.Quad`
 (`subject, predicate, object, graph`; the graph is `None` for the default
 graph). Here a document's IRIs move to a new namespace:
 
@@ -362,12 +362,16 @@ ledger.insert(quads)                      # or write them straight to a ledger
 ```
 
 - A path (a `Path`, not a `str`, which is the document's text) gives its
-  format by extension (`.ttl`, `.trig`, `.nt`, `.nq`); text needs `format=`.
-  Turtle and TriG resolve relative IRIs against `base=`.
+  format by extension (`.ttl`, `.trig`, `.nt`, `.nq`, `.jsonld`, `.json`);
+  text needs `format=`, and a dict or list is JSON-LD. Turtle, TriG and
+  JSON-LD resolve relative IRIs against `base=`.
 - RDF 1.2 is read whole. A triple term is a `fluree.Triple`, and an
   annotation or a reified triple is the quad `(reifier, rdf:reifies,
   Triple(...))`, the annotated triple being a quad of its own. `serialize`
-  writes such quads back as annotations where the format has them.
+  writes such quads back as annotations where the format has them. JSON-LD
+  writes these as `@annotation` on a value, a node's `@reifies`, and
+  `{"@id": {"@id": s, p: o}}`, and a named graph as `{"@id": g, "@graph":
+  [...]}`.
 - Literals are Python values, as in query results, so a number's spelling is
   not kept (`"01"` reads as `1`); a float is written in its shortest form
   (`0.9957`). `literals="lexical"` keeps every typed literal but a plain
@@ -376,7 +380,7 @@ ledger.insert(quads)                      # or write them straight to a ledger
 - Blank nodes keep the document's labels; an anonymous one gets a fresh
   label.
 - `ledger.insert(quads)` and `upsert(quads)` write quads, named graphs
-  included. `parse` does not read JSON-LD; `insert` takes it directly.
+  included.
 
 ## rdflib
 
