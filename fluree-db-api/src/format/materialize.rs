@@ -19,11 +19,20 @@ use fluree_db_query::binding::Binding;
 /// - If an encoded binding is encountered but `result.binary_graph` is `None`
 /// - If the binary store cannot resolve the encoded IDs
 pub(crate) fn materialize_binding(result: &QueryResult, binding: &Binding) -> Result<Binding> {
+    materialize_with_graph(result.binary_graph.as_ref(), binding)
+}
+
+/// [`materialize_binding`] for callers holding the binary graph directly
+/// rather than a whole `QueryResult`.
+pub(crate) fn materialize_with_graph(
+    gv: Option<&BinaryGraphView>,
+    binding: &Binding,
+) -> Result<Binding> {
     if !binding.is_encoded() {
         return Ok(binding.clone());
     }
 
-    let gv = result.binary_graph.as_ref().ok_or_else(|| {
+    let gv = gv.ok_or_else(|| {
         FormatError::InvalidBinding(
             "Encountered encoded binding during formatting but QueryResult has no binary_graph"
                 .to_string(),
@@ -78,16 +87,9 @@ fn materialize_encoded_lit(binding: &Binding, gv: &BinaryGraphView) -> std::io::
     match val {
         FlakeValue::Ref(sid) => Ok(Binding::sid(sid)),
         other => {
-            // NUM_BIG arena values share one EncodedLit whose dt_id is hardcoded
-            // to decimal — recover xsd:integer vs xsd:decimal from the decoded
-            // value, not dt_id (issue #1329).
-            let dt_sid = other.overflow_numeric_datatype_sid().unwrap_or_else(|| {
-                store
-                    .dt_sids()
-                    .get(*dt_id as usize)
-                    .cloned()
-                    .unwrap_or_else(|| Sid::new(0, ""))
-            });
+            let dt_sid = store
+                .resolve_dt_id_sid_for_value(*dt_id, &other)
+                .unwrap_or_else(|| Sid::new(0, ""));
             let meta = store.decode_meta(*lang_id, *i_val);
             let dtc = match meta.and_then(|m| m.lang.map(std::sync::Arc::from)) {
                 Some(lang) => DatatypeConstraint::LangTag(lang),

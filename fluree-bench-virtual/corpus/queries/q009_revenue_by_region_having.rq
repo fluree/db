@@ -1,0 +1,10 @@
+# q009 revenue_by_region_having
+# Intent: Rollup with HAVING on the aggregate.
+# BI lineage (BI-06): "Which regions generate more than $5M in order revenue?"
+# Predicates verified against enterprise.ttl — FactOrder: orderTotal, customer; DimCustomer: geography; DimGeography: region.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?region (SUM(?tot) AS ?rev)
+WHERE { ?o a edw:Order ; edw:orderTotal ?tot ; edw:customer ?c .
+        ?c edw:geography ?g . ?g edw:region ?region . }
+GROUP BY ?region
+HAVING (SUM(?tot) > 5000000)

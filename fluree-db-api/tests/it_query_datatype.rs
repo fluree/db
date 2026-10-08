@@ -107,7 +107,6 @@ async fn datatype_query_explicit_typed_value_object_matches() {
     let q = json!({
         "@context": ctx,
         "select": "?name",
-        // Rust normalizes xsd:int to xsd:integer.
         "where": {"ex:name":"?name","ex:age":{"@value":36,"@type":"xsd:integer"}}
     });
 
@@ -116,13 +115,9 @@ async fn datatype_query_explicit_typed_value_object_matches() {
         .unwrap()
         .to_jsonld(&ledger.snapshot)
         .unwrap();
-    // NOTE(parity): Rust currently normalizes numeric datatypes so untyped integers and
-    // explicitly-typed integer-family values share `xsd:integer`. This means both Homer
-    // (untyped 36) and Marge (typed xsd:int → normalized) match here.
-    assert_eq!(
-        normalize_rows(&rows),
-        normalize_rows(&json!(["Homer", "Marge"]))
-    );
+    // A typed constant matches its own datatype only: Homer's untyped 36 is
+    // `xsd:integer`; Marge's 36 is `xsd:int`, a different term (#1737).
+    assert_eq!(normalize_rows(&rows), normalize_rows(&json!(["Homer"])));
 }
 
 #[cfg(feature = "native")]
@@ -762,6 +757,81 @@ async fn langstring_brand_new_namespace_exported() {
         out.contains("zz.example/ns/count"),
         "export must contain the brand-new-namespace integer (encoded path); got:\n{out}"
     );
+}
+
+/// Issue #1445: RDF export must emit `xsd:double` values in the W3C canonical
+/// lexical form (`1.0E6`), not Rust `{:E}` form (`1E6`, missing the mantissa
+/// dot). Covers both export lanes: the indexed/encoded path (pre-reindex
+/// insert) and the novelty raw-flake path (post-reindex insert).
+#[tokio::test]
+async fn double_export_uses_canonical_lexical_form() {
+    use fluree_db_api::export::ExportFormat;
+    use fluree_db_api::ReindexOptions;
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fluree = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .build()
+        .expect("build file fluree");
+    let ledger_id = "doublecanon/export:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.unwrap();
+    let ctx = ctx_datatype();
+
+    // Indexed double (encoded path after reindex).
+    let base = json!({
+        "@context": ctx,
+        "@id": "ex:indexed",
+        "ex:score": {"@type": "xsd:double", "@value": 1_000_000.0}
+    });
+    let _l1 = fluree.insert(ledger0, &base).await.unwrap().ledger;
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let indexed = fluree.ledger(ledger_id).await.expect("load indexed");
+
+    // Novelty double (raw-flake path over the indexed base).
+    let novelty = json!({
+        "@context": ctx,
+        "@id": "ex:novel",
+        "ex:score": {"@type": "xsd:double", "@value": 0.001}
+    });
+    fluree
+        .insert_with_opts(
+            indexed,
+            &novelty,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &fluree_db_api::IndexConfig {
+                reindex_min_bytes: 1_000_000_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
+        )
+        .await
+        .unwrap();
+
+    for fmt in [ExportFormat::NTriples, ExportFormat::Turtle] {
+        let mut buf: Vec<u8> = Vec::new();
+        fluree
+            .export(ledger_id)
+            .format(fmt)
+            .write_to(&mut buf)
+            .await
+            .unwrap_or_else(|e| panic!("export {fmt:?} failed: {e}"));
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("\"1.0E6\""),
+            "{fmt:?} export must render the indexed double canonically; got:\n{out}"
+        );
+        assert!(
+            out.contains("\"1.0E-3\""),
+            "{fmt:?} export must render the novelty double canonically; got:\n{out}"
+        );
+        assert!(
+            !out.contains("\"1E6\""),
+            "{fmt:?} export must not use the dotless {{:E}} form; got:\n{out}"
+        );
+    }
 }
 
 /// Issue #1273 follow-up: deleting one language variant must retract exactly

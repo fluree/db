@@ -102,11 +102,29 @@ impl fmt::Debug for GeoPointBits {
 }
 
 impl fmt::Display for GeoPointBits {
+    /// WKT, longitude first. Each coordinate is the shortest decimal that
+    /// encodes to this point, so `POINT(2.2945 48.8584)` reads back as
+    /// written rather than as the binary expansion of its decoded cell.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // WKT format: POINT(lng lat) - note: longitude first!
+        const LNG_BITS: u64 = (1 << 30) - 1;
         let (lat, lng) = ObjKey::from_u64(self.0).decode_geo_point();
-        write!(f, "POINT({lng} {lat})")
+        let lat_text = shortest_decimal(lat, |c| {
+            GeoPointBits::new(c, lng).map(|p| p.0 & !LNG_BITS) == Some(self.0 & !LNG_BITS)
+        });
+        let lng_text = shortest_decimal(lng, |c| {
+            GeoPointBits::new(lat, c).map(|p| p.0 & LNG_BITS) == Some(self.0 & LNG_BITS)
+        });
+        write!(f, "POINT({lng_text} {lat_text})")
     }
+}
+
+/// The shortest fixed-point rendering of `value` that `same` accepts.
+fn shortest_decimal(value: f64, same: impl Fn(f64) -> bool) -> String {
+    (0..=12)
+        .map(|digits| format!("{value:.digits$}"))
+        .map(|text| if text == "-0" { "0".to_string() } else { text })
+        .find(|text| text.parse().is_ok_and(&same))
+        .unwrap_or_else(|| value.to_string())
 }
 
 /// Polymorphic value type for flake objects
@@ -1263,6 +1281,26 @@ fn count_significant_digits(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A point reads back as the WKT it was written as: each coordinate is
+    /// the shortest decimal that encodes to the stored point.
+    #[test]
+    fn geo_point_displays_as_written() {
+        for (lng, lat, wkt) in [
+            (2.2945, 48.8584, "POINT(2.2945 48.8584)"),
+            (-122.4194, 37.7749, "POINT(-122.4194 37.7749)"),
+            (0.0, 0.0, "POINT(0 0)"),
+            (180.0, -90.0, "POINT(180 -90)"),
+            (12.5, 41.9, "POINT(12.5 41.9)"),
+        ] {
+            let point = GeoPointBits::new(lat, lng).expect("in range");
+            let shown = point.to_string();
+            assert_eq!(shown, wkt);
+            // And it parses back to the same point.
+            let (lat, lng) = crate::geo::try_extract_point(&shown).expect("wkt");
+            assert_eq!(GeoPointBits::new(lat, lng), Some(point));
+        }
+    }
 
     /// `FlakeValue::Vector` is `Arc<[f64]>` behind a `serde(with)` adapter
     /// inside a `serde(untagged)` enum — verify it still round-trips as a

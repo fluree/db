@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "query_id": "q006",
+  "result_hash": "c97c06df8202545d98a2b958e62f8e058ea41fbd6af61bf9af5c2ae5f42b3bab",
+  "rows": 3593,
+  "head_rows": [
+    "Account 10002\u001f4.38983049380e8",
+    "Account 10005\u001f4.57262173260e8",
+    "Account 10006\u001f3.67553619970e8",
+    "Account 10009\u001f3.85845147610e8",
+    "Account 10021\u001f4.50174730690e8",
+    "Account 10026\u001f4.14525275390e8",
+    "Account 10027\u001f8.56512713600e7",
+    "Account 10029\u001f3.98089864560e8",
+    "Account 1003\u001f2.42999872930e8",
+    "Account 10031\u001f4.21844540260e8",
+    "Account 10040\u001f4.12872255060e8",
+    "Account 10050\u001f3.27194236840e8",
+    "Account 10060\u001f3.40434263970e8",
+    "Account 10079\u001f2.70341316470e8",
+    "Account 1008\u001f2.88804108160e8",
+    "Account 10080\u001f1.79294858630e8",
+    "Account 10081\u001f1.49532621200e8",
+    "Account 10087\u001f1.56346765810e8",
+    "Account 10094\u001f2.60755057440e8",
+    "Account 10095\u001f4.17798775700e7"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

@@ -13,6 +13,8 @@
 //! Both handles produce identical [`ColumnBatch`] output — the choice of handle
 //! is invisible to the cursor and cache layers.
 
+#[cfg(target_arch = "wasm32")]
+use crate::wasm_compat::memmap2;
 use std::io;
 use std::ops::Range;
 use std::sync::Arc;
@@ -145,6 +147,95 @@ impl LeafHandle for FullBlobLeafHandle {
 }
 
 // ============================================================================
+// SharedBlobLeafHandle (resident bytes)
+// ============================================================================
+
+/// Leaf handle over shared, already-resident bytes.
+///
+/// Whole leaf blobs the content store already holds in memory
+/// (`resolve_cached_bytes`) arrive as `Arc<[u8]>`: in-memory storage on
+/// native, the residency tier on wasm32. This handle is
+/// [`FullBlobLeafHandle`] with shared instead of owned backing, so opening a
+/// resident leaf clones two `Arc`s — no byte copy.
+pub struct SharedBlobLeafHandle {
+    bytes: Arc<[u8]>,
+    dir: Arc<DecodedLeafDirV3>,
+    sidecar: Option<Arc<[u8]>>,
+    leaf_id: u128,
+}
+
+impl SharedBlobLeafHandle {
+    /// Create from resident leaf bytes and optional resident sidecar bytes.
+    ///
+    /// Parses the header and directory from the leaf bytes.
+    pub fn new(bytes: Arc<[u8]>, sidecar: Option<Arc<[u8]>>, leaf_id: u128) -> io::Result<Self> {
+        let header = decode_leaf_header_v3(&bytes)?;
+        let dir = Arc::new(decode_leaf_dir_v3_with_base(&bytes, &header)?);
+        Ok(Self::with_dir(bytes, dir, sidecar, leaf_id))
+    }
+
+    /// Create with a directory already decoded, shared from the
+    /// [`LeafletCache`](super::leaflet_cache::LeafletCache).
+    pub fn with_dir(
+        bytes: Arc<[u8]>,
+        dir: Arc<DecodedLeafDirV3>,
+        sidecar: Option<Arc<[u8]>>,
+        leaf_id: u128,
+    ) -> Self {
+        Self {
+            bytes,
+            dir,
+            sidecar,
+            leaf_id,
+        }
+    }
+}
+
+impl LeafHandle for SharedBlobLeafHandle {
+    fn dir(&self) -> &DecodedLeafDirV3 {
+        &self.dir
+    }
+
+    fn load_columns(
+        &self,
+        leaflet_idx: usize,
+        projection: &ColumnProjection,
+        order: RunSortOrder,
+    ) -> io::Result<ColumnBatch> {
+        let entry = &self.dir.entries[leaflet_idx];
+        load_leaflet_columns(&self.bytes, entry, self.dir.payload_base, projection, order)
+    }
+
+    fn load_sidecar_segment(&self, leaflet_idx: usize) -> io::Result<Vec<HistEntryV2>> {
+        let entry = &self.dir.entries[leaflet_idx];
+        if entry.history_len == 0 {
+            return Ok(Vec::new());
+        }
+        let sc_bytes = self.sidecar.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "sidecar bytes required for history replay but not available",
+            )
+        })?;
+        let seg = HistorySegmentRef {
+            offset: entry.history_offset,
+            len: entry.history_len,
+            min_t: entry.history_min_t,
+            max_t: entry.history_max_t,
+        };
+        decode_history_segment(sc_bytes, &seg)
+    }
+
+    fn sidecar_bytes(&self) -> Option<&[u8]> {
+        self.sidecar.as_deref()
+    }
+
+    fn leaf_id(&self) -> u128 {
+        self.leaf_id
+    }
+}
+
+// ============================================================================
 // MmapLeafHandle
 // ============================================================================
 
@@ -165,7 +256,11 @@ impl LeafHandle for FullBlobLeafHandle {
 /// cache — this handle only supplies the bytes for a cold decode. Raw leaf bytes
 /// are never copied into the cache budget.
 pub struct MmapLeafHandle {
-    mmap: memmap2::Mmap,
+    /// Shared mapping: leaf files are immutable CAS artifacts, so one
+    /// mapping is created per leaf and shared across concurrent handles
+    /// (see `LeafletCache::try_get_or_load_leaf_mmap`). `Mmap` does not
+    /// keep the file descriptor alive — sharing costs address space only.
+    mmap: Arc<memmap2::Mmap>,
     dir: Arc<DecodedLeafDirV3>,
     sidecar: Option<Vec<u8>>,
     leaf_id: u128,
@@ -173,7 +268,7 @@ pub struct MmapLeafHandle {
 
 impl MmapLeafHandle {
     pub fn new(
-        mmap: memmap2::Mmap,
+        mmap: Arc<memmap2::Mmap>,
         dir: Arc<DecodedLeafDirV3>,
         sidecar: Option<Vec<u8>>,
         leaf_id: u128,

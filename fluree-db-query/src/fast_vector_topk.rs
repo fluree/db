@@ -440,11 +440,7 @@ pub fn vector_topk_operator(
             if ctx.to_t < store.max_t() {
                 return Ok(None);
             }
-            let overlay_present = ctx
-                .overlay
-                .map(fluree_db_core::OverlayProvider::epoch)
-                .unwrap_or(0)
-                != 0;
+            let overlay_present = crate::fast_path_common::overlay_has_novelty(ctx);
             let g_id: GraphId = ctx.binary_g_id;
 
             let _span = tracing::debug_span!(
@@ -690,10 +686,6 @@ fn scan_partitioned(
         need,
     } = scan;
     let to_t = ctx.to_t;
-    let epoch = ctx
-        .overlay
-        .map(fluree_db_core::OverlayProvider::epoch)
-        .unwrap_or(0);
     let ncpu = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
@@ -713,7 +705,7 @@ fn scan_partitioned(
         for leaf in leaves {
             let handle = store
                 .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
-                .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+                .map_err(|e| QueryError::from_io("leaf open", e))?;
             for entry in &handle.dir().entries {
                 if entry.row_count == 0 || entry.p_const != Some(p_id) {
                     continue;
@@ -753,7 +745,6 @@ fn scan_partitioned(
             hi,
             sliced,
             to_t,
-            epoch,
         ) else {
             return Ok(Some(Vec::new()));
         };

@@ -22,6 +22,7 @@ use crate::context::ExecutionContext;
 use crate::error::Result;
 use crate::eval::PreparedBoolExpression;
 use crate::execute::build_where_operators_seeded;
+use crate::exists::any_solution;
 use crate::ir::triple::Ref;
 use crate::ir::{Expression, FlakeValue, Pattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
@@ -45,38 +46,15 @@ use fluree_db_core::Sid;
 ///
 /// Returns `None` if no rows pass the filter.
 pub fn filter_batch(
-    batch: &Batch,
+    batch: Batch,
     expr: &PreparedBoolExpression,
-    schema: &Arc<[VarId]>,
     ctx: &ExecutionContext<'_>,
 ) -> Result<Option<Batch>> {
-    let mut keep_indices: Vec<usize> = Vec::new();
-    for row_idx in 0..batch.len() {
-        let Some(row) = batch.row_view(row_idx) else {
-            continue;
-        };
-        if expr.eval_to_bool_non_strict(&row, Some(ctx))? {
-            keep_indices.push(row_idx);
-        }
+    let mut keep = Vec::with_capacity(batch.len());
+    for row in batch.rows() {
+        keep.push(expr.eval_to_bool_non_strict(&row, Some(ctx))?);
     }
-
-    if keep_indices.is_empty() {
-        return Ok(None);
-    }
-
-    let columns: Vec<Vec<Binding>> = (0..schema.len())
-        .map(|col_idx| {
-            let src_col = batch
-                .column_by_idx(col_idx)
-                .expect("batch schema must match operator schema");
-            keep_indices
-                .iter()
-                .map(|&row_idx| src_col[row_idx].clone())
-                .collect()
-        })
-        .collect();
-
-    Ok(Some(Batch::new(schema.clone(), columns)?))
+    Ok(batch.filter_rows(&keep))
 }
 
 /// Check if an expression tree contains any `Expression::Exists` nodes.
@@ -115,6 +93,13 @@ struct ExistsSemijoinKey {
 /// Cached subject sets for simple correlated EXISTS patterns.
 ///
 /// The cache maps (subject_var, p_id) -> set of matching subject IDs (s_id).
+///
+/// The key deliberately omits the object position: a cache entry answers
+/// "does this subject have *any* object for this predicate". That is only the
+/// truth value of the EXISTS when the inner object is a genuinely free
+/// variable, so every producer and consumer of an entry must first establish
+/// that the object variable carries no binding — see the object-position gates
+/// in [`build_exists_semijoin_cache`] and [`try_eval_simple_exists_semijoin`].
 #[derive(Default)]
 struct ExistsSemijoinCache {
     subjects_by_key: FxHashMap<ExistsSemijoinKey, FxHashSet<u64>>,
@@ -124,7 +109,19 @@ fn allow_exists_semijoin_fast_path(ctx: &ExecutionContext<'_>) -> bool {
     fast_path_store(ctx).is_some()
 }
 
-fn collect_simple_exists_keys(expr: &Expression, out: &mut Vec<(VarId, Ref)>) {
+/// `fast-path outcome` site name for the EXISTS semijoin cache. This path has
+/// no `FastPathOperator` to stamp for it, so the cache build stamps its own
+/// verdict once per FILTER `open()`.
+const EXISTS_SEMIJOIN_SITE: &str = "exists_semijoin";
+
+/// Collect `(subject_var, predicate, object_var)` for every hoistable
+/// `EXISTS { ?s <p> ?o }` in `expr`.
+///
+/// The object variable is carried out so the caller can reject the pattern
+/// when that variable is correlated; `Term::is_bound()` below is a plan-time
+/// syntactic test ("is not a variable") and says nothing about whether the
+/// variable is bound at runtime.
+fn collect_simple_exists_keys(expr: &Expression, out: &mut Vec<(VarId, Ref, VarId)>) {
     match expr {
         Expression::Exists {
             patterns,
@@ -144,13 +141,13 @@ fn collect_simple_exists_keys(expr: &Expression, out: &mut Vec<(VarId, Ref)>) {
             if !tp.p_bound() {
                 return;
             }
-            if tp.o.is_bound() {
+            let Some(ov) = tp.o.as_var() else {
                 return;
-            }
+            };
             if tp.dtc.is_some() {
                 return;
             }
-            out.push((*sv, tp.p.clone()));
+            out.push((*sv, tp.p.clone(), ov));
         }
         Expression::Call { func: _, args } => {
             for a in args {
@@ -187,7 +184,7 @@ fn build_exists_semijoin_cache(
         return Ok(None);
     };
 
-    let mut exists_nodes: Vec<(VarId, Ref)> = Vec::new();
+    let mut exists_nodes: Vec<(VarId, Ref, VarId)> = Vec::new();
     collect_simple_exists_keys(expr, &mut exists_nodes);
     if exists_nodes.is_empty() {
         return Ok(None);
@@ -197,8 +194,23 @@ fn build_exists_semijoin_cache(
     let schema_vars: HashSet<VarId> = schema.iter().copied().collect();
 
     let mut cache = ExistsSemijoinCache::default();
-    for (sv, pred_ref) in exists_nodes {
+    for (sv, pred_ref, ov) in exists_nodes {
         if !schema_vars.contains(&sv) {
+            continue;
+        }
+        // An object var an outer pattern can bind makes this EXISTS ask about
+        // one specific object, which the subject-set key cannot express.
+        //
+        // This is deliberately more conservative than the per-row guard in
+        // `try_eval_simple_exists_semijoin`, which declines only rows where the
+        // var is actually bound: a var in the schema may still be unbound in a
+        // given row (an unmatched OPTIONAL), and those rows would take the
+        // semijoin. Cache-build time has no per-row bindings to consult, so the
+        // choice is between skipping the entry and speculatively paying a PSOT
+        // scan for rows that may all decline. Skipping is the better trade, and
+        // it costs only performance — the per-row guard is what keeps the
+        // answer right.
+        if schema_vars.contains(&ov) {
             continue;
         }
         let Some(pred_sid) = try_normalize_pred_sid(store, &pred_ref) else {
@@ -223,8 +235,18 @@ fn build_exists_semijoin_cache(
     }
 
     if cache.subjects_by_key.is_empty() {
+        crate::fast_path_outcome::stamp_fast_path(
+            EXISTS_SEMIJOIN_SITE,
+            crate::fast_path_outcome::FastPathOutcome::Fallback(
+                crate::fast_path_outcome::FastPathFallback::GateDeclined,
+            ),
+        );
         Ok(None)
     } else {
+        crate::fast_path_outcome::stamp_fast_path(
+            EXISTS_SEMIJOIN_SITE,
+            crate::fast_path_outcome::FastPathOutcome::Proceed,
+        );
         Ok(Some(cache))
     }
 }
@@ -240,61 +262,6 @@ fn is_uncorrelated_exists(patterns: &[Pattern], batch_schema: &[VarId]) -> bool 
         .flat_map(super::ir::Pattern::referenced_vars)
         .collect();
     pattern_vars.is_disjoint(&schema_vars)
-}
-
-/// Evaluate an EXISTS subquery once (uncorrelated) using an empty seed.
-async fn eval_exists_uncorrelated(
-    patterns: &[Pattern],
-    negated: bool,
-    ctx: &ExecutionContext<'_>,
-    planning: &crate::temporal_mode::PlanningContext,
-) -> Result<bool> {
-    #[expect(clippy::box_default)]
-    let seed: BoxedOperator = Box::new(EmptyOperator::new());
-    let mut exists_op = build_where_operators_seeded(Some(seed), patterns, None, None, planning)?;
-
-    exists_op.open(ctx).await?;
-
-    let has_match = loop {
-        match exists_op.next_batch(ctx).await? {
-            Some(b) if !b.is_empty() => break true,
-            Some(_) => continue,
-            None => break false,
-        }
-    };
-
-    exists_op.close();
-    Ok(if negated { !has_match } else { has_match })
-}
-
-/// Evaluate an EXISTS subquery for a given row (correlated).
-///
-/// Seeds the subquery with the current row's bindings and checks if any
-/// result is produced.
-async fn eval_exists_for_row(
-    patterns: &[Pattern],
-    negated: bool,
-    batch: &Batch,
-    row_idx: usize,
-    ctx: &ExecutionContext<'_>,
-    planning: &crate::temporal_mode::PlanningContext,
-) -> Result<bool> {
-    let seed = SeedOperator::from_batch_row(batch, row_idx);
-    let mut exists_op =
-        build_where_operators_seeded(Some(Box::new(seed)), patterns, None, None, planning)?;
-
-    exists_op.open(ctx).await?;
-
-    let has_match = loop {
-        match exists_op.next_batch(ctx).await? {
-            Some(b) if !b.is_empty() => break true,
-            Some(_) => continue,
-            None => break false,
-        }
-    };
-
-    exists_op.close();
-    Ok(if negated { !has_match } else { has_match })
 }
 
 /// Evaluate a pattern comprehension for a given row (always correlated): run the
@@ -354,9 +321,10 @@ fn pre_resolve_uncorrelated<'a>(
         match expr {
             Expression::Exists { patterns, negated } => {
                 if is_uncorrelated_exists(patterns, batch_schema) {
-                    let result =
-                        eval_exists_uncorrelated(patterns, *negated, ctx, planning).await?;
-                    Ok(Expression::Const(FlakeValue::Boolean(result)))
+                    #[expect(clippy::box_default)]
+                    let seed: BoxedOperator = Box::new(EmptyOperator::new());
+                    let found = any_solution(seed, patterns, None, planning, ctx).await?;
+                    Ok(Expression::Const(FlakeValue::Boolean(found != *negated)))
                 } else {
                     Ok(expr.clone())
                 }
@@ -416,7 +384,24 @@ fn try_eval_simple_exists_semijoin(
     if !tp.p_bound() {
         return Ok(None);
     }
-    if tp.o.is_bound() {
+    // `Term::is_bound()` is `!is_var()` — a plan-time syntactic test. It rejects
+    // a constant object but says nothing about a variable the current row has
+    // already bound, and the cache key carries no object at all, so a
+    // correlated object would silently be answered as "any object".
+    //
+    // Testing the row rather than the schema is not merely permissive, it is
+    // the correct reading: EXISTS substitutes only the bindings the row
+    // actually carries, so a variable left unbound by an unmatched OPTIONAL is
+    // a fresh free variable inside the subpattern. For those rows "does this
+    // subject have any object for this predicate" is exactly the question being
+    // asked, and the semijoin answers it.
+    let Some(object_var) = tp.o.as_var() else {
+        return Ok(None);
+    };
+    if batch
+        .get(row_idx, object_var)
+        .is_some_and(Binding::is_matchable)
+    {
         return Ok(None);
     }
     let Some(pred_sid) = try_normalize_pred_sid(store, &tp.p) else {
@@ -470,9 +455,9 @@ fn resolve_exists_for_row<'a>(
                     }
                 }
 
-                let result =
-                    eval_exists_for_row(patterns, *negated, batch, row_idx, ctx, planning).await?;
-                Ok(Expression::Const(FlakeValue::Boolean(result)))
+                let seed = SeedOperator::from_batch_row(batch, row_idx);
+                let found = any_solution(Box::new(seed), patterns, None, planning, ctx).await?;
+                Ok(Expression::Const(FlakeValue::Boolean(found != *negated)))
             }
             Expression::PatternComprehension {
                 patterns,
@@ -544,9 +529,8 @@ pub(crate) async fn resolve_row_exists(
 /// If ALL EXISTS subexpressions are uncorrelated, phase 2 skips async work
 /// entirely and uses the fast synchronous `filter_batch` path.
 async fn filter_batch_with_exists(
-    batch: &Batch,
+    batch: Batch,
     expr: &Expression,
-    schema: &Arc<[VarId]>,
     ctx: &ExecutionContext<'_>,
     cache: Option<&ExistsSemijoinCache>,
     planning: &crate::temporal_mode::PlanningContext,
@@ -559,47 +543,24 @@ async fn filter_batch_with_exists(
     // to resolve, we can use the fast synchronous path.
     if !needs_metadata && !contains_exists(&partially_resolved) {
         let prepared = PreparedBoolExpression::new(partially_resolved);
-        return filter_batch(batch, &prepared, schema, ctx);
+        return filter_batch(batch, &prepared, ctx);
     }
 
     // Phase 2: resolve remaining correlated EXISTS (and metadata) per-row
-    let mut keep_indices: Vec<usize> = Vec::new();
-
-    for row_idx in 0..batch.len() {
+    let mut keep = Vec::with_capacity(batch.len());
+    for (row_idx, row) in batch.rows().enumerate() {
         let resolved_expr =
-            resolve_exists_for_row(&partially_resolved, batch, row_idx, ctx, cache, planning)
+            resolve_exists_for_row(&partially_resolved, &batch, row_idx, ctx, cache, planning)
                 .await?;
-        let Some(row) = batch.row_view(row_idx) else {
-            continue;
-        };
         let resolved_expr = if needs_metadata {
             crate::eval::metadata_resolve::resolve_row_metadata(&resolved_expr, &row, ctx).await?
         } else {
             resolved_expr
         };
-        let pass = resolved_expr.eval_to_bool_non_strict(&row, Some(ctx))?;
-        if pass {
-            keep_indices.push(row_idx);
-        }
+        keep.push(resolved_expr.eval_to_bool_non_strict(&row, Some(ctx))?);
     }
 
-    if keep_indices.is_empty() {
-        return Ok(None);
-    }
-
-    let columns: Vec<Vec<Binding>> = (0..schema.len())
-        .map(|col_idx| {
-            let src_col = batch
-                .column_by_idx(col_idx)
-                .expect("batch schema must match operator schema");
-            keep_indices
-                .iter()
-                .map(|&row_idx| src_col[row_idx].clone())
-                .collect()
-        })
-        .collect();
-
-    Ok(Some(Batch::new(schema.clone(), columns)?))
+    Ok(batch.filter_rows(&keep))
 }
 
 /// Filter operator - applies a predicate to each row from child
@@ -673,6 +634,16 @@ impl FilterOperator {
 
 #[async_trait]
 impl Operator for FilterOperator {
+    /// Item 11 (F-AUD-7): DECLINE forwarding — a FILTER may reject arbitrarily many
+    /// input rows, so producing `k` output can require unboundedly many input rows.
+    /// Explicit (was a silent trait-default no-op) so the swallow is observable.
+    fn set_row_budget(&mut self, budget: usize) {
+        tracing::debug!(
+            budget,
+            "FILTER row-budget swallowed (unsound to forward: a filter rejects rows)"
+        );
+    }
+
     fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
         vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
     }
@@ -713,9 +684,8 @@ impl Operator for FilterOperator {
             let needs_metadata = self.has_metadata && !ctx.allow_unfiltered();
             let filtered = if self.has_exists || needs_metadata {
                 filter_batch_with_exists(
-                    &batch,
+                    batch,
                     &self.expr,
-                    &self.schema,
                     ctx,
                     self.exists_semijoin.as_ref(),
                     &self.planning,
@@ -723,7 +693,7 @@ impl Operator for FilterOperator {
                 )
                 .await?
             } else {
-                filter_batch(&batch, &self.prepared_expr, &self.schema, ctx)?
+                filter_batch(batch, &self.prepared_expr, ctx)?
             };
 
             if let Some(filtered) = filtered {
@@ -827,6 +797,40 @@ mod tests {
         ))];
         let schema = &[VarId(0), VarId(1)];
         assert!(is_uncorrelated_exists(&patterns, schema));
+    }
+
+    /// The semijoin key carries no object, so the object var has to travel out
+    /// of the collector for the caller to test it against the batch schema.
+    #[test]
+    fn simple_exists_key_carries_object_var() {
+        let expr = Expression::Exists {
+            patterns: vec![Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Sid(Sid::new(100, "member")),
+                Term::Var(VarId(7)),
+            ))],
+            negated: true,
+        };
+        let mut out = Vec::new();
+        collect_simple_exists_keys(&expr, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, VarId(0));
+        assert_eq!(out[0].2, VarId(7));
+    }
+
+    #[test]
+    fn simple_exists_key_declines_constant_object() {
+        let expr = Expression::Exists {
+            patterns: vec![Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Sid(Sid::new(100, "member")),
+                Term::Value(FlakeValue::Long(1)),
+            ))],
+            negated: true,
+        };
+        let mut out = Vec::new();
+        collect_simple_exists_keys(&expr, &mut out);
+        assert!(out.is_empty());
     }
 
     #[test]

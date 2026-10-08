@@ -1,7 +1,9 @@
 use crate::cli::IcebergMapArgs;
 use crate::context;
 use crate::error::{CliError, CliResult};
+use crate::graph_source_display::{print_local_graph_source, print_remote_graph_source};
 use comfy_table::{ContentArrangement, Table};
+use fluree_db_api::ledger_info::graph_source_type_label;
 use fluree_db_api::server_defaults::FlureeDir;
 
 // =============================================================================
@@ -66,7 +68,7 @@ pub async fn run_iceberg_list(
         }
     }
 
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let gs_records = fluree.nameservice().all_graph_source_records().await?;
     let mut entries: Vec<_> = gs_records
         .into_iter()
@@ -92,7 +94,7 @@ pub async fn run_iceberg_list(
         table.add_row(vec![
             gs.name,
             gs.branch,
-            format_source_type(&gs.source_type),
+            graph_source_type_label(&gs.source_type),
             t_str,
         ]);
     }
@@ -131,8 +133,8 @@ pub async fn run_iceberg_info(
         }
     }
 
-    let fluree = context::build_fluree(dirs)?;
-    let gs_id = context::to_ledger_id(name);
+    let fluree = context::build_fluree(dirs).await?;
+    let gs_id = context::to_ledger_id(name)?;
     let gs = fluree
         .nameservice()
         .lookup_graph_source(&gs_id)
@@ -147,7 +149,7 @@ pub async fn run_iceberg_info(
         )));
     }
 
-    print_graph_source_info(&gs);
+    print_local_graph_source(&gs);
     Ok(())
 }
 
@@ -200,8 +202,8 @@ pub async fn run_iceberg_drop(
         }
     }
 
-    let fluree = context::build_fluree(dirs)?;
-    let gs_id = context::to_ledger_id(name);
+    let fluree = context::build_fluree(dirs).await?;
+    let gs_id = context::to_ledger_id(name)?;
     let gs = fluree
         .nameservice()
         .lookup_graph_source(&gs_id)
@@ -325,11 +327,12 @@ async fn run_iceberg_map_remote(
             if connection {
                 "verified"
             } else {
-                "not tested (direct mode or catalog unreachable)"
+                "not tested (tested for REST catalogs only, or catalog unreachable)"
             }
         );
     }
 
+    print_model_warnings(&model_warnings_of(&result));
     Ok(())
 }
 
@@ -341,7 +344,7 @@ async fn run_iceberg_map_remote(
 /// `text/turtle` (the resolver's default), case-insensitively. Returns `None`
 /// only when the path has no extension at all, leaving the server to apply the
 /// same default. An explicit `--r2rml-type` still overrides this at the call site.
-fn infer_mapping_media_type(path: &std::path::Path) -> Option<String> {
+pub(crate) fn infer_mapping_media_type(path: &std::path::Path) -> Option<String> {
     use fluree_db_r2rml::loader::MappingFormat;
     // No extension means no signal to infer from — defer to the server default.
     path.extension()?;
@@ -354,6 +357,26 @@ fn infer_mapping_media_type(path: &std::path::Path) -> Option<String> {
 }
 
 /// Convert CLI args to a JSON body for the server endpoint.
+/// Print registration warnings about the `--model` reference (one per line).
+pub(crate) fn print_model_warnings(warnings: &[String]) {
+    for w in warnings {
+        eprintln!("warning: {w}");
+    }
+}
+
+/// The `model_warnings` of a server map response, if any.
+pub(crate) fn model_warnings_of(result: &serde_json::Value) -> Vec<String> {
+    result
+        .get("model_warnings")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|w| w.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
     let mut body = serde_json::json!({
         "name": args.name,
@@ -399,8 +422,17 @@ fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
     if let Some(ref v) = args.branch {
         obj.insert("branch".into(), v.clone().into());
     }
+    if let Some(ref v) = args.model {
+        obj.insert("model".into(), v.clone().into());
+    }
+    if let Some(v) = args.default_allow {
+        obj.insert("default_allow".into(), v.into());
+    }
     if let Some(ref v) = args.auth_bearer {
         obj.insert("auth_bearer".into(), v.clone().into());
+    }
+    if let Some(ref v) = args.auth_bearer_env {
+        obj.insert("auth_bearer_env".into(), v.clone().into());
     }
     if let Some(ref v) = args.oauth2_token_url {
         obj.insert("oauth2_token_url".into(), v.clone().into());
@@ -410,6 +442,9 @@ fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
     }
     if let Some(ref v) = args.oauth2_client_secret {
         obj.insert("oauth2_client_secret".into(), v.clone().into());
+    }
+    if let Some(ref v) = args.oauth2_client_secret_env {
+        obj.insert("oauth2_client_secret_env".into(), v.clone().into());
     }
     if let Some(ref v) = args.oauth2_scope {
         obj.insert("oauth2_scope".into(), v.clone().into());
@@ -495,7 +530,7 @@ fn print_iceberg_list_remote(
 
 fn print_iceberg_info_remote(name: &str, info: &serde_json::Value) -> CliResult<()> {
     ensure_remote_iceberg_info(name, info)?;
-    print_remote_graph_source_info(info);
+    print_remote_graph_source(info);
     Ok(())
 }
 
@@ -549,81 +584,13 @@ fn print_remote_drop_response(response: &serde_json::Value) -> CliResult<()> {
     Ok(())
 }
 
-fn print_remote_graph_source_info(info: &serde_json::Value) {
-    let name = info.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-    let branch = info.get("branch").and_then(|v| v.as_str()).unwrap_or("?");
-    let gs_type = info.get("type").and_then(|v| v.as_str()).unwrap_or("?");
-    let gs_id = info
-        .get("graph_source_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("?");
-
-    println!("Name:           {name}");
-    println!("Branch:         {branch}");
-    println!("Type:           {gs_type}");
-    println!("ID:             {gs_id}");
-
-    if let Some(t) = info.get("index_t").and_then(serde_json::Value::as_i64) {
-        println!("Index t:        {t}");
-    }
-    if let Some(id) = info.get("index_id").and_then(|v| v.as_str()) {
-        println!("Index ID:       {id}");
-    }
-    if let Some(deps) = info.get("dependencies").and_then(|v| v.as_array()) {
-        let dep_strs: Vec<&str> = deps.iter().filter_map(|v| v.as_str()).collect();
-        if !dep_strs.is_empty() {
-            println!("Dependencies:   {}", dep_strs.join(", "));
-        }
-    }
-    if let Some(config) = info.get("config") {
-        println!();
-        println!("Configuration:");
-        println!(
-            "{}",
-            serde_json::to_string_pretty(config).unwrap_or_default()
-        );
-    }
-}
-
-fn print_graph_source_info(gs: &fluree_db_nameservice::GraphSourceRecord) {
-    println!("Name:           {}", gs.name);
-    println!("Branch:         {}", gs.branch);
-    println!("Type:           {}", format_source_type(&gs.source_type));
-    println!("ID:             {}", gs.graph_source_id);
-    println!("Retracted:      {}", gs.retracted);
-    println!("Index t:        {}", gs.index_t);
-    println!(
-        "Index ID:       {}",
-        gs.index_id
-            .as_ref()
-            .map(std::string::ToString::to_string)
-            .as_deref()
-            .unwrap_or("(none)")
-    );
-
-    if !gs.dependencies.is_empty() {
-        println!("Dependencies:   {}", gs.dependencies.join(", "));
-    }
-
-    if !gs.config.is_empty() && gs.config != "{}" {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&gs.config) {
-            println!();
-            println!("Configuration:");
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| gs.config.clone())
-            );
-        }
-    }
-}
-
 // =============================================================================
 // Local execution (feature-gated)
 // =============================================================================
 
 #[cfg(feature = "iceberg")]
 async fn run_iceberg_map_local(args: IcebergMapArgs, dirs: &FlureeDir) -> CliResult<()> {
-    let fluree = crate::context::build_fluree(dirs)?;
+    let fluree = crate::context::build_fluree(dirs).await?;
     let iceberg_config = build_iceberg_config(&args)?;
 
     if let Some(ref r2rml_path) = args.r2rml {
@@ -654,6 +621,7 @@ async fn run_iceberg_map_local(args: IcebergMapArgs, dirs: &FlureeDir) -> CliRes
             result.graph_source_id
         );
         println!("  Table:       {}", result.table_identifier);
+        print_model_warnings(&result.model_warnings);
         println!("  Catalog:     {}", result.catalog_uri);
         println!("  R2RML:       {}", result.mapping_source);
         println!("  TriplesMaps: {}", result.triples_map_count);
@@ -685,13 +653,14 @@ async fn run_iceberg_map_local(args: IcebergMapArgs, dirs: &FlureeDir) -> CliRes
             result.graph_source_id
         );
         println!("  Table:       {}", result.table_identifier);
+        print_model_warnings(&result.model_warnings);
         println!("  Catalog:     {}", result.catalog_uri);
         println!(
             "  Connection:  {}",
             if result.connection_tested {
                 "verified"
             } else {
-                "not tested (direct mode or catalog unreachable)"
+                "not tested (tested for REST catalogs only, or catalog unreachable)"
             }
         );
     }
@@ -711,92 +680,59 @@ async fn run_iceberg_map_local(_args: IcebergMapArgs, _dirs: &FlureeDir) -> CliR
 // =============================================================================
 
 #[cfg(feature = "iceberg")]
+/// A secret given literally or as the name of an environment variable (clap
+/// refuses both).
+pub(crate) fn secret_value(
+    literal: &Option<String>,
+    env: &Option<String>,
+) -> Option<fluree_db_api::IcebergConfigValue> {
+    use fluree_db_api::IcebergConfigValue as ConfigValue;
+    match (literal, env) {
+        (Some(value), _) => Some(ConfigValue::literal(value)),
+        (None, Some(name)) => Some(ConfigValue::from_env(name)),
+        (None, None) => None,
+    }
+}
+
+#[cfg(feature = "iceberg")]
 fn build_iceberg_config(args: &IcebergMapArgs) -> CliResult<fluree_db_api::IcebergCreateConfig> {
-    let mode = args.mode.to_lowercase();
-    let mut config = match mode.as_str() {
-        "rest" => {
-            let catalog_uri = args
-                .catalog_uri
-                .as_ref()
-                .ok_or_else(|| CliError::Usage("--catalog-uri is required for rest mode".into()))?;
-            let table = args.table.as_deref().unwrap_or_default();
-            if table.is_empty() && args.r2rml.is_none() {
-                return Err(CliError::Usage(
-                    "--table is required for rest mode (or use --r2rml to define tables via mapping)"
-                        .into(),
-                ));
-            }
-            let table = if table.is_empty() {
-                "default.default"
-            } else {
-                table
-            };
-            fluree_db_api::IcebergCreateConfig::new(&args.name, catalog_uri, table)
-        }
-        "direct" => {
-            let location = args.table_location.as_ref().ok_or_else(|| {
-                CliError::Usage("--table-location is required for direct mode".into())
-            })?;
-            fluree_db_api::IcebergCreateConfig::new_direct(&args.name, location)
-        }
-        "glue" => {
-            let table = args.table.as_deref().unwrap_or_default();
-            if table.is_empty() {
-                return Err(CliError::Usage(
-                    "--table is required for glue mode (namespace.table, e.g. enterprise_dw.dim_geography)"
-                        .into(),
-                ));
-            }
-            let connection = fluree_db_api::IcebergConnectionConfig::glue(
-                args.region.clone(),
-                args.catalog_id.clone(),
-            );
-            fluree_db_api::IcebergCreateConfig {
-                name: args.name.clone(),
-                branch: None,
-                connection,
-                table_identifier: table.to_string(),
-            }
-        }
-        "s3tables" => {
-            let arn = args.table_bucket_arn.as_ref().ok_or_else(|| {
-                CliError::Usage("--table-bucket-arn is required for s3tables mode".into())
-            })?;
-            let table = args.table.as_deref().unwrap_or_default();
-            if table.is_empty() {
-                return Err(CliError::Usage(
-                    "--table is required for s3tables mode (namespace.table)".into(),
-                ));
-            }
-            let connection =
-                fluree_db_api::IcebergConnectionConfig::s3_tables(args.region.clone(), arn);
-            fluree_db_api::IcebergCreateConfig {
-                name: args.name.clone(),
-                branch: None,
-                connection,
-                table_identifier: table.to_string(),
-            }
-        }
-        other => {
-            return Err(CliError::Usage(format!(
-                "unknown catalog mode '{other}'. Use 'rest', 'direct', 'glue', or 's3tables'."
-            )));
-        }
+    // One mode dispatch for every surface (the server parses its JSON the same
+    // way); errors name this surface's flags.
+    let mode_args = fluree_db_api::CatalogModeArgs {
+        mode: &args.mode,
+        catalog_uri: args.catalog_uri.as_deref(),
+        table_location: args.table_location.as_deref(),
+        region: args.region.as_deref(),
+        catalog_id: args.catalog_id.as_deref(),
+        table_bucket_arn: args.table_bucket_arn.as_deref(),
     };
+    let mut config = fluree_db_api::IcebergCreateConfig::from_mode(
+        &args.name,
+        mode_args,
+        args.table.as_deref(),
+        args.r2rml.is_some(),
+    )
+    .map_err(|e| CliError::Usage(e.message(|field| format!("--{}", field.replace('_', "-")))))?;
 
     if let Some(ref branch) = args.branch {
         config = config.with_branch(branch);
     }
-    if let Some(ref token) = args.auth_bearer {
-        config = config.with_auth_bearer(token);
+    if let Some(ref model) = args.model {
+        config = config.with_model(model);
+    }
+    if let Some(allow) = args.default_allow {
+        config = config.with_default_allow(allow);
+    }
+    if let Some(token) = secret_value(&args.auth_bearer, &args.auth_bearer_env) {
+        config = config.with_auth_bearer_value(token);
     }
     // OAuth2 activates on token_url + client_secret; client_id defaults to "" so
     // Horizon / PAT users can omit it (an empty client_id is what Snowflake
     // Horizon's `session:role:` exchange requires).
-    if let (Some(ref url), Some(ref secret)) = (&args.oauth2_token_url, &args.oauth2_client_secret)
-    {
+    let oauth2_secret = secret_value(&args.oauth2_client_secret, &args.oauth2_client_secret_env);
+    if let (Some(ref url), Some(secret)) = (&args.oauth2_token_url, oauth2_secret) {
         let id = args.oauth2_client_id.as_deref().unwrap_or("");
-        config = config.with_auth_oauth2(url, id, secret);
+        config = config.with_auth_oauth2_secret_value(url, id, secret);
         if let Some(ref scope) = args.oauth2_scope {
             config = config.with_oauth2_scope(scope);
         }
@@ -825,7 +761,7 @@ fn build_iceberg_config(args: &IcebergMapArgs) -> CliResult<fluree_db_api::Icebe
 
 /// Format the `Tables:` summary as `N (name1, name2, …)`, or just `N` when no
 /// table names are available (e.g. an unvalidated address-based mapping).
-fn format_table_summary(count: usize, names: &[String]) -> String {
+pub(crate) fn format_table_summary(count: usize, names: &[String]) -> String {
     if names.is_empty() {
         count.to_string()
     } else {
@@ -833,27 +769,20 @@ fn format_table_summary(count: usize, names: &[String]) -> String {
     }
 }
 
+/// Mapped (R2RML-backed) graph sources: Iceberg, R2RML and SQL. `fluree sql`
+/// and `fluree iceberg` share list/info/drop over this family.
 fn is_iceberg_family_source_type(st: &fluree_db_nameservice::GraphSourceType) -> bool {
     matches!(
         st,
         fluree_db_nameservice::GraphSourceType::Iceberg
             | fluree_db_nameservice::GraphSourceType::R2rml
+            | fluree_db_nameservice::GraphSourceType::Sql
+            | fluree_db_nameservice::GraphSourceType::Delta
     )
 }
 
 fn is_iceberg_family_type_str(s: &str) -> bool {
-    matches!(s, "Iceberg" | "R2RML")
-}
-
-fn format_source_type(st: &fluree_db_nameservice::GraphSourceType) -> String {
-    match st {
-        fluree_db_nameservice::GraphSourceType::Bm25 => "BM25".to_string(),
-        fluree_db_nameservice::GraphSourceType::Vector => "Vector".to_string(),
-        fluree_db_nameservice::GraphSourceType::Geo => "Geo".to_string(),
-        fluree_db_nameservice::GraphSourceType::R2rml => "R2RML".to_string(),
-        fluree_db_nameservice::GraphSourceType::Iceberg => "Iceberg".to_string(),
-        fluree_db_nameservice::GraphSourceType::Unknown(s) => format!("Unknown({s})"),
-    }
+    matches!(s, "Iceberg" | "R2RML" | "SQL" | "Delta")
 }
 
 #[cfg(test)]
@@ -874,10 +803,14 @@ mod tests {
             r2rml: None,
             r2rml_type: None,
             branch: None,
+            model: None,
+            default_allow: None,
             auth_bearer: None,
+            auth_bearer_env: None,
             oauth2_token_url: None,
             oauth2_client_id: None,
             oauth2_client_secret: None,
+            oauth2_client_secret_env: None,
             oauth2_scope: None,
             oauth2_audience: None,
             warehouse: None,
@@ -886,6 +819,17 @@ mod tests {
             s3_endpoint: None,
             s3_path_style: false,
         }
+    }
+
+    #[test]
+    fn args_to_json_carries_model_ledger() {
+        let mut args = base_rest_args();
+        assert!(args_to_json(&args).unwrap().get("model").is_none());
+        args.model = Some("governance:main".to_string());
+        assert_eq!(args_to_json(&args).unwrap()["model"], "governance:main");
+        assert!(args_to_json(&args).unwrap().get("default_allow").is_none());
+        args.default_allow = Some(true);
+        assert_eq!(args_to_json(&args).unwrap()["default_allow"], true);
     }
 
     #[test]
@@ -901,6 +845,78 @@ mod tests {
         assert_eq!(body["oauth2_audience"], "polaris");
         // Omitting client_id leaves it out of the remote body entirely.
         assert!(body.get("oauth2_client_id").is_none());
+    }
+
+    #[test]
+    fn a_secret_named_by_variable_reaches_a_remote_server_as_the_name() {
+        let mut args = base_rest_args();
+        args.auth_bearer_env = Some("CATALOG_TOKEN".to_string());
+        args.oauth2_client_secret_env = Some("CATALOG_SECRET".to_string());
+
+        let body = args_to_json(&args).unwrap();
+        assert_eq!(body["auth_bearer_env"], "CATALOG_TOKEN");
+        assert_eq!(body["oauth2_client_secret_env"], "CATALOG_SECRET");
+        assert!(body.get("auth_bearer").is_none());
+        assert!(body.get("oauth2_client_secret").is_none());
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn a_secret_named_by_variable_is_stored_as_the_name() {
+        let mut bearer = base_rest_args();
+        bearer.auth_bearer_env = Some("CATALOG_TOKEN".to_string());
+        let stored = serde_json::to_value(
+            build_iceberg_config(&bearer)
+                .unwrap()
+                .to_iceberg_gs_config(),
+        )
+        .unwrap();
+        assert_eq!(stored["catalog"]["auth"]["type"], "bearer");
+        assert_eq!(
+            stored["catalog"]["auth"]["token"]["env_var"],
+            "CATALOG_TOKEN"
+        );
+
+        let mut oauth2 = base_rest_args();
+        oauth2.oauth2_token_url = Some("https://catalog.example.com/token".to_string());
+        oauth2.oauth2_client_id = Some("app".to_string());
+        oauth2.oauth2_client_secret_env = Some("CATALOG_SECRET".to_string());
+        let stored = serde_json::to_value(
+            build_iceberg_config(&oauth2)
+                .unwrap()
+                .to_iceberg_gs_config(),
+        )
+        .unwrap();
+        let auth = &stored["catalog"]["auth"];
+        assert_eq!(auth["type"], "oauth2_client_credentials");
+        assert_eq!(auth["client_id"], "app");
+        assert_eq!(auth["client_secret"]["env_var"], "CATALOG_SECRET");
+    }
+
+    #[test]
+    fn a_secret_is_given_one_way_or_the_other() {
+        use clap::Parser;
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "fluree",
+                "iceberg",
+                "map",
+                "gs",
+                "--catalog-uri",
+                "https://c",
+            ];
+            argv.extend_from_slice(extra);
+            crate::cli::Cli::try_parse_from(argv)
+        };
+        assert!(parse(&["--auth-bearer-env", "T"]).is_ok());
+        assert!(parse(&["--auth-bearer", "t", "--auth-bearer-env", "T"]).is_err());
+        assert!(parse(&[
+            "--oauth2-client-secret",
+            "s",
+            "--oauth2-client-secret-env",
+            "S"
+        ])
+        .is_err());
     }
 
     #[cfg(feature = "iceberg")]

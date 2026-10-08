@@ -56,6 +56,15 @@ pub struct S3Config {
     pub prefix: Option<String>,
     /// Optional endpoint override (e.g. LocalStack/MinIO, or custom AWS endpoint)
     pub endpoint: Option<String>,
+    /// Address the bucket in the URL path (`http://host/bucket/key`)
+    /// rather than as a virtual host (`http://bucket.host/key`).
+    ///
+    /// Required for S3-compatible stores that do not resolve
+    /// bucket-subdomains — MinIO without wildcard DNS in front of it
+    /// being the common case. An endpoint override alone is not enough:
+    /// the SDK still emits virtual-hosted URLs against it, and a plain
+    /// `http://minio:9000` rejects those.
+    pub force_path_style: Option<bool>,
     /// Operation timeout in milliseconds (optional)
     pub timeout_ms: Option<u64>,
     /// Max retries (retries *after* the initial attempt)
@@ -140,6 +149,9 @@ impl S3Storage {
         // Apply endpoint override if configured (e.g. LocalStack/MinIO)
         if let Some(endpoint) = &config.endpoint {
             s3_config_builder = s3_config_builder.endpoint_url(endpoint);
+        }
+        if let Some(path_style) = config.force_path_style {
+            s3_config_builder = s3_config_builder.force_path_style(path_style);
         }
 
         // Apply retry overrides
@@ -276,6 +288,19 @@ impl S3Storage {
 
 #[async_trait]
 impl StorageRead for S3Storage {
+    /// Reads return exactly the bytes at rest.
+    fn permits_plaintext_cache(&self) -> bool {
+        true
+    }
+
+    fn is_remote(&self) -> bool {
+        true
+    }
+
+    fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
+        None
+    }
+
     async fn read_bytes(&self, address: &str) -> std::result::Result<Vec<u8>, CoreError> {
         const SLOW_S3_SEND_WARN_MS: u64 = 1_000;
         const SLOW_S3_BODY_WARN_MS: u64 = 5_000;
@@ -589,8 +614,125 @@ impl StorageRead for S3Storage {
     }
 }
 
+/// Keys per `DeleteObjects` request, the S3 maximum.
+const DELETE_OBJECTS_BATCH: usize = 1000;
+
 #[async_trait]
 impl StorageWrite for S3Storage {
+    /// One `DeleteObjects` request per thousand addresses, each under one
+    /// request permit. A collector pass over a long chain or a storage sweep
+    /// issued one `DeleteObject` per artifact before this, which at the
+    /// request cap starved every reader for as long as the pass ran.
+    async fn delete_many(&self, addresses: &[String]) -> Vec<(String, CoreError)> {
+        let mut failures = Vec::new();
+        let mut keyed: Vec<(String, &str)> = Vec::with_capacity(addresses.len());
+        for address in addresses {
+            match self.to_key(address) {
+                Ok(key) => keyed.push((key, address.as_str())),
+                Err(e) => failures.push((address.clone(), e)),
+            }
+        }
+
+        for chunk in keyed.chunks(DELETE_OBJECTS_BATCH) {
+            let mut objects = Vec::with_capacity(chunk.len());
+            for (key, address) in chunk {
+                match aws_sdk_s3::types::ObjectIdentifier::builder()
+                    .key(key.clone())
+                    .build()
+                {
+                    Ok(object) => objects.push(object),
+                    Err(e) => failures.push((
+                        (*address).to_string(),
+                        CoreError::storage(format!("Invalid key '{key}': {e}")),
+                    )),
+                }
+            }
+            if objects.is_empty() {
+                continue;
+            }
+            let delete = match aws_sdk_s3::types::Delete::builder()
+                .set_objects(Some(objects))
+                .quiet(true)
+                .build()
+            {
+                Ok(delete) => delete,
+                Err(e) => {
+                    failures.extend(chunk.iter().map(|(_, address)| {
+                        (
+                            (*address).to_string(),
+                            CoreError::storage(format!("build DeleteObjects: {e}")),
+                        )
+                    }));
+                    continue;
+                }
+            };
+
+            let permit = match self.acquire_request_permit_core().await {
+                Ok(permit) => permit,
+                Err(e) => {
+                    failures.extend(chunk.iter().map(|(_, address)| {
+                        ((*address).to_string(), CoreError::io(e.to_string()))
+                    }));
+                    continue;
+                }
+            };
+            let started = Instant::now();
+            let request = self
+                .client
+                .delete_objects()
+                .bucket(&self.bucket)
+                .delete(delete);
+
+            match tokio::time::timeout(self.send_timeout, request.send()).await {
+                Ok(Ok(output)) => {
+                    // Quiet mode reports only the keys it could not delete. A
+                    // key that did not exist is not among them.
+                    for error in output.errors() {
+                        let Some(key) = error.key() else { continue };
+                        if let Some((_, address)) = chunk.iter().find(|(k, _)| k == key) {
+                            failures.push((
+                                (*address).to_string(),
+                                CoreError::io(format!(
+                                    "S3 DeleteObjects rejected key '{key}': {} {}",
+                                    error.code().unwrap_or(""),
+                                    error.message().unwrap_or("")
+                                )),
+                            ));
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    let mapped = ext_error_to_core(map_s3_error_ext(e, "<DeleteObjects batch>"));
+                    let message = mapped.to_string();
+                    failures.extend(chunk.iter().map(|(_, address)| {
+                        ((*address).to_string(), CoreError::io(message.clone()))
+                    }));
+                }
+                Err(_) => {
+                    let elapsed_ms = started.elapsed().as_millis() as u64;
+                    tracing::error!(
+                        bucket = self.bucket.as_str(),
+                        keys = chunk.len(),
+                        elapsed_ms,
+                        timeout_ms = self.send_timeout.as_millis() as u64,
+                        is_express = Self::is_express_bucket(&self.bucket),
+                        "s3 delete_many: delete_objects timed out"
+                    );
+                    let message = format!(
+                        "S3 DeleteObjects timed out after {} ms",
+                        self.send_timeout.as_millis()
+                    );
+                    failures.extend(chunk.iter().map(|(_, address)| {
+                        ((*address).to_string(), CoreError::io(message.clone()))
+                    }));
+                }
+            }
+            drop(permit);
+        }
+
+        failures
+    }
+
     async fn write_bytes(&self, address: &str, bytes: &[u8]) -> std::result::Result<(), CoreError> {
         const SLOW_S3_PUT_WARN_MS: u64 = 1_000;
 
@@ -1013,8 +1155,11 @@ impl StorageCas for S3Storage {
 
     async fn compare_and_swap<T, F>(&self, address: &str, f: F) -> StorageExtResult<CasOutcome<T>>
     where
-        F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError> + Send + Sync,
-        T: Send,
+        F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError>
+            + Send
+            + Sync
+            + 'static,
+        T: Send + 'static,
     {
         let key = address_to_key(address, self.prefix.as_deref())
             .map_err(|e| StorageExtError::io(format!("Invalid address: {e}")))?;
@@ -1209,6 +1354,62 @@ mod tests {
         // Edge cases
         assert!(!S3Storage::is_express_bucket(""));
         assert!(!S3Storage::is_express_bucket("--x-s3"));
+    }
+
+    /// The whole point of the knob is the URL shape the SDK emits, so
+    /// observe that directly: presigning builds the real request URL
+    /// without touching the network.
+    #[tokio::test]
+    async fn force_path_style_changes_the_url_shape() {
+        use aws_sdk_s3::presigning::PresigningConfig;
+        use std::time::Duration;
+
+        let sdk = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::for_tests())
+            .load()
+            .await;
+        let presign = PresigningConfig::expires_in(Duration::from_secs(60)).expect("presign");
+
+        let url_for = |path_style: Option<bool>| {
+            let sdk = sdk.clone();
+            let presign = presign.clone();
+            async move {
+                let storage = S3Storage::new(
+                    &sdk,
+                    S3Config {
+                        bucket: "fluree".into(),
+                        endpoint: Some("http://minio:9000".into()),
+                        force_path_style: path_style,
+                        ..S3Config::default()
+                    },
+                )
+                .await
+                .expect("builds");
+                storage
+                    .client
+                    .get_object()
+                    .bucket("fluree")
+                    .key("k")
+                    .presigned(presign)
+                    .await
+                    .expect("presigns")
+                    .uri()
+                    .to_string()
+            }
+        };
+
+        let path_style = url_for(Some(true)).await;
+        assert!(
+            path_style.starts_with("http://minio:9000/fluree/k"),
+            "path-style must put the bucket in the path: {path_style}",
+        );
+
+        let virtual_hosted = url_for(None).await;
+        assert!(
+            virtual_hosted.starts_with("http://fluree.minio:9000/k"),
+            "unset must leave the SDK default, bucket as a virtual host: {virtual_hosted}",
+        );
     }
 
     #[test]

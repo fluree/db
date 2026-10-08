@@ -2,6 +2,8 @@
 
 Fluree supports three query languages over the same graph data: **JSON-LD Query** (Fluree's native query language), **SPARQL** (the W3C standard), and **Cypher** (openCypher). All three run against one underlying store — data written through any surface is immediately visible to the others — and each provides access to Fluree's unique features including time travel, graph sources, and policy enforcement.
 
+A fourth surface, **[GraphQL](graphql.md)**, sits a level above them: it has no query engine of its own, but derives a schema from the ledger's own data and SHACL shapes and compiles each request into a JSON-LD Query.
+
 ## Query Languages
 
 ### [JSON-LD Query](jsonld-query.md)
@@ -10,7 +12,7 @@ Fluree's native query language that uses JSON-LD syntax. JSON-LD Query provides 
 
 **Key Features:**
 - JSON-based syntax (no string parsing)
-- Full support for time travel (`@t:`, `@iso:`, `@commit:`)
+- Full support for time travel (`@t:`, `@time:`, `@commit:`)
 - Graph source integration
 - Policy enforcement
 - History queries
@@ -36,7 +38,20 @@ Industry-standard SPARQL 1.1 query language. Fluree provides full SPARQL support
 - Neo4j-compatible `cypher-json` output (or RDF JSON-LD)
 - Auto-detected by the CLI; `Content-Type: application/cypher` over HTTP
 
-See the [openCypher support matrix](../reference/cypher-support-matrix.md) for a feature-by-feature status view.
+See [Cypher → Differences from Neo4j](cypher.md#differences-from-neo4j) for the model divergences and deferred forms.
+
+### [GraphQL](graphql.md)
+
+A GraphQL endpoint on every ledger, with the schema **derived from what the ledger already contains** — no `.graphqls` upload, no resolvers, no build step. It sharpens in three tiers as the ledger says more about itself: statistics alone, then SHACL shapes, then a `graphql:Schema` that decides what is published.
+
+**Key Features:**
+- Zero-configuration introspection, filtering, ordering and pagination on any existing ledger
+- SHACL supplies cardinality, enums, reverse fields and documentation
+- `graphql:Schema` controls exposure, names, interfaces, and opts in to mutations
+- Policy applies by pruning: a denied class is absent from introspection
+- `extensions.explain` returns the JSON-LD query each field lowered to
+
+Unlike the three above, GraphQL is not a peer engine: every request compiles to a JSON-LD Query, which is what `explain` shows you.
 
 [opencypher]: https://opencypher.org/resources/
 
@@ -119,7 +134,7 @@ ledger:main@t:100
 
 **ISO 8601 Timestamp:**
 ```
-ledger:main@iso:2024-01-15T10:30:00Z
+ledger:main@time:2024-01-15T10:30:00Z
 ```
 
 **Commit ContentId:**

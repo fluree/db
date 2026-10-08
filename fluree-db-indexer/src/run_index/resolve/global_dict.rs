@@ -938,7 +938,9 @@ impl LanguageTagDict {
     /// Returns 0 if `tag` is None.
     pub fn get_or_insert(&mut self, tag: Option<&str>) -> u16 {
         match tag {
-            Some(t) => self.inner.assign_or_lookup(t),
+            Some(t) => self
+                .inner
+                .assign_or_lookup(&fluree_db_core::normalize_lang_tag(t)),
             None => 0,
         }
     }
@@ -964,7 +966,20 @@ impl LanguageTagDict {
     ///
     /// Returns `None` if the tag is not in the dictionary.
     pub fn find_id(&self, tag: &str) -> Option<u16> {
-        self.inner.find(tag)
+        self.find_normalized(tag)
+    }
+
+    /// Case-insensitive reverse lookup: the dictionary stores normalized
+    /// (lowercase) tags, but a dictionary persisted before normalization may
+    /// still hold the tag as written, so an exact miss falls back to a scan.
+    fn find_normalized(&self, tag: &str) -> Option<u16> {
+        let norm = fluree_db_core::normalize_lang_tag(tag);
+        self.inner.find(&norm).or_else(|| {
+            self.inner
+                .iter()
+                .find(|(_, t)| t.eq_ignore_ascii_case(&norm))
+                .map(|(id, _)| id)
+        })
     }
 
     /// Iterator over (id, tag) pairs.
@@ -980,7 +995,17 @@ impl LanguageTagDict {
     /// Reconstruct from an ordered list of tags (e.g., from `IndexRoot`).
     ///
     /// Tag at index `i` gets ID `i + 1` (base_id=1; 0 = "no tag").
+    ///
+    /// Tags are normalized on the way in. `get_or_insert` normalizes, so a
+    /// verbatim seed from a pre-normalization root would miss on an
+    /// already-present tag and append a second id for the same language —
+    /// splitting `en-US` from `en-us` in the rebuilt root and shifting every
+    /// later `lang_id` when the store dedups them at load.
     pub fn from_ordered_tags(tags: Vec<std::sync::Arc<str>>) -> Self {
+        let tags: Vec<std::sync::Arc<str>> = tags
+            .iter()
+            .map(|t| std::sync::Arc::from(&*fluree_db_core::normalize_lang_tag(t)))
+            .collect();
         Self {
             inner: VecBiDict::from_ordered_vec(1, tags),
         }
@@ -997,38 +1022,20 @@ impl Default for LanguageTagDict {
 // Datatype dict constants (dt_ids)
 // ============================================================================
 
-/// Reserved datatype dictionary IDs.
+/// Create a new datatype dict with the reserved entries pre-inserted.
 ///
-/// These constants are defined in `fluree_db_core::DatatypeDictId`.
-/// Only types with special encoding/coercion rules get reserved IDs.
-/// Everything else is dynamically assigned (ID 14+).
-///
-/// Type is `u16` to match `RunRecord.dt` — most datasets use ≤255 types
-/// (encoded as u8 in leaf Region 2), but u16 supports up to 65535 distinct
-/// datatype IRIs in a single import.
-///
-/// Create a new datatype dict with reserved entries pre-inserted.
-///
-/// Order matters: `get_or_insert` returns sequential IDs starting at 0.
-/// Only types with special encoding/coercion rules are reserved.
+/// The reserved entries come from `DatatypeDictId::RESERVED_IRIS`, in ID
+/// order. Every other datatype is assigned the next ID the first time it
+/// is seen, from `RESERVED_COUNT` up to `DatatypeDictId::MAX`.
 pub(crate) fn new_datatype_dict() -> PredicateDict {
     let mut d = PredicateDict::new();
-    d.get_or_insert("@id"); // 0
-    d.get_or_insert(fluree_vocab::xsd::STRING); // 1
-    d.get_or_insert(fluree_vocab::xsd::BOOLEAN); // 2
-    d.get_or_insert(fluree_vocab::xsd::INTEGER); // 3
-    d.get_or_insert(fluree_vocab::xsd::LONG); // 4
-    d.get_or_insert(fluree_vocab::xsd::DECIMAL); // 5
-    d.get_or_insert(fluree_vocab::xsd::DOUBLE); // 6
-    d.get_or_insert(fluree_vocab::xsd::FLOAT); // 7
-    d.get_or_insert(fluree_vocab::xsd::DATE_TIME); // 8
-    d.get_or_insert(fluree_vocab::xsd::DATE); // 9
-    d.get_or_insert(fluree_vocab::xsd::TIME); // 10
-    d.get_or_insert(fluree_vocab::rdf::LANG_STRING); // 11
-    d.get_or_insert(fluree_vocab::rdf::JSON); // 12
-    d.get_or_insert(fluree_vocab::fluree::EMBEDDING_VECTOR); // 13
-    d.get_or_insert(fluree_vocab::fluree::FULL_TEXT); // 14
-    debug_assert_eq!(d.len(), 15);
+    for iri in fluree_db_core::DatatypeDictId::RESERVED_IRIS {
+        d.get_or_insert(iri);
+    }
+    debug_assert_eq!(
+        d.len(),
+        u32::from(fluree_db_core::DatatypeDictId::RESERVED_COUNT)
+    );
     d
 }
 
@@ -1284,6 +1291,25 @@ impl GlobalDicts {
 
 #[cfg(test)]
 mod tests {
+
+    /// Seeding from a pre-normalization root must not split a tag. The
+    /// resolver seeds from `IndexRoot.language_tags` and then `get_or_insert`s
+    /// the (normalized) tag coming off novelty; a verbatim seed makes that an
+    /// exact miss, so the rebuilt root would carry both `en-US` and `en-us`
+    /// and every later `lang_id` shifts when the store dedups them at load.
+    #[test]
+    fn ordered_seed_normalizes_so_reindex_does_not_split_a_tag() {
+        let mut d = super::LanguageTagDict::from_ordered_tags(vec!["en-US".into(), "fr".into()]);
+        assert_eq!(d.resolve(1), Some("en-us"), "seed stored normalized");
+        assert_eq!(
+            d.get_or_insert(Some("en-US")),
+            1,
+            "no second id for the same tag"
+        );
+        assert_eq!(d.get_or_insert(Some("en-us")), 1);
+        assert_eq!(d.len(), 2, "still exactly the seeded tags");
+        assert_eq!(d.find_id("fr"), Some(2), "later ids keep their position");
+    }
     use super::*;
     use fluree_db_core::DatatypeDictId;
 

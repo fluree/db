@@ -1,8 +1,9 @@
 //! `HashJoinOperator` — build/probe inner join for object→subject "path" joins.
 //!
 //! This is the cure for the BSBM-BI "small + large" two-pattern join slowdown
-//! (see `docs/troubleshooting/performance-tracing.md` and the benchmark report
-//! `bsbm-bi-fluree-100m-join-scaling.md`). The minimal repro:
+//! (see `docs/design/performance.md` for where this sits in the engine, and
+//! `docs/troubleshooting/performance-tracing.md` for diagnosing the shape).
+//! The minimal repro:
 //!
 //! ```sparql
 //! SELECT (COUNT(*) AS ?c) WHERE {
@@ -129,6 +130,12 @@ const HASH_JOIN_MEDIUM_BUILD_MAX: f64 = 250_000.0;
 /// build side in `open()`, so a wide, high-row intermediate can defeat outer
 /// LIMIT.
 const HASH_JOIN_AUTO_NARROW_BUILD_SCHEMA: usize = 2;
+/// Largest requested prefix for preferring startup latency over a hash build.
+/// Matches the minimum batched probe window.
+const ROW_GOAL_MAX: usize = crate::operator::flush::MIN_FLUSH;
+/// Small builds still use the throughput cost model. Keep this tied to the
+/// first expansion of the probe window rather than a separate tuning value.
+const ROW_GOAL_MIN_BUILD: usize = ROW_GOAL_MAX * crate::operator::flush::FLUSH_GROWTH;
 /// Don't scan a probe predicate more than this many times the driving-set size —
 /// a guard against the pathological "scan a huge predicate for a handful of driving
 /// rows" case. It is deliberately loose: the alternative we replace is the scattered
@@ -177,6 +184,8 @@ pub(crate) enum HashJoinReason {
     /// The object-join shape matched, but the build side is already a wider
     /// intermediate. Auto hash join would drain it in open() and can defeat LIMIT.
     BuildSideTooWide,
+    /// A small output prefix favors a streaming probe over an eager build.
+    SmallRowGoal,
     /// The subject (not the object) is bound from the left, so this is a forward
     /// join the object→subject hash can't replace. Reordering to drive the other
     /// end is what helps (the BSBM-BI bowtie case).
@@ -193,6 +202,7 @@ impl HashJoinReason {
             HashJoinReason::ScanRatioTooHigh => "scan-ratio-too-high",
             HashJoinReason::NoProbeStats => "no-probe-stats",
             HashJoinReason::BuildSideTooWide => "build-side-too-wide",
+            HashJoinReason::SmallRowGoal => "small-row-goal",
             HashJoinReason::SubjectDriven => "subject-driven-forward-join",
         }
     }
@@ -322,16 +332,39 @@ pub(crate) struct HashJoinPlanner<'a> {
     /// `before_step` runs with stats present, so single-pattern / stats-less callers
     /// never auto-fire (force-`On` still does).
     step_est: Option<f64>,
+    row_goal: Option<usize>,
 }
 
 impl<'a> HashJoinPlanner<'a> {
+    /// The block's planner stats — shared with sibling join-shape decisions
+    /// (e.g. the membership-join build-size gate in `build_scan_or_join`).
+    pub(crate) fn stats(&self) -> Option<&'a StatsView> {
+        self.stats
+    }
+
+    /// The driving-set size snapshot taken by the latest [`before_step`](Self::before_step)
+    /// — the estimated rows entering the probe being built. Shared with the
+    /// membership-join gate in `build_scan_or_join`, whose left operator often
+    /// reports no estimate of its own (`DatasetOperator` and the nested loop
+    /// above it both return `None`), which that gate would otherwise read as
+    /// "unbounded" and drain a whole predicate extension for a handful of rows.
+    pub(crate) fn step_est(&self) -> Option<f64> {
+        self.step_est
+    }
+
     pub(crate) fn new(stats: Option<&'a StatsView>) -> Self {
         Self {
             stats,
             force: hash_join_force(),
             driving_est: 1.0,
             step_est: None,
+            row_goal: None,
         }
+    }
+
+    pub(crate) fn with_row_goal(mut self, row_goal: Option<usize>) -> Self {
+        self.row_goal = row_goal;
+        self
     }
 
     /// Seed the running driving estimate from the block's incoming LEFT operator
@@ -432,6 +465,24 @@ impl<'a> HashJoinPlanner<'a> {
             (Some(pc), Some(d)) => Some(pc as f64 / d.max(1.0)),
             _ => None,
         };
+
+        // A nested-loop join can emit after one small probe window. Keep the
+        // hash build for larger prefixes and small build sides; avoid draining
+        // a large build just to return a handful of rows. The goal is advisory:
+        // filters and dedup may require the streaming plan to read everything.
+        if self.force == HashJoinForce::Auto
+            && self.row_goal.is_some_and(|goal| goal <= ROW_GOAL_MAX)
+            && driving_est.is_some_and(|rows| rows > ROW_GOAL_MIN_BUILD as f64)
+        {
+            return Some(HashJoinDecision {
+                join_var: Some(join_var),
+                probe_count,
+                driving_est,
+                scan_ratio,
+                chosen: false,
+                reason: HashJoinReason::SmallRowGoal,
+            });
+        }
 
         let (chosen, reason) = match self.force {
             HashJoinForce::On => (true, HashJoinReason::ForcedOn),
@@ -665,6 +716,16 @@ impl HashJoinOperator {
         let ncols = self.build_schema.len();
         build.open(ctx).await?;
         while let Some(batch) = build.next_batch(ctx).await? {
+            // The build side is drained FULLY here in open() — for a multi-million-row
+            // FACT build that is minutes of accumulation into `table`/`wildcard_rows`
+            // with no poll of its own (the round-3 OOM driver). Account this batch's
+            // contribution to the query-scoped memory counter, then checkpoint: a
+            // deadline abort surfaces a clean `Cancelled`, and an over-budget build —
+            // inherently un-LIMIT-able, every build row is needed for correctness —
+            // surfaces a typed `MemoryBudgetExceeded` BEFORE the runtime OOMs.
+            // Batch-granularity, approximate (rows × cols × est/binding).
+            ctx.record_alloc(batch.len() * ncols * crate::context::BINDING_EST_BYTES);
+            ctx.checkpoint()?;
             for row in 0..batch.len() {
                 let row_vals: Vec<Binding> = (0..ncols)
                     .map(|c| batch.get_by_col(row, c).clone())
@@ -766,6 +827,11 @@ impl Operator for HashJoinOperator {
         let probe = self.probe.as_mut().expect("hash join probe");
 
         loop {
+            // Checkpoint per probe-drive iteration (batch granularity; the inner
+            // per-probe-row loop is bounded by one batch between polls). Covers both
+            // the deadline and the memory budget — the build table is fully retained
+            // through the probe, so a build that crossed the budget still aborts here.
+            ctx.checkpoint()?;
             // Ensure we have a probe batch to consume.
             if self.cur_probe.is_none() {
                 match probe.next_batch(ctx).await? {
@@ -966,7 +1032,7 @@ mod tests {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::{FlakeValue, LedgerSnapshot};
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let mut vars = VarRegistry::new();
         let x = vars.get_or_insert("?x"); // join var (bound object)
         let driver = vars.get_or_insert("?driver");
@@ -1030,6 +1096,260 @@ mod tests {
             rows, 2,
             "Poisoned build row must not fan out to every probe row"
         );
+    }
+
+    /// R3-A: HashJoin drains its build side FULLY in `open()` with no poll of its
+    /// own — a multi-million-row FACT build ran minutes to an OOM. With a
+    /// pre-cancelled deadline, `open()` must abort typed `Cancelled` at the build
+    /// loop's per-batch poll, not run the drain to completion.
+    #[tokio::test]
+    async fn r3a_hash_join_build_polls_cancellation() {
+        use crate::context::ExecutionContext;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{
+            FlakeValue, LedgerSnapshot, QueryCancellation, QueryCancellationReason,
+        };
+
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let mut vars = VarRegistry::new();
+        let x = vars.get_or_insert("?x");
+        let driver = vars.get_or_insert("?driver");
+        let s = vars.get_or_insert("?s");
+        let cancel = QueryCancellation::new();
+        cancel.cancel_with(QueryCancellationReason::Timeout);
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel);
+
+        let key = || Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"));
+        let build_schema: Arc<[VarId]> = Arc::from(vec![x, driver].into_boxed_slice());
+        let build_batch = Batch::new(build_schema.clone(), vec![vec![key()], vec![key()]]).unwrap();
+        let probe_schema: Arc<[VarId]> = Arc::from(vec![x, s].into_boxed_slice());
+        let probe_batch = Batch::new(probe_schema.clone(), vec![vec![key()], vec![key()]]).unwrap();
+        let right_pattern =
+            TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(1, "p")), Term::Var(x));
+        let mut hj = HashJoinOperator::new(
+            Box::new(OnceOp {
+                schema: build_schema,
+                batch: Some(build_batch),
+            }),
+            Box::new(OnceOp {
+                schema: probe_schema,
+                batch: Some(probe_batch),
+            }),
+            x,
+            None,
+            right_pattern,
+            None,
+            crate::temporal_mode::PlanningContext::current().mode(),
+        );
+        let err = hj.open(&ctx).await.unwrap_err();
+        assert!(
+            matches!(err, crate::error::QueryError::Cancelled { .. }),
+            "build drain must poll the deadline, got {err:?}"
+        );
+    }
+
+    /// R3-B: a tiny memory budget makes the HashJoin build abort typed
+    /// (`MemoryBudgetExceeded`) before OOM — distinguishable from a timeout.
+    #[tokio::test]
+    async fn r3b_hash_join_build_budget_aborts_typed() {
+        use crate::context::ExecutionContext;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{FlakeValue, LedgerSnapshot, QueryCancellation};
+
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let mut vars = VarRegistry::new();
+        let x = vars.get_or_insert("?x");
+        let driver = vars.get_or_insert("?driver");
+        let s = vars.get_or_insert("?s");
+        // Pin a 1-byte ceiling on the query handle → the first build batch's recorded
+        // allocation crosses it, so the checkpoint aborts typed.
+        let cancel = QueryCancellation::new();
+        cancel.set_memory_limit(1);
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel);
+
+        let key = || Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"));
+        let build_schema: Arc<[VarId]> = Arc::from(vec![x, driver].into_boxed_slice());
+        let build_batch = Batch::new(build_schema.clone(), vec![vec![key()], vec![key()]]).unwrap();
+        let probe_schema: Arc<[VarId]> = Arc::from(vec![x, s].into_boxed_slice());
+        let probe_batch = Batch::new(probe_schema.clone(), vec![vec![key()], vec![key()]]).unwrap();
+        let right_pattern =
+            TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(1, "p")), Term::Var(x));
+        let mut hj = HashJoinOperator::new(
+            Box::new(OnceOp {
+                schema: build_schema,
+                batch: Some(build_batch),
+            }),
+            Box::new(OnceOp {
+                schema: probe_schema,
+                batch: Some(probe_batch),
+            }),
+            x,
+            None,
+            right_pattern,
+            None,
+            crate::temporal_mode::PlanningContext::current().mode(),
+        );
+        let err = hj.open(&ctx).await.unwrap_err();
+        assert!(
+            matches!(err, crate::error::QueryError::MemoryBudgetExceeded { .. }),
+            "build must abort typed on the memory budget, got {err:?}"
+        );
+    }
+
+    /// D1: the rebuild-boundary release stops a REBUILT inner subplan from
+    /// over-counting the shared memory budget into a false 507. A correlated
+    /// GraphOperator / batched-OPTIONAL rebuilds its inner (a hash join here) once
+    /// per parent row/batch on ONE shared cancellation handle; without a release the
+    /// monotonic counter grows ~N× the true one-build peak and aborts a legitimate
+    /// query. This isolates the mechanism: two INDEPENDENT builds on one handle, the
+    /// first dropped before the second, under a budget that admits one build's peak
+    /// but not the two-build sum — with the boundary release (the exact snapshot→
+    /// charge→drop→release pattern the operators now apply) the second build MUST
+    /// complete. See `GraphOperator::execute_in_graph{,_batched}` and
+    /// `OptionalOperator::build_batch`.
+    #[tokio::test]
+    async fn d1_rebuild_boundary_release_no_false_abort() {
+        use crate::context::ExecutionContext;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{FlakeValue, LedgerSnapshot, QueryCancellation};
+
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let mut vars = VarRegistry::new();
+        let x = vars.get_or_insert("?x");
+        let driver = vars.get_or_insert("?driver");
+        let s = vars.get_or_insert("?s");
+
+        // One build charges 1 row x 2 build-schema cols x BINDING_EST_BYTES. Pin the
+        // ceiling above one build but below the two-build running sum, so the second
+        // build only fits once the first is released at the rebuild boundary. Derived
+        // from BINDING_EST_BYTES so the pin tracks the per-binding estimate (88 at
+        // this rung) instead of a hard-coded byte count.
+        let per_build = 2 * crate::context::BINDING_EST_BYTES; // 1 row x 2 build cols
+        let cancel = QueryCancellation::new();
+        cancel.set_memory_limit(per_build + per_build / 2);
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel);
+
+        let key = || Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"));
+        let build_schema: Arc<[VarId]> = Arc::from(vec![x, driver].into_boxed_slice());
+        let probe_schema: Arc<[VarId]> = Arc::from(vec![x, s].into_boxed_slice());
+        let make_hj = || {
+            let build_batch =
+                Batch::new(build_schema.clone(), vec![vec![key()], vec![key()]]).unwrap();
+            let probe_batch =
+                Batch::new(probe_schema.clone(), vec![vec![key()], vec![key()]]).unwrap();
+            let right_pattern =
+                TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(1, "p")), Term::Var(x));
+            HashJoinOperator::new(
+                Box::new(OnceOp {
+                    schema: build_schema.clone(),
+                    batch: Some(build_batch),
+                }),
+                Box::new(OnceOp {
+                    schema: probe_schema.clone(),
+                    batch: Some(probe_batch),
+                }),
+                x,
+                None,
+                right_pattern,
+                None,
+                crate::temporal_mode::PlanningContext::current().mode(),
+            )
+        };
+
+        // ---- First rebuild. Snapshot before the inner charges, drain it, drop it.
+        let mem_before_1 = ctx.mem_used();
+        {
+            let mut hj1 = make_hj();
+            hj1.open(&ctx).await.expect("first build is within budget");
+            while hj1.next_batch(&ctx).await.expect("drain hj1").is_some() {}
+            hj1.close();
+        }
+        // (negative control) The dropped inner's charge is still on the shared counter
+        // — record_alloc never auto-releases — so a second build's running sum WOULD
+        // exceed the budget. This is what makes the release load-bearing, not the test
+        // vacuous.
+        let accumulated = ctx.mem_used();
+        assert_eq!(
+            accumulated,
+            mem_before_1 + per_build,
+            "the finished inner's build charge is retained until released"
+        );
+        assert!(
+            accumulated + per_build > per_build + per_build / 2,
+            "two un-released builds would exceed the pinned budget (the D1 false 507)"
+        );
+
+        // ---- Release at the rebuild boundary (exactly what the operators now do).
+        ctx.release(ctx.mem_used().saturating_sub(mem_before_1));
+        assert_eq!(
+            ctx.mem_used(),
+            mem_before_1,
+            "boundary release nets the finished rebuild to zero"
+        );
+
+        // ---- Second rebuild on the SAME handle: true peak is again one build, so it
+        // MUST NOT false-abort now that the first was released.
+        {
+            let mut hj2 = make_hj();
+            hj2.open(&ctx)
+                .await
+                .expect("second build must NOT false-abort after the boundary release");
+            while hj2.next_batch(&ctx).await.expect("drain hj2").is_some() {}
+            hj2.close();
+        }
+    }
+
+    #[test]
+    fn small_row_goal_avoids_a_large_build_but_respects_force_mode() {
+        let subject = VarId(0);
+        let object = VarId(1);
+        let predicate = Sid::new(1, "knows");
+        let triple = TriplePattern::new(
+            Ref::Var(subject),
+            Ref::Sid(predicate.clone()),
+            Term::Var(object),
+        );
+        let mut stats = StatsView::default();
+        stats.properties.insert(
+            predicate,
+            PropertyStatData {
+                count: 150_000,
+                ndv_values: 50_000,
+                ndv_subjects: 50_000,
+            },
+        );
+        let mut planner = HashJoinPlanner::new(Some(&stats));
+        planner.force = HashJoinForce::Auto;
+        planner.step_est = Some(150_000.0);
+        let decision = |p: &HashJoinPlanner<'_>| {
+            p.explain_object_hash_join(&[object], &triple, false, true)
+                .unwrap()
+        };
+        assert!(decision(&planner).chosen);
+        for goal in [1, 1024] {
+            planner.row_goal = Some(goal);
+            let d = decision(&planner);
+            assert!(!d.chosen);
+            assert_eq!(d.reason, HashJoinReason::SmallRowGoal);
+        }
+        planner.row_goal = Some(1025);
+        assert!(
+            decision(&planner).chosen,
+            "larger prefixes keep the cost model"
+        );
+        planner.row_goal = Some(1);
+        planner.step_est = Some(8192.0);
+        assert!(
+            decision(&planner).chosen,
+            "small builds keep the cost model"
+        );
+        planner.step_est = Some(150_000.0);
+        planner.force = HashJoinForce::On;
+        assert_eq!(decision(&planner).reason, HashJoinReason::ForcedOn);
+        assert!(decision(&planner).chosen);
+        planner.force = HashJoinForce::Off;
+        assert_eq!(decision(&planner).reason, HashJoinReason::ForcedOff);
+        assert!(!decision(&planner).chosen);
     }
 
     #[test]
@@ -1257,6 +1577,7 @@ mod tests {
         let planner = HashJoinPlanner {
             stats: Some(&stats),
             force: HashJoinForce::Auto,
+            row_goal: None,
             driving_est: 10_980.0,
             step_est: Some(10_980.0),
         };
@@ -1295,6 +1616,7 @@ mod tests {
         let planner = HashJoinPlanner {
             stats: Some(&stats),
             force: HashJoinForce::Auto,
+            row_goal: None,
             driving_est: 237_440.0,
             step_est: Some(237_440.0),
         };
@@ -1325,6 +1647,7 @@ mod tests {
         let planner = HashJoinPlanner {
             stats: Some(&stats),
             force: HashJoinForce::Auto,
+            row_goal: None,
             driving_est: 1_085_090.0,
             step_est: Some(1_085_090.0),
         };

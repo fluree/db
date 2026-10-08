@@ -1,0 +1,7 @@
+# q001 store_directory
+# Intent: Single-dimension star projection over DIM_STORE.
+# BI lineage (BI-01): "List our stores with their channel and store type."
+# Predicates verified against enterprise.ttl — DimStore: name, channel, storeType.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?n ?ch ?t
+WHERE { ?s a edw:Store ; edw:name ?n ; edw:channel ?ch ; edw:storeType ?t . }

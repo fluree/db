@@ -126,6 +126,17 @@ For small-to-medium corpora (up to hundreds of thousands of documents per predic
 }
 ```
 
+**Or in SPARQL:**
+```sparql
+SELECT ?title ?score WHERE {
+  ?doc ex:content ?content ; ex:title ?title .
+  BIND(fulltext(?content, "Rust programming") AS ?score)
+  FILTER(?score > 0)
+}
+ORDER BY DESC(?score)
+LIMIT 10
+```
+
 See [Inline Fulltext Search](fulltext.md) for details.
 
 ## Full-Text Search (BM25 Graph Source)

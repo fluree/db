@@ -1,0 +1,11 @@
+# q034 manager_chain_path
+# Intent: Transitive property path (manager+). H8 CORRECTNESS gap (findings-register F1): a transitive +/* path is NOT lowered and silently returns 0 rows on virtual-sf01 (native 4514) — no error, no scan. Contrast q035: a sequence path a/b decomposes to triples and works (but slow).
+# BI lineage (BI-17): "Who is in each employee's full management chain?"
+# Predicates verified against enterprise.ttl — DimEmployee: name, manager (path manager+).
+# PR-0/0a: a property path inside a GRAPH-over-R2RML scope now ERRORS loudly on
+#   virtual targets (was silently 0 rows — F1); native still returns 4514 rows.
+#   Manifest: expected_status = {native: ok, virtual: error}.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?en ?boss
+WHERE { ?e a edw:Employee ; edw:name ?en ; edw:manager+ ?boss . }
+LIMIT 5000

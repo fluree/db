@@ -47,12 +47,14 @@ use crate::{publish_index_result, IndexResult};
 #[cfg(feature = "embedded-orchestrator")]
 use fluree_db_core::Storage;
 use fluree_db_core::StorageBackend;
+use fluree_db_core::{LedgerId, LedgerName};
 use fluree_db_nameservice::{
-    IndexingNameService, LedgerEventBus, NameServiceEvent, SubscriptionScope,
+    IndexingNameService, LedgerEventBus, NameServiceEvent, NsRecord, SubscriptionScope,
 };
 use futures::FutureExt;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -377,7 +379,7 @@ impl IndexerOrchestrator {
     /// Check if a ledger needs indexing
     ///
     /// Returns `true` if the ledger's index is behind its commits.
-    pub async fn needs_indexing(&self, ledger_id: &str) -> Result<bool> {
+    pub async fn needs_indexing(&self, ledger_id: &LedgerId) -> Result<bool> {
         let record = self
             .nameservice
             .lookup(ledger_id)
@@ -402,7 +404,7 @@ impl IndexerOrchestrator {
     /// Returns the existing index if already current, otherwise:
     /// 1. Attempts incremental refresh if an index exists
     /// 2. Falls back to full batched rebuild if refresh fails or no index exists
-    pub async fn index_ledger(&self, ledger_id: &str) -> Result<IndexResult> {
+    pub async fn index_ledger(&self, ledger_id: &LedgerId) -> Result<IndexResult> {
         let cs = fluree_db_nameservice::branched_content_store_for_id(
             &self.backend,
             self.nameservice.as_ref(),
@@ -422,9 +424,22 @@ impl IndexerOrchestrator {
     /// Index a ledger and publish the result
     ///
     /// Combines `index_ledger` with publishing to the nameservice.
-    pub async fn index_and_publish(&self, ledger_id: &str) -> Result<IndexResult> {
-        let result = self.index_ledger(ledger_id).await?;
-        publish_index_result(self.nameservice.as_ref(), &result).await?;
+    pub async fn index_and_publish(&self, ledger_id: &LedgerId) -> Result<IndexResult> {
+        let cs = fluree_db_nameservice::branched_content_store_for_id(
+            &self.backend,
+            self.nameservice.as_ref(),
+            ledger_id,
+        )
+        .await
+        .map_err(|e| crate::error::IndexerError::NameService(e.to_string()))?;
+        let result = crate::build_index_for_ledger(
+            cs.clone(),
+            self.nameservice.as_ref(),
+            ledger_id,
+            self.config.clone(),
+        )
+        .await?;
+        publish_index_result(&cs, self.nameservice.as_ref(), &result).await?;
         Ok(result)
     }
 
@@ -449,7 +464,451 @@ impl IndexerOrchestrator {
 // =============================================================================
 
 /// Per-ledger state map
-type LedgerStates = BTreeMap<String, LedgerIndexState>;
+type LedgerStates = BTreeMap<LedgerId, LedgerIndexState>;
+
+/// Ledgers currently held by an exclusive maintenance operation.
+///
+/// A `std` mutex rather than tokio's, so [`MaintenanceGuard`] can release on
+/// drop: every critical section is a set insert, remove, or lookup with no
+/// await inside.
+type MaintenanceHolds = Arc<std::sync::Mutex<std::collections::HashSet<LedgerId>>>;
+
+/// Collector passes, release windows and builds in flight, all keyed by
+/// ledger **name**.
+///
+/// Two branches of one ledger must not collect at once: each could see the
+/// other's not-yet-released old root still referencing a dictionary blob,
+/// both would defer it, and both would consume the manifests that named it.
+/// See the module docs on [`crate::gc`].
+///
+/// And no branch of a ledger may build while a pass on any of them releases:
+/// a build can produce a blob byte-identical to one the pass is about to
+/// release (see `gc::collector::retained_refs`), and whether it uploaded
+/// before or after the release, the root it publishes would name a blob
+/// that is gone. A pass therefore releases inside a [`ReleaseWindow`], which
+/// waits out builds in flight and keeps new ones from starting.
+///
+/// Only this process is covered; a second-process indexer is the
+/// single-process caveat that [`MaintenanceGuard`] carries too.
+#[derive(Default)]
+struct GcLockState {
+    inner: std::sync::Mutex<GcLockInner>,
+    /// Woken on every change, so a waiter re-checks.
+    changed: Notify,
+}
+
+#[derive(Default)]
+struct GcLockInner {
+    /// Names with a collector pass in flight.
+    held: HashSet<LedgerName>,
+    /// Names inside a release window.
+    releasing: HashSet<LedgerName>,
+    /// Worker builds in flight per name.
+    building: HashMap<LedgerName, usize>,
+    /// Per name, every branch this process has built or taken for
+    /// maintenance: siblings a cached listing may be too old to show. See
+    /// [`SIBLING_LISTING_MAX_AGE`]. Bounded by the branches a ledger has had.
+    built: HashMap<LedgerName, HashSet<LedgerId>>,
+}
+
+type GcLocks = Arc<GcLockState>;
+
+/// Exclusive hold on a ledger's collector passes. Dropping it releases.
+pub struct GcGuard {
+    ledger_name: LedgerName,
+    locks: GcLocks,
+}
+
+impl std::fmt::Debug for GcGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GcGuard")
+            .field("ledger_name", &self.ledger_name)
+            .finish()
+    }
+}
+
+impl Drop for GcGuard {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.locks.inner.lock() {
+            inner.held.remove(&self.ledger_name);
+        }
+        self.locks.changed.notify_waiters();
+    }
+}
+
+/// Take the collector lock for `ledger_name` if no pass holds it.
+fn try_hold_gc(locks: &GcLocks, ledger_name: &LedgerName) -> Option<GcGuard> {
+    let mut inner = locks.inner.lock().ok()?;
+    if !inner.held.insert(ledger_name.clone()) {
+        return None;
+    }
+    Some(GcGuard {
+        ledger_name: ledger_name.clone(),
+        locks: Arc::clone(locks),
+    })
+}
+
+/// Take the collector lock for `ledger_name`, waiting out a pass in flight.
+async fn hold_gc(locks: &GcLocks, ledger_name: &LedgerName) -> GcGuard {
+    loop {
+        // Registered before the check: a `Notified` receives wakeups from
+        // `notify_waiters` from creation, so a release between the failed
+        // attempt and the await is not missed.
+        let changed = locks.changed.notified();
+        if let Some(guard) = try_hold_gc(locks, ledger_name) {
+            return guard;
+        }
+        changed.await;
+    }
+}
+
+/// A worker build in flight on some branch of a ledger. Dropping it ends it.
+struct BuildTicket {
+    ledger_name: LedgerName,
+    locks: GcLocks,
+}
+
+impl Drop for BuildTicket {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.locks.inner.lock() {
+            if let Some(count) = inner.building.get_mut(&self.ledger_name) {
+                *count -= 1;
+                if *count == 0 {
+                    inner.building.remove(&self.ledger_name);
+                }
+            }
+        }
+        self.locks.changed.notify_waiters();
+    }
+}
+
+/// Register a build on a branch of `ledger_name`, or `None` while a release
+/// window is open on it. A poisoned lock reads as "open", like
+/// [`BackgroundIndexerWorker::maintenance_held`].
+fn try_begin_build(locks: &GcLocks, ledger_id: &LedgerId) -> Option<BuildTicket> {
+    let ledger_name = ledger_name_of(ledger_id);
+    let mut inner = locks.inner.lock().ok()?;
+    if inner.releasing.contains(&ledger_name) {
+        return None;
+    }
+    *inner.building.entry(ledger_name.clone()).or_default() += 1;
+    inner
+        .built
+        .entry(ledger_name.clone())
+        .or_default()
+        .insert(ledger_id.clone());
+    Some(BuildTicket {
+        ledger_name,
+        locks: Arc::clone(locks),
+    })
+}
+
+/// Note that `ledger_id`'s index is being written outside the worker.
+fn note_built(locks: &GcLocks, ledger_id: &LedgerId) {
+    if let Ok(mut inner) = locks.inner.lock() {
+        inner
+            .built
+            .entry(ledger_name_of(ledger_id))
+            .or_default()
+            .insert(ledger_id.clone());
+    }
+}
+
+/// The branches of `ledger_name` this process has built or taken for
+/// maintenance.
+fn built_branches(locks: &GcLocks, ledger_name: &LedgerName) -> Vec<LedgerId> {
+    locks.inner.lock().map_or_else(
+        |_| Vec::new(),
+        |inner| {
+            inner
+                .built
+                .get(ledger_name)
+                .map(|ids| ids.iter().cloned().collect())
+                .unwrap_or_default()
+        },
+    )
+}
+
+/// What a pass does about a build already running when it wants to release.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InFlightBuild {
+    /// Wait for it. For the pass a publish spawns, which starts before its
+    /// own build has returned, and on a busy ledger would otherwise never
+    /// find a gap.
+    WaitOut,
+    /// Give the pass up. For the periodic pass, which must not stall the
+    /// catch-up loop behind a long build; that build's publish spawns a pass.
+    GiveUp,
+}
+
+/// No branch of the ledger builds until this drops. See [`GcLockState`].
+pub struct ReleaseWindow {
+    ledger_name: LedgerName,
+    locks: GcLocks,
+    /// Wakes the worker on close so deferred builds resume promptly.
+    tick: watch::Sender<u64>,
+}
+
+impl std::fmt::Debug for ReleaseWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReleaseWindow")
+            .field("ledger_name", &self.ledger_name)
+            .finish()
+    }
+}
+
+impl Drop for ReleaseWindow {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.locks.inner.lock() {
+            inner.releasing.remove(&self.ledger_name);
+        }
+        self.locks.changed.notify_waiters();
+        self.tick.send_modify(|t| *t = t.wrapping_add(1));
+    }
+}
+
+/// Open a release window for the pass holding `gc`.
+///
+/// `None` when the ledger cannot be made quiet: a branch is held for
+/// maintenance — a reindex or sweep writes index artifacts outside the
+/// worker, for hours — or a build is running and `in_flight` says not to
+/// wait. The pass releases nothing and a later one retries.
+///
+/// The window is marked open *before* the maintenance holds are read, and
+/// [`TriggerHandle::hold_quiesced`] takes its hold before it reads the
+/// windows, so whichever order the two run in, one sees the other.
+async fn open_release_window(
+    gc: &GcGuard,
+    maintenance: &MaintenanceHolds,
+    tick: &watch::Sender<u64>,
+    in_flight: InFlightBuild,
+) -> Option<ReleaseWindow> {
+    let name = &gc.ledger_name;
+    gc.locks.inner.lock().ok()?.releasing.insert(name.clone());
+    let window = ReleaseWindow {
+        ledger_name: name.clone(),
+        locks: Arc::clone(&gc.locks),
+        tick: tick.clone(),
+    };
+    let under_maintenance = maintenance.lock().map_or(true, |holds| {
+        holds.iter().any(|id| ledger_name_of(id) == *name)
+    });
+    if under_maintenance {
+        return None;
+    }
+    loop {
+        let changed = gc.locks.changed.notified();
+        if !gc.locks.inner.lock().ok()?.building.contains_key(name) {
+            return Some(window);
+        }
+        if in_flight == InFlightBuild::GiveUp {
+            return None;
+        }
+        changed.await;
+    }
+}
+
+/// Wait until no release window is open on `ledger_name`.
+async fn wait_release_window_closed(locks: &GcLocks, ledger_name: &LedgerName) {
+    loop {
+        let changed = locks.changed.notified();
+        let open = locks
+            .inner
+            .lock()
+            .is_ok_and(|inner| inner.releasing.contains(ledger_name));
+        if !open {
+            return;
+        }
+        changed.await;
+    }
+}
+
+/// The ledger name a ledger id belongs to, for keying the collector lock.
+fn ledger_name_of(ledger_id: &LedgerId) -> LedgerName {
+    ledger_id.ledger_name()
+}
+
+/// How old the branch listing the collector's sibling check reads may be.
+///
+/// The listing only has to *discover* siblings; each one's head is re-read
+/// when the pass releases. `all_records()` is O(ledgers) on every backend —
+/// a directory walk, a LIST plus a GET per record, a DynamoDB query per
+/// ledger — so it is not taken per pass.
+///
+/// A fork the listing is too old to show holds either a copy of its source's
+/// head root, or roots this process built or reindexed. The second kind is
+/// tracked ([`GcLockInner::built`]) and joins the siblings. The first
+/// references only what the source's head did under five minutes ago, and
+/// the source still has that root: a version leaves a chain only once the
+/// age guard has passed, and every root left in the chain is protected
+/// (`gc::collector::retained_refs`), on this branch or a sibling's. That
+/// needs the guard to outlast the listing, so a short guard, or the version
+/// ceiling that overrides it, takes the listing fresh for every pass.
+const SIBLING_LISTING_MAX_AGE: Duration = Duration::from_secs(300);
+
+/// The nameservice's records, listed at most every
+/// [`SIBLING_LISTING_MAX_AGE`] on demand and replaced outright by the
+/// catch-up tick, which lists anyway.
+#[derive(Default)]
+struct BranchDirectory {
+    inner: Mutex<Option<(Instant, Arc<Vec<NsRecord>>)>>,
+}
+
+impl BranchDirectory {
+    async fn records(
+        &self,
+        nameservice: &dyn IndexingNameService,
+        max_age: Duration,
+    ) -> fluree_db_nameservice::Result<Arc<Vec<NsRecord>>> {
+        let mut inner = self.inner.lock().await;
+        if let Some((listed_at, records)) = inner.as_ref() {
+            if listed_at.elapsed() <= max_age {
+                return Ok(Arc::clone(records));
+            }
+        }
+        let records = Arc::new(nameservice.all_records().await?);
+        *inner = Some((Instant::now(), Arc::clone(&records)));
+        Ok(records)
+    }
+
+    async fn replace(&self, records: Arc<Vec<NsRecord>>) {
+        *self.inner.lock().await = Some((Instant::now(), records));
+    }
+}
+
+/// Everything one collector pass needs beyond the ledger it runs on.
+#[derive(Clone)]
+struct GcPassContext {
+    backend: StorageBackend,
+    nameservice: Arc<dyn IndexingNameService>,
+    directory: Arc<BranchDirectory>,
+    config: IndexerConfig,
+    maintenance: MaintenanceHolds,
+    tick: watch::Sender<u64>,
+}
+
+impl GcPassContext {
+    /// The branches that may be siblings of `ledger_id`: the listing's, plus
+    /// the ones this process has built. `None` when the listing cannot be
+    /// taken, which defers every shared blob rather than guess.
+    async fn sibling_candidates(
+        &self,
+        gc: &GcGuard,
+        ledger_id: &LedgerId,
+    ) -> Option<Vec<LedgerId>> {
+        let guard_secs = u64::from(self.config.gc_min_time_mins) * 60;
+        let max_age = if self.config.gc_hard_max_old_indexes.is_some()
+            || guard_secs < 2 * SIBLING_LISTING_MAX_AGE.as_secs()
+        {
+            Duration::ZERO
+        } else {
+            SIBLING_LISTING_MAX_AGE
+        };
+        match self
+            .directory
+            .records(self.nameservice.as_ref(), max_age)
+            .await
+        {
+            Ok(records) => {
+                let mut ids: Vec<LedgerId> = crate::gc::siblings_of(&records, ledger_id)
+                    .into_iter()
+                    .map(|b| b.ledger_id)
+                    .collect();
+                ids.extend(built_branches(&gc.locks, &gc.ledger_name));
+                Some(ids)
+            }
+            Err(e) => {
+                warn!(
+                    ledger_id = %ledger_id,
+                    error = %e,
+                    "could not list branches for the collector's sibling check; deferring shared blobs"
+                );
+                None
+            }
+        }
+    }
+
+    /// Run the collector over `ledger_id`'s chain from `root_id`, releasing
+    /// dictionary blobs no sibling branch still reaches.
+    ///
+    /// Plans against a snapshot, then releases inside a [`ReleaseWindow`]
+    /// from what is true once the ledger is quiet: see
+    /// [`crate::gc::release_garbage_plan`].
+    async fn run(
+        &self,
+        ledger_id: &LedgerId,
+        root_id: &fluree_db_core::ContentId,
+        gc: &GcGuard,
+        in_flight: InFlightBuild,
+    ) -> Result<crate::gc::CleanGarbageResult> {
+        let cache_dir = self.config.artifact_cache_dir();
+        let store = self.backend.content_store(ledger_id);
+        let config = crate::gc::CleanGarbageConfig {
+            max_old_indexes: Some(self.config.gc_max_old_indexes),
+            min_time_garbage_mins: Some(self.config.gc_min_time_mins),
+            // `None` sets no ceiling: the age guard always holds.
+            hard_max_old_indexes: self.config.gc_hard_max_old_indexes,
+            artifact_cache_dir: Some(cache_dir.clone()),
+            ..Default::default()
+        };
+        let Some(plan) = crate::gc::plan_garbage(store.as_ref(), root_id, &config).await? else {
+            return Ok(crate::gc::CleanGarbageResult::default());
+        };
+        let Some(_window) = open_release_window(gc, &self.maintenance, &self.tick, in_flight).await
+        else {
+            debug!(
+                ledger_id = %ledger_id,
+                "collector pass could not quiet the ledger; releasing nothing this pass"
+            );
+            return Ok(crate::gc::CleanGarbageResult::default());
+        };
+        let siblings = self.sibling_candidates(gc, ledger_id).await;
+        crate::gc::release_garbage_plan(
+            plan,
+            &self.backend,
+            self.nameservice.as_ref(),
+            ledger_id,
+            siblings.as_deref(),
+            Some(&cache_dir),
+        )
+        .await
+    }
+}
+
+/// Excludes index builds for one ledger until dropped.
+///
+/// Operations that write index artifacts outside the worker's admission path
+/// — the storage sweep and reindex — hold this for their whole run.
+/// [`TriggerHandle::wait_for_idle`] is not a substitute: it reports that a
+/// ledger *was* idle, and a build can start again the moment it returns.
+///
+/// Only the in-process worker consults this. An external indexer writing to
+/// the same storage is not excluded, so operations relying on it are safe
+/// only in single-process deployments.
+pub struct MaintenanceGuard {
+    ledger_id: LedgerId,
+    holds: MaintenanceHolds,
+    /// Wakes the worker on release so deferred builds resume promptly rather
+    /// than waiting for the next commit to tick.
+    tick: watch::Sender<u64>,
+}
+
+impl std::fmt::Debug for MaintenanceGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MaintenanceGuard")
+            .field("ledger_id", &self.ledger_id)
+            .finish()
+    }
+}
+
+impl Drop for MaintenanceGuard {
+    fn drop(&mut self) {
+        if let Ok(mut holds) = self.holds.lock() {
+            holds.remove(&self.ledger_id);
+        }
+        self.tick.send_modify(|t| *t = t.wrapping_add(1));
+    }
+}
 
 /// Fires its inner `oneshot::Sender<()>` on drop. Wrapped in an
 /// `Arc` and shared across every external `IndexerHandle` clone so
@@ -499,6 +958,10 @@ pub struct TriggerHandle {
     tick: watch::Sender<u64>,
     /// Notifier for idle state changes
     idle_notify: Arc<Notify>,
+    /// Ledgers held for maintenance (shared with worker)
+    maintenance: MaintenanceHolds,
+    /// Collector passes in flight (shared with worker)
+    gc_locks: GcLocks,
 }
 
 impl std::fmt::Debug for TriggerHandle {
@@ -525,6 +988,10 @@ impl std::fmt::Debug for TriggerHandle {
 #[derive(Clone)]
 pub struct IndexerHandle {
     trigger: TriggerHandle,
+    /// Where this worker's builds and collector cache index artifacts, so
+    /// maintenance run from outside the worker reads through the same cache
+    /// rather than a directory of its own.
+    artifact_cache_dir: Arc<Path>,
     /// Holding this Arc bumps the shutdown trigger's strong count;
     /// dropping the last clone fires the worker's `shutdown_rx`.
     _shutdown: Arc<ShutdownTrigger>,
@@ -534,6 +1001,7 @@ impl std::fmt::Debug for IndexerHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IndexerHandle")
             .field("trigger", &self.trigger)
+            .field("artifact_cache_dir", &self.artifact_cache_dir)
             .finish()
     }
 }
@@ -546,8 +1014,8 @@ impl TriggerHandle {
     /// then resolves ALL waiters whose min_t is satisfied.
     ///
     /// Fire-and-forget: just drop the returned `IndexCompletion`.
-    pub async fn trigger(&self, ledger_id: impl Into<String>, min_t: i64) -> IndexCompletion {
-        let ledger_id = ledger_id.into();
+    pub async fn trigger(&self, ledger_id: &LedgerId, min_t: i64) -> IndexCompletion {
+        let ledger_id = ledger_id.clone();
         let (tx, rx) = oneshot::channel();
         let (phase, pending_min_t, waiter_count);
 
@@ -598,6 +1066,106 @@ impl TriggerHandle {
         IndexCompletion { receiver: rx }
     }
 
+    /// Queue `ledger_id` only if nothing else already owns it.
+    ///
+    /// For callers that are guessing — a timer noticing a ledger looks stuck —
+    /// rather than reacting to a commit they just made. Returns whether it
+    /// queued.
+    ///
+    /// Unlike [`trigger`](Self::trigger) this **never** clears `cancelled` and
+    /// **never** resets the retry backoff. Those are correct for an explicit
+    /// trigger and wrong for a periodic one: on a timer they would resurrect
+    /// work an operator deliberately cancelled, and reset the backoff of a
+    /// failing build over and over. It also registers no waiter, so the entry
+    /// converges back to `Idle` on success without anything to resolve.
+    ///
+    /// Declines when the ledger is already Pending or InProgress, has been
+    /// cancelled, or is held for maintenance — a sweep must not start a build
+    /// underneath a reindex that took the ledger quiet.
+    ///
+    /// `min_t` must be the record's `commit_t`: `process_ledger`'s satisfaction
+    /// gate returns early without building when `index_t >= pending_min_t`.
+    pub async fn trigger_if_idle(&self, ledger_id: &LedgerId, min_t: i64) -> bool {
+        // Check the maintenance hold before the states lock: a poisoned lock
+        // means some holder panicked, and the conservative reading of "someone
+        // may hold this" is to decline.
+        match self.maintenance.lock() {
+            Ok(holds) if holds.contains(ledger_id) => return false,
+            Err(_) => return false,
+            Ok(_) => {}
+        }
+
+        {
+            let mut states = self.states.lock().await;
+            if let Some(existing) = states.get(ledger_id) {
+                if existing.phase != IndexPhase::Idle
+                    || existing.cancelled
+                    || existing.has_pending_work()
+                {
+                    return false;
+                }
+            }
+            let state = states.entry(ledger_id.clone()).or_default();
+            state.pending_min_t = Some(min_t);
+            state.phase = IndexPhase::Pending;
+        }
+
+        self.tick.send_modify(|t| *t = t.wrapping_add(1));
+
+        info!(
+            ledger_id = %ledger_id,
+            min_t,
+            "Catch-up sweep queued a stalled ledger"
+        );
+        true
+    }
+
+    /// Exclude index builds for `ledger_id` until the returned guard drops.
+    ///
+    /// Returns `None` when another maintenance operation already holds the
+    /// ledger. Callers report that rather than waiting — a sweep queued behind
+    /// a multi-hour reindex is indistinguishable from a hang.
+    ///
+    /// This excludes builds the in-process worker would *start*. A build
+    /// already in progress runs to completion, so callers that need the ledger
+    /// quiet must also [`cancel`](Self::cancel) and
+    /// [`wait_for_idle`](Self::wait_for_idle) after acquiring; taking the
+    /// guard first is what keeps a new build from starting in between.
+    pub fn acquire_maintenance(&self, ledger_id: &LedgerId) -> Option<MaintenanceGuard> {
+        let mut holds = self.maintenance.lock().ok()?;
+        if !holds.insert(ledger_id.clone()) {
+            return None;
+        }
+        note_built(&self.gc_locks, ledger_id);
+        Some(MaintenanceGuard {
+            ledger_id: ledger_id.clone(),
+            holds: Arc::clone(&self.maintenance),
+            tick: self.tick.clone(),
+        })
+    }
+
+    /// Take an exclusive hold on `ledger_id` and drain any build already in
+    /// flight, so the caller can write index artifacts without racing one.
+    ///
+    /// The guard stops new builds from starting; [`cancel`](Self::cancel) and
+    /// [`wait_for_idle`](Self::wait_for_idle) drain the build that may already
+    /// be running. Acquiring the guard *first* is what closes the window
+    /// `wait_for_idle` leaves open on its own — without the hold, a build can
+    /// start again between the wait returning and the caller acting.
+    ///
+    /// Returns `None` when another maintenance operation already holds the
+    /// ledger. Callers report that rather than waiting: a sweep queued behind
+    /// a multi-hour reindex is indistinguishable from a hang.
+    pub async fn hold_quiesced(&self, ledger_id: &LedgerId) -> Option<MaintenanceGuard> {
+        let guard = self.acquire_maintenance(ledger_id)?;
+        self.cancel(ledger_id).await;
+        self.wait_for_idle(ledger_id).await;
+        // A collector pass mid-release on any branch of the ledger finishes
+        // first; later passes see the hold and release nothing.
+        wait_release_window_closed(&self.gc_locks, &ledger_name_of(ledger_id)).await;
+        Some(guard)
+    }
+
     /// Cancel pending/queued work for a ledger
     ///
     /// - Removes from pending queue (if not yet started)
@@ -606,7 +1174,7 @@ impl TriggerHandle {
     /// - Resolves all waiters whose min_t is NOT yet satisfied as Cancelled
     ///
     /// Returns true if there was pending work to cancel.
-    pub async fn cancel(&self, ledger_id: &str) -> bool {
+    pub async fn cancel(&self, ledger_id: &LedgerId) -> bool {
         let had_work = {
             let mut states = self.states.lock().await;
             if let Some(state) = states.get_mut(ledger_id) {
@@ -650,13 +1218,13 @@ impl TriggerHandle {
     }
 
     /// Check current status for a ledger
-    pub async fn status(&self, ledger_id: &str) -> Option<IndexStatusSnapshot> {
+    pub async fn status(&self, ledger_id: &LedgerId) -> Option<IndexStatusSnapshot> {
         let states = self.states.lock().await;
         states.get(ledger_id).map(LedgerIndexState::snapshot)
     }
 
     /// Check if a ledger has pending or in-progress work
-    pub async fn is_pending(&self, ledger_id: &str) -> bool {
+    pub async fn is_pending(&self, ledger_id: &LedgerId) -> bool {
         let states = self.states.lock().await;
         states
             .get(ledger_id)
@@ -664,7 +1232,7 @@ impl TriggerHandle {
     }
 
     /// List all ledgers with pending/in-progress work
-    pub async fn pending_ledgers(&self) -> Vec<String> {
+    pub async fn pending_ledgers(&self) -> Vec<LedgerId> {
         let states = self.states.lock().await;
         states
             .iter()
@@ -678,7 +1246,7 @@ impl TriggerHandle {
     /// Returns immediately if no work pending.
     /// Different from `IndexCompletion`: this waits for the queue to drain,
     /// not for a specific min_t to be reached.
-    pub async fn wait_for_idle(&self, ledger_id: &str) {
+    pub async fn wait_for_idle(&self, ledger_id: &LedgerId) {
         loop {
             // Avoid missed-wakeup races: create the notification future *before*
             // checking the condition, then await it if still not idle.
@@ -718,13 +1286,67 @@ impl TriggerHandle {
 impl IndexerHandle {
     /// Trigger indexing for a ledger with completion tracking. See
     /// [`TriggerHandle::trigger`].
-    pub async fn trigger(&self, ledger_id: impl Into<String>, min_t: i64) -> IndexCompletion {
+    pub async fn trigger(&self, ledger_id: &LedgerId, min_t: i64) -> IndexCompletion {
         self.trigger.trigger(ledger_id, min_t).await
+    }
+
+    /// Queue a ledger only if nothing else already owns it. See
+    /// [`TriggerHandle::trigger_if_idle`].
+    pub async fn trigger_if_idle(&self, ledger_id: &LedgerId, min_t: i64) -> bool {
+        self.trigger.trigger_if_idle(ledger_id, min_t).await
+    }
+
+    /// Exclude index builds for a ledger. See
+    /// [`TriggerHandle::acquire_maintenance`].
+    pub fn acquire_maintenance(&self, ledger_id: &LedgerId) -> Option<MaintenanceGuard> {
+        self.trigger.acquire_maintenance(ledger_id)
+    }
+
+    /// Where this worker caches index artifacts on local disk.
+    pub fn artifact_cache_dir(&self) -> &Path {
+        &self.artifact_cache_dir
+    }
+
+    /// Take an exclusive hold and drain in-flight work. See
+    /// [`TriggerHandle::hold_quiesced`].
+    pub async fn hold_quiesced(&self, ledger_id: &LedgerId) -> Option<MaintenanceGuard> {
+        self.trigger.hold_quiesced(ledger_id).await
+    }
+
+    /// Hold `ledger_name`'s collector passes off until the guard drops,
+    /// waiting out a pass already in flight.
+    ///
+    /// For maintenance that releases shared dictionary blobs itself, such as
+    /// a branch drop: the pass and the drop each decide from what the
+    /// ledger's other branches reference, and they must not decide at once.
+    pub async fn hold_gc(&self, ledger_name: &LedgerName) -> GcGuard {
+        hold_gc(&self.trigger.gc_locks, ledger_name).await
+    }
+
+    /// The branches of `ledger_name` this process has built or taken for
+    /// maintenance, for a sibling check whose listing may not show them yet.
+    pub fn built_branches(&self, ledger_name: &LedgerName) -> Vec<LedgerId> {
+        built_branches(&self.trigger.gc_locks, ledger_name)
+    }
+
+    /// Keep every branch of `gc`'s ledger from building until the window
+    /// drops, waiting out a build in flight. Anything that releases shared
+    /// dictionary blobs decides what to release, and releases it, inside one.
+    ///
+    /// `None` when a branch of the ledger is held for maintenance.
+    pub async fn open_release_window(&self, gc: &GcGuard) -> Option<ReleaseWindow> {
+        open_release_window(
+            gc,
+            &self.trigger.maintenance,
+            &self.trigger.tick,
+            InFlightBuild::WaitOut,
+        )
+        .await
     }
 
     /// Cancel pending/queued work for a ledger. See
     /// [`TriggerHandle::cancel`].
-    pub async fn cancel(&self, ledger_id: &str) -> bool {
+    pub async fn cancel(&self, ledger_id: &LedgerId) -> bool {
         self.trigger.cancel(ledger_id).await
     }
 
@@ -735,25 +1357,25 @@ impl IndexerHandle {
 
     /// Snapshot the per-ledger indexing status. See
     /// [`TriggerHandle::status`].
-    pub async fn status(&self, ledger_id: &str) -> Option<IndexStatusSnapshot> {
+    pub async fn status(&self, ledger_id: &LedgerId) -> Option<IndexStatusSnapshot> {
         self.trigger.status(ledger_id).await
     }
 
     /// Check if a ledger has pending/in-progress work. See
     /// [`TriggerHandle::is_pending`].
-    pub async fn is_pending(&self, ledger_id: &str) -> bool {
+    pub async fn is_pending(&self, ledger_id: &LedgerId) -> bool {
         self.trigger.is_pending(ledger_id).await
     }
 
     /// List all ledgers with pending/in-progress work. See
     /// [`TriggerHandle::pending_ledgers`].
-    pub async fn pending_ledgers(&self) -> Vec<String> {
+    pub async fn pending_ledgers(&self) -> Vec<LedgerId> {
         self.trigger.pending_ledgers().await
     }
 
     /// Wait until a specific ledger has no pending work. See
     /// [`TriggerHandle::wait_for_idle`].
-    pub async fn wait_for_idle(&self, ledger_id: &str) {
+    pub async fn wait_for_idle(&self, ledger_id: &LedgerId) {
         self.trigger.wait_for_idle(ledger_id).await;
     }
 
@@ -805,12 +1427,55 @@ pub struct BackgroundIndexerWorker {
     /// reached — safe because GC re-scans the full prev-index chain on every
     /// run, so a skipped pass is reattempted after the next successful index.
     gc_semaphore: Arc<Semaphore>,
+    /// Shared with the handle. Builds for a held ledger are deferred rather
+    /// than started; see [`MaintenanceGuard`].
+    maintenance: MaintenanceHolds,
+    /// Shared with the handle. One collector pass per ledger name at a
+    /// time; see [`GcLockState`].
+    gc_locks: GcLocks,
+    /// Branch listing the collector's sibling check reads; see
+    /// [`BranchDirectory`].
+    branch_directory: Arc<BranchDirectory>,
 }
 
 /// Max concurrent background-GC tasks (see `BackgroundIndexerWorker::gc_semaphore`).
 const MAX_CONCURRENT_GC: usize = 4;
 
 impl BackgroundIndexerWorker {
+    /// Whether an exclusive maintenance operation currently holds `ledger_id`.
+    ///
+    /// A poisoned lock reports "held", so a panic while mutating the set
+    /// stalls indexing rather than admitting builds the sweep believes are
+    /// excluded.
+    fn maintenance_held(&self, ledger_id: &LedgerId) -> bool {
+        self.maintenance
+            .lock()
+            .map_or(true, |holds| holds.contains(ledger_id))
+    }
+
+    /// Claim a GC slot and the per-ledger collector lock for `ledger_id`,
+    /// or `None` if either is taken. Never waits: the next publish or the
+    /// periodic pass retries, so nothing is lost by skipping.
+    fn try_begin_gc(
+        &self,
+        ledger_id: &LedgerId,
+    ) -> Option<(tokio::sync::OwnedSemaphorePermit, GcGuard)> {
+        let permit = Arc::clone(&self.gc_semaphore).try_acquire_owned().ok()?;
+        let guard = try_hold_gc(&self.gc_locks, &ledger_name_of(ledger_id))?;
+        Some((permit, guard))
+    }
+
+    fn gc_context(&self) -> GcPassContext {
+        GcPassContext {
+            backend: self.backend.clone(),
+            nameservice: Arc::clone(&self.nameservice),
+            directory: Arc::clone(&self.branch_directory),
+            config: self.config.clone(),
+            maintenance: Arc::clone(&self.maintenance),
+            tick: self.subscriber_trigger.tick.clone(),
+        }
+    }
+
     /// Create a new worker and its associated handle.
     ///
     /// `nameservice` is the combined ledger-discovery + index-head
@@ -825,14 +1490,19 @@ impl BackgroundIndexerWorker {
         let (tick_tx, tick_rx) = watch::channel(0u64);
         let idle_notify = Arc::new(Notify::new());
         let (shutdown, shutdown_rx) = ShutdownTrigger::pair();
+        let maintenance: MaintenanceHolds = Arc::default();
+        let gc_locks: GcLocks = Arc::default();
 
         let trigger = TriggerHandle {
             states: Arc::clone(&states),
             tick: tick_tx,
             idle_notify: Arc::clone(&idle_notify),
+            maintenance: Arc::clone(&maintenance),
+            gc_locks: Arc::clone(&gc_locks),
         };
         let handle = IndexerHandle {
             trigger: trigger.clone(),
+            artifact_cache_dir: Arc::from(config.artifact_cache_dir()),
             _shutdown: shutdown,
         };
 
@@ -847,15 +1517,21 @@ impl BackgroundIndexerWorker {
             subscriber_trigger: trigger,
             event_bus: None,
             gc_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_GC)),
+            maintenance,
+            gc_locks,
+            branch_directory: Arc::default(),
         };
 
         (worker, handle)
     }
 
-    /// Attach a [`LedgerEventBus`]. [`run`](Self::run) subscribes,
-    /// performs a catch-up sweep, then translates
-    /// `LedgerCommitPublished` events into trigger calls. The
-    /// subscriber's lifetime is tied to the `run` task.
+    /// Attach a [`LedgerEventBus`]. [`run`](Self::run) subscribes and
+    /// translates `LedgerCommitPublished` events into trigger calls,
+    /// re-sweeping if the broadcast channel lags. The subscriber's
+    /// lifetime is tied to the `run` task.
+    ///
+    /// This is optional and orthogonal to catching up: `run` sweeps for
+    /// behind ledgers with or without a bus.
     pub fn with_event_bus(mut self, event_bus: Arc<LedgerEventBus>) -> Self {
         self.event_bus = Some(event_bus);
         self
@@ -869,10 +1545,93 @@ impl BackgroundIndexerWorker {
     /// 3. Resolves waiters based on min_t predicate
     /// 4. Handles cancellation and backoff
     pub async fn run(mut self) {
+        // Catch up on ledgers that are already behind, whether or not an event
+        // bus was wired.
+        //
+        // This sweep used to live in `run_event_subscriber`, which runs only
+        // when a caller supplied an event bus — and the only caller that does
+        // is the raft leader task. Every embedded and standalone deployment
+        // therefore had NO catch-up sweep at all, not even at startup, leaving
+        // triggering entirely to the post-commit hooks in the api layer. Those
+        // are in-process, so they die with the process.
+        //
+        // That combination is a deadlock, not a slow path. `at_max_novelty`
+        // gates on the ledger's accumulated novelty, not on the size of the
+        // incoming transaction, so a ledger loaded with a backlog already over
+        // `reindex_max_bytes` rejects EVERY write:
+        //
+        //     novelty >= reindex_max_bytes -> write rejected -> no commit
+        //       -> no post-commit trigger, and no sweep to replace it
+        //       -> novelty stays >= reindex_max_bytes, forever
+        //
+        // The one thing that can lower novelty is gated behind the one thing
+        // novelty blocks, and no smaller write can break in. Restarting does
+        // not help, because the sweep that would have found it never ran.
+        //
+        // Observed on a 24-ledger materialize fan-out: ledgers sitting at
+        // commit_t 597 / index_t 251 with no index build ever attempted, for
+        // hours, across a fresh process. Because a materialize job's watermark
+        // cannot advance while any of its fan-out targets is behind, single
+        // wedged targets froze 13 source tables behind them.
+        //
+        // Sweeping from here rather than subscribing the worker to the bus is
+        // deliberate: `process_ledger` builds whenever `commit_t > index_t`
+        // with no byte gate, so triggering off every `LedgerCommitPublished`
+        // would index after every commit and quietly discard the
+        // `reindex_min_bytes` threshold the operator configured.
+        //
+        // The sweep gets the trigger surface rather than the full
+        // `IndexerHandle` for the same reason the subscriber does — see below.
+        //
+        // The same task then re-sweeps on a timer, for the residual the start-up
+        // sweep cannot cover: a ledger that falls behind later and stops
+        // receiving the commits that would trigger it.
+        //
+        // Both sweeps are skipped when this worker does not own catch-up for
+        // its nameservice — see `IndexerConfig::catchup_sweeps_enabled`. A
+        // process can run two workers against one nameservice (raft does), and
+        // because they hold independent `states` maps, `trigger_if_idle` cannot
+        // see the other's claim: both would queue and build the same ledger.
+        //
+        // Subscribe BEFORE spawning the sweep, not inside the subscriber task.
+        // The sweep and the subscription used to be sequential statements in
+        // one task, which is what made "events arriving during the sweep are
+        // buffered, not lost" true. They are separate tasks now, so leaving the
+        // `subscribe()` inside the subscriber would let a commit published
+        // between the sweep's `all_records()` and the subscriber's first poll
+        // reach neither. Taking the receiver here restores the ordering: the
+        // broadcast buffers from this point on, whatever order the tasks run in.
+        let subscription = self
+            .event_bus
+            .as_ref()
+            .map(|bus| bus.subscribe(SubscriptionScope::All));
+
+        let _sweep_guard = if self.config.catchup_sweeps_enabled {
+            let trigger = self.subscriber_trigger.clone();
+            let nameservice = Arc::clone(&self.nameservice);
+            let interval = self.config.catchup_interval;
+            let gc_tick = GcTick {
+                ctx: self.gc_context(),
+                semaphore: Arc::clone(&self.gc_semaphore),
+                locks: Arc::clone(&self.gc_locks),
+            };
+            Some(AbortOnDrop(tokio::spawn(async move {
+                catch_up_sweep(&trigger, nameservice.as_ref()).await;
+                if interval.is_zero() {
+                    debug!("indexer catch-up re-sweep disabled");
+                    return;
+                }
+                run_catchup_sweeps(trigger, nameservice, interval, gc_tick).await;
+            })))
+        } else {
+            debug!("indexer catch-up sweeps disabled; another worker owns catch-up");
+            None
+        };
+
         // Guard ensures aborting the outer `run` task also aborts
         // the subscriber — its broadcast receiver doesn't otherwise
         // observe cancellation.
-        let _subscriber_guard = self.event_bus.clone().map(|bus| {
+        let _subscriber_guard = subscription.map(|subscription| {
             // Hand the subscriber the trigger surface, not the full
             // `IndexerHandle`. The subscriber keeps a `watch::Sender`
             // alive (so trigger() can wake the worker), but it does
@@ -882,7 +1641,7 @@ impl BackgroundIndexerWorker {
             let trigger = self.subscriber_trigger.clone();
             let nameservice = Arc::clone(&self.nameservice);
             AbortOnDrop(tokio::spawn(async move {
-                run_event_subscriber(bus, trigger, nameservice).await;
+                run_event_subscriber(subscription, trigger, nameservice).await;
             }))
         });
 
@@ -939,7 +1698,7 @@ impl BackgroundIndexerWorker {
 
             // Collect ledgers that need processing
             let now = tokio::time::Instant::now();
-            let ledgers_to_process: Vec<String> = {
+            let ledgers_to_process: Vec<LedgerId> = {
                 let states = self.states.lock().await;
                 states
                     .iter()
@@ -1080,7 +1839,7 @@ impl BackgroundIndexerWorker {
     }
 
     /// Process a single ledger
-    async fn process_ledger(&self, ledger_id: &str) {
+    async fn process_ledger(&self, ledger_id: &LedgerId) {
         let process_started = Instant::now();
 
         let (pending_min_t, waiter_count, retry_count) = {
@@ -1100,6 +1859,29 @@ impl BackgroundIndexerWorker {
                 );
                 return;
             }
+        };
+
+        // Defer while an exclusive maintenance operation holds the ledger.
+        // The phase stays `Pending`, so the work resumes on the tick the
+        // guard sends when it releases.
+        if self.maintenance_held(ledger_id) {
+            debug!(
+                ledger_id = %ledger_id,
+                "Deferring queued indexing; ledger is held for maintenance"
+            );
+            return;
+        }
+
+        // Defer likewise while a collector pass releases on any branch of
+        // this ledger; the window ticks the worker when it closes. Held to
+        // the end of this function, so from before the first upload until
+        // after the publish. See [`GcLockState`].
+        let Some(_build) = try_begin_build(&self.gc_locks, ledger_id) else {
+            debug!(
+                ledger_id = %ledger_id,
+                "Deferring queued indexing; a collector pass is releasing on this ledger"
+            );
+            return;
         };
 
         // Mark as in-progress
@@ -1446,7 +2228,7 @@ impl BackgroundIndexerWorker {
         };
 
         let result = crate::build_index_for_record_with_tracker(
-            content_store,
+            content_store.clone(),
             build_tracker.clone(),
             &record,
             job_config,
@@ -1456,8 +2238,12 @@ impl BackgroundIndexerWorker {
         match result {
             Ok(index_result) => {
                 // Try to publish
-                if let Err(e) =
-                    crate::publish_index_result(self.nameservice.as_ref(), &index_result).await
+                if let Err(e) = crate::publish_index_result(
+                    &content_store,
+                    self.nameservice.as_ref(),
+                    &index_result,
+                )
+                .await
                 {
                     // Surface the build's fuel + index_t on publish failure —
                     // in background mode there is no caller, so this is the
@@ -1489,33 +2275,24 @@ impl BackgroundIndexerWorker {
                             gc_keep_count,
                             "Skipping background GC; index chain cannot exceed retention yet"
                         );
-                    } else if let Ok(gc_permit) = Arc::clone(&self.gc_semaphore).try_acquire_owned()
-                    {
-                        let gc_store = self.backend.content_store(&index_result.ledger_id);
+                    } else if let Some((gc_permit, gc_guard)) = self.try_begin_gc(ledger_id) {
+                        let gc_ctx = self.gc_context();
                         let gc_root_id = index_result.root_id.clone();
-                        let gc_ns = Arc::clone(&self.nameservice);
                         let gc_ledger_id = index_result.ledger_id.clone();
                         let gc_index_t = index_result.index_t;
-                        let gc_config = crate::gc::CleanGarbageConfig {
-                            max_old_indexes: Some(self.config.gc_max_old_indexes),
-                            min_time_garbage_mins: Some(self.config.gc_min_time_mins),
-                            artifact_cache_dir: Some(
-                                self.config
-                                    .data_dir
-                                    .as_ref()
-                                    .map(|d| d.join("binary_artifact_cache"))
-                                    .unwrap_or_else(|| {
-                                        std::env::temp_dir().join("fluree_binary_cache")
-                                    }),
-                            ),
-                        };
                         tokio::spawn(async move {
-                            // Hold the permit for the task's lifetime; dropping it
-                            // on completion frees a GC slot.
+                            // Hold the permit and the per-ledger lock for the
+                            // task's lifetime; dropping them on completion
+                            // frees a GC slot and lets a sibling's pass run.
                             let _gc_permit = gc_permit;
-                            if let Err(e) =
-                                crate::gc::clean_garbage(gc_store.as_ref(), &gc_root_id, gc_config)
-                                    .await
+                            if let Err(e) = gc_ctx
+                                .run(
+                                    &gc_ledger_id,
+                                    &gc_root_id,
+                                    &gc_guard,
+                                    InFlightBuild::WaitOut,
+                                )
+                                .await
                             {
                                 warn!(
                                     error = %e,
@@ -1528,8 +2305,10 @@ impl BackgroundIndexerWorker {
                                 // captured in the index root, so their entries
                                 // in the commit-CID index will never be needed
                                 // by an incremental walk again. Compact them.
-                                if let Err(e) =
-                                    gc_ns.prune_commit_index(&gc_ledger_id, gc_index_t).await
+                                if let Err(e) = gc_ctx
+                                    .nameservice
+                                    .prune_commit_index(&gc_ledger_id, gc_index_t)
+                                    .await
                                 {
                                     debug!(
                                         error = %e,
@@ -1541,14 +2320,15 @@ impl BackgroundIndexerWorker {
                             }
                         });
                     } else {
-                        // GC concurrency cap reached — skip this pass. GC re-scans
-                        // the full prev-index chain each run, so the next
-                        // successful index reattempts; nothing is lost.
+                        // GC concurrency cap reached, or a pass for this ledger
+                        // is in flight — skip this pass. GC re-scans the full
+                        // prev-index chain each run, so the next successful
+                        // index or the periodic pass reattempts; nothing is lost.
                         debug!(
                             ledger_id = %ledger_id,
                             root_id = %index_result.root_id,
                             max_concurrent_gc = MAX_CONCURRENT_GC,
-                            "Skipping background GC; concurrency cap reached (will retry after a later index)"
+                            "Skipping background GC; concurrency cap reached or a pass is in flight (will retry later)"
                         );
                     }
 
@@ -1579,19 +2359,52 @@ impl BackgroundIndexerWorker {
                 // build failed. Best-effort signal — disabled tracker or
                 // a failure before the first write reports None / 0.
                 let partial_fuel = build_tracker.tally().and_then(|t| t.fuel);
-                warn!(
-                    ledger_id = %ledger_id,
-                    partial_fuel = ?partial_fuel,
-                    error = %e,
-                    "Indexing failed, will retry"
-                );
-                self.schedule_retry(ledger_id, &e.to_string()).await;
+                self.on_build_error(ledger_id, e, partial_fuel).await;
             }
         }
     }
 
+    /// Terminal handling for a build that returned `Err`. A cancelled task
+    /// means the runtime is shutting down under the worker (`spawn_blocking`
+    /// refuses work once the blocking pool closes) — not a failed build, so
+    /// no warning, no backoff, no `last_error`. Waiters resolve `Cancelled`;
+    /// the next process start re-derives pending work from `commit_t >
+    /// index_t`. Every other error is a failure and goes to backoff.
+    async fn on_build_error(
+        &self,
+        ledger_id: &LedgerId,
+        error: crate::error::IndexerError,
+        partial_fuel: Option<f64>,
+    ) {
+        if let crate::error::IndexerError::Cancelled(task) = &error {
+            info!(
+                ledger_id = %ledger_id,
+                task = %task,
+                "Index build cancelled by runtime shutdown; not scheduling retry"
+            );
+            let mut states = self.states.lock().await;
+            if let Some(state) = states.get_mut(ledger_id) {
+                state.resolve_waiters_below(i64::MAX, IndexOutcome::Cancelled);
+                state.pending_min_t = None;
+                state.next_retry_at = None;
+                // An earlier attempt's error would otherwise outlive the
+                // failure it described, reported against an idle ledger.
+                state.last_error = None;
+                state.phase = IndexPhase::Idle;
+            }
+            return;
+        }
+        warn!(
+            ledger_id = %ledger_id,
+            partial_fuel = ?partial_fuel,
+            error = %error,
+            "Indexing failed, will retry"
+        );
+        self.schedule_retry(ledger_id, &error.to_string()).await;
+    }
+
     /// Schedule a retry with exponential backoff
-    async fn schedule_retry(&self, ledger_id: &str, error: &str) {
+    async fn schedule_retry(&self, ledger_id: &LedgerId, error: &str) {
         let mut states = self.states.lock().await;
         if let Some(state) = states.get_mut(ledger_id) {
             // Check if cancelled - don't retry
@@ -1649,6 +2462,7 @@ async fn catch_up_sweep(handle: &TriggerHandle, nameservice: &dyn IndexingNameSe
     let behind = records
         .into_iter()
         .filter(|r| !r.retracted && r.has_novelty());
+    let mut queued = 0usize;
     for record in behind {
         debug!(
             ledger_id = %record.ledger_id,
@@ -1656,23 +2470,212 @@ async fn catch_up_sweep(handle: &TriggerHandle, nameservice: &dyn IndexingNameSe
             index_t = record.index_t,
             "Catch-up: triggering indexer"
         );
-        let _ = handle.trigger(record.ledger_id, record.commit_t).await;
+        let _ = handle.trigger(&record.ledger_id, record.commit_t).await;
+        queued += 1;
+    }
+    // Logged as a total because the count is the operator-visible cost. The
+    // predicate is "behind", which `reindex_min_bytes` cannot narrow (an
+    // `NsRecord` carries no novelty byte count), so on a deployment with many
+    // small idle ledgers this is one index build per ledger listed here.
+    if queued > 0 {
+        info!(queued, "Catch-up sweep queued behind ledgers for indexing");
     }
 }
 
-/// Translate [`NameServiceEvent::LedgerCommitPublished`] from `bus`
-/// into [`IndexerHandle::trigger`] calls. Catch-up sweeps run at
-/// startup and on `Lagged`. Returns when the bus closes.
+/// Ledgers that are behind AND whose `commit_t` has not moved since the
+/// previous observation, most-behind first. Returns `(ledger_id, commit_t)`.
+///
+/// Kept as a pure function so the decision is testable without a nameservice,
+/// a worker, or a timer.
+///
+/// The stall condition is what makes a *periodic* sweep affordable.
+/// `catch_up_sweep`'s own predicate is "behind", which on a busy deployment
+/// matches most ledgers — and `process_ledger` builds whenever
+/// `commit_t > index_t` with no byte gate, so re-sweeping on "behind" alone
+/// would force an extra index build per ledger per interval. A ledger that is
+/// still committing has a moving `commit_t` and is already served by the
+/// post-commit trigger; a wedged one is frozen by definition.
+///
+/// A ledger seen for the first time is deliberately skipped: it has no previous
+/// `commit_t` to compare against, so the earliest a stall can be asserted is
+/// the second observation.
+///
+/// The predicate can misfire once, on a ledger whose commits happen to straddle
+/// two sweeps at the same `commit_t`. That costs one extra build and then
+/// converges: afterwards `index_t == commit_t`, `has_novelty()` is false, and it
+/// is not swept again until it falls behind.
+fn stalled_ledgers(
+    records: &[NsRecord],
+    last_seen: &HashMap<LedgerId, i64>,
+) -> Vec<(LedgerId, i64)> {
+    // Carry the gap through the sort rather than looking it up per comparison:
+    // a comparator that scans `records` makes the sort O(S log S * R).
+    let mut stalled: Vec<(LedgerId, i64, i64)> = records
+        .iter()
+        .filter(|r| !r.retracted && r.has_novelty())
+        .filter(|r| last_seen.get(&r.ledger_id) == Some(&r.commit_t))
+        .map(|r| (r.ledger_id.clone(), r.commit_t, r.commit_t - r.index_t))
+        .collect();
+    // Most-behind first: on a deployment that starts with a backlog, the ledger
+    // blocking writes should be queued ahead of one merely lagging by a commit.
+    stalled.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    stalled
+        .into_iter()
+        .map(|(id, commit_t, _gap)| (id, commit_t))
+        .collect()
+}
+
+/// Re-sweep for stalled ledgers on a timer, forever.
+///
+/// The start-up sweep in [`BackgroundIndexerWorker::run`] fixes a process that
+/// begins with a backlog. This covers the residual: a ledger that falls behind
+/// afterwards and stops receiving the commits that would trigger it — a rebase
+/// writing past the per-commit gate, or an indexer process that does not write
+/// the storage it indexes and so has no trigger source at all.
+///
+/// `interval` of zero disables it; the caller checks that before spawning.
+///
+/// The same tick runs a collector pass over every ledger whose chain may
+/// exceed retention (see [`GcTick`]), so a ledger that stops publishing does
+/// not keep the versions its last burst left inside the age guard.
+async fn run_catchup_sweeps(
+    handle: TriggerHandle,
+    nameservice: Arc<dyn IndexingNameService>,
+    interval: Duration,
+    gc: GcTick,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    // `Skip` rather than the default `Burst`: if a sweep overruns the period,
+    // running the missed ticks back to back would list the nameservice in a
+    // tight loop for as long as it takes to catch up.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The first tick of a tokio interval fires immediately, and `run` has just
+    // swept — but it has not collected. A process that starts on a chain its
+    // predecessor left inside the age guard collects it here rather than at
+    // the ledger's next publish, which for a load-once dataset never comes.
+    ticker.tick().await;
+    match nameservice.all_records().await {
+        Ok(records) => {
+            let records = Arc::new(records);
+            gc.ctx.directory.replace(Arc::clone(&records)).await;
+            gc.collect_idle(&records).await;
+        }
+        Err(e) => warn!(error = %e, "start-up collector pass: all_records() failed"),
+    }
+
+    let mut last_seen: HashMap<LedgerId, i64> = HashMap::new();
+    loop {
+        ticker.tick().await;
+
+        let records = match nameservice.all_records().await {
+            Ok(records) => Arc::new(records),
+            Err(e) => {
+                warn!(error = %e, "catch-up re-sweep: all_records() failed");
+                continue;
+            }
+        };
+        gc.ctx.directory.replace(Arc::clone(&records)).await;
+
+        for (ledger_id, commit_t) in stalled_ledgers(&records, &last_seen) {
+            handle.trigger_if_idle(&ledger_id, commit_t).await;
+        }
+
+        gc.collect_idle(&records).await;
+
+        last_seen = records
+            .iter()
+            .filter(|r| !r.retracted)
+            .map(|r| (r.ledger_id.clone(), r.commit_t))
+            .collect();
+    }
+}
+
+/// The periodic collector pass: what [`run_catchup_sweeps`] needs to run
+/// [`GcPassContext::run`] over every ledger in a listing.
+struct GcTick {
+    ctx: GcPassContext,
+    semaphore: Arc<Semaphore>,
+    locks: GcLocks,
+}
+
+impl GcTick {
+    /// One collector pass per listed ledger whose chain can exceed retention,
+    /// sequentially, under one GC slot at a time.
+    ///
+    /// Sequential on purpose: this is maintenance, and a deployment with many
+    /// ledgers should see it as a trickle rather than a burst against the
+    /// storage request cap. Ledgers held for maintenance are skipped — a
+    /// sweep or reindex owns them — and so are ledgers with a pass in flight.
+    /// A ledger whose `index_t` cannot have produced more versions than
+    /// retention keeps is skipped before any storage read.
+    async fn collect_idle(&self, records: &[NsRecord]) {
+        let keep_count = 1_i64 + i64::from(self.ctx.config.gc_max_old_indexes);
+        let mut passes = 0usize;
+        let mut cleaned = 0usize;
+        for record in records {
+            let Some(root_id) = record.index_head_id.as_ref() else {
+                continue;
+            };
+            if record.retracted || record.index_t <= keep_count {
+                continue;
+            }
+            if self
+                .ctx
+                .maintenance
+                .lock()
+                .map_or(true, |holds| holds.contains(&record.ledger_id))
+            {
+                continue;
+            }
+            let Ok(_permit) = Arc::clone(&self.semaphore).try_acquire_owned() else {
+                debug!("periodic collector pass: no GC slot free; trying again next tick");
+                return;
+            };
+            let Some(guard) = try_hold_gc(&self.locks, &ledger_name_of(&record.ledger_id)) else {
+                continue;
+            };
+            passes += 1;
+            match self
+                .ctx
+                .run(&record.ledger_id, root_id, &guard, InFlightBuild::GiveUp)
+                .await
+            {
+                Ok(result) => cleaned += result.indexes_cleaned,
+                Err(e) => warn!(
+                    ledger_id = %record.ledger_id,
+                    error = %e,
+                    "periodic collector pass failed (non-fatal)"
+                ),
+            }
+        }
+        if cleaned > 0 {
+            info!(
+                passes,
+                cleaned, "periodic collector pass released index versions"
+            );
+        } else {
+            debug!(
+                passes,
+                "periodic collector pass found nothing past retention"
+            );
+        }
+    }
+}
+
+/// Translate [`NameServiceEvent::LedgerCommitPublished`] from
+/// `subscription` into [`IndexerHandle::trigger`] calls. A catch-up
+/// sweep runs on `Lagged`; the startup sweep belongs to
+/// [`BackgroundIndexerWorker::run`], which performs it whether or not
+/// a bus was wired. Returns when the bus closes.
+///
+/// Takes an already-created [`Subscription`](fluree_db_nameservice::Subscription)
+/// rather than the bus: `run` subscribes synchronously so events are buffered
+/// from before the start-up sweep begins, whatever order the two tasks run in.
 async fn run_event_subscriber(
-    bus: Arc<LedgerEventBus>,
+    mut subscription: fluree_db_nameservice::Subscription,
     handle: TriggerHandle,
     nameservice: Arc<dyn IndexingNameService>,
 ) {
-    // Subscribe before the catch-up sweep so events arriving during
-    // the sweep are buffered, not lost.
-    let mut subscription = bus.subscribe(SubscriptionScope::All);
-    catch_up_sweep(&handle, nameservice.as_ref()).await;
-
     loop {
         match subscription.receiver.recv().await {
             Ok(NameServiceEvent::LedgerCommitPublished {
@@ -1685,7 +2688,7 @@ async fn run_event_subscriber(
                     commit_t,
                     "Indexer subscriber: trigger from LedgerCommitPublished"
                 );
-                let _ = handle.trigger(ledger_id, commit_t).await;
+                let _ = handle.trigger(&ledger_id, commit_t).await;
             }
             Ok(_) => {}
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -1736,7 +2739,7 @@ fn current_ns_record(ledger: &LedgerState) -> Option<&fluree_db_nameservice::NsR
     let index_matches =
         record.index_t == ledger.index_t() && record.index_head_id == ledger.head_index_id;
 
-    if record.ledger_id == ledger.ledger_id() && commit_matches && index_matches {
+    if record.ledger_id == *ledger.ledger_id() && commit_matches && index_matches {
         Some(record)
     } else {
         None
@@ -1864,10 +2867,15 @@ where
                 fuel = ?result.fuel,
                 "post-commit index build complete"
             );
-            // Track publish result but continue regardless
-            let publish_result = nameservice
-                .publish_index(&ledger_addr, result.index_t, &result.root_id)
-                .await;
+            // Track publish result but continue regardless. The artifacts
+            // go to the device before the pointer that names them.
+            let publish_result = match cs.sync().await {
+                Ok(()) => nameservice
+                    .publish_index(&ledger_addr, result.index_t, &result.root_id)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(format!("flush index artifacts: {e}")),
+            };
             let published = publish_result.is_ok();
             let publish_error = publish_result.err().map(|e| e.to_string());
 
@@ -1937,7 +2945,7 @@ where
             &ledger_addr,
         )
         .await
-        .map_err(|e| IndexerError::NameService(e.to_string()))?;
+        .map_err(|e| crate::error::IndexerError::NameService(e.to_string()))?;
 
     // Per-build fuel tracker — measurement only; the pre-commit refresh path
     // returns Ok(LedgerState) and so cannot surface fuel back to the caller.
@@ -1973,10 +2981,15 @@ where
         "pre-commit index refresh complete"
     );
 
+    cs.sync().await.map_err(|e| {
+        IndexerError::Core(fluree_db_core::Error::io(format!(
+            "flush index artifacts: {e}"
+        )))
+    })?;
     nameservice
         .publish_index(&ledger_addr, result.index_t, &result.root_id)
         .await
-        .map_err(|e| IndexerError::NameService(e.to_string()))?;
+        .map_err(|e| crate::error::IndexerError::NameService(e.to_string()))?;
 
     ledger
         .apply_index(&result.root_id, &cs)
@@ -1989,6 +3002,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn id(s: &str) -> LedgerId {
+        LedgerId::parse(s).unwrap()
+    }
+
+    fn name(s: &str) -> LedgerName {
+        LedgerName::parse(s).unwrap()
+    }
     use fluree_db_core::{
         ContentAddressedWrite, ContentId, ContentKind, Flake, FlakeValue, MemoryStorage, Sid,
     };
@@ -2118,7 +3139,7 @@ mod tests {
         );
 
         // No commits - doesn't need indexing
-        let needs = orchestrator.needs_indexing("test:main").await.unwrap();
+        let needs = orchestrator.needs_indexing(&id("test:main")).await.unwrap();
         assert!(!needs);
     }
 
@@ -2152,7 +3173,7 @@ mod tests {
         );
 
         // Has commits but no index - needs indexing
-        let needs = orchestrator.needs_indexing("test:main").await.unwrap();
+        let needs = orchestrator.needs_indexing(&id("test:main")).await.unwrap();
         assert!(needs);
     }
 
@@ -2188,11 +3209,14 @@ mod tests {
         );
 
         // Index the ledger
-        let result = orchestrator.index_and_publish("test:main").await.unwrap();
+        let result = orchestrator
+            .index_and_publish(&id("test:main"))
+            .await
+            .unwrap();
         assert_eq!(result.index_t, 1);
 
         // Now index is current - doesn't need indexing
-        let needs = orchestrator.needs_indexing("test:main").await.unwrap();
+        let needs = orchestrator.needs_indexing(&id("test:main")).await.unwrap();
         assert!(!needs);
     }
 
@@ -2226,7 +3250,10 @@ mod tests {
             ns.clone(),
             config,
         );
-        orchestrator.index_and_publish("test:main").await.unwrap();
+        orchestrator
+            .index_and_publish(&id("test:main"))
+            .await
+            .unwrap();
 
         // Add another commit
         let commit2 = Commit {
@@ -2247,7 +3274,7 @@ mod tests {
         ns.publish_commit("test:main", 2, &cid2).await.unwrap();
 
         // Index is now behind - needs indexing
-        let needs = orchestrator.needs_indexing("test:main").await.unwrap();
+        let needs = orchestrator.needs_indexing(&id("test:main")).await.unwrap();
         assert!(needs);
     }
 
@@ -2282,9 +3309,392 @@ mod tests {
             config,
         );
 
-        let result = orchestrator.index_ledger("test:main").await.unwrap();
+        let result = orchestrator.index_ledger(&id("test:main")).await.unwrap();
         assert_eq!(result.index_t, 1);
         assert_eq!(result.ledger_id, "test:main");
+    }
+
+    /// Two passes for branches of one ledger cannot overlap, and a waiter
+    /// gets the lock once the pass in flight drops it.
+    #[tokio::test]
+    async fn gc_lock_is_exclusive_per_ledger_name_and_waits_for_release() {
+        let locks: GcLocks = Arc::default();
+        let first = try_hold_gc(&locks, &name("db")).expect("free lock");
+        assert!(
+            try_hold_gc(&locks, &name("db")).is_none(),
+            "a second pass on the same ledger must be refused"
+        );
+        assert!(
+            try_hold_gc(&locks, &name("other")).is_some(),
+            "other ledgers are independent"
+        );
+
+        let waiter = {
+            let locks = Arc::clone(&locks);
+            tokio::spawn(async move {
+                let _guard = hold_gc(&locks, &name("db")).await;
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the waiter must block while the pass holds the lock"
+        );
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter acquires once the pass releases")
+            .unwrap();
+    }
+
+    /// A release window keeps every branch of its ledger from building, and
+    /// closing it wakes the worker so a deferred build resumes.
+    #[tokio::test]
+    async fn a_release_window_defers_builds_on_every_branch_of_its_ledger() {
+        let locks: GcLocks = Arc::default();
+        let maintenance: MaintenanceHolds = Arc::default();
+        let (tick, tick_rx) = watch::channel(0u64);
+        let gc = try_hold_gc(&locks, &name("db")).expect("free lock");
+
+        let window = open_release_window(&gc, &maintenance, &tick, InFlightBuild::GiveUp)
+            .await
+            .expect("nothing is building");
+        assert!(
+            try_begin_build(&locks, &id("db")).is_none(),
+            "no branch of the ledger may start a build inside the window"
+        );
+        assert!(
+            try_begin_build(&locks, &id("other")).is_some(),
+            "other ledgers are independent"
+        );
+
+        let ticks_before = *tick_rx.borrow();
+        drop(window);
+        assert_ne!(
+            *tick_rx.borrow(),
+            ticks_before,
+            "closing wakes the worker so the deferred build resumes"
+        );
+        assert!(try_begin_build(&locks, &id("db")).is_some());
+    }
+
+    /// The worker's admission path honours the window: queued work on a
+    /// sibling branch stays pending instead of starting.
+    #[tokio::test]
+    async fn the_worker_defers_a_build_while_a_sibling_branch_releases() {
+        let (worker, handle) = BackgroundIndexerWorker::new(
+            StorageBackend::Managed(Arc::new(MemoryStorage::new())),
+            Arc::new(MemoryNameService::new()),
+            IndexerConfig::small(),
+        );
+        let gc = handle.hold_gc(&name("db")).await;
+        let window = handle.open_release_window(&gc).await.expect("quiet");
+
+        let _completion = handle.trigger(&id("db:dev"), 1).await;
+        worker.process_ledger(&id("db:dev")).await;
+        let status = handle
+            .status(&id("db:dev"))
+            .await
+            .expect("ledger is tracked");
+        assert_eq!(
+            status.phase,
+            IndexPhase::Pending,
+            "the build must not start while db:main's pass releases"
+        );
+
+        // With the window closed the build is admitted; this ledger does not
+        // exist, so admission shows as the work being resolved.
+        drop(window);
+        worker.process_ledger(&id("db:dev")).await;
+        let status = handle
+            .status(&id("db:dev"))
+            .await
+            .expect("ledger is tracked");
+        assert_eq!(status.phase, IndexPhase::Idle);
+    }
+
+    /// The window opens only once a build already in flight has ended —
+    /// the build may have uploaded a blob the pass is about to release — and
+    /// holds new builds off while it waits. The periodic pass gives up instead.
+    #[tokio::test]
+    async fn a_release_window_waits_out_a_build_in_flight() {
+        let locks: GcLocks = Arc::default();
+        let maintenance: MaintenanceHolds = Arc::default();
+        let (tick, _tick_rx) = watch::channel(0u64);
+        let gc = try_hold_gc(&locks, &name("db")).expect("free lock");
+        let build = try_begin_build(&locks, &id("db")).expect("no window open");
+
+        assert!(
+            open_release_window(&gc, &maintenance, &tick, InFlightBuild::GiveUp)
+                .await
+                .is_none(),
+            "the periodic pass does not wait behind a build"
+        );
+        assert!(
+            try_begin_build(&locks, &id("db")).is_some(),
+            "a window given up must not leave builds deferred"
+        );
+
+        let waiter = {
+            let (maintenance, tick) = (Arc::clone(&maintenance), tick.clone());
+            tokio::spawn(async move {
+                open_release_window(&gc, &maintenance, &tick, InFlightBuild::WaitOut)
+                    .await
+                    .is_some()
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the window must not open while a build is in flight"
+        );
+        assert!(
+            try_begin_build(&locks, &id("db")).is_none(),
+            "a second build must not start while the window waits"
+        );
+        drop(build);
+        let opened = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the window opens once the build ends")
+            .unwrap();
+        assert!(opened);
+    }
+
+    /// A reindex or sweep writes index artifacts outside the worker, so a
+    /// hold on any branch refuses the window, and taking a hold waits out a
+    /// window already open.
+    #[tokio::test]
+    async fn release_windows_and_maintenance_holds_exclude_each_other() {
+        let (_worker, handle) = BackgroundIndexerWorker::new(
+            StorageBackend::Managed(Arc::new(MemoryStorage::new())),
+            Arc::new(MemoryNameService::new()),
+            IndexerConfig::small(),
+        );
+        let gc = handle.hold_gc(&name("db")).await;
+
+        let held = handle.acquire_maintenance(&id("db:dev")).expect("free");
+        assert!(
+            handle.open_release_window(&gc).await.is_none(),
+            "a sibling branch under maintenance refuses the window"
+        );
+        drop(held);
+
+        let window = handle
+            .open_release_window(&gc)
+            .await
+            .expect("nothing holds the ledger");
+        let quiesce = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.hold_quiesced(&id("db:main")).await.is_some() })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !quiesce.is_finished(),
+            "maintenance must not proceed while a pass is releasing"
+        );
+        drop(window);
+        let held = tokio::time::timeout(Duration::from_secs(5), quiesce)
+            .await
+            .expect("the hold completes once the window closes")
+            .unwrap();
+        assert!(held);
+    }
+
+    /// A chain past retention on a ledger that never publishes again is
+    /// collected by the periodic pass. A ledger under a maintenance hold is
+    /// left alone.
+    #[tokio::test]
+    async fn periodic_pass_collects_a_chain_that_no_publish_will_reach() {
+        use crate::gc::test_support::{cid_and_addr_for, minimal_fir6_for};
+        use fluree_db_binary_index::{BinaryGarbageRef, BinaryPrevIndexRef};
+        use fluree_db_core::{ContentStore, StorageWrite};
+        use fluree_db_nameservice::IndexPublisher;
+
+        const LEDGER: &str = "idle:main";
+        let storage = MemoryStorage::new();
+        let dict = ContentId::new(ContentKind::IndexLeaf, b"dict");
+
+        let (cid1, addr1) = cid_and_addr_for(LEDGER, ContentKind::IndexRoot, b"r1");
+        let (cid2, addr2) = cid_and_addr_for(LEDGER, ContentKind::IndexRoot, b"r2");
+        let (cid3, addr3) = cid_and_addr_for(LEDGER, ContentKind::IndexRoot, b"r3");
+        let (garb2, garb2_addr) = cid_and_addr_for(LEDGER, ContentKind::GarbageRecord, b"g2");
+        let (leaf, leaf_addr) = cid_and_addr_for(LEDGER, ContentKind::IndexLeaf, b"old leaf");
+
+        let root1 = minimal_fir6_for(LEDGER, 1, None, None, dict.clone());
+        let root2 = minimal_fir6_for(
+            LEDGER,
+            2,
+            Some(BinaryPrevIndexRef {
+                t: 1,
+                id: cid1.clone(),
+            }),
+            Some(BinaryGarbageRef { id: garb2.clone() }),
+            dict.clone(),
+        );
+        let root3 = minimal_fir6_for(
+            LEDGER,
+            3,
+            Some(BinaryPrevIndexRef {
+                t: 2,
+                id: cid2.clone(),
+            }),
+            None,
+            dict,
+        );
+        let garbage2 = format!(
+            r#"{{"ledger_id": "{LEDGER}", "t": 2, "garbage": ["{leaf}"], "created_at_ms": 1}}"#
+        );
+        for (addr, bytes) in [
+            (&addr1, root1.as_slice()),
+            (&addr2, root2.as_slice()),
+            (&addr3, root3.as_slice()),
+            (&garb2_addr, garbage2.as_bytes()),
+            (&leaf_addr, b"old leaf".as_slice()),
+        ] {
+            storage.write_bytes(addr, bytes).await.unwrap();
+        }
+
+        let mut record = NsRecord::new("idle:main");
+        record.index_head_id = Some(cid3.clone());
+        record.index_t = 3;
+
+        // The release step reads the head from the nameservice, not the record
+        // the tick listed.
+        let ns = Arc::new(MemoryNameService::new());
+        ns.create_ledger(LEDGER).unwrap();
+        ns.publish_index(LEDGER, 3, &cid3).await.unwrap();
+
+        let tick = GcTick {
+            ctx: GcPassContext {
+                backend: StorageBackend::Managed(Arc::new(storage.clone())),
+                nameservice: ns,
+                directory: Arc::default(),
+                config: IndexerConfig {
+                    gc_max_old_indexes: 1,
+                    gc_min_time_mins: 0,
+                    ..IndexerConfig::default()
+                },
+                maintenance: Arc::default(),
+                tick: watch::channel(0u64).0,
+            },
+            semaphore: Arc::new(Semaphore::new(1)),
+            locks: Arc::default(),
+        };
+        let store = fluree_db_core::storage::content_store_for(storage.clone(), LEDGER);
+
+        tick.ctx.maintenance.lock().unwrap().insert(id(LEDGER));
+        tick.collect_idle(std::slice::from_ref(&record)).await;
+        assert!(
+            store.has(&cid1).await.unwrap(),
+            "a ledger held for maintenance is not collected"
+        );
+        tick.ctx.maintenance.lock().unwrap().clear();
+
+        tick.collect_idle(std::slice::from_ref(&record)).await;
+        assert!(
+            !store.has(&cid1).await.unwrap(),
+            "t=1 is past retention and must be released without a publish"
+        );
+        assert!(
+            !store.has(&leaf).await.unwrap(),
+            "its replaced leaf goes too"
+        );
+        assert!(store.has(&cid2).await.unwrap());
+        assert!(store.has(&cid3).await.unwrap());
+    }
+
+    /// A fork newer than the cached listing is still a sibling once this
+    /// process has built it: its head is looked up when the pass releases,
+    /// and a dictionary blob it references is deferred.
+    #[tokio::test]
+    async fn a_fork_the_listing_predates_is_a_sibling_once_built_here() {
+        use crate::gc::test_support::{cid_and_addr_for, minimal_fir6_for};
+        use fluree_db_binary_index::{BinaryGarbageRef, BinaryPrevIndexRef};
+        use fluree_db_core::{ContentStore, DictKind, StorageWrite};
+        use fluree_db_nameservice::IndexPublisher;
+
+        const MAIN: &str = "db:main";
+        const DEV: &str = "db:dev";
+        let dict_kind = ContentKind::DictBlob {
+            dict: DictKind::Graphs,
+        };
+        // Seeds unique to this test: the artifact cache is keyed by CID and
+        // shared by every test in the process.
+        let storage = MemoryStorage::new();
+        let (shared, shared_addr) = cid_and_addr_for(MAIN, dict_kind, b"leaf state N");
+        let (touched, touched_addr) = cid_and_addr_for(MAIN, dict_kind, b"leaf state N+1");
+
+        let (cid1, addr1) = cid_and_addr_for(MAIN, ContentKind::IndexRoot, b"fork-r1");
+        let (cid2, addr2) = cid_and_addr_for(MAIN, ContentKind::IndexRoot, b"fork-r2");
+        let (cid3, addr3) = cid_and_addr_for(MAIN, ContentKind::IndexRoot, b"fork-r3");
+        let (garb2, garb2_addr) = cid_and_addr_for(MAIN, ContentKind::GarbageRecord, b"fork-g2");
+        let (dev1, dev1_addr) = cid_and_addr_for(DEV, ContentKind::IndexRoot, b"fork-d1");
+        let prev = |t: i64, id: &ContentId| Some(BinaryPrevIndexRef { t, id: id.clone() });
+
+        let root1 = minimal_fir6_for(MAIN, 1, None, None, shared.clone());
+        let root2 = minimal_fir6_for(
+            MAIN,
+            2,
+            prev(1, &cid1),
+            Some(BinaryGarbageRef { id: garb2.clone() }),
+            touched.clone(),
+        );
+        let root3 = minimal_fir6_for(MAIN, 3, prev(2, &cid2), None, touched.clone());
+        // The fork's own build revived the blob main replaced at t=2.
+        let dev_root = minimal_fir6_for(DEV, 4, None, None, shared.clone());
+        let garbage2 = format!(
+            r#"{{"ledger_id": "{MAIN}", "t": 2, "garbage": ["{shared}"], "created_at_ms": 1}}"#
+        );
+        for (addr, bytes) in [
+            (&addr1, root1.as_slice()),
+            (&addr2, root2.as_slice()),
+            (&addr3, root3.as_slice()),
+            (&dev1_addr, dev_root.as_slice()),
+            (&garb2_addr, garbage2.as_bytes()),
+            (&shared_addr, b"leaf state N".as_slice()),
+            (&touched_addr, b"leaf state N+1".as_slice()),
+        ] {
+            storage.write_bytes(addr, bytes).await.unwrap();
+        }
+
+        let ns = Arc::new(MemoryNameService::new());
+        ns.create_ledger(MAIN).unwrap();
+        ns.publish_index(MAIN, 3, &cid3).await.unwrap();
+        ns.create_ledger(DEV).unwrap();
+        ns.publish_index(DEV, 4, &dev1).await.unwrap();
+
+        let ctx = GcPassContext {
+            backend: StorageBackend::Managed(Arc::new(storage.clone())),
+            nameservice: ns,
+            directory: Arc::default(),
+            config: IndexerConfig {
+                gc_max_old_indexes: 1,
+                ..IndexerConfig::default()
+            },
+            maintenance: Arc::default(),
+            tick: watch::channel(0u64).0,
+        };
+        // Listed before the fork existed.
+        let mut main_record = NsRecord::new("db:main");
+        main_record.index_head_id = Some(cid3.clone());
+        ctx.directory.replace(Arc::new(vec![main_record])).await;
+
+        let locks: GcLocks = Arc::default();
+        drop(try_begin_build(&locks, &id(DEV)).expect("no window open"));
+
+        let gc = try_hold_gc(&locks, &name("db")).expect("free lock");
+        let result = ctx
+            .run(&id(MAIN), &cid3, &gc, InFlightBuild::GiveUp)
+            .await
+            .unwrap();
+
+        let store = fluree_db_core::storage::content_store_for(storage.clone(), MAIN);
+        assert_eq!(result.indexes_cleaned, 1, "t=1 goes");
+        assert_eq!(result.shared_deferred, 1);
+        assert!(
+            store.has(&shared).await.unwrap(),
+            "db:dev's head references the blob; it must survive main's pass"
+        );
     }
 
     #[tokio::test]
@@ -2318,7 +3728,10 @@ mod tests {
             config,
         );
 
-        let result = orchestrator.index_and_publish("test:main").await.unwrap();
+        let result = orchestrator
+            .index_and_publish(&id("test:main"))
+            .await
+            .unwrap();
         assert_eq!(result.index_t, 1);
 
         // Verify the index was published
@@ -2359,10 +3772,13 @@ mod tests {
         );
 
         // First index
-        let result1 = orchestrator.index_and_publish("test:main").await.unwrap();
+        let result1 = orchestrator
+            .index_and_publish(&id("test:main"))
+            .await
+            .unwrap();
 
         // Second index - should return existing
-        let result2 = orchestrator.index_ledger("test:main").await.unwrap();
+        let result2 = orchestrator.index_ledger(&id("test:main")).await.unwrap();
 
         assert_eq!(result1.root_id, result2.root_id);
         assert_eq!(result2.stats.flake_count, 0); // No work done
@@ -2379,7 +3795,7 @@ mod tests {
             IndexerConfig::small(),
         );
 
-        let result = orchestrator.index_ledger("nonexistent:main").await;
+        let result = orchestrator.index_ledger(&id("nonexistent:main")).await;
         assert!(result.is_err());
     }
 
@@ -2398,7 +3814,7 @@ mod tests {
         );
 
         // Trigger without starting worker - completion should be pending
-        let mut completion = handle.trigger("test:main", 1).await;
+        let mut completion = handle.trigger(&id("test:main"), 1).await;
 
         // Should not be ready yet (worker not running)
         assert!(completion.try_get().is_none());
@@ -2412,6 +3828,95 @@ mod tests {
         assert!(matches!(outcome, IndexOutcome::Cancelled));
     }
 
+    fn maintenance_test_handle() -> IndexerHandle {
+        let (_worker, handle) = BackgroundIndexerWorker::new(
+            StorageBackend::Managed(Arc::new(MemoryStorage::new())),
+            Arc::new(MemoryNameService::new()),
+            IndexerConfig::small(),
+        );
+        handle
+    }
+
+    /// Maintenance is exclusive per ledger. A second acquire is refused rather
+    /// than queued, so an admin operation reports the conflict instead of
+    /// blocking behind a build of unbounded length.
+    #[test]
+    fn maintenance_is_exclusive_per_ledger() {
+        let handle = maintenance_test_handle();
+
+        let held = handle
+            .acquire_maintenance(&id("test:main"))
+            .expect("first acquire succeeds");
+        assert!(
+            handle.acquire_maintenance(&id("test:main")).is_none(),
+            "a second acquire on the same ledger is refused"
+        );
+
+        drop(held);
+        assert!(
+            handle.acquire_maintenance(&id("test:main")).is_some(),
+            "releasing frees the ledger for the next operation"
+        );
+    }
+
+    /// The hold is scoped to one ledger — maintenance on one must not stall
+    /// indexing for any other.
+    #[test]
+    fn maintenance_on_one_ledger_leaves_others_free() {
+        let handle = maintenance_test_handle();
+
+        let _held = handle
+            .acquire_maintenance(&id("test:main"))
+            .expect("first acquire succeeds");
+        assert!(
+            handle.acquire_maintenance(&id("other:main")).is_some(),
+            "a different ledger is unaffected"
+        );
+    }
+
+    /// A build queued while maintenance is held stays pending rather than
+    /// starting, and the guard's release wakes the worker so it resumes
+    /// without waiting for the next commit.
+    #[tokio::test]
+    async fn a_held_ledger_defers_rather_than_starts_a_build() {
+        let (worker, handle) = BackgroundIndexerWorker::new(
+            StorageBackend::Managed(Arc::new(MemoryStorage::new())),
+            Arc::new(MemoryNameService::new()),
+            IndexerConfig::small(),
+        );
+
+        let guard = handle
+            .acquire_maintenance(&id("test:main"))
+            .expect("acquire succeeds");
+        assert!(
+            worker.maintenance_held(&id("test:main")),
+            "the worker sees the hold and defers admission"
+        );
+
+        let _completion = handle.trigger(&id("test:main"), 1).await;
+        let status = handle
+            .status(&id("test:main"))
+            .await
+            .expect("ledger is tracked");
+        assert_eq!(
+            status.phase,
+            IndexPhase::Pending,
+            "queued work stays pending while the ledger is held"
+        );
+
+        let ticks_before = *worker.tick_rx.borrow();
+        drop(guard);
+        assert!(
+            !worker.maintenance_held(&id("test:main")),
+            "releasing clears the hold"
+        );
+        assert_ne!(
+            *worker.tick_rx.borrow(),
+            ticks_before,
+            "releasing wakes the worker so deferred work resumes"
+        );
+    }
+
     #[tokio::test]
     async fn test_handle_cancel_resolves_waiters_as_cancelled() {
         let storage = MemoryStorage::new();
@@ -2423,10 +3928,10 @@ mod tests {
         );
 
         // Trigger and get completion
-        let completion = handle.trigger("test:main", 1).await;
+        let completion = handle.trigger(&id("test:main"), 1).await;
 
         // Cancel the ledger
-        let had_work = handle.cancel("test:main").await;
+        let had_work = handle.cancel(&id("test:main")).await;
         assert!(had_work);
 
         // Completion should be cancelled
@@ -2445,8 +3950,8 @@ mod tests {
         );
 
         // Trigger multiple ledgers
-        let c1 = handle.trigger("test:one", 1).await;
-        let c2 = handle.trigger("test:two", 2).await;
+        let c1 = handle.trigger(&id("test:one"), 1).await;
+        let c2 = handle.trigger(&id("test:two"), 2).await;
 
         // Cancel all
         handle.cancel_all().await;
@@ -2467,13 +3972,13 @@ mod tests {
         );
 
         // No status for unknown ledger
-        assert!(handle.status("unknown").await.is_none());
+        assert!(handle.status(&id("unknown")).await.is_none());
 
         // Trigger a ledger
-        let _completion = handle.trigger("test:main", 5).await;
+        let _completion = handle.trigger(&id("test:main"), 5).await;
 
         // Should have status now
-        let status = handle.status("test:main").await.unwrap();
+        let status = handle.status(&id("test:main")).await.unwrap();
         assert_eq!(status.phase, IndexPhase::Pending);
         assert_eq!(status.pending_min_t, Some(5));
         assert_eq!(status.waiter_count, 1);
@@ -2489,11 +3994,11 @@ mod tests {
             IndexerConfig::small(),
         );
 
-        assert!(!handle.is_pending("test:main").await);
+        assert!(!handle.is_pending(&id("test:main")).await);
 
-        let _completion = handle.trigger("test:main", 1).await;
+        let _completion = handle.trigger(&id("test:main"), 1).await;
 
-        assert!(handle.is_pending("test:main").await);
+        assert!(handle.is_pending(&id("test:main")).await);
     }
 
     #[tokio::test]
@@ -2508,13 +4013,13 @@ mod tests {
 
         assert!(handle.pending_ledgers().await.is_empty());
 
-        let _c1 = handle.trigger("test:one", 1).await;
-        let _c2 = handle.trigger("test:two", 2).await;
+        let _c1 = handle.trigger(&id("test:one"), 1).await;
+        let _c2 = handle.trigger(&id("test:two"), 2).await;
 
         let pending = handle.pending_ledgers().await;
         assert_eq!(pending.len(), 2);
-        assert!(pending.contains(&"test:one".to_string()));
-        assert!(pending.contains(&"test:two".to_string()));
+        assert!(pending.contains(&id("test:one")));
+        assert!(pending.contains(&id("test:two")));
     }
 
     #[tokio::test]
@@ -2528,12 +4033,12 @@ mod tests {
         );
 
         // First trigger with min_t=5
-        let _c1 = handle.trigger("test:main", 5).await;
+        let _c1 = handle.trigger(&id("test:main"), 5).await;
         // Second trigger with min_t=3 (lower)
-        let _c2 = handle.trigger("test:main", 3).await;
+        let _c2 = handle.trigger(&id("test:main"), 3).await;
 
         // Status should show coalesced min_t = 3 (the minimum)
-        let status = handle.status("test:main").await.unwrap();
+        let status = handle.status(&id("test:main")).await.unwrap();
         assert_eq!(status.pending_min_t, Some(3));
         // Should have 2 waiters
         assert_eq!(status.waiter_count, 2);
@@ -2550,25 +4055,98 @@ mod tests {
         );
 
         // Ensure ledger state exists.
-        let _c1 = handle.trigger("test:main", 1).await;
+        let _c1 = handle.trigger(&id("test:main"), 1).await;
 
         // Put it into backoff.
-        worker.schedule_retry("test:main", "boom").await;
+        worker.schedule_retry(&id("test:main"), "boom").await;
         {
             let states = handle.trigger.states.lock().await;
-            let state = states.get("test:main").expect("state exists");
+            let state = states.get(&id("test:main")).expect("state exists");
             assert!(state.next_retry_at.is_some());
             assert!(state.retry_count > 0);
         }
 
         // New trigger should clear backoff.
-        let _c2 = handle.trigger("test:main", 2).await;
+        let _c2 = handle.trigger(&id("test:main"), 2).await;
         {
             let states = handle.trigger.states.lock().await;
-            let state = states.get("test:main").expect("state exists");
+            let state = states.get(&id("test:main")).expect("state exists");
             assert!(state.next_retry_at.is_none());
             assert_eq!(state.retry_count, 0);
         }
+    }
+
+    /// A build whose task was cancelled (runtime shutdown) is not a failed
+    /// build: no backoff, no `last_error`, waiters resolve `Cancelled`.
+    #[tokio::test]
+    async fn cancelled_build_does_not_schedule_retry() {
+        let storage = MemoryStorage::new();
+        let ns = Arc::new(MemoryNameService::new());
+        let (worker, handle) = BackgroundIndexerWorker::new(
+            StorageBackend::Managed(Arc::new(storage)),
+            ns,
+            IndexerConfig::small(),
+        );
+        let completion = handle.trigger(&id("test:main"), 1).await;
+
+        // Shutdown can cancel a ledger that already failed once and is sitting
+        // in backoff; without this the assertions below hold vacuously.
+        {
+            let mut states = handle.trigger.states.lock().await;
+            let state = states.get_mut(&id("test:main")).expect("state exists");
+            state.last_error = Some("earlier failure".to_string());
+            state.next_retry_at = Some(tokio::time::Instant::now() + Duration::from_secs(30));
+        }
+
+        worker
+            .on_build_error(
+                &id("test:main"),
+                crate::error::IndexerError::Cancelled("index build task".into()),
+                None,
+            )
+            .await;
+
+        {
+            let states = handle.trigger.states.lock().await;
+            let state = states.get(&id("test:main")).expect("state exists");
+            assert_eq!(state.retry_count, 0);
+            assert!(state.next_retry_at.is_none());
+            assert!(state.last_error.is_none());
+            assert!(state.pending_min_t.is_none());
+            assert_eq!(state.phase, IndexPhase::Idle);
+        }
+        assert!(matches!(completion.wait().await, IndexOutcome::Cancelled));
+    }
+
+    /// Counterpart: any other build error still goes through backoff.
+    #[tokio::test]
+    async fn failed_build_schedules_retry() {
+        let storage = MemoryStorage::new();
+        let ns = Arc::new(MemoryNameService::new());
+        let (worker, handle) = BackgroundIndexerWorker::new(
+            StorageBackend::Managed(Arc::new(storage)),
+            ns,
+            IndexerConfig::small(),
+        );
+        let _completion = handle.trigger(&id("test:main"), 1).await;
+
+        worker
+            .on_build_error(
+                &id("test:main"),
+                crate::error::IndexerError::StorageWrite("boom".into()),
+                None,
+            )
+            .await;
+
+        let states = handle.trigger.states.lock().await;
+        let state = states.get(&id("test:main")).expect("state exists");
+        assert_eq!(state.retry_count, 1);
+        assert!(state.next_retry_at.is_some());
+        assert_eq!(
+            state.last_error.as_deref(),
+            Some("Storage write error: boom")
+        );
+        assert_eq!(state.phase, IndexPhase::Pending);
     }
 
     #[tokio::test]
@@ -2587,19 +4165,23 @@ mod tests {
             IndexerConfig::small(),
         );
 
-        let _c1 = handle.trigger("test:main", 1).await;
-        worker.schedule_retry("test:main", "boom").await;
+        let _c1 = handle.trigger(&id("test:main"), 1).await;
+        worker.schedule_retry(&id("test:main"), "boom").await;
         {
             let states = handle.trigger.states.lock().await;
-            assert!(states.get("test:main").unwrap().next_retry_at.is_some());
+            assert!(states
+                .get(&id("test:main"))
+                .unwrap()
+                .next_retry_at
+                .is_some());
         }
 
         // Cancelling must drop the retry deadline and leave the ledger
         // un-processable (so it contributes no wake).
-        assert!(handle.cancel("test:main").await);
+        assert!(handle.cancel(&id("test:main")).await);
         {
             let states = handle.trigger.states.lock().await;
-            let state = states.get("test:main").unwrap();
+            let state = states.get(&id("test:main")).unwrap();
             assert!(state.next_retry_at.is_none());
             assert!(!state.is_processable());
         }
@@ -2629,7 +4211,7 @@ mod tests {
 
             // Cancelled with a stale (past) deadline — must be ignored.
             states.insert(
-                "cancelled".to_string(),
+                id("cancelled"),
                 LedgerIndexState {
                     pending_min_t: Some(5),
                     cancelled: true,
@@ -2639,7 +4221,7 @@ mod tests {
             );
             // Idle leftover: no pending work, stale deadline — must be ignored.
             states.insert(
-                "idle".to_string(),
+                id("idle"),
                 LedgerIndexState {
                     pending_min_t: None,
                     cancelled: false,
@@ -2649,7 +4231,7 @@ mod tests {
             );
             // Genuinely processable, retry in the future — the only contributor.
             states.insert(
-                "live".to_string(),
+                id("live"),
                 LedgerIndexState {
                     pending_min_t: Some(3),
                     cancelled: false,
@@ -2658,9 +4240,9 @@ mod tests {
                 },
             );
 
-            assert!(!states["cancelled"].is_processable());
-            assert!(!states["idle"].is_processable());
-            assert!(states["live"].is_processable());
+            assert!(!states[&id("cancelled")].is_processable());
+            assert!(!states[&id("idle")].is_processable());
+            assert!(states[&id("live")].is_processable());
 
             let deadline = states
                 .values()
@@ -2775,7 +4357,7 @@ mod tests {
         // Seed a prunable idle entry directly.
         {
             let mut states = handle.trigger.states.lock().await;
-            states.insert("idle:ledger".to_string(), LedgerIndexState::default());
+            states.insert(id("idle:ledger"), LedgerIndexState::default());
         }
 
         let run_handle = tokio::spawn(worker.run());
@@ -2783,18 +4365,18 @@ mod tests {
         // A trigger for a ledger that does not exist in the (empty) nameservice
         // resolves its waiter as Failed and the entry settles to Idle, while
         // also ticking the loop so the seeded idle entry is pruned.
-        let completion = handle.trigger("missing:ledger", 1).await;
+        let completion = handle.trigger(&id("missing:ledger"), 1).await;
         let _ = completion.wait().await;
 
         // Give the post-processing prune a moment to run on a subsequent tick.
-        handle.trigger("missing:ledger", 1).await;
+        handle.trigger(&id("missing:ledger"), 1).await;
 
         // Poll until the idle entry is pruned (bounded).
         let mut pruned = false;
         for _ in 0..50 {
             {
                 let states = handle.trigger.states.lock().await;
-                if !states.contains_key("idle:ledger") {
+                if !states.contains_key(&id("idle:ledger")) {
                     pruned = true;
                     break;
                 }
@@ -2823,7 +4405,7 @@ mod tests {
         {
             let mut states = handle.trigger.states.lock().await;
             states.insert(
-                "cancelled:done".to_string(),
+                id("cancelled:done"),
                 LedgerIndexState {
                     phase: IndexPhase::Idle,
                     cancelled: true,
@@ -2835,14 +4417,14 @@ mod tests {
         let run_handle = tokio::spawn(worker.run());
 
         // Tick the loop (a missing ledger settles to Idle and is also pruned).
-        let _ = handle.trigger("missing:ledger", 1).await.wait().await;
-        handle.trigger("missing:ledger", 1).await;
+        let _ = handle.trigger(&id("missing:ledger"), 1).await.wait().await;
+        handle.trigger(&id("missing:ledger"), 1).await;
 
         let mut pruned = false;
         for _ in 0..50 {
             {
                 let states = handle.trigger.states.lock().await;
-                if !states.contains_key("cancelled:done") {
+                if !states.contains_key(&id("cancelled:done")) {
                     pruned = true;
                     break;
                 }
@@ -2868,7 +4450,7 @@ mod tests {
         );
 
         // Should return immediately for unknown ledger
-        handle.wait_for_idle("unknown").await;
+        handle.wait_for_idle(&id("unknown")).await;
     }
 
     #[tokio::test]
@@ -2895,7 +4477,7 @@ mod tests {
             IndexerConfig::small(),
         );
 
-        let completion = handle.trigger("test:main", 1).await;
+        let completion = handle.trigger(&id("test:main"), 1).await;
         // Should not panic
         let debug_str = format!("{completion:?}");
         assert!(debug_str.contains("IndexCompletion"));
@@ -2953,30 +4535,26 @@ mod tests {
             BackgroundIndexerWorker::new(backend, Arc::clone(&ns), IndexerConfig::default());
 
         let bus = Arc::new(LedgerEventBus::new(16));
+        // Subscribing here rather than inside the task is what `run` does, and
+        // it is what makes this test deterministic: the receiver exists before
+        // `notify`, so the event is buffered no matter when the task is polled.
+        let subscription = bus.subscribe(SubscriptionScope::All);
         let sub_task = tokio::spawn({
-            let bus = Arc::clone(&bus);
             let handle = handle.clone();
             let ns = Arc::clone(&ns);
             async move {
-                run_event_subscriber(bus, handle.trigger.clone(), ns).await;
+                run_event_subscriber(subscription, handle.trigger.clone(), ns).await;
             }
         });
 
-        // Ensure the subscriber has called subscribe() before we emit.
-        // The catch-up sweep runs after subscribe, so once it completes
-        // the receiver is ready — yield a few times to let it land.
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-
         bus.notify(NameServiceEvent::LedgerCommitPublished {
-            ledger_id: "test:main".into(),
+            ledger_id: id("test:main"),
             commit_id: test_commit_cid(1),
             commit_t: 5,
         });
 
         tokio::time::timeout(Duration::from_secs(2), async {
-            while !handle.is_pending("test:main").await {
+            while !handle.is_pending(&id("test:main")).await {
                 tokio::task::yield_now().await;
             }
         })
@@ -2984,6 +4562,58 @@ mod tests {
         .expect("subscriber should trigger handle within 2s");
 
         sub_task.abort();
+    }
+
+    /// A worker that does not own catch-up must not sweep — neither at start-up
+    /// nor on the timer. Raft is why: every node runs a node-scope worker built
+    /// by the api layer, and the leader runs a second, bus-wired one. Two
+    /// sweeping workers hold independent `states` maps, so `trigger_if_idle`
+    /// cannot see the other's claim and the same ledger is queued and built
+    /// twice; on followers, sweeping means initiating builds whose publish
+    /// cannot land — `RaftNameService::publish_index` swallows the
+    /// `ForwardToLeader` a non-leader gets back as `Ok(())`, so the build pays
+    /// its full cost, reports success, and advances no index head.
+    ///
+    /// The handle must still work: this turns off automatic catch-up, not the
+    /// indexer. Admin reindex, post-commit triggers and the max-novelty nudge
+    /// all route through `IndexerHandle` and are unaffected.
+    #[tokio::test]
+    async fn a_worker_that_does_not_own_catchup_never_sweeps() {
+        let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+        let ns = Arc::new(MemoryNameService::new());
+        let ns_dyn: Arc<dyn IndexingNameService> = Arc::clone(&ns) as _;
+
+        // Behind before the worker starts: a sweeping worker would find this.
+        ns.create_ledger("behind:main").unwrap();
+        ns.publish_commit("behind:main", 7, &test_commit_cid(7))
+            .await
+            .unwrap();
+
+        let config = IndexerConfig::default()
+            .with_catchup_sweeps(false)
+            // Short enough that a periodic sweep would have fired many times
+            // over inside the window this test waits.
+            .with_catchup_interval(Duration::from_millis(10));
+        let (worker, handle) = BackgroundIndexerWorker::new(backend, Arc::clone(&ns_dyn), config);
+        let worker_task = tokio::spawn(worker.run());
+
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            !handle.is_pending(&id("behind:main")).await,
+            "a worker that does not own catch-up must not queue a behind ledger"
+        );
+
+        // The handle is still live: an explicit request is honoured.
+        assert!(
+            handle.trigger_if_idle(&id("behind:main"), 7).await,
+            "disabling the sweeps must not disable the indexer itself"
+        );
+
+        worker_task.abort();
     }
 
     #[tokio::test]
@@ -3006,12 +4636,264 @@ mod tests {
         catch_up_sweep(&handle.trigger, ns_dyn.as_ref()).await;
 
         assert!(
-            handle.is_pending("behind:main").await,
+            handle.is_pending(&id("behind:main")).await,
             "behind ledger should be triggered"
         );
         assert!(
-            !handle.is_pending("current:main").await,
+            !handle.is_pending(&id("current:main")).await,
             "current ledger should be skipped"
+        );
+    }
+
+    /// **The deadlock this exists to break.** The catch-up sweep used to run
+    /// only from `run_event_subscriber`, which is spawned only when a caller
+    /// supplied an event bus — and in this repo only the raft leader task does.
+    /// So every embedded and standalone deployment started with no sweep, and a
+    /// ledger whose backlog already exceeded `reindex_max_bytes` rejected every
+    /// write, published no commit, and therefore never triggered the indexer
+    /// that was the only thing able to drain it.
+    ///
+    /// The property: a worker with NO event bus must still catch up a ledger
+    /// that is behind when it starts. `catch_up_sweep_triggers_only_behind_ledgers`
+    /// covers the sweep as a function; nothing asserted that `run()` calls it,
+    /// which is exactly where the bug lived.
+    ///
+    /// Observed in production: ledgers at commit_t 597 / index_t 251 with no
+    /// index build ever attempted across a fresh process, freezing 13
+    /// materialize source tables behind them.
+    #[tokio::test]
+    async fn run_sweeps_behind_ledgers_without_an_event_bus() {
+        let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+        let ns = Arc::new(MemoryNameService::new());
+        let ns_dyn: Arc<dyn IndexingNameService> = Arc::clone(&ns) as _;
+
+        // Both ledgers exist before the worker starts, so the sweep is the only
+        // thing that can find them: no commit is published afterwards, and
+        // there is no bus to carry an event even if one were.
+        ns.create_ledger("behind:main").unwrap();
+        ns.publish_commit("behind:main", 7, &test_commit_cid(7))
+            .await
+            .unwrap();
+        ns.create_ledger("current:main").unwrap();
+
+        let (worker, handle) =
+            BackgroundIndexerWorker::new(backend, Arc::clone(&ns_dyn), IndexerConfig::default());
+        assert!(
+            worker.event_bus.is_none(),
+            "this test is only meaningful without a bus — that is the deployment shape that wedged"
+        );
+        let run_task = tokio::spawn(worker.run());
+
+        let triggered = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if handle.is_pending(&id("behind:main")).await {
+                    return true;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        // Read this before aborting: `current:main` is caught up, so the sweep
+        // must leave it alone. Asserting it against a ledger that exists (rather
+        // than one absent from the nameservice) is what makes the assertion able
+        // to fail at all.
+        let current_pending = handle.is_pending(&id("current:main")).await;
+        run_task.abort();
+
+        assert!(
+            triggered,
+            "a ledger behind at startup must be swept even with no event bus; \
+             without this the only escape is a manual reindex"
+        );
+        assert!(!current_pending, "a caught-up ledger must not be triggered");
+    }
+
+    fn ns_record(name: &str, commit_t: i64, index_t: i64, retracted: bool) -> NsRecord {
+        let mut record = NsRecord::new(format!("{name}:main").as_str());
+        record.commit_t = commit_t;
+        record.index_t = index_t;
+        record.retracted = retracted;
+        record
+    }
+
+    /// The predicate that makes a *periodic* sweep affordable. Sweeping on
+    /// "behind" alone would re-index every actively-committing ledger once per
+    /// interval, because `process_ledger` has no byte gate.
+    #[test]
+    fn stalled_ledgers_wants_frozen_ledgers_only() {
+        let records = vec![
+            ns_record("frozen", 100, 40, false),
+            ns_record("advancing", 100, 40, false),
+            ns_record("firstsight", 100, 40, false),
+            ns_record("current", 100, 100, false),
+            ns_record("retracted", 100, 40, true),
+        ];
+        let last_seen = HashMap::from([
+            (id("frozen:main"), 100),
+            // Committed since the previous sweep: the post-commit trigger owns it.
+            (id("advancing:main"), 90),
+            (id("current:main"), 100),
+            (id("retracted:main"), 100),
+        ]);
+
+        let stalled = stalled_ledgers(&records, &last_seen);
+
+        assert_eq!(
+            stalled,
+            vec![(id("frozen:main"), 100)],
+            "only a behind ledger whose commit_t has not moved since the previous \
+             sweep is stalled; an advancing one, a caught-up one, a retracted one, \
+             and one seen for the first time are all left alone"
+        );
+    }
+
+    #[test]
+    fn stalled_ledgers_queues_the_most_behind_first() {
+        let records = vec![
+            ns_record("small", 100, 95, false),
+            ns_record("huge", 100, 10, false),
+            ns_record("mid", 100, 60, false),
+        ];
+        let last_seen = HashMap::from([
+            (id("small:main"), 100),
+            (id("huge:main"), 100),
+            (id("mid:main"), 100),
+        ]);
+
+        let ids: Vec<LedgerId> = stalled_ledgers(&records, &last_seen)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        assert_eq!(
+            ids,
+            vec!["huge:main", "mid:main", "small:main"],
+            "the ledger most likely to be blocking writes goes first"
+        );
+    }
+
+    /// `trigger` clears `cancelled` and zeroes the retry backoff, which is right
+    /// for an explicit request and wrong for one a timer made: on a timer it
+    /// would resurrect work an operator cancelled, and reset a failing build's
+    /// backoff every interval.
+    #[tokio::test]
+    async fn trigger_if_idle_yields_to_everything_that_already_owns_the_ledger() {
+        let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+        let ns: Arc<dyn IndexingNameService> = Arc::new(MemoryNameService::new());
+        let (_worker, handle) =
+            BackgroundIndexerWorker::new(backend, Arc::clone(&ns), IndexerConfig::default());
+
+        assert!(
+            handle.trigger.trigger_if_idle(&id("fresh:main"), 5).await,
+            "an untracked ledger is idle, so the sweep may queue it"
+        );
+        assert!(
+            !handle.trigger.trigger_if_idle(&id("fresh:main"), 5).await,
+            "already pending — the sweep must not re-queue it"
+        );
+
+        // Cancelled work stays cancelled.
+        let _ = handle.trigger(&id("cancelled:main"), 5).await;
+        handle.cancel(&id("cancelled:main")).await;
+        assert!(
+            !handle
+                .trigger
+                .trigger_if_idle(&id("cancelled:main"), 5)
+                .await,
+            "a deliberately cancelled ledger must not be resurrected on a timer"
+        );
+
+        // A maintenance hold means a reindex is writing index artifacts; a build
+        // started underneath it would race those writes.
+        let _guard = handle
+            .trigger
+            .acquire_maintenance(&id("held:main"))
+            .expect("nothing else holds it");
+        assert!(
+            !handle.trigger.trigger_if_idle(&id("held:main"), 5).await,
+            "a ledger held for maintenance must be left alone"
+        );
+    }
+
+    /// The residual the start-up sweep cannot cover: a ledger that falls behind
+    /// *after* the worker starts and then stops receiving the commits that would
+    /// trigger it. It is created after `run()` is spawned, so the start-up sweep
+    /// cannot be what finds it, and no event bus is wired, so nothing can carry
+    /// a commit event either — only the timer can.
+    #[tokio::test]
+    async fn periodic_sweep_finds_a_ledger_that_stalls_after_startup() {
+        let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+        let ns = Arc::new(MemoryNameService::new());
+        let ns_dyn: Arc<dyn IndexingNameService> = Arc::clone(&ns) as _;
+        let config = IndexerConfig::default().with_catchup_interval(Duration::from_millis(20));
+        let (worker, handle) = BackgroundIndexerWorker::new(backend, Arc::clone(&ns_dyn), config);
+        let run_task = tokio::spawn(worker.run());
+
+        // Let the start-up sweep run and find nothing.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            !handle.is_pending(&id("late:main")).await,
+            "the ledger does not exist yet"
+        );
+
+        ns.create_ledger("late:main").unwrap();
+        ns.publish_commit("late:main", 11, &test_commit_cid(11))
+            .await
+            .unwrap();
+
+        // Two ticks minimum: the first records `commit_t`, the second sees it
+        // unchanged and calls it stalled.
+        let triggered = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if handle.is_pending(&id("late:main")).await {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        run_task.abort();
+
+        assert!(
+            triggered,
+            "a ledger that stalls after start-up must be picked up by the periodic \
+             re-sweep; otherwise the only escape is a restart or a manual reindex"
+        );
+    }
+
+    #[tokio::test]
+    async fn trigger_if_idle_does_not_reset_the_retry_backoff() {
+        let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+        let ns: Arc<dyn IndexingNameService> = Arc::new(MemoryNameService::new());
+        let (worker, handle) =
+            BackgroundIndexerWorker::new(backend, Arc::clone(&ns), IndexerConfig::default());
+
+        {
+            let mut states = worker.states.lock().await;
+            let state = states.entry(id("failing:main")).or_default();
+            state.retry_count = 4;
+            state.next_retry_at = Some(tokio::time::Instant::now() + Duration::from_secs(30));
+            state.pending_min_t = Some(9);
+            state.phase = IndexPhase::Pending;
+        }
+
+        assert!(
+            !handle.trigger.trigger_if_idle(&id("failing:main"), 9).await,
+            "a ledger with pending work is not idle"
+        );
+
+        let states = worker.states.lock().await;
+        let state = states.get(&id("failing:main")).expect("state kept");
+        assert_eq!(
+            state.retry_count, 4,
+            "the sweep must not reset backoff — on a timer that is a hot retry loop"
+        );
+        assert!(
+            state.next_retry_at.is_some(),
+            "the retry deadline must stand"
         );
     }
 
@@ -3038,7 +4920,7 @@ mod tests {
         // be gone (no observable side effect). We just check the run
         // task aborted cleanly without lingering joins.
         bus.notify(NameServiceEvent::LedgerCommitPublished {
-            ledger_id: "test:main".into(),
+            ledger_id: id("test:main"),
             commit_id: test_commit_cid(1),
             commit_t: 1,
         });
@@ -3093,7 +4975,7 @@ mod tests {
         let run_task = tokio::spawn(worker.run());
 
         // Register a waiter for a min_t that will never be reached.
-        let completion = handle.trigger("never-published:main", 10).await;
+        let completion = handle.trigger(&id("never-published:main"), 10).await;
 
         // Drop the last handle to signal shutdown.
         drop(handle);

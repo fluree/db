@@ -7,9 +7,11 @@ use crate::error::TransactError;
 use crate::generate::{infer_datatype, validate_value_dt_pair};
 use crate::namespace::{NamespaceRegistry, NsAllocator};
 use crate::value_convert::{convert_native_literal, convert_string_literal};
+#[cfg(test)]
+use fluree_db_core::edge::EdgeKey;
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::{Flake, FlakeMeta, FlakeValue, Sid};
-use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, TermId};
+use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -46,7 +48,7 @@ enum ResolvedTerm {
 /// let mut ns = NamespaceRegistry::from_db(&db);
 /// let mut sink = FlakeSink::new(&mut ns, new_t, txn_id);
 /// fluree_graph_turtle::parse(ttl, &mut sink)?;
-/// let flakes = sink.finish().expect("no invariant violation");
+/// let flakes = sink.into_flakes().expect("no invariant violation");
 /// ```
 pub struct FlakeSink<'a> {
     /// Resolved terms indexed by TermId
@@ -91,9 +93,15 @@ impl<'a> FlakeSink<'a> {
 
     /// Consume the sink and return the accumulated flakes, or surface the
     /// first storage-invariant violation observed during parsing as a hard
-    /// error. Mirrors [`ImportSink::finish`](crate::import_sink::ImportSink)
+    /// error. Mirrors
+    /// [`ImportSink::into_parts`](crate::import_sink::ImportSink::into_parts)
     /// — bad input must fail the transaction, not silently omit a triple.
-    pub fn finish(self) -> Result<Vec<Flake>, TransactError> {
+    ///
+    /// Distinct from the protocol's [`GraphSink::finish`] (flush/finalize):
+    /// this is the sink's *product*. Deferred-error semantics are unchanged
+    /// by the fallible protocol — `emit_*` still records the first violation
+    /// and keeps going, and this method is where it becomes a hard error.
+    pub fn into_flakes(self) -> Result<Vec<Flake>, TransactError> {
         if let Some(err) = self.invariant_error {
             return Err(err);
         }
@@ -144,6 +152,32 @@ impl<'a> FlakeSink<'a> {
     ) -> Option<Flake> {
         let s = self.resolve_sid(subject)?;
         let p = self.resolve_sid(predicate)?;
+
+        // Reserved-predicate firewall (mirrors the JSON-LD and SPARQL UPDATE
+        // surfaces): a user-authored `f:reifies*` statement must not reach
+        // stage. Annotations are minted only through the RDF 1.2 annotation
+        // syntax (`~` / `{| |}` / `<< >>`), which arrives via
+        // `emit_reified_triple` and builds a complete, validated bundle.
+        // Bulk import (`ImportSink`) is the administrative bootstrap path and
+        // deliberately stays permissive so an export round-trips.
+        if fluree_db_core::is_reserved_reifies_predicate(&p) {
+            let iri = format!(
+                "{}{}",
+                self.ns_registry.get_prefix(p.namespace_code).unwrap_or(""),
+                p.name
+            );
+            let e = TransactError::UnsupportedFeature(format!(
+                "'{iri}' is a system-controlled predicate; use the RDF 1.2 annotation \
+                 syntax (`~ <reifier> {{| ... |}}` or `<< s p o >>`) instead of \
+                 writing f:reifies* triples by hand"
+            ));
+            tracing::error!("FlakeSink: reserved predicate, aborting — {e}");
+            if self.invariant_error.is_none() {
+                self.invariant_error = Some(e);
+            }
+            return None;
+        }
+
         let (o, dtc) = self.resolve_object(object)?;
 
         let dt = dtc.datatype().clone();
@@ -162,15 +196,7 @@ impl<'a> FlakeSink<'a> {
             return None;
         }
 
-        let meta = match (&lang, list_index) {
-            (Some(l), Some(i)) => Some(FlakeMeta {
-                lang: Some(l.clone()),
-                i: Some(i),
-            }),
-            (Some(l), None) => Some(FlakeMeta::with_lang(l)),
-            (None, Some(i)) => Some(FlakeMeta::with_index(i)),
-            (None, None) => None,
-        };
+        let meta = FlakeMeta::from_parts(lang.as_deref(), list_index);
 
         Some(Flake::new(s, p, o, dt, self.t, true, meta))
     }
@@ -211,9 +237,17 @@ impl GraphSink for FlakeSink<'_> {
                 id
             }
             None => {
-                // Anonymous blank node — unique counter-based label
+                // Anonymous blank node (`[]`, bare `~` reifiers, `{| … |}`
+                // blocks) — unique counter-based label. The leading '-'
+                // keeps the minted namespace disjoint from every
+                // user-written label: BLANK_NODE_LABEL must start with
+                // PN_CHARS_U | [0-9], so `_:-b1` can never lex (`_:b1` +
+                // an anonymous mint used to skolemize identically and
+                // silently merge). '-' stays legal medially, so the full
+                // skolemized `fdb-{txn}--b{N}` label still serializes and
+                // re-imports as the same stored node.
                 self.blank_counter += 1;
-                let label = format!("b{}", self.blank_counter);
+                let label = format!("-b{}", self.blank_counter);
                 let sid = self.skolemize(&label);
                 self.add_term(ResolvedTerm::Sid(sid))
             }
@@ -250,16 +284,65 @@ impl GraphSink for FlakeSink<'_> {
         })
     }
 
-    fn emit_triple(&mut self, subject: TermId, predicate: TermId, object: TermId) {
+    fn emit_triple(&mut self, subject: TermId, predicate: TermId, object: TermId) -> SinkResult {
         if let Some(flake) = self.build_flake(subject, predicate, object, None) {
             self.flakes.push(flake);
         }
+        Ok(())
     }
 
-    fn emit_list_item(&mut self, subject: TermId, predicate: TermId, object: TermId, index: i32) {
+    fn emit_list_item(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        index: i32,
+    ) -> SinkResult {
         if let Some(flake) = self.build_flake(subject, predicate, object, Some(index)) {
             self.flakes.push(flake);
         }
+        Ok(())
+    }
+
+    fn supports_reified_triples(&self) -> bool {
+        true
+    }
+
+    /// Turtle-star reifier attachment → the durable `f:reifies*` bundle,
+    /// built by the shared [`crate::generate::flakes::reified_triple_bundle`]
+    /// (bit-identical with the JSON-LD `@annotation` lowering and with
+    /// `ImportSink`'s bulk path). The base triple has already been emitted
+    /// by the parser via `emit_triple`.
+    fn emit_reified_triple(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        reifier: TermId,
+    ) -> SinkResult {
+        let Some(s) = self.resolve_sid(subject) else {
+            return Ok(());
+        };
+        let Some(p) = self.resolve_sid(predicate) else {
+            return Ok(());
+        };
+        let Some((o, dtc)) = self.resolve_object(object) else {
+            return Ok(());
+        };
+        let Some(ann) = self.resolve_sid(reifier) else {
+            return Ok(());
+        };
+
+        match crate::generate::flakes::reified_triple_bundle(None, s, p, o, &dtc, &ann, self.t) {
+            Ok(bundle) => self.flakes.extend(bundle),
+            Err(e) => {
+                tracing::error!("FlakeSink: invariant violation in reifier bundle, aborting — {e}");
+                if self.invariant_error.is_none() {
+                    self.invariant_error = Some(e);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -287,9 +370,9 @@ mod tests {
         let s = sink.term_iri("http://example.org/alice");
         let p = sink.term_iri("http://example.org/name");
         let o = sink.term_literal("Alice", Datatype::xsd_string(), None);
-        sink.emit_triple(s, p, o);
+        sink.emit_triple(s, p, o).unwrap();
 
-        let flakes = sink.finish().expect("no invariant violation");
+        let flakes = sink.into_flakes().expect("no invariant violation");
         assert_eq!(flakes.len(), 1);
         let f = &flakes[0];
         assert!(f.op); // assertion
@@ -306,9 +389,9 @@ mod tests {
         let s = sink.term_iri("http://example.org/alice");
         let p = sink.term_iri("http://example.org/age");
         let o = sink.term_literal_value(LiteralValue::Integer(30), Datatype::xsd_integer());
-        sink.emit_triple(s, p, o);
+        sink.emit_triple(s, p, o).unwrap();
 
-        let flakes = sink.finish().expect("no invariant violation");
+        let flakes = sink.into_flakes().expect("no invariant violation");
         assert_eq!(flakes.len(), 1);
         assert!(matches!(&flakes[0].o, FlakeValue::Long(30)));
     }
@@ -321,9 +404,9 @@ mod tests {
         let s = sink.term_iri("http://example.org/x");
         let p = sink.term_iri("http://example.org/val");
         let o = sink.term_literal_value(LiteralValue::Double(3.13), Datatype::xsd_double());
-        sink.emit_triple(s, p, o);
+        sink.emit_triple(s, p, o).unwrap();
 
-        let flakes = sink.finish().expect("no invariant violation");
+        let flakes = sink.into_flakes().expect("no invariant violation");
         assert_eq!(flakes.len(), 1);
         assert!(matches!(&flakes[0].o, FlakeValue::Double(d) if (*d - 3.13).abs() < f64::EPSILON));
     }
@@ -336,9 +419,9 @@ mod tests {
         let s = sink.term_iri("http://example.org/x");
         let p = sink.term_iri("http://example.org/active");
         let o = sink.term_literal_value(LiteralValue::Boolean(true), Datatype::xsd_boolean());
-        sink.emit_triple(s, p, o);
+        sink.emit_triple(s, p, o).unwrap();
 
-        let flakes = sink.finish().expect("no invariant violation");
+        let flakes = sink.into_flakes().expect("no invariant violation");
         assert_eq!(flakes.len(), 1);
         assert!(matches!(&flakes[0].o, FlakeValue::Boolean(true)));
     }
@@ -351,9 +434,9 @@ mod tests {
         let s = sink.term_iri("http://example.org/alice");
         let p = sink.term_iri("http://example.org/name");
         let o = sink.term_literal("Alice", Datatype::rdf_lang_string(), Some("en"));
-        sink.emit_triple(s, p, o);
+        sink.emit_triple(s, p, o).unwrap();
 
-        let flakes = sink.finish().expect("no invariant violation");
+        let flakes = sink.into_flakes().expect("no invariant violation");
         assert_eq!(flakes.len(), 1);
         let f = &flakes[0];
         assert!(matches!(&f.o, FlakeValue::String(s) if s == "Alice"));
@@ -382,6 +465,25 @@ mod tests {
     }
 
     #[test]
+    fn test_anonymous_mints_disjoint_from_user_label_namespace() {
+        let (mut ns, t, txn_id) = make_sink();
+        let mut sink = FlakeSink::new(&mut ns, t, txn_id);
+
+        // A user-written `_:b1` and the first anonymous mint used to
+        // skolemize to the SAME Sid (`{txn}-b1`), silently merging user
+        // data into system-minted `[]`/reifier nodes. TermId inequality
+        // (above) never caught it — the collision was at the Sid level.
+        let user = sink.term_blank(Some("b1"));
+        let anon = sink.term_blank(None);
+        let user_sid = sink.resolve_sid(user).expect("user blank is a Sid");
+        let anon_sid = sink.resolve_sid(anon).expect("anon blank is a Sid");
+        assert_ne!(
+            user_sid, anon_sid,
+            "anonymous mint must never share a Sid with a user `_:b1`"
+        );
+    }
+
+    #[test]
     fn test_iri_object_as_ref() {
         let (mut ns, t, txn_id) = make_sink();
         let mut sink = FlakeSink::new(&mut ns, t, txn_id);
@@ -389,9 +491,9 @@ mod tests {
         let s = sink.term_iri("http://example.org/alice");
         let p = sink.term_iri("http://example.org/knows");
         let o = sink.term_iri("http://example.org/bob");
-        sink.emit_triple(s, p, o);
+        sink.emit_triple(s, p, o).unwrap();
 
-        let flakes = sink.finish().expect("no invariant violation");
+        let flakes = sink.into_flakes().expect("no invariant violation");
         assert_eq!(flakes.len(), 1);
         let f = &flakes[0];
         assert!(matches!(&f.o, FlakeValue::Ref(_)));
@@ -409,11 +511,11 @@ mod tests {
         let o0 = sink.term_literal_value(LiteralValue::Integer(10), Datatype::xsd_integer());
         let o1 = sink.term_literal_value(LiteralValue::Integer(20), Datatype::xsd_integer());
         let o2 = sink.term_literal_value(LiteralValue::Integer(30), Datatype::xsd_integer());
-        sink.emit_list_item(s, p, o0, 0);
-        sink.emit_list_item(s, p, o1, 1);
-        sink.emit_list_item(s, p, o2, 2);
+        sink.emit_list_item(s, p, o0, 0).unwrap();
+        sink.emit_list_item(s, p, o1, 1).unwrap();
+        sink.emit_list_item(s, p, o2, 2).unwrap();
 
-        let flakes = sink.finish().expect("no invariant violation");
+        let flakes = sink.into_flakes().expect("no invariant violation");
         assert_eq!(flakes.len(), 3);
         for (i, f) in flakes.iter().enumerate() {
             let meta = f.m.as_ref().expect("list items should have meta");
@@ -430,9 +532,9 @@ mod tests {
         let s = sink.term_iri("http://example.org/event");
         let p = sink.term_iri("http://example.org/date");
         let o = sink.term_literal("2024-01-15T10:30:00Z", Datatype::xsd_date_time(), None);
-        sink.emit_triple(s, p, o);
+        sink.emit_triple(s, p, o).unwrap();
 
-        let flakes = sink.finish().expect("no invariant violation");
+        let flakes = sink.into_flakes().expect("no invariant violation");
         assert_eq!(flakes.len(), 1);
         assert!(matches!(&flakes[0].o, FlakeValue::DateTime(_)));
     }
@@ -445,9 +547,9 @@ mod tests {
         let s = sink.term_iri("http://example.org/x");
         let p = sink.term_iri("http://example.org/count");
         let o = sink.term_literal("42", Datatype::xsd_integer(), None);
-        sink.emit_triple(s, p, o);
+        sink.emit_triple(s, p, o).unwrap();
 
-        let flakes = sink.finish().expect("no invariant violation");
+        let flakes = sink.into_flakes().expect("no invariant violation");
         assert_eq!(flakes.len(), 1);
         assert!(matches!(&flakes[0].o, FlakeValue::Long(42)));
     }
@@ -461,14 +563,121 @@ mod tests {
         let s = sink.term_iri("http://example.org/x");
         let p = sink.term_iri("http://example.org/count");
         let o = sink.term_literal("42", Datatype::xsd_long(), None);
-        sink.emit_triple(s, p, o);
+        sink.emit_triple(s, p, o).unwrap();
 
-        let flakes = sink.finish().expect("no invariant violation");
+        let flakes = sink.into_flakes().expect("no invariant violation");
         assert_eq!(flakes.len(), 1);
         assert!(matches!(&flakes[0].o, FlakeValue::Long(42)));
         // dt must be xsd:long (declared), not xsd:integer (inferred)
         let expected_dt = ns.sid_for_iri(xsd::LONG);
         assert_eq!(flakes[0].dt, expected_dt);
+    }
+
+    #[test]
+    fn user_authored_reifies_predicate_is_rejected() {
+        // The reserved-predicate firewall: a Turtle statement that names an
+        // `f:reifies*` predicate directly must fail the whole transaction,
+        // exactly like the JSON-LD and SPARQL UPDATE surfaces. Only the
+        // parser's reifier path (`emit_reified_triple`) may mint bundles.
+        let (mut ns, t, txn_id) = make_sink();
+        let mut sink = FlakeSink::new(&mut ns, t, txn_id);
+
+        let claim = sink.term_iri("http://example.org/claim1");
+        let p = sink.term_iri("https://ns.flur.ee/db#reifiesSubject");
+        let alice = sink.term_iri("http://example.org/alice");
+        sink.emit_triple(claim, p, alice).unwrap();
+
+        let err = sink
+            .into_flakes()
+            .expect_err("a hand-written f:reifiesSubject triple must be rejected");
+        assert!(
+            matches!(&err, TransactError::UnsupportedFeature(m) if m.contains("reifiesSubject")),
+            "expected the reserved-predicate error naming the predicate, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_reified_triple_emits_jsonld_compatible_bundle() {
+        // Ref-object, default-graph: exactly Subject + Predicate + Object —
+        // NO f:reifiesDatatype (the JSON-LD-compatible shape), and the
+        // bundle decodes back to the base edge's EdgeKey.
+        use fluree_db_core::namespaces::{
+            is_reifies_datatype, is_reifies_object, is_reifies_predicate, is_reifies_subject,
+        };
+
+        let (mut ns, t, txn_id) = make_sink();
+        let mut sink = FlakeSink::new(&mut ns, t, txn_id);
+
+        let s = sink.term_iri("http://example.org/alice");
+        let p = sink.term_iri("http://example.org/worksFor");
+        let o = sink.term_iri("http://example.org/acme");
+        let r = sink.term_iri("http://example.org/reifier");
+        sink.emit_triple(s, p, o).unwrap();
+        sink.emit_reified_triple(s, p, o, r).unwrap();
+
+        let flakes = sink.into_flakes().expect("no invariant violation");
+        // 1 base + 3 bundle flakes.
+        assert_eq!(flakes.len(), 4);
+        let base = &flakes[0];
+        let bundle = &flakes[1..];
+        assert!(bundle.iter().any(|f| is_reifies_subject(&f.p)));
+        assert!(bundle.iter().any(|f| is_reifies_predicate(&f.p)));
+        assert!(bundle.iter().any(|f| is_reifies_object(&f.p)));
+        assert!(
+            !bundle.iter().any(|f| is_reifies_datatype(&f.p)),
+            "JSON-LD-compatible bundle must omit f:reifiesDatatype: {bundle:?}"
+        );
+        for f in bundle {
+            assert!(f.op, "assertion bundle");
+            assert_eq!(f.t, t);
+            assert!(f.g.is_none(), "plain Turtle is default-graph");
+        }
+        let decoded = EdgeKey::from_reifies_facts(bundle).expect("bundle decodes");
+        assert_eq!(
+            decoded,
+            EdgeKey::from_flake(base),
+            "decoded EdgeKey must equal the base edge's EdgeKey"
+        );
+    }
+
+    #[test]
+    fn test_reified_triple_lang_literal_bundle_carries_lang() {
+        // Language-tagged object: bundle adds f:reifiesLang and the
+        // f:reifiesObject flake carries m.lang (cascade symmetry with the
+        // JSON-LD writer — see EdgeKey docs / BUGS-2).
+        use fluree_db_core::namespaces::{is_reifies_lang, is_reifies_object};
+
+        let (mut ns, t, txn_id) = make_sink();
+        let mut sink = FlakeSink::new(&mut ns, t, txn_id);
+
+        let s = sink.term_iri("http://example.org/alice");
+        let p = sink.term_iri("http://example.org/label");
+        let o = sink.term_literal("chat", Datatype::rdf_lang_string(), Some("fr"));
+        let r = sink.term_iri("http://example.org/reifier");
+        sink.emit_triple(s, p, o).unwrap();
+        sink.emit_reified_triple(s, p, o, r).unwrap();
+
+        let flakes = sink.into_flakes().expect("no invariant violation");
+        // 1 base + 4 bundle flakes (S, P, O, Lang).
+        assert_eq!(flakes.len(), 5);
+        let base = &flakes[0];
+        let bundle = &flakes[1..];
+        let obj = bundle
+            .iter()
+            .find(|f| is_reifies_object(&f.p))
+            .expect("f:reifiesObject");
+        assert_eq!(
+            obj.m.as_ref().and_then(|m| m.lang.as_deref()),
+            Some("fr"),
+            "f:reifiesObject must carry m.lang"
+        );
+        let lang = bundle
+            .iter()
+            .find(|f| is_reifies_lang(&f.p))
+            .expect("f:reifiesLang");
+        assert!(matches!(&lang.o, FlakeValue::String(l) if l == "fr"));
+        let decoded = EdgeKey::from_reifies_facts(bundle).expect("bundle decodes");
+        assert_eq!(decoded, EdgeKey::from_flake(base));
     }
 
     #[test]
@@ -489,9 +698,11 @@ mod tests {
             Datatype::from_iri(fluree_vocab::fluree::EMBEDDING_VECTOR),
             None,
         );
-        sink.emit_triple(s, p, o);
+        sink.emit_triple(s, p, o).unwrap();
 
-        let err = sink.finish().expect_err("invariant violation must abort");
+        let err = sink
+            .into_flakes()
+            .expect_err("invariant violation must abort");
         let msg = err.to_string();
         assert!(
             msg.contains("embeddingVector"),

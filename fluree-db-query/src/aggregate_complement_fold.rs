@@ -37,6 +37,8 @@
 //! else is left untouched (safe no-op). `AVG` only — the empty-complement filter
 //! needs the count, and `MIN`/`MAX`/`COUNT(DISTINCT)`/etc. are not distributive.
 
+mod shared;
+
 use crate::ir::{
     AggregateFn, AggregateSpec, Aggregation, Expression, Function, Grouping, InputSemantics,
     Pattern, Query, SubqueryPattern,
@@ -96,7 +98,17 @@ fn not_exists_inner(p: &Pattern) -> Option<&[Pattern]> {
 
 /// Rewrite every matching avg-over-complement sub-SELECT in `query`, recursing
 /// into nested scopes. No-op for queries that do not match.
-pub fn fold_aggregate_complements(query: &mut Query) {
+pub fn fold_aggregate_complements(
+    query: &mut Query,
+    planning: &crate::temporal_mode::PlanningContext,
+) {
+    if planning.allow_semantic_elision
+        && !planning.multi_default_graph
+        && !planning.is_history()
+        && shared::fold(query)
+    {
+        return;
+    }
     let mut next_var = max_var_id(query).saturating_add(1);
     fold_in_patterns(&mut query.patterns, &mut next_var);
 }

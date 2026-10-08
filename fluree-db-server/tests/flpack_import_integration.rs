@@ -623,3 +623,343 @@ async fn negotiated_endpoints_404_when_presign_disabled() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+// ============================================================================
+// Source-upload (server-side bulk import) tests
+// ============================================================================
+
+/// Drive the mint → PUT → complete → poll handshake for a raw source upload.
+async fn run_source_upload(
+    state: &Arc<AppState>,
+    dst: &str,
+    filename: &str,
+    bytes: Vec<u8>,
+) -> JsonValue {
+    run_source_upload_with_options(state, dst, filename, bytes, JsonValue::Null).await
+}
+
+async fn run_source_upload_with_options(
+    state: &Arc<AppState>,
+    dst: &str,
+    filename: &str,
+    bytes: Vec<u8>,
+    options: JsonValue,
+) -> JsonValue {
+    let mut mint_body = json!({ "ledger": dst, "source_kind": "source", "filename": filename });
+    if let (Some(body), Some(options)) = (mint_body.as_object_mut(), options.as_object()) {
+        body.extend(options.clone());
+    }
+    let (status, mint) = json_request(
+        state,
+        Request::builder()
+            .method("POST")
+            .uri("/v1/fluree/import-upload")
+            .header("content-type", "application/json")
+            .body(Body::from(mint_body.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "mint: {mint:?}");
+    let import_id = mint["import_id"].as_str().expect("import_id").to_string();
+    let upload_url = mint["upload"]["url"]
+        .as_str()
+        .expect("upload.url")
+        .to_string();
+
+    let (status, _) = json_request(
+        state,
+        Request::builder()
+            .method("PUT")
+            .uri(&upload_url)
+            .header("content-type", "application/octet-stream")
+            .body(Body::from(bytes))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "source upload should succeed");
+
+    let (status, complete) = json_request(
+        state,
+        Request::builder()
+            .method("POST")
+            .uri(format!("/v1/fluree/import-upload/{import_id}/complete"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "complete: {complete:?}");
+
+    let mut final_status = JsonValue::Null;
+    for _ in 0..500 {
+        let (status, body) = json_request(
+            state,
+            Request::builder()
+                .method("GET")
+                .uri(format!("/v1/fluree/import-upload/{import_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        if matches!(body["status"].as_str(), Some("succeeded" | "failed")) {
+            final_status = body;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    final_status
+}
+
+#[tokio::test]
+async fn source_upload_ttl_imports_via_bulk_pipeline() {
+    let (_tmp, state) = presign_test_state().await;
+    let dst = "src-ttl/data:main";
+
+    let ttl = br#"@prefix ex: <http://example.org/ns/> .
+@prefix schema: <http://schema.org/> .
+ex:alice a ex:User ; schema:name "Alice" .
+ex:bob a ex:User ; schema:name "Bob" .
+"#
+    .to_vec();
+
+    let final_status = run_source_upload(&state, dst, "data.ttl", ttl).await;
+    assert_eq!(
+        final_status["status"], "succeeded",
+        "import should succeed: {final_status:?}"
+    );
+    assert_eq!(final_status["result"]["kind"], "bulk-import");
+    assert_eq!(final_status["result"]["ledger_id"], dst);
+    assert!(final_status["result"]["flake_count"].as_u64().unwrap_or(0) >= 4);
+
+    // The imported ledger is queryable.
+    let handle = state.fluree.ledger(dst).await.expect("load imported");
+    let query = json!({
+        "select": ["?name"],
+        "where": { "@id": "?s", "@type": "ex:User", "schema:name": "?name" },
+        "@context": { "ex": "http://example.org/ns/", "schema": "http://schema.org/" }
+    });
+    let db = GraphDb::from_ledger_state(&handle);
+    let out = state
+        .fluree
+        .query(&db, &query)
+        .await
+        .expect("query")
+        .to_jsonld(&handle.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(out.as_array().expect("array").len(), 2);
+}
+
+#[tokio::test]
+async fn source_upload_json_extension_imports_as_jsonld() {
+    let (_tmp, state) = presign_test_state().await;
+    let dst = "src-json/data:main";
+    let source = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@id": "ex:alice",
+        "ex:name": "Alice"
+    })
+    .to_string()
+    .into_bytes();
+
+    let final_status = run_source_upload(&state, dst, "data.json", source).await;
+    assert_eq!(
+        final_status["status"], "succeeded",
+        "JSON-LD with a .json extension should import: {final_status:?}"
+    );
+    let handle = state.fluree.ledger(dst).await.expect("load imported");
+    assert_eq!(handle.snapshot.t, 1);
+}
+
+#[tokio::test]
+async fn source_upload_cypher_converts_then_imports() {
+    let (_tmp, state) = presign_test_state().await;
+    let dst = "src-cypher/data:main";
+
+    let cypher = br#"CREATE (:Person {name: "Alice"});
+CREATE (:Person {name: "Bob"});
+"#
+    .to_vec();
+
+    let final_status = run_source_upload(&state, dst, "dump.cypher", cypher).await;
+    assert_eq!(
+        final_status["status"], "succeeded",
+        "import should succeed: {final_status:?}"
+    );
+    assert_eq!(final_status["result"]["ledger_id"], dst);
+    assert!(final_status["result"]["flake_count"].as_u64().unwrap_or(0) >= 4);
+
+    // The imported ledger loads and carries the two Person nodes (bare
+    // namespace-0 names — query through the Cypher surface).
+    let handle = state.fluree.ledger(dst).await.expect("load imported");
+    let db = GraphDb::from_ledger_state(&handle);
+    let result = state
+        .fluree
+        .query_cypher(&db, "MATCH (n:Person) RETURN n.name")
+        .await
+        .expect("cypher query");
+    assert_eq!(result.row_count(), 2);
+}
+
+#[tokio::test]
+async fn source_upload_cypher_preserves_conversion_options() {
+    let (_tmp, state) = presign_test_state().await;
+    let dst = "src-cypher-options/data:main";
+    let cypher = br#"CREATE (:Person {name: "Alice"});
+CREATE (:Person {name: "Bob"});
+MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS {since: 2020}]->(b);
+"#
+    .to_vec();
+
+    let final_status = run_source_upload_with_options(
+        &state,
+        dst,
+        "dump.cypher",
+        cypher,
+        json!({
+            "edge_properties": "plain",
+            "base_iri": "http://example.org/kb/"
+        }),
+    )
+    .await;
+    assert_eq!(final_status["status"], "succeeded", "{final_status:?}");
+    assert_eq!(final_status["result"]["has_annotations"], false);
+
+    let handle = state.fluree.ledger(dst).await.expect("load imported");
+    let db = GraphDb::from_ledger_state(&handle)
+        .with_default_context(Some(json!({"@vocab": "http://example.org/kb/"})));
+    let result = state
+        .fluree
+        .query_cypher(&db, "MATCH (:Person)-[r:KNOWS]->(:Person) RETURN type(r)")
+        .await
+        .expect("query imported names");
+    assert_eq!(result.row_count(), 1);
+}
+
+#[tokio::test]
+async fn source_upload_rejects_unknown_extension_and_missing_filename() {
+    let (_tmp, state) = presign_test_state().await;
+
+    // Unsupported format.
+    let (status, body) = json_request(
+        &state,
+        Request::builder()
+            .method("POST")
+            .uri("/v1/fluree/import-upload")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "ledger": "x:main", "source_kind": "source", "filename": "data.parquet" })
+                    .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+
+    // Missing filename.
+    let (status, body) = json_request(
+        &state,
+        Request::builder()
+            .method("POST")
+            .uri("/v1/fluree/import-upload")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "ledger": "x:main", "source_kind": "source" }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+
+    // Compressed CSV is refused (the converter reads plain files).
+    let (status, body) = json_request(
+        &state,
+        Request::builder()
+            .method("POST")
+            .uri("/v1/fluree/import-upload")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "ledger": "x:main", "source_kind": "source", "filename": "d.csv.gz" })
+                    .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+}
+
+#[tokio::test]
+async fn discovery_advertises_source_upload_when_presign_enabled() {
+    let (_tmp, state) = presign_test_state().await;
+    let (status, body) = json_request(
+        &state,
+        Request::builder()
+            .method("GET")
+            .uri("/.well-known/fluree.json")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let modes: Vec<&str> = body["import"]["modes"]
+        .as_array()
+        .expect("modes")
+        .iter()
+        .filter_map(|m| m.as_str())
+        .collect();
+    assert!(modes.contains(&"source-upload"), "{modes:?}");
+    let formats = body["import"]["source_formats"]
+        .as_array()
+        .expect("source_formats");
+    assert!(formats.iter().any(|f| f == "ttl"), "{formats:?}");
+    assert!(formats.iter().any(|f| f == "cypher"), "{formats:?}");
+}
+
+#[tokio::test]
+async fn source_upload_with_relationships_seals_annotation_arena() {
+    let (_tmp, state) = presign_test_state().await;
+    let dst = "src-cypher-rel/data:main";
+
+    // Relationship CREATEs reify edges (EdgePolicy::Annotated default), so the
+    // imported ledger carries f:reifies* facts; the post-import reindex must
+    // leave a sealed annotation arena, not scan-fallback.
+    let cypher = br#"CREATE (:Person {name: "Alice"});
+CREATE (:Person {name: "Bob"});
+MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS {since: 2020}]->(b);
+"#
+    .to_vec();
+
+    let final_status = run_source_upload(&state, dst, "dump.cypher", cypher).await;
+    assert_eq!(
+        final_status["status"], "succeeded",
+        "import should succeed: {final_status:?}"
+    );
+    assert_eq!(final_status["result"]["has_annotations"], true);
+
+    let handle = state.fluree.ledger(dst).await.expect("load imported");
+    let expected_root = handle
+        .head_index_id
+        .as_ref()
+        .map(std::string::ToString::to_string);
+    assert_eq!(
+        final_status["result"]["root_id"].as_str(),
+        expected_root.as_deref(),
+        "job result must return the post-seal nameservice root"
+    );
+    assert!(
+        handle.snapshot.has_annotations,
+        "imported ledger carries annotations"
+    );
+    assert!(
+        handle.snapshot.annotation_index.is_some(),
+        "post-import reindex must seal the annotation arena"
+    );
+
+    // The relationship is queryable through the Cypher surface.
+    let db = GraphDb::from_ledger_state(&handle);
+    let result = state
+        .fluree
+        .query_cypher(&db, "MATCH (:Person)-[r:KNOWS]->(:Person) RETURN r.since")
+        .await
+        .expect("cypher rel query");
+    assert_eq!(result.row_count(), 1);
+}

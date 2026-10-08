@@ -6,8 +6,9 @@ use crate::binding::{Binding, RowAccess};
 use crate::context::ExecutionContext;
 use crate::context::WellKnownDatatypes;
 use crate::error::{QueryError, Result};
-use crate::ir::{Expression, Function};
+use crate::ir::{CompareOp, Expression, Function};
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
+use fluree_db_core::temporal::CalendarField;
 use fluree_db_core::{FlakeValue, ObjKind};
 use once_cell::sync::Lazy;
 use regex::{Regex, RegexBuilder};
@@ -63,6 +64,13 @@ struct CacheableBoolPredicate {
 pub struct PreparedBoolExpression {
     expr: Expression,
     cache_spec: Option<CacheableBoolPredicate>,
+    /// `?var = <const>` / `!=`: `compare::fast_eq_ne_for_iri_bindings` answers
+    /// this shape with a memoized constant resolution and a `u64` compare,
+    /// which is cheaper than probing the encoded-bool-predicate cache — over
+    /// ~4k distinct products BSBM Q5's `FILTER(<product> != ?product)` spent
+    /// more time thrashing the 256-entry LRU than comparing. Tried first; rows
+    /// it cannot decide still go through the cache.
+    iri_eq_op: Option<CompareOp>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,7 +98,10 @@ thread_local! {
 
 /// Build a regex with optional flags (cached)
 ///
-/// Supported flags: i (case-insensitive), m (multiline), s (dot-all), x (ignore whitespace)
+/// Supported flags: i (case-insensitive), m (multiline), s (dot-all),
+/// x (ignore whitespace), q (literal pattern — all metacharacters escaped,
+/// XPath `fn:matches`). Per XPath F&O §5.6.2, `q` used together with `m`,
+/// `s`, or `x` renders those flags no-ops; `q` composes with `i`.
 /// Returns an error for unknown flags (not silent ignore).
 ///
 /// Uses a thread-local LRU cache to avoid recompiling the same pattern+flags
@@ -104,27 +115,46 @@ pub fn build_regex_with_flags(pattern: &str, flags: &str) -> Result<Regex> {
         return Ok(re);
     }
 
-    // Not in cache - compile and store
-    let mut builder = RegexBuilder::new(pattern);
+    // Validate flags before compiling; `q` escapes the whole pattern.
+    let literal = flags.contains('q');
     for flag in flags.chars() {
         match flag {
-            'i' => {
-                builder.case_insensitive(true);
-            }
-            'm' => {
-                builder.multi_line(true);
-            }
-            's' => {
-                builder.dot_matches_new_line(true);
-            }
-            'x' => {
-                builder.ignore_whitespace(true);
-            }
+            'i' | 'm' | 's' | 'x' | 'q' => {}
             c => {
                 return Err(QueryError::InvalidFilter(format!(
                     "Unknown regex flag: '{c}'"
                 )));
             }
+        }
+    }
+
+    let escaped;
+    let effective_pattern = if literal {
+        escaped = regex::escape(pattern);
+        &escaped
+    } else {
+        pattern
+    };
+
+    // Not in cache - compile and store
+    let mut builder = RegexBuilder::new(effective_pattern);
+    for flag in flags.chars() {
+        match flag {
+            'i' => {
+                builder.case_insensitive(true);
+            }
+            // `q` neutralizes m/s/x (they'd have no meaning against an
+            // escaped literal anyway — x would strip literal whitespace).
+            'm' if !literal => {
+                builder.multi_line(true);
+            }
+            's' if !literal => {
+                builder.dot_matches_new_line(true);
+            }
+            'x' if !literal => {
+                builder.ignore_whitespace(true);
+            }
+            _ => {}
         }
     }
     let re = builder
@@ -142,7 +172,12 @@ pub fn build_regex_with_flags(pattern: &str, flags: &str) -> Result<Regex> {
 impl PreparedBoolExpression {
     pub fn new(expr: Expression) -> Self {
         let cache_spec = analyze_cacheable_bool_predicate(&expr);
-        Self { expr, cache_spec }
+        let iri_eq_op = cache_spec.and(var_const_eq_shape(&expr));
+        Self {
+            expr,
+            cache_spec,
+            iri_eq_op,
+        }
     }
 
     pub fn expr(&self) -> &Expression {
@@ -158,6 +193,11 @@ impl PreparedBoolExpression {
         row: &R,
         ctx: Option<&ExecutionContext<'_>>,
     ) -> Result<bool> {
+        if let (Some(op), Expression::Call { args, .. }) = (self.iri_eq_op, &self.expr) {
+            if let Some(pass) = super::compare::fast_eq_ne_for_iri_bindings(op, args, row, ctx)? {
+                return Ok(pass);
+            }
+        }
         if let Some(pass) =
             eval_cached_bool_predicate_with_spec(self.cache_spec.as_ref(), row, ctx, || {
                 self.expr.eval_to_bool_uncached(row, ctx)
@@ -230,6 +270,27 @@ fn eval_cached_bool_predicate_with_spec<R: RowAccess>(
         cache.borrow_mut().put(cache_key, pass);
     });
     Ok(Some(pass))
+}
+
+/// `Eq`/`Ne` between one variable and one variable-free operand — the shape
+/// [`super::compare::fast_eq_ne_for_iri_bindings`] decides for a
+/// resource-valued binding without materializing anything.
+fn var_const_eq_shape(expr: &Expression) -> Option<CompareOp> {
+    let Expression::Call { func, args } = expr else {
+        return None;
+    };
+    let op = match func {
+        Function::Eq => CompareOp::Eq,
+        Function::Ne => CompareOp::Ne,
+        _ => return None,
+    };
+    if args.len() != 2 {
+        return None;
+    }
+    let is_var = |e: &Expression| matches!(e, Expression::Var(_));
+    let is_const = |e: &Expression| !is_var(e) && e.referenced_vars().is_empty();
+    ((is_var(&args[0]) && is_const(&args[1])) || (is_const(&args[0]) && is_var(&args[1])))
+        .then_some(op)
 }
 
 /// Cheap, hash-free variable-usage walk used to pre-filter cacheable predicates.
@@ -411,6 +472,7 @@ fn function_supported_for_bool_cache(func: &Function) -> bool {
         func,
         Function::Rand
             | Function::Now
+            | Function::Today
             | Function::Uuid
             | Function::StrUuid
             | Function::Bnode
@@ -423,6 +485,59 @@ fn function_supported_for_bool_cache(func: &Function) -> bool {
             | Function::Op
             | Function::Custom(_)
     )
+}
+
+/// Whether evaluating `expr` twice against the same row is guaranteed to give
+/// the same answer.
+///
+/// Sinking a `FILTER` into an annotation wrapper *copies* it rather than moving
+/// it, so the original keeps feeding any sibling triple's `ObjectBounds`
+/// pushdown. Copying only preserves semantics when the expression is a pure
+/// function of its row: `FILTER(?c > RAND())` evaluated twice keeps a different
+/// set of rows than the same filter evaluated once, so that one has to be moved
+/// rather than copied.
+///
+/// This is the same question [`function_supported_for_bool_cache`] answers — a
+/// result that may differ between two calls can be neither cached nor
+/// duplicated — so both read one exclusion list instead of drifting apart. If a
+/// function is added there, duplication safety follows automatically.
+pub(crate) fn expression_is_duplication_safe(expr: &Expression) -> bool {
+    match expr {
+        Expression::Call { func, args } => {
+            function_supported_for_bool_cache(func)
+                && args.iter().all(expression_is_duplication_safe)
+        }
+        Expression::Map(entries) => entries
+            .iter()
+            .all(|(_, v)| expression_is_duplication_safe(v)),
+        Expression::ListComprehension {
+            list, filter, map, ..
+        } => {
+            expression_is_duplication_safe(list)
+                && filter.as_deref().is_none_or(expression_is_duplication_safe)
+                && map.as_deref().is_none_or(expression_is_duplication_safe)
+        }
+        Expression::Reduce {
+            init, list, body, ..
+        } => {
+            expression_is_duplication_safe(init)
+                && expression_is_duplication_safe(list)
+                && expression_is_duplication_safe(body)
+        }
+        Expression::ListPredicate {
+            list, predicate, ..
+        } => expression_is_duplication_safe(list) && expression_is_duplication_safe(predicate),
+        Expression::Member { target, .. } => expression_is_duplication_safe(target),
+        // Resolved per-row against the execution context. The sink already
+        // declines these via `contains_exists`; excluded here too so the
+        // predicate stands on its own rather than relying on a caller's gate.
+        Expression::Exists { .. } | Expression::PatternComprehension { .. } => false,
+        // Already resolved against one execution context; re-evaluating it
+        // elsewhere is not obviously the same question, so decline rather than
+        // reason about which context it was resolved in.
+        Expression::Resolved(_) => false,
+        Expression::Var(_) | Expression::Const(_) => true,
+    }
 }
 
 fn function_returns_bool(func: &Function, all_children_return_bool: bool) -> bool {
@@ -462,7 +577,7 @@ fn function_may_materialize_encoded_value(func: &Function) -> bool {
             | Function::StrEnds
             | Function::Regex
             | Function::Str
-            | Function::Lang
+            | Function::Lang { .. }
             | Function::Lcase
             | Function::Ucase
             | Function::Strlen
@@ -481,7 +596,7 @@ fn function_may_materialize_encoded_value(func: &Function) -> bool {
             | Function::EncodeForUri
             | Function::StrDt
             | Function::StrLang
-            | Function::Datatype
+            | Function::Datatype { .. }
             | Function::LangMatches
             | Function::SameTerm
             | Function::Iri
@@ -498,6 +613,9 @@ fn function_may_materialize_encoded_value(func: &Function) -> bool {
             | Function::XsdDouble
             | Function::XsdDecimal
             | Function::XsdString
+            | Function::XsdDateTime
+            | Function::XsdDate
+            | Function::XsdTime
             | Function::Year
             | Function::Month
             | Function::Day
@@ -528,14 +646,14 @@ fn hash_flake_value(value: &FlakeValue, state: &mut impl Hasher) {
         FlakeValue::Double(v) => v.to_bits().hash(state),
         FlakeValue::BigInt(v) => v.to_string().hash(state),
         FlakeValue::Decimal(v) => v.to_string().hash(state),
-        FlakeValue::DateTime(v) => v.original().hash(state),
-        FlakeValue::Date(v) => v.original().hash(state),
-        FlakeValue::Time(v) => v.original().hash(state),
-        FlakeValue::GYear(v) => v.original().hash(state),
-        FlakeValue::GYearMonth(v) => v.original().hash(state),
-        FlakeValue::GMonth(v) => v.original().hash(state),
-        FlakeValue::GDay(v) => v.original().hash(state),
-        FlakeValue::GMonthDay(v) => v.original().hash(state),
+        FlakeValue::DateTime(v) => v.hash(state),
+        FlakeValue::Date(v) => v.hash(state),
+        FlakeValue::Time(v) => v.hash(state),
+        FlakeValue::GYear(v) => v.hash(state),
+        FlakeValue::GYearMonth(v) => v.hash(state),
+        FlakeValue::GMonth(v) => v.hash(state),
+        FlakeValue::GDay(v) => v.hash(state),
+        FlakeValue::GMonthDay(v) => v.hash(state),
         FlakeValue::YearMonthDuration(v) => v.original().hash(state),
         FlakeValue::DayTimeDuration(v) => v.original().hash(state),
         FlakeValue::Duration(v) => v.original().hash(state),
@@ -589,6 +707,18 @@ pub fn check_min_arity(args: &[Expression], min: usize, fn_name: &str) -> Result
 // DateTime Parsing
 // =============================================================================
 
+/// Whether `dt` is one of the datatypes the temporal readers accept.
+fn is_temporal_datatype(dt: &fluree_db_core::Sid, datatypes: &WellKnownDatatypes) -> bool {
+    *dt == datatypes.xsd_datetime
+        || *dt == datatypes.xsd_date
+        || *dt == datatypes.xsd_time
+        || *dt == datatypes.xsd_g_year
+        || *dt == datatypes.xsd_g_year_month
+        || *dt == datatypes.xsd_g_month
+        || *dt == datatypes.xsd_g_day
+        || *dt == datatypes.xsd_g_month_day
+}
+
 /// Parse a datetime from a binding, respecting datatype
 ///
 /// Returns None if not a datetime type or parse fails.
@@ -605,19 +735,9 @@ pub fn parse_datetime_from_binding(
     match binding {
         Binding::Lit { val, dtc, .. } => {
             let dt = dtc.datatype();
-            let is_datetime_type = *dt == datatypes.xsd_datetime
-                || *dt == datatypes.xsd_date
-                || *dt == datatypes.xsd_time
-                || *dt == datatypes.xsd_g_year
-                || *dt == datatypes.xsd_g_year_month
-                || *dt == datatypes.xsd_g_month
-                || *dt == datatypes.xsd_g_day
-                || *dt == datatypes.xsd_g_month_day;
-
-            if !is_datetime_type {
+            if !is_temporal_datatype(dt, datatypes) {
                 return None;
             }
-
             flake_value_to_datetime(val, Some(dt), datatypes)
         }
         Binding::EncodedLit {
@@ -631,28 +751,81 @@ pub fn parse_datetime_from_binding(
             let ctx = ctx?;
             let store = ctx.binary_store.as_deref()?;
             let dt_sid = store.dt_sids().get(*dt_id as usize)?.clone();
-
-            let is_datetime_type = dt_sid == datatypes.xsd_datetime
-                || dt_sid == datatypes.xsd_date
-                || dt_sid == datatypes.xsd_time
-                || dt_sid == datatypes.xsd_g_year
-                || dt_sid == datatypes.xsd_g_year_month
-                || dt_sid == datatypes.xsd_g_month
-                || dt_sid == datatypes.xsd_g_day
-                || dt_sid == datatypes.xsd_g_month_day;
-            if !is_datetime_type {
+            if !is_temporal_datatype(&dt_sid, datatypes) {
                 return None;
             }
-
             let gv = ctx.graph_view()?;
             let val = gv
                 .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
                 .ok()?;
-
             flake_value_to_datetime(&val, Some(&dt_sid), datatypes)
         }
         _ => None,
     }
+}
+
+/// Whether this binding holds a temporal value — the only question `TZ` and
+/// `TIMEZONE` need to answer.
+///
+/// Deliberately inspects the datatype alone and never decodes the value: Fluree
+/// normalizes temporals to UTC and does not persist the source offset, so the
+/// answer cannot depend on the value. Skipping the decode also keeps `TZ` cheap,
+/// since it is evaluated per row.
+pub fn binding_is_temporal(binding: &Binding, ctx: Option<&ExecutionContext<'_>>) -> bool {
+    let datatypes = &*WELL_KNOWN_DATATYPES;
+    match binding {
+        Binding::Lit { dtc, .. } => is_temporal_datatype(dtc.datatype(), datatypes),
+        Binding::EncodedLit { dt_id, .. } => ctx
+            .and_then(|c| c.binary_store.as_deref())
+            .and_then(|store| store.dt_sids().get(*dt_id as usize))
+            .is_some_and(|dt_sid| is_temporal_datatype(dt_sid, datatypes)),
+        _ => false,
+    }
+}
+
+/// Promote a calendar fragment (`xsd:gYear` and friends) to a whole instant,
+/// filling the fields it does not carry from [`CalendarField::promotion_default`].
+///
+/// The filler is for whole-value uses only — comparison, ordering,
+/// `TZ`/`TIMEZONE`. Reading a field back off the result is only valid once
+/// [`TemporalKind::carries`] says the value carries it; the SPARQL accessors
+/// check that first (see `eval::datetime`), because reporting a filled field as
+/// data is exactly what made `DAY("2005"^^xsd:gYear)` answer 1.
+/// The date a value carrying no date at all promotes to, from the shared
+/// defaults: the Unix epoch's 1970-01-01.
+fn promotion_default_date() -> Option<NaiveDate> {
+    NaiveDate::from_ymd_opt(
+        i32::try_from(CalendarField::Year.promotion_default()).ok()?,
+        u32::try_from(CalendarField::Month.promotion_default()).ok()?,
+        u32::try_from(CalendarField::Day.promotion_default()).ok()?,
+    )
+}
+
+/// Promote a gYear-family fragment to a full instant by filling the missing
+/// fields from the shared defaults. Always UTC — these types carry no timezone
+/// (see `fluree_db_core::temporal`).
+fn promote_calendar_fragment(
+    year: Option<i32>,
+    month: Option<u32>,
+    day: Option<u32>,
+) -> Option<DateTime<FixedOffset>> {
+    let offset = FixedOffset::east_opt(0)?;
+    let naive = NaiveDate::from_ymd_opt(
+        year.unwrap_or(i32::try_from(CalendarField::Year.promotion_default()).ok()?),
+        month.unwrap_or(u32::try_from(CalendarField::Month.promotion_default()).ok()?),
+        day.unwrap_or(u32::try_from(CalendarField::Day.promotion_default()).ok()?),
+    )?
+    .and_hms_opt(
+        u32::try_from(CalendarField::Hour.promotion_default()).ok()?,
+        u32::try_from(CalendarField::Minute.promotion_default()).ok()?,
+        u32::try_from(CalendarField::Second.promotion_default()).ok()?,
+    )?;
+    Some(
+        offset
+            .from_local_datetime(&naive)
+            .single()
+            .unwrap_or_else(|| offset.from_utc_datetime(&naive)),
+    )
 }
 
 /// Convert a FlakeValue to a DateTime, handling all XSD temporal types.
@@ -667,95 +840,30 @@ fn flake_value_to_datetime(
     let utc = FixedOffset::east_opt(0).unwrap();
 
     match val {
-        FlakeValue::DateTime(dt) => {
-            let offset = dt.tz_offset().unwrap_or(utc);
-            Some(dt.instant().with_timezone(&offset))
-        }
-        FlakeValue::Date(d) => {
-            let offset = d.tz_offset().unwrap_or(utc);
-            let naive = d.date().and_hms_opt(0, 0, 0)?;
-            Some(
-                offset
-                    .from_local_datetime(&naive)
-                    .single()
-                    .unwrap_or_else(|| offset.from_utc_datetime(&naive)),
-            )
-        }
+        // Temporal values carry no offset (see fluree_db_core::temporal), so
+        // every component is read in UTC on both storage lanes.
+        FlakeValue::DateTime(dt) => Some(dt.instant().with_timezone(&utc)),
+        FlakeValue::Date(d) => Some(utc.from_utc_datetime(&d.date().and_hms_opt(0, 0, 0)?)),
         FlakeValue::Time(t) => {
-            let offset = t.tz_offset().unwrap_or(utc);
-            let date = NaiveDate::from_ymd_opt(1970, 1, 1)?;
-            let naive = NaiveDateTime::new(date, t.time());
-            Some(
-                offset
-                    .from_local_datetime(&naive)
-                    .single()
-                    .unwrap_or_else(|| offset.from_utc_datetime(&naive)),
-            )
+            // A time carries no date; fill it from the shared defaults.
+            let date = promotion_default_date()?;
+            Some(utc.from_utc_datetime(&NaiveDateTime::new(date, t.time())))
         }
-        FlakeValue::GYear(gy) => {
-            let offset = gy.tz_offset().unwrap_or(utc);
-            let naive = NaiveDate::from_ymd_opt(gy.year(), 1, 1)?.and_hms_opt(0, 0, 0)?;
-            Some(
-                offset
-                    .from_local_datetime(&naive)
-                    .single()
-                    .unwrap_or_else(|| offset.from_utc_datetime(&naive)),
-            )
-        }
+        FlakeValue::GYear(gy) => promote_calendar_fragment(Some(gy.year()), None, None),
         FlakeValue::GYearMonth(gym) => {
-            let offset = gym.tz_offset().unwrap_or(utc);
-            let naive =
-                NaiveDate::from_ymd_opt(gym.year(), gym.month(), 1)?.and_hms_opt(0, 0, 0)?;
-            Some(
-                offset
-                    .from_local_datetime(&naive)
-                    .single()
-                    .unwrap_or_else(|| offset.from_utc_datetime(&naive)),
-            )
+            promote_calendar_fragment(Some(gym.year()), Some(gym.month()), None)
         }
-        FlakeValue::GMonth(gm) => {
-            let offset = gm.tz_offset().unwrap_or(utc);
-            let naive = NaiveDate::from_ymd_opt(1970, gm.month(), 1)?.and_hms_opt(0, 0, 0)?;
-            Some(
-                offset
-                    .from_local_datetime(&naive)
-                    .single()
-                    .unwrap_or_else(|| offset.from_utc_datetime(&naive)),
-            )
-        }
-        FlakeValue::GDay(gd) => {
-            let offset = gd.tz_offset().unwrap_or(utc);
-            let naive = NaiveDate::from_ymd_opt(1970, 1, gd.day())?.and_hms_opt(0, 0, 0)?;
-            Some(
-                offset
-                    .from_local_datetime(&naive)
-                    .single()
-                    .unwrap_or_else(|| offset.from_utc_datetime(&naive)),
-            )
-        }
+        FlakeValue::GMonth(gm) => promote_calendar_fragment(None, Some(gm.month()), None),
+        FlakeValue::GDay(gd) => promote_calendar_fragment(None, None, Some(gd.day())),
         FlakeValue::GMonthDay(gmd) => {
-            let offset = gmd.tz_offset().unwrap_or(utc);
-            let naive =
-                NaiveDate::from_ymd_opt(1970, gmd.month(), gmd.day())?.and_hms_opt(0, 0, 0)?;
-            Some(
-                offset
-                    .from_local_datetime(&naive)
-                    .single()
-                    .unwrap_or_else(|| offset.from_utc_datetime(&naive)),
-            )
+            promote_calendar_fragment(None, Some(gmd.month()), Some(gmd.day()))
         }
         FlakeValue::String(s) => DateTime::parse_from_rfc3339(s).ok().or_else(|| {
             let with_time = format!("{s}T00:00:00+00:00");
             DateTime::parse_from_rfc3339(&with_time).ok()
         }),
         FlakeValue::Long(y) if dt_sid == Some(&datatypes.xsd_g_year) => {
-            let year = i32::try_from(*y).ok()?;
-            let naive = NaiveDate::from_ymd_opt(year, 1, 1)?.and_hms_opt(0, 0, 0)?;
-            Some(
-                utc.from_local_datetime(&naive)
-                    .single()
-                    .unwrap_or_else(|| utc.from_utc_datetime(&naive)),
-            )
+            promote_calendar_fragment(Some(i32::try_from(*y).ok()?), None, None)
         }
         _ => None,
     }

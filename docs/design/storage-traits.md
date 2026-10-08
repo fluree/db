@@ -79,6 +79,10 @@ pub trait ContentStore: Debug + Send + Sync {
 
     /// Check whether an object exists
     async fn has(&self, id: &ContentId) -> Result<bool>;
+
+    /// Whether bytes returned by `get` may be persisted unencrypted outside
+    /// this store (the binary-index disk cache). Required: see below.
+    fn permits_plaintext_cache(&self) -> bool;
 }
 ```
 
@@ -86,7 +90,7 @@ pub trait ContentStore: Debug + Send + Sync {
 - `ContentId` is a CIDv1 value encoding the hash function, digest, and content kind (multicodec). See [ContentId and ContentStore](content-id-and-contentstore.md).
 - `ContentKind` enables routing to different storage tiers (commit store vs index store) without parsing URL paths.
 - `put` computes the content hash and returns the derived `ContentId`.
-- Implementations include `MemoryContentStore` (for testing) and `BridgeContentStore` (adapts a `Storage` backend).
+- Implementations include `MemoryContentStore` (for testing), `StorageContentStore<S>` (adapts a `Storage` backend), and `BranchedContentStore` (branch-scoped reads).
 
 ## Physical Storage Traits (fluree-db-core)
 
@@ -129,12 +133,43 @@ pub trait StorageRead: Debug + Send + Sync {
 
     /// Resolve a CAS address to a local filesystem path, if available.
     fn resolve_local_path(&self, address: &str) -> Option<PathBuf> { None }
+
+    /// Whether bytes read here may be persisted unencrypted outside this
+    /// storage. Plain backends answer `true`; `EncryptedStorage` answers
+    /// `false`; wrappers delegate.
+    fn permits_plaintext_cache(&self) -> bool;
+
+    /// The key-rotation surface when this storage encrypts at rest, else
+    /// `None`. Wrappers delegate; `EncryptedStorage` returns itself.
+    fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>>;
 }
 
 /// `(address, size)` pair returned by `list_prefix_with_metadata`.
 pub struct RemoteObject {
     pub address: String,
     pub size_bytes: u64,
+}
+```
+
+`permits_plaintext_cache` and `encryption_admin` have no default on purpose. A
+wrapper that forgot to delegate would otherwise re-open a plaintext copy of an
+encrypted ledger in the disk cache, or report an encrypted store as plaintext
+(to the status endpoint and to key rotation). Every implementation has to
+answer, so the compiler catches a missing delegation.
+
+`EncryptionAdmin` is what key rotation drives:
+
+```rust
+#[async_trait]
+pub trait EncryptionAdmin: Send + Sync {
+    /// Ids of every key the storage can decrypt with, current first.
+    fn key_ids(&self) -> Vec<u32>;
+    /// Id of the key that encrypts new writes.
+    fn current_key_id(&self) -> u32;
+    /// The key id in the envelope at `address`, from its header alone.
+    async fn key_id_at(&self, address: &str) -> Result<Option<u32>>;
+    /// Re-envelope the blob at `address` under the current key, in place.
+    async fn reencrypt(&self, address: &str) -> Result<Option<u64>>;
 }
 ```
 
@@ -168,6 +203,35 @@ pub trait StorageWrite: Debug + Send + Sync {
 **Design notes:**
 - `delete` is part of the core write trait (not separate) because any writable storage should support deletion
 - Implementations should be idempotent: deleting a non-existent address succeeds silently
+
+**Write visibility and durability.** The trait does not say when a write becomes
+visible or when it is safe against power loss; that is each backend's contract:
+
+| Backend | Visibility | Durability |
+|---|---|---|
+| `FileStorage` | Atomic. Bytes are staged beside the destination and moved into place, so a reader at the address sees the previous contents or the complete new contents, never a partial file. | Per `Durability` on the instance — `Sync` (default) flushes the file and its parent directory before returning; `PageCache` returns once the bytes reach the OS page cache. |
+| `MemoryStorage` | Atomic (map insert). | None — process lifetime only. |
+| `S3Storage` | Atomic (object PUT). | Acknowledged after replication. |
+
+`FileStorage` also narrows durability by `ContentKind`: kinds for which
+`ContentKind::is_derived()` is true (index nodes, dictionaries, sketches,
+annotation arenas) are written `PageCache` in either mode, because they are
+rebuildable from the commit chain and are written at much higher volume than
+commits. Source-of-truth kinds — `Commit`, `Txn`, `LedgerConfig`,
+`GraphSourceMapping` — follow the instance setting. The match is exhaustive, so
+adding a `ContentKind` forces this decision at compile time.
+
+`StorageWrite::sync` (and `ContentStore::sync`, which forwards to it) flushes
+whatever the backend reported complete short of the device: for `FileStorage`,
+the derived content written since the last call. Publishing a pointer to
+derived content — an index head — calls it first, so the pointer never names
+files that did not reach the device, and the flushes are paid once per build
+rather than once per object. Backends whose writes are durable on return keep
+the default no-op.
+
+Callers that need a durability guarantee should get it from the backend rather
+than adding flushes of their own; see
+[Storage durability](../operations/storage.md#durability).
 
 ### ContentAddressedWrite
 
@@ -210,25 +274,26 @@ pub trait ContentAddressedWrite: StorageWrite {
 A convenience marker trait indicating full storage capability.
 
 ```rust
-/// Full storage capability: read + content-addressed write
-pub trait Storage: StorageRead + ContentAddressedWrite {}
+/// Full storage capability: read + content-addressed write + method reporting.
+/// Used for type erasure in `AnyStorage`.
+pub trait Storage: StorageRead + ContentAddressedWrite + StorageMethod {}
 
-/// Blanket implementation for any type implementing both traits
-impl<T: StorageRead + ContentAddressedWrite> Storage for T {}
+/// Blanket implementation for any type implementing all three traits
+impl<T: StorageRead + ContentAddressedWrite + StorageMethod> Storage for T {}
 ```
 
 **Usage:**
 ```rust
 // Instead of this verbose bound:
-fn process<S: StorageRead + StorageWrite + ContentAddressedWrite>(storage: &S)
+fn process<S: StorageRead + ContentAddressedWrite + StorageMethod>(storage: &S)
 
 // Use this:
 fn process<S: Storage>(storage: &S)
 ```
 
-## Extension Traits (fluree-db-nameservice)
+## Extension Traits
 
-The nameservice crate defines additional traits with `StorageExtResult<T>` for richer error handling (e.g., `PreconditionFailed` for CAS operations).
+Additional traits using `StorageExtResult<T>` for richer error handling (e.g. `PreconditionFailed` for CAS operations). These live alongside the core traits in `fluree-db-core/src/storage.rs`.
 
 ### StorageList
 
@@ -254,22 +319,42 @@ Compare-and-swap operations for consistent distributed updates.
 
 ```rust
 #[async_trait]
-pub trait StorageCas {
-    /// Write only if the address doesn't exist
-    async fn write_if_absent(&self, address: &str, bytes: &[u8]) -> StorageExtResult<bool>;
+pub trait StorageCas: Debug + Send + Sync {
+    /// Write bytes only if the key does not already exist.
+    /// Returns `true` if the key was created, `false` if it already existed.
+    async fn insert(&self, address: &str, bytes: &[u8]) -> StorageExtResult<bool>;
 
-    /// Write only if the current version matches expected_etag
-    async fn write_if_match(
-        &self,
-        address: &str,
-        bytes: &[u8],
-        expected_etag: &str,
-    ) -> StorageExtResult<String>;
-
-    /// Read with version/etag for subsequent CAS operations
-    async fn read_with_etag(&self, address: &str) -> StorageExtResult<(Vec<u8>, String)>;
+    /// Atomic read-modify-write. The closure may be called more than once on
+    /// retry, so it must be a pure function of its input.
+    ///
+    /// The closure is `'static` so an implementation can run it off the
+    /// calling task, for example on a blocking thread.
+    async fn compare_and_swap<T, F>(&self, address: &str, f: F) -> StorageExtResult<CasOutcome<T>>
+    where
+        F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError>
+            + Send
+            + Sync
+            + 'static,
+        T: Send + 'static;
 }
 ```
+
+This is the nameservice head path: `compare_and_swap` publishes a new head
+against the exact head a commit was built on, and `insert`'s create-if-absent
+answer is what detects a duplicate ledger.
+
+Both follow the same visibility and durability rules as `StorageWrite` above. On
+`FileStorage` they take the instance's `Durability` — nameservice records are
+source-of-truth, never derived — so with the default an acknowledged head
+publish has been flushed to the device.
+
+`insert` stages its bytes and hard-links them into place, since a rename would
+overwrite an existing file and destroy the create-if-absent answer. Filesystems
+that refuse `link(2)` outright — exFAT, some FUSE and NFS mounts, which report
+`EPERM` or `EOPNOTSUPP` — fall back to `O_CREAT|O_EXCL` and write in place. The
+create-if-absent answer and the durability are unchanged there; only the staged
+file's atomicity is lost, so on those mounts a reader can observe a partial file
+at a *newly created* address. Overwrites and CAS write-backs are unaffected.
 
 ### StorageDelete (nameservice)
 
@@ -312,6 +397,14 @@ impl StorageRead for MyReadOnlyStorage {
     async fn list_prefix(&self, _prefix: &str) -> Result<Vec<String>> {
         Err(Error::storage("list_prefix not supported"))
     }
+
+    fn permits_plaintext_cache(&self) -> bool {
+        true
+    }
+
+    fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>> {
+        None
+    }
 }
 
 // Must also implement StorageWrite (with error stubs) and ContentAddressedWrite
@@ -345,6 +438,8 @@ impl StorageRead for MyStorage {
     async fn read_bytes(&self, address: &str) -> Result<Vec<u8>> { ... }
     async fn exists(&self, address: &str) -> Result<bool> { ... }
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> { ... }
+    fn permits_plaintext_cache(&self) -> bool { true }
+    fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>> { None }
 }
 
 #[async_trait]
@@ -523,9 +618,13 @@ Adds transparent encryption:
 ```rust
 pub struct EncryptedStorage<S, K> {
     inner: S,
-    key_provider: K,
+    keys: Arc<K>,
 }
 ```
+
+Built with `EncryptedStorage::new(inner, keys)` or `with_arc_keys`. It answers
+`permits_plaintext_cache() == false` and implements `EncryptionAdmin` for key
+rotation.
 
 ### AddressIdentifierResolverStorage
 

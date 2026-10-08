@@ -18,6 +18,8 @@ use serde_json::Value as JsonValue;
 
 use crate::error::{BuilderError, BuilderErrors};
 use crate::format::FormatterConfig;
+use crate::query::connection::FormatTarget;
+#[cfg(feature = "iceberg")]
 use crate::query::helpers::parse_dataset_spec;
 use crate::view::{DataSetDb, GraphDb, QueryInput};
 use crate::{
@@ -37,8 +39,6 @@ pub enum GraphSourceMode {
     /// No graph source integration (default).
     #[default]
     None,
-    /// Enable BM25/Vector index providers.
-    IndexProviders,
     /// Enable R2RML/Iceberg support (feature-gated).
     #[cfg(feature = "iceberg")]
     R2rml,
@@ -124,8 +124,8 @@ impl<'a> QueryCore<'a> {
         self.execution = options;
     }
 
-    pub(crate) fn set_index_providers(&mut self) {
-        self.graph_sources = GraphSourceMode::IndexProviders;
+    pub(crate) fn set_params(&mut self, params: fluree_db_sparql::ParamMap) {
+        self.execution = std::mem::take(&mut self.execution).with_params(params);
     }
 
     #[cfg(feature = "iceberg")]
@@ -145,12 +145,6 @@ impl<'a> QueryCore<'a> {
 
         match self.graph_sources {
             GraphSourceMode::None => {}
-            GraphSourceMode::IndexProviders => {
-                errs.push(BuilderError::Invalid {
-                    field: "graph_sources",
-                    message: "Index provider mode (.with_index_providers()) is not yet supported by query builders; use fluree.query_connection_with_bm25() or fluree.query_dataset_with_bm25() instead".into(),
-                });
-            }
             #[cfg(feature = "iceberg")]
             GraphSourceMode::R2rml => {
                 if self.r2rml.is_none() {
@@ -244,15 +238,15 @@ impl<'a> ViewQueryBuilder<'a> {
         self
     }
 
-    /// Set query execution controls.
-    pub fn execution_options(mut self, options: QueryExecutionOptions) -> Self {
-        self.core.set_execution_options(options);
+    /// Bind SPARQL variables to values; see [`QueryExecutionOptions::with_params`].
+    pub fn params(mut self, params: fluree_db_sparql::ParamMap) -> Self {
+        self.core.set_params(params);
         self
     }
 
-    /// Enable BM25/Vector index providers for graph source queries.
-    pub fn with_index_providers(mut self) -> Self {
-        self.core.set_index_providers();
+    /// Set query execution controls.
+    pub fn execution_options(mut self, options: QueryExecutionOptions) -> Self {
+        self.core.set_execution_options(options);
         self
     }
 
@@ -348,14 +342,9 @@ impl<'a> ViewQueryBuilder<'a> {
                     .await?
             }
         };
-        match self.view.policy() {
-            Some(policy) => Ok(result
-                .format_async_with_policy(self.view.as_graph_db_ref(), &format_config, policy)
-                .await?),
-            None => Ok(result
-                .format_async(self.view.as_graph_db_ref(), &format_config)
-                .await?),
-        }
+        Ok(result
+            .format_async_for_view(self.view, &format_config)
+            .await?)
     }
 
     /// Execute and return formatted string output.
@@ -530,15 +519,15 @@ impl<'a> DatasetQueryBuilder<'a> {
         self
     }
 
-    /// Set query execution controls.
-    pub fn execution_options(mut self, options: QueryExecutionOptions) -> Self {
-        self.core.set_execution_options(options);
+    /// Bind SPARQL variables to values; see [`QueryExecutionOptions::with_params`].
+    pub fn params(mut self, params: fluree_db_sparql::ParamMap) -> Self {
+        self.core.set_params(params);
         self
     }
 
-    /// Enable BM25/Vector index providers.
-    pub fn with_index_providers(mut self) -> Self {
-        self.core.set_index_providers();
+    /// Set query execution controls.
+    pub fn execution_options(mut self, options: QueryExecutionOptions) -> Self {
+        self.core.set_execution_options(options);
         self
     }
 
@@ -634,14 +623,9 @@ impl<'a> DatasetQueryBuilder<'a> {
 
         // Use primary view's db for formatting
         if let Some(primary) = self.dataset.primary() {
-            match primary.policy() {
-                Some(policy) => Ok(result
-                    .format_async_with_policy(primary.as_graph_db_ref(), &format_config, policy)
-                    .await?),
-                None => Ok(result
-                    .format_async(primary.as_graph_db_ref(), &format_config)
-                    .await?),
-            }
+            Ok(result
+                .format_async_for_view(primary, &format_config)
+                .await?)
         } else {
             Err(ApiError::query("No primary view in dataset for formatting"))
         }
@@ -776,6 +760,21 @@ pub struct FromQueryBuilder<'a> {
     core: QueryCore<'a>,
     policy: Option<Arc<PolicyContext>>,
     connection_opts: Option<GovernanceOptions>,
+    authorization: Option<&'a crate::PolicyAuthorization>,
+}
+
+/// The builder's graph-source providers in the borrowed form execution takes.
+#[allow(clippy::type_complexity)]
+fn providers<'s>(
+    r2rml: Option<&'s (
+        Arc<dyn R2rmlProvider + '_>,
+        Arc<dyn R2rmlTableProvider + '_>,
+    )>,
+) -> Option<crate::R2rmlProviders<'s>> {
+    r2rml.map(|(provider, table_provider)| crate::R2rmlProviders {
+        provider: provider.as_ref(),
+        table_provider: table_provider.as_ref(),
+    })
 }
 
 impl<'a> FromQueryBuilder<'a> {
@@ -786,7 +785,68 @@ impl<'a> FromQueryBuilder<'a> {
             core: QueryCore::new(),
             policy: None,
             connection_opts: None,
+            authorization: None,
         }
+    }
+
+    /// Route a subgraph ("crawl") projection over a single-source virtual
+    /// (R2RML) dataset through the R2RML operator instead of native binary-index
+    /// hydration — which has no flakes for a virtual dataset and returns `[]`
+    /// (the deployed "View Instances shows no instances" bug on the ledger-scoped
+    /// / connection query path).
+    ///
+    /// Returns `Ok(None)` — so the caller runs its normal formatting path
+    /// unchanged — for a non-crawl query (cheapest gate first), a query whose
+    /// dataset spec names anything other than exactly one graph (a federated
+    /// multi-source crawl must NOT collapse to a single source), or when the
+    /// resolved view is not graph-source-backed (a genuinely native ledger, which
+    /// `maybe_expand_crawl` filters out).
+    #[cfg(feature = "iceberg")]
+    async fn try_expand_crawl(
+        &self,
+        json: &JsonValue,
+        r2rml: Option<(&dyn R2rmlProvider, &dyn R2rmlTableProvider)>,
+        execution: &QueryExecutionOptions,
+        format_config: &FormatterConfig,
+    ) -> Result<Option<JsonValue>> {
+        // Cheapest possible gate: an ordinary (non-crawl) query pays only this.
+        if !crate::graph_source::crawl::is_wildcard_crawl(json) {
+            return Ok(None);
+        }
+        // Resolve the single target ledger from the query's own dataset spec. A
+        // crawl over a federated multi-source dataset must not collapse to one
+        // source, so bail unless exactly one graph is specified.
+        let (spec, opts) = parse_dataset_spec(json)?;
+        if spec.default_graphs.len() + spec.named_graphs.len() != 1 {
+            return Ok(None);
+        }
+        let alias = spec
+            .default_graphs
+            .first()
+            .or_else(|| spec.named_graphs.first())
+            .expect("exactly one graph checked above");
+        let view = self.fluree.load_view_from_source(alias).await?;
+        if view.graph_source_id.is_none() {
+            return Ok(None);
+        }
+        // Expansion executes a rewritten query against this view, so bind
+        // policy here before the original JSON options disappear.
+        let view = if let Some(policy) = &self.policy {
+            view.with_policy(Arc::clone(policy))
+        } else {
+            self.fluree
+                .apply_source_or_global_policy(view, alias, &opts)
+                .await?
+        };
+        crate::graph_source::crawl::maybe_expand_crawl(
+            self.fluree,
+            &view,
+            Some(json),
+            r2rml,
+            execution.clone(),
+            format_config,
+        )
+        .await
     }
 
     // --- Shared setters ---
@@ -827,15 +887,15 @@ impl<'a> FromQueryBuilder<'a> {
         self
     }
 
-    /// Set query execution controls.
-    pub fn execution_options(mut self, options: QueryExecutionOptions) -> Self {
-        self.core.set_execution_options(options);
+    /// Bind SPARQL variables to values; see [`QueryExecutionOptions::with_params`].
+    pub fn params(mut self, params: fluree_db_sparql::ParamMap) -> Self {
+        self.core.set_params(params);
         self
     }
 
-    /// Enable BM25/Vector index providers.
-    pub fn with_index_providers(mut self) -> Self {
-        self.core.set_index_providers();
+    /// Set query execution controls.
+    pub fn execution_options(mut self, options: QueryExecutionOptions) -> Self {
+        self.core.set_execution_options(options);
         self
     }
 
@@ -857,6 +917,12 @@ impl<'a> FromQueryBuilder<'a> {
     /// Only available on `FromQueryBuilder` — for view/dataset queries,
     /// policy is applied at the view level (Tier 1).
     pub fn policy(mut self, ctx: PolicyContext) -> Self {
+        if self.authorization.is_some() {
+            self.core.errors.push(BuilderError::Conflict {
+                field: "authorization",
+                message: "authorization cannot be combined with a prebuilt policy context".into(),
+            });
+        }
         self.policy = Some(Arc::new(ctx));
         self
     }
@@ -865,16 +931,68 @@ impl<'a> FromQueryBuilder<'a> {
     /// / inline policy) that should be resolved into a `PolicyContext`
     /// *internally*, against the query's own resolved dataset.
     ///
-    /// This is the policy channel for **SPARQL** sub-queries, which have no
-    /// body `opts` block to carry identity/policy the way JSON-LD does. When
-    /// set and the input is SPARQL, execution routes through
+    /// This is the programmatic policy channel for **SPARQL**, which carries
+    /// only the pragma subset of JSON-LD's body `opts` (no inline `policy`
+    /// document). When set and the input is SPARQL, execution routes through
     /// `query_connection_sparql_with_opts` (mirroring JSON-LD's
-    /// `query_connection` opts→policy path). For JSON-LD input it is a no-op
-    /// — JSON-LD carries its opts in the body. Takes precedence over
+    /// `query_connection` opts→policy path), and the request's own
+    /// `# PRAGMA` policy selection is not consulted. For JSON-LD input it is a
+    /// no-op — JSON-LD carries its opts in the body. Takes precedence over
     /// [`Self::policy`] when both are set.
     pub fn connection_opts(mut self, opts: GovernanceOptions) -> Self {
         self.connection_opts = Some(opts);
         self
+    }
+
+    /// Bind this request to host-verified policy selection. Caller JSON options,
+    /// source overrides and connection options cannot replace this selection.
+    /// The host must separately authorize every ledger named by the request.
+    pub fn authorization(mut self, authorization: &'a crate::PolicyAuthorization) -> Self {
+        if self.policy.is_some() {
+            self.core.errors.push(BuilderError::Conflict {
+                field: "authorization",
+                message: "authorization cannot be combined with a prebuilt policy context".into(),
+            });
+        }
+        self.authorization = Some(authorization);
+        self
+    }
+
+    fn prepare_authorization(&mut self) -> Result<Option<JsonValue>> {
+        self.adopt_sparql_pragma_policy();
+        let Some(authorization) = self.authorization else {
+            return Ok(None);
+        };
+        self.connection_opts = Some(
+            authorization.constrain_options(
+                self.connection_opts
+                    .as_ref()
+                    .unwrap_or(&GovernanceOptions::default()),
+            ),
+        );
+        if let Some(QueryInput::JsonLd(json)) = self.core.input {
+            let mut json = json.clone();
+            authorization.apply_to_jsonld(&mut json)?;
+            Ok(Some(json))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// A SPARQL request's policy pragmas stand in for the body `opts` it has
+    /// no room for, unless the caller chose policy programmatically. Under
+    /// [`Self::authorization`] they are constrained like any request selection.
+    fn adopt_sparql_pragma_policy(&mut self) {
+        if self.connection_opts.is_some() || self.policy.is_some() {
+            return;
+        }
+        if let Some(QueryInput::Sparql(sparql)) = self.core.input {
+            let mut opts = GovernanceOptions::from_sparql(sparql);
+            if opts.has_any_policy_inputs() {
+                opts.server_identity = self.core.execution.server_identity.clone();
+                self.connection_opts = Some(opts);
+            }
+        }
     }
 
     // --- Terminal operations ---
@@ -893,16 +1011,21 @@ impl<'a> FromQueryBuilder<'a> {
     ///
     /// Resolves ledgers from the query body's `from` / `FROM` clauses,
     /// applies policy if set, and executes.
-    pub async fn execute(self) -> Result<QueryResult> {
+    pub async fn execute(mut self) -> Result<QueryResult> {
         let errs = self.core.validate();
         if !errs.is_empty() {
             return Err(ApiError::Builder(BuilderErrors(errs)));
         }
 
+        let authorized_json = self.prepare_authorization()?;
         let mut core = self.core;
         let r2rml = core.r2rml.take();
         let execution = core.execution.clone();
         let input = core.input.take().unwrap();
+        let input = authorized_json
+            .as_ref()
+            .map(QueryInput::JsonLd)
+            .unwrap_or(input);
         // SPARQL policy via connection opts (multi-query aliases): SPARQL has
         // no body opts, so the merged envelope/sub opts arrive here. Takes
         // precedence over `.policy()`; for JSON-LD input it's a no-op.
@@ -910,7 +1033,12 @@ impl<'a> FromQueryBuilder<'a> {
         {
             return self
                 .fluree
-                .query_connection_sparql_with_opts_options(sparql, qc_opts, execution.clone())
+                .query_connection_sparql_with_opts_options(
+                    sparql,
+                    qc_opts,
+                    providers(r2rml.as_ref()),
+                    execution.clone(),
+                )
                 .await;
         }
         match input {
@@ -1001,6 +1129,7 @@ impl<'a> FromQueryBuilder<'a> {
             return Err(ApiError::Builder(BuilderErrors(errs)));
         }
 
+        let authorized_json = self.prepare_authorization()?;
         let r2rml = self.core.r2rml.take();
         let execution = self.core.execution.clone();
         let format_config = self
@@ -1009,15 +1138,38 @@ impl<'a> FromQueryBuilder<'a> {
             .take()
             .unwrap_or_else(|| self.core.default_format());
         let input = self.core.input.take().unwrap();
+        let input = authorized_json
+            .as_ref()
+            .map(QueryInput::JsonLd)
+            .unwrap_or(input);
+        // Top-intercept a virtual-dataset subgraph crawl (JSON-LD only) BEFORE
+        // the main query runs, so it is routed through R2RML rather than native
+        // hydration (which returns `[]`). `as_jsonld()` borrows `input` (Copy),
+        // leaving it intact for the paths below.
+        #[cfg(feature = "iceberg")]
+        if let Some(json) = input.as_jsonld() {
+            let r2rml_pair = r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref()));
+            if let Some(expanded) = self
+                .try_expand_crawl(json, r2rml_pair, &execution, &format_config)
+                .await?
+            {
+                return Ok(expanded);
+            }
+        }
         // SPARQL policy via connection opts (multi-query aliases) — see
         // `connection_opts`. Resolves & applies policy from the merged opts.
         if let (Some(qc_opts), QueryInput::Sparql(sparql)) = (self.connection_opts.as_ref(), input)
         {
             let result = self
                 .fluree
-                .query_connection_sparql_with_opts_options(sparql, qc_opts, execution.clone())
+                .query_connection_sparql_with_opts_options(
+                    sparql,
+                    qc_opts,
+                    providers(r2rml.as_ref()),
+                    execution.clone(),
+                )
                 .await?;
-            let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
+            let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
             let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
             return if let Some(alias) = spec
                 .default_graphs
@@ -1039,42 +1191,39 @@ impl<'a> FromQueryBuilder<'a> {
             QueryInput::JsonLd(json) => {
                 let policy = self.policy.as_deref();
                 let r2rml_pair = r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref()));
-                let (result, dataset) = self
+                let (result, target) = self
                     .fluree
-                    .query_connection_jsonld_returning_dataset_with_options(
+                    .query_connection_jsonld_returning_target_with_options(
                         json,
                         policy,
                         r2rml_pair,
                         execution.clone(),
                     )
                     .await?;
-                match dataset {
+                match target {
                     // Multi-ledger: format hydration per home-ledger view so
                     // cross-graph IRIs/properties decode correctly (issue #1259).
-                    Some(dataset) => Ok(crate::format::format_results_async_dataset(
+                    FormatTarget::Dataset(dataset) => {
+                        Ok(crate::format::format_results_async_dataset(
+                            &result,
+                            &result.context,
+                            &dataset,
+                            &format_config,
+                            None,
+                        )
+                        .await?)
+                    }
+                    // Single-ledger: the view the query ran on, so hydration is
+                    // filtered by the policy that filtered the rows.
+                    FormatTarget::Single(view) => Ok(crate::format::format_results_async(
                         &result,
                         &result.context,
-                        &dataset,
+                        view.as_graph_db_ref(),
                         &format_config,
+                        view.policy(),
                         None,
                     )
                     .await?),
-                    // Single-ledger: format against the sole view (today's path).
-                    None => {
-                        let (spec, _) = parse_dataset_spec(json)?;
-                        let alias = spec
-                            .default_graphs
-                            .first()
-                            .or_else(|| spec.named_graphs.first())
-                            .ok_or_else(|| ApiError::query("No graph specified for formatting"))?;
-                        let view = self
-                            .fluree
-                            .db_or_graph_source(alias.identifier.as_str())
-                            .await?;
-                        Ok(result
-                            .format_async(view.as_graph_db_ref(), &format_config)
-                            .await?)
-                    }
                 }
             }
             QueryInput::Sparql(sparql) => {
@@ -1119,7 +1268,7 @@ impl<'a> FromQueryBuilder<'a> {
                         }
                     },
                 };
-                let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
+                let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
                 let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
                 if let Some(alias) = spec
                     .default_graphs
@@ -1151,6 +1300,7 @@ impl<'a> FromQueryBuilder<'a> {
             return Err(ApiError::Builder(BuilderErrors(errs)));
         }
 
+        let authorized_json = self.prepare_authorization()?;
         let r2rml = self.core.r2rml.take();
         let execution = self.core.execution.clone();
         let format_config = self
@@ -1159,15 +1309,37 @@ impl<'a> FromQueryBuilder<'a> {
             .take()
             .unwrap_or_else(|| self.core.default_format());
         let input = self.core.input.take().unwrap();
+        let input = authorized_json
+            .as_ref()
+            .map(QueryInput::JsonLd)
+            .unwrap_or(input);
+        // Top-intercept a virtual-dataset subgraph crawl (JSON-LD only) BEFORE
+        // the main query runs; serialize the expanded documents to a string to
+        // match this terminal's return type.
+        #[cfg(feature = "iceberg")]
+        if let Some(json) = input.as_jsonld() {
+            let r2rml_pair = r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref()));
+            if let Some(expanded) = self
+                .try_expand_crawl(json, r2rml_pair, &execution, &format_config)
+                .await?
+            {
+                return serde_json::to_string(&expanded).map_err(ApiError::from);
+            }
+        }
         // SPARQL policy via connection opts (multi-query aliases) — see
         // `connection_opts`. Resolves & applies policy from the merged opts.
         if let (Some(qc_opts), QueryInput::Sparql(sparql)) = (self.connection_opts.as_ref(), input)
         {
             let result = self
                 .fluree
-                .query_connection_sparql_with_opts_options(sparql, qc_opts, execution.clone())
+                .query_connection_sparql_with_opts_options(
+                    sparql,
+                    qc_opts,
+                    providers(r2rml.as_ref()),
+                    execution.clone(),
+                )
                 .await?;
-            let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
+            let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
             let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
             return if let Some(alias) = spec
                 .default_graphs
@@ -1195,48 +1367,39 @@ impl<'a> FromQueryBuilder<'a> {
             QueryInput::JsonLd(json) => {
                 let policy = self.policy.as_deref();
                 let r2rml_pair = r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref()));
-                let (result, dataset) = self
+                let (result, target) = self
                     .fluree
-                    .query_connection_jsonld_returning_dataset_with_options(
+                    .query_connection_jsonld_returning_target_with_options(
                         json,
                         policy,
                         r2rml_pair,
                         execution.clone(),
                     )
                     .await?;
-                match dataset {
+                match target {
                     // Multi-ledger: dataset-aware string formatting (issue #1259).
-                    Some(dataset) => crate::format::format_results_string_async_dataset(
-                        &result,
-                        &result.context,
-                        &dataset,
-                        &format_config,
-                        None,
-                    )
-                    .await
-                    .map_err(ApiError::from),
-                    // Single-ledger: format against the sole view (today's path).
-                    None => {
-                        let (spec, _) = parse_dataset_spec(json)?;
-                        let alias = spec
-                            .default_graphs
-                            .first()
-                            .or_else(|| spec.named_graphs.first())
-                            .ok_or_else(|| ApiError::query("No graph specified for formatting"))?;
-                        let view = self
-                            .fluree
-                            .db_or_graph_source(alias.identifier.as_str())
-                            .await?;
-                        crate::format::format_results_string_async(
+                    FormatTarget::Dataset(dataset) => {
+                        crate::format::format_results_string_async_dataset(
                             &result,
                             &result.context,
-                            view.as_graph_db_ref(),
+                            &dataset,
                             &format_config,
                             None,
                         )
                         .await
                         .map_err(ApiError::from)
                     }
+                    // Single-ledger: the view the query ran on, so hydration is
+                    // filtered by the policy that filtered the rows.
+                    FormatTarget::Single(view) => crate::format::format_results_string_async(
+                        &result,
+                        &result.context,
+                        view.as_graph_db_ref(),
+                        &format_config,
+                        view.policy(),
+                    )
+                    .await
+                    .map_err(ApiError::from),
                 }
             }
             QueryInput::Sparql(sparql) => {
@@ -1281,7 +1444,7 @@ impl<'a> FromQueryBuilder<'a> {
                         }
                     },
                 };
-                let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
+                let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
                 let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
                 if let Some(alias) = spec
                     .default_graphs
@@ -1323,11 +1486,36 @@ impl<'a> FromQueryBuilder<'a> {
             return Err(TrackedErrorResponse::new(400, msg, None));
         }
 
+        let authorized_json = self
+            .prepare_authorization()
+            .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), None))?;
         let r2rml = self.core.r2rml.take();
         let format_config = self.core.format.take();
         let tracking = self.core.tracking.take();
         let execution = self.core.execution.clone();
         let input = self.core.input.take().unwrap();
+        let input = authorized_json
+            .as_ref()
+            .map(QueryInput::JsonLd)
+            .unwrap_or(input);
+        // Top-intercept a virtual-dataset subgraph crawl (JSON-LD only) BEFORE
+        // dispatching the tracked query. The crawl has no fuel/policy/time stats,
+        // so it returns a 200 response with empty tracking. Boxed like the
+        // dispatch futures below to keep this frame small (fluree/db#1408).
+        #[cfg(feature = "iceberg")]
+        if let Some(json) = input.as_jsonld() {
+            let r2rml_pair = r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref()));
+            let fc = format_config
+                .clone()
+                .unwrap_or_else(|| self.core.default_format());
+            match Box::pin(self.try_expand_crawl(json, r2rml_pair, &execution, &fc)).await {
+                Ok(Some(expanded)) => {
+                    return Ok(TrackedQueryResponse::success(expanded, None));
+                }
+                Ok(None) => {}
+                Err(e) => return Err(TrackedErrorResponse::new(500, e.to_string(), None)),
+            }
+        }
         // SPARQL policy via connection opts (multi-query aliases) — see
         // `connection_opts`. Resolves & applies policy from the merged opts.
         if let (Some(qc_opts), QueryInput::Sparql(sparql)) = (self.connection_opts.as_ref(), input)
@@ -1349,6 +1537,7 @@ impl<'a> FromQueryBuilder<'a> {
                         qc_opts,
                         format_config,
                         tracking,
+                        providers(r2rml.as_ref()),
                         execution.clone(),
                     ),
             )
@@ -1590,8 +1779,8 @@ mod tests {
     // Builder construction tests
     // ========================================================================
 
-    #[test]
-    fn test_view_query_builder_validate_missing_input() {
+    #[tokio::test]
+    async fn test_view_query_builder_validate_missing_input() {
         let fluree = FlureeBuilder::memory().build_memory();
         // We can't create a view without a ledger, so test validate on FromQueryBuilder instead
         let builder = FromQueryBuilder::new(&fluree);
@@ -1605,8 +1794,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_from_query_builder_validate_with_input() {
+    #[tokio::test]
+    async fn test_from_query_builder_validate_with_input() {
         let fluree = FlureeBuilder::memory().build_memory();
         let query = json!({
             "from": "test:main",
@@ -1618,8 +1807,8 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_from_query_builder_validate_conflict() {
+    #[tokio::test]
+    async fn test_from_query_builder_validate_conflict() {
         let fluree = FlureeBuilder::memory().build_memory();
         let query = json!({"from": "test:main", "select": ["?s"]});
         let builder = fluree

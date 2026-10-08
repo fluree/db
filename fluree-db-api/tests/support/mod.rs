@@ -13,6 +13,7 @@
 // plain `allow` is the only annotation correct across every binary.
 #![allow(dead_code)]
 
+pub mod hooked_storage;
 pub mod span_capture;
 
 use fluree_db_api::{LedgerState, Novelty};
@@ -96,6 +97,19 @@ pub async fn query_jsonld_formatted(
     Ok(result.to_jsonld_async(db.as_graph_db_ref()).await?)
 }
 
+/// Execute a SPARQL query and return formatted JSON-LD output (async formatting
+/// path). Lets tests assert named-graph reads via `GRAPH <g> { ... }`, which the
+/// JSON-LD/FQL default-graph `where` cannot express.
+pub async fn query_sparql_formatted(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &LedgerState,
+    sparql: &str,
+) -> fluree_db_api::Result<JsonValue> {
+    let db = graphdb_from_ledger(ledger);
+    let result = fluree.query(&db, sparql).await?;
+    Ok(result.to_jsonld_async(db.as_graph_db_ref()).await?)
+}
+
 /// Execute a JSON-LD query and format using a provided formatter config (async).
 pub async fn query_jsonld_format(
     fluree: &fluree_db_api::Fluree,
@@ -130,6 +144,104 @@ pub async fn query_jsonld_tracked(
 ) -> std::result::Result<fluree_db_api::TrackedQueryResponse, fluree_db_api::TrackedErrorResponse> {
     let db = graphdb_from_ledger(ledger);
     db.query(fluree).jsonld(query_json).execute_tracked().await
+}
+
+/// Decode every edge-annotation bundle whose reified SUBJECT is `subject_iri`
+/// within graph `g_id` of `ledger`, via `EdgeKey::from_reifies_facts` — the
+/// exact path both readers (JSON-LD hydration + attachment indexer) take.
+///
+/// Panics on a decode error (`GraphMismatch` / `Duplicate` — the silent-drop
+/// failure mode of a bad graph re-home), so a returned key is proof the bundle
+/// is self-consistent. Locating the reifier by `f:reifiesSubject` (not by
+/// `@id`) works for both anonymous and explicit reifiers. Returned keys are
+/// ordered by reifier Sid.
+///
+/// Uses point (`Eq`) POST + SPOT lookups rather than an unbounded scan so it
+/// works on both the novelty path and the V3 binary-index provider (which
+/// rejects `RangeTest::Ge` full scans).
+pub async fn decode_annotations_for_subject(
+    ledger: &LedgerState,
+    g_id: fluree_db_core::GraphId,
+    subject_iri: &str,
+) -> Vec<fluree_db_core::edge::EdgeKey> {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::edge::EdgeKey;
+    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
+    use fluree_db_core::FlakeValue;
+
+    let subject_sid = ledger
+        .snapshot
+        .encode_iri(subject_iri)
+        .expect("encode subject IRI");
+    let reifies_subject_pid = fluree_db_core::namespaces::reifies_subject_sid().clone();
+
+    // Reifier subjects: POST lookup of f:reifiesSubject → subject, in g_id.
+    let pointers = range_with_overlay(
+        &ledger.snapshot,
+        g_id,
+        ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(reifies_subject_pid, FlakeValue::Ref(subject_sid)),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan f:reifiesSubject pointers");
+
+    let mut reifiers: Vec<fluree_db_core::Sid> = pointers
+        .iter()
+        .filter(|f| f.op)
+        .map(|f| f.s.clone())
+        .collect();
+    reifiers.sort();
+    reifiers.dedup();
+
+    let mut keys = Vec::with_capacity(reifiers.len());
+    for ann_sid in reifiers {
+        let subject_flakes = range_with_overlay(
+            &ledger.snapshot,
+            g_id,
+            ledger.novelty.as_ref(),
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch::subject(ann_sid.clone()),
+            RangeOptions::new().with_to_t(ledger.t()),
+        )
+        .await
+        .expect("scan annotation subject flakes");
+        // Index-decoded flakes carry `g: None` — the graph is the index they
+        // came from, not a field on the flake — while `f:reifiesGraph` names
+        // the graph. `from_reifies_facts` reconciles the two, so without this
+        // stamp an indexed named-graph bundle decodes as `GraphMismatch` and
+        // this helper reports a defect that isn't there. Production scans of a
+        // reifier's own facts stamp for the same reason (`stamp_graph` in
+        // `fluree-db-transact`).
+        let g_sid = subject_flakes.iter().find_map(|f| {
+            (f.op && f.p.name.as_ref() == fluree_vocab::db::REIFIES_GRAPH)
+                .then(|| match &f.o {
+                    FlakeValue::Ref(sid) => Some(sid.clone()),
+                    _ => None,
+                })
+                .flatten()
+        });
+        let bundle: Vec<_> = subject_flakes
+            .iter()
+            .filter(|f| f.op && fluree_db_core::is_reserved_reifies_predicate(&f.p))
+            .cloned()
+            .map(|mut f| {
+                f.g = g_sid.clone();
+                f
+            })
+            .collect();
+        let key = EdgeKey::from_reifies_facts(&bundle).unwrap_or_else(|e| {
+            panic!(
+                "from_reifies_facts failed for reifier {ann_sid} in g_id {g_id}: \
+                 {e:?}; bundle: {bundle:#?}"
+            )
+        });
+        keys.push(key);
+    }
+    keys
 }
 
 /// Create a genesis ledger state for the given ledger ID.
@@ -259,7 +371,9 @@ pub async fn trigger_index_and_wait_outcome(
     ledger_id: &str,
     t: i64,
 ) -> fluree_db_api::IndexOutcome {
-    let completion = handle.trigger(ledger_id, t).await;
+    let completion = handle
+        .trigger(&fluree_db_api::LedgerId::parse(ledger_id).unwrap(), t)
+        .await;
     match completion.wait().await {
         ok @ fluree_db_api::IndexOutcome::Completed { .. } => ok,
         fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
@@ -320,7 +434,10 @@ pub fn start_background_indexer_with_attachments(
 
     #[async_trait]
     impl AttachmentEventsProvider for TestProvider {
-        async fn attachment_events(&self, ledger_id: &str) -> Option<AttachmentEventCoverage> {
+        async fn attachment_events(
+            &self,
+            ledger_id: &fluree_db_api::LedgerId,
+        ) -> Option<AttachmentEventCoverage> {
             use fluree_db_api::ledger_manager::RunningCoverage;
             let result = self
                 .manager
@@ -392,8 +509,10 @@ pub async fn wait_for_index_application(
         .await
         .expect("notify after reindex");
 
-    // Poll the cached handle's snapshot.t (the *indexed* t).
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // Poll the cached handle's snapshot.t (the *indexed* t). The deadline
+    // bounds a broken path, not a loaded runner — nextest hard-kills a true
+    // hang at 360s, so a short budget here only buys flakes.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let handle = fluree
             .ledger_cached(&canonical)
@@ -682,4 +801,184 @@ pub async fn load_people(fluree: &MemoryFluree) -> Result<String, Box<dyn std::e
 
     fluree.insert(ledger, &insert_txn).await?;
     Ok(ledger_id.to_string())
+}
+
+// =============================================================================
+// Collector end-to-end scenario (shared by the file and the S3 + DynamoDB suites)
+// =============================================================================
+
+/// Indexer settings under which every publish past the second collects:
+/// one old version kept, no age guard.
+#[cfg(feature = "native")]
+pub fn collecting_indexer_config() -> fluree_db_indexer::IndexerConfig {
+    fluree_db_indexer::IndexerConfig {
+        gc_max_old_indexes: 1,
+        gc_min_time_mins: 0,
+        ..fluree_db_indexer::IndexerConfig::small()
+    }
+}
+
+/// Drive a ledger and a fork of it through builds the running worker
+/// collects behind, then drop the fork, and check after each stage that
+/// every dictionary blob a surviving chain references is still in storage.
+///
+/// Subject ids are sequential on purpose: that is the key pattern under
+/// which a reverse-dictionary leaf split recreates a blob an earlier
+/// manifest named as garbage.
+///
+/// `fluree` must be in background indexing mode on `handle`, whose worker
+/// is running with [`collecting_indexer_config`].
+#[cfg(feature = "native")]
+pub async fn run_collector_and_fork_drop_scenario(
+    fluree: &fluree_db_api::Fluree,
+    handle: &fluree_db_indexer::IndexerHandle,
+    ledger_name: &str,
+) {
+    use fluree_db_core::ContentStore;
+    use fluree_db_indexer::{shared_refs_of_branches, BranchIndexHead};
+    use std::time::Duration;
+
+    let main_id = format!("{ledger_name}:main");
+    let dev_id = format!("{ledger_name}:dev");
+    let index_cfg = fluree_db_api::IndexConfig {
+        reindex_min_bytes: 0,
+        reindex_max_bytes: 1_000_000_000,
+    };
+
+    // One transaction of sequential subjects, then a build through the worker.
+    let round = |ledger_id: String, round: usize| {
+        let index_cfg = index_cfg.clone();
+        async move {
+            let ledger = fluree.ledger(&ledger_id).await.expect("load ledger");
+            let subjects: Vec<_> = (0..40)
+                .map(|i| json!({"@id": format!("ex:item-{:06}", round * 1000 + i), "ex:val": i}))
+                .collect();
+            let tx = json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": subjects
+            });
+            let result = fluree
+                .insert_with_opts(
+                    ledger,
+                    &tx,
+                    fluree_db_transact::TxnOpts::default(),
+                    fluree_db_transact::CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert");
+            let completion = handle
+                .trigger(
+                    &fluree_db_api::LedgerId::parse(&ledger_id).unwrap(),
+                    result.receipt.t,
+                )
+                .await;
+            match tokio::time::timeout(Duration::from_secs(120), completion.wait())
+                .await
+                .expect("build timed out: a release window must not wedge the worker")
+            {
+                fluree_db_api::IndexOutcome::Completed { .. } => {}
+                other => panic!("build on {ledger_id} did not complete: {other:?}"),
+            }
+        }
+    };
+
+    // Every dictionary blob `ledger_id`'s whole chain references is present.
+    let assert_dicts_present = |ledger_id: String, stage: &'static str| async move {
+        // Let a pass the last publish spawned finish before looking.
+        drop(
+            handle
+                .hold_gc(&fluree_db_api::LedgerName::parse(ledger_name).unwrap())
+                .await,
+        );
+        let head = fluree
+            .nameservice()
+            .lookup(&ledger_id)
+            .await
+            .expect("lookup")
+            .expect("record")
+            .index_head_id;
+        let refs = shared_refs_of_branches(
+            fluree.backend(),
+            &[BranchIndexHead {
+                ledger_id: fluree_db_api::LedgerId::parse(&ledger_id).unwrap(),
+                index_head_id: head,
+            }],
+            None,
+        )
+        .await
+        .expect("walk chain");
+        assert!(
+            !refs.is_empty(),
+            "{stage}: {ledger_id} references no dictionaries"
+        );
+        let store = fluree.content_store(&ledger_id);
+        for cid in &refs {
+            assert!(
+                store.has(cid).await.expect("has"),
+                "{stage}: {ledger_id} still references dictionary blob {cid}, which is gone"
+            );
+        }
+    };
+
+    fluree.create_ledger(ledger_name).await.expect("create");
+    let first_root = {
+        round(main_id.clone(), 0).await;
+        fluree
+            .nameservice()
+            .lookup(&main_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .index_head_id
+            .expect("first build published")
+    };
+    for r in 1..4 {
+        round(main_id.clone(), r).await;
+    }
+    assert_dicts_present(main_id.clone(), "main alone").await;
+
+    // The collector really ran: the first version is past retention.
+    let store = fluree.content_store(&main_id);
+    let mut collected = false;
+    for _ in 0..100 {
+        if !store.has(&first_root).await.expect("has") {
+            collected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        collected,
+        "the collector never released the first index version"
+    );
+
+    // Fork, build on the fork, then keep building on main: main's passes now
+    // name blobs the fork's copied root still reads.
+    fluree
+        .create_branch(ledger_name, "dev", None, None)
+        .await
+        .expect("create branch");
+    for r in 10..12 {
+        round(dev_id.clone(), r).await;
+    }
+    for r in 4..7 {
+        round(main_id.clone(), r).await;
+    }
+    assert_dicts_present(main_id.clone(), "after fork").await;
+    assert_dicts_present(dev_id.clone(), "after fork").await;
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(120),
+        fluree.drop_branch(ledger_name, "dev"),
+    )
+    .await
+    .expect("branch drop timed out")
+    .expect("branch drop");
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_dicts_present(main_id.clone(), "after fork drop").await;
+
+    // And the worker still builds once the drop's window has closed.
+    round(main_id.clone(), 7).await;
+    assert_dicts_present(main_id.clone(), "after a build following the drop").await;
 }

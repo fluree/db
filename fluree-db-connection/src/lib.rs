@@ -36,7 +36,7 @@ pub use aws::AwsConnectionHandle;
 
 // Re-export core types commonly used with connections
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
-pub use fluree_db_core::FileStorage;
+pub use fluree_db_core::{Durability, FileStorage};
 pub use fluree_db_core::{LedgerSnapshot, MemoryStorage};
 
 /// Connection that can be file, memory, or AWS backed
@@ -184,23 +184,7 @@ pub async fn connect_from_config(config: ConnectionConfig) -> Result<ConnectionH
 /// Sync connection creation for local backends (file, memory)
 fn create_sync_connection(config: ConnectionConfig) -> Result<ConnectionHandle> {
     match &config.index_storage.storage_type {
-        StorageType::File => {
-            #[cfg(not(all(feature = "native", not(target_arch = "wasm32"))))]
-            {
-                return Err(ConnectionError::unsupported_component(
-                    "https://ns.flur.ee/system#filePath (native feature disabled)",
-                ));
-            }
-            #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
-            {
-                let path =
-                    config.index_storage.path.as_ref().ok_or_else(|| {
-                        ConnectionError::invalid_config("File storage requires path")
-                    })?;
-                let storage = FileStorage::new(path.as_ref());
-                Ok(ConnectionHandle::File { config, storage })
-            }
-        }
+        StorageType::File => file_connection(config),
         StorageType::Memory => {
             let storage = MemoryStorage::new();
             Ok(ConnectionHandle::Memory { config, storage })
@@ -219,23 +203,7 @@ fn create_sync_connection(config: ConnectionConfig) -> Result<ConnectionHandle> 
 async fn create_async_connection(config: ConnectionConfig) -> Result<ConnectionHandle> {
     match &config.index_storage.storage_type {
         StorageType::S3(s3_config) => create_aws_connection(config.clone(), s3_config).await,
-        StorageType::File => {
-            #[cfg(not(all(feature = "native", not(target_arch = "wasm32"))))]
-            {
-                return Err(ConnectionError::unsupported_component(
-                    "https://ns.flur.ee/system#filePath (native feature disabled)",
-                ));
-            }
-            #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
-            {
-                let path =
-                    config.index_storage.path.as_ref().ok_or_else(|| {
-                        ConnectionError::invalid_config("File storage requires path")
-                    })?;
-                let storage = FileStorage::new(path.as_ref());
-                Ok(ConnectionHandle::File { config, storage })
-            }
-        }
+        StorageType::File => file_connection_async(config).await,
         StorageType::Memory => {
             let storage = MemoryStorage::new();
             Ok(ConnectionHandle::Memory { config, storage })
@@ -253,8 +221,63 @@ async fn create_async_connection(config: ConnectionConfig) -> Result<ConnectionH
         StorageType::S3(_) => Err(ConnectionError::unsupported_component(
             "S3 storage requires the 'aws' feature to be enabled",
         )),
+        StorageType::File => file_connection_async(config).await,
         _ => create_sync_connection(config),
     }
+}
+
+/// Opens the file storage `config` names and recovers its WAL on the calling thread.
+fn file_connection(config: ConnectionConfig) -> Result<ConnectionHandle> {
+    #[cfg(not(all(feature = "native", not(target_arch = "wasm32"))))]
+    {
+        let _ = config;
+        Err(file_storage_unsupported())
+    }
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    {
+        let storage = open_file_storage(&config)?;
+        storage.recover_wal()?;
+        Ok(ConnectionHandle::File { config, storage })
+    }
+}
+
+/// Opens the file storage `config` names and recovers its WAL without blocking the caller.
+async fn file_connection_async(config: ConnectionConfig) -> Result<ConnectionHandle> {
+    #[cfg(not(all(feature = "native", not(target_arch = "wasm32"))))]
+    {
+        let _ = config;
+        Err(file_storage_unsupported())
+    }
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    {
+        let storage = open_file_storage(&config)?;
+        storage.recover_wal_async().await?;
+        Ok(ConnectionHandle::File { config, storage })
+    }
+}
+
+/// Opens the file storage `config` names and starts the sweep of crash-orphaned staging files.
+///
+/// Opening a connection is startup, so the sweep runs here.
+/// Holding a storage handle does not start it.
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+fn open_file_storage(config: &ConnectionConfig) -> Result<FileStorage> {
+    let path = config
+        .index_storage
+        .path
+        .as_ref()
+        .ok_or_else(|| ConnectionError::invalid_config("File storage requires path"))?;
+    let storage = FileStorage::new(path.as_ref())
+        .with_durability(Durability::resolve(config.index_storage.durability));
+    storage.sweep_orphaned_staging();
+    Ok(storage)
+}
+
+#[cfg(not(all(feature = "native", not(target_arch = "wasm32"))))]
+fn file_storage_unsupported() -> ConnectionError {
+    ConnectionError::unsupported_component(
+        "https://ns.flur.ee/system#filePath (native feature disabled)",
+    )
 }
 
 /// Create AWS connection from parsed JSON-LD config
@@ -390,6 +413,12 @@ mod tests {
         );
     }
 
+    // The hardcoded shared path below is safe *only because* constructing a
+    // `FileStorage` touches nothing on disk — the staging sweep is an
+    // explicit startup call (`sweep_orphaned_staging`), taken by
+    // `create_sync_connection` / `create_async_connection`, not by `new`.
+    // When it hung off the constructor, running this test unlinked stale
+    // `.tmp` files an operator had under /tmp/test.
     #[test]
     #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
     fn test_connection_handle_file() {
@@ -398,5 +427,68 @@ mod tests {
             storage: FileStorage::new("/tmp/test"),
         };
         assert!(format!("{handle:?}").contains("FileStorage"));
+    }
+
+    /// The sweep moved out of `FileStorage::new` and into the startup layer,
+    /// so the startup layer has to be seen taking it: opening a file
+    /// connection reclaims what a crash left behind. Sync creation runs
+    /// outside a runtime, so the walk is inline and finished by the time the
+    /// handle exists — no polling.
+    #[test]
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    fn file_connection_startup_sweeps_orphaned_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        // A stale orphan in the current staging format, bearing another
+        // process's token, aged well past the 24h threshold.
+        let orphan = dir.path().join("leaf.json.4242.0123456789abcdef.0.tmp");
+        std::fs::write(&orphan, b"half a leaf").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&orphan)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600))
+            .unwrap();
+
+        let _handle =
+            create_sync_connection(ConnectionConfig::file(dir.path().to_str().unwrap())).unwrap();
+
+        assert!(
+            !orphan.exists(),
+            "opening a file connection did not sweep a stale staging orphan"
+        );
+    }
+
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    async fn crash_with_a_logged_write(root: &std::path::Path) -> std::path::PathBuf {
+        FileStorage::crash_with_a_logged_write_for_test(root, "fluree:file://a.bin", b"logged")
+            .await
+            .unwrap()
+    }
+
+    /// Opening a file connection replays the WAL a crash left behind.
+    #[tokio::test]
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    async fn file_connection_recovers_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crash_with_a_logged_write(dir.path()).await;
+
+        let _handle =
+            create_sync_connection(ConnectionConfig::file(dir.path().to_str().unwrap())).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"logged");
+    }
+
+    /// Opening a file connection from async code replays the WAL a crash left behind.
+    #[tokio::test]
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    async fn async_file_connection_recovers_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crash_with_a_logged_write(dir.path()).await;
+
+        let _handle = connect_from_config(ConnectionConfig::file(dir.path().to_str().unwrap()))
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"logged");
     }
 }

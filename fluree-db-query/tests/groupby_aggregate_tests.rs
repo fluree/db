@@ -61,7 +61,7 @@ fn implicit_grouping(aggregates: Vec<AggregateSpec>) -> Grouping {
 }
 
 fn make_test_snapshot() -> LedgerSnapshot {
-    LedgerSnapshot::genesis("test/main")
+    LedgerSnapshot::genesis("test:main")
 }
 
 fn xsd_long() -> Sid {
@@ -91,6 +91,9 @@ fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> Query {
         reasoning: ReasoningConfig::default(),
         post_values: None,
         include_system_facts: false,
+        union_default_graph: None,
+        cypher_vocab: None,
+        unmatched_optional: Default::default(),
     }
 }
 
@@ -617,14 +620,15 @@ async fn test_order_by_on_grouped_var_errors() {
     );
 }
 
-/// Aggregating a GROUP BY key var should error (it is not Grouped in this model).
+/// Aggregating a GROUP BY key var into a fresh output var is legal SPARQL
+/// (COUNT(?city) counts the rows collapsed into each ?city group).
 #[tokio::test]
-async fn test_aggregate_on_group_by_key_errors() {
+async fn test_aggregate_on_group_by_key() {
     let snapshot = make_test_snapshot();
     let vars = VarRegistry::new();
 
     let mut query = make_query(
-        vec![VarId(0), VarId(1)],
+        vec![VarId(0), VarId(2)],
         vec![Pattern::Values {
             vars: vec![VarId(0), VarId(1)],
             rows: vec![
@@ -640,11 +644,56 @@ async fn test_aggregate_on_group_by_key_errors() {
         }],
     );
 
-    // Attempt to COUNT(?city) while also GROUP BY ?city.
+    // COUNT(?city) AS ?n while also GROUP BY ?city.
     query.grouping = Some(explicit_grouping(
         vec![VarId(0)],
         vec![AggregateSpec {
             function: AggregateFn::Count(VarId(0)), // key var
+            output_var: VarId(2),
+        }],
+    ));
+    let options = ReasoningConfig::default();
+
+    let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
+    let executable = ExecutableQuery::new(query, options);
+    let results = execute(db, &vars, &executable, ContextConfig::default())
+        .await
+        .unwrap();
+
+    // One NYC group whose key is bound in both rows -> count 2.
+    let total_rows: usize = results.iter().map(|b| b.rows().count()).sum();
+    assert_eq!(total_rows, 1, "expected a single NYC group");
+    let count = results[0].get_by_col(0, 1);
+    if let Binding::Lit { val, .. } = count {
+        assert_eq!(*val, FlakeValue::Long(2));
+    } else {
+        panic!("Expected Lit binding for count, got {count:?}");
+    }
+}
+
+/// Writing an aggregate's output onto the GROUP BY key itself is still an
+/// error: the key column stays in the schema, so the alias collides.
+#[tokio::test]
+async fn test_aggregate_output_onto_group_by_key_errors() {
+    let snapshot = make_test_snapshot();
+    let vars = VarRegistry::new();
+
+    let mut query = make_query(
+        vec![VarId(0), VarId(1)],
+        vec![Pattern::Values {
+            vars: vec![VarId(0), VarId(1)],
+            rows: vec![vec![
+                Binding::lit(FlakeValue::String("NYC".into()), xsd_string()),
+                Binding::sid(Sid::new(100, "alice")),
+            ]],
+        }],
+    );
+
+    // COUNT(?city) AS ?city while also GROUP BY ?city.
+    query.grouping = Some(explicit_grouping(
+        vec![VarId(0)],
+        vec![AggregateSpec {
+            function: AggregateFn::Count(VarId(0)),
             output_var: VarId(0),
         }],
     ));
@@ -656,7 +705,7 @@ async fn test_aggregate_on_group_by_key_errors() {
         .await
         .unwrap_err();
     assert!(
-        err.to_string().contains("GROUP BY key"),
+        err.to_string().contains("already exists in schema"),
         "unexpected error: {err}"
     );
 }

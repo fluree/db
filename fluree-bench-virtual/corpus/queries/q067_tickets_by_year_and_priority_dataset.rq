@@ -1,0 +1,20 @@
+# q067 tickets_by_year_and_priority_dataset
+# Intent: W4-2 MIXED fact+dim GROUP BY keys WITH an integer SUM (complements q066's
+#         COUNT-only). ?yearNum is a DimDate attribute (FactSupportTicket -> dateDim
+#         -> DimDate), ?priority is a FactSupportTicket column. csatScore is
+#         xsd:integer, so the SUM fold accumulates it EXACTLY as i128 (summation-order
+#         independent, hash-deterministic) — unlike the double measures on
+#         FactShipment/FactOrder. So this member exercises the mixed-key resolution
+#         together with a value fold, with a deterministic full-hash oracle. Keys are
+#         typed differently: ?priority = xsd:string (fact), ?yearNum = xsd:integer (dim).
+# BI lineage: the round-3b #7 mixed-key rollup shape, integer-measure variant.
+# Predicates verified against enterprise-sf01-mapping.ttl — FactSupportTicket:
+#         priority (PRIORITY), csatScore (CSAT_SCORE xsd:integer), dateDim -> DimDate
+#         (OPEN_DATE_KEY -> DATE_KEY); DimDate: year (YEAR_NUM xsd:integer).
+# Exec path: query_from() with FROM <enterprise-sf01-v:main>.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?yearNum ?priority (COUNT(?t) AS ?n) (SUM(?csat) AS ?totalCsat)
+FROM <enterprise-sf01-v:main>
+WHERE { ?t a edw:SupportTicket ; edw:priority ?priority ; edw:csatScore ?csat ; edw:dateDim ?d .
+        ?d edw:year ?yearNum . }
+GROUP BY ?yearNum ?priority

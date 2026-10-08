@@ -404,6 +404,73 @@ async fn multi_query_asof_collision_returns_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// An `asOf` the caller got wrong is a 400, as the same instant is on
+/// `/query`: a time before the ledger's first commit, or a malformed
+/// timestamp.
+#[tokio::test]
+async fn multi_query_asof_naming_no_data_returns_400() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "mq:early").await;
+    insert_one(&app, "mq:early", "ex:z", "Z").await;
+
+    for (as_of, expect) in [
+        ("1999-01-01T00:00:00Z", "no data as of"),
+        (
+            "2021-13-45T00:00:00Z",
+            "invalid ISO 8601 timestamp for asOf",
+        ),
+    ] {
+        let envelope = json!({
+            "asOf": as_of,
+            "queries": {
+                "a": {
+                    "language": "jsonld",
+                    "query": {
+                        "@context": { "ex": "http://example.org/" },
+                        "from": "mq:early",
+                        "select": ["?name"],
+                        "where": { "@id": "?s", "ex:name": "?name" }
+                    }
+                }
+            }
+        });
+        let (status, body) = post_envelope(&app, &envelope).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{as_of}: {body}");
+        assert_eq!(body["@type"], "err:db/InvalidQuery", "{as_of}: {body}");
+        assert!(body.to_string().contains(expect), "{as_of}: {body}");
+    }
+}
+
+/// A ledger that does not exist is a 404, as it is on `/query`.
+#[tokio::test]
+async fn multi_query_unknown_ledger_returns_404() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+
+    for as_of in [None, Some("2024-01-01T00:00:00Z")] {
+        let mut envelope = json!({
+            "queries": {
+                "a": {
+                    "language": "jsonld",
+                    "query": {
+                        "@context": { "ex": "http://example.org/" },
+                        "from": "mq:missing",
+                        "select": ["?name"],
+                        "where": { "@id": "?s", "ex:name": "?name" }
+                    }
+                }
+            }
+        });
+        if let Some(as_of) = as_of {
+            envelope["asOf"] = json!(as_of);
+        }
+        let (status, body) = post_envelope(&app, &envelope).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{as_of:?}: {body}");
+        assert!(body.to_string().contains("mq:missing"), "{as_of:?}: {body}");
+    }
+}
+
 #[tokio::test]
 async fn multi_query_envelope_max_fuel_returns_400() {
     let (_tmp, state) = test_state().await;
@@ -594,19 +661,31 @@ async fn multi_query_per_alias_tracking_surfaces_under_opts_meta() {
     );
     // Both aliases tracked; each entry mirrors the single-query
     // TrackedQueryResponse fields (time / fuel / policy are siblings).
+    // `opts.meta: true` asks for all three, so all three must be there —
+    // a disjunction here passed on `time` alone and pinned nothing.
     for alias in ["by_alice", "by_brian"] {
         let entry = &tracking[alias];
         assert!(
             entry.is_object(),
             "tracking[{alias}] should be an object, got: {entry}"
         );
-        // At least one of the trackable metrics must be present.
-        let has_metric = entry.get("time").is_some()
-            || entry.get("fuel").is_some()
-            || entry.get("policy").is_some();
         assert!(
-            has_metric,
-            "tracking[{alias}] should report time / fuel / policy, got: {entry}"
+            entry["time"].is_string(),
+            "tracking[{alias}] should report time, got: {entry}"
+        );
+        assert!(
+            entry["fuel"].is_number(),
+            "tracking[{alias}] should report fuel, got: {entry}"
+        );
+        assert_eq!(
+            entry.get("policy"),
+            Some(&json!({})),
+            "policy tracking is on, and no policy runs on an unenforced query, \
+             so the map is present and empty; got: {entry}"
+        );
+        assert!(
+            entry.get("policy_enforcement").is_none(),
+            "these sub-queries carry no policy inputs, so nothing enforced them; got: {entry}"
         );
     }
 

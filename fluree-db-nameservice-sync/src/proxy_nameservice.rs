@@ -4,17 +4,24 @@
 //! endpoint instead of direct file access. This allows peers to operate without storage
 //! credentials.
 
+use crate::transport::{HttpTransport, TransportRequest};
 use async_trait::async_trait;
+use fluree_db_core::LedgerId;
 use fluree_db_nameservice::{NameServiceError, NsRecord, Result};
-use reqwest::{Client, StatusCode};
+use http::StatusCode;
 use serde::Deserialize;
 use std::fmt::Debug;
+use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
 /// NameService implementation that proxies lookups through the transaction server
+///
+/// All network I/O goes through the [`HttpTransport`] seam; see
+/// [`crate::transport`] for the wasm-implementability contract.
 #[derive(Clone)]
 pub struct ProxyNameService {
-    client: Client,
+    transport: Arc<dyn HttpTransport>,
     api_base: String,
     token: String,
 }
@@ -35,8 +42,6 @@ impl Debug for ProxyNameService {
 /// forward-compatible when the server adds new fields.
 #[derive(Debug, Deserialize)]
 struct NsRecordResponse {
-    #[serde(default)]
-    name: Option<String>,
     branch: String,
     commit_head_id: Option<String>,
     commit_t: i64,
@@ -61,26 +66,22 @@ struct NsRecordResponse {
 }
 
 impl NsRecordResponse {
-    /// Convert to NsRecord, using the original lookup key as the ledger_id.
+    /// Convert to NsRecord for the ledger the caller looked up.
     ///
-    /// When the server omits `name`, derive it from `lookup_key` by splitting
-    /// on `:` (e.g., `"books:main"` → `"books"`). This avoids copying the full
-    /// `ledger_id` (which includes the branch) into the `name` field.
-    fn into_ns_record(self, lookup_key: &str) -> NsRecord {
+    /// The id is built from the lookup key's name and the server's branch, so
+    /// a branchless lookup (`books`) still yields a canonical `books:main`
+    /// record — a branchless id would derive storage paths without a branch
+    /// segment (#1540).
+    fn into_ns_record(self, lookup_key: &str) -> Result<NsRecord> {
         use fluree_db_core::ContentId;
 
-        let derived_name = self.name.unwrap_or_else(|| {
-            lookup_key
-                .split_once(':')
-                .map(|(name, _branch)| name.to_string())
-                .unwrap_or_else(|| lookup_key.to_string())
-        });
+        let requested = LedgerId::parse(lookup_key)?;
+        let ledger_id = requested.with_branch(&self.branch)?;
 
-        NsRecord {
-            // ledger_id is the key used for lookup (may differ from name)
-            ledger_id: lookup_key.to_string(),
-            name: derived_name,
-            branch: self.branch,
+        Ok(NsRecord {
+            name: ledger_id.name().to_string(),
+            branch: ledger_id.branch().to_string(),
+            ledger_id,
             commit_head_id: self
                 .commit_head_id
                 .and_then(|s| s.parse::<ContentId>().ok()),
@@ -94,7 +95,7 @@ impl NsRecordResponse {
             retracted: self.retracted,
             source_branch: self.source_branch,
             branches: self.branches,
-        }
+        })
     }
 }
 
@@ -105,6 +106,7 @@ impl ProxyNameService {
     ///
     /// * `base_url` - Base URL of the transaction server (e.g., `https://tx.fluree.internal:8090`)
     /// * `token` - Bearer token for authentication (with `fluree.storage.*` claims)
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(base_url: String, token: String) -> Self {
         // Server root → default versioned API base.
         let api_base = format!("{}/v1/fluree", base_url.trim_end_matches('/'));
@@ -116,14 +118,25 @@ impl ProxyNameService {
     /// add` or advertised via discovery's `api_base_url`. Use this instead
     /// of [`new`](Self::new) when the API may be mounted under a
     /// non-default prefix.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn from_api_base(api_base: String, token: String) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30)) // 30 seconds for NS lookups
-            .build()
-            .expect("Failed to create proxy nameservice client");
+        let transport = Arc::new(crate::transport::ReqwestTransport::with_timeout(
+            Duration::from_secs(30), // 30 seconds for NS lookups
+        ));
+        Self::from_api_base_with_transport(api_base, token, transport)
+    }
 
+    /// Create a proxy nameservice client over a caller-supplied
+    /// [`HttpTransport`] (e.g. a browser fetch transport);
+    /// [`new`](Self::new) and [`from_api_base`](Self::from_api_base) are
+    /// conveniences that plug in the default reqwest transport.
+    pub fn from_api_base_with_transport(
+        api_base: String,
+        token: String,
+        transport: Arc<dyn HttpTransport>,
+    ) -> Self {
         Self {
-            client,
+            transport,
             api_base: api_base.trim_end_matches('/').to_string(),
             token,
         }
@@ -139,16 +152,52 @@ impl ProxyNameService {
     }
 }
 
+/// Project a fetched record onto one head ref.
+///
+/// A retracted branch yields `None`, matching the raft nameservice: `lookup`
+/// keeps serving the record so admin tooling can see the `retracted` flag, but
+/// this is the active-read surface and must not resolve a head for a branch the
+/// operator soft-deleted. The remote endpoint projects `lookup`, so without
+/// this the proxy would resurrect branches its own raft-backed origin reports
+/// as gone.
+fn project_ref(
+    record: Option<NsRecord>,
+    kind: fluree_db_nameservice::RefKind,
+) -> Option<fluree_db_nameservice::RefValue> {
+    use fluree_db_nameservice::{RefKind, RefValue};
+    let r = record.filter(|r| !r.retracted)?;
+    Some(match kind {
+        RefKind::CommitHead => RefValue {
+            id: r.commit_head_id,
+            t: r.commit_t,
+        },
+        RefKind::IndexHead => RefValue {
+            id: r.index_head_id,
+            t: r.index_t,
+        },
+    })
+}
+
+/// Project a fetched record onto both head refs. Tombstones retracted
+/// branches for the same reason as [`project_ref`].
+fn project_heads(record: Option<NsRecord>) -> Option<fluree_db_nameservice::LedgerHeads> {
+    record
+        .filter(|r| !r.retracted)
+        .map(|r| fluree_db_nameservice::LedgerHeads::from_record(&r))
+}
+
 #[async_trait]
 impl fluree_db_nameservice::RefLookup for ProxyNameService {
+    /// The proxy endpoint serves whole records, so a single-ref read is a
+    /// projection of `lookup` — still one HTTP round trip. Retracted branches
+    /// report `None`; see [`project_ref`].
     async fn get_ref(
         &self,
-        _ledger_id: &str,
-        _kind: fluree_db_nameservice::RefKind,
+        ledger_id: &str,
+        kind: fluree_db_nameservice::RefKind,
     ) -> Result<Option<fluree_db_nameservice::RefValue>> {
-        Err(NameServiceError::storage(
-            "get_ref not supported in proxy mode".to_string(),
-        ))
+        use fluree_db_nameservice::NameServiceLookup;
+        Ok(project_ref(self.lookup(ledger_id).await?, kind))
     }
 }
 
@@ -181,24 +230,28 @@ impl fluree_db_nameservice::NameServiceLookup for ProxyNameService {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         let url = self.ns_url(ledger_id);
 
-        let response = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.token))
-            .send()
-            .await
-            .map_err(|e| {
-                NameServiceError::storage(format!("Nameservice proxy request failed: {e}"))
-            })?;
+        let request =
+            TransportRequest::get(url).header("authorization", format!("Bearer {}", self.token));
+        let response = self.transport.execute(request).await.map_err(|e| match e {
+            // Body-read failures historically surfaced through response
+            // decoding, so they keep the parse-error message.
+            crate::transport::TransportError::Body(e) => {
+                NameServiceError::storage(format!("Failed to parse NS response: {e}"))
+            }
+            other => {
+                NameServiceError::storage(format!("Nameservice proxy request failed: {other}"))
+            }
+        })?;
 
-        let status = response.status();
+        let status = response.status;
 
         match status {
             StatusCode::OK => {
-                let ns_response: NsRecordResponse = response.json().await.map_err(|e| {
-                    NameServiceError::storage(format!("Failed to parse NS response: {e}"))
-                })?;
-                Ok(Some(ns_response.into_ns_record(ledger_id)))
+                let ns_response: NsRecordResponse = serde_json::from_slice(&response.body)
+                    .map_err(|e| {
+                        NameServiceError::storage(format!("Failed to parse NS response: {e}"))
+                    })?;
+                Ok(Some(ns_response.into_ns_record(ledger_id)?))
             }
             StatusCode::NOT_FOUND => Ok(None),
             StatusCode::UNAUTHORIZED => Err(NameServiceError::storage(format!(
@@ -212,6 +265,11 @@ impl fluree_db_nameservice::NameServiceLookup for ProxyNameService {
                 "Nameservice proxy unexpected status {status} for {ledger_id}"
             ))),
         }
+    }
+
+    /// Retracted branches report `None` — see [`project_heads`].
+    async fn heads(&self, ledger_id: &str) -> Result<Option<fluree_db_nameservice::LedgerHeads>> {
+        Ok(project_heads(self.lookup(ledger_id).await?))
     }
 
     async fn all_records(&self) -> Result<Vec<NsRecord>> {
@@ -260,6 +318,8 @@ impl fluree_db_nameservice::GraphSourceLookup for ProxyNameService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::{ContentId, ContentKind};
+    use fluree_db_nameservice::{RefKind, RefValue};
 
     #[test]
     fn test_proxy_nameservice_debug() {
@@ -302,7 +362,6 @@ mod tests {
     #[test]
     fn test_ns_record_conversion() {
         let response = NsRecordResponse {
-            name: Some("books".to_string()),
             branch: "main".to_string(),
             commit_head_id: None,
             commit_t: 42,
@@ -315,10 +374,10 @@ mod tests {
             branches: 0,
         };
 
-        // Use the lookup key as ledger_id (simulating lookup("books"))
-        let record = response.into_ns_record("books");
-        // ledger_id should be the lookup key, not the alias
-        assert_eq!(record.ledger_id, "books");
+        // A branchless lookup still yields a canonical id (#1540): a
+        // branchless one derives storage paths with no branch segment.
+        let record = response.into_ns_record("books").unwrap();
+        assert_eq!(record.ledger_id, "books:main");
         assert_eq!(record.name, "books");
         assert_eq!(record.branch, "main");
         assert_eq!(record.commit_t, 42);
@@ -326,6 +385,79 @@ mod tests {
         assert!(!record.retracted);
         // default_context is not exposed via proxy API
         assert!(record.default_context.is_none());
+    }
+
+    fn record(retracted: bool) -> NsRecord {
+        NsRecordResponse {
+            branch: "main".to_string(),
+            commit_head_id: Some(ContentId::new(ContentKind::Commit, b"c").to_string()),
+            commit_t: 42,
+            index_head_id: Some(ContentId::new(ContentKind::IndexRoot, b"i").to_string()),
+            index_t: 40,
+            default_context: None,
+            retracted,
+            config_id: None,
+            source_branch: None,
+            branches: 0,
+        }
+        .into_ns_record("books:main")
+        .unwrap()
+    }
+
+    #[test]
+    fn projections_carry_both_heads() {
+        let r = record(false);
+        let commit = project_ref(Some(r.clone()), RefKind::CommitHead).expect("commit ref");
+        assert_eq!(commit.id, Some(ContentId::new(ContentKind::Commit, b"c")));
+        assert_eq!(commit.t, 42);
+
+        let index = project_ref(Some(r.clone()), RefKind::IndexHead).expect("index ref");
+        assert_eq!(index.id, Some(ContentId::new(ContentKind::IndexRoot, b"i")));
+        assert_eq!(index.t, 40);
+
+        // `heads` must agree with the two single-ref reads, not drift from them.
+        let heads = project_heads(Some(r)).expect("heads");
+        assert_eq!(heads.commit, commit);
+        assert_eq!(heads.index, index);
+    }
+
+    /// A retracted branch is tombstoned on the active-read surface even though
+    /// the remote endpoint keeps serving its record (with the flag set) through
+    /// `lookup`. Without this the proxy resurrects branches a raft-backed
+    /// origin reports as gone — see `project_ref`.
+    #[test]
+    fn projections_tombstone_a_retracted_branch() {
+        let r = record(true);
+        assert!(r.retracted, "the record itself still carries the flag");
+        assert_eq!(project_ref(Some(r.clone()), RefKind::CommitHead), None);
+        assert_eq!(project_ref(Some(r.clone()), RefKind::IndexHead), None);
+        assert_eq!(project_heads(Some(r)), None);
+    }
+
+    /// An unknown ledger (the endpoint's 404) is `None`, distinct from a
+    /// known-but-unborn branch, which projects zeroed refs.
+    #[test]
+    fn projections_distinguish_unknown_from_unborn() {
+        assert_eq!(project_ref(None, RefKind::CommitHead), None);
+        assert_eq!(project_heads(None), None);
+
+        let unborn = NsRecordResponse {
+            branch: "main".to_string(),
+            commit_head_id: None,
+            commit_t: 0,
+            index_head_id: None,
+            index_t: 0,
+            default_context: None,
+            retracted: false,
+            config_id: None,
+            source_branch: None,
+            branches: 0,
+        }
+        .into_ns_record("books:main")
+        .unwrap();
+        let heads = project_heads(Some(unborn)).expect("unborn branch is known");
+        assert_eq!(heads.commit, RefValue { id: None, t: 0 });
+        assert_eq!(heads.index, RefValue { id: None, t: 0 });
     }
 
     /// Regression for finding #11: `source_branch` and `branches`
@@ -336,7 +468,6 @@ mod tests {
     #[test]
     fn ns_record_conversion_preserves_branch_lineage() {
         let response = NsRecordResponse {
-            name: Some("books".to_string()),
             branch: "feature".to_string(),
             commit_head_id: None,
             commit_t: 7,
@@ -349,7 +480,7 @@ mod tests {
             branches: 3,
         };
 
-        let record = response.into_ns_record("books:feature");
+        let record = response.into_ns_record("books:feature").unwrap();
         assert_eq!(record.source_branch.as_deref(), Some("main"));
         assert_eq!(record.branches, 3);
     }
@@ -378,7 +509,6 @@ mod tests {
     fn test_ns_record_name_derived_from_lookup_key() {
         // When server omits `name`, derive it by splitting lookup_key on ':'
         let response = NsRecordResponse {
-            name: None,
             branch: "main".to_string(),
             commit_head_id: None,
             commit_t: 10,
@@ -391,7 +521,7 @@ mod tests {
             branches: 0,
         };
 
-        let record = response.into_ns_record("books:main");
+        let record = response.into_ns_record("books:main").unwrap();
         assert_eq!(record.ledger_id, "books:main");
         // name should be "books", NOT "books:main"
         assert_eq!(record.name, "books");
@@ -401,7 +531,6 @@ mod tests {
     fn test_ns_record_name_no_branch_in_lookup_key() {
         // When lookup_key has no colon, use it as-is
         let response = NsRecordResponse {
-            name: None,
             branch: "main".to_string(),
             commit_head_id: None,
             commit_t: 10,
@@ -414,8 +543,8 @@ mod tests {
             branches: 0,
         };
 
-        let record = response.into_ns_record("books");
-        assert_eq!(record.ledger_id, "books");
+        let record = response.into_ns_record("books").unwrap();
+        assert_eq!(record.ledger_id, "books:main");
         assert_eq!(record.name, "books");
     }
 }

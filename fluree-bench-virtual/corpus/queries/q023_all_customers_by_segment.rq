@@ -1,0 +1,8 @@
+# q023 all_customers_by_segment
+# Intent: SCD correctness pair with q022: counts include 90K historical versions.
+# BI lineage (BI-13): "Customers by segment WITHOUT the SCD current-version filter (the trap)."
+# Predicates verified against enterprise.ttl — DimCustomer: segment.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?seg (COUNT(?c) AS ?n)
+WHERE { ?c a edw:Customer ; edw:segment ?seg . }
+GROUP BY ?seg

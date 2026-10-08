@@ -85,6 +85,43 @@ Specifies what to return in results. The shape of `select` determines the shape 
 
 The array value is the selection spec — `"*"` for all forward properties, `"@id"` for the subject IRI, `"@type"` (equivalently `"rdf:type"`) for the subject's types, individual property names (`"schema:name"`), or nested object forms for sub-selections. Add `"depth": N` at the query top level to bound auto-expansion of unselected references.
 
+**Ordering and paging inside an expansion.** A nested selection's value may be an object instead of an array, adding `orderBy`, `limit` and `offset` around its `select`:
+
+```json
+{
+  "select": {
+    "?person": [
+      "@id",
+      "schema:name",
+      {
+        "schema:knows": {
+          "select": ["@id", "schema:name", "schema:age"],
+          "orderBy": [["desc", "schema:age"]],
+          "limit": 3
+        }
+      }
+    ]
+  },
+  "where": { "@id": "?person", "@type": "schema:Person" }
+}
+```
+
+These bound how many values **each subject** shows, which is a different question from how many rows the query returns — the top-level `limit` bounds people, this one bounds each person's friends. There is no way to express it in the `where` clause.
+
+| Key | Meaning |
+|-----|---------|
+| `select` | The selection spec, exactly as in the array form. Optional: omit it for a literal-valued property, which has nothing to expand. |
+| `orderBy` | Sort keys, most significant first. A property name, or `["desc", name]`. `"@value"` (equivalently `"@id"`) sorts by the value itself — the literal for a literal-valued property, the subject IRI for an expanded node. |
+| `limit` / `offset` | Applied **after** ordering, so they cut a stable window. |
+
+A key with several values sorts by its first. Values missing the sort key sort last in ascending order, so the ones that have it are the ones a `limit` keeps. Values that cannot be compared (objects without the key, mixed types) keep their relative order.
+
+```json
+{ "select": { "?person": [{ "ex:tag": { "orderBy": ["@value"], "limit": 5 } }] } }
+```
+
+Reverse selections (`@reverse`) do not accept these yet.
+
 **Mixed array** — combine flat variables and subject expansions in one row, in any order. Each object is an independent expansion with its own root and selection spec:
 
 ```json
@@ -199,13 +236,24 @@ Specifies which ledger(s) to query:
 
 ```json
 {
-  "from": "mydb:main@iso:2024-01-15T10:30:00Z"
+  "from": "mydb:main@time:2024-01-15T10:30:00Z"
 }
 ```
 
 ```json
 {
   "from": "mydb:main@commit:bafybeig..."
+}
+```
+
+**Union default graph:** a ledger's default graph holds only the triples written outside any named graph, unless the ledger reads a [union default graph](../concepts/datasets-and-named-graphs.md#union-default-graph). `opts.unionDefaultGraph` decides for one query, whatever the ledger's setting (the SPARQL counterpart is `# PRAGMA union-default-graph`):
+
+```json
+{
+  "from": "mydb:main",
+  "opts": { "unionDefaultGraph": true },
+  "select": ["?name"],
+  "where": { "@id": "?person", "ex:name": "?name" }
 }
 ```
 
@@ -267,6 +315,28 @@ Use variables (starting with `?`) to match unknown values:
   "ex:name": "?name"
 }
 ```
+
+A variable can also stand in predicate position to enumerate all properties of
+a subject:
+
+```json
+{
+  "@id": "?person",
+  "?p": "?o"
+}
+```
+
+Variable-predicate scans return every stored triple, including data written
+with the Fluree vocabulary (`https://ns.flur.ee/db#`, e.g. stored
+`f:AccessPolicy` definitions). The one exception is the seven `f:reifies*`
+predicates — the internal storage encoding of edge annotations. They are
+system-written (user transactions cannot assert them), redundant with the
+edge and annotation content already in the results, and therefore hidden from
+variable-predicate scans. Pass `"opts": {"includeSystemFacts": true}` (in
+SPARQL, `# PRAGMA include-system-facts: true`) to surface them for debugging or
+inspection. Commit metadata (`f:t`, `f:address`,
+…) lives in the ledger's txn-meta graph, not the default graph, so it never
+appears in default-graph scans either way.
 
 ### Type Patterns
 
@@ -541,6 +611,55 @@ Apply conditions to filter results:
 }
 ```
 
+**Comparing against IRIs:**
+
+An unquoted prefixed name or `<...>` IRI is an IRI operand wherever RDF terms
+are compared — `=`, `!=`, `in`, `not-in`, `sameTerm` — and compares by
+identity, so `(= ?p ex:knows)` matches the predicate `ex:knows` — never the
+string `"ex:knows"`. In every other position it is the string it has always
+been:
+
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "select": ["?s", "?o"],
+  "where": [
+    { "@id": "?s", "?p": "?o" },
+    ["filter", "(= ?p ex:knows)"]
+  ]
+}
+```
+
+A bare absolute URL is an IRI operand too: `(= ?u http://example.org/page)`
+compares against the IRI, and `(= ?u "http://example.org/page")` against the
+string. **This changed after 4.2.0.** Every unquoted atom used to lower to a
+string, so `(= ?p ex:knows)` could never match a predicate — the bug this
+fixes. A query that compared a *string-valued* property against an unquoted
+URL matched before and does not now; quote the operand to restore it. The
+prefixed-name form cannot break a working query, since the string `"ex:knows"`
+never matched an IRI either way.
+
+A prefixed name whose prefix the query's `@context` does not define stays a
+plain string and never equals an IRI; quote a value (`"ex:knows"`) when you
+mean the literal text. Inside [datalog rules](datalog-rules.md) an undefined
+prefix is an error rather than a silent string.
+
+The distinction lives in the quoting, so it exists only in the s-expression
+string form. In the **array form** every element is a JSON string, with no
+syntax to mark one as unquoted, so `["=", "?p", "ex:knows"]` compares against
+the *string* `"ex:knows"`. Write the s-expression form, or wrap an **absolute**
+IRI in `iri`, when you mean the IRI:
+
+```json
+["filter", "(= ?p ex:knows)"]
+["filter", ["=", "?p", ["iri", "http://example.org/knows"]]]
+```
+
+`iri` does not expand prefixes: its argument is used verbatim, so
+`["iri", "ex:knows"]` builds the IRI `ex:knows` and matches nothing. (SPARQL's
+`IRI()` resolves a relative argument against the query's `BASE`; the JSON-LD
+surface has no `BASE`, so nothing is resolved here either.)
+
 **Complex Filters:**
 
 ```json
@@ -551,6 +670,14 @@ Apply conditions to filter results:
   ]
 }
 ```
+
+Filter expressions use S-expression (prefix) syntax. SPARQL-style function
+calls — `contains(lcase(?name), "x")` — are rejected with a parse error rather
+than accepted; so is a filter that is a bare string or number constant, since
+it would match every row. To compare against a string literal that itself looks
+like a function call, quote it: `"(= ?v \"contains(x)\")"`. `bind` and `unwind`
+share the same expression language, so a call-shaped literal there needs the
+same quoting: `["bind", "?co", "\"Acme(Inc)\""]`.
 
 ### Bind Patterns
 
@@ -572,8 +699,23 @@ Provide initial bindings:
 ```json
 {
   "where": [
-    ["values", "?name", ["Alice", "Bob", "Carol"]],
+    ["values", ["?name", ["Alice", "Bob", "Carol"]]],
     { "@id": "?person", "ex:name": "?name" }
+  ]
+}
+```
+
+`values` takes exactly one argument, the `[vars, rows]` pair. Bind several
+variables together by making `vars` a list and each row a list of the same
+length; IRI cells are written `{"@id": "..."}`:
+
+```json
+{
+  "where": [
+    ["values", [["?person", "?name"], [
+      [{"@id": "ex:alice"}, "Alice"],
+      [{"@id": "ex:bob"}, "Bob"]
+    ]]]
   ]
 }
 ```
@@ -1086,6 +1228,20 @@ Arithmetic operators accept two or more arguments. With multiple arguments, they
 - `(- ?x)` - Unary negation (single argument)
 - `(abs ?x)` - Absolute value
 
+`(- ?a ?b)` also subtracts two temporal values of the same kind — two
+`xsd:dateTime`s, two `xsd:date`s or two `xsd:time`s — yielding the elapsed time
+as an `xsd:dayTimeDuration`:
+
+```json
+["bind", "?elapsed", "(- ?end ?start)"]
+```
+
+The result is signed, and subtraction is the only operator defined over two
+temporal operands (shifting by a duration is the other form). This is an extension beyond the SPARQL
+standard; see [Date/Time Arithmetic](sparql.md#datetime-arithmetic) for the full
+semantics and portability caveat, which apply identically here — both query
+surfaces lower to the same expression IR.
+
 ### List Value Functions
 
 Operate on list values — those produced by `range`, `list`, or [`collect`](#aggregation-functions). Usable anywhere expressions are (`bind`, `filter`, `select`), and the list-producing ones drive [`unwind`](#unwind-patterns).
@@ -1245,7 +1401,7 @@ Query historical data using time specifiers in `from`:
 ```json
 {
   "@context": { "ex": "http://example.org/ns/" },
-  "from": "ledger:main@iso:2024-01-15T10:30:00Z",
+  "from": "ledger:main@time:2024-01-15T10:30:00Z",
   "select": ["?name"],
   "where": [
     { "@id": "?person", "ex:name": "?name" }
@@ -1337,8 +1493,8 @@ Both annotations work uniformly for literal-valued and IRI-valued objects.
 ```json
 {
   "@context": { "ex": "http://example.org/ns/" },
-  "from": "ledger:main@iso:2024-01-01T00:00:00Z",
-  "to": "ledger:main@iso:2024-12-31T23:59:59Z",
+  "from": "ledger:main@time:2024-01-01T00:00:00Z",
+  "to": "ledger:main@time:2024-12-31T23:59:59Z",
   "select": ["?name", "?t", "?op"],
   "where": [
     { "@id": "ex:alice", "ex:name": { "@value": "?name", "@t": "?t", "@op": "?op" } }
@@ -1520,7 +1676,7 @@ The default is `true`. Disable only when you are intentionally working with bare
 1. **Always Provide @context**: Makes queries readable and maintainable
 2. **Use Specific Patterns**: More specific patterns are more efficient
 3. **Limit Result Sets**: Use `limit` for large result sets
-4. **Flexible Filter Placement**: Filters can be placed anywhere in `where` clauses - the query engine automatically applies each filter as soon as all its required variables are bound
+4. **Flexible Filter Placement**: Filters, including `exists` and `not-exists`, can be placed anywhere in `where` clauses - the query engine applies each one to the whole clause, as soon as every variable it reads has its final value. A variable that an `optional` or a `null` in `values` leaves unbound on some rows waits for any later pattern that fills it in
 5. **Use Time Specifiers**: Use `@t:` when transaction numbers are known (fastest)
 6. **Graph Source Selection**: Choose appropriate graph sources for query patterns
 

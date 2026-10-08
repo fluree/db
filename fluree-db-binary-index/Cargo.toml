@@ -6,9 +6,15 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Store-driven sync residency mode on native (wasm32 has it unconditionally):
+# lets native tests and tools drive the resolve_cached_bytes + NeedFetch +
+# miss-register read arms with a residency-tier content store. Off by default
+# so production native builds compile the exact pre-residency read path.
+residency = []
+
 [dependencies]
-fluree-db-core = { path = "../fluree-db-core", features = ["native"] }
-fluree-db-spatial = { path = "../fluree-db-spatial" }
+fluree-db-core = { path = "../fluree-db-core" }
 fluree-vocab = { path = "../fluree-vocab" }
 
 # Core dependencies
@@ -16,17 +22,14 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tokio.workspace = true
 
 # Index format dependencies
 zstd.workspace = true
-memmap2 = "0.9"
 rustc-hash = "2"
 ciborium = "0.2"
 
 # Cache
-moka.workspace = true
-fs2 = "0.4"
+# moka is native-only: its eviction clock aborts on wasm32 (see fluree-db-core::wasm_cache)
 
 # Concurrency
 once_cell.workspace = true
@@ -58,3 +61,17 @@ fluree-db-novelty = { path = "../fluree-db-novelty" }
 
 [lints]
 workspace = true
+
+# Native: full tokio + mmap + real spatial provider; core's filesystem backends.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+moka = { workspace = true }
+fluree-db-core = { path = "../fluree-db-core", features = ["native"] }
+fluree-db-spatial = { path = "../fluree-db-spatial" }
+tokio = { workspace = true }
+memmap2 = "0.9"
+
+# wasm32: single-threaded, no mmap/threads; tokio limited to wasm-supported features.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", default-features = false, features = ["sync", "macros", "rt", "time"] }
+# moka's uuid needs a JS randomness source on wasm32-unknown-unknown
+uuid = { version = "1", default-features = false, features = ["js"] }

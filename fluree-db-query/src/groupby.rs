@@ -31,9 +31,9 @@ use crate::operator::{
 };
 use crate::var_registry::VarId;
 use async_trait::async_trait;
+use fluree_db_core::clock::Instant;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 use tracing::Instrument;
 
 /// Type alias for a group entry: (group_key, rows_in_group)
@@ -350,7 +350,7 @@ mod tests {
     }
 
     fn make_test_snapshot() -> LedgerSnapshot {
-        LedgerSnapshot::genesis("test/main")
+        LedgerSnapshot::genesis("test:main")
     }
 
     #[test]

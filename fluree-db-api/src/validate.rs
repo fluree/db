@@ -24,6 +24,7 @@ use fluree_db_shacl::{Severity, ShaclCache, ShaclCacheKey, ShaclEngine};
 use fluree_db_transact::namespace::NamespaceRegistry;
 use fluree_db_transact::TransactError;
 use fluree_vocab::config_iris;
+use fluree_vocab::fluree::DB as FLUREE_NS;
 use fluree_vocab::shacl as sh_vocab;
 use serde_json::{json, Value as JsonValue};
 
@@ -51,6 +52,18 @@ pub struct ValidateOptions {
     /// When the shapes source is not [`ShapesSource::Attached`], also union
     /// in the ledger's attached shapes instead of replacing them.
     pub include_attached: bool,
+    /// Micro-fuel ceiling for the whole validation pass. `None` / `Some(0)`
+    /// = unbounded.
+    ///
+    /// Matters because of `sh:sparql`: every other SHACL constraint can only
+    /// read what is reachable from the focus node, but a `sh:sparql` body may
+    /// walk anywhere in the graph, once per focus node. Fuel is what makes
+    /// that reading bounded.
+    pub max_fuel: Option<u64>,
+    /// Request-scoped cooperative cancellation: the deadline, and the carrier
+    /// for the per-query memory ceiling (which is installed only when a
+    /// cancellation is present). Server callers should always pass one.
+    pub cancellation: Option<fluree_db_core::QueryCancellation>,
 }
 
 impl Default for ValidateOptions {
@@ -59,36 +72,13 @@ impl Default for ValidateOptions {
             graph: None,
             shapes: ShapesSource::Attached,
             include_attached: false,
+            max_fuel: None,
+            cancellation: None,
         }
     }
 }
 
-/// One validation result with all identifiers resolved to IRIs.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ReportResult {
-    /// The node that failed validation (`sh:focusNode`): a JSON string for
-    /// IRIs / blank-node labels, or a JSON-LD value object (or native
-    /// scalar) for literal `sh:targetNode` targets.
-    pub focus_node: JsonValue,
-    /// The property path, when it is a single predicate (`sh:resultPath`).
-    /// Complex paths are omitted rather than misrepresented.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result_path: Option<String>,
-    /// The node shape that produced this result.
-    pub source_shape: String,
-    /// The property shape that produced this result, when applicable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_constraint: Option<String>,
-    /// The constraint component IRI (`sh:sourceConstraintComponent`).
-    pub constraint_component: String,
-    /// Severity IRI: `sh:Violation`, `sh:Warning`, or `sh:Info`.
-    pub severity: String,
-    /// Human-readable message (`sh:resultMessage`).
-    pub message: String,
-    /// The offending value, when applicable (`sh:value`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<JsonValue>,
-}
+pub use fluree_db_transact::ReportResult;
 
 /// A resolved validation report, ready for serialization.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -100,6 +90,10 @@ pub struct ValidateReport {
     /// Number of compiled shapes that were checked. `0` means the shapes
     /// source produced no shapes — the report is vacuously conforming.
     pub shape_count: usize,
+    /// The ledger `t` this report describes: the exact snapshot (index plus
+    /// novelty overlay) the shapes were evaluated against. Anything a caller
+    /// measures alongside these results must be read at this `t`.
+    pub t: i64,
 }
 
 impl ValidateReport {
@@ -162,18 +156,24 @@ impl ValidateReport {
             .collect();
 
         json!({
-            "@context": {"sh": "http://www.w3.org/ns/shacl#"},
+            "@context": {
+                "sh": "http://www.w3.org/ns/shacl#",
+                "f": FLUREE_NS,
+            },
             "@type": "sh:ValidationReport",
             "sh:conforms": self.conforms,
+            "f:t": self.t,
             "sh:result": results,
         })
     }
 
     /// Serialize as a W3C `sh:ValidationReport` Turtle document.
     pub fn to_turtle(&self) -> String {
-        let mut out = String::from("@prefix sh: <http://www.w3.org/ns/shacl#> .\n\n");
+        let mut out = String::from("@prefix sh: <http://www.w3.org/ns/shacl#> .\n");
+        out.push_str(&format!("@prefix f: <{FLUREE_NS}> .\n\n"));
         out.push_str("[] a sh:ValidationReport ;\n");
-        out.push_str(&format!("    sh:conforms {}", self.conforms));
+        out.push_str(&format!("    sh:conforms {} ;\n", self.conforms));
+        out.push_str(&format!("    f:t {}", self.t));
         for r in &self.results {
             out.push_str(" ;\n    sh:result [\n        a sh:ValidationResult ;\n");
             let focus_term = match r.focus_node.as_str() {
@@ -215,9 +215,20 @@ impl ValidateReport {
 
 /// Render an IRI or blank-node label as a Turtle term.
 ///
-/// Skolemized blank-node labels may carry characters that are invalid in a
-/// Turtle BLANK_NODE_LABEL (e.g. `/` and `:` from embedded ledger ids) —
-/// sanitize them so the emitted document always parses.
+/// A blank-node label may carry characters that are invalid in a Turtle
+/// BLANK_NODE_LABEL — map them to `-` so the emitted report always parses.
+///
+/// Two label shapes still need it. Ledgers imported by Fluree 4.1.4 or earlier
+/// hold ids that embedded the ledger id, so they contain `/` and `:`
+/// (`fdb-lubm:main-1-genid10`); current import ids are `[0-9a-z-]` only (see
+/// `fluree_db_core::skolem`) and pass through unchanged. Client-authored
+/// labels can also carry characters JSON-LD accepts and Turtle does not.
+///
+/// The rewrite is **lossy**: two labels differing only in sanitized characters
+/// collapse onto one. That is acceptable here — a validation report is
+/// human-facing output, not a round-trippable serialization of the graph — and
+/// it is why the same rewrite is deliberately NOT applied on the export path
+/// (`crate::export`), where identity has to survive.
 fn turtle_term(iri_or_bnode: &str) -> String {
     match iri_or_bnode.strip_prefix("_:") {
         Some(label) => {
@@ -237,31 +248,19 @@ fn turtle_term(iri_or_bnode: &str) -> String {
     }
 }
 
-/// Render an IRI as a Turtle IRIREF, `\uXXXX`-escaping the characters the Turtle
-/// grammar forbids inside `<…>` (controls, space, and ``<>"{}|^`\``). The parser
-/// unescapes these back to the original codepoint, so the IRI round-trips —
-/// unlike percent-encoding, which would change the IRI's identity.
+/// Render an IRI as a Turtle IRIREF; characters the grammar forbids inside
+/// `<…>` are `\uXXXX`-escaped, which the parser reads back as the same IRI.
 fn turtle_iri(iri: &str) -> String {
-    use std::fmt::Write;
     let mut out = String::with_capacity(iri.len() + 2);
-    out.push('<');
-    for c in iri.chars() {
-        match c {
-            '\u{00}'..='\u{20}' | '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\' => {
-                let _ = write!(out, "\\u{:04X}", c as u32);
-            }
-            _ => out.push(c),
-        }
-    }
-    out.push('>');
+    fluree_graph_ir::syntax::push_iri_ref(&mut out, iri);
     out
 }
 
 /// Render an IRI as `sh:Name` when it lives in the SHACL namespace.
 fn turtle_sh_term(iri: &str) -> String {
     match iri.strip_prefix("http://www.w3.org/ns/shacl#") {
-        Some(local) => format!("sh:{local}"),
-        None => turtle_term(iri),
+        Some(local) if fluree_graph_ir::syntax::is_pn_local(local) => format!("sh:{local}"),
+        _ => turtle_term(iri),
     }
 }
 
@@ -273,7 +272,13 @@ fn turtle_value_term(value: &JsonValue) -> String {
                 return turtle_term(iri);
             }
             if let Some(lex) = obj.get("@value").and_then(|v| v.as_str()) {
-                if let Some(lang) = obj.get("@language").and_then(|v| v.as_str()) {
+                // A tag has no escape form; an invalid one would end the
+                // literal and forge triples, so the report drops it.
+                if let Some(lang) = obj
+                    .get("@language")
+                    .and_then(|v| v.as_str())
+                    .filter(|lang| fluree_graph_ir::syntax::is_lang_tag(lang))
+                {
                     return format!("{}@{lang}", turtle_string(lex));
                 }
                 if let Some(dt) = obj.get("@type").and_then(|v| v.as_str()) {
@@ -294,16 +299,7 @@ fn turtle_value_term(value: &JsonValue) -> String {
 fn turtle_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(c),
-        }
-    }
+    fluree_graph_ir::syntax::push_string(&mut out, s);
     out.push('"');
     out
 }
@@ -319,6 +315,11 @@ fn compact_sh(iri: &str) -> String {
 impl crate::Fluree {
     /// Validate the current state of a ledger against SHACL shapes and
     /// return a resolved validation report. See [`ValidateOptions`].
+    ///
+    /// This is the entry point that supports a cross-ledger `f:shapesSource`
+    /// (`f:ledger` set): the model ledger's shapes are resolved through the
+    /// governance cache (one nameservice head lookup when M is unchanged)
+    /// and validated against exactly like the transaction path.
     pub async fn validate_ledger(
         &self,
         ledger_id: &str,
@@ -326,7 +327,52 @@ impl crate::Fluree {
     ) -> Result<ValidateReport> {
         let handle = self.ledger_cached(ledger_id).await?;
         let view = handle.snapshot().await;
-        validate_view(&view, ledger_id, options).await
+
+        let use_attached =
+            matches!(options.shapes, ShapesSource::Attached) || options.include_attached;
+        let (config, cross) = if use_attached {
+            let config = resolve_config_for_validate(&view).await;
+            let is_cross_ledger = config
+                .as_ref()
+                .and_then(|c| c.shacl.as_ref())
+                .and_then(|s| s.shapes_source.as_ref())
+                .is_some_and(|s| s.ledger.is_some());
+            let cross = if is_cross_ledger {
+                let mut resolve_ctx =
+                    crate::cross_ledger::ResolveCtx::new(&view.snapshot.ledger_id, self);
+                crate::tx::open_cross_ledger_shapes_model(config.as_ref(), &mut resolve_ctx)
+                    .await
+                    .map_err(ApiError::from)?
+            } else {
+                None
+            };
+            (config, cross)
+        } else {
+            (None, None)
+        };
+
+        validate_view_inner(&view, ledger_id, options, config, cross).await
+    }
+}
+
+/// Resolve the ledger config for validation. Mirrors the transaction path's
+/// degrade semantics: a broken config graph read falls back to defaults
+/// (default-graph shapes) rather than failing validation.
+async fn resolve_config_for_validate(
+    view: &LedgerView,
+) -> Option<fluree_db_core::ledger_config::LedgerConfig> {
+    match crate::config_resolver::resolve_ledger_config(
+        view.snapshot.as_ref(),
+        view.novelty.as_ref(),
+        view.t,
+    )
+    .await
+    {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::debug!(error = %e, "Config graph read failed during validate — using defaults");
+            None
+        }
     }
 }
 
@@ -334,10 +380,45 @@ impl crate::Fluree {
 ///
 /// Runs over the query-visible composition (snapshot + novelty overlay) of
 /// `view`, scoped to the data graph selected by `options.graph`.
+///
+/// This view-scoped entry point has no connection handle, so a cross-ledger
+/// `f:shapesSource` cannot be resolved here and returns an error — use
+/// [`crate::Fluree::validate_ledger`] for ledgers configured that way.
 pub async fn validate_view(
     view: &LedgerView,
     ledger_id: &str,
     options: &ValidateOptions,
+) -> Result<ValidateReport> {
+    let use_attached = matches!(options.shapes, ShapesSource::Attached) || options.include_attached;
+    let config = if use_attached {
+        resolve_config_for_validate(view).await
+    } else {
+        None
+    };
+    validate_view_inner(view, ledger_id, options, config, None).await
+}
+
+/// Fuel tracker for one validation pass. `None` / `Some(0)` = unbounded,
+/// matching `tracker_for_limits` on the query and transact paths.
+fn validate_tracker(max_fuel: Option<u64>) -> fluree_db_core::tracking::Tracker {
+    use fluree_db_core::tracking::{Tracker, TrackingOptions};
+    match max_fuel.filter(|limit| *limit > 0) {
+        Some(limit) => Tracker::new(TrackingOptions {
+            track_time: false,
+            track_fuel: true,
+            track_policy: false,
+            max_fuel: Some(limit),
+        }),
+        None => Tracker::disabled(),
+    }
+}
+
+async fn validate_view_inner(
+    view: &LedgerView,
+    ledger_id: &str,
+    options: &ValidateOptions,
+    config: Option<fluree_db_core::ledger_config::LedgerConfig>,
+    cross: Option<crate::tx::CrossLedgerShapesModel>,
 ) -> Result<ValidateReport> {
     let snapshot = view.snapshot.as_ref();
     let novelty = view.novelty.as_ref();
@@ -356,28 +437,56 @@ pub async fn validate_view(
     #[allow(unused_assignments)]
     let mut inline_overlay = None;
     let mut inline_membership: Option<fluree_db_shacl::CrossLedgerMembership<'_>> = None;
+    #[allow(unused_assignments)]
+    let mut cross_overlay = None;
+    let mut cross_membership: Option<fluree_db_shacl::CrossLedgerMembership<'_>> = None;
 
     let mut shape_dbs: Vec<GraphDbRef<'_>> = Vec::new();
     let mut membership: Vec<GraphId> = Vec::new();
 
     let use_attached = matches!(options.shapes, ShapesSource::Attached) || options.include_attached;
     if use_attached {
-        // Mirror the transaction path: a broken config graph read degrades to
-        // defaults (default-graph shapes) rather than failing validation.
-        let config = match crate::config_resolver::resolve_ledger_config(snapshot, novelty, to_t)
-            .await
-        {
-            Ok(config) => config,
-            Err(e) => {
-                tracing::debug!(error = %e, "Config graph read failed during validate — using defaults");
-                None
+        if let Some(model) = cross.as_ref() {
+            // Cross-ledger `f:shapesSource`: compile from M's wire artifact,
+            // translated against D's committed namespace registry (validate
+            // has no in-flight transaction, so the snapshot registry is
+            // complete). Mirrors the transaction path's shape source; D's
+            // own default-graph shapes compose via the bundle overlay's
+            // novelty base exactly as they do at staging time.
+            let wire = model.wire().ok_or_else(|| {
+                ApiError::from(TransactError::Parse(
+                    "cross-ledger shapes resolution returned a non-shapes artifact".into(),
+                ))
+            })?;
+            let registry = NamespaceRegistry::from_db(snapshot);
+            let bundle = wire
+                .translate_to_schema_bundle_flakes(&registry)
+                .map_err(|e| {
+                    ApiError::from(TransactError::Parse(format!(
+                        "cross-ledger shapes wire translation failed: {e}"
+                    )))
+                })?;
+            cross_overlay = Some(fluree_db_query::schema_bundle::SchemaBundleOverlay::new(
+                novelty, bundle,
+            ));
+            shape_dbs.push(GraphDbRef::new(
+                snapshot,
+                0u16,
+                cross_overlay.as_ref().expect("just set above"),
+                to_t,
+            ));
+            membership.push(0);
+            // `sh:class` value-sets living alongside M's shapes: probe M's
+            // shapes graph after a local membership miss, translating D-term
+            // Sids through the snapshot namespace map.
+            cross_membership = Some(model.membership(snapshot.namespaces()));
+        } else {
+            let shapes_g_ids = crate::tx::resolve_shapes_source_g_ids(config.as_ref(), snapshot)?;
+            for g_id in &shapes_g_ids {
+                shape_dbs.push(GraphDbRef::new(snapshot, *g_id, novelty, to_t));
             }
-        };
-        let shapes_g_ids = crate::tx::resolve_shapes_source_g_ids(config.as_ref(), snapshot)?;
-        for g_id in &shapes_g_ids {
-            shape_dbs.push(GraphDbRef::new(snapshot, *g_id, novelty, to_t));
+            membership.extend(shapes_g_ids);
         }
-        membership.extend(shapes_g_ids);
     }
 
     match &options.shapes {
@@ -418,7 +527,7 @@ pub async fn validate_view(
             // `include_attached` is set, the attached shape dbs pushed above
             // contribute the union — never a double scan of graph 0.
             static NO_OVERLAY: NoOverlay = NoOverlay;
-            inline_snapshot = Some(LedgerSnapshot::genesis(ledger_id));
+            inline_snapshot = Some(LedgerSnapshot::genesis(&view.snapshot.ledger_id));
             inline_overlay = Some(fluree_db_query::schema_bundle::SchemaBundleOverlay::new(
                 &NO_OVERLAY,
                 bundle,
@@ -460,11 +569,14 @@ pub async fn validate_view(
         shapes,
         hierarchy.as_ref(),
     );
-    let engine = match hierarchy {
+    let mut engine = match hierarchy {
         Some(h) => ShaclEngine::new_with_hierarchy(cache, h),
         None => ShaclEngine::new(cache),
     }
     .with_membership_graphs(membership);
+    if let Some(cancellation) = options.cancellation.clone() {
+        engine = engine.with_cancellation(cancellation);
+    }
 
     let shape_count = engine.shape_count();
     if engine.is_empty() {
@@ -472,69 +584,34 @@ pub async fn validate_view(
             conforms: true,
             results: Vec::new(),
             shape_count,
+            t: to_t,
         });
     }
 
-    let data_db = GraphDbRef::new(snapshot, data_g_id, novelty, to_t);
+    // Fuel bounds how much the pass may READ. `sh:sparql` runs one query per
+    // focus node whose body is not limited to the focus node's neighbourhood,
+    // so without a tracker a single request can walk the whole ledger
+    // repeatedly. `with_tracker` is a no-op on a disabled tracker, so the
+    // unbounded default costs nothing.
+    let tracker = validate_tracker(options.max_fuel);
+    let data_db = GraphDbRef::new(snapshot, data_g_id, novelty, to_t).with_tracker(&tracker);
+    // The engine takes one external membership source. Inline shapes carry
+    // their own value-set facts (same term space), so an explicit inline
+    // document keeps precedence; the cross-ledger probe serves the attached
+    // cross-ledger shapes otherwise.
     let raw = engine
-        .validate_all_with_membership(data_db, inline_membership)
+        .validate_all_with_membership(data_db, inline_membership.or(cross_membership))
         .await
         .map_err(TransactError::from)?;
 
     let resolve = |sid: &Sid| resolve_sid(snapshot, inline_registry.as_ref(), sid);
-    let mut results: Vec<ReportResult> = raw
-        .results
-        .iter()
-        .map(|r| ReportResult {
-            focus_node: match &r.focus_node {
-                fluree_db_shacl::FocusNode::Node(sid) => JsonValue::String(resolve(sid)),
-                fluree_db_shacl::FocusNode::Literal(lit) => {
-                    match value_json(
-                        &lit.value,
-                        Some(&lit.datatype),
-                        lit.lang.as_deref(),
-                        &resolve,
-                    ) {
-                        // A bare string would be ambiguous with an IRI focus —
-                        // wrap plain string literals as a value object.
-                        JsonValue::String(s) => json!({"@value": s}),
-                        other => other,
-                    }
-                }
-            },
-            result_path: r.result_path.as_ref().map(&resolve),
-            source_shape: resolve(&r.source_shape),
-            source_constraint: r.source_constraint.as_ref().map(&resolve),
-            constraint_component: r.constraint_component.to_string(),
-            severity: severity_iri(r.severity).to_string(),
-            message: r.message.clone(),
-            value: r.value.as_ref().map(|v| {
-                value_json(
-                    v,
-                    r.value_datatype.as_ref(),
-                    r.value_lang.as_deref(),
-                    &resolve,
-                )
-            }),
-        })
-        .collect();
-    results.sort_by(|a, b| {
-        (
-            a.focus_node.to_string(),
-            &a.constraint_component,
-            &a.message,
-        )
-            .cmp(&(
-                b.focus_node.to_string(),
-                &b.constraint_component,
-                &b.message,
-            ))
-    });
+    let results = report_results(&raw.results, &resolve);
 
     Ok(ValidateReport {
         conforms: raw.conforms,
         results,
         shape_count,
+        t: to_t,
     })
 }
 
@@ -576,6 +653,62 @@ fn resolve_sid(
             })
         })
         .unwrap_or_else(|| sid.name.to_string())
+}
+
+/// Validation results with every identifier resolved by `resolve`, sorted by
+/// (focus node, component, message).
+pub(crate) fn report_results<'a>(
+    results: impl IntoIterator<Item = &'a fluree_db_shacl::ValidationResult>,
+    resolve: &impl Fn(&Sid) -> String,
+) -> Vec<ReportResult> {
+    let mut results: Vec<ReportResult> = results
+        .into_iter()
+        .map(|r| ReportResult {
+            focus_node: match &r.focus_node {
+                fluree_db_shacl::FocusNode::Node(sid) => JsonValue::String(resolve(sid)),
+                fluree_db_shacl::FocusNode::Literal(lit) => {
+                    match value_json(
+                        &lit.value,
+                        Some(&lit.datatype),
+                        lit.lang.as_deref(),
+                        resolve,
+                    ) {
+                        // A bare string would be ambiguous with an IRI focus —
+                        // wrap plain string literals as a value object.
+                        JsonValue::String(s) => json!({"@value": s}),
+                        other => other,
+                    }
+                }
+            },
+            result_path: r.result_path.as_ref().map(resolve),
+            source_shape: resolve(&r.source_shape),
+            source_constraint: r.source_constraint.as_ref().map(resolve),
+            constraint_component: r.constraint_component.to_string(),
+            severity: severity_iri(r.severity).to_string(),
+            message: r.message.clone(),
+            value: r.value.as_ref().map(|v| {
+                value_json(
+                    v,
+                    r.value_datatype.as_ref(),
+                    r.value_lang.as_deref(),
+                    resolve,
+                )
+            }),
+        })
+        .collect();
+    results.sort_by(|a, b| {
+        (
+            a.focus_node.to_string(),
+            &a.constraint_component,
+            &a.message,
+        )
+            .cmp(&(
+                b.focus_node.to_string(),
+                &b.constraint_component,
+                &b.message,
+            ))
+    });
+    results
 }
 
 fn severity_iri(severity: Severity) -> &'static str {
@@ -695,6 +828,7 @@ mod tests {
                 value: None,
             }],
             shape_count: 1,
+            t: 7,
         }
     }
 
@@ -703,11 +837,26 @@ mod tests {
         let turtle = sample_report().to_turtle();
         let mut sink = fluree_graph_ir::GraphCollectorSink::new();
         fluree_graph_turtle::parse(&turtle, &mut sink).expect("report Turtle must parse");
-        let graph = sink.finish();
+        let graph = sink.into_graph();
         // report node (type + conforms + result) and the result node's fields
         assert!(graph.len() >= 8, "expected full report triples: {turtle}");
         assert!(turtle.contains("sh:MinCountConstraintComponent"));
         assert!(turtle.contains("<http://example.org/ns/nameless>"));
+    }
+
+    #[test]
+    fn rendered_reports_carry_ledger_t() {
+        let report = sample_report();
+        let jsonld = report.to_jsonld();
+        assert_eq!(jsonld["f:t"], json!(7));
+        assert_eq!(jsonld["@context"]["f"], json!(FLUREE_NS));
+        assert!(
+            report.to_turtle().contains("    f:t 7"),
+            "turtle must carry f:t: {}",
+            report.to_turtle()
+        );
+        let summary = serde_json::to_value(&report).unwrap();
+        assert_eq!(summary["t"], json!(7));
     }
 
     #[test]

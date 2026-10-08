@@ -5,12 +5,18 @@ mod support;
 mod it_policy_allow;
 #[path = "it_policy_class.rs"]
 mod it_policy_class;
+#[path = "it_policy_class_cache_sequential.rs"]
+mod it_policy_class_cache_sequential;
 #[path = "it_policy_cross_ledger.rs"]
 mod it_policy_cross_ledger;
+#[path = "it_policy_cypher_conditions.rs"]
+mod it_policy_cypher_conditions;
 #[path = "it_policy_federation.rs"]
 mod it_policy_federation;
 #[path = "it_policy_fquery.rs"]
 mod it_policy_fquery;
+#[path = "it_policy_graph_builder.rs"]
+mod it_policy_graph_builder;
 #[path = "it_policy_identity_based.rs"]
 mod it_policy_identity_based;
 #[path = "it_policy_indexed.rs"]
@@ -19,13 +25,19 @@ mod it_policy_indexed;
 mod it_policy_named_graphs;
 #[path = "it_policy_optional_hashjoin.rs"]
 mod it_policy_optional_hashjoin;
+#[path = "it_policy_predicate_fast_lanes.rs"]
+mod it_policy_predicate_fast_lanes;
 #[path = "it_policy_query_connection.rs"]
 mod it_policy_query_connection;
+#[path = "it_policy_sparql.rs"]
+mod it_policy_sparql;
 #[path = "it_policy_time_travel.rs"]
 mod it_policy_time_travel;
 #[path = "it_policy_tracking.rs"]
 mod it_policy_tracking;
 #[path = "it_policy_tx.rs"]
 mod it_policy_tx;
+#[path = "it_policy_verbs.rs"]
+mod it_policy_verbs;
 #[path = "it_policy_write_path.rs"]
 mod it_policy_write_path;

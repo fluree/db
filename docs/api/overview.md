@@ -55,7 +55,7 @@ Historical queries use time specifiers in ledger IDs:
 
 ```text
 ledger:branch@t:100           # Transaction number
-ledger:branch@iso:2024-01-15  # ISO timestamp
+ledger:branch@time:2024-01-15  # ISO timestamp
 ledger:branch@commit:bafybeig...  # Commit ID
 ```
 
@@ -87,12 +87,19 @@ defaults to `/v1/fluree`.
 - Returns: Transaction receipt with commit info
 
 **POST /insert** / **POST /upsert**
-- Insert or upsert data (JSON-LD and Turtle; TriG on upsert)
+- Insert or upsert data (JSON-LD, Turtle and TriG)
+
+**POST /sync**
+- Make one graph's contents exactly the payload, committing only the difference (JSON-LD, Turtle, N-Triples or TriG)
+
+**GET / HEAD / PUT / POST / DELETE /data**
+- W3C Graph Store Protocol: read, replace, add to or remove one graph ([Graph Store Protocol](graph-store.md))
 
 ### Query Endpoints
 
 **POST /query**
 - Execute queries (JSON-LD Query, SPARQL, or Cypher — Cypher on the ledger-scoped `/query/{ledger}` route with `Content-Type: application/cypher`)
+- Execute GraphQL against a derived schema (`/graphql/{ledger}`), or read that schema as SDL (`/graphql-schema/{ledger}`)
 - Parameters: None (ledger specified in query body)
 - Returns: Query results
 - Supports history queries via time range in `from` clause (see [Time Travel](../concepts/time-travel.md))
@@ -294,29 +301,10 @@ See [Signed Requests](signed-requests.md) for detailed documentation.
 
 ## Rate Limiting
 
-### Default Limits
-
-Production deployments should implement rate limiting:
-- Queries: 100 requests per minute
-- Transactions: 10 requests per minute
-- History: 50 requests per minute
-
-### Rate Limit Headers
-
-Responses include rate limit information:
-
-```http
-X-RateLimit-Limit: 100
-X-RateLimit-Remaining: 95
-X-RateLimit-Reset: 1642857600
-```
-
-### Exceeding Limits
-
-When limits are exceeded:
-- Status code: `429 Too Many Requests`
-- Response body includes retry information
-- `Retry-After` header indicates wait time
+The server does not rate-limit requests and sends no `X-RateLimit-*` headers. Production
+deployments that need rate limiting should enforce it in a reverse proxy or API gateway in
+front of the server; status codes and headers such as `429 Too Many Requests` and
+`Retry-After` then come from that layer.
 
 ## API Versioning
 
@@ -443,7 +431,8 @@ async function retryRequest(fn, maxRetries = 3) {
 
 ### 6. Monitor Rate Limits
 
-Track rate limit headers and back off when approaching limits.
+If a proxy or gateway in front of the server enforces rate limits, track its headers and back
+off when approaching limits.
 
 ### 7. Use Compression
 
@@ -478,7 +467,9 @@ Never expose credentials in code or logs:
 
 ### Implement CORS Carefully
 
-If exposing API to web applications, configure CORS appropriately:
+If exposing API to web applications, configure CORS appropriately. The server's built-in
+CORS is on/off only and, when on, allows any origin. To restrict origins, disable it
+(`--cors-enabled=false`) and have a reverse proxy send headers such as:
 
 ```http
 Access-Control-Allow-Origin: https://your-app.com
@@ -495,7 +486,7 @@ Combine related entities in single transactions for better performance.
 ### 2. Use Appropriate Time Specifiers
 
 - `@t:NNN` is fastest (direct lookup)
-- `@iso:DATETIME` requires binary search
+- `@time:DATETIME` requires binary search
 - `@commit:CID` requires scan
 
 ### 3. Limit Result Sets

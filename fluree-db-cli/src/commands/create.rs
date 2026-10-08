@@ -11,12 +11,16 @@ pub struct ImportOpts {
     pub memory_budget_mb: usize,
     pub parallelism: usize,
     pub chunk_size_mb: usize,
+    /// Namespace salting minted blank-node ids. `None` = the ledger id.
+    pub skolem_namespace: Option<String>,
     pub leaflet_rows: usize,
     pub leaflets_per_leaf: usize,
-    /// CSV import: how relationship (edge) properties are encoded.
+    /// CSV/Cypher import: how relationship (edge) properties are encoded.
     pub edge_policy: fluree_db_api::csv_import::EdgePolicy,
-    /// CSV import: base IRI namespace for minted ids/predicates/classes.
-    pub base_iri: String,
+    /// CSV/Cypher import: base IRI namespace for minted ids/predicates/classes.
+    /// `None` = the format's default (CSV: `http://example.org/`; Cypher: bare
+    /// namespace-0 names).
+    pub base_iri: Option<String>,
 }
 
 /// `fluree create <ledger> --remote <name>` — create an empty ledger on the
@@ -26,7 +30,7 @@ pub struct ImportOpts {
 /// remote storage is separate from local.
 pub async fn run_remote(ledger: &str, remote_name: &str, dirs: &FlureeDir) -> CliResult<()> {
     let client = context::build_remote_client(remote_name, dirs).await?;
-    let ledger_id = context::to_ledger_id(ledger);
+    let ledger_id = context::to_ledger_id(ledger)?;
     let response = client.create_ledger(&ledger_id).await.map_err(|e| {
         CliError::Remote(format!(
             "failed to create '{ledger}' on remote '{remote_name}': {e}"
@@ -61,7 +65,7 @@ pub async fn run_remote_flpack_import(
     let size = meta.len();
 
     let client = context::build_remote_client(remote_name, dirs).await?;
-    let ledger_id = context::to_ledger_id(ledger);
+    let ledger_id = context::to_ledger_id(ledger)?;
 
     let cap = client.fetch_import_capability().await;
     let result = if cap.needs_negotiated_upload(size) {
@@ -257,8 +261,15 @@ async fn poll_remote_import(
             }
             Some("running" | "awaiting-upload") => {}
             other => {
+                // `other` is `Option<&str>`; Debug-printing it rendered the
+                // Rust container — `unexpected remote import status:
+                // Some("weird")`. Show the status the way the server sent it,
+                // and fall back to the raw JSON when the field is absent or
+                // isn't a string (`null`, a number, an object) so the message
+                // still names what arrived.
+                let shown = other.map_or_else(|| status["status"].to_string(), ToString::to_string);
                 return Err(CliError::Remote(format!(
-                    "unexpected remote import status: {other:?}"
+                    "unexpected remote import status: {shown}"
                 )));
             }
         }
@@ -270,6 +281,100 @@ async fn poll_remote_import(
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(3));
     }
+}
+
+/// `fluree create <ledger> --remote <name> --from <data>` for non-`.flpack`
+/// inputs: upload the raw source file to a server advertising
+/// `source-upload` and let it run the bulk-import pipeline (the same formats
+/// `fluree create --from` takes locally). Single files only — a directory
+/// can't ride one upload slot; pack it or create locally and publish.
+pub async fn run_remote_source_import(
+    ledger: &str,
+    remote_name: &str,
+    path: &Path,
+    dirs: &FlureeDir,
+    edge_policy: fluree_db_api::csv_import::EdgePolicy,
+    base_iri: Option<&str>,
+) -> CliResult<()> {
+    use colored::Colorize;
+
+    if !path.is_file() {
+        return Err(CliError::Usage(format!(
+            "--remote --from requires a single file ({} is a directory); \
+             create locally then `fluree publish {remote_name} {ledger}`, or export \
+             to .flpack (`fluree export <ledger> --format ledger -o out.flpack`).",
+            path.display()
+        )));
+    }
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| CliError::Input(format!("unusable file name: {}", path.display())))?;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| CliError::Input(format!("failed to stat {}: {e}", path.display())))?;
+    let size = meta.len();
+
+    let client = context::build_remote_client(remote_name, dirs).await?;
+    let ledger_id = context::to_ledger_id(ledger)?;
+
+    let cap = client.fetch_import_capability().await;
+    if !cap.supports_source_upload() {
+        return Err(CliError::Usage(format!(
+            "remote '{remote_name}' does not offer server-side bulk import (source-upload); \
+             export to .flpack first (`fluree export <ledger> --format ledger -o out.flpack`), \
+             or create locally then `fluree publish {remote_name} {ledger}`."
+        )));
+    }
+
+    eprintln!(
+        "Uploading '{}' to remote '{}' for server-side bulk import ({}, {})...",
+        ledger.cyan(),
+        remote_name,
+        filename,
+        format_human_bytes(size),
+    );
+
+    // Same mint → upload → complete → poll handshake as the negotiated
+    // `.flpack` path; the mint body declares the source kind + filename so the
+    // server stages with the right extension and runs the pipeline on
+    // complete.
+    let mint = client
+        .mint_source_import_upload(&ledger_id, Some(size), filename, edge_policy, base_iri)
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to start upload to '{remote_name}': {e}")))?;
+    let import_id = mint["import_id"]
+        .as_str()
+        .ok_or_else(|| CliError::Remote("mint response missing import_id".to_string()))?
+        .to_string();
+
+    let completed_parts = if mint.get("multipart").is_some() {
+        upload_multipart(&client, &mint, path, size).await?
+    } else {
+        upload_single(&client, &mint, path).await?
+    };
+
+    client
+        .complete_import_upload(&import_id, &completed_parts)
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to start remote import: {e}")))?;
+
+    eprintln!("Upload complete; importing on '{remote_name}'...");
+
+    let result = poll_remote_import(&client, &import_id).await?;
+    context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+
+    let resolved = result["ledger_id"].as_str().unwrap_or(&ledger_id);
+    let t = result["t"].as_i64().unwrap_or(0);
+    let flakes = result["flake_count"].as_u64().unwrap_or(0);
+    println!(
+        "{} Imported '{}' to remote '{}' — t={}, {} flakes",
+        "✓".green(),
+        resolved,
+        remote_name,
+        t,
+        flakes,
+    );
+    Ok(())
 }
 
 /// Print the shared success summary for a remote import (both paths).
@@ -300,14 +405,14 @@ pub async fn run(
 ) -> CliResult<()> {
     // Refuse if this alias is already tracked (mutual exclusion)
     let store = config::TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
-    if store.get_tracked(ledger).is_some() {
+    if store.get_tracked(&context::to_ledger_id(ledger)?).is_some() {
         return Err(CliError::Usage(format!(
             "alias '{ledger}' is already used by a tracked ledger.\n  \
              Run `fluree track remove {ledger}` first, or choose a different name."
         )));
     }
 
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
 
     match from {
         Some(path) if is_flpack_path(path) => {
@@ -319,6 +424,12 @@ pub async fn run(
         // understand RDF/JSON-LD.
         Some(path) if is_csv_input(path) => {
             run_csv_import(&fluree, ledger, path, dirs, verbose, quiet, import_opts).await?;
+        }
+        // Cypher scripts (.cypher/.cyp/.cql of CREATE / MATCH…CREATE
+        // statements) are converted to newline-delimited JSON-LD and loaded
+        // through the same chunked bulk-import pipeline.
+        Some(path) if is_cypher_input(path) => {
+            run_cypher_import(&fluree, ledger, path, dirs, verbose, quiet, import_opts).await?;
         }
         Some(path) if path.is_dir() => {
             // Validate directory format (catches mixed formats & empty dirs).
@@ -356,7 +467,7 @@ pub async fn run(
             let format = detect::detect_data_format(Some(path), &content, None)?;
 
             match format {
-                detect::DataFormat::Turtle => {
+                detect::DataFormat::Turtle | detect::DataFormat::Trig => {
                     // Safety redirect: if a .ttl file reaches this branch
                     // (e.g., due to path/extension edge cases), always route
                     // through the import pipeline to avoid novelty limits.
@@ -435,6 +546,9 @@ async fn run_bulk_import(
     }
     if import_opts.chunk_size_mb > 0 {
         builder = builder.chunk_size_mb(import_opts.chunk_size_mb);
+    }
+    if let Some(ns) = import_opts.skolem_namespace.as_deref() {
+        builder = builder.skolem_namespace(ns);
     }
     if import_opts.leaflet_rows != 25_000 {
         builder = builder.leaflet_rows(import_opts.leaflet_rows);
@@ -746,6 +860,13 @@ async fn run_bulk_import(
         "\n\nAbout ledger '{}':\nImported {:.1}M flakes in {:.2}s ({:.2} M flakes/s) across {} commits (t={})",
         ledger, total_m, secs, mflakes_per_sec, result.t, result.t
     );
+    if result.duplicates_removed > 0 {
+        println!(
+            "Collapsed {} duplicate statement(s); the index holds {} distinct flakes",
+            format_with_commas(result.duplicates_removed),
+            format_with_commas(result.flake_count - result.duplicates_removed)
+        );
+    }
 
     if let Some(ref summary) = result.summary {
         if !summary.top_classes.is_empty() {
@@ -803,8 +924,24 @@ async fn run_bulk_import(
             .await
         {
             Ok(_) => {
+                // Report what actually landed: the reindex can complete
+                // without sealing anything (no attachment-event coverage),
+                // and an unsealed ledger answers quoted-triple queries
+                // through the slow generic join chain.
+                let sealed = fluree
+                    .ledger(ledger)
+                    .await
+                    .map(|state| state.snapshot.annotation_index.is_some())
+                    .unwrap_or(false);
                 if !quiet {
-                    eprintln!("{} Annotation arena sealed.", "info:".cyan().bold());
+                    if sealed {
+                        eprintln!("{} Annotation arena sealed.", "info:".cyan().bold());
+                    } else {
+                        eprintln!(
+                            "{} Annotation arena was not sealed (no attachment events resolved); quoted-triple queries fall back to the generic join chain until `fluree reindex` seals it.",
+                            "warning:".yellow().bold()
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -910,10 +1047,11 @@ fn format_human_bytes(bytes: u64) -> String {
 
 /// Whether this single-file path should use the import pipeline.
 ///
-/// - `.ttl` files (case-insensitive) → import (auto-splits large files)
-/// - `.jsonld` files (case-insensitive) → import (bypasses novelty)
-/// - `.ttl.gz` → error with helpful message
-/// - Everything else (e.g. `.json`) → detect-based transact path
+/// - RDF/JSON-LD formats (`.ttl`/`.nt`/`.nq`/`.trig`/`.json`/`.jsonld`/
+///   `.jsonl`/`.ndjson`, case-insensitive, optionally `.gz`/`.zst`-compressed)
+///   → import
+/// - `.bz2` → error with helpful message
+/// - Everything else (e.g. `.csv`) → detect-based transact path
 ///
 /// Note: directories are handled separately in `run()` via `fluree_db_api::scan_directory_format()`.
 fn is_import_path(path: &Path) -> CliResult<bool> {
@@ -951,9 +1089,25 @@ fn is_csv_input(path: &Path) -> bool {
 }
 
 fn has_csv_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("csv"))
+    fluree_db_api::import_source::has_csv_extension(path)
+}
+
+/// Whether `--from` points at a Cypher script: a single `.cypher`/`.cyp`/`.cql`
+/// file, or a directory containing at least one.
+fn is_cypher_input(path: &Path) -> bool {
+    if path.is_dir() {
+        std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .filter_map(std::result::Result::ok)
+            .any(|e| has_cypher_extension(&e.path()))
+    } else {
+        has_cypher_extension(path)
+    }
+}
+
+fn has_cypher_extension(path: &Path) -> bool {
+    fluree_db_api::import_source::has_cypher_extension(path)
 }
 
 /// Convert CSV node/relationship files (neo4j-admin header convention) to
@@ -970,30 +1124,14 @@ async fn run_csv_import(
     quiet: bool,
     import_opts: &ImportOpts,
 ) -> CliResult<()> {
-    use fluree_db_api::csv_import::{write_csv_ndjson, CsvImportOptions};
-    use std::io::{BufReader, BufWriter};
-
-    let files: Vec<std::path::PathBuf> = if path.is_dir() {
-        let mut v: Vec<_> = std::fs::read_dir(path)
-            .map_err(|e| CliError::Input(format!("failed to read {}: {e}", path.display())))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| has_csv_extension(p))
-            .collect();
-        v.sort();
-        v
-    } else {
-        vec![path.to_path_buf()]
-    };
-    if files.is_empty() {
-        return Err(CliError::Input(format!(
-            "no .csv files found in {}",
-            path.display()
-        )));
-    }
+    use fluree_db_api::csv_import::CsvImportOptions;
 
     let opts = CsvImportOptions {
         edge_policy: import_opts.edge_policy,
-        base_iri: import_opts.base_iri.clone(),
+        base_iri: import_opts
+            .base_iri
+            .clone()
+            .unwrap_or_else(|| CsvImportOptions::default().base_iri),
         ..Default::default()
     };
 
@@ -1004,35 +1142,80 @@ async fn run_csv_import(
         .map_err(|e| CliError::Input(format!("failed to create temp dir: {e}")))?;
     if !quiet {
         println!(
-            "Converting {} CSV file(s) → JSON-LD (edge properties: {:?})...",
-            files.len(),
+            "Converting CSV → JSON-LD (edge properties: {:?})...",
             import_opts.edge_policy
         );
     }
-    let mut total_objects = 0usize;
-    for (i, csv_path) in files.iter().enumerate() {
-        let stem = csv_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(sanitize_for_filename)
-            .unwrap_or_else(|| format!("part{i}"));
-        let out_path = tmp.path().join(format!("{i:05}_{stem}.jsonl"));
-        let reader =
-            BufReader::new(std::fs::File::open(csv_path).map_err(|e| {
-                CliError::Input(format!("failed to open {}: {e}", csv_path.display()))
-            })?);
-        let mut writer = BufWriter::new(
-            std::fs::File::create(&out_path)
-                .map_err(|e| CliError::Input(format!("failed to write temp jsonl: {e}")))?,
-        );
-        total_objects += write_csv_ndjson(reader, &opts, &mut writer)
-            .map_err(|e| CliError::Input(format!("CSV import ({}): {e}", csv_path.display())))?;
-        writer
-            .into_inner()
-            .map_err(|e| CliError::Input(format!("failed to flush temp jsonl: {e}")))?;
-    }
+    let total_objects = fluree_db_api::import_source::csv_to_shards(path, &opts, tmp.path())
+        .map_err(|e| CliError::Input(e.to_string()))?;
     if !quiet {
         println!("Converted {total_objects} object(s); importing...");
+    }
+
+    // Hand the temp dir of `.jsonl` to the bulk import (chunked + progress).
+    run_bulk_import(
+        fluree,
+        ledger,
+        tmp.path(),
+        dirs.data_dir(),
+        verbose,
+        quiet,
+        import_opts,
+    )
+    .await
+}
+
+/// Convert Cypher scripts (CREATE / MATCH…CREATE statements, the Neo4j /
+/// Memgraph dump convention) to newline-delimited JSON-LD in a temp directory,
+/// then load through the existing **chunked, parallel bulk-import pipeline** —
+/// instead of replaying statements one at a time over the transactional write
+/// path. Three sequential passes over the input (each statement parsed once):
+/// learn match-key property sets, emit nodes, emit edges.
+async fn run_cypher_import(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &str,
+    path: &Path,
+    dirs: &FlureeDir,
+    verbose: bool,
+    quiet: bool,
+    import_opts: &ImportOpts,
+) -> CliResult<()> {
+    use fluree_db_api::cypher_import::CypherImportOptions;
+
+    if !quiet {
+        println!(
+            "Converting Cypher → JSON-LD (edge properties: {:?})...",
+            import_opts.edge_policy
+        );
+    }
+
+    // Shards land in a temp dir (cleaned up on drop, after the import
+    // completes); the shared converter runs the three passes (learn keys,
+    // nodes, edges) so node ids derive identically across files.
+    let tmp = tempfile::tempdir()
+        .map_err(|e| CliError::Input(format!("failed to create temp dir: {e}")))?;
+    let stats = fluree_db_api::import_source::cypher_to_shards(
+        path,
+        CypherImportOptions {
+            edge_policy: import_opts.edge_policy,
+            vocab: import_opts.base_iri.clone(),
+        },
+        tmp.path(),
+    )
+    .map_err(|e| CliError::Input(e.to_string()))?;
+    if !quiet {
+        println!(
+            "Converted {} object(s) ({} nodes, {} edges); importing...",
+            stats.nodes + stats.edges,
+            stats.nodes,
+            stats.edges
+        );
+    }
+    if stats.edges_skipped > 0 {
+        eprintln!(
+            "warning: skipped {} MATCH…CREATE edge(s) whose endpoint node was never created",
+            stats.edges_skipped
+        );
     }
 
     // Hand the temp dir of `.jsonl` to the bulk import (chunked + progress).
@@ -1171,7 +1354,7 @@ pub async fn run_memory_import(
     let include_user = !no_user;
     let commits = git_memory_commits(&repo_root, include_user)?;
 
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
 
     // Create ledger + transact memory schema
     fluree
@@ -1419,15 +1602,17 @@ mod is_import_path_tests {
 
     #[test]
     fn rdf_formats_remain_import_paths() {
-        for name in ["x.ttl", "x.nt", "x.nq", "x.trig", "x.jsonld", "x.ttl.gz"] {
+        // `.json` is accepted as a JSON-LD filename convention.
+        for name in [
+            "x.ttl", "x.nt", "x.nq", "x.trig", "x.json", "x.jsonld", "x.ttl.gz",
+        ] {
             assert!(is_import_path(Path::new(name)).unwrap(), "{name}");
         }
     }
 
     #[test]
     fn non_bulk_inputs_are_not_import_paths() {
-        // `.json` deliberately routes to the detect/transact path, not import.
-        assert!(!is_import_path(Path::new("x.json")).unwrap());
         assert!(!is_import_path(Path::new("x.csv")).unwrap());
+        assert!(!is_import_path(Path::new("x.txt")).unwrap());
     }
 }

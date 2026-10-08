@@ -91,6 +91,10 @@ pub enum DiagCode {
     #[serde(rename = "S009")]
     UndefinedPrefix,
 
+    /// Nesting exceeds the parser's recursion depth ceiling
+    #[serde(rename = "S010")]
+    NestingTooDeep,
+
     // =========================================================================
     // Fluree restrictions (F001-F099) - "Fluree doesn't support this"
     // =========================================================================
@@ -110,7 +114,8 @@ pub enum DiagCode {
     #[serde(rename = "F004")]
     UnsupportedMultipleUsing,
 
-    /// GRAPH restrictions in SPARQL Update templates
+    /// GRAPH restrictions in SPARQL Update templates. No longer emitted: kept
+    /// so the serialized `F005` code is not reused for something else.
     #[serde(rename = "F005")]
     UnsupportedGraphInUpdate,
 
@@ -129,6 +134,55 @@ pub enum DiagCode {
     /// Variables not allowed in INSERT DATA / DELETE DATA
     #[serde(rename = "F009")]
     VariableInGroundData,
+
+    /// Blank nodes not allowed in DELETE DATA / DELETE WHERE / DELETE templates
+    /// (SPARQL 1.1 Update §19.8 grammar note 8)
+    #[serde(rename = "F010")]
+    BlankNodeInDelete,
+
+    // =================================================================
+    // Semantic validation (V001-V099) - SPARQL spec semantic rules
+    // =========================================================================
+    /// Blank node label reused across basic graph patterns (SPARQL §19.6)
+    #[serde(rename = "V001")]
+    BlankNodeLabelCrossScope,
+
+    /// SELECT * is not allowed with GROUP BY (SPARQL §11)
+    #[serde(rename = "V002")]
+    SelectStarWithGroupBy,
+
+    /// Projected variable is neither a group key nor aggregated (SPARQL §11 / §18.2.4)
+    #[serde(rename = "V003")]
+    UngroupedVariableInProjection,
+
+    /// BIND target variable already in scope in the group (SPARQL §10.1)
+    #[serde(rename = "V004")]
+    BindTargetAlreadyInScope,
+
+    /// SELECT (expr AS ?v) alias assigned twice or already in scope (SPARQL §19.8 note 13)
+    #[serde(rename = "V005")]
+    SelectAliasAlreadyBound,
+
+    /// Aggregate call nested inside another aggregate's argument
+    #[serde(rename = "V006")]
+    NestedAggregate,
+
+    /// Variable listed more than once in a VALUES clause
+    #[serde(rename = "V007")]
+    DuplicateValuesVariable,
+
+    /// Annotation minting an anonymous reifier in ground DATA (DELETE DATA)
+    #[serde(rename = "V008")]
+    AnonymousAnnotationInGroundData,
+
+    /// Anonymous annotation (fresh blank-node reifier) in a DELETE form
+    #[serde(rename = "F011")]
+    AnonymousAnnotationInDelete,
+
+    /// `# PRAGMA` directive with an unknown name, a malformed value, or one
+    /// that does not apply to the request form
+    #[serde(rename = "F012")]
+    InvalidPragma,
 
     // =========================================================================
     // Rust port status (R001-R099) - "Rust engine not finished"
@@ -167,6 +221,7 @@ impl DiagCode {
             Self::InvalidBlankNode => "S007",
             Self::InvalidPrefixedName => "S008",
             Self::UndefinedPrefix => "S009",
+            Self::NestingTooDeep => "S010",
             // Fluree
             Self::UnsupportedPropertyPathDepth => "F001",
             Self::UnsupportedPropertyPathPrimary => "F002",
@@ -177,6 +232,18 @@ impl DiagCode {
             Self::UnsupportedSelectReduced => "F007",
             Self::UnsupportedDistinctAggregate => "F008",
             Self::VariableInGroundData => "F009",
+            // Semantic validation
+            Self::BlankNodeLabelCrossScope => "V001",
+            Self::SelectStarWithGroupBy => "V002",
+            Self::UngroupedVariableInProjection => "V003",
+            Self::BindTargetAlreadyInScope => "V004",
+            Self::SelectAliasAlreadyBound => "V005",
+            Self::NestedAggregate => "V006",
+            Self::DuplicateValuesVariable => "V007",
+            Self::AnonymousAnnotationInGroundData => "V008",
+            Self::BlankNodeInDelete => "F010",
+            Self::AnonymousAnnotationInDelete => "F011",
+            Self::InvalidPragma => "F012",
             // Rust port
             Self::LoweringNotImplemented => "R001",
             // Warnings

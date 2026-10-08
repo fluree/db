@@ -2,30 +2,31 @@
 
 A semantic graph database with time travel, branching, and verifiable data — built on W3C standards.
 
-Fluree DB is a single binary that stores your data as an RDF knowledge graph, queryable with SPARQL, JSON-LD Query, or Cypher, with every commit immutably recorded so you can travel back to any prior state. It supports git-style branching and merging, signed and policy-gated transactions, SHACL validation, OWL/RDFS reasoning, and full-text and vector search — over local files, S3, or IPFS — without bolting on external services.
+Fluree DB is a single binary that stores your data as an RDF knowledge graph, queryable with SPARQL, JSON-LD Query, Cypher, or GraphQL, with every commit immutably recorded so you can travel back to any prior state. It supports git-style branching and merging, signed and policy-gated transactions, SHACL validation, OWL/RDFS reasoning, and full-text and vector search — over local files or S3 — without bolting on external services.
 
 ## What you get
 
-- **Semantic by default.** Your data is RDF. IRIs, JSON-LD `@context`, named graphs, and typed values are first-class. Queries are SPARQL 1.1, the equivalent JSON-LD Query, or openCypher — all compiling to the same execution engine.
+- **Semantic by default.** Your data is RDF. IRIs, JSON-LD `@context`, named graphs, and typed values are first-class. Queries are SPARQL 1.1, the equivalent JSON-LD Query, or openCypher — all compiling to the same execution engine. A GraphQL endpoint sits on top, its schema derived from the data and its SHACL shapes.
 - **Property graphs and statement-level metadata.** Attach properties to a *relationship*, not just a node — `role` and `since` on a `worksFor` edge, `source` and `confidence` on a claim — with RDF 1.2 / SPARQL 1.2 edge annotations. Labeled-property-graph edges, parallel relationships between the same two nodes, and RDF-star provenance all live on one surface, and plain triple queries are left undisturbed. See [Edge annotations](concepts/edge-annotations.md).
 - **Time travel.** Every transaction is a commit on an immutable chain. Query the state of the graph at any past moment with a single `t` parameter — no snapshots to restore, no separate audit log to consult.
 - **Branching and merging.** Create a branch off any commit, transact against it in isolation, then merge it back. Useful for staging changes, running what-if analyses, or maintaining environment-specific overlays.
 - **Verifiable data.** Transactions and commits can be signed (JWS / W3C Verifiable Credentials). The commit chain is content-addressed, so any tampering is detectable. Pair it with policy enforcement to prove *who* changed *what* and *when* they were allowed to.
 - **Policy-based access control.** Policies are written as graph data, evaluated per query and per transaction, and travel with the ledger — not bolted on at the API layer.
-- **Storage your way.** Local filesystem for development, S3 + DynamoDB for production, IPFS for content-addressed distribution. The same ledger format works across all of them.
+- **Storage your way.** Local filesystem for development, S3 + DynamoDB for production, and (experimentally, from the Rust API) IPFS for content-addressed distribution. The same ledger format works across all of them.
 - **Search built in.** BM25 full-text indexing and HNSW vector search live alongside SPARQL — no separate search service to operate.
 - **Reasoning.** OWL/RDFS inference and Datalog rules run inside the query engine, so derived facts are queryable without a materialization step.
-- **Embeddable.** The same engine that powers the server runs as a Rust library, generic over storage and nameservice. Use it directly in your application or run it standalone over HTTP.
+- **Embeddable.** The same engine that powers the server runs as a Rust library, generic over storage and nameservice, and in-process from Python. Use it directly in your application or run it standalone over HTTP.
 
 ## Start here
 
 - **New to Fluree?** → [Getting started](getting-started/)
 - **Run the server** → [Quickstart: run the server](getting-started/quickstart-server.md)
 - **Create a ledger and write data** → [Quickstart: create a ledger](getting-started/quickstart-ledger.md) → [Quickstart: write data](getting-started/quickstart-write.md)
-- **Query data** → [Quickstart: query (JSON-LD, SPARQL, Cypher)](getting-started/quickstart-query.md)
+- **Query data** → [Quickstart: query (JSON-LD, SPARQL, Cypher)](getting-started/quickstart-query.md), or [GraphQL](query/graphql.md) for a schema derived from your data
 - **End-to-end walkthrough** → [Tutorial: search, time travel, branching, policies](getting-started/tutorial-end-to-end.md)
 - **Coming from SQL?** → [Fluree for SQL developers](getting-started/fluree-for-sql-developers.md)
 - **Embedding in Rust?** → [Using Fluree as a Rust library](getting-started/rust-api.md)
+- **Using Python?** → [Using Fluree from Python](getting-started/python.md)
 
 ## Explore the docs
 
@@ -33,12 +34,12 @@ Fluree DB is a single binary that stores your data as an RDF knowledge graph, qu
 - [Guides (cookbooks)](guides/) — query patterns, search, time travel, branching, policies, SHACL, edge annotations — task-oriented recipes
 - [CLI reference](cli/) — every `fluree` command, flag by flag
 - [HTTP API](api/) — endpoints, headers, signed requests, error model
-- [Query](query/) — JSON-LD Query, SPARQL, Cypher, output formats, CONSTRUCT, explain plans, reasoning
+- [Query](query/) — JSON-LD Query, SPARQL, Cypher, GraphQL, output formats, CONSTRUCT, explain plans, reasoning
 - [Transactions](transactions/) — insert, upsert, update, conditional updates, signed transactions
 - [Security and policy](security/) — authentication, encryption, commit signing, policy model
 - [Indexing and search](indexing-and-search/) — background indexing, BM25, vector search, geospatial
 - [Graph sources and integrations](graph-sources/) — Iceberg/Parquet, R2RML, BM25 graph source
-- [Operations](operations/) — configuration, Docker, storage modes, telemetry, archive/restore
+- [Operations](operations/) — scaling and resilience, configuration, Docker, storage modes, telemetry, archive/restore
 - [Design](design/) — internals: query execution, storage traits, index format, nameservice
 - [Reference](reference/) — glossary, vocabulary, OWL/RDFS support, crate map
 - [Troubleshooting](troubleshooting/) — common errors, debugging queries, performance tracing

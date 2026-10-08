@@ -4,9 +4,17 @@ Architecture and design documents for Fluree's internal systems. These documents
 
 ## Documents
 
+### [Performance architecture](performance.md)
+
+Why Fluree is fast, layer by layer: integer-ID execution, columnar leaflets with region-selective decompression, directory-only aggregates, the cost model and its tested invariants, the specialized join operators, the 16 fast-path operators and their fallback contract, batched frontier traversal, and where parallelism is and isn't applied. Includes measured head-to-head results and a frank account of current limits.
+
 ### [Query execution and overlay merge](query-execution.md)
 
 How queries run through a single preparation/execution pipeline, how scan operators select the binary-cursor path vs the range fallback, and where overlay novelty merges with indexed data (including graph scoping boundaries).
+
+### [Row-returning multi-fact virtual joins (late-materialization corridor)](virtual-multifact-row-corridor.md)
+
+Sized design (not yet implemented) for a row-returning multi-fact join over the virtual/R2RML path: why it needs a new row-emitting columnar operator rather than a widening of the fused aggregate, and how it reuses the semi-join membership + FK→IRI resolver + budget-forwarding primitives to prune columnar-first and late-materialize only surviving rows. Captured out of db #1589 (which shipped the fused-aggregate S1/S2 generality).
 
 ### [Auth Contract (CLI ↔ Server)](auth-contract.md)
 
@@ -30,7 +38,7 @@ The content-addressed identity layer: `ContentId` type, `ContentStore` trait, mu
 
 ### [Index Format](index-format.md)
 
-Binary columnar index format: branch/leaf/leaflet hierarchy, dictionary artifacts, SPOT/PSOT/POST/OPST/TSPO layout, and encoding details.
+Binary columnar index format: branch/leaf/leaflet hierarchy, dictionary artifacts, SPOT/PSOT/POST/OPST layout, and encoding details.
 
 ### [Edge annotations (storage internals)](edge-annotations.md)
 
@@ -55,6 +63,14 @@ How a single **model ledger** can hold the ontology, SHACL shapes, policy rules,
 ### [Storage Traits](storage-traits.md)
 
 Storage trait architecture: `StorageRead`, `StorageWrite`, `ContentAddressedWrite`, `Storage`, and `NameService` trait design with guidance for implementing new backends.
+
+### [Raft substrate (`fluree-raft-core`)](raft-core.md)
+
+The application-agnostic half of Raft: storage, node/group identity, rendezvous
+ownership, transport, membership admin, forwarding, the `AppStateMachine` /
+`StateMachineObserver` seam, group bootstrap, and the optional replicated
+key/value fragment. Read this before building a new replicated group, or before
+touching the fence, expiry, or eviction semantics of `kv`.
 
 ### [Raft command queue and replicated state machine](raft-command-queue.md)
 

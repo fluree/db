@@ -27,7 +27,7 @@ use fluree_db_binary_index::{
 use fluree_db_core::o_type::OType;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::{FlakeValue, GraphId, LedgerSnapshot, QueryCancellation, Sid};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
@@ -192,12 +192,7 @@ impl Operator for PredicateGroupCountFirstsOperator {
         // Try V6 fast-path first (only when no novelty overlay — overlay delta merge not yet implemented).
         //
         // `ExecutionContext` always carries an overlay provider; `NoOverlay` has epoch=0.
-        if ctx
-            .overlay
-            .map(fluree_db_core::OverlayProvider::epoch)
-            .unwrap_or(0)
-            == 0
-        {
+        if !crate::fast_path_common::overlay_has_novelty(ctx) {
             if let Some(binary_index_store) = ctx.binary_store.as_ref() {
                 match group_count_v6(
                     binary_index_store,
@@ -438,19 +433,26 @@ impl Operator for PredicateObjectCountFirstsOperator {
         // Try V6 fast-path first (only when no novelty overlay — overlay delta merge not yet implemented).
         //
         // `ExecutionContext` always carries an overlay provider; `NoOverlay` has epoch=0.
-        if ctx
-            .overlay
-            .map(fluree_db_core::OverlayProvider::epoch)
-            .unwrap_or(0)
-            == 0
-        {
+        if !crate::fast_path_common::overlay_has_novelty(ctx) {
             if let Some(binary_index_store) = ctx.binary_store.as_ref() {
+                let stats_view = crate::stats_cache::cached_stats_view_for_db(
+                    fluree_db_core::GraphDbRef::new(
+                        ctx.active_snapshot,
+                        ctx.binary_g_id,
+                        ctx.overlay(),
+                        ctx.to_t,
+                    )
+                    .with_runtime_small_dicts_opt(ctx.runtime_small_dicts),
+                    Some(binary_index_store),
+                    false,
+                );
                 match count_bound_object_v6(
                     ctx.active_snapshot,
                     binary_index_store,
                     ctx.binary_g_id,
                     &self.predicate,
                     &self.object,
+                    stats_view.as_deref(),
                     &ctx.cancellation,
                 ) {
                     Ok(total) => {
@@ -607,9 +609,34 @@ fn count_bound_object_v6(
     g_id: GraphId,
     predicate: &Ref,
     object: &Term,
+    stats_view: Option<&fluree_db_core::StatsView>,
     cancellation: &QueryCancellation,
 ) -> Result<i64> {
     let p_id = resolve_predicate_id_v6(predicate, store)?;
+
+    // A bare number counts every numeric datatype holding an equal value: one
+    // (o_type, o_key) per datatype the predicate carries. A slice that needs
+    // the decoded-value filter declines to the generic count.
+    if let Term::Value(value @ (FlakeValue::Long(_) | FlakeValue::Double(_))) = object {
+        // This path reads the index at its max_t, so arena handles are current.
+        let slices = crate::binary_scan::untyped_numeric_slices(
+            store,
+            g_id,
+            Some(p_id),
+            crate::binary_scan::observed_datatypes(stats_view, g_id, p_id),
+            value,
+            true,
+        )
+        .ok_or_else(|| QueryError::Internal("non-finite numeric constant".to_string()))?;
+        let mut total = 0;
+        for (o_type, o_key) in slices {
+            let o_key = o_key.ok_or_else(|| {
+                QueryError::Internal("NumBig rows need the decoded-value filter".to_string())
+            })?;
+            total += count_object_key_v6(store, g_id, p_id, o_type.as_u16(), o_key, cancellation)?;
+        }
+        return Ok(total);
+    }
 
     // Translate the bound object term into V6 (o_type, o_key). A `None` here is
     // a *conclusive* base-dict miss (refs are resolved snapshot-aware); since
@@ -620,7 +647,18 @@ fn count_bound_object_v6(
     else {
         return Ok(0);
     };
+    count_object_key_v6(store, g_id, p_id, target_o_type, target_o_key, cancellation)
+}
 
+/// Rows of predicate `p_id` whose object is exactly `(target_o_type, target_o_key)`.
+fn count_object_key_v6(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    target_o_type: u16,
+    target_o_key: u64,
+    cancellation: &QueryCancellation,
+) -> Result<i64> {
     let branch = store
         .branch_for_order(g_id, RunSortOrder::Post)
         .ok_or_else(|| QueryError::Internal("no POST branch for graph".to_string()))?;
@@ -654,7 +692,7 @@ fn count_bound_object_v6(
         check_cancelled(cancellation)?;
         let leaf_entry = &branch.leaves[leaf_idx];
         let bytes = store
-            .get_leaf_bytes_sync(&leaf_entry.leaf_cid)
+            .get_leaf_bytes_shared(&leaf_entry.leaf_cid)
             .map_err(|e| QueryError::Internal(format!("leaf fetch: {e}")))?;
         let header =
             decode_leaf_header_v3(&bytes).map_err(|e| QueryError::Internal(e.to_string()))?;
@@ -823,7 +861,7 @@ fn offer_topk(heap: &mut BinaryHeap<GroupTopK>, limit: usize, cand: GroupTopK) {
     }
 }
 
-fn group_count_v6(
+pub(crate) fn group_count_v6(
     store: &BinaryIndexStore,
     g_id: GraphId,
     predicate: &crate::ir::triple::Ref,
@@ -871,7 +909,7 @@ fn group_count_v6(
         check_cancelled(cancellation)?;
         let leaf_entry = &branch.leaves[leaf_idx];
         let bytes = store
-            .get_leaf_bytes_sync(&leaf_entry.leaf_cid)
+            .get_leaf_bytes_shared(&leaf_entry.leaf_cid)
             .map_err(|e| QueryError::Internal(format!("leaf fetch: {e}")))?;
         let header =
             decode_leaf_header_v3(&bytes).map_err(|e| QueryError::Internal(e.to_string()))?;
@@ -1011,7 +1049,7 @@ fn group_count_v6(
 /// Return values:
 /// - `Ok(Some(..))` — resolved to a persisted `(o_type, o_key)`.
 /// - `Ok(None)` — the object is **conclusively absent from the base dict**.
-///   Combined with the caller's no-novelty (`epoch == 0`) gate, "absent from
+///   Combined with the caller's no-live-novelty gate, "absent from
 ///   base dict" implies "absent from the logical DB", so the caller reports a
 ///   0 count.
 /// - `Err(..)` — genuine error or unbound object; routes to the generic
@@ -1084,8 +1122,13 @@ impl AggStateStar {
         }
     }
 
-    fn observe(&mut self, s_id: u64, want_min: bool, want_max: bool, want_sample: bool) {
-        self.count = self.count.saturating_add(1);
+    /// Fold one group-predicate row for subject `s_id`, joined against `mult`
+    /// filter-star rows (the product of the filter predicates' per-subject row
+    /// counts). SPARQL bag semantics: the join multiplies each group row by
+    /// `mult`, so COUNT adds `mult`; MIN/MAX/SAMPLE over `?s` are
+    /// duplicate-insensitive and ignore it.
+    fn observe(&mut self, s_id: u64, mult: u64, want_min: bool, want_max: bool, want_sample: bool) {
+        self.count = self.count.saturating_add(mult);
         if want_sample && self.sample_s.is_none() {
             self.sample_s = Some(s_id);
         }
@@ -1105,6 +1148,12 @@ impl AggStateStar {
 /// `GROUP BY ?o ORDER BY DESC(?count) LIMIT k`
 ///
 /// Optionally also computes MIN/MAX/SAMPLE on `?s`.
+///
+/// COUNT honors SPARQL bag semantics: each group-predicate row is multiplied
+/// by the product of the filter predicates' per-subject row counts, not merely
+/// gated on subject existence (#1652). That product is the star join's
+/// multiplicity only because the filter object vars are pairwise distinct —
+/// `detect_group_by_object_star_topk` declines when they are not.
 pub struct GroupByObjectStarTopKOperator {
     group_pred: crate::ir::triple::Ref,
     filter_preds: Vec<crate::ir::triple::Ref>,
@@ -1173,6 +1222,9 @@ impl Operator for GroupByObjectStarTopKOperator {
             return Err(QueryError::OperatorAlreadyOpened);
         }
 
+        use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
+        const SITE: &str = "group_by_object_star_topk";
+
         if allow_cursor_fast_path(ctx) {
             if let Some(store) = ctx.binary_store.as_ref() {
                 let Some(batch) = compute_group_by_object_star_topk(
@@ -1192,6 +1244,10 @@ impl Operator for GroupByObjectStarTopKOperator {
                 else {
                     // Fast-path unavailable under this execution context (e.g., overlay requires fallback).
                     // Fall through to the provided fallback operator.
+                    stamp_fast_path(
+                        SITE,
+                        FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
+                    );
                     let Some(fallback) = &mut self.fallback else {
                         return Err(QueryError::Internal(
                             "group-by-object star topk fast-path unavailable and no fallback provided".into(),
@@ -1201,6 +1257,7 @@ impl Operator for GroupByObjectStarTopKOperator {
                     self.state = OperatorState::Open;
                     return Ok(());
                 };
+                stamp_fast_path(SITE, FastPathOutcome::Proceed);
                 self.result = Some(batch);
                 self.emitted = false;
                 self.fallback = None;
@@ -1209,6 +1266,10 @@ impl Operator for GroupByObjectStarTopKOperator {
             }
         }
 
+        stamp_fast_path(
+            SITE,
+            FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
+        );
         let Some(fallback) = &mut self.fallback else {
             return Err(QueryError::Internal(
                 "group-by-object star topk fast-path unavailable and no fallback provided".into(),
@@ -1250,24 +1311,26 @@ impl Operator for GroupByObjectStarTopKOperator {
     }
 }
 
-fn collect_subject_set_for_predicate_group(
+/// Stream one filter predicate's PSOT rows and fold them into a
+/// `subject -> multiplicity` map. With `restrict_to` set (the running product
+/// over earlier filter predicates), a subject survives only if present there,
+/// and its new multiplicity is `restrict_to[s] * row_count(s)` — the star
+/// join's bag multiplicity across filter predicates. Without it, the
+/// multiplicity is this predicate's row count alone.
+fn collect_subject_counts_for_predicate_group(
     store: &Arc<BinaryIndexStore>,
     ctx: &ExecutionContext<'_>,
     g_id: GraphId,
     pred: &crate::ir::triple::Ref,
-    restrict_to: Option<&FxHashSet<u64>>,
-) -> Result<Option<FxHashSet<u64>>> {
-    let overlay_has_rows = ctx
-        .overlay
-        .map(fluree_db_core::OverlayProvider::epoch)
-        .unwrap_or(0)
-        != 0;
+    restrict_to: Option<&FxHashMap<u64, u64>>,
+) -> Result<Option<FxHashMap<u64, u64>>> {
+    let overlay_has_rows = crate::fast_path_common::overlay_has_novelty(ctx);
     let sid = normalize_pred_sid(store, pred)?;
     let Some(p_id) = store.sid_to_p_id(&sid) else {
         return if overlay_has_rows {
             Ok(None)
         } else {
-            Ok(Some(FxHashSet::default()))
+            Ok(Some(FxHashMap::default()))
         };
     };
     let mut out = ColumnSet::EMPTY;
@@ -1282,8 +1345,19 @@ fn collect_subject_set_for_predicate_group(
         return Ok(None);
     };
 
-    let mut set: FxHashSet<u64> = FxHashSet::default();
-    let mut last_s: Option<u64> = None;
+    let mut map: FxHashMap<u64, u64> = FxHashMap::default();
+    let flush = |s: u64, n: u64, map: &mut FxHashMap<u64, u64>| match restrict_to {
+        Some(r) => {
+            if let Some(&m) = r.get(&s) {
+                map.insert(s, m.saturating_mul(n));
+            }
+        }
+        None => {
+            map.insert(s, n);
+        }
+    };
+    let mut cur_s: Option<u64> = None;
+    let mut cur_n: u64 = 0;
     while let Some(batch) = cursor
         .next_batch()
         .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
@@ -1291,19 +1365,21 @@ fn collect_subject_set_for_predicate_group(
         ctx.check_cancelled()?;
         for i in 0..batch.row_count {
             let s = batch.s_id.get(i);
-            if last_s == Some(s) {
-                continue;
-            }
-            last_s = Some(s);
-            if let Some(r) = restrict_to {
-                if !r.contains(&s) {
-                    continue;
+            if cur_s == Some(s) {
+                cur_n += 1;
+            } else {
+                if let Some(prev) = cur_s {
+                    flush(prev, cur_n, &mut map);
                 }
+                cur_s = Some(s);
+                cur_n = 1;
             }
-            set.insert(s);
         }
     }
-    Ok(Some(set))
+    if let Some(prev) = cur_s {
+        flush(prev, cur_n, &mut map);
+    }
+    Ok(Some(map))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1321,11 +1397,7 @@ fn compute_group_by_object_star_topk(
     sample_var: Option<VarId>,
     limit: usize,
 ) -> Result<Option<crate::binding::Batch>> {
-    let overlay_has_rows = ctx
-        .overlay
-        .map(fluree_db_core::OverlayProvider::epoch)
-        .unwrap_or(0)
-        != 0;
+    let overlay_has_rows = crate::fast_path_common::overlay_has_novelty(ctx);
     // Scan group predicate PSOT for (s_id, o_type, o_key).
     let sid = normalize_pred_sid(store, group_pred)?;
     let Some(p_id) = store.sid_to_p_id(&sid) else {
@@ -1382,13 +1454,14 @@ fn compute_group_by_object_star_topk(
         let mut g_i: usize = 0;
         let mut f_batch: Option<ColumnBatch> = None;
         let mut f_i: usize = 0;
-        let mut f_last: Option<u64> = None;
 
-        let next_filter_subject = |fcur: &mut BinaryCursor,
-                                   f_batch: &mut Option<ColumnBatch>,
-                                   f_i: &mut usize,
-                                   f_last: &mut Option<u64>|
-         -> Result<Option<u64>> {
+        // Next `(subject, row_count)` group of the filter predicate. The whole
+        // run is consumed (across batch refills) before returning, so filter
+        // subjects arrive strictly increasing with their bag multiplicity.
+        let next_filter_group = |fcur: &mut BinaryCursor,
+                                 f_batch: &mut Option<ColumnBatch>,
+                                 f_i: &mut usize|
+         -> Result<Option<(u64, u64)>> {
             loop {
                 if f_batch.is_none() || *f_i >= f_batch.as_ref().unwrap().row_count {
                     ctx.check_cancelled()?;
@@ -1399,16 +1472,31 @@ fn compute_group_by_object_star_topk(
                     if f_batch.is_none() {
                         return Ok(None);
                     }
-                }
-                let b = f_batch.as_ref().unwrap();
-                let s = b.s_id.get(*f_i);
-                *f_i += 1;
-                if *f_last == Some(s) {
                     continue;
                 }
-                *f_last = Some(s);
-                return Ok(Some(s));
+                break;
             }
+            let s = f_batch.as_ref().unwrap().s_id.get(*f_i);
+            let mut n: u64 = 0;
+            loop {
+                let b = f_batch.as_ref().unwrap();
+                while *f_i < b.row_count && b.s_id.get(*f_i) == s {
+                    n += 1;
+                    *f_i += 1;
+                }
+                if *f_i < b.row_count {
+                    break; // group ended within this batch
+                }
+                ctx.check_cancelled()?;
+                *f_batch = fcur
+                    .next_batch()
+                    .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?;
+                *f_i = 0;
+                if f_batch.is_none() {
+                    break; // stream ended; group is complete
+                }
+            }
+            Ok(Some((s, n)))
         };
 
         let peek_group_subject = |cursor: &mut BinaryCursor,
@@ -1429,8 +1517,8 @@ fn compute_group_by_object_star_topk(
             Ok(Some(b.s_id.get(*g_i)))
         };
 
-        let mut fs = next_filter_subject(&mut fcur, &mut f_batch, &mut f_i, &mut f_last)?;
-        while let (Some(gs), Some(cur_fs)) =
+        let mut fs = next_filter_group(&mut fcur, &mut f_batch, &mut f_i)?;
+        while let (Some(gs), Some((cur_fs, f_mult))) =
             (peek_group_subject(&mut cursor, &mut g_batch, &mut g_i)?, fs)
         {
             match gs.cmp(&cur_fs) {
@@ -1447,7 +1535,7 @@ fn compute_group_by_object_star_topk(
                     }
                 }
                 Ordering::Greater => {
-                    fs = next_filter_subject(&mut fcur, &mut f_batch, &mut f_i, &mut f_last)?;
+                    fs = next_filter_group(&mut fcur, &mut f_batch, &mut f_i)?;
                 }
                 Ordering::Equal => {
                     let s = gs;
@@ -1464,40 +1552,43 @@ fn compute_group_by_object_star_topk(
                         };
                         aggs.entry(k).or_insert_with(AggStateStar::new).observe(
                             s,
+                            f_mult,
                             want_min,
                             want_max,
                             want_sample,
                         );
                         g_i += 1;
                     }
-                    fs = next_filter_subject(&mut fcur, &mut f_batch, &mut f_i, &mut f_last)?;
+                    fs = next_filter_group(&mut fcur, &mut f_batch, &mut f_i)?;
                 }
             }
         }
     } else {
-        // General path: build subject set S by intersecting filter predicates.
-        let mut s_set: Option<FxHashSet<u64>> = None;
+        // General path: fold the filter predicates into a subject -> bag
+        // multiplicity map (the product of per-subject row counts; a subject
+        // absent from any filter predicate drops out).
+        let mut s_counts: Option<FxHashMap<u64, u64>> = None;
         for p in filter_preds {
-            let Some(next) = collect_subject_set_for_predicate_group(
+            let Some(next) = collect_subject_counts_for_predicate_group(
                 store,
                 ctx,
                 g_id,
                 p,
-                s_set.as_ref().map(|s| s as &FxHashSet<u64>),
+                s_counts.as_ref().map(|s| s as &FxHashMap<u64, u64>),
             )?
             else {
                 return Ok(None);
             };
-            s_set = Some(next);
-            if s_set
+            s_counts = Some(next);
+            if s_counts
                 .as_ref()
-                .is_some_and(std::collections::HashSet::is_empty)
+                .is_some_and(std::collections::HashMap::is_empty)
             {
                 break;
             }
         }
-        let s_set = s_set.unwrap_or_default();
-        if s_set.is_empty() {
+        let s_counts = s_counts.unwrap_or_default();
+        if s_counts.is_empty() {
             return Ok(Some(crate::binding::Batch::empty(schema)?));
         }
 
@@ -1508,15 +1599,16 @@ fn compute_group_by_object_star_topk(
             ctx.check_cancelled()?;
             for i in 0..batch.row_count {
                 let s = batch.s_id.get(i);
-                if !s_set.contains(&s) {
+                let Some(&mult) = s_counts.get(&s) else {
                     continue;
-                }
+                };
                 let k = ObjGroupKey {
                     o_type: batch.o_type.get(i),
                     o_key: batch.o_key.get(i),
                 };
                 aggs.entry(k).or_insert_with(AggStateStar::new).observe(
                     s,
+                    mult,
                     want_min,
                     want_max,
                     want_sample,
@@ -1545,7 +1637,9 @@ fn compute_group_by_object_star_topk(
     // Build output columns.
     let view = BinaryGraphView::with_novelty(Arc::clone(store), g_id, ctx.dict_novelty.clone())
         .with_namespace_codes_fallback(ctx.namespace_codes_fallback.clone());
-    let dt_count = WellKnownDatatypes::new().xsd_long;
+    // SPARQL COUNT yields xsd:integer (§18.5.1.6), matching the materialized /
+    // streaming aggregate paths; xsd:long here re-typed the count (agg02).
+    let dt_count = WellKnownDatatypes::new().xsd_integer;
 
     let mut col_o1: Vec<Binding> = Vec::with_capacity(rows.len());
     let mut col_count: Vec<Binding> = Vec::with_capacity(rows.len());

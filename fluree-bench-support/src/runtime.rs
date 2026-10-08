@@ -5,15 +5,20 @@
 //!
 //! | Env var | Type | Default | Effect |
 //! |---|---|---|---|
-//! | `FLUREE_BENCH_PROFILE` | `Quick` \| `Full` | `Quick` (local), `Full` (CI) | sample-count + warmup discipline |
+//! | `FLUREE_BENCH_PROFILE` | `Quick` \| `Full` | `Quick` | sample-count + warmup discipline |
 //! | `FLUREE_BENCH_SCALE` | `Tiny` \| `Small` \| `Medium` \| `Large` | `Small` | per-bench input size |
 //!
 //! ## Profile semantics
 //!
 //! - **`Quick`** — fewer samples, no warmup, target wall-time ≤ 2s per bench.
-//!   Used by `cargo bench` on a developer's machine and by the PR-gated CI job.
 //! - **`Full`** — full criterion sample counts, full warmup, multi-size matrix.
-//!   Used by the nightly job in `bench-nightly`.
+//!
+//! No job in CI runs `Full` today: both `ci.yml`'s `bench-compare` and
+//! `bench.yml`'s nightly `bench-gate` pin `FLUREE_BENCH_PROFILE=quick` and
+//! `FLUREE_BENCH_SCALE=tiny` to stay inside their wall-clock budgets. `Full` is
+//! a local knob for widening a distribution when a bench looks flaky. Run-to-run
+//! spread is measured separately, by accumulating repeat captures into a
+//! median + MAD (see [`crate::baseline::NoiseStats`]).
 //!
 //! Benches read the profile via [`current_profile()`] and choose
 //! `group.sample_size(...)` accordingly. The chassis does **not** override
@@ -41,21 +46,18 @@ use std::sync::OnceLock;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BenchProfile {
     /// Few samples, no warmup, target wall-time ≤ 2s per bench. Local
-    /// development and PR-gated CI.
+    /// development and every CI job, nightly included.
     Quick,
-    /// Full criterion sample counts, full warmup. Nightly CI.
+    /// Full criterion sample counts, full warmup. Local use only today.
     Full,
 }
 
 impl BenchProfile {
     /// Suggested criterion `sample_size`. Benches may override.
     ///
-    /// `Quick` (PR-gated) keeps the sample tight (10) so the gate stays
-    /// under its wall-clock budget; `Full` uses criterion's default
-    /// (100) for a wider distribution suitable for the nightly. Both
-    /// are starting points — once `bench-nightly` lands and we have
-    /// flap data from real CI runs, we may need to bump `Full` higher
-    /// (200+) to bring noise within the regression-budget thresholds.
+    /// `Quick` — what every CI job runs — keeps the sample tight (10) so the
+    /// gate stays under its wall-clock budget; `Full` uses criterion's default
+    /// (100) for a wider distribution. Both are starting points.
     pub fn sample_size(self) -> usize {
         match self {
             BenchProfile::Quick => 10,

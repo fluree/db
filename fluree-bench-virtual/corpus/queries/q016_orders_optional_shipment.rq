@@ -1,0 +1,10 @@
+# q016 orders_optional_shipment
+# Intent: OPTIONAL (left-join) fact-to-fact.
+# BI lineage (BI-10): "List orders with their shipment status where one exists."
+# Predicates verified against enterprise.ttl — FactOrder: orderId; FactShipment: order, shipStatus.
+# Determinism: unordered LIMIT truncates a larger set (any k rows are valid) -> hash_gate=rows_only; gated on row count + invariants, not an exact hash.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?oid ?st
+WHERE { ?o a edw:Order ; edw:orderId ?oid .
+        OPTIONAL { ?sh edw:order ?o ; edw:shipStatus ?st . } }
+LIMIT 5000

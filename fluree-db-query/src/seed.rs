@@ -17,6 +17,24 @@ use crate::var_registry::VarId;
 use async_trait::async_trait;
 use std::sync::Arc;
 
+/// Schema variables bound in every row of `batches`.
+pub(crate) fn vars_bound_in_every_row<'a>(
+    schema: &[VarId],
+    batches: impl Iterator<Item = &'a Batch> + Clone,
+) -> Vec<VarId> {
+    schema
+        .iter()
+        .copied()
+        .filter(|var| {
+            batches.clone().all(|batch| {
+                batch
+                    .column(*var)
+                    .is_some_and(|cells| cells.iter().all(Binding::is_bound))
+            })
+        })
+        .collect()
+}
+
 /// Operator that yields exactly one row from a source batch
 ///
 /// Used for correlated subqueries where each input row needs to be
@@ -32,6 +50,8 @@ pub struct SeedOperator {
     emitted: bool,
     /// Operator state
     state: OperatorState,
+    /// Stands in for rows not known yet; see [`SeedOperator::placeholder`].
+    is_placeholder: bool,
 }
 
 impl SeedOperator {
@@ -52,6 +72,18 @@ impl SeedOperator {
             row,
             emitted: false,
             state: OperatorState::Created,
+            is_placeholder: false,
+        }
+    }
+
+    /// A stand-in for one row of `schema` whose values are not known yet, as
+    /// when EXPLAIN plans a correlated subquery. Its cells are unbound, but it
+    /// is planned as if every variable were bound, like the rows it stands for.
+    pub fn placeholder(schema: Arc<[VarId]>) -> Self {
+        let row = vec![Binding::Unbound; schema.len()];
+        Self {
+            is_placeholder: true,
+            ..Self::from_row(schema, row)
         }
     }
 
@@ -68,6 +100,7 @@ impl SeedOperator {
             row,
             emitted: false,
             state: OperatorState::Created,
+            is_placeholder: false,
         }
     }
 
@@ -126,6 +159,17 @@ impl Operator for SeedOperator {
 
     fn estimated_rows(&self) -> Option<usize> {
         Some(1)
+    }
+
+    fn bound_in_every_row(&self) -> Option<Vec<VarId>> {
+        Some(
+            self.schema
+                .iter()
+                .zip(&self.row)
+                .filter(|(_, binding)| self.is_placeholder || binding.is_bound())
+                .map(|(var, _)| *var)
+                .collect(),
+        )
     }
 }
 
@@ -188,6 +232,13 @@ impl Operator for BatchSeedOperator {
     fn estimated_rows(&self) -> Option<usize> {
         Some(self.batch.len())
     }
+
+    fn bound_in_every_row(&self) -> Option<Vec<VarId>> {
+        Some(vars_bound_in_every_row(
+            &self.schema,
+            std::iter::once(&self.batch),
+        ))
+    }
 }
 
 /// Operator that yields a single empty solution
@@ -232,8 +283,75 @@ impl Default for EmptyOperator {
     }
 }
 
+/// Replays already-materialized batches as an operator — the seed for a
+/// subplan that has to run over rows another operator has already drained
+/// (the annotation hash lane buffers its whole driving stream before it can
+/// tell whether the sweep pays off, and hands the rows to the generic chain
+/// through this when it does not).
+pub struct BatchReplayOperator {
+    schema: Arc<[VarId]>,
+    batches: std::collections::VecDeque<Batch>,
+    state: OperatorState,
+}
+
+impl BatchReplayOperator {
+    pub fn new(schema: Arc<[VarId]>, batches: Vec<Batch>) -> Self {
+        Self {
+            schema,
+            batches: batches.into(),
+            state: OperatorState::Created,
+        }
+    }
+}
+
+#[async_trait]
+impl Operator for BatchReplayOperator {
+    fn schema(&self) -> &[VarId] {
+        &self.schema
+    }
+
+    async fn open(&mut self, _ctx: &ExecutionContext<'_>) -> Result<()> {
+        self.state = OperatorState::Open;
+        Ok(())
+    }
+
+    async fn next_batch(&mut self, _ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+        if self.state != OperatorState::Open {
+            return Ok(None);
+        }
+        match self.batches.pop_front() {
+            Some(batch) => Ok(Some(batch)),
+            None => {
+                self.state = OperatorState::Exhausted;
+                Ok(None)
+            }
+        }
+    }
+
+    fn close(&mut self) {
+        self.batches.clear();
+        self.state = OperatorState::Closed;
+    }
+
+    fn estimated_rows(&self) -> Option<usize> {
+        Some(self.batches.iter().map(Batch::len).sum())
+    }
+
+    fn bound_in_every_row(&self) -> Option<Vec<VarId>> {
+        Some(vars_bound_in_every_row(&self.schema, self.batches.iter()))
+    }
+}
+
 #[async_trait]
 impl Operator for EmptyOperator {
+    fn is_identity_seed(&self) -> bool {
+        true
+    }
+
+    fn bound_in_every_row(&self) -> Option<Vec<VarId>> {
+        Some(Vec::new())
+    }
+
     fn schema(&self) -> &[VarId] {
         // Empty schema - no columns
         &[]

@@ -59,6 +59,16 @@ impl Operator for ProjectOperator {
         self.child.set_row_budget(budget);
     }
 
+    fn set_topk(&mut self, ordering: &[crate::sort::SortSpec], k: usize) {
+        // Projection is row- and order-preserving, so a top-k directive passes
+        // straight through to the scan below (mirrors `set_row_budget`).
+        self.child.set_topk(ordering, k);
+    }
+
+    fn set_distinct(&mut self, vars: &[crate::var_registry::VarId]) {
+        self.child.set_distinct(vars);
+    }
+
     async fn next_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
         if !self.state.can_next() {
             if self.state == OperatorState::Created {

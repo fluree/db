@@ -6,8 +6,11 @@
 //! check, memo lookup) are kept here and unit-tested in isolation.
 
 use super::CrossLedgerError;
+use crate::view::GraphDb;
 use crate::Fluree;
 use fluree_db_core::graph_registry::{config_graph_iri, txn_meta_graph_iri};
+use fluree_db_core::LedgerId;
+use fluree_db_ledger::LedgerState;
 use fluree_db_policy::PolicyArtifactWire;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -234,11 +237,14 @@ impl SchemaArtifactWire {
     /// Translate to a Sid-form `SchemaBundleFlakes` against the
     /// data ledger's snapshot.
     ///
-    /// Each triple's IRIs are encoded via `snapshot.encode_iri_strict`.
-    /// Triples whose subject, predicate, or object IRI has no
-    /// registered namespace on D are dropped — D has no instance
-    /// data under those IRIs so the missing axiom can't fire on data
-    /// D doesn't have. The downstream whitelist check in
+    /// Each triple's IRIs are encoded via `snapshot.encode_iri`, which
+    /// falls back to the EMPTY namespace for an IRI D has never
+    /// registered. On a native D such a Sid matches no instance data,
+    /// so the axiom is inert; on a virtual (graph-source) D — a genesis
+    /// snapshot whose data lives outside its namespace table — it is
+    /// exactly the encoding the policy targets and the R2RML policy
+    /// gate use, so `f:onClass` expansion sees the model's hierarchy.
+    /// The downstream whitelist check in
     /// `SchemaBundleFlakes::from_collected_schema_triples` is the
     /// canonical filter; if a future cross-ledger producer emits
     /// non-whitelist triples they'll drop there.
@@ -262,9 +268,9 @@ impl SchemaArtifactWire {
                 continue;
             };
             let (Some(s_sid), Some(p_sid), Some(o_sid)) = (
-                snapshot.encode_iri_strict(&t.s),
-                snapshot.encode_iri_strict(&t.p),
-                snapshot.encode_iri_strict(o_iri),
+                snapshot.encode_iri(&t.s),
+                snapshot.encode_iri(&t.p),
+                snapshot.encode_iri(o_iri),
             ) else {
                 continue;
             };
@@ -558,7 +564,7 @@ pub struct WireOrigin {
 ///   cross-subsystem de-dup never trips cycle detection.
 pub struct ResolveCtx<'a> {
     /// Canonical data-ledger id D.
-    pub data_ledger_id: &'a str,
+    pub data_ledger_id: &'a LedgerId,
     /// The Fluree instance hosting D and (per the same-instance
     /// constraint) the referenced model ledger.
     pub fluree: &'a Fluree,
@@ -566,7 +572,7 @@ pub struct ResolveCtx<'a> {
     /// `resolved_t`. Phase 1a is the only producer (M's head at
     /// first reference); pinned `f:atT` is rejected upstream until
     /// Phase 3.
-    pub resolved_ts: HashMap<String, i64>,
+    pub resolved_ts: HashMap<LedgerId, i64>,
     /// Active resolution stack (cycle detection). Keyed on the full
     /// resolution tuple including `ArtifactKind` so a `PolicyRules`
     /// resolve doesn't see a `Shapes` resolution of the same
@@ -575,18 +581,65 @@ pub struct ResolveCtx<'a> {
     /// Per-request completed memo, keyed on the same tuple so
     /// different artifact kinds can't return each other's entries.
     pub memo: HashMap<ResolutionKey, Arc<ResolvedGraph>>,
+    /// The data ledger's own state, when the caller has it in hand (the
+    /// staging paths do). A reference that names the data ledger itself is
+    /// served from here rather than from the ledger cache: staging may hold
+    /// that ledger's write lock, and the cache's read would wait on it
+    /// forever. See [`Self::open_model_db`].
+    pub data_state: Option<LedgerState>,
 }
 
 impl<'a> ResolveCtx<'a> {
     /// Build a fresh resolution context for a request against D.
-    pub fn new(data_ledger_id: &'a str, fluree: &'a Fluree) -> Self {
+    pub fn new(data_ledger_id: &'a LedgerId, fluree: &'a Fluree) -> Self {
         Self {
             data_ledger_id,
             fluree,
             resolved_ts: HashMap::new(),
             active: Vec::new(),
             memo: HashMap::new(),
+            data_state: None,
         }
+    }
+
+    /// Carry the data ledger's state, so a reference the config makes to
+    /// the data ledger itself is answered from it.
+    pub fn with_data_state(mut self, state: LedgerState) -> Self {
+        self.data_state = Some(state);
+        self
+    }
+
+    /// Open the model ledger at `t` for a materializer.
+    ///
+    /// A model that is the data ledger itself never goes through the ledger
+    /// cache: the request resolving it may hold that ledger's write lock
+    /// (staging does), and the cache's read of the same lock would wait on
+    /// it forever. It is served from the state the caller passed, at the
+    /// same `t`, or loaded without the cache otherwise.
+    pub async fn open_model_db(
+        &self,
+        canonical_model_ledger_id: &str,
+        t: i64,
+    ) -> crate::error::Result<GraphDb> {
+        if canonical_model_ledger_id != self.data_ledger_id {
+            return self
+                .fluree
+                .load_graph_db_at_t(canonical_model_ledger_id, t)
+                .await;
+        }
+        if let Some(state) = self.data_state.as_ref().filter(|s| s.t() == t) {
+            return Ok(GraphDb::from_ledger_state(state));
+        }
+        let state = self
+            .fluree
+            .load_ledger_uncached(canonical_model_ledger_id)
+            .await?;
+        if state.t() == t {
+            return Ok(GraphDb::from_ledger_state(&state));
+        }
+        self.fluree
+            .load_graph_db_historical(canonical_model_ledger_id, t)
+            .await
     }
 
     /// Build a resolution context pre-seeded with `resolved_t`
@@ -601,9 +654,9 @@ impl<'a> ResolveCtx<'a> {
     /// per-resolution-call state (cycle detection, dedup within a
     /// single dispatch tree) and don't carry across calls.
     pub fn with_resolved_ts(
-        data_ledger_id: &'a str,
+        data_ledger_id: &'a LedgerId,
         fluree: &'a Fluree,
-        resolved_ts: HashMap<String, i64>,
+        resolved_ts: HashMap<LedgerId, i64>,
     ) -> Self {
         Self {
             data_ledger_id,
@@ -611,6 +664,7 @@ impl<'a> ResolveCtx<'a> {
             resolved_ts,
             active: Vec::new(),
             memo: HashMap::new(),
+            data_state: None,
         }
     }
 }

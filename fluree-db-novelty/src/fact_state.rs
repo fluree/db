@@ -192,4 +192,49 @@ mod tests {
             "no-meta = different identity"
         );
     }
+
+    /// Two language tags at the SAME list position are two identities.
+    ///
+    /// [`meta_is_part_of_identity`] above reads as if it covers this, and does
+    /// not: every meta it builds has `i: None`, and `FlakeMeta`'s ordering only
+    /// used to consult `lang` when neither side carried a list index. So
+    /// `{en, i: 0}` and `{fr, i: 0}` were one `FactKey` slot, `is_asserted`
+    /// answered `true` for a fact this map had never seen, and the per-commit
+    /// dedup dropped it (#1711). The key carries no `t`, so it bit across any
+    /// two commits, not only same-`t` ones.
+    #[test]
+    fn one_list_position_under_two_language_tags_is_two_identities() {
+        fn at(lang: &str, i: i32, t: i64, op: bool) -> Flake {
+            Flake::new(
+                Sid::new(1, "s1"),
+                Sid::new(1, "p"),
+                FlakeValue::Long(7),
+                Sid::new(2, "long"),
+                t,
+                op,
+                Some(FlakeMeta {
+                    lang: Some(lang.to_string()),
+                    i: Some(i),
+                }),
+            )
+        }
+
+        let mut fs = NoveltyFactState::new();
+        fs.record(0, &at("en", 0, 1, true));
+        assert!(fs.is_asserted(0, &at("en", 0, 1, true)));
+        assert!(
+            !fs.is_asserted(0, &at("fr", 0, 1, true)),
+            "a second tag at the same list position is a distinct fact, \
+             not one already asserted"
+        );
+
+        // Both recorded: retracting one must not tombstone the other.
+        fs.record(0, &at("fr", 0, 2, true));
+        fs.record(0, &at("en", 0, 3, false));
+        assert!(!fs.is_asserted(0, &at("en", 0, 3, false)), "@en retracted");
+        assert!(
+            fs.is_asserted(0, &at("fr", 0, 2, true)),
+            "@fr must survive its twin's retraction"
+        );
+    }
 }

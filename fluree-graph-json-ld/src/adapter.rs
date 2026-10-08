@@ -13,7 +13,13 @@
 //!
 //! # Limitations
 //!
-//! - **`@graph`**: Named graphs are flattened into the default graph (no quad support)
+//! - **`@graph`**: dropped, not flattened. Every `@`-prefixed key except
+//!   `@type` is skipped, so the contents of a `@graph` entry never reach the
+//!   sink at all. Emitting them correctly needs the quad protocol
+//!   ([`fluree_graph_ir::GraphSink::supports_quads`] /
+//!   [`fluree_graph_ir::GraphSink::emit_quad`]); until this adapter uses it,
+//!   the behavior stays as-is rather than being silently folded into the
+//!   default graph.
 //! - **`@reverse`**: Reverse properties are not yet supported
 //!
 //! # Example
@@ -55,6 +61,11 @@ pub enum AdapterError {
     /// Invalid expanded JSON-LD structure
     #[error("Invalid expanded JSON-LD: {0}")]
     InvalidStructure(String),
+
+    /// The sink refused an emitted event, or its downstream writer failed.
+    /// Conversion stops at the first such error.
+    #[error("Sink error: {0}")]
+    Sink(#[from] fluree_graph_ir::SinkError),
 }
 
 /// Result type for adapter operations
@@ -170,7 +181,7 @@ fn process_node<S: GraphSink>(
             for type_val in types {
                 if let Some(type_iri) = type_val.as_str() {
                     let object_id = sink.term_iri(type_iri);
-                    sink.emit_triple(subject_id, rdf_type_id, object_id);
+                    sink.emit_triple(subject_id, rdf_type_id, object_id)?;
                 }
             }
             continue;
@@ -188,11 +199,11 @@ fn process_node<S: GraphSink>(
         for val in values {
             match process_value(val, sink)? {
                 ProcessedValue::Single(object_id) => {
-                    sink.emit_triple(subject_id, predicate_id, object_id);
+                    sink.emit_triple(subject_id, predicate_id, object_id)?;
                 }
                 ProcessedValue::List(items) => {
                     for (index, object_id) in items {
-                        sink.emit_list_item(subject_id, predicate_id, object_id, index);
+                        sink.emit_list_item(subject_id, predicate_id, object_id, index)?;
                     }
                 }
                 ProcessedValue::None => {}
@@ -283,6 +294,14 @@ fn process_list<S: GraphSink>(list_val: &Value, sink: &mut S) -> Result<Processe
             ))
         }
     };
+
+    // An empty @list denotes the IRI rdf:nil (JSON-LD 1.1 § List to RDF
+    // Conversion): the statement stores as one ordinary triple, the twin of
+    // Turtle's `()` fix (issue #1694). It used to produce zero events,
+    // silently losing the statement.
+    if items.is_empty() {
+        return Ok(ProcessedValue::Single(sink.term_iri(rdf::NIL)));
+    }
 
     let mut indexed_items = Vec::with_capacity(items.len());
 
@@ -812,7 +831,7 @@ mod tests {
         let mut sink = GraphCollectorSink::new();
         to_graph_events(&expanded, &mut sink).unwrap();
 
-        let mut graph = sink.finish();
+        let mut graph = sink.into_graph();
         assert_eq!(graph.len(), 3, "Should have 3 list item triples");
 
         // All triples should be list elements
@@ -858,7 +877,7 @@ mod tests {
         let mut sink = GraphCollectorSink::new();
         to_graph_events(&expanded, &mut sink).unwrap();
 
-        let mut graph = sink.finish();
+        let mut graph = sink.into_graph();
         assert_eq!(graph.len(), 2);
 
         graph.sort();
@@ -893,7 +912,7 @@ mod tests {
         let mut sink = GraphCollectorSink::new();
         to_graph_events(&expanded, &mut sink).unwrap();
 
-        let graph = sink.finish();
+        let graph = sink.into_graph();
         // 2 list item triples + 2 name triples for embedded nodes = 4
         assert_eq!(
             graph.len(),
@@ -931,7 +950,7 @@ mod tests {
         let mut sink = GraphCollectorSink::new();
         to_graph_events(&expanded, &mut sink).unwrap();
 
-        let mut graph = sink.finish();
+        let mut graph = sink.into_graph();
         assert_eq!(graph.len(), 4);
 
         graph.sort();
@@ -977,9 +996,17 @@ mod tests {
         let mut sink = GraphCollectorSink::new();
         to_graph_events(&expanded, &mut sink).unwrap();
 
-        let graph = sink.finish();
-        // Empty list produces no triples
-        assert_eq!(graph.len(), 0, "Empty list should produce no triples");
+        let graph = sink.into_graph();
+        // An empty @list denotes rdf:nil: one ordinary triple, no list
+        // metadata (issue #1694 twin — it used to produce zero events).
+        assert_eq!(graph.len(), 1, "empty @list must store the rdf:nil triple");
+        let triple = graph.iter().next().unwrap();
+        assert!(!triple.is_list_element());
+        assert!(
+            matches!(&triple.o, Term::Iri(iri) if iri.as_ref() == rdf::NIL),
+            "expected rdf:nil object, got {:?}",
+            triple.o
+        );
     }
 
     #[test]
@@ -998,7 +1025,7 @@ mod tests {
         let mut sink = GraphCollectorSink::new();
         to_graph_events(&expanded, &mut sink).unwrap();
 
-        let mut graph = sink.finish();
+        let mut graph = sink.into_graph();
         assert_eq!(
             graph.len(),
             3,
@@ -1042,7 +1069,7 @@ mod tests {
         let mut sink = GraphCollectorSink::new();
         to_graph_events(&expanded, &mut sink).unwrap();
 
-        let mut graph = sink.finish();
+        let mut graph = sink.into_graph();
         assert_eq!(graph.len(), 3, "Should have 3 list items");
 
         graph.sort();

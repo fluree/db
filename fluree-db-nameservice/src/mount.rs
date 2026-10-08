@@ -22,12 +22,13 @@
 use crate::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
     ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
-    GraphSourceType, IndexPublisher, LedgerLifecycle, NameServiceError, NameServiceLookup,
-    NameServicePublisher, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind, RefLookup,
-    RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
+    GraphSourceType, IndexPublisher, LedgerHeads, LedgerLifecycle, NameServiceError,
+    NameServiceLookup, NameServicePublisher, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind,
+    RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher,
+    StatusValue,
 };
 use async_trait::async_trait;
-use fluree_db_core::ContentId;
+use fluree_db_core::{ContentId, LedgerId};
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -70,17 +71,18 @@ impl RemoteMount {
 
     /// Rewrite a remote record so all identity fields carry the local
     /// (prefixed) alias. Branch names are unprefixed and stay as-is.
-    fn localize_record(&self, mut record: NsRecord) -> NsRecord {
-        record.ledger_id = format!("{}/{}", self.prefix, record.ledger_id);
-        record.name = format!("{}/{}", self.prefix, record.name);
-        record
+    fn localize_record(&self, mut record: NsRecord) -> Result<NsRecord> {
+        record.name = format!("{}/{}", self.prefix, record.ledger_id.name());
+        record.ledger_id = LedgerId::from_parts(&record.name, record.ledger_id.branch())?;
+        Ok(record)
     }
 
     /// Rewrite a remote graph-source record onto the local alias namespace.
-    fn localize_graph_source(&self, mut record: GraphSourceRecord) -> GraphSourceRecord {
-        record.graph_source_id = format!("{}/{}", self.prefix, record.graph_source_id);
-        record.name = format!("{}/{}", self.prefix, record.name);
-        record
+    fn localize_graph_source(&self, mut record: GraphSourceRecord) -> Result<GraphSourceRecord> {
+        record.name = format!("{}/{}", self.prefix, record.graph_source_id.name());
+        record.graph_source_id =
+            LedgerId::from_parts(&record.name, record.graph_source_id.branch())?;
+        Ok(record)
     }
 }
 
@@ -158,7 +160,8 @@ impl NameServiceLookup for CompositeNameService {
                 .lookup
                 .lookup(remote)
                 .await?
-                .map(|r| mount.localize_record(r))),
+                .map(|r| mount.localize_record(r))
+                .transpose()?),
             None => self.local.lookup(ledger_id).await,
         }
     }
@@ -170,7 +173,9 @@ impl NameServiceLookup for CompositeNameService {
         let mut records = self.local.all_records().await?;
         for mount in &self.mounts {
             let remote = mount.lookup.all_records().await?;
-            records.extend(remote.into_iter().map(|r| mount.localize_record(r)));
+            for r in remote {
+                records.push(mount.localize_record(r)?);
+            }
         }
         Ok(records)
     }
@@ -183,8 +188,15 @@ impl NameServiceLookup for CompositeNameService {
                 .await?
                 .into_iter()
                 .map(|r| mount.localize_record(r))
-                .collect()),
+                .collect::<Result<_>>()?),
             None => self.local.list_branches(ledger_name).await,
+        }
+    }
+
+    async fn heads(&self, ledger_id: &str) -> Result<Option<LedgerHeads>> {
+        match self.mount_for(ledger_id) {
+            Some((mount, remote)) => mount.lookup.heads(remote).await,
+            None => self.local.heads(ledger_id).await,
         }
     }
 }
@@ -200,7 +212,8 @@ impl GraphSourceLookup for CompositeNameService {
                 .lookup
                 .lookup_graph_source(remote)
                 .await?
-                .map(|r| mount.localize_graph_source(r))),
+                .map(|r| mount.localize_graph_source(r))
+                .transpose()?),
             None => self.local.lookup_graph_source(graph_source_id).await,
         }
     }
@@ -208,9 +221,9 @@ impl GraphSourceLookup for CompositeNameService {
     async fn lookup_any(&self, resource_id: &str) -> Result<NsLookupResult> {
         match self.mount_for(resource_id) {
             Some((mount, remote)) => Ok(match mount.lookup.lookup_any(remote).await? {
-                NsLookupResult::Ledger(r) => NsLookupResult::Ledger(mount.localize_record(r)),
+                NsLookupResult::Ledger(r) => NsLookupResult::Ledger(mount.localize_record(r)?),
                 NsLookupResult::GraphSource(r) => {
-                    NsLookupResult::GraphSource(mount.localize_graph_source(r))
+                    NsLookupResult::GraphSource(mount.localize_graph_source(r)?)
                 }
                 NsLookupResult::NotFound => NsLookupResult::NotFound,
             }),
@@ -222,7 +235,9 @@ impl GraphSourceLookup for CompositeNameService {
         let mut records = self.local.all_graph_source_records().await?;
         for mount in &self.mounts {
             let remote = mount.lookup.all_graph_source_records().await?;
-            records.extend(remote.into_iter().map(|r| mount.localize_graph_source(r)));
+            for r in remote {
+                records.push(mount.localize_graph_source(r)?);
+            }
         }
         Ok(records)
     }

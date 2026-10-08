@@ -4,6 +4,10 @@
   "_comment": "Per-bench, per-scale percentage regression CI accepts. 5.0 means observed time may exceed the committed baseline by up to 5%. Omitted scales fall back to default_budget_pct. Numbers below are placeholders until the first nightly run lands a baseline; tighten them in a follow-up PR once baselines exist. See BENCHMARKING.md and docs/contributing/benches.md.",
   "crates": {
     "fluree-db-api": {
+      "policy_authorization": {
+        "tiny": 10.0,
+        "small": 5.0
+      },
       "insert_formats": {
         "tiny": 10.0,
         "small": 5.0
@@ -20,6 +24,16 @@
         "medium": 5.0
       },
       "transact_commit": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 5.0
+      },
+      "transact_filtered_delete": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 5.0
+      },
+      "query_overlay_only_range": {
         "tiny": 10.0,
         "small": 5.0,
         "medium": 5.0
@@ -59,10 +73,69 @@
         "small": 5.0,
         "medium": 5.0
       },
+      "annotation_varlength_probe": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 5.0
+      },
       "query_hot_bsbm_bi": {
         "tiny": 10.0,
         "small": 5.0,
         "medium": 3.0
+      },
+      "query_hot_optional": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 3.0
+      },
+      "query_hot_negation_count": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 3.0
+      },
+      "query_hot_limit_startup": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 3.0
+      },
+      "query_hot_property_path": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 3.0
+      },
+      "query_hot_whole_graph_agg": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 3.0
+      },
+      "query_hot_construct_formats": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 3.0
+      },
+      "query_hot_fanout_star": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 3.0
+      },
+      "query_hot_values_star": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 3.0
+      },
+      "query_overlay_matrix": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 3.0
+      },
+      "graphql_schema": {
+        "small": 5.0
+      }
+    },
+    "fluree-db-server": {
+      "policy_http": {
+        "tiny": 10.0,
+        "small": 5.0
       }
     },
     "fluree-db-query": {

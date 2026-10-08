@@ -5,6 +5,7 @@ use anyhow::{bail, ensure, Context, Result};
 use crate::evaluator::TestEvaluator;
 use crate::files::read_file_to_string;
 use crate::manifest::Test;
+use crate::query_handler;
 use crate::query_handler::evaluate_query_evaluation_test;
 use crate::subprocess::{run_in_subprocess, TestDescriptor};
 use crate::vocab::mf;
@@ -20,7 +21,8 @@ pub fn register_sparql_tests(evaluator: &mut TestEvaluator) {
     evaluator.register(mf::NEGATIVE_SYNTAX_TEST, evaluate_negative_syntax_test);
     evaluator.register(mf::NEGATIVE_SYNTAX_TEST_11, evaluate_negative_syntax_test);
 
-    // Update syntax tests — SPARQL UPDATE uses the same parser
+    // Update syntax tests — SPARQL UPDATE uses the same parser.
+    // The un-versioned types are used by the SPARQL 1.2 manifests.
     evaluator.register(
         mf::POSITIVE_UPDATE_SYNTAX_TEST_11,
         evaluate_positive_syntax_test,
@@ -29,15 +31,29 @@ pub fn register_sparql_tests(evaluator: &mut TestEvaluator) {
         mf::NEGATIVE_UPDATE_SYNTAX_TEST_11,
         evaluate_negative_syntax_test,
     );
+    evaluator.register(
+        mf::POSITIVE_UPDATE_SYNTAX_TEST,
+        evaluate_positive_syntax_test,
+    );
+    evaluator.register(
+        mf::NEGATIVE_UPDATE_SYNTAX_TEST,
+        evaluate_negative_syntax_test,
+    );
 
     // Query evaluation tests
     evaluator.register(mf::QUERY_EVALUATION_TEST, evaluate_query_evaluation_test);
 
-    // Update evaluation tests — not yet implemented
-    evaluator.register(mf::UPDATE_EVALUATION_TEST, evaluate_update_evaluation_test);
+    // Update evaluation tests: load initial graph-store state, apply the
+    // update via the public SPARQL UPDATE surface, compare resulting state.
+    evaluator.register(
+        mf::UPDATE_EVALUATION_TEST,
+        query_handler::evaluate_update_evaluation_test,
+    );
 
-    // CSV result format tests — not yet implemented
-    evaluator.register(mf::CSV_RESULT_FORMAT_TEST, evaluate_csv_result_format_test);
+    // CSV result format tests: same eval flow as QueryEvaluationTest; the
+    // .csv extension of the expected-result file selects lossy CSV-space
+    // comparison in the eval handler.
+    evaluator.register(mf::CSV_RESULT_FORMAT_TEST, evaluate_query_evaluation_test);
 
     // Infrastructure tests — not applicable to a database engine
     evaluator.register(mf::PROTOCOL_TEST, evaluate_not_applicable_test);
@@ -94,31 +110,6 @@ fn evaluate_negative_syntax_test(test: &Test) -> Result<()> {
     );
 
     Ok(())
-}
-
-/// Handler for UpdateEvaluationTest.
-///
-/// Fluree does not yet support SPARQL UPDATE execution in the test harness.
-/// Fails with a descriptive message.
-fn evaluate_update_evaluation_test(test: &Test) -> Result<()> {
-    bail!(
-        "SPARQL UPDATE evaluation not yet implemented.\n\
-         Test: {}\n\
-         This test type (mf:UpdateEvaluationTest) requires executing SPARQL UPDATE \
-         operations and comparing the resulting graph state.",
-        test.id,
-    )
-}
-
-/// Handler for CSVResultFormatTest.
-///
-/// CSV/TSV result format comparison is not yet implemented.
-fn evaluate_csv_result_format_test(test: &Test) -> Result<()> {
-    bail!(
-        "CSV/TSV result format comparison not yet implemented.\n\
-         Test: {}",
-        test.id,
-    )
 }
 
 /// Handler for test types not applicable to a database engine.

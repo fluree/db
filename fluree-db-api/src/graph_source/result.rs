@@ -209,6 +209,10 @@ pub struct IcebergCreateResult {
 
     /// Whether the catalog connection was tested successfully
     pub connection_tested: bool,
+
+    /// Warnings about the `model` reference (policies a virtual source cannot
+    /// evaluate). Empty when no model is set or nothing is amiss.
+    pub model_warnings: Vec<String>,
 }
 
 /// Result of creating an R2RML graph source.
@@ -241,4 +245,8 @@ pub struct R2rmlCreateResult {
 
     /// Whether the mapping was validated successfully
     pub mapping_validated: bool,
+
+    /// Warnings about the `model` reference (policies a virtual source cannot
+    /// evaluate). Empty when no model is set or nothing is amiss.
+    pub model_warnings: Vec<String>,
 }

@@ -1,0 +1,28 @@
+[package]
+name = "fluree-wasm-probe"
+version = "0.0.0"
+edition = "2021"
+
+# Opt out of the parent workspace: this is a spike measurement harness.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fluree-db-api = { path = "../fluree-db-api", default-features = false }
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# run-node.mjs uses wasm-pack for the node smoke run; keep that build
+# deterministic by skipping wasm-pack's bundled wasm-opt pass (it can reject
+# bulk-memory output depending on the installed wasm-opt). Size measurement
+# runs wasm-opt separately with explicit feature flags — see README.md.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

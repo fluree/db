@@ -76,8 +76,11 @@ impl GeoSearchOperator {
             schema_vars.push(pattern.subject_var);
         }
 
-        // Add distance variable if present
-        if let Some(v) = pattern.distance_var {
+        // Add distance and point variables if present
+        for v in [pattern.distance_var, pattern.location_var]
+            .into_iter()
+            .flatten()
+        {
             if seen.insert(v) {
                 schema_vars.push(v);
             }
@@ -156,7 +159,7 @@ impl GeoSearchOperator {
             return Ok(vec![]);
         };
 
-        let mut results: Vec<(u64, f64)> = Vec::new(); // (s_id, distance)
+        let mut results: Vec<(u64, u64, f64)> = Vec::new(); // (s_id, o_key, distance)
 
         // Get branch manifest for POST order.
         let branch_ref = store
@@ -236,31 +239,21 @@ impl GeoSearchOperator {
                     // Apply haversine post-filter
                     let distance = haversine_distance(center_lat, center_lng, point_lat, point_lng);
                     if distance <= radius {
-                        results.push((s_id, distance));
+                        results.push((s_id, o_key, distance));
                     }
                 }
             }
         }
 
-        // Deduplicate by subject_id, keeping min distance.
-        // This handles:
-        // 1. Antimeridian crossing (same subject in multiple latitude bands)
-        // 2. Multiple GeoPoint values per subject for the same predicate
-        let mut deduped: HashMap<u64, f64> = HashMap::new();
-        for (s_id, distance) in results {
-            deduped
-                .entry(s_id)
-                .and_modify(|existing| {
-                    if distance < *existing {
-                        *existing = distance;
-                    }
-                })
-                .or_insert(distance);
-        }
-        let mut results: Vec<(u64, f64)> = deduped.into_iter().collect();
+        // One row per (subject, point), as the triple pattern this replaces
+        // would give: a subject with several points within the radius matches
+        // once for each. A point seen in two latitude bands (antimeridian
+        // crossing) is the same match.
+        let mut seen_points: HashSet<(u64, u64)> = HashSet::new();
+        results.retain(|(s_id, o_key, _)| seen_points.insert((*s_id, *o_key)));
 
         // Sort by distance and apply limit
-        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
         if let Some(lim) = limit {
             results.truncate(lim);
         }
@@ -269,7 +262,7 @@ impl GeoSearchOperator {
         let num_cols = self.in_schema.len();
         let mut output_rows: Vec<Vec<Binding>> = Vec::with_capacity(results.len());
 
-        for (s_id, distance) in results {
+        for (s_id, o_key, distance) in results {
             let mut row = vec![Binding::Unbound; num_cols];
 
             // Copy child columns
@@ -303,6 +296,14 @@ impl GeoSearchOperator {
                 row[dist_pos] = Binding::lit(
                     FlakeValue::Double(distance),
                     self.datatypes.xsd_double.clone(),
+                );
+            }
+
+            if let Some(loc_var) = self.pattern.location_var {
+                let loc_pos = *self.out_pos.get(&loc_var).unwrap();
+                row[loc_pos] = Binding::lit(
+                    FlakeValue::GeoPoint(GeoPointBits(o_key)),
+                    self.datatypes.geo_wkt_literal.clone(),
                 );
             }
 

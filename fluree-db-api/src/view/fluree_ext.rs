@@ -2,15 +2,17 @@
 //!
 //! Provides convenience methods on `Fluree` for loading and wrapping views.
 
+use fluree_db_core::VerifiedIdentity;
 use std::sync::Arc;
-
-use chrono::DateTime;
 
 use crate::view::{GraphDb, ReasoningModePrecedence};
 use crate::{config_resolver, time_resolve, ApiError, Fluree, GovernanceOptions, Result, TimeSpec};
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::ids::GraphId;
-use fluree_db_core::{ContentStore, DictNovelty, IndexType, DEFAULT_GRAPH_ID, TXN_META_GRAPH_ID};
+use fluree_db_core::{
+    ContentStore, DictNovelty, IndexType, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID, DEFAULT_GRAPH_IRI,
+    TXN_META_GRAPH_ID,
+};
 use fluree_db_query::ir::ReasoningModes;
 use fluree_db_query::BinaryRangeProvider;
 use tracing::Instrument;
@@ -26,6 +28,8 @@ enum GraphRef {
     Default,
     /// Transaction metadata graph (g_id = 1)
     TxnMeta,
+    /// Ledger config graph (g_id = 2)
+    Config,
     /// User-defined named graph by exact IRI
     Named(String),
 }
@@ -38,8 +42,9 @@ impl Fluree {
     /// so the ledger_id always matches the nameservice alias.
     ///
     /// Supported fragments:
-    /// - *(none)* → default graph (g_id = 0)
+    /// - *(none)* or `#urn:default` → default graph (g_id = 0)
     /// - `#txn-meta` → txn metadata graph (g_id = 1)
+    /// - `#config` → ledger config graph (g_id = 2)
     /// - `#<iri>` → user-defined named graph by exact IRI
     fn parse_graph_ref(ledger_id: &str) -> Result<(&str, GraphRef)> {
         // Strip urn:fluree: prefix so full IRIs resolve to the same ledger alias.
@@ -49,13 +54,29 @@ impl Fluree {
             None => Ok((ledger_id, GraphRef::Default)),
             Some((ledger_id, frag)) => {
                 if ledger_id.is_empty() {
-                    return Err(ApiError::query("Missing ledger before '#'"));
+                    return Err(ApiError::invalid_query("Missing ledger before '#'"));
                 }
                 if frag.is_empty() {
-                    return Err(ApiError::query("Missing named graph after '#'"));
+                    return Err(ApiError::invalid_query("Missing named graph after '#'"));
                 }
                 match frag {
+                    DEFAULT_GRAPH_IRI => Ok((ledger_id, GraphRef::Default)),
                     "txn-meta" => Ok((ledger_id, GraphRef::TxnMeta)),
+                    // The config graph is reserved and slot-addressed exactly
+                    // like `txn-meta`; the baseline gave `txn-meta` a fragment
+                    // arm and `config` none, so `#config` fell through to an
+                    // exact-IRI lookup for the bare fragment `"config"`, which
+                    // cannot match — the graph is registered under its full
+                    // `urn:fluree:<ledger>#config` IRI. Every documented
+                    // `--ledger mydb:main#config` and connection-path
+                    // `FROM <urn:fluree:mydb:main#config>` therefore failed
+                    // with "Unknown named graph '#config'".
+                    //
+                    // This is an ADDRESSING surface: the fragment is only
+                    // reachable once a ledger has already been named, so it is
+                    // explicit by construction. See the reserved-graph contract
+                    // table on `resolve_within_ledger_graph` in `view/query.rs`.
+                    "config" => Ok((ledger_id, GraphRef::Config)),
                     // Any other fragment is treated as a graph IRI (exact match).
                     other => Ok((ledger_id, GraphRef::Named(other.to_string()))),
                 }
@@ -72,6 +93,7 @@ impl Fluree {
         let g_id: GraphId = match graph_ref {
             GraphRef::Default => DEFAULT_GRAPH_ID,
             GraphRef::TxnMeta => TXN_META_GRAPH_ID,
+            GraphRef::Config => CONFIG_GRAPH_ID,
             GraphRef::Named(iri) => view
                 .snapshot
                 .graph_registry
@@ -83,7 +105,7 @@ impl Fluree {
                         .as_ref()
                         .and_then(|s| s.graph_id_for_iri(&iri))
                 })
-                .ok_or_else(|| ApiError::query(format!("Unknown named graph '#{iri}'")))?,
+                .ok_or_else(|| ApiError::GraphNotFound(format!("<{iri}>")))?,
         };
 
         if g_id != DEFAULT_GRAPH_ID && view.binary_store.is_some() && view.dict_novelty.is_some() {
@@ -110,26 +132,38 @@ impl Fluree {
     /// config graph is empty.
     ///
     /// Note: Reasoning defaults are NOT applied here — they are applied at
-    /// the request boundary via `config_resolver::merge_reasoning()` which
-    /// respects override control and server-verified identity.
+    /// query preparation by [`complete_config_defaults`](Self::complete_config_defaults),
+    /// via `config_resolver::merge_reasoning()`, which applies override
+    /// control against whatever server-verified identity the caller supplies.
     pub(crate) async fn resolve_and_attach_config(&self, view: GraphDb) -> Result<GraphDb> {
-        // Config reads are best-effort. If the config graph is unqueryable
-        // (e.g., historical snapshot without a range_provider for g_id=2),
-        // treat it as "no config" and apply system defaults.
-        let config =
-            match config_resolver::resolve_ledger_config(&view.snapshot, &*view.overlay, view.t)
-                .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::debug!(error = %e, "Config graph read failed — using system defaults");
-                    return Ok(view);
-                }
-            };
+        if view.config_is_resolved() {
+            return Ok(view);
+        }
+        // A read failure must never become an unrestricted policy view.
+        // Resolved through the same marker-keyed cache the write path uses:
+        // query preparation completes config defaults on every view that
+        // arrives without them, which for the ledger-scoped server routes is
+        // every request, and a configured ledger would otherwise pay the full
+        // config-graph read each time. The cache serves a value only on an
+        // exact `config_write_t` match at head, so a stale read is not
+        // possible; a miss costs the resolve this used to do unconditionally.
+        // `view.novelty()` is passed explicitly because a read view's overlay
+        // may be a composed reasoning overlay rather than a bare `Novelty`, in
+        // which case the resolver's own downcast would find no marker and
+        // silently stop caching.
+        let config = crate::policy_view::resolve_ledger_config_cached(
+            self,
+            &view.snapshot,
+            &*view.overlay,
+            view.novelty().map(|n| &**n),
+            view.t,
+        )
+        .await?;
 
-        let config = match config {
-            Some(c) => Arc::new(c),
-            None => return Ok(view),
+        let Some(config) = config else {
+            let mut view = view;
+            view.config_absent = true;
+            return Ok(view);
         };
 
         // Resolve effective config for this view's graph
@@ -225,7 +259,7 @@ impl Fluree {
                     .get(&index_cid)
                     .await
                     .map_err(|e| ApiError::internal(format!("read index root: {e}")))?;
-                let cache_dir = std::env::temp_dir().join("fluree-cache");
+                let cache_dir = crate::ledger_manager::temp_cache_dir("fluree-cache");
                 let mut store = BinaryIndexStore::load_from_root_bytes(
                     cs,
                     &bytes,
@@ -320,6 +354,17 @@ impl Fluree {
             });
         }
 
+        self.load_graph_db_historical(ledger_id, target_t).await
+    }
+
+    /// Open a ledger at a past `t` through the historical loader: no ledger
+    /// cache, so no cache lock is taken. [`Self::load_graph_db_at_t`] uses
+    /// this once it knows `t` is not the cached head.
+    pub(crate) async fn load_graph_db_historical(
+        &self,
+        ledger_id: &str,
+        target_t: i64,
+    ) -> Result<GraphDb> {
         let historical = self.ledger_view_at(ledger_id, target_t).await?;
         let mut view = GraphDb::from_historical(&historical);
 
@@ -360,7 +405,7 @@ impl Fluree {
                     let bytes = cs.get(index_cid).await.map_err(|e| {
                         ApiError::internal(format!("failed to read index root {index_cid}: {e}"))
                     })?;
-                    let cache_dir = std::env::temp_dir().join("fluree-cache");
+                    let cache_dir = crate::ledger_manager::temp_cache_dir("fluree-cache");
                     let mut store = BinaryIndexStore::load_from_root_bytes(
                         cs,
                         &bytes,
@@ -448,7 +493,7 @@ impl Fluree {
 
     /// Load a view at a flexible time specification.
     ///
-    /// Resolves `@t:`, `@iso:`, `@recorded:`, `@commit:`, or `latest` time
+    /// Resolves `@t:`, `@time:`, `@recorded:`, `@commit:`, or `latest` time
     /// specifications.
     pub(crate) async fn load_graph_db_at(
         &self,
@@ -458,61 +503,16 @@ impl Fluree {
         match spec {
             TimeSpec::Latest => self.load_graph_db(ledger_id).await,
             TimeSpec::AtT(t) => self.load_graph_db_at_t(ledger_id, t).await,
-            TimeSpec::AtTime(iso) => {
+            // Every other spec resolves against the ledger's head state through
+            // the one shared resolver. `ledger_cached` runs first, so an alias that
+            // is not a ledger surfaces NotFound and the callers' graph-source
+            // fallback still fires (a `@snapshot:` on a real ledger is refused
+            // by the resolver).
+            spec => {
                 let handle = self.ledger_cached(ledger_id).await?;
                 let snapshot = handle.snapshot().await;
                 let ledger = snapshot.to_ledger_state();
-                let current_t = ledger.t();
-                let dt = DateTime::parse_from_rfc3339(&iso).map_err(|e| {
-                    ApiError::internal(format!(
-                        "Invalid ISO-8601 timestamp for time travel: {iso} ({e})"
-                    ))
-                })?;
-                // `ledger#time` flakes store epoch milliseconds. If the ISO timestamp includes
-                // sub-millisecond precision, `timestamp_millis()` truncates, which can push the
-                // target *slightly before* the intended instant. To avoid off-by-one-ms
-                // resolution (especially around the first commit after genesis), we ceiling
-                // to the next millisecond when sub-ms precision is present.
-                let mut target_epoch_ms = dt.timestamp_millis();
-                if dt.timestamp_subsec_nanos() % 1_000_000 != 0 {
-                    target_epoch_ms += 1;
-                }
-                let resolved_t = time_resolve::datetime_to_t(
-                    &ledger.snapshot,
-                    Some(ledger.novelty.as_ref()),
-                    target_epoch_ms,
-                    current_t,
-                )
-                .await?;
-                self.load_graph_db_at_t(ledger_id, resolved_t).await
-            }
-            TimeSpec::AtRecorded(iso) => {
-                let handle = self.ledger_cached(ledger_id).await?;
-                let snapshot = handle.snapshot().await;
-                let ledger = snapshot.to_ledger_state();
-                let current_t = ledger.t();
-                let target_epoch_ms = time_resolve::iso_to_target_epoch_ms(&iso)?;
-                let resolved_t = time_resolve::recorded_to_t(
-                    &ledger.snapshot,
-                    Some(ledger.novelty.as_ref()),
-                    target_epoch_ms,
-                    current_t,
-                )
-                .await?;
-                self.load_graph_db_at_t(ledger_id, resolved_t).await
-            }
-            TimeSpec::AtCommit(commit_prefix) => {
-                let handle = self.ledger_cached(ledger_id).await?;
-                let snapshot = handle.snapshot().await;
-                let ledger = snapshot.to_ledger_state();
-                let current_t = ledger.t();
-                let resolved_t = time_resolve::commit_to_t(
-                    &ledger.snapshot,
-                    Some(ledger.novelty.as_ref()),
-                    &commit_prefix,
-                    current_t,
-                )
-                .await?;
+                let resolved_t = time_resolve::resolve_time_spec(&ledger, &spec).await?;
                 self.load_graph_db_at_t(ledger_id, resolved_t).await
             }
         }
@@ -588,6 +588,7 @@ impl Fluree {
         let graph_ref = match selector {
             crate::dataset::GraphSelector::Default => GraphRef::Default,
             crate::dataset::GraphSelector::TxnMeta => GraphRef::TxnMeta,
+            crate::dataset::GraphSelector::Config => GraphRef::Config,
             crate::dataset::GraphSelector::Iri(iri) => GraphRef::Named(iri.clone()),
         };
         Self::select_graph(view, graph_ref)
@@ -626,26 +627,156 @@ impl Fluree {
     /// the single source of truth for the genesis graph-source view; see
     /// [`db_or_graph_source`](Self::db_or_graph_source) and the dataset path's
     /// `resolve_as_graph_source`.
-    pub async fn resolve_graph_source(&self, ledger_id: &str) -> Result<Option<GraphDb>> {
-        let gs_id = fluree_db_core::normalize_ledger_id(ledger_id)
-            .unwrap_or_else(|_| ledger_id.to_string());
+    /// The config a governed virtual source presents to `wrap_policy` (see
+    /// `graph_source::r2rml::source_resolved_config`); `None` when the record
+    /// sets neither a model ledger nor a `default-allow`.
+    pub(crate) fn graph_source_model_config(
+        record: &fluree_db_nameservice::GraphSourceRecord,
+    ) -> Option<fluree_db_core::ledger_config::ResolvedConfig> {
+        #[cfg(feature = "iceberg")]
+        {
+            let (model, default_allow) = crate::graph_source::r2rml::policy_config_of(record);
+            crate::graph_source::r2rml::source_resolved_config(model.as_deref(), default_allow)
+        }
+        #[cfg(not(feature = "iceberg"))]
+        {
+            let _ = record;
+            None
+        }
+    }
 
-        if self
+    /// Validate a graph source's `--model` reference at registration and
+    /// return user-facing warnings about it.
+    ///
+    /// The model must be an existing native ledger (a typo would otherwise
+    /// surface only as a 502 on every governed query). Policies in it that use
+    /// `f:query` are reported: a virtual source cannot evaluate them, so they
+    /// deny their targets.
+    ///
+    /// Only graph-source registration calls this, and both entry points are
+    /// feature-gated, so the method is gated the same way — a wasm32
+    /// `--no-default-features` build would otherwise lint it as dead.
+    #[cfg(any(feature = "iceberg", feature = "sql"))]
+    pub(crate) async fn validate_source_model(&self, model: Option<&str>) -> Result<Vec<String>> {
+        let Some(model) = model else {
+            return Ok(Vec::new());
+        };
+        let id = fluree_db_core::LedgerId::parse(model)?;
+        let ns = self.nameservice();
+        if ns
+            .lookup_graph_source(&id)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .is_some()
+        {
+            return Err(ApiError::config(format!(
+                "model '{model}' is a graph source; a model must be a native ledger \
+                 holding the policies and class hierarchy"
+            )));
+        }
+        match ns.lookup(&id).await {
+            Ok(Some(record)) if !record.retracted => {}
+            Ok(_) => {
+                return Err(ApiError::config(format!(
+                    "model ledger '{model}' not found; create it first (`fluree create`) \
+                     or check the name"
+                )));
+            }
+            Err(e) => return Err(ApiError::internal(e.to_string())),
+        }
+
+        let probe = serde_json::json!({
+            "from": id,
+            "select": ["?policy"],
+            "where": { "@id": "?policy", "https://ns.flur.ee/db#query": "?q" },
+        });
+        let rows = self.query_from().jsonld(&probe).execute_formatted().await?;
+        let mut warnings: Vec<String> = rows
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| row.get(0).and_then(|v| v.as_str()))
+            .map(|policy| {
+                format!(
+                    "policy {policy} in model '{model}' uses f:query, which a virtual source \
+                     cannot evaluate; its targets will be denied"
+                )
+            })
+            .collect();
+        warnings.sort();
+        warnings.dedup();
+        Ok(warnings)
+    }
+
+    pub async fn resolve_graph_source(&self, ledger_id: &str) -> Result<Option<GraphDb>> {
+        self.resolve_graph_source_at(ledger_id, &TimeSpec::Latest)
+            .await
+    }
+
+    /// [`Self::resolve_graph_source`] for a time-specified alias. The view
+    /// carries the table state the query reads; the two routes that resolve a
+    /// pinned alias (the `from`-driven dataset builder and the lazy `graph_at()`
+    /// handle) both come through here, so refusals live in one place: `@t:` /
+    /// `@commit:` on any graph source, and any pin on a source that is not an
+    /// Iceberg-backed table (SQL, BM25, vector, geo) — those read their current
+    /// state and would otherwise accept the pin and ignore it.
+    pub(crate) async fn resolve_graph_source_at(
+        &self,
+        ledger_id: &str,
+        spec: &TimeSpec,
+    ) -> Result<Option<GraphDb>> {
+        // A graph-source alias may carry a graph fragment (`{ds}#txn-meta`) or an
+        // explicit `:branch`. Split the fragment off BEFORE normalizing/looking up:
+        // the nameservice registers a graph source under its `name:branch` id, and
+        // `normalize_ledger_id` only understands `:` (not `#`), so a `#fragment`
+        // left on the alias would never match — a commit-history
+        // `from:{ds}#txn-meta` query would 500 with NotFound instead of returning
+        // []. Reuse `parse_graph_ref` so `#txn-meta` / `urn:fluree:` handling stays
+        // identical to the native `db()` path (this also fixes the rarer
+        // `{ds}:main#...` NotFound).
+        let (base_id, graph_ref) = Self::parse_graph_ref(ledger_id)?;
+        let gs_id = fluree_db_core::LedgerId::parse(base_id)?;
+
+        // A drop leaves the record as a tombstone.
+        let Some(record) = self
             .nameservice()
             .lookup_graph_source(&gs_id)
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?
-            .is_none()
-        {
+            .filter(|record| !record.retracted)
+        else {
             return Ok(None);
+        };
+
+        let graph_source_time = crate::graph_source::source_time_for(spec)?;
+        if graph_source_time.is_some()
+            && !matches!(
+                record.source_type,
+                fluree_db_nameservice::GraphSourceType::Iceberg
+                    | fluree_db_nameservice::GraphSourceType::R2rml
+                    | fluree_db_nameservice::GraphSourceType::Delta
+            )
+        {
+            return Err(ApiError::invalid_query(format!(
+                "graph source '{gs_id}' ({}) does not support time-pinned reads; only \
+                 Iceberg- and Delta-backed graph sources do. Remove the time specification \
+                 to query its current state.",
+                record.source_type.to_type_string()
+            )));
         }
 
         let snapshot = fluree_db_core::LedgerSnapshot::genesis(&gs_id);
         let state =
             fluree_db_ledger::LedgerState::new(snapshot, fluree_db_novelty::Novelty::new(0));
         let mut db = GraphDb::from_ledger_state(&state);
-        db.graph_source_id = Some(gs_id.into());
-        Ok(Some(db))
+
+        // The default graph routes to the virtual provider and uses its model
+        // configuration. Shared graph selection removes both when selecting an
+        // empty system graph, for fragments and explicit dataset selectors alike.
+        db.resolved_config = Self::graph_source_model_config(&record);
+        db.graph_source_id = Some(gs_id.to_string().into());
+        db.graph_source_time = graph_source_time;
+        Self::select_graph(db, graph_ref).map(Some)
     }
 }
 
@@ -654,13 +785,34 @@ impl Fluree {
 // ============================================================================
 
 impl Fluree {
+    /// Apply configured policy defaults when no request policy was selected.
+    /// Unconfigured views keep their plain-query path. Unlike a synthetic
+    /// `default_allow: true`, empty governance lets config supply its classes.
+    pub async fn wrap_policy_defaults(&self, view: GraphDb) -> Result<GraphDb> {
+        if view.has_policy() {
+            return Ok(view);
+        }
+        let view = self.resolve_and_attach_config(view).await?;
+        if view
+            .resolved_config()
+            .is_some_and(|config| config.policy.is_some())
+        {
+            self.wrap_policy(view, &GovernanceOptions::default()).await
+        } else {
+            Ok(view)
+        }
+    }
+
     /// Build policy from options and wrap a view.
     ///
     /// If the view has a `ResolvedConfig`, config defaults are merged with query
-    /// opts and override control is checked against `server_identity`.
+    /// opts and override control is checked against `opts.server_identity`.
     ///
-    /// `server_identity` is the auth-layer-verified identity — NOT `opts.identity`
-    /// which is the user-settable policy evaluation context.
+    /// `opts.server_identity` is the auth-layer-verified identity — NOT
+    /// `opts.identity`, which is the user-settable policy evaluation context.
+    /// Server routes populate it from the verified credential or bearer; an
+    /// embedding application that runs its own auth may set it. Left `None`,
+    /// `f:IdentityRestricted` override control denies the request.
     ///
     /// # Example
     ///
@@ -668,18 +820,18 @@ impl Fluree {
     /// let view = fluree.db("mydb:main").await?;
     /// let opts = GovernanceOptions {
     ///     identity: Some("did:example:user".into()),
+    ///     server_identity: Some(VerifiedIdentity::new("did:example:user")),
     ///     ..Default::default()
     /// };
-    /// let view = fluree.wrap_policy(view, &opts, None).await?;
+    /// let view = fluree.wrap_policy(view, &opts).await?;
     /// ```
-    pub async fn wrap_policy(
-        &self,
-        view: GraphDb,
-        opts: &GovernanceOptions,
-        server_identity: Option<&str>,
-    ) -> Result<GraphDb> {
+    pub async fn wrap_policy(&self, view: GraphDb, opts: &GovernanceOptions) -> Result<GraphDb> {
+        // Callers may construct a view directly from staged/loaded ledger state.
+        // Such a view must not bypass ledger override controls just because
+        // config has not been attached yet (for example GraphQL read-back).
+        let view = self.resolve_and_attach_config(view).await?;
         let effective_opts = if let Some(ref resolved) = view.resolved_config {
-            config_resolver::merge_policy_opts(resolved, opts, server_identity)
+            config_resolver::merge_policy_opts(resolved, opts)
         } else {
             opts.clone()
         };
@@ -704,9 +856,9 @@ impl Fluree {
             // written back below so the subsequent `query` call's
             // own ResolveCtx observes the same per-ledger head-t.
             //
-            // `ledger_id_owned` keeps a string alive past the
+            // `ledger_id_owned` keeps the id alive past the
             // eventual `view` move at the end of this branch.
-            let ledger_id_owned: String = view.snapshot.ledger_id.to_string();
+            let ledger_id_owned = view.snapshot.ledger_id.clone();
             let mut ctx = crate::cross_ledger::ResolveCtx::with_resolved_ts(
                 &ledger_id_owned,
                 self,
@@ -715,10 +867,18 @@ impl Fluree {
             // The class-filter chain, identity contract (bind-only, never a
             // rule selector), and PolicyRules dispatch all live in the shared
             // helper so read and write paths can't drift. The config's
-            // policy_class is passed separately: merge_policy_opts returns
-            // the request opts unchanged when the request carries any policy
-            // input and override is permitted, so an identity-only request
-            // would otherwise never see the config's f:policyClass.
+            // policy_class is passed separately: merge_policy_opts keeps the
+            // request's own policy inputs when the request carries any and
+            // override is permitted, so an identity-only request would
+            // otherwise never see the config's f:policyClass.
+            //
+            // f:defaultAllow used to need the same sidecar and no longer does —
+            // it is tri-state, so merge_policy_opts fills an unset request from
+            // config. policy_class could follow, but folding it into the merge
+            // would also start applying config's f:policyClass to
+            // identity-carrying requests on the *local* path, which this sidecar
+            // never did. That is a behavior change, not a refactor; left alone
+            // deliberately.
             let config_policy_class = view
                 .resolved_config
                 .as_ref()
@@ -730,6 +890,7 @@ impl Fluree {
                 config_policy_class,
                 source,
                 &mut ctx,
+                view.graph_source_id.is_some(),
             )
             .await?;
 
@@ -795,7 +956,7 @@ impl Fluree {
             .filter(|r| r.schema_source.as_ref().is_some_and(|s| s.ledger.is_some()))
         {
             Some(reasoning) => {
-                let ledger_id_owned: String = view.snapshot.ledger_id.to_string();
+                let ledger_id_owned = view.snapshot.ledger_id.clone();
                 let mut ctx = crate::cross_ledger::ResolveCtx::with_resolved_ts(
                     &ledger_id_owned,
                     self,
@@ -831,20 +992,19 @@ impl Fluree {
 
     /// Load a view at head with policy applied.
     ///
-    /// Convenience method that combines `db()` + `wrap_policy()`.
-    /// Passes `None` for server identity (no auth layer plumbing yet).
+    /// Convenience method that combines `db()` + `wrap_policy()`. Override
+    /// control reads `opts.server_identity`.
     pub async fn db_with_policy(
         &self,
         ledger_id: &str,
         opts: &GovernanceOptions,
     ) -> Result<GraphDb> {
         let view = self.db(ledger_id).await?;
-        self.wrap_policy(view, opts, None).await
+        self.wrap_policy(view, opts).await
     }
 
-    /// Load a db at a specific time with policy applied.
-    ///
-    /// Passes `None` for server identity (no auth layer plumbing yet).
+    /// Load a db at a specific time with policy applied. Override control
+    /// reads `opts.server_identity`.
     pub async fn db_at_t_with_policy(
         &self,
         ledger_id: &str,
@@ -852,7 +1012,7 @@ impl Fluree {
         opts: &GovernanceOptions,
     ) -> Result<GraphDb> {
         let view = self.db_at_t(ledger_id, target_t).await?;
-        self.wrap_policy(view, opts, None).await
+        self.wrap_policy(view, opts).await
     }
 }
 
@@ -886,7 +1046,11 @@ impl Fluree {
     ///
     /// `server_identity` is the auth-layer-verified identity (NOT opts.identity).
     /// Pass `None` when no auth layer is present (Phase 1).
-    pub fn apply_config_reasoning(&self, view: GraphDb, server_identity: Option<&str>) -> GraphDb {
+    pub fn apply_config_reasoning(
+        &self,
+        view: GraphDb,
+        server_identity: Option<&VerifiedIdentity>,
+    ) -> GraphDb {
         let resolved = match &view.resolved_config {
             Some(r) => r,
             None => return view,
@@ -899,6 +1063,14 @@ impl Fluree {
         let budget = config_resolver::config_reasoning_budget(resolved, server_identity);
 
         let view = match config_resolver::merge_reasoning(resolved, server_identity) {
+            // Config supplies *defaults*, so it must not overwrite reasoning
+            // the caller attached to the view. `with_reasoning_precedence`
+            // replaces `reasoning` outright, and `effective_reasoning`
+            // arbitrates only between the wrapper and the query's own modes,
+            // so a wrapper discarded here cannot be recovered downstream --
+            // not even one set with `Force`. The budget below still applies:
+            // a ledger's materialization cap governs whichever modes win.
+            Some(_) if view.reasoning().is_some() => view,
             Some((mode_strings, precedence)) => {
                 let modes = ReasoningModes::from_mode_strings(&mode_strings);
                 // Always wrap if modes has enabled flags or explicit_none=true
@@ -923,16 +1095,57 @@ impl Fluree {
     ///
     /// Convenience wrapper that calls both `apply_config_reasoning` and
     /// `apply_config_datalog` in sequence.
-    pub fn apply_config_defaults(&self, view: GraphDb, server_identity: Option<&str>) -> GraphDb {
+    pub fn apply_config_defaults(
+        &self,
+        view: GraphDb,
+        server_identity: Option<&VerifiedIdentity>,
+    ) -> GraphDb {
         let view = self.apply_config_reasoning(view, server_identity);
         self.apply_config_datalog(view, server_identity)
+    }
+
+    /// Return `view` with its ledger's config-graph defaults in force,
+    /// resolving the config graph first when the view doesn't carry it yet.
+    ///
+    /// Views reach query preparation in two states. One built through
+    /// [`db()`](Self::db) carries a resolved config; one built straight from a
+    /// `LedgerState` via `GraphDb::from_ledger_state` — the sync constructor
+    /// the ledger-scoped server routes use — carries none, because config
+    /// resolution is async. Neither carries the reasoning/datalog wrappers
+    /// derived from that config. Completing both here rather than at each
+    /// view-construction site is what keeps a configured `f:reasoningDefaults`
+    /// from being silently dropped by whichever route built the view
+    /// (fluree/db#1577).
+    ///
+    /// A ledger with an empty config graph re-resolves on every query, but
+    /// `resolve_ledger_config` short-circuits that case before it scans.
+    ///
+    /// `server_identity` is the auth-layer-verified identity that
+    /// `f:overrideControl` gates on. It is not `opts.identity`, which is the
+    /// caller-settable policy evaluation context. On the query path it
+    /// travels as `QueryExecutionOptions::server_identity` from the request
+    /// boundary through `build_executable_for_view` /
+    /// `build_executable_for_dataset` to here. `None` is anonymous, which
+    /// `f:IdentityRestricted` denies; entry points with no execution options
+    /// (the CLI, internal probes) are anonymous by design.
+    pub(crate) async fn complete_config_defaults(
+        &self,
+        view: &GraphDb,
+        server_identity: Option<&VerifiedIdentity>,
+    ) -> Result<GraphDb> {
+        let view = self.resolve_and_attach_config(view.clone()).await?;
+        Ok(self.apply_config_defaults(view, server_identity))
     }
 
     /// Apply config-graph datalog defaults to a view.
     ///
     /// Stores resolved datalog config on the view. Enforcement happens
     /// at query execution time, not here.
-    pub fn apply_config_datalog(&self, view: GraphDb, server_identity: Option<&str>) -> GraphDb {
+    pub fn apply_config_datalog(
+        &self,
+        view: GraphDb,
+        server_identity: Option<&VerifiedIdentity>,
+    ) -> GraphDb {
         let resolved = match &view.resolved_config {
             Some(r) => r,
             None => return view,
@@ -985,17 +1198,17 @@ fn resolve_local_rules_source_g_id(
         return Ok(None);
     }
     if src.at_t.is_some() {
-        return Err(ApiError::config(
+        return Err(ApiError::ledger_config(
             "f:rulesSource with f:atT (temporal pinning) is not yet supported",
         ));
     }
     if src.trust_policy.is_some() {
-        return Err(ApiError::config(
+        return Err(ApiError::ledger_config(
             "f:rulesSource with f:trustPolicy is not yet supported",
         ));
     }
     if src.rollback_guard.is_some() {
-        return Err(ApiError::config(
+        return Err(ApiError::ledger_config(
             "f:rulesSource with f:rollbackGuard is not yet supported",
         ));
     }
@@ -1006,7 +1219,7 @@ fn resolve_local_rules_source_g_id(
     };
     match g_id {
         Some(id) => Ok(Some(id)),
-        None => Err(ApiError::config(format!(
+        None => Err(ApiError::ledger_config(format!(
             "f:rulesSource graph '{}' not found in this ledger's graph registry",
             src.graph_selector.as_deref().unwrap_or("<none>"),
         ))),
@@ -1037,6 +1250,90 @@ fn populate_dict_novelty_from_view(
 mod tests {
     use super::*;
     use crate::FlureeBuilder;
+
+    /// A query over a view that arrives without a resolved config resolves it
+    /// through the shared marker-keyed cache, so the next such query on the
+    /// same ledger state hits instead of re-reading the config graph. Lives
+    /// here rather than in `tests/` because `config_cache_get` is crate-private.
+    ///
+    /// Both memo shapes are covered: a resolved config on a configured ledger,
+    /// and the "no config" result on an unconfigured one, which is what lets
+    /// unconfigured ledgers skip the scan after the first miss.
+    #[tokio::test]
+    async fn read_path_populates_the_config_cache() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        assert!(
+            fluree.ledger_manager().is_some(),
+            "harness: the cache lives on the ledger manager, which this builder must attach"
+        );
+
+        // --- configured ledger: memoizes Some(config) ---
+        let configured = "cfgcache/configured:main";
+        let ledger = fluree.create_ledger(configured).await.expect("create");
+        let trig = format!(
+            r"
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            GRAPH <urn:fluree:{configured}#config> {{
+                <urn:config:main> rdf:type f:LedgerConfig .
+                <urn:config:main> f:reasoningDefaults <urn:config:reasoning> .
+                <urn:config:reasoning> f:reasoningModes f:rdfs .
+            }}
+            "
+        );
+        fluree
+            .stage_owned(ledger)
+            .upsert_turtle(&trig)
+            .execute()
+            .await
+            .expect("write config");
+
+        let handle = fluree
+            .ledger_cached(configured)
+            .await
+            .expect("cached handle");
+        let state = fluree.ledger(configured).await.expect("ledger state");
+        let key = state.novelty.config_write_t;
+        assert!(
+            handle.config_cache_get(key).await.is_none(),
+            "nothing has resolved config yet, so the marker must miss"
+        );
+
+        let db = GraphDb::from_ledger_state(&state);
+        let q = serde_json::json!({"select": "?s", "where": {"@id": "?s"}});
+        fluree.query(&db, &q).await.expect("query");
+
+        assert!(
+            matches!(handle.config_cache_get(key).await, Some(Some(_))),
+            "a read over a config-less view must resolve through the cache and memoize the config"
+        );
+
+        // --- unconfigured ledger: memoizes None ---
+        let bare = "cfgcache/bare:main";
+        let ledger = fluree.create_ledger(bare).await.expect("create");
+        fluree
+            .insert(
+                ledger,
+                &serde_json::json!({"@id": "http://example.org/a", "http://example.org/p": "v"}),
+            )
+            .await
+            .expect("insert");
+        let handle = fluree.ledger_cached(bare).await.expect("cached handle");
+        let state = fluree.ledger(bare).await.expect("ledger state");
+        let key = state.novelty.config_write_t;
+        assert!(
+            handle.config_cache_get(key).await.is_none(),
+            "unconfigured: cold"
+        );
+
+        let db = GraphDb::from_ledger_state(&state);
+        fluree.query(&db, &q).await.expect("query");
+
+        assert!(
+            matches!(handle.config_cache_get(key).await, Some(None)),
+            "a read over an unconfigured ledger must memoize the no-config result"
+        );
+    }
 
     #[tokio::test]
     async fn test_view_not_found() {

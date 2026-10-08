@@ -35,7 +35,9 @@ impl Fluree {
         let parsed = parse_query(query_json, primary.snapshot.as_ref(), &mut vars, None)?;
 
         // Build the runtime dataset
-        let runtime_dataset = dataset.as_runtime_dataset();
+        let runtime_dataset = self
+            .runtime_dataset(dataset, parsed.union_default_graph)
+            .await?;
 
         // Build executable query
         let executable = ExecutableQuery::simple(parsed.clone());
@@ -94,6 +96,9 @@ impl Fluree {
     /// For queries that don't use graph source patterns, prefer `query_connection()`
     /// as it may take faster code paths for simple single-ledger queries.
     pub async fn query_connection_with_bm25(&self, query_json: &JsonValue) -> Result<QueryResult> {
+        // This entry point carries no execution options, so there is no
+        // auth-layer-verified identity to stamp: it runs anonymous for
+        // `f:overrideControl` purposes.
         let (spec, qc_opts) = parse_dataset_spec(query_json)?;
 
         if spec.is_empty() {

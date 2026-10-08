@@ -62,12 +62,12 @@ async fn apply_index<S: Storage + Clone + 'static>(
     // Extract metadata from FIR6 root
     let root = fluree_db_binary_index::IndexRoot::decode(&bytes).expect("decode FIR6 root");
     let meta = LedgerSnapshotMetadata {
-        ledger_id: root.ledger_id,
+        ledger_id: fluree_db_api::LedgerId::parse(&root.ledger_id).unwrap(),
         t: root.index_t,
         base_t: root.base_t,
         namespace_codes: root.namespace_codes.into_iter().collect(),
         ns_split_mode: root.ns_split_mode,
-        stats: root.stats,
+        stats: root.stats.map(std::sync::Arc::new),
         schema: root.schema,
         subject_watermarks: root.subject_watermarks,
         string_watermark: root.string_watermark,
@@ -75,6 +75,7 @@ async fn apply_index<S: Storage + Clone + 'static>(
         has_annotations: root.has_annotations,
         annotation_index: root.annotation_index.clone(),
         had_annotation_arena: root.had_annotation_arena,
+        has_list_meta: root.has_list_meta,
     };
     let mut db = LedgerSnapshot::new_meta(meta).expect("seed graph registry from root");
     db.range_provider = Some(Arc::new(provider));
@@ -803,6 +804,302 @@ async fn ref_class_reattributed_after_both_endpoints_retype() {
                 ),
                 None,
                 "no stale Employee.worksFor -> Organization"
+            );
+        })
+        .await;
+}
+
+/// Untyped→typed (Case B variant): an OBJECT that had NO rdf:type when its
+/// inbound refs were indexed gains its FIRST type in a later batch. The edges
+/// must attribute to the new object class — a first-time-typed subject has no
+/// `base_subject_classes` entry, so this exercises the net-map branch of the
+/// endpoint resolver (a plain re-type does not).
+#[tokio::test]
+async fn ref_class_attributed_when_object_typed_later() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let mut fluree = FlureeBuilder::file(path)
+        .build()
+        .expect("build file fluree");
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/ref-object-typed-later:main";
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let storage = fluree
+                .backend()
+                .admin_storage_cloned()
+                .expect("test uses managed backend");
+
+            // org1 is a bare reference target: no rdf:type yet.
+            let txn1 = json!({
+                "@context": { "ex": "http://example.org/" },
+                "@graph": [
+                    {"@id":"ex:alice","@type":"ex:Employee","ex:worksFor":{"@id":"ex:org1"}},
+                    {"@id":"ex:bob","@type":"ex:Employee","ex:worksFor":{"@id":"ex:org1"}}
+                ]
+            });
+            let r1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &txn1,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert txn1");
+            let o1 =
+                trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
+            let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o1 else {
+                unreachable!("helper only returns Completed")
+            };
+            let loaded1 = load_ledger_snapshot(&storage, &root_id.expect("root1"), ledger_id)
+                .await
+                .expect("load snapshot 1");
+            assert_eq!(
+                ref_class_total(
+                    &loaded1,
+                    "http://example.org/Employee",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
+                None,
+                "first index: org1 untyped, so no object-class bucket yet"
+            );
+
+            // org1 gains its FIRST type; the worksFor edges are untouched.
+            let type_later = json!({
+                "@context": { "ex": "http://example.org/" },
+                "@graph": [
+                    {"@id":"ex:org1","@type":"ex:Organization"}
+                ]
+            });
+            let r2 = fluree
+                .insert_with_opts(
+                    r1.ledger,
+                    &type_later,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("type org1");
+            let o2 =
+                trigger_index_and_wait_outcome(&handle, r2.ledger.ledger_id(), r2.receipt.t).await;
+            let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
+                unreachable!("helper only returns Completed")
+            };
+            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
+                .await
+                .expect("load snapshot 2");
+            assert_eq!(
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Employee",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
+                Some(2),
+                "both pre-existing edges attribute once org1 is typed"
+            );
+        })
+        .await;
+}
+
+/// Untyped→typed (Case A variant): a SUBJECT with existing outgoing refs gains
+/// its FIRST type in a later batch. Its edges must appear under the new
+/// subject-class bucket.
+#[tokio::test]
+async fn ref_class_attributed_when_subject_typed_later() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let mut fluree = FlureeBuilder::file(path)
+        .build()
+        .expect("build file fluree");
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/ref-subject-typed-later:main";
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let storage = fluree
+                .backend()
+                .admin_storage_cloned()
+                .expect("test uses managed backend");
+
+            // alice has an edge but no rdf:type yet; org1 is typed.
+            let txn1 = json!({
+                "@context": { "ex": "http://example.org/" },
+                "@graph": [
+                    {"@id":"ex:alice","ex:worksFor":{"@id":"ex:org1"}},
+                    {"@id":"ex:org1","@type":"ex:Organization"}
+                ]
+            });
+            let r1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &txn1,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert txn1");
+            let _ =
+                trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
+
+            // alice gains her FIRST type; worksFor untouched.
+            let type_later = json!({
+                "@context": { "ex": "http://example.org/" },
+                "@graph": [
+                    {"@id":"ex:alice","@type":"ex:Employee"}
+                ]
+            });
+            let r2 = fluree
+                .insert_with_opts(
+                    r1.ledger,
+                    &type_later,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("type alice");
+            let o2 =
+                trigger_index_and_wait_outcome(&handle, r2.ledger.ledger_id(), r2.receipt.t).await;
+            let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
+                unreachable!("helper only returns Completed")
+            };
+            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
+                .await
+                .expect("load snapshot 2");
+            assert_eq!(
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Employee",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
+                Some(1),
+                "pre-existing edge attributes once alice is typed"
+            );
+        })
+        .await;
+}
+
+/// Untyped→typed, both endpoints: subject AND object of an existing edge gain
+/// their FIRST types in the same later batch. The edge must land in the new
+/// (subject_class, p, object_class) bucket exactly once.
+#[tokio::test]
+async fn ref_class_attributed_when_both_endpoints_typed_later() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let mut fluree = FlureeBuilder::file(path)
+        .build()
+        .expect("build file fluree");
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/ref-both-typed-later:main";
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let storage = fluree
+                .backend()
+                .admin_storage_cloned()
+                .expect("test uses managed backend");
+
+            // Neither endpoint has a type yet.
+            let txn1 = json!({
+                "@context": { "ex": "http://example.org/" },
+                "@graph": [
+                    {"@id":"ex:alice","ex:worksFor":{"@id":"ex:org1"}}
+                ]
+            });
+            let r1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &txn1,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert txn1");
+            let _ =
+                trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
+
+            let type_later = json!({
+                "@context": { "ex": "http://example.org/" },
+                "@graph": [
+                    {"@id":"ex:alice","@type":"ex:Employee"},
+                    {"@id":"ex:org1","@type":"ex:Organization"}
+                ]
+            });
+            let r2 = fluree
+                .insert_with_opts(
+                    r1.ledger,
+                    &type_later,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("type both");
+            let o2 =
+                trigger_index_and_wait_outcome(&handle, r2.ledger.ledger_id(), r2.receipt.t).await;
+            let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
+                unreachable!("helper only returns Completed")
+            };
+            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
+                .await
+                .expect("load snapshot 2");
+            assert_eq!(
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Employee",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
+                Some(1),
+                "edge attributes exactly once when both endpoints gain first types"
             );
         })
         .await;
@@ -2259,6 +2556,133 @@ async fn ndv_cardinality_estimates_are_accurate() {
             assert!(
                 (18..=22).contains(&status_ndv_subjects),
                 "ex:status ndv_subjects should be ~20, got {status_ndv_subjects}"
+            );
+        })
+        .await;
+}
+
+/// The flat property roll-up the planner reads (`IndexStats::properties`)
+/// must keep its ndv across an incremental build over a base root without
+/// HLL sketches — a bulk import (only a full rebuild uploads sketches). The
+/// incremental seeds such properties with empty registers and clamps their
+/// ndv to the base estimate; the roll-up used to be taken before that clamp,
+/// so every untouched property published ndv 0 and the planner fell back to
+/// its 10-row bound-subject estimate — one write to a bulk-imported BSBM
+/// ledger made Explore Q5 4x slower.
+#[tokio::test]
+async fn flat_property_ndv_survives_incremental_over_sketchless_base() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let data_dir = tempfile::TempDir::new().expect("data tempdir");
+    let mut nt = String::new();
+    for i in 0..20 {
+        nt.push_str(&format!(
+            "<http://example.org/person{i}> <http://example.org/name> \"Person {i}\" .\n\
+             <http://example.org/person{i}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+             <http://example.org/Person> .\n"
+        ));
+    }
+    std::fs::write(data_dir.path().join("00-people.nt"), nt).expect("write nt");
+
+    let mut fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file fluree");
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "test/ndv-incremental:main";
+            fluree
+                .create(ledger_id)
+                .import(data_dir.path())
+                .threads(1)
+                .memory_budget_mb(256)
+                .cleanup(false)
+                .execute()
+                .await
+                .expect("import");
+            let storage = fluree
+                .backend()
+                .admin_storage_cloned()
+                .expect("test uses managed backend");
+
+            let flat_name_stat = |loaded: &LedgerSnapshot| -> (u64, u64, u64) {
+                loaded
+                    .stats
+                    .as_ref()
+                    .and_then(|s| s.properties.as_ref())
+                    .and_then(|props| {
+                        props.iter().find(|p| {
+                            let sid = fluree_db_core::Sid::new(p.sid.0, &p.sid.1);
+                            loaded
+                                .decode_sid(&sid)
+                                .map(|iri| iri == "http://example.org/name")
+                                .unwrap_or(false)
+                        })
+                    })
+                    .map(|p| (p.count, p.ndv_values, p.ndv_subjects))
+                    .expect("ex:name property should exist in the flat roll-up")
+            };
+
+            let base_view = fluree.db(ledger_id).await.expect("imported view");
+            let (base_count, base_ndv_values, base_ndv_subjects) =
+                flat_name_stat(&base_view.snapshot);
+            assert_eq!(base_count, 20);
+            assert!(
+                (18..=22).contains(&base_ndv_subjects) && (18..=22).contains(&base_ndv_values),
+                "base ndv ~20: values {base_ndv_values}, subjects {base_ndv_subjects}"
+            );
+
+            // One unrelated write, indexed incrementally over the sketchless base.
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let ledger1 = fluree
+                .ledger(ledger_id)
+                .await
+                .expect("load imported ledger");
+            let delta = fluree
+                .insert_with_opts(
+                    ledger1,
+                    &json!({
+                        "@context": {"ex": "http://example.org/"},
+                        "@id": "ex:note1",
+                        "ex:note": "pending"
+                    }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert delta");
+            let outcome =
+                trigger_index_and_wait_outcome(&handle, delta.ledger.ledger_id(), delta.receipt.t)
+                    .await;
+            let fluree_db_api::IndexOutcome::Completed { root_id, .. } = outcome else {
+                unreachable!("helper only returns Completed")
+            };
+            let delta_root = root_id.expect("delta root id");
+            let delta_loaded = load_ledger_snapshot(&storage, &delta_root, ledger_id)
+                .await
+                .expect("load delta root");
+            assert!(
+                delta_loaded.t > base_view.snapshot.t,
+                "the write must publish a newer root"
+            );
+            let (count, ndv_values, ndv_subjects) = flat_name_stat(&delta_loaded);
+            assert_eq!(count, 20, "ex:name count is untouched by the write");
+            assert_eq!(
+                (ndv_values, ndv_subjects),
+                (base_ndv_values, base_ndv_subjects),
+                "ex:name ndv must carry forward through the incremental build"
             );
         })
         .await;

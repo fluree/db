@@ -77,6 +77,7 @@ fn table(namespace: &str, name: &str, columns: Vec<EmitColumn>) -> EmitTableSche
         name: name.to_string(),
         columns,
         identifier_field_ids: vec![1], // PK is always field id 1 in these fixtures
+        foreign_keys: Vec::new(),
     }
 }
 

@@ -24,19 +24,20 @@
 //! - A database with transactions
 
 use crate::ns_format::{
-    ns_context, BranchPointRef, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2, NS_VERSION,
+    merge_heads, ns_context, BranchPointRef, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2,
+    NS_VERSION,
 };
 use crate::{
     check_cas_expectation, deserialize_json, parse_default_context_value, ref_values_match,
     serialize_json, AdminPublisher, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
     ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
-    GraphSourceType, IndexPublisher, LedgerLifecycle, NameServiceError, NsLookupResult, NsRecord,
-    RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup,
-    StatusPublisher, StatusValue,
+    GraphSourceType, IndexPublisher, LedgerHeads, LedgerLifecycle, NameServiceError,
+    NsLookupResult, NsRecord, RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult,
+    StatusLookup, StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
-use fluree_db_core::ledger_id::{format_ledger_id, normalize_ledger_id, split_ledger_id};
-use fluree_db_core::{CasAction, CasOutcome, ContentId, FileStorage, StorageCas};
+use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
+use fluree_db_core::{CasAction, CasOutcome, ContentId, FileStorage, LedgerId, StorageCas};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
@@ -131,12 +132,50 @@ struct GraphSourceIndexFileV2WithT {
     index_t: i64,
 }
 
+fn commit_index_line(t: i64, cid_str: &str) -> String {
+    format!("{{\"t\":{t},\"cid\":\"{cid_str}\"}}\n")
+}
+
+async fn append_commit_index_line(path: &Path, line: &str) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    file.write_all(line.as_bytes()).await?;
+    file.flush().await
+}
+
+/// Run `fut` without the caller waiting on it. Outside a tokio runtime the
+/// work is skipped: it is only ever the best-effort index line, which the
+/// reader recovers from by walking the chain.
+fn spawn_detached<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(fut);
+        }
+        Err(_) => tracing::debug!("no runtime to append the commit-index line on; skipped"),
+    }
+}
+
 impl FileNameService {
     /// Create a new file-based nameservice
     pub fn new(base_path: impl Into<PathBuf>) -> Self {
-        Self {
-            storage: FileStorage::new(base_path),
-        }
+        Self::with_storage(FileStorage::new(base_path))
+    }
+
+    /// Share an already configured storage handle, so the nameservice
+    /// inherits its durability and, under the WAL, its ownership of the
+    /// root's log rather than opening the root a second time.
+    pub fn with_storage(storage: FileStorage) -> Self {
+        Self { storage }
     }
 
     /// Build a `fluree:file://` address for the main ns record.
@@ -190,19 +229,8 @@ impl FileNameService {
         t: i64,
         cid_str: &str,
     ) -> std::io::Result<()> {
-        use tokio::io::AsyncWriteExt;
         let path = self.commits_path(ledger_name, branch);
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let line = format!("{{\"t\":{t},\"cid\":\"{cid_str}\"}}\n");
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await?;
-        file.write_all(line.as_bytes()).await?;
-        file.flush().await
+        append_commit_index_line(&path, &commit_index_line(t, cid_str)).await
     }
 
     /// Recursively walk `root` and return the relative paths of main ns record
@@ -238,9 +266,10 @@ impl FileNameService {
 
                 let file_name = entry.file_name().to_string_lossy().to_string();
 
-                if file_name.ends_with(".index.json")
-                    || file_name.ends_with(".snapshots.json")
-                    || file_name.ends_with(".lock")
+                // Sidecars (`.index.json`, `.snapshots.json`) are not skipped
+                // by name: a branch may be named `x.index`. `read_record_at`
+                // tells them apart by content.
+                if file_name.ends_with(".lock")
                     || file_name.ends_with(".tmp")
                     || !file_name.ends_with(".json")
                 {
@@ -276,9 +305,22 @@ impl FileNameService {
 
     /// Load and merge main record with index file
     async fn load_record(&self, ledger_name: &str, branch: &str) -> Result<Option<NsRecord>> {
+        let record = self
+            .read_record_at(&format!("{ledger_name}/{branch}"))
+            .await?;
+        // The file is authoritative for identity. A file whose name/branch
+        // differ from the requested ones belongs to another ledger that maps
+        // to the same path (`a:b/c` vs `a/b:c`), so this ledger does not exist.
+        Ok(record.filter(|r| r.name == ledger_name && r.branch == branch))
+    }
+
+    /// Read the ledger record stored at `ns@v2/{relative}.json`, taking its
+    /// identity from the file rather than the path: a path does not determine
+    /// `name:branch` once names and branches may both contain `/`.
+    async fn read_record_at(&self, relative: &str) -> Result<Option<NsRecord>> {
         use fluree_db_core::StorageRead;
-        let main_address = Self::ns_address(ledger_name, branch);
-        let index_address = Self::index_address(ledger_name, branch);
+        let main_address = format!("fluree:file://{NS_VERSION}/{relative}.json");
+        let index_address = format!("fluree:file://{NS_VERSION}/{relative}.index.json");
 
         // Read the main record bytes once.
         let main_bytes = match self.storage.read_bytes(&main_address).await {
@@ -298,14 +340,28 @@ impl FileNameService {
             return Ok(None);
         }
 
+        // Enumeration hands us sidecar keys too (`{branch}.index.json`,
+        // `{gs}.snapshots.json`): a branch may legitimately be named
+        // `x.index`, so the suffix alone cannot say which file this is.
+        if crate::ns_format::has_sidecar_suffix(&main_address)
+            && !crate::ns_format::is_ledger_main_record(&main_bytes)
+        {
+            return Ok(None);
+        }
+
         let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
+        let Some(ledger_id) =
+            crate::ns_format::persisted_ledger_id(&main.ledger.id, &main.branch, &main_address)
+        else {
+            return Ok(None);
+        };
 
         // Read index file (if exists)
         let index_file: Option<NsIndexFileV2> = self.read_json_from_address(&index_address).await?;
 
         // Convert to NsRecord
         let mut record = NsRecord {
-            ledger_id: format_ledger_id(ledger_name, branch),
+            ledger_id,
             name: main.ledger.id.clone(),
             branch: main.branch,
             commit_head_id: main
@@ -347,6 +403,26 @@ impl FileNameService {
         }
 
         Ok(Some(record))
+    }
+
+    /// Head pointers only: same files and merge rule as `load_record`, minus
+    /// the config/context/status fields.
+    async fn load_heads(&self, ledger_name: &str, branch: &str) -> Result<Option<LedgerHeads>> {
+        use fluree_db_core::StorageRead;
+        let main_address = Self::ns_address(ledger_name, branch);
+        let main_bytes = match self.storage.read_bytes(&main_address).await {
+            Ok(bytes) => bytes,
+            Err(fluree_db_core::Error::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(NameServiceError::from(e)),
+        };
+        if Self::is_graph_source_from_bytes(&main_bytes) {
+            return Ok(None);
+        }
+        let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
+        let index_file: Option<NsIndexFileV2> = self
+            .read_json_from_address(&Self::index_address(ledger_name, branch))
+            .await?;
+        Ok(Some(merge_heads(&main, index_file.as_ref())))
     }
 
     /// Check if a record file is a graph source record (based on @type).
@@ -428,9 +504,14 @@ impl FileNameService {
             .map(|t| GraphSourceType::from_type_string(t))
             .unwrap_or(GraphSourceType::Unknown("unknown".to_string()));
 
-        // Convert to GraphSourceRecord
+        // Convert to GraphSourceRecord. The file is authoritative for
+        // identity; a different name/branch at this path is another source.
+        let graph_source_id = LedgerId::from_persisted_parts(&main.name, &main.branch)?;
+        if graph_source_id.name() != name || graph_source_id.branch() != branch {
+            return Ok(None);
+        }
         let mut record = GraphSourceRecord {
-            graph_source_id: format_ledger_id(name, branch),
+            graph_source_id,
             name: main.name,
             branch: main.branch,
             source_type,
@@ -464,19 +545,22 @@ impl crate::NameServiceLookup for FileNameService {
         self.load_record(&ledger_name, &branch).await
     }
 
+    async fn heads(&self, ledger_id: &str) -> Result<Option<LedgerHeads>> {
+        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        self.load_heads(&ledger_name, &branch).await
+    }
+
     async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
         let ledger_dir = self.storage.base_path().join(NS_VERSION).join(ledger_name);
         let mut records = Vec::new();
 
         for relative in Self::walk_ns_json_files(&ledger_dir).await? {
-            let branch = relative
-                .to_string_lossy()
-                .trim_end_matches(".json")
-                .to_string();
-
-            // Graph-source records are skipped by `load_record` (returns Ok(None)).
-            if let Ok(Some(record)) = self.load_record(ledger_name, &branch).await {
-                if !record.retracted {
+            // Files under `{ledger_name}/` also include nested ledgers
+            // (`{ledger_name}/sub/main.json`); the record says which it is.
+            // Graph-source records are skipped by `read_record_at` (Ok(None)).
+            let relative = format!("{ledger_name}/{}", ns_record_stem(&relative));
+            if let Ok(Some(record)) = self.read_record_at(&relative).await {
+                if record.name == ledger_name && !record.retracted {
                     records.push(record);
                 }
             }
@@ -490,26 +574,29 @@ impl crate::NameServiceLookup for FileNameService {
         let mut records = Vec::new();
 
         for relative in Self::walk_ns_json_files(&ns_dir).await? {
-            let file_stem = relative
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let parent = relative
-                .parent()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-            if parent.is_empty() {
+            if relative.parent().is_none_or(|p| p.as_os_str().is_empty()) {
                 continue;
             }
-
-            // Graph-source records are skipped by `load_record` (returns Ok(None)).
-            if let Ok(Some(record)) = self.load_record(&parent, &file_stem).await {
+            // Graph-source records, and ids whose path could alias another
+            // ledger's, are skipped by `read_record_at` (Ok(None)).
+            // A read failure must not silently shrink the result: callers
+            // that decide what to delete treat a missing branch as one with
+            // nothing to protect.
+            if let Some(record) = self.read_record_at(&ns_record_stem(&relative)).await? {
                 records.push(record);
             }
         }
 
         Ok(records)
     }
+}
+
+/// `a/b/main.json` → `a/b/main`, with `/` separators on every platform.
+fn ns_record_stem(relative: &std::path::Path) -> String {
+    let joined = fluree_db_core::storage::address_path(relative);
+    joined
+        .strip_suffix(".json")
+        .map_or(joined.clone(), str::to_string)
 }
 
 #[async_trait]
@@ -654,7 +741,7 @@ impl crate::BranchLifecycle for FileNameService {
 
         let outcome = self
             .storage
-            .compare_and_swap(&address, |bytes| {
+            .compare_and_swap(&address, move |bytes| {
                 let Some(data) = bytes else {
                     return Ok(CasAction::Abort(()));
                 };
@@ -863,11 +950,12 @@ impl CommitPublisher for FileNameService {
         let ledger_name_c = ledger_name.clone();
         let branch_c = branch.clone();
         let cid_str = commit_id.to_string();
+        let cid_c = cid_str.clone();
 
         let outcome = self
             .storage
-            .compare_and_swap(&address, |bytes| {
-                let cid_val = Some(cid_str.clone());
+            .compare_and_swap(&address, move |bytes| {
+                let cid_val = Some(cid_c.clone());
 
                 match bytes {
                     Some(data) => {
@@ -928,7 +1016,7 @@ impl CommitPublisher for FileNameService {
 
     fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
         // File nameservice returns the normalized ledger ID for publishing
-        Some(normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string()))
+        LedgerId::parse(ledger_id).ok().map(String::from)
     }
 }
 
@@ -945,7 +1033,7 @@ impl IndexPublisher for FileNameService {
         let cid_str = index_id.to_string();
 
         self.storage
-            .compare_and_swap(&address, |bytes| {
+            .compare_and_swap(&address, move |bytes| {
                 if let Some(data) = bytes {
                     let existing: NsIndexFileV2 = deserialize_json(data)?;
                     if index_t <= existing.index.t {
@@ -982,7 +1070,7 @@ impl AdminPublisher for FileNameService {
         let cid_str = index_id.to_string();
 
         self.storage
-            .compare_and_swap(&address, |bytes| {
+            .compare_and_swap(&address, move |bytes| {
                 let should_update = match bytes {
                     Some(data) => {
                         let existing: NsIndexFileV2 = deserialize_json(data)?;
@@ -1034,20 +1122,16 @@ impl GraphSourcePublisher for FileNameService {
         let source_type_str = source_type.to_type_string();
 
         self.storage
-            .compare_and_swap::<(), _>(&address, |bytes| {
-                // For graph source config, we always update (config changes are allowed)
-                // Only preserve retracted status if already set
-                let status = match bytes {
-                    Some(data) => {
-                        let existing: GraphSourceNsFileV2 = deserialize_json(data)?;
-                        if existing.status == "retracted" {
-                            "retracted".to_string()
-                        } else {
-                            "ready".to_string()
-                        }
-                    }
-                    None => "ready".to_string(),
-                };
+            .compare_and_swap::<(), _>(&address, move |bytes| {
+                // Publishing config is what creating or reconfiguring a graph
+                // source does, so the record comes out active — including a
+                // record retracted by an earlier drop. Preserving the
+                // retraction here made `drop` then `create` under the same
+                // name report success and publish an invisible index.
+                // Retraction is `retract_graph_source`'s to set, and the
+                // index pointer is left to `publish_graph_source_index`.
+                let _ = bytes;
+                let status = "ready".to_string();
 
                 let file = GraphSourceNsFileV2 {
                     context: ns_context(),
@@ -1082,7 +1166,7 @@ impl GraphSourcePublisher for FileNameService {
         let branch_c = branch.to_string();
 
         self.storage
-            .compare_and_swap(&address, |bytes| {
+            .compare_and_swap(&address, move |bytes| {
                 // Strictly monotonic: only update if new_t > existing_t
                 if let Some(data) = bytes {
                     let existing: GraphSourceIndexFileV2WithT = deserialize_json(data)?;
@@ -1308,9 +1392,10 @@ impl RefPublisher for FileNameService {
                 let branch_c = branch.clone();
                 let address_c = normalized_address.clone();
 
+                let phase = std::time::Instant::now();
                 let outcome = self
                     .storage
-                    .compare_and_swap(&address, |bytes| {
+                    .compare_and_swap(&address, move |bytes| {
                         let existing: Option<NsFileV2> = bytes.map(deserialize_json).transpose()?;
 
                         let current_ref = existing.as_ref().map(|f| RefValue {
@@ -1330,7 +1415,6 @@ impl RefPublisher for FileNameService {
                         ) {
                             return Ok(CasAction::Abort(conflict));
                         }
-
                         // Monotonic guard: CommitHead requires strict new.t > current.t
                         if let Some(ref cur) = current_ref {
                             if new_clone.t <= cur.t {
@@ -1379,6 +1463,8 @@ impl RefPublisher for FileNameService {
                     CasOutcome::Written => CasResult::Updated,
                     CasOutcome::Aborted(r) => r,
                 };
+                let cas_us = phase.elapsed().as_micros() as u64;
+                let phase = std::time::Instant::now();
 
                 // Mirror the advanced head into the commit-CID index so
                 // incremental indexing can discover the chain without a serial
@@ -1386,17 +1472,30 @@ impl RefPublisher for FileNameService {
                 // head through this path (transact/commit.rs → compare_and_set_ref
                 // / fast_forward_commit). Best-effort; never fail the publish.
                 if matches!(result, CasResult::Updated) {
-                    if let Some(cid) = new_clone.id.as_ref() {
-                        let cid_str = cid.to_string();
-                        if let Err(e) = self
-                            .append_commit_index_entry(&ledger_name, &branch, new_clone.t, &cid_str)
-                            .await
-                        {
-                            tracing::debug!(error = %e, ledger_id, t = new_clone.t, "commit-index append failed (non-fatal)");
-                        }
+                    if let Some(cid) = new.id.as_ref() {
+                        // Appended off this call: the publish is inside a
+                        // ledger's commit window, and the index is a
+                        // discovery accelerator whose reader sorts by `t`
+                        // and falls back to the chain walk for any gap, so
+                        // neither ordering nor timing is load-bearing.
+                        let path = self.commits_path(&ledger_name, &branch);
+                        let line = commit_index_line(new.t, &cid.to_string());
+                        let ledger_id = ledger_id.to_string();
+                        let t = new.t;
+                        spawn_detached(async move {
+                            if let Err(e) = append_commit_index_line(&path, &line).await {
+                                tracing::debug!(error = %e, ledger_id, t, "commit-index append failed (non-fatal)");
+                            }
+                        });
                     }
                 }
 
+                tracing::debug!(
+                    target: "fluree::write_path",
+                    cas_us,
+                    index_us = phase.elapsed().as_micros() as u64,
+                    "publish phases"
+                );
                 Ok(result)
             }
 
@@ -1422,7 +1521,7 @@ impl RefPublisher for FileNameService {
 
                 let outcome = self
                     .storage
-                    .compare_and_swap(&address, |bytes| {
+                    .compare_and_swap(&address, move |bytes| {
                         let existing: Option<NsIndexFileV2> =
                             bytes.map(deserialize_json).transpose()?;
 
@@ -1519,7 +1618,7 @@ impl StatusPublisher for FileNameService {
 
         let outcome = self
             .storage
-            .compare_and_swap(&address, |bytes| {
+            .compare_and_swap(&address, move |bytes| {
                 let existing: Option<NsFileV2> = bytes.map(deserialize_json).transpose()?;
 
                 let current = existing.as_ref().map(NsFileV2::to_status_value);
@@ -1593,7 +1692,7 @@ impl ConfigPublisher for FileNameService {
 
         let outcome = self
             .storage
-            .compare_and_swap(&address, |bytes| {
+            .compare_and_swap(&address, move |bytes| {
                 let existing: Option<NsFileV2> = bytes.map(deserialize_json).transpose()?;
 
                 let current = existing.as_ref().map(NsFileV2::to_config_value);
@@ -1759,6 +1858,106 @@ mod tests {
         assert_eq!(record.index_t, 8);
     }
 
+    /// Enumeration takes identity from each record, never from its path:
+    /// nested names, legacy `/` branches, and branches spelled like sidecar
+    /// files all round-trip (a record missing here reads as unprotected to GC).
+    #[tokio::test]
+    async fn test_file_ns_enumeration_round_trips_ambiguous_layouts() {
+        let (_temp, ns) = setup().await;
+        for id in [
+            "acme:main",
+            "acme/inventory:main",
+            "mydb:release/v1.0",
+            "mydb:feature.index",
+            "mydb:main.json",
+        ] {
+            ns.publish_commit(id, 1, &test_cid(id)).await.unwrap();
+        }
+
+        let mut all: Vec<String> = ns
+            .all_records()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| {
+                assert_eq!(r.ledger_id, format!("{}:{}", r.name, r.branch));
+                r.ledger_id.to_string()
+            })
+            .collect();
+        all.sort();
+        assert_eq!(
+            all,
+            [
+                "acme/inventory:main",
+                "acme:main",
+                "mydb:feature.index",
+                "mydb:main.json",
+                "mydb:release/v1.0"
+            ]
+        );
+
+        let acme: Vec<_> = ns.list_branches("acme").await.unwrap();
+        assert_eq!(acme.len(), 1, "nested ledger is not a branch: {acme:?}");
+        let mut mydb: Vec<String> = ns
+            .list_branches("mydb")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.branch)
+            .collect();
+        mydb.sort();
+        assert_eq!(mydb, ["feature.index", "main.json", "release/v1.0"]);
+
+        // Same path, different identity: not this ledger.
+        assert!(ns.lookup("mydb/release:v1.0").await.unwrap().is_none());
+        assert!(ns.lookup("mydb:release/v1.0").await.unwrap().is_some());
+    }
+
+    /// Ids an older release could store but the current grammar rejects
+    /// never fail the listing: `@`/`#` stay listed so GC and drop still see
+    /// them, and a name whose path can alias another ledger's is skipped.
+    #[tokio::test]
+    async fn legacy_ids_do_not_fail_the_listing() {
+        let (temp, ns) = setup().await;
+        for id in [
+            "plain:main",
+            "repQ2026:main",
+            "mydb:featureQ1",
+            "unsafeQ:main",
+        ] {
+            ns.publish_commit(id, 1, &test_cid(id)).await.unwrap();
+        }
+        let ns_dir = temp.path().join(NS_VERSION);
+        for (from, to, (placeholder, legacy)) in [
+            ("repQ2026/main", "rep@2026/main", ("repQ2026", "rep@2026")),
+            (
+                "mydb/featureQ1",
+                "mydb/feature#1",
+                ("featureQ1", "feature#1"),
+            ),
+            ("unsafeQ/main", "unsafeQ/main", ("unsafeQ", "/unsafe")),
+        ] {
+            let from = ns_dir.join(format!("{from}.json"));
+            let json = std::fs::read_to_string(&from)
+                .unwrap()
+                .replace(placeholder, legacy);
+            std::fs::remove_file(&from).unwrap();
+            let to = ns_dir.join(format!("{to}.json"));
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            std::fs::write(to, json).unwrap();
+        }
+
+        let mut all: Vec<String> = ns
+            .all_records()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.ledger_id.to_string())
+            .collect();
+        all.sort();
+        assert_eq!(all, ["mydb:feature#1", "plain:main", "rep@2026:main"]);
+    }
+
     #[tokio::test]
     async fn test_file_ns_all_records() {
         let (_temp, ns) = setup().await;
@@ -1920,6 +2119,33 @@ mod tests {
 
         let record = ns.lookup_graph_source("gs:main").await.unwrap().unwrap();
         assert!(record.retracted);
+    }
+
+    #[tokio::test]
+    async fn test_graph_source_recreate_after_retract_is_active() {
+        let (_temp, ns) = setup().await;
+
+        ns.publish_graph_source("gs", "main", GraphSourceType::Bm25, "{}", &[])
+            .await
+            .unwrap();
+        ns.retract_graph_source("gs", "main").await.unwrap();
+        assert!(
+            ns.lookup_graph_source("gs:main")
+                .await
+                .unwrap()
+                .unwrap()
+                .retracted
+        );
+
+        ns.publish_graph_source("gs", "main", GraphSourceType::Bm25, "{\"v\":2}", &[])
+            .await
+            .unwrap();
+        let record = ns.lookup_graph_source("gs:main").await.unwrap().unwrap();
+        assert!(
+            !record.retracted,
+            "a re-published graph source is active again"
+        );
+        assert_eq!(record.config, "{\"v\":2}");
     }
 
     #[tokio::test]
@@ -2318,6 +2544,102 @@ mod tests {
             .unwrap();
         assert_eq!(index.id, Some(index_cid));
         assert_eq!(index.t, 3);
+    }
+
+    #[tokio::test]
+    async fn test_file_heads_unknown_and_graph_source() {
+        let (_dir, ns) = setup().await;
+        assert_eq!(ns.heads("nonexistent:main").await.unwrap(), None);
+
+        ns.publish_graph_source("search", "main", GraphSourceType::Bm25, "{}", &[])
+            .await
+            .unwrap();
+        assert_eq!(ns.heads("search:main").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_file_heads_matches_lookup() {
+        let (_dir, ns) = setup().await;
+        let commit_cid = test_cid("commit-1");
+        let index_cid = ContentId::new(ContentKind::IndexRoot, b"index-1");
+        ns.publish_commit("mydb:main", 5, &commit_cid)
+            .await
+            .unwrap();
+
+        // Commit only: index unborn.
+        let heads = ns.heads("mydb:main").await.unwrap().unwrap();
+        assert_eq!(
+            heads.commit,
+            RefValue {
+                id: Some(commit_cid.clone()),
+                t: 5
+            }
+        );
+        assert_eq!(heads.index, RefValue { id: None, t: 0 });
+
+        // Separate index file merges in; heads agrees with lookup and get_ref.
+        ns.publish_index("mydb:main", 3, &index_cid).await.unwrap();
+        let heads = ns.heads("mydb:main").await.unwrap().unwrap();
+        let record = ns.lookup("mydb:main").await.unwrap().unwrap();
+        assert_eq!(heads, LedgerHeads::from_record(&record));
+        assert_eq!(
+            Some(heads.index.clone()),
+            ns.get_ref("mydb:main", RefKind::IndexHead).await.unwrap()
+        );
+        assert_eq!(heads.index.id, Some(index_cid));
+        assert_eq!(crate::NsRecordSnapshot::from(&heads).index_t, 3);
+    }
+
+    /// `heads` and `lookup` must apply the SAME index merge rule. The
+    /// interesting boundary is equal `t` with different cids: `load_record`
+    /// takes `>=`, so the separate index file wins, and `merge_heads` claims
+    /// to match. Constructed by writing both ns files directly, since
+    /// `publish_index` only ever writes the separate one.
+    #[tokio::test]
+    async fn test_file_heads_agrees_with_lookup_at_equal_index_t() {
+        let (dir, ns) = setup().await;
+        let inline = ContentId::new(ContentKind::IndexRoot, b"inline");
+        let separate = ContentId::new(ContentKind::IndexRoot, b"separate");
+
+        ns.publish_commit("mydb:main", 9, &test_cid("commit-1"))
+            .await
+            .unwrap();
+
+        // Give the main file an inline index at t=5 ...
+        let main_path = dir.path().join(NS_VERSION).join("mydb").join("main.json");
+        let mut main: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&main_path).unwrap()).unwrap();
+        main["f:ledgerIndex"] = serde_json::json!({
+            "f:cid": inline.to_string(),
+            "f:t": 5,
+        });
+        std::fs::write(&main_path, serde_json::to_vec(&main).unwrap()).unwrap();
+
+        // ... and the separate index file a DIFFERENT cid at the same t.
+        let index_path = dir
+            .path()
+            .join(NS_VERSION)
+            .join("mydb")
+            .join("main.index.json");
+        std::fs::write(
+            &index_path,
+            serde_json::to_vec(&serde_json::json!({
+                "@context": ns_context(),
+                "f:ledgerIndex": { "f:cid": separate.to_string(), "f:t": 5 },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let heads = ns.heads("mydb:main").await.unwrap().unwrap();
+        let record = ns.lookup("mydb:main").await.unwrap().unwrap();
+        assert_eq!(
+            heads,
+            LedgerHeads::from_record(&record),
+            "heads must not drift from lookup at the equal-t boundary"
+        );
+        assert_eq!(heads.index.id, Some(separate));
+        assert_eq!(heads.index.t, 5);
     }
 
     // =========================================================================

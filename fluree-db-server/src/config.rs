@@ -85,7 +85,9 @@ pub struct DataAuthConfig {
     pub audience: Option<String>,
     /// Trusted issuer did:key identifiers for Bearer tokens
     pub trusted_issuers: Vec<String>,
-    /// Default policy class IRI (optional). Applied when request does not specify one.
+    /// Verified issuers allowed to issue fixed policy selections or controller credentials.
+    pub policy_authorities: Vec<String>,
+    /// Default policy class IRI for authenticated requests without delegated policies.
     pub default_policy_class: Option<String>,
     /// DANGEROUS: Accept any valid signature regardless of issuer.
     /// Only for development/testing.
@@ -97,14 +99,19 @@ pub struct DataAuthConfig {
 impl DataAuthConfig {
     /// Validate configuration at startup
     pub fn validate(&self) -> Result<(), String> {
+        if !self.policy_authorities.is_empty() && self.audience.as_deref().is_none_or(str::is_empty)
+        {
+            return Err("data policy authorities require --data-auth-audience".to_string());
+        }
         if self.mode == DataAuthMode::Required
             && self.trusted_issuers.is_empty()
+            && self.policy_authorities.is_empty()
             && !self.has_jwks_issuers
             && !self.insecure_accept_any_issuer
         {
             return Err(
                 "data_auth.mode=required requires --data-auth-trusted-issuer, \
-                 --jwks-issuer, or --data-auth-insecure-accept-any-issuer flag"
+                 --data-auth-policy-authority, --jwks-issuer, or --data-auth-insecure-accept-any-issuer flag"
                     .to_string(),
             );
         }
@@ -117,10 +124,10 @@ impl DataAuthConfig {
         if self.insecure_accept_any_issuer {
             return true;
         }
-        if self.trusted_issuers.is_empty() {
-            return false;
-        }
-        self.trusted_issuers.iter().any(|i| i == issuer)
+        self.trusted_issuers
+            .iter()
+            .chain(&self.policy_authorities)
+            .any(|i| i == issuer)
     }
 }
 
@@ -245,6 +252,8 @@ pub struct McpAuthConfig {
     /// DANGEROUS: Accept any valid signature regardless of issuer.
     /// Only for development/testing.
     pub insecure_accept_any_issuer: bool,
+    /// The data API's auth mode, which decides whether MCP may run tokenless.
+    pub data_auth_mode: DataAuthMode,
 }
 
 impl McpAuthConfig {
@@ -254,19 +263,29 @@ impl McpAuthConfig {
         mcp_enabled: bool,
         events_auth: &EventsAuthConfig,
     ) -> Result<(), String> {
-        if mcp_enabled {
-            // Must have some trusted issuers (own or from events_auth)
-            let has_trusted = !self.trusted_issuers.is_empty()
-                || !events_auth.trusted_issuers.is_empty()
+        if mcp_enabled && self.token_required(events_auth) {
+            let has_trusted = !self.effective_trusted_issuers(events_auth).is_empty()
                 || self.insecure_accept_any_issuer;
 
             if !has_trusted {
-                return Err("mcp_enabled requires --mcp-auth-trusted-issuer, \
-                     --events-auth-trusted-issuer, or --mcp-auth-insecure flag"
-                    .to_string());
+                return Err(
+                    "mcp_enabled with --data-auth-mode optional or required needs \
+                     --mcp-auth-trusted-issuer, --events-auth-trusted-issuer, or \
+                     --mcp-auth-insecure-accept-any-issuer"
+                        .to_string(),
+                );
             }
         }
         Ok(())
+    }
+
+    /// Whether `/mcp` requests must carry a token. Without data auth and without
+    /// any MCP issuer configured, `/mcp` is as open as `/query` on the same
+    /// server; configuring an issuer turns tokens on regardless of data auth.
+    pub fn token_required(&self, events_auth: &EventsAuthConfig) -> bool {
+        self.data_auth_mode != DataAuthMode::None
+            || self.insecure_accept_any_issuer
+            || !self.effective_trusted_issuers(events_auth).is_empty()
     }
 
     /// Get effective trusted issuers (own list or fallback to events_auth)
@@ -402,25 +421,113 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_CONNECTION_CONFIG")]
     pub connection_config: Option<PathBuf>,
 
-    /// Enable CORS (Cross-Origin Resource Sharing)
-    #[arg(long, env = "FLUREE_CORS_ENABLED", default_value_t = server_defaults::DEFAULT_CORS_ENABLED)]
+    /// Keep all ledgers in memory; they are lost when the server stops.
+    /// Takes the place of a storage path or connection config from a
+    /// lower-precedence source.
+    #[arg(
+        long,
+        env = "FLUREE_MEMORY_STORAGE",
+        default_value_t = false,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub memory: bool,
+
+    /// The configured storage `--memory` took the place of, recorded while
+    /// settling it against other sources so startup can warn. Not an option.
+    #[arg(skip)]
+    pub memory_displaced: Option<String>,
+
+    /// Enable CORS (Cross-Origin Resource Sharing). On by default;
+    /// `--cors-enabled=false` turns it off.
+    #[arg(
+        long,
+        env = "FLUREE_CORS_ENABLED",
+        default_value_t = server_defaults::DEFAULT_CORS_ENABLED,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
     pub cors_enabled: bool,
 
-    /// Enable background indexing
-    #[arg(long, env = "FLUREE_INDEXING_ENABLED", default_value_t = server_defaults::DEFAULT_INDEXING_ENABLED)]
+    /// Enable background indexing. On by default; `--indexing-enabled=false`
+    /// turns it off.
+    #[arg(
+        long,
+        env = "FLUREE_INDEXING_ENABLED",
+        default_value_t = server_defaults::DEFAULT_INDEXING_ENABLED,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
     pub indexing_enabled: bool,
+
+    /// Keep BM25 full-text indexes current automatically, syncing each one when
+    /// its source ledger commits. Off by default; without it an index only
+    /// advances when something calls `POST /v1/fluree/bm25/sync`.
+    #[arg(long, env = "FLUREE_BM25_AUTO_SYNC", default_value_t = server_defaults::DEFAULT_BM25_AUTO_SYNC)]
+    pub bm25_auto_sync: bool,
 
     /// Novelty size (bytes) that triggers background reindexing (soft threshold)
     #[arg(long, env = "FLUREE_REINDEX_MIN_BYTES", default_value_t = server_defaults::DEFAULT_REINDEX_MIN_BYTES)]
     pub reindex_min_bytes: usize,
 
-    /// Novelty size (bytes) that blocks new commits until reindexing completes (hard threshold)
+    /// Novelty size (bytes) at which new transactions are rejected (503 `err:db/NoveltyAtMax`, retryable) until reindexing completes (hard threshold)
     ///
     /// Default: 20% of system RAM (256 MB fallback). Set explicitly to override.
     #[arg(long, env = "FLUREE_REINDEX_MAX_BYTES")]
     pub reindex_max_bytes: Option<usize>,
 
-    /// Global cache budget in MB (default: tiered fraction of system RAM — 30% if <4GB, 40% if 4-8GB, 50% if ≥8GB)
+    /// Old index versions to retain before GC (default 5)
+    #[arg(long, env = "FLUREE_GC_MAX_OLD_INDEXES")]
+    pub gc_max_old_indexes: Option<u32>,
+
+    /// Minimum age in minutes before an index version can be GC'd (default 15)
+    ///
+    /// Protects queries that started against an older version. This is ANDed
+    /// with `--gc-max-old-indexes`, so the slower of the two wins.
+    #[arg(long, env = "FLUREE_GC_MIN_TIME_MINS")]
+    pub gc_min_time_mins: Option<u32>,
+
+    /// Retained old index versions past which the age guard is overridden and
+    /// versions are collected regardless of age (default: unset, no ceiling)
+    ///
+    /// Because the two above are ANDed, a ledger publishing faster than the age
+    /// guard accumulates versions without limit and `--gc-max-old-indexes`
+    /// bounds nothing. Set this to cap the chain anyway. Past the ceiling GC
+    /// releases artifacts a query still reading an older version may need, so
+    /// set it well above the number of versions published during your longest
+    /// query. It bounds versions, not bytes: size it from observed per-version
+    /// disk use.
+    #[arg(long, env = "FLUREE_GC_HARD_MAX_OLD_INDEXES")]
+    pub gc_hard_max_old_indexes: Option<u32>,
+
+    /// How often to re-sweep for ledgers whose indexing has stalled (seconds)
+    ///
+    /// A safety net for a ledger that falls behind and then stops receiving the
+    /// commits that would trigger it. Only ledgers that are behind AND whose
+    /// commit_t has not moved since the previous sweep are queued, so a healthy
+    /// deployment pays one nameservice listing per interval and nothing else.
+    /// `0` disables the re-sweep; the sweep performed at start-up always runs.
+    ///
+    /// Both sweeps queue on "behind" alone. `NsRecord` carries no novelty byte
+    /// count, so neither can re-apply --reindex-min-bytes: a ledger the soft
+    /// threshold deliberately left unindexed is built anyway once a sweep
+    /// reaches it. On a deployment with many small, mostly-idle ledgers that
+    /// means an index build per behind ledger on every process start, and one
+    /// more per ledger that goes idle while behind. Builds are serialized per
+    /// worker, so the cost is throughput rather than a stampede.
+    #[arg(long, env = "FLUREE_INDEXER_CATCHUP_INTERVAL_SECS", default_value_t = server_defaults::DEFAULT_INDEXER_CATCHUP_INTERVAL_SECS)]
+    pub indexer_catchup_interval_secs: u64,
+
+    /// Global cache budget in MB (default: tiered fraction of system RAM — 30% if <4GB, 40% if 4-8GB, 35% if ≥8GB)
     ///
     /// This controls the shared API-level cache budget used for decoded index artifacts.
     #[arg(long, env = "FLUREE_CACHE_MAX_MB")]
@@ -431,6 +538,17 @@ pub struct ServerConfig {
     /// disables). `FLUREE_DISK_CACHE_BUDGET_BYTES` (bytes) still overrides this.
     #[arg(long, env = "FLUREE_DISK_CACHE_MAX_MB")]
     pub disk_cache_max_mb: Option<usize>,
+
+    /// Directories under which catalog-less Iceberg tables may be read from the
+    /// local filesystem (colon-separated, absolute).
+    ///
+    /// Unset (the default) disables local-filesystem Iceberg tables entirely: a
+    /// graph source whose `table_location` is a `file://` URI or an absolute
+    /// path is refused at creation. When set, such locations are allowed and
+    /// every path read — including those a table's own manifests reference — is
+    /// confined to these directories. Use `/` to allow the whole filesystem.
+    #[arg(long, env = "FLUREE_ICEBERG_LOCAL_ROOTS")]
+    pub iceberg_local_roots: Option<String>,
 
     /// Request body size limit in bytes (default 50MB)
     #[arg(long, env = "FLUREE_BODY_LIMIT", default_value_t = server_defaults::DEFAULT_BODY_LIMIT)]
@@ -443,6 +561,14 @@ pub struct ServerConfig {
     /// Maximum time to wait for HTTP read-after-write min-t freshness checks.
     #[arg(long, env = "FLUREE_QUERY_MIN_T_TIMEOUT_MS", default_value_t = server_defaults::DEFAULT_QUERY_MIN_T_TIMEOUT_MS)]
     pub query_min_t_timeout_ms: u64,
+
+    /// Nesting depth a GraphQL document may reach (0 disables the limit).
+    #[arg(long, env = "FLUREE_GRAPHQL_MAX_DEPTH", default_value_t = server_defaults::DEFAULT_GRAPHQL_MAX_DEPTH)]
+    pub graphql_max_depth: usize,
+
+    /// Fields one GraphQL document may select (0 disables the limit).
+    #[arg(long, env = "FLUREE_GRAPHQL_MAX_COMPLEXITY", default_value_t = server_defaults::DEFAULT_GRAPHQL_MAX_COMPLEXITY)]
+    pub graphql_max_complexity: usize,
 
     /// Heartbeat interval (ms) for the streaming query endpoint. Keep-alive
     /// records flush at this cadence during stalls; set below the fronting
@@ -552,6 +678,14 @@ pub struct ServerConfig {
         env = "FLUREE_DATA_AUTH_TRUSTED_ISSUERS"
     )]
     pub data_auth_trusted_issuers: Vec<String>,
+
+    /// Issuer allowed to issue fixed policy selections or controller credentials (repeatable).
+    /// Establishes issuer trust and requires --data-auth-audience.
+    #[arg(
+        long = "data-auth-policy-authority",
+        env = "FLUREE_DATA_AUTH_POLICY_AUTHORITIES"
+    )]
+    pub data_auth_policy_authorities: Vec<String>,
 
     /// Default policy class IRI for data API requests (optional)
     #[arg(long, env = "FLUREE_DATA_AUTH_DEFAULT_POLICY_CLASS")]
@@ -693,6 +827,18 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_STORAGE_PROXY_TOKEN_FILE")]
     pub storage_proxy_token_file: Option<PathBuf>,
 
+    // === Bolt protocol options ===
+    /// Address for the Bolt protocol listener (Neo4j drivers; conventional
+    /// port 7687). Unset disables Bolt. Requires the `bolt` build feature.
+    #[arg(long, env = "FLUREE_BOLT_LISTEN_ADDR")]
+    pub bolt_listen_addr: Option<SocketAddr>,
+
+    /// Ledger served to Bolt sessions that name no `db` (in HELLO defaults
+    /// or per-RUN metadata). Sessions with no `db` and no default fail
+    /// their RUNs with a clear error.
+    #[arg(long, env = "FLUREE_BOLT_DEFAULT_DB")]
+    pub bolt_default_db: Option<String>,
+
     // === MCP (Model Context Protocol) options ===
     /// Enable MCP (Model Context Protocol) endpoint at /mcp
     #[arg(long, env = "FLUREE_MCP_ENABLED")]
@@ -795,14 +941,24 @@ impl Default for ServerConfig {
             listen_addr: server_defaults::DEFAULT_LISTEN_ADDR.parse().unwrap(),
             storage_path: None,
             connection_config: None,
+            memory: false,
+            memory_displaced: None,
+            iceberg_local_roots: None,
             cors_enabled: server_defaults::DEFAULT_CORS_ENABLED,
             indexing_enabled: server_defaults::DEFAULT_INDEXING_ENABLED,
+            bm25_auto_sync: server_defaults::DEFAULT_BM25_AUTO_SYNC,
             reindex_min_bytes: server_defaults::DEFAULT_REINDEX_MIN_BYTES,
             reindex_max_bytes: None,
+            gc_max_old_indexes: None,
+            gc_min_time_mins: None,
+            gc_hard_max_old_indexes: None,
+            indexer_catchup_interval_secs: server_defaults::DEFAULT_INDEXER_CATCHUP_INTERVAL_SECS,
             cache_max_mb: None,
             disk_cache_max_mb: None,
             body_limit: server_defaults::DEFAULT_BODY_LIMIT,
             query_timeout_ms: server_defaults::DEFAULT_QUERY_TIMEOUT_MS,
+            graphql_max_depth: server_defaults::DEFAULT_GRAPHQL_MAX_DEPTH,
+            graphql_max_complexity: server_defaults::DEFAULT_GRAPHQL_MAX_COMPLEXITY,
             query_min_t_timeout_ms: server_defaults::DEFAULT_QUERY_MIN_T_TIMEOUT_MS,
             stream_heartbeat_ms: server_defaults::DEFAULT_STREAM_HEARTBEAT_MS,
             query_refresh_enabled: server_defaults::DEFAULT_QUERY_REFRESH_ENABLED,
@@ -821,6 +977,7 @@ impl Default for ServerConfig {
             data_auth_mode: DataAuthMode::None,
             data_auth_audience: None,
             data_auth_trusted_issuers: Vec::new(),
+            data_auth_policy_authorities: Vec::new(),
             data_auth_default_policy_class: None,
             data_auth_insecure_accept_any_issuer: false,
             // JWKS defaults
@@ -854,6 +1011,9 @@ impl Default for ServerConfig {
             storage_access_mode: StorageAccessMode::Shared,
             storage_proxy_token: None,
             storage_proxy_token_file: None,
+            // Bolt defaults
+            bolt_listen_addr: None,
+            bolt_default_db: None,
             // MCP defaults
             mcp_enabled: false,
             mcp_auth_trusted_issuers: Vec::new(),
@@ -883,24 +1043,18 @@ impl ServerConfig {
         Self::parse()
     }
 
-    /// Check if using file storage (vs memory)
-    pub fn is_file_storage(&self) -> bool {
-        self.storage_path.is_some() && self.connection_config.is_none()
-    }
-
-    /// Check if using a connection config file (S3, DynamoDB, etc.)
-    pub fn has_connection_config(&self) -> bool {
-        self.connection_config.is_some()
-    }
-
-    /// Get storage type string for logging
+    /// The storage the server builds from this config, for logs and
+    /// `/v1/fluree/stats`. Checked in the order `build_default_fluree` picks.
     pub fn storage_type_str(&self) -> &'static str {
-        if self.connection_config.is_some() {
-            "connection-config"
-        } else if self.storage_path.is_some() {
-            "file"
-        } else {
+        if self.is_proxy_storage_mode() {
+            "proxy"
+        } else if self.memory {
             "memory"
+        } else if self.connection_config.is_some() {
+            "connection-config"
+        } else {
+            // With no path the server uses `.fluree/storage`.
+            "file"
         }
     }
 
@@ -915,12 +1069,23 @@ impl ServerConfig {
         }
     }
 
+    /// Whether the data API requires a token while `/events` requires none.
+    /// The two are configured separately, so `/events?all=true` then lists
+    /// every ledger's nameservice record to anyone. They stay separate on
+    /// purpose: query peers subscribe to `/events`, without a token when
+    /// events auth is off.
+    pub fn events_open_under_data_auth(&self) -> bool {
+        self.data_auth_mode == DataAuthMode::Required
+            && self.events_auth_mode == EventsAuthMode::None
+    }
+
     /// Get the data API authentication configuration
     pub fn data_auth(&self) -> DataAuthConfig {
         DataAuthConfig {
             mode: self.data_auth_mode,
             audience: self.data_auth_audience.clone(),
             trusted_issuers: self.data_auth_trusted_issuers.clone(),
+            policy_authorities: self.data_auth_policy_authorities.clone(),
             default_policy_class: self.data_auth_default_policy_class.clone(),
             insecure_accept_any_issuer: self.data_auth_insecure_accept_any_issuer,
             has_jwks_issuers: self.has_jwks_issuers(),
@@ -985,6 +1150,7 @@ impl ServerConfig {
         McpAuthConfig {
             trusted_issuers: self.mcp_auth_trusted_issuers.clone(),
             insecure_accept_any_issuer: self.mcp_auth_insecure_accept_any_issuer,
+            data_auth_mode: self.data_auth_mode,
         }
     }
 
@@ -1032,6 +1198,24 @@ impl ServerConfig {
             }
         }
 
+        // `load_and_merge_config` settles `--memory` against a storage path or
+        // connection config from other sources; two flags remain a conflict.
+        if self.memory && (self.storage_path.is_some() || self.connection_config.is_some()) {
+            return Err(
+                "--memory cannot be combined with --storage-path or --connection-config"
+                    .to_string(),
+            );
+        }
+        // A peer reads the transaction server's storage, which a store local
+        // to this process can never be.
+        if self.memory && self.server_role == ServerRole::Peer {
+            return Err(
+                "--memory is not available on a query peer (server_role=peer): a peer \
+                 reads the transaction server's storage"
+                    .to_string(),
+            );
+        }
+
         // Warn if both connection_config and storage_path are set
         if self.connection_config.is_some() && self.storage_path.is_some() {
             tracing::warn!("--storage-path is ignored when --connection-config is set");
@@ -1064,6 +1248,11 @@ impl ServerConfig {
                 return Err(
                     "raft.enabled=true is incompatible with storage-access-mode=proxy".to_string(),
                 );
+            }
+            // The log outlives the process; the ledger data it points at
+            // would not.
+            if self.memory {
+                return Err("raft.enabled=true is incompatible with --memory".to_string());
             }
             // The raft log + snapshot tree (raft_storage_path) and
             // the ledger content store (storage_path) both manage
@@ -1291,6 +1480,15 @@ mod raft_validation_tests {
     }
 
     #[test]
+    fn rejects_raft_with_memory_storage() {
+        let mut cfg = raft_enabled_base();
+        cfg.raft_storage_path = Some(PathBuf::from("/srv/raft"));
+        cfg.memory = true;
+        let err = cfg.validate().expect_err("the log would outlive the data");
+        assert!(err.contains("--memory"), "unexpected error message: {err}");
+    }
+
+    #[test]
     fn accepts_raft_without_local_storage_path() {
         // Connection-config-driven deployments don't set
         // `storage_path` at all — the disjoint check should noop.
@@ -1299,5 +1497,261 @@ mod raft_validation_tests {
         cfg.storage_path = None;
         cfg.validate()
             .expect("missing storage_path should skip the disjoint check");
+    }
+}
+
+#[cfg(test)]
+mod gc_retention_flag_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// First hop of the env → `ServerConfig` → `FlureeBuilder` →
+    /// `IndexerConfig` path: the flags parse, the ceiling is unset unless
+    /// asked for, and each flag carries its documented env name.
+    /// The on-by-default switches can be turned off from the command line.
+    #[test]
+    fn default_on_switches_take_an_explicit_value() {
+        let parse = |args: &[&str]| {
+            let cfg = ServerConfig::try_parse_from(
+                std::iter::once("fluree-server").chain(args.iter().copied()),
+            )
+            .expect("flags parse");
+            (cfg.cors_enabled, cfg.indexing_enabled)
+        };
+        assert_eq!(parse(&[]), (true, true));
+        assert_eq!(
+            parse(&["--cors-enabled", "--indexing-enabled"]),
+            (true, true)
+        );
+        assert_eq!(
+            parse(&["--cors-enabled=false", "--indexing-enabled=off"]),
+            (false, false)
+        );
+        assert_eq!(
+            parse(&["--cors-enabled=0", "--indexing-enabled=true"]),
+            (false, true)
+        );
+        assert!(ServerConfig::try_parse_from(["fluree-server", "--cors-enabled=maybe"]).is_err());
+    }
+
+    #[test]
+    fn gc_retention_flags_parse_and_name_their_env_vars() {
+        let cfg = ServerConfig::try_parse_from([
+            "fluree-server",
+            "--gc-max-old-indexes",
+            "3",
+            "--gc-min-time-mins",
+            "45",
+            "--gc-hard-max-old-indexes",
+            "12",
+        ])
+        .expect("flags parse");
+        assert_eq!(cfg.gc_max_old_indexes, Some(3));
+        assert_eq!(cfg.gc_min_time_mins, Some(45));
+        assert_eq!(cfg.gc_hard_max_old_indexes, Some(12));
+
+        let unset = ServerConfig::try_parse_from(["fluree-server"]).expect("no flags parse");
+        assert_eq!(unset.gc_hard_max_old_indexes, None, "the ceiling is opt-in");
+
+        let cmd = ServerConfig::command();
+        let env_of = |id: &str| {
+            cmd.get_arguments()
+                .find(|a| a.get_id() == id)
+                .unwrap_or_else(|| panic!("{id} is a ServerConfig arg"))
+                .get_env()
+                .map(|e| e.to_string_lossy().into_owned())
+        };
+        assert_eq!(
+            env_of("gc_max_old_indexes").as_deref(),
+            Some("FLUREE_GC_MAX_OLD_INDEXES")
+        );
+        assert_eq!(
+            env_of("gc_min_time_mins").as_deref(),
+            Some("FLUREE_GC_MIN_TIME_MINS")
+        );
+        assert_eq!(
+            env_of("gc_hard_max_old_indexes").as_deref(),
+            Some("FLUREE_GC_HARD_MAX_OLD_INDEXES")
+        );
+    }
+}
+
+#[cfg(test)]
+mod storage_selection_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Names the storage `build_default_fluree` builds: memory only with
+    /// `--memory`, and file storage when no path is given.
+    #[test]
+    fn storage_type_str_names_the_built_storage() {
+        let with = |set: fn(&mut ServerConfig)| {
+            let mut config = ServerConfig::default();
+            set(&mut config);
+            config.storage_type_str()
+        };
+        assert_eq!(with(|_| {}), "file");
+        assert_eq!(with(|c| c.storage_path = Some("/data".into())), "file");
+        assert_eq!(
+            with(|c| c.connection_config = Some("/conn.jsonld".into())),
+            "connection-config"
+        );
+        assert_eq!(with(|c| c.memory = true), "memory");
+        assert_eq!(
+            with(|c| {
+                c.server_role = ServerRole::Peer;
+                c.storage_access_mode = StorageAccessMode::Proxy;
+            }),
+            "proxy"
+        );
+    }
+
+    #[test]
+    fn memory_flag_parses_and_names_its_env_var() {
+        let parse = |args: &[&str]| {
+            ServerConfig::try_parse_from(
+                std::iter::once("fluree-server").chain(args.iter().copied()),
+            )
+            .expect("flags parse")
+            .memory
+        };
+        assert!(!parse(&[]));
+        assert!(parse(&["--memory"]));
+        assert!(!parse(&["--memory=false"]));
+
+        let cmd = ServerConfig::command();
+        let env = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "memory")
+            .and_then(|a| a.get_env())
+            .map(|e| e.to_string_lossy().into_owned());
+        assert_eq!(env.as_deref(), Some("FLUREE_MEMORY_STORAGE"));
+    }
+
+    #[test]
+    fn memory_with_a_storage_path_does_not_validate() {
+        let config = ServerConfig {
+            memory: true,
+            storage_path: Some("/data".into()),
+            ..Default::default()
+        };
+        let err = config.validate().expect_err("contradictory storage");
+        assert!(err.contains("--memory"), "{err}");
+    }
+
+    #[test]
+    fn memory_on_a_query_peer_does_not_validate() {
+        let config = ServerConfig {
+            memory: true,
+            server_role: ServerRole::Peer,
+            ..Default::default()
+        };
+        let err = config
+            .validate()
+            .expect_err("a peer cannot share a memory store");
+        assert!(err.contains("query peer"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod policy_authority_tests {
+    use super::*;
+
+    #[test]
+    fn policy_authority_also_establishes_issuer_trust() {
+        let config = DataAuthConfig {
+            mode: DataAuthMode::Required,
+            audience: Some("db".into()),
+            policy_authorities: vec!["did:key:app".into()],
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+        assert!(config.is_issuer_trusted("did:key:app"));
+        assert!(!config.is_issuer_trusted("did:key:other"));
+    }
+
+    #[test]
+    fn policy_authorities_require_an_audience_even_with_development_issuer_trust() {
+        let mut config = DataAuthConfig {
+            policy_authorities: vec!["did:key:gateway".into()],
+            insecure_accept_any_issuer: true,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+        config.audience = Some(String::new());
+        assert!(config.validate().is_err());
+        config.audience = Some("production-data".into());
+        assert!(config.validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod mcp_auth_tests {
+    use super::*;
+
+    #[test]
+    fn events_left_open_under_required_data_auth_is_flagged() {
+        let config = |data_auth_mode, events_auth_mode| ServerConfig {
+            events_auth_mode,
+            data_auth_mode,
+            ..Default::default()
+        };
+        assert!(config(DataAuthMode::Required, EventsAuthMode::None).events_open_under_data_auth());
+        for (data, events) in [
+            (DataAuthMode::Required, EventsAuthMode::Required),
+            (DataAuthMode::Required, EventsAuthMode::Optional),
+            (DataAuthMode::Optional, EventsAuthMode::None),
+            (DataAuthMode::None, EventsAuthMode::None),
+        ] {
+            assert!(
+                !config(data, events).events_open_under_data_auth(),
+                "{data:?} data auth, {events:?} events auth"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_runs_tokenless_only_without_data_auth_or_an_mcp_issuer() {
+        let no_events = EventsAuthConfig::default();
+        let open = McpAuthConfig::default();
+        assert!(!open.token_required(&no_events));
+        assert!(
+            open.validate(true, &no_events).is_ok(),
+            "--mcp-enabled alone"
+        );
+
+        let with_issuer = McpAuthConfig {
+            trusted_issuers: vec!["did:key:mcp".into()],
+            ..Default::default()
+        };
+        assert!(with_issuer.token_required(&no_events));
+
+        let insecure = McpAuthConfig {
+            insecure_accept_any_issuer: true,
+            ..Default::default()
+        };
+        assert!(insecure.token_required(&no_events));
+
+        let events = EventsAuthConfig {
+            trusted_issuers: vec!["did:key:events".into()],
+            ..Default::default()
+        };
+        assert!(
+            open.token_required(&events),
+            "events issuers are MCP's fallback"
+        );
+
+        for mode in [DataAuthMode::Optional, DataAuthMode::Required] {
+            let guarded = McpAuthConfig {
+                data_auth_mode: mode,
+                ..Default::default()
+            };
+            assert!(guarded.token_required(&no_events));
+            assert!(
+                guarded.validate(true, &no_events).is_err(),
+                "{mode:?} data auth needs an MCP issuer"
+            );
+            assert!(guarded.validate(false, &no_events).is_ok());
+        }
     }
 }

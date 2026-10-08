@@ -97,6 +97,7 @@ impl Bm25IndexProvider for FlureeIndexProvider<'_> {
         sync: bool,
         timeout_ms: Option<u64>,
     ) -> QueryResult<Arc<Bm25Index>> {
+        self.lookup_live(graph_source_id).await?;
         // Load BM25 manifest from CAS
         let manifest = self
             .fluree
@@ -277,6 +278,24 @@ impl Bm25SearchProvider for FlureeIndexProvider<'_> {
 }
 
 impl FlureeIndexProvider<'_> {
+    /// The graph source's record, unless it was dropped: a drop leaves the
+    /// record as a tombstone, which no query may resolve.
+    async fn lookup_live(
+        &self,
+        graph_source_id: &str,
+    ) -> QueryResult<Option<fluree_db_nameservice::GraphSourceRecord>> {
+        let record = self
+            .fluree
+            .nameservice()
+            .lookup_graph_source(graph_source_id)
+            .await
+            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?;
+        match record {
+            Some(record) if record.retracted => Err(graph_source_not_found(graph_source_id)),
+            record => Ok(record),
+        }
+    }
+
     /// Get deployment configuration for a graph source.
     ///
     /// Looks up the graph source record from nameservice and parses the deployment
@@ -286,15 +305,7 @@ impl FlureeIndexProvider<'_> {
         &self,
         graph_source_id: &str,
     ) -> QueryResult<SearchDeploymentConfig> {
-        // Look up graph source record from nameservice
-        let gs_record = self
-            .fluree
-            .nameservice()
-            .lookup_graph_source(graph_source_id)
-            .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?;
-
-        let Some(record) = gs_record else {
+        let Some(record) = self.lookup_live(graph_source_id).await? else {
             // Graph source not found - return default embedded mode
             // The actual search will fail later with a more specific error
             return Ok(SearchDeploymentConfig::default());
@@ -521,25 +532,27 @@ impl FlureeIndexProvider<'_> {
 
         let _ = params.timeout_ms; // Reserved for future use
 
-        // Vector indexes are head-only -- reject as_of_t requests
-        if params.as_of_t.is_some() {
-            return Err(QueryError::InvalidQuery(format!(
-                "Vector index '{graph_source_id}' does not support time-travel queries (as_of_t). \
-                 Only the latest snapshot is available."
-            )));
-        }
-
         // Load head snapshot via nameservice head pointer
         let record = self
-            .fluree
-            .nameservice()
-            .lookup_graph_source(graph_source_id)
-            .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?;
+            .lookup_live(graph_source_id)
+            .await?
+            .ok_or_else(|| graph_source_not_found(graph_source_id))?;
 
-        let record = record.ok_or_else(|| {
-            QueryError::InvalidQuery(format!("Graph source not found: {graph_source_id}"))
-        })?;
+        // Vector indexes are head-only. A single-ledger view always names its
+        // `t`, so `as_of_t` alone is not time travel: only a request for a
+        // state older than the index watermark asks for something the
+        // snapshot cannot answer. At or past the watermark the head snapshot
+        // is the right answer, possibly stale, exactly as for a head query.
+        if let Some(t) = params.as_of_t {
+            if t < record.index_t {
+                return Err(QueryError::InvalidQuery(format!(
+                    "Vector index '{graph_source_id}' does not support time-travel queries: \
+                     requested t={t} but the index snapshot is at t={}. Only the latest \
+                     snapshot is available.",
+                    record.index_t
+                )));
+            }
+        }
 
         let index_id = match &record.index_id {
             Some(id) => id.clone(),
@@ -552,17 +565,11 @@ impl FlureeIndexProvider<'_> {
                         .map_err(|e| QueryError::Internal(format!("Sync error: {e}")))?;
 
                     // Re-lookup after sync
-                    let record = self
-                        .fluree
-                        .nameservice()
-                        .lookup_graph_source(graph_source_id)
-                        .await
-                        .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
-                        .ok_or_else(|| {
-                            QueryError::Internal(format!(
-                                "Graph source disappeared after sync: {graph_source_id}"
-                            ))
-                        })?;
+                    let record = self.lookup_live(graph_source_id).await?.ok_or_else(|| {
+                        QueryError::Internal(format!(
+                            "Graph source disappeared after sync: {graph_source_id}"
+                        ))
+                    })?;
 
                     record.index_id.ok_or_else(|| {
                         QueryError::InvalidQuery(format!(
@@ -611,4 +618,8 @@ impl FlureeIndexProvider<'_> {
             .map(|r| VectorSearchHit::new(r.iri, r.ledger_alias, r.score))
             .collect())
     }
+}
+
+fn graph_source_not_found(graph_source_id: &str) -> QueryError {
+    QueryError::InvalidQuery(format!("Graph source not found: {graph_source_id}"))
 }

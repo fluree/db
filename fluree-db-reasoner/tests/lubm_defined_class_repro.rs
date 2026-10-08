@@ -148,7 +148,7 @@ async fn lubm_grad_student_and_chair_defined_classes() {
     ];
     f.sort_by(|a, b| IndexType::Spot.compare(a, b));
 
-    let mut snapshot = LedgerSnapshot::genesis("test/main");
+    let mut snapshot = LedgerSnapshot::genesis("test:main");
     for (code, iri) in [
         (3, "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
         (4, "http://www.w3.org/2000/01/rdf-schema#"),

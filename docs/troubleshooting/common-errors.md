@@ -240,11 +240,10 @@ curl http://localhost:8090/v1/fluree/info/mydb:main
 - Remove unnecessary joins
 - Use more specific patterns
 
-**Increase timeout:**
+**Increase timeout:** the limit is server-wide (default 15 minutes; `0` disables it), not per
+request:
 ```bash
-curl -X POST http://localhost:8090/v1/fluree/query \
-  -H "X-Fluree-Timeout: 60000" \
-  -d '{...}'
+FLUREE_QUERY_TIMEOUT_MS=1800000 fluree server run
 ```
 
 ## POLICY_DENIED
@@ -289,12 +288,17 @@ WHERE {
 }
 ```
 
-**Test with policy trace:**
+**Check whether policy filtered the request:**
 ```bash
-curl -X POST http://localhost:8090/v1/fluree/query \
-  -H "X-Fluree-Policy-Trace: true" \
+curl -X POST http://localhost:8090/v1/fluree/query/mydb \
+  -H "fluree-track-policy: true" \
+  -H "Authorization: Bearer <token>" \
   -d '{...}'
 ```
+
+The response reports which policies ran (`policy`) and whether policy governed
+the request at all (`policy_enforcement`). See
+[Detecting that policy was applied](../security/policy-in-queries.md#detecting-that-policy-was-applied).
 
 **Check DID:**
 - Verify DID in signed request
@@ -341,23 +345,32 @@ curl -X POST http://localhost:8090/v1/fluree/query \
 
 ## PAYLOAD_TOO_LARGE
 
+A 413 carries one of two `@type` codes — branch on `@type`, not the status
+(see [API Errors](../api/errors.md) for the full contract):
+
 ```json
 {
-  "error": "PayloadTooLarge",
-  "message": "Transaction exceeds maximum size of 10485760 bytes",
-  "code": "PAYLOAD_TOO_LARGE",
-  "details": {
-    "max_size": 10485760,
-    "actual_size": 15000000
-  }
+  "error": "request body exceeds the configured limit",
+  "status": 413,
+  "@type": "err:db/PayloadTooLarge"
+}
+```
+
+```json
+{
+  "error": "Transaction would exceed novelty limit: current=0, delta=2048576, max=1048576",
+  "status": 413,
+  "@type": "err:db/NoveltyDeltaTooLarge"
 }
 ```
 
 ### Causes
 
-1. Transaction too large
-2. Query result too large
-3. Large embedded data
+1. `err:db/PayloadTooLarge`: the raw HTTP request body exceeds the server's
+   configured body-size limit (refused before parsing)
+2. `err:db/NoveltyDeltaTooLarge`: the parsed transaction's novelty delta
+   alone meets or exceeds `reindex_max_bytes` — no indexer draining can ever
+   admit it, so retrying the same request can never succeed
 
 ### Solutions
 
@@ -381,7 +394,45 @@ for (let i = 0; i < entities.length; i += batchSize) {
 
 **Increase limits (if appropriate):**
 ```bash
-./fluree-db-server --max-transaction-size 20971520
+# Raise the request body limit (err:db/PayloadTooLarge); default 50 MB
+fluree server run -- --body-limit 104857600
+
+# Raise the novelty hard limit (err:db/NoveltyDeltaTooLarge)
+fluree server run -- --reindex-max-bytes 2147483648
+```
+
+## DATATYPE_LIMIT_EXCEEDED
+
+```json
+{
+  "error": "datatype limit exceeded: the ledger holds 16369 of at most 16369 non-reserved datatypes, and this write would add 1 more",
+  "status": 422,
+  "@type": "err:db/DatatypeLimitExceeded"
+}
+```
+
+### Causes
+
+The write uses datatypes the ledger has not seen before, and the ledger has
+no room for them. A ledger holds at most 16,369 distinct datatypes beyond
+15 reserved ones. Every datatype counts from its first use, even after its
+data is retracted. See [Datatype Limit](../concepts/datatypes.md#datatype-limit)
+for which datatypes count.
+
+The write was refused before anything was committed, so the ledger is
+unchanged. Retrying the same write cannot succeed.
+
+### Solutions
+
+**Reuse datatypes the ledger already holds.** Values typed with an existing
+datatype are always accepted.
+
+**Move the varying part out of the datatype.** Unit and currency vocabularies
+often use one datatype per unit. Record the unit in its own property instead:
+
+```turtle
+ex:room1 ex:area "42.5"^^xsd:decimal ;
+         ex:areaUnit unit:SquareMetre .
 ```
 
 ## STORAGE_ERROR
@@ -453,7 +504,7 @@ curl http://localhost:8090/v1/fluree/info/mydb:main
 
 **Tune indexing:**
 ```bash
-fluree-server \
+fluree server run -- \
   --indexing-enabled \
   --reindex-min-bytes 100000 \
   --reindex-max-bytes 1000000

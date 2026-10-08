@@ -55,6 +55,41 @@ pub enum QueryError {
     #[error("Dictionary lookup failed: {0}")]
     DictionaryLookup(String),
 
+    /// A caller-requested Iceberg snapshot does not exist in the table's
+    /// metadata — typically expired by the source table's snapshot retention.
+    ///
+    /// A typed variant (not `Internal`) so a consumer holding a snapshot pin
+    /// can DISTINGUISH "pin expired → re-pin / full-run invalidation" from a
+    /// transient scan failure it should retry — without string-matching.
+    #[error("snapshot {snapshot_id} not found for table '{table}' (expired by retention, or never existed)")]
+    SnapshotNotFound {
+        /// The table whose metadata was consulted.
+        table: String,
+        /// The requested snapshot id.
+        snapshot_id: i64,
+    },
+
+    /// A time-pinned graph-source read (`@iso:` / `@recorded:`) names an
+    /// instant before the table's oldest retained snapshot, so no snapshot can
+    /// answer it. Typed, like [`Self::SnapshotNotFound`], and never satisfied
+    /// by the oldest or the current snapshot instead.
+    #[error(
+        "no snapshot of table '{table}' at or before {requested}; {}",
+        .oldest.as_deref().map_or_else(
+            || "the table has no snapshots".to_string(),
+            |oldest| format!("the oldest retained snapshot is {oldest}"),
+        )
+    )]
+    NoSnapshotAtTime {
+        /// The table whose metadata was consulted.
+        table: String,
+        /// The requested instant, RFC 3339.
+        requested: String,
+        /// The oldest retained snapshot's commit time, RFC 3339; `None` for a
+        /// table with no snapshots.
+        oldest: Option<String>,
+    },
+
     /// Resource limit exceeded
     #[error("Resource limit exceeded: {0}")]
     ResourceLimit(String),
@@ -69,6 +104,88 @@ pub enum QueryError {
         reason: fluree_db_core::QueryCancellationReason,
     },
 
+    /// An in-memory join build or GROUP-BY aggregate fold exceeded the query
+    /// memory budget (R3-B). A cooperative pre-OOM abort: it fails the query with
+    /// a typed error the caller can DISTINGUISH from a timeout (`Cancelled`) and
+    /// degrade on, instead of the runtime killing the container with a raw OOM.
+    #[error(
+        "Query memory budget exceeded: used ~{used_bytes} B (estimated) > budget {budget_bytes} B"
+    )]
+    MemoryBudgetExceeded {
+        /// APPROXIMATE recorded query memory (rows x declared-schema cols x a flat
+        /// per-binding estimate), NOT measured bytes: it can be off in both directions
+        /// on a wide, string-heavy build (under on long IRIs / GROUP_CONCAT state, over
+        /// on narrow declared-but-empty columns). Enough to catch a runaway before OOM;
+        /// don't debug exact allocations against it. Field name kept stable (public API).
+        used_bytes: usize,
+        budget_bytes: usize,
+    },
+
+    /// A syntactically valid query used a pattern the R2RML rewrite cannot
+    /// convert to a table scan on a virtual (graph-source) dataset — currently a
+    /// VARIABLE predicate paired with a BOUND term (`?s ?p <iri>` / `?s ?p "x"`),
+    /// or a top-level VALUES clause on a subgraph crawl.
+    ///
+    /// Distinct from [`Self::InvalidQuery`] (which means *malformed*) so the API
+    /// layer can surface the stable `err:r2rml/UnsupportedPattern` machine code
+    /// at HTTP 400 that callers gate on, rather than matching the (previously
+    /// wrong) prose. The `#[error]` Display keeps the "cannot be converted to
+    /// R2RML scans" phrase existing prose-matchers rely on during migration; the
+    /// `detail` names the ACTUAL unsupported shape and stays actionable.
+    #[error(
+        "R2RML graph source query contains a pattern that cannot be converted to \
+         R2RML scans: {detail}"
+    )]
+    R2rmlUnsupportedPattern { detail: String },
+
+    /// Object storage denied a read of an external table's data (S3 403 /
+    /// `AccessDenied`).
+    ///
+    /// Kept iceberg-agnostic (plain fields, no crate dependency): the API layer
+    /// lifts `IcebergError::StorageAccessDenied` into this so the server can
+    /// surface HTTP 403 instead of a generic 400/500. Because S3 also returns
+    /// `AccessDenied` for a missing object without `s3:ListBucket`, this means
+    /// the credentials lack access **or** the object was moved/removed.
+    #[error(
+        "Storage access denied for s3://{bucket}/{key}{region_suffix}: {message}",
+        region_suffix = .region.as_deref().map(|r| format!(" (region {r})")).unwrap_or_default()
+    )]
+    StorageAccessDenied {
+        /// Bucket parsed from the object path.
+        bucket: String,
+        /// Object key parsed from the object path.
+        key: String,
+        /// Configured/resolved region, if known.
+        region: Option<String>,
+        /// The underlying storage error detail.
+        message: String,
+    },
+
+    /// The catalog authorized the table but vended no storage credentials while
+    /// the source requires them (`vended_credentials = true`).
+    ///
+    /// Fail-closed: the scan is refused rather than silently downgrading to
+    /// ambient (process-default) AWS credentials.
+    #[error(
+        "Catalog {catalog_uri} authorized the table but vended no storage credentials; \
+         either fix the catalog's credential vending or set vended_credentials=false on \
+         the source to explicitly use ambient AWS credentials"
+    )]
+    CatalogCredentialsNotVended {
+        /// The REST catalog URI that authorized the table.
+        catalog_uri: String,
+    },
+
+    /// The catalog refused this principal access to the table (its 401/403),
+    /// in the catalog's own words.
+    #[error("Catalog denied access to table '{table}': {message}")]
+    CatalogAccessDenied {
+        /// The table as the catalog names it.
+        table: String,
+        /// The catalog's refusal.
+        message: String,
+    },
+
     /// Internal error (should not happen in normal operation)
     #[error("Internal error: {0}")]
     Internal(String),
@@ -76,6 +193,15 @@ pub enum QueryError {
     /// Policy evaluation error
     #[error("Policy error: {0}")]
     Policy(String),
+
+    /// A sync read needed CAS bytes that are not resident (wasm/residency
+    /// read tier). Typed so io-preserving frames can catch it without
+    /// string matching — the store-level miss register
+    /// ([`fluree_db_core::storage::residency::MissRegister`]) is the
+    /// load-bearing carrier; this variant is belt-and-braces where the
+    /// `io::Error` survives (mirrors the `FuelLimitExceeded` precedent).
+    #[error("{0}")]
+    NeedFetch(fluree_db_core::storage::residency::NeedFetch),
 
     /// Query mode not yet supported with binary indexes
     #[error("Unsupported mode: {0}")]
@@ -141,6 +267,15 @@ impl QueryError {
         Self::Internal(msg.into())
     }
 
+    /// Create an [`Self::R2rmlUnsupportedPattern`] refusal with an actionable
+    /// detail (the shape that was refused and the supported alternative). Used by
+    /// the R2RML rewrite refusal sites and the graph-source crawl guard.
+    pub fn r2rml_unsupported_pattern(detail: impl Into<String>) -> Self {
+        Self::R2rmlUnsupportedPattern {
+            detail: detail.into(),
+        }
+    }
+
     /// Convert an `io::Error` to a `QueryError`, preserving fuel-exhaustion
     /// errors (which `BinaryGraphView`/`BinaryCursor` smuggle through as
     /// `io::Error::other(FuelExceededError)`).
@@ -150,6 +285,9 @@ impl QueryError {
             .and_then(|inner| inner.downcast_ref::<fluree_db_core::FuelExceededError>())
         {
             return Self::FuelLimitExceeded(fe.clone());
+        }
+        if let Some(nf) = fluree_db_core::storage::residency::NeedFetch::from_io_error(&err) {
+            return Self::NeedFetch(nf.clone());
         }
         Self::Internal(format!("{context}: {err}"))
     }
@@ -191,5 +329,43 @@ mod tests {
             !QueryError::dictionary_lookup("missing string id".to_string())
                 .demotes_to_unbound_in_extend()
         );
+    }
+
+    #[test]
+    fn storage_access_denied_display_names_object_and_region() {
+        let e = QueryError::StorageAccessDenied {
+            bucket: "b".to_string(),
+            key: "warehouse/t/data/f.parquet".to_string(),
+            region: Some("us-east-2".to_string()),
+            message: "service error: AccessDenied".to_string(),
+        };
+        let shown = e.to_string();
+        assert!(
+            shown.contains("s3://b/warehouse/t/data/f.parquet"),
+            "{shown}"
+        );
+        assert!(shown.contains("region us-east-2"), "{shown}");
+
+        // Region is omitted cleanly when unknown.
+        let no_region = QueryError::StorageAccessDenied {
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            region: None,
+            message: "m".to_string(),
+        };
+        assert_eq!(
+            no_region.to_string(),
+            "Storage access denied for s3://b/k: m"
+        );
+    }
+
+    #[test]
+    fn catalog_credentials_not_vended_display_is_actionable() {
+        let e = QueryError::CatalogCredentialsNotVended {
+            catalog_uri: "https://catalog.example/v1".to_string(),
+        };
+        let shown = e.to_string();
+        assert!(shown.contains("https://catalog.example/v1"), "{shown}");
+        assert!(shown.contains("vended_credentials=false"), "{shown}");
     }
 }

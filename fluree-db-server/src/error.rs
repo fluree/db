@@ -47,9 +47,38 @@ pub enum ServerError {
     #[error("{0}")]
     NotAcceptable(String),
 
+    /// Unsupported Media Type (415) - request body format not accepted
+    #[error("{0}")]
+    UnsupportedMediaType(String),
+
     /// SPARQL UPDATE lowering error
     #[error("SPARQL UPDATE error: {0}")]
     SparqlUpdateLower(#[from] SparqlUpdateLowerError),
+
+    /// Novelty backpressure (503 + `Retry-After`): the ledger's in-memory
+    /// novelty is at `reindex_max_bytes` (or the transaction would cross it)
+    /// and the indexer must drain it before new commits are accepted.
+    /// Carries the pipeline's message for submissions whose typed
+    /// `ApiError::Transact` variant was flattened at the consensus boundary;
+    /// errors that still carry the variant map via the `ApiError` arms.
+    #[error("{0}")]
+    NoveltyBackpressure(String),
+
+    /// The transaction's own delta meets or exceeds `reindex_max_bytes`
+    /// (413 + `err:db/NoveltyDeltaTooLarge`, no `Retry-After`): no amount
+    /// of indexer draining can ever admit it, so telling the client to
+    /// retry (the 503 shape above) would wedge a pipeline on the oversized
+    /// record forever. Same consensus-boundary role as
+    /// `NoveltyBackpressure`.
+    #[error("{0}")]
+    NoveltyDeltaTooLarge(String),
+
+    /// The write would bring the ledger past the number of distinct
+    /// datatypes its index can store (422 + `err:db/DatatypeLimitExceeded`,
+    /// no `Retry-After`). Same consensus-boundary role as
+    /// `NoveltyBackpressure`.
+    #[error("{0}")]
+    DatatypeLimitExceeded(String),
 }
 
 impl ServerError {
@@ -62,14 +91,26 @@ impl ServerError {
             //
             // Map common statuses to stable error types so clients can branch on `@type`.
             ServerError::Api(ApiError::Http { status, .. }) => match status {
+                // The committer flattens typed errors to this shape (merge,
+                // rebase and revert's `InvalidBranch`, among others), so a 400
+                // must not read as an internal error here.
+                400 => errors::BAD_REQUEST,
                 401 => errors::UNAUTHORIZED,
                 403 => errors::ACCESS_DENIED,
                 409 => errors::COMMIT_CONFLICT,
+                // The HTTP body-size cap (`read_limited_body`). The other
+                // 413 — an oversized novelty delta — never takes this arm:
+                // it stays typed end-to-end (`ServerError::NoveltyDeltaTooLarge`
+                // / the `Transact` variant below) precisely so the two 413s
+                // carry distinct codes for clients to branch on.
+                413 => errors::PAYLOAD_TOO_LARGE,
                 422 => errors::INVALID_TRANSACTION,
                 _ => errors::INTERNAL,
             },
 
             // Not Found
+            ServerError::Api(ApiError::GraphNotFound(_)) => errors::GRAPH_NOT_FOUND,
+            ServerError::Api(ApiError::CommitNotFound(_)) => errors::COMMIT_NOT_FOUND,
             ServerError::Api(ApiError::NotFound(msg)) => {
                 // Distinguish graph source not found from ledger not found
                 if msg.contains("Graph source") || msg.contains("graph source") {
@@ -80,7 +121,18 @@ impl ServerError {
             }
 
             // Ledger management
+            ServerError::Api(ApiError::NoveltyDeferred { .. }) => errors::NOVELTY_DEFERRED,
+            ServerError::Api(ApiError::MaterializePartial { tally, .. }) => {
+                if tally.failed > 0 {
+                    errors::MATERIALIZE_PARTIAL
+                } else {
+                    errors::NOVELTY_DEFERRED
+                }
+            }
             ServerError::Api(ApiError::LedgerExists(_)) => errors::LEDGER_EXISTS,
+            // The code a merge or rebase conflict already gets from the
+            // committer as a flattened 409.
+            ServerError::Api(ApiError::BranchConflict(_)) => errors::COMMIT_CONFLICT,
 
             // Index operations
             ServerError::Api(ApiError::IndexTimeout(_)) => errors::INDEX_TIMEOUT,
@@ -103,8 +155,45 @@ impl ServerError {
             ServerError::Api(ApiError::Query(fluree_db_query::QueryError::Cancelled {
                 ..
             })) => errors::QUERY_CANCELLED,
+
+            // Storage-permission / fail-closed errors (403). Raised directly on
+            // the preview path or wrapped from the query engine on the scan
+            // path; both surface the same distinct `@type` so clients can branch.
+            // These MUST precede the generic `ApiError::Query(_)` arm below.
+            ServerError::Api(
+                ApiError::StorageAccessDenied { .. }
+                | ApiError::Query(fluree_db_query::QueryError::StorageAccessDenied { .. }),
+            ) => errors::STORAGE_ACCESS_DENIED,
+            ServerError::Api(
+                ApiError::CatalogCredentialsNotVended { .. }
+                | ApiError::Query(fluree_db_query::QueryError::CatalogCredentialsNotVended {
+                    ..
+                }),
+            ) => errors::CATALOG_CREDENTIALS_NOT_VENDED,
+            ServerError::Api(ApiError::Query(
+                fluree_db_query::QueryError::CatalogAccessDenied { .. },
+            )) => errors::CATALOG_ACCESS_DENIED,
+
+            // Virtual-dataset (R2RML) unsupported-pattern refusal: a distinct
+            // `@type` so Solo's browse UI can gate on the condition instead of
+            // matching prose. Stays HTTP 400 (well-formed request, unsupported on
+            // this source) — unlike the 403/507 distinct-status precedents — via
+            // the generic `Query(_)` arm in `status_code()`. MUST precede the
+            // generic `ApiError::Query(_)` arm below.
+            // The same fact as it leaves the ledger loader, unconverted.
+            ServerError::Api(e) if e.is_not_found() => errors::LEDGER_NOT_FOUND,
+            ServerError::Api(ApiError::Query(
+                fluree_db_query::QueryError::R2rmlUnsupportedPattern { .. },
+            )) => errors::R2RML_UNSUPPORTED_PATTERN,
+
             ServerError::Api(ApiError::Query(_)) => errors::INVALID_QUERY,
             ServerError::Api(ApiError::Batch(_)) => errors::INVALID_QUERY,
+            ServerError::Api(
+                ApiError::Policy(fluree_db_api::PolicyError::ModifyDenied { .. })
+                | ApiError::Transact(fluree_db_api::TransactError::PolicyViolation(
+                    fluree_db_api::PolicyError::ModifyDenied { .. },
+                )),
+            ) => errors::ACCESS_DENIED,
             // Optimistic-concurrency conflicts: a distinct, retryable class so
             // clients can branch on `@type` (and the 409 status below).
             ServerError::Api(ApiError::Transact(
@@ -112,16 +201,47 @@ impl ServerError {
                 | fluree_db_api::TransactError::PublishLostRace { .. }
                 | fluree_db_api::TransactError::NamespaceConflict(_),
             )) => errors::COMMIT_CONFLICT,
+            // Oversized single delta: `delta >= max` can never succeed by
+            // drain, so it must not carry the retryable code below. MUST
+            // precede the drainable novelty arm.
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::NoveltyWouldExceed {
+                    delta_bytes,
+                    max_bytes,
+                    ..
+                },
+            )) if delta_bytes >= max_bytes => errors::NOVELTY_DELTA_TOO_LARGE,
+            ServerError::NoveltyDeltaTooLarge(_) => errors::NOVELTY_DELTA_TOO_LARGE,
+            // Novelty backpressure: retryable capacity pressure, not an
+            // invalid transaction. Both variants carry the same machine code
+            // (the message distinguishes at-max from would-exceed) so clients
+            // branch on one `@type` for "the indexer needs to drain".
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::NoveltyAtMax
+                | fluree_db_api::TransactError::NoveltyWouldExceed { .. },
+            ))
+            | ServerError::NoveltyBackpressure(_) => errors::NOVELTY_AT_MAX,
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::DatatypeLimitExceeded { .. },
+            ))
+            | ServerError::DatatypeLimitExceeded(_) => errors::DATATYPE_LIMIT_EXCEEDED,
             ServerError::Api(ApiError::Transact(_)) => errors::INVALID_TRANSACTION,
 
             // API-level errors
             ServerError::MissingLedger => errors::MISSING_LEDGER,
-            ServerError::BadRequest(_) => errors::BAD_REQUEST,
+            // The same code as an id refused at the edge (`From<LedgerIdParseError>`).
+            ServerError::BadRequest(_)
+            | ServerError::Api(
+                ApiError::InvalidLedgerId(_)
+                | ApiError::InvalidBranch(_)
+                | ApiError::NameService(NameServiceError::InvalidId(_)),
+            ) => errors::BAD_REQUEST,
             ServerError::InvalidHeader(_) => errors::INVALID_HEADER,
             ServerError::NotImplemented(_) => errors::NOT_IMPLEMENTED,
             ServerError::Unauthorized(_) => errors::UNAUTHORIZED,
             ServerError::NotFound(_) => errors::NOT_FOUND,
             ServerError::NotAcceptable(_) => errors::NOT_ACCEPTABLE,
+            ServerError::UnsupportedMediaType(_) => errors::UNSUPPORTED_MEDIA_TYPE,
             ServerError::SparqlUpdateLower(_) => errors::SPARQL_LOWER,
 
             // Auth/Policy (requires credential feature)
@@ -139,7 +259,7 @@ impl ServerError {
             ServerError::Api(ApiError::Internal(_)) => errors::INTERNAL,
             ServerError::Api(ApiError::Drop(_)) => errors::INTERNAL,
             ServerError::Api(ApiError::Json(_)) => errors::INTERNAL,
-            ServerError::Api(ApiError::Config(_)) => errors::CONFIG,
+            ServerError::Api(ApiError::Config(_) | ApiError::LedgerConfig(_)) => errors::CONFIG,
             ServerError::Api(ApiError::Format(_)) => errors::FORMAT,
 
             // Cross-ledger model dependency failure (502). The variant
@@ -163,10 +283,32 @@ impl ServerError {
             }
 
             // 404 - Not Found
-            ServerError::Api(ApiError::NotFound(_)) => StatusCode::NOT_FOUND,
+            // Retryable backpressure, NOT a fault. The 503 belonged here, in
+            // ServerError's mapping, which is what the HTTP layer consults — putting it
+            // only on `ApiError::status_code()` left it dead and a deferral surfaced as
+            // a 500 `err:system/InternalError`, telling operators a normal capacity
+            // condition was an internal error.
+            ServerError::Api(ApiError::NoveltyDeferred { .. }) => StatusCode::SERVICE_UNAVAILABLE,
+            // A partial fan-out window splits by WHY it is incomplete. Deferral-only is
+            // the same retryable capacity condition as above; a target that actually
+            // failed is a fault and must not be dressed up as backpressure, or a
+            // permanently broken target would 503 forever and read as "just busy".
+            ServerError::Api(ApiError::MaterializePartial { tally, .. }) => {
+                if tally.failed > 0 {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }
+            // Every form `ApiError` gives a missing ledger, not only `NotFound`:
+            // the ledger loader's own error is one, and read as a 500 here.
+            ServerError::Api(e) if e.is_not_found() => StatusCode::NOT_FOUND,
+            ServerError::Api(ApiError::GraphNotFound(_)) => StatusCode::NOT_FOUND,
+            ServerError::Api(ApiError::CommitNotFound(_)) => StatusCode::NOT_FOUND,
 
             // 409 - Conflict
             ServerError::Api(ApiError::LedgerExists(_)) => StatusCode::CONFLICT,
+            ServerError::Api(ApiError::BranchConflict(_)) => StatusCode::CONFLICT,
             // Optimistic-concurrency / namespace-allocation conflicts are
             // retryable: 409 lets clients distinguish "retry" from a 400 "bad
             // request". (After server-side reconcile-and-retry these only reach
@@ -176,6 +318,57 @@ impl ServerError {
                 | fluree_db_api::TransactError::PublishLostRace { .. }
                 | fluree_db_api::TransactError::NamespaceConflict(_),
             )) => StatusCode::CONFLICT,
+
+            // 413 - the transaction's own delta meets or exceeds
+            // `reindex_max_bytes`: no drain can ever admit it, so a 503
+            // would wedge the client retrying a request that can never
+            // work. MUST precede the drainable 503 arm below.
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::NoveltyWouldExceed {
+                    delta_bytes,
+                    max_bytes,
+                    ..
+                },
+            )) if delta_bytes >= max_bytes => StatusCode::PAYLOAD_TOO_LARGE,
+            ServerError::NoveltyDeltaTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+
+            // 422 - well-formed, but the ledger has no room for the new
+            // datatypes. Permanent, so no `Retry-After`. MUST precede the
+            // generic `ApiError::Transact(_)` arm below.
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::DatatypeLimitExceeded { .. },
+            ))
+            | ServerError::DatatypeLimitExceeded(_) => StatusCode::UNPROCESSABLE_ENTITY,
+
+            // 503 - novelty backpressure. The same retryable capacity class
+            // as `NoveltyDeferred` above: only the indexer draining clears
+            // it. A 400 here tells well-behaved clients (retry 5xx, treat
+            // 4xx as permanent) to drop the write. MUST precede the generic
+            // `ApiError::Transact(_)` arm below.
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::NoveltyAtMax
+                | fluree_db_api::TransactError::NoveltyWouldExceed { .. },
+            ))
+            | ServerError::NoveltyBackpressure(_) => StatusCode::SERVICE_UNAVAILABLE,
+
+            // 403 - Forbidden (storage-permission / fail-closed). Raised
+            // directly (preview path) or wrapped from the query engine (scan
+            // path). MUST precede the generic `ApiError::Query(_)` arm below.
+            ServerError::Api(
+                ApiError::StorageAccessDenied { .. }
+                | ApiError::CatalogCredentialsNotVended { .. }
+                | ApiError::Query(
+                    fluree_db_query::QueryError::StorageAccessDenied { .. }
+                    | fluree_db_query::QueryError::CatalogCredentialsNotVended { .. }
+                    | fluree_db_query::QueryError::CatalogAccessDenied { .. },
+                ),
+            ) => StatusCode::FORBIDDEN,
+            ServerError::Api(
+                ApiError::Policy(fluree_db_api::PolicyError::ModifyDenied { .. })
+                | ApiError::Transact(fluree_db_api::TransactError::PolicyViolation(
+                    fluree_db_api::PolicyError::ModifyDenied { .. },
+                )),
+            ) => StatusCode::FORBIDDEN,
 
             // 400 - Bad Request (client errors)
             ServerError::Api(ApiError::Parse(_)) => StatusCode::BAD_REQUEST,
@@ -192,7 +385,14 @@ impl ServerError {
             ServerError::Api(ApiError::CypherLower(_)) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::CypherUpdateLower(_)) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::Config(_)) => StatusCode::BAD_REQUEST,
+            // Operator data, not caller input. See `ApiError::LedgerConfig`.
+            ServerError::Api(ApiError::LedgerConfig(_)) => StatusCode::INTERNAL_SERVER_ERROR,
             ServerError::Api(ApiError::Format(_)) => StatusCode::BAD_REQUEST,
+            ServerError::Api(
+                ApiError::InvalidLedgerId(_)
+                | ApiError::InvalidBranch(_)
+                | ApiError::NameService(NameServiceError::InvalidId(_)),
+            ) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::AwaitTNotReached { .. }) => StatusCode::REQUEST_TIMEOUT,
             ServerError::MissingLedger => StatusCode::BAD_REQUEST,
             ServerError::Json(_) => StatusCode::BAD_REQUEST,
@@ -211,6 +411,7 @@ impl ServerError {
 
             // 406 - Not Acceptable (content negotiation failure)
             ServerError::NotAcceptable(_) => StatusCode::NOT_ACCEPTABLE,
+            ServerError::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             #[cfg(feature = "credential")]
             ServerError::Api(ApiError::Credential(_)) => StatusCode::UNAUTHORIZED,
 
@@ -275,6 +476,26 @@ impl ServerError {
     pub fn not_acceptable(msg: impl Into<String>) -> Self {
         ServerError::NotAcceptable(msg.into())
     }
+
+    /// Create an unsupported media type error (415)
+    pub fn unsupported_media_type(msg: impl Into<String>) -> Self {
+        ServerError::UnsupportedMediaType(msg.into())
+    }
+}
+
+impl From<fluree_db_api::LedgerIdParseError> for ServerError {
+    fn from(e: fluree_db_api::LedgerIdParseError) -> Self {
+        ServerError::bad_request(e.to_string())
+    }
+}
+
+/// The ledger id a request names, for authorizing it.
+///
+/// Accepts the full address grammar (`name[:branch][@t:..][#graph]`) and
+/// returns the id the API will resolve it to, so a scope check and the
+/// operation it guards cannot disagree about which ledger that is.
+pub(crate) fn scope_id(raw: &str) -> std::result::Result<fluree_db_api::LedgerId, ServerError> {
+    Ok(fluree_db_api::LedgerRef::parse(raw)?.id)
 }
 
 impl From<NameServiceError> for ServerError {
@@ -323,9 +544,69 @@ impl IntoResponse for ServerError {
             )
         });
 
-        (status, [("content-type", "application/json")], json).into_response()
+        let mut response = (status, [("content-type", "application/json")], json).into_response();
+        // Every 503 this server emits is retryable capacity pressure
+        // (novelty at max, materialization deferred, committer overloaded),
+        // and RFC 9110 says a 503 should tell the client when to come back.
+        //
+        // The value is a conservative jittered constant, not the smallest
+        // non-zero one: many HTTP clients honor `Retry-After` IN PREFERENCE
+        // to their own exponential backoff, so a static 1s would pin every
+        // blocked client at 1 rps of rejected requests during exactly the
+        // window the server is capacity-stressed. Drain time isn't
+        // observable at the error site — which argues for a conservative
+        // constant, and the per-response jitter de-choruses clients that
+        // were refused in the same instant.
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            debug_assert!(
+                RETRYABLE_503_TYPES.contains(&error_type),
+                "503 with unclassified @type {error_type}: every 503 this server \
+                 emits must be retryable capacity pressure (Retry-After attaches \
+                 unconditionally) — classify the new source in RETRYABLE_503_TYPES \
+                 or map it to a different status"
+            );
+            let secs: u32 = rand::Rng::gen_range(
+                &mut rand::thread_rng(),
+                RETRY_AFTER_SECS_MIN..=RETRY_AFTER_SECS_MAX,
+            );
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(secs),
+            );
+        }
+        response
     }
 }
+
+/// Bounds for the jittered `Retry-After` on 503 responses (uniform integer
+/// seconds, inclusive). See the rationale at the attachment site in
+/// [`ServerError::into_response`].
+pub(crate) const RETRY_AFTER_SECS_MIN: u32 = 3;
+pub(crate) const RETRY_AFTER_SECS_MAX: u32 = 8;
+
+/// The `@type` codes a 503 response is allowed to carry.
+///
+/// `Retry-After` attaches to every 503 unconditionally, so "every 503 this
+/// server emits is retryable capacity pressure" is a load-bearing invariant:
+/// a non-retryable condition mapped to 503 would tell clients to hammer a
+/// request that can never succeed. The `debug_assert` in `into_response`
+/// fails any test that produces a 503 whose `@type` is not classified here,
+/// forcing a conscious decision for each new 503 source.
+///
+/// - `NOVELTY_AT_MAX`: novelty backpressure (stage-time at-max, or a
+///   drainable commit-time would-exceed) — clears when the indexer drains.
+/// - `NOVELTY_DEFERRED`: materialization deferred (including the
+///   deferral-only `MaterializePartial` split) — same capacity class.
+/// - `INTERNAL`: the status-passthrough hole — `SubmissionError::Overloaded`
+///   (committer in-flight cap, retryable by its contract) and any tracked
+///   error relayed via `ApiError::Http { status: 503 }` reach `error_type`'s
+///   `Http` catch-all. If a new 503 lands here, give it a typed code instead
+///   of relying on this entry.
+pub(crate) const RETRYABLE_503_TYPES: [&str; 3] = [
+    fluree_vocab::errors::NOVELTY_AT_MAX,
+    fluree_vocab::errors::NOVELTY_DEFERRED,
+    fluree_vocab::errors::INTERNAL,
+];
 
 /// Extract cause chain from error (only for high-value cases)
 fn extract_cause(error: &ServerError) -> Option<Box<ErrorResponse>> {
@@ -389,3 +670,481 @@ fn extract_cause(error: &ServerError) -> Option<Box<ErrorResponse>> {
 
 /// Result type alias for server operations
 pub type Result<T> = std::result::Result<T, ServerError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_vocab::errors;
+
+    #[test]
+    fn policy_denied_write_is_forbidden_with_access_denied_type() {
+        let denied = || fluree_db_api::PolicyError::modify_denied("write refused");
+        for err in [
+            ApiError::Policy(denied()),
+            ApiError::Transact(fluree_db_api::TransactError::PolicyViolation(denied())),
+        ] {
+            let response = ServerError::Api(err).into_response();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(
+                response.headers().get(axum::http::header::RETRY_AFTER),
+                None
+            );
+        }
+        let err = ServerError::Api(ApiError::Transact(
+            fluree_db_api::TransactError::PolicyViolation(denied()),
+        ));
+        assert_eq!(err.error_type(), errors::ACCESS_DENIED);
+    }
+
+    /// An id refused below the edge is still the caller's input.
+    #[test]
+    fn an_invalid_ledger_id_is_a_bad_request_wherever_it_is_refused() {
+        let parse = fluree_db_api::LedgerIdParseError::new("Invalid ledger id 'a@b'");
+        for err in [
+            ServerError::from(parse.clone()),
+            ServerError::Api(ApiError::InvalidLedgerId(parse)),
+            ServerError::Api(ApiError::InvalidBranch("a@b".into())),
+            ServerError::Api(ApiError::NameService(NameServiceError::InvalidId(
+                "a@b".into(),
+            ))),
+        ] {
+            assert_eq!(err.status_code(), StatusCode::BAD_REQUEST, "{err:?}");
+            assert_eq!(err.error_type(), errors::BAD_REQUEST, "{err:?}");
+        }
+    }
+
+    fn storage_denied_direct() -> ApiError {
+        ApiError::StorageAccessDenied {
+            bucket: "b".into(),
+            key: "warehouse/t/data/f.parquet".into(),
+            region: Some("us-east-2".into()),
+            message: "service error: AccessDenied".into(),
+        }
+    }
+
+    fn storage_denied_via_query() -> ApiError {
+        ApiError::Query(fluree_db_query::QueryError::StorageAccessDenied {
+            bucket: "b".into(),
+            key: "warehouse/t/data/f.parquet".into(),
+            region: Some("us-east-2".into()),
+            message: "service error: AccessDenied".into(),
+        })
+    }
+
+    fn not_vended_direct() -> ApiError {
+        ApiError::CatalogCredentialsNotVended {
+            catalog_uri: "https://catalog.example/v1".into(),
+        }
+    }
+
+    fn not_vended_via_query() -> ApiError {
+        ApiError::Query(fluree_db_query::QueryError::CatalogCredentialsNotVended {
+            catalog_uri: "https://catalog.example/v1".into(),
+        })
+    }
+
+    #[test]
+    fn storage_access_denied_is_403_both_paths() {
+        // Preview path (direct ApiError) and scan path (wrapped via Query) both
+        // surface HTTP 403 + the distinct STORAGE_ACCESS_DENIED @type.
+        for api in [storage_denied_direct(), storage_denied_via_query()] {
+            let se = ServerError::Api(api);
+            assert_eq!(se.status_code(), StatusCode::FORBIDDEN);
+            assert_eq!(se.error_type(), errors::STORAGE_ACCESS_DENIED);
+        }
+    }
+
+    #[test]
+    fn a_catalog_access_refusal_is_403_with_its_own_type() {
+        let se = ServerError::Api(ApiError::Query(
+            fluree_db_query::QueryError::CatalogAccessDenied {
+                table: "main.sales.orders".into(),
+                message: "User does not have SELECT (403 Forbidden)".into(),
+            },
+        ));
+        assert_eq!(se.status_code(), StatusCode::FORBIDDEN);
+        assert_eq!(se.error_type(), errors::CATALOG_ACCESS_DENIED);
+    }
+
+    #[test]
+    fn credentials_not_vended_is_403_both_paths() {
+        for api in [not_vended_direct(), not_vended_via_query()] {
+            let se = ServerError::Api(api);
+            assert_eq!(se.status_code(), StatusCode::FORBIDDEN);
+            assert_eq!(se.error_type(), errors::CATALOG_CREDENTIALS_NOT_VENDED);
+        }
+    }
+
+    #[test]
+    fn error_body_json_shape_for_storage_access_denied() {
+        // Exact body the solo code-first dispatch consumes: `@type` is the
+        // stable dispatch key; `status` is 403; the structured fields
+        // (bucket/key/region) are carried in the human-readable `error` string.
+        let se = ServerError::Api(storage_denied_via_query());
+        let body = ErrorResponse {
+            error: se.to_string(),
+            status: se.status_code().as_u16(),
+            error_type: se.error_type().to_string(),
+            cause: extract_cause(&se),
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["status"], 403);
+        assert_eq!(json["@type"], errors::STORAGE_ACCESS_DENIED);
+        let msg = json["error"].as_str().unwrap();
+        assert!(msg.contains("s3://b/warehouse/t/data/f.parquet"), "{msg}");
+        assert!(msg.contains("region us-east-2"), "{msg}");
+        // No cause chain for these leaf errors.
+        assert!(json.get("cause").is_none());
+    }
+
+    #[test]
+    fn error_body_json_shape_for_credentials_not_vended() {
+        let se = ServerError::Api(not_vended_direct());
+        let body = ErrorResponse {
+            error: se.to_string(),
+            status: se.status_code().as_u16(),
+            error_type: se.error_type().to_string(),
+            cause: extract_cause(&se),
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["status"], 403);
+        assert_eq!(json["@type"], errors::CATALOG_CREDENTIALS_NOT_VENDED);
+        let msg = json["error"].as_str().unwrap();
+        assert!(msg.contains("https://catalog.example/v1"), "{msg}");
+        assert!(msg.contains("vended_credentials=false"), "{msg}");
+    }
+
+    #[test]
+    fn r2rml_unsupported_pattern_is_400_with_distinct_type() {
+        // Well-formed but unsupported ON THIS SOURCE: stays HTTP 400 (not a
+        // distinct status like 403/507), but carries a distinct `@type` machine
+        // code so the Solo browse UI can branch on it instead of matching prose.
+        let se = ServerError::Api(ApiError::Query(
+            fluree_db_query::QueryError::r2rml_unsupported_pattern(
+                "graph source 'x' has 1 pattern(s) with a variable predicate and a bound term",
+            ),
+        ));
+        assert_eq!(se.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(se.error_type(), errors::R2RML_UNSUPPORTED_PATTERN);
+        let body = ErrorResponse {
+            error: se.to_string(),
+            status: se.status_code().as_u16(),
+            error_type: se.error_type().to_string(),
+            cause: extract_cause(&se),
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["status"], 400);
+        assert_eq!(json["@type"], errors::R2RML_UNSUPPORTED_PATTERN);
+        // The human-readable message keeps the migration substring existing
+        // prose-matchers rely on.
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains("cannot be converted to R2RML scans"),
+            "{}",
+            json["error"]
+        );
+    }
+
+    use fluree_db_api::TargetTally;
+
+    fn partial(ok: usize, deferred: usize, failed: usize) -> ServerError {
+        ServerError::Api(ApiError::MaterializePartial {
+            tally: TargetTally {
+                ok,
+                deferred,
+                failed,
+            },
+            detail: "test".into(),
+        })
+    }
+
+    /// A partial window's status must be decided by WHY it is incomplete.
+    ///
+    /// Deferral is capacity and clears itself, so 503 ("try again") is honest. A target
+    /// that FAILED will not clear itself, and answering 503 would tell a caller to keep
+    /// retrying a permanently broken ledger while reporting it as merely busy — the same
+    /// mistake, in the other direction, as the 500 that a plain deferral used to return.
+    #[test]
+    fn partial_window_status_follows_the_reason_not_the_partialness() {
+        assert_eq!(
+            partial(21, 1, 0).status_code(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "deferral-only is retryable capacity pressure"
+        );
+        assert_eq!(
+            partial(21, 0, 1).status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a failed target is a fault and must not be reported as backpressure"
+        );
+        // A failure alongside deferrals still reports the failure: it is the outcome
+        // needing attention, and burying it under the milder one is how a broken ledger
+        // stayed invisible for 20 minutes across 208 windows.
+        assert_eq!(
+            partial(20, 1, 1).status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// Novelty backpressure must answer 503 + `err:db/NoveltyAtMax` in every
+    /// shape it reaches this layer: the raw `ApiError::Transact` variants
+    /// (paths that never cross the consensus boundary) and the
+    /// `ServerError::NoveltyBackpressure` reconstruction (paths where the
+    /// variant was flattened to a `SubmissionError`). Before this mapping the
+    /// condition fell through the `Transact(_)` catch-alls as 400
+    /// InvalidTransaction, and a client that retries 5xx but treats 4xx as
+    /// permanent dropped the write.
+    #[test]
+    fn novelty_backpressure_is_503_with_novelty_code_in_every_shape() {
+        let shapes = [
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::NoveltyAtMax,
+            )),
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::NoveltyWouldExceed {
+                    current_bytes: 90,
+                    delta_bytes: 20,
+                    max_bytes: 100,
+                },
+            )),
+            ServerError::NoveltyBackpressure("Novelty at maximum size, reindexing required".into()),
+        ];
+        for se in shapes {
+            assert_eq!(se.status_code(), StatusCode::SERVICE_UNAVAILABLE, "{se}");
+            assert_eq!(se.error_type(), errors::NOVELTY_AT_MAX, "{se}");
+        }
+    }
+
+    /// Every 503 carries `Retry-After` (all of this server's 503s are
+    /// retryable capacity pressure); non-503s must not. The value is
+    /// jittered, so assert presence + the configured range, not an exact
+    /// number — an exact pin would re-freeze the constant the jitter
+    /// exists to avoid.
+    #[test]
+    fn service_unavailable_responses_carry_retry_after() {
+        let resp = ServerError::Api(ApiError::Transact(
+            fluree_db_api::TransactError::NoveltyAtMax,
+        ))
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let secs = retry_after_secs(&resp).expect("503 must carry Retry-After");
+        assert!(
+            (RETRY_AFTER_SECS_MIN..=RETRY_AFTER_SECS_MAX).contains(&secs),
+            "Retry-After {secs} outside [{RETRY_AFTER_SECS_MIN}, {RETRY_AFTER_SECS_MAX}]"
+        );
+
+        let resp = ServerError::BadRequest("nope".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(resp
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none());
+    }
+
+    fn retry_after_secs(resp: &Response) -> Option<u32> {
+        resp.headers()
+            .get(axum::http::header::RETRY_AFTER)?
+            .to_str()
+            .ok()?
+            .parse()
+            .ok()
+    }
+
+    /// The "every 503 is retryable capacity" invariant, pinned against an
+    /// explicit allowlist. Enumerates every 503-producing path in this
+    /// crate's mapping; each must carry an `@type` from
+    /// [`RETRYABLE_503_TYPES`] and a `Retry-After` in the jitter range. A
+    /// future arm that maps a new condition to 503 fails this test (or the
+    /// `debug_assert` in `into_response`, for paths this corpus misses)
+    /// until the code is consciously classified as retryable capacity.
+    #[test]
+    fn every_503_source_is_classified_retryable_capacity() {
+        // One entry per 503-producing path, with the code it must carry.
+        let sources: [(ServerError, &str, &str); 6] = [
+            (
+                ServerError::Api(ApiError::NoveltyDeferred { remaining: 3 }),
+                errors::NOVELTY_DEFERRED,
+                "materialization deferred (capacity)",
+            ),
+            (
+                partial(21, 1, 0),
+                errors::NOVELTY_DEFERRED,
+                "deferral-only partial window",
+            ),
+            (
+                ServerError::Api(ApiError::Transact(
+                    fluree_db_api::TransactError::NoveltyAtMax,
+                )),
+                errors::NOVELTY_AT_MAX,
+                "stage-time novelty at max",
+            ),
+            (
+                ServerError::Api(ApiError::Transact(
+                    fluree_db_api::TransactError::NoveltyWouldExceed {
+                        current_bytes: 90,
+                        delta_bytes: 20,
+                        max_bytes: 100,
+                    },
+                )),
+                errors::NOVELTY_AT_MAX,
+                "drainable commit-time would-exceed",
+            ),
+            (
+                ServerError::NoveltyBackpressure("novelty at max (flattened)".into()),
+                errors::NOVELTY_AT_MAX,
+                "consensus-flattened novelty backpressure",
+            ),
+            (
+                // `SubmissionError::Overloaded` reaches this shape via
+                // `submission_error_to_server_error` — retryable by its
+                // contract (in-flight cap), but its `@type` is the `Http`
+                // catch-all. Classified consciously; a typed code should
+                // replace this entry if the passthrough grows more cases.
+                ServerError::Api(ApiError::http(
+                    503,
+                    "committer overloaded; in-flight operation cap reached",
+                )),
+                errors::INTERNAL,
+                "committer-overload status passthrough",
+            ),
+        ];
+        for (se, expected_type, why) in sources {
+            assert_eq!(se.status_code(), StatusCode::SERVICE_UNAVAILABLE, "{why}");
+            assert_eq!(se.error_type(), expected_type, "{why}");
+            assert!(
+                RETRYABLE_503_TYPES.contains(&expected_type),
+                "{why}: {expected_type} missing from the allowlist"
+            );
+            let resp = se.into_response();
+            let secs = retry_after_secs(&resp)
+                .unwrap_or_else(|| panic!("{why}: 503 must carry Retry-After"));
+            assert!(
+                (RETRY_AFTER_SECS_MIN..=RETRY_AFTER_SECS_MAX).contains(&secs),
+                "{why}: Retry-After {secs} outside range"
+            );
+        }
+        // The allowlist itself is part of the contract: growing it is a
+        // conscious act, recorded here.
+        assert_eq!(RETRYABLE_503_TYPES.len(), 3);
+    }
+
+    /// The two 413s carry distinct codes for clients to branch on: the HTTP
+    /// body-size cap (`read_limited_body`'s `ApiError::http(413, ..)`) is
+    /// `err:db/PayloadTooLarge`, never the novelty code — and, like the
+    /// novelty 413, it must not invite a retry.
+    #[test]
+    fn body_limit_413_carries_payload_too_large_not_the_novelty_code() {
+        let se = ServerError::Api(ApiError::http(
+            413,
+            "request body exceeds the configured limit",
+        ));
+        assert_eq!(se.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(se.error_type(), errors::PAYLOAD_TOO_LARGE);
+        assert_ne!(se.error_type(), errors::NOVELTY_DELTA_TOO_LARGE);
+        let resp = se.into_response();
+        assert!(resp
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none());
+    }
+
+    /// The oversized-delta carve-out: a delta at or above
+    /// `reindex_max_bytes` can never succeed by drain (the commit check is
+    /// `current + delta >= max`, so even empty novelty refuses it), so it
+    /// must NOT get the retryable 503 shape — it answers 413 +
+    /// `err:db/NoveltyDeltaTooLarge` with NO `Retry-After`, in both the
+    /// raw-variant and consensus-flattened shapes. The drainable/oversized
+    /// boundary is exactly `delta >= max`.
+    #[test]
+    fn oversized_novelty_delta_is_413_with_distinct_code_and_no_retry_after() {
+        let shapes = [
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::NoveltyWouldExceed {
+                    current_bytes: 0,
+                    delta_bytes: 100,
+                    max_bytes: 100,
+                },
+            )),
+            ServerError::NoveltyDeltaTooLarge(
+                "Transaction would exceed novelty limit: current=0, delta=100, max=100".into(),
+            ),
+        ];
+        for se in shapes {
+            assert_eq!(se.status_code(), StatusCode::PAYLOAD_TOO_LARGE, "{se}");
+            assert_eq!(se.error_type(), errors::NOVELTY_DELTA_TOO_LARGE, "{se}");
+            let resp = se.into_response();
+            assert!(
+                resp.headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .is_none(),
+                "413 must not invite a retry"
+            );
+        }
+    }
+
+    /// The datatype limit is a permanent refusal: 422 +
+    /// `err:db/DatatypeLimitExceeded` with no `Retry-After`, in both the
+    /// raw-variant and consensus-flattened shapes.
+    #[test]
+    fn datatype_limit_is_422_with_distinct_code_and_no_retry_after() {
+        let shapes = [
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::DatatypeLimitExceeded {
+                    used: 16_369,
+                    adding: 1,
+                    max: 16_369,
+                },
+            )),
+            ServerError::DatatypeLimitExceeded("datatype limit exceeded".into()),
+        ];
+        for se in shapes {
+            assert_eq!(se.status_code(), StatusCode::UNPROCESSABLE_ENTITY, "{se}");
+            assert_eq!(se.error_type(), errors::DATATYPE_LIMIT_EXCEEDED, "{se}");
+            let resp = se.into_response();
+            assert!(
+                resp.headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .is_none(),
+                "422 must not invite a retry"
+            );
+        }
+    }
+
+    /// Merge, rebase and revert reach the HTTP layer through the committer,
+    /// which flattens a typed error to `ApiError::Http { status }`; previews
+    /// and sweeps return it typed. A branch error answers the same either way.
+    #[test]
+    fn branch_errors_answer_the_same_typed_or_flattened() {
+        for (api, status, code) in [
+            (
+                ApiError::InvalidBranch("Branch main has no source branch".into()),
+                StatusCode::BAD_REQUEST,
+                errors::BAD_REQUEST,
+            ),
+            (
+                ApiError::BranchConflict("another maintenance operation holds db:main".into()),
+                StatusCode::CONFLICT,
+                errors::COMMIT_CONFLICT,
+            ),
+        ] {
+            let flattened = ServerError::Api(ApiError::http(api.status_code(), api.to_string()));
+            for se in [ServerError::Api(api), flattened] {
+                assert_eq!(se.status_code(), status, "{se}");
+                assert_eq!(se.error_type(), code, "{se}");
+            }
+        }
+    }
+
+    #[test]
+    fn partial_window_error_code_matches_its_status() {
+        assert_eq!(
+            partial(21, 1, 0).error_type(),
+            fluree_vocab::errors::NOVELTY_DEFERRED
+        );
+        assert_eq!(
+            partial(21, 0, 1).error_type(),
+            fluree_vocab::errors::MATERIALIZE_PARTIAL
+        );
+    }
+}

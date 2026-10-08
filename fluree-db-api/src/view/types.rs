@@ -29,6 +29,8 @@ pub struct ConfigReasoningBudget {
     pub max_facts: Option<u64>,
     /// `f:reasoningMaxSeconds` — max materialization wall-clock seconds.
     pub max_seconds: Option<u64>,
+    /// `f:reasoningMaxMemoryMb` — max megabytes of derived facts.
+    pub max_memory_mb: Option<u64>,
     /// Whether these values override a query-supplied budget.
     pub force: bool,
 }
@@ -39,9 +41,11 @@ impl ConfigReasoningBudget {
         if self.force {
             modes.max_facts = self.max_facts;
             modes.max_seconds = self.max_seconds;
+            modes.max_memory_mb = self.max_memory_mb;
         } else {
             modes.max_facts = modes.max_facts.or(self.max_facts);
             modes.max_seconds = modes.max_seconds.or(self.max_seconds);
+            modes.max_memory_mb = modes.max_memory_mb.or(self.max_memory_mb);
         }
     }
 }
@@ -196,6 +200,12 @@ pub struct GraphDb {
     /// Carried on `GraphDb` so downstream callers can apply identity gating
     /// at request time without re-reading the config graph.
     pub(crate) resolved_config: Option<ResolvedConfig>,
+    /// Successful resolution found no config; distinct from not yet resolved.
+    pub(crate) config_absent: bool,
+    /// This view's own union default graph switch, ahead of the ledger's
+    /// `f:unionDefaultGraph` and behind the query's; see
+    /// [`Self::with_union_default_graph`].
+    pub(crate) union_default_graph: Option<bool>,
 
     // ========================================================================
     // Datalog config (from config graph, applied at query boundary)
@@ -226,7 +236,8 @@ pub struct GraphDb {
     ///
     /// Empty by default. Cloned via `Arc` so policy-wrap doesn't
     /// inflate the cached `GraphDb` cost.
-    pub(crate) cross_ledger_resolved_ts: Arc<std::collections::HashMap<String, i64>>,
+    pub(crate) cross_ledger_resolved_ts:
+        Arc<std::collections::HashMap<fluree_db_core::LedgerId, i64>>,
 
     // ========================================================================
     // Graph source context (optional — set when view is created from a graph source)
@@ -235,6 +246,10 @@ pub struct GraphDb {
     /// rather than a real ledger. Query patterns should be auto-wrapped in
     /// `GRAPH <gs_id> { ... }` so the R2RML provider handles them.
     pub(crate) graph_source_id: Option<Arc<str>>,
+    /// The table state a time-specified graph-source view reads
+    /// (`alias@time:` / `@recorded:` / `@snapshot:`). Pushed into the R2RML
+    /// provider before execution; `None` reads the source's current state.
+    pub(crate) graph_source_time: Option<fluree_db_query::r2rml::SourceTime>,
 }
 
 impl std::fmt::Debug for GraphDb {
@@ -295,12 +310,15 @@ impl GraphDb {
             default_context: None,
             ledger_config: None,
             resolved_config: None,
+            config_absent: false,
+            union_default_graph: None,
             datalog_enabled: true,
             query_time_rules_allowed: true,
             datalog_override_allowed: true,
             rules_source_g_id: None,
             cross_ledger_resolved_ts: Arc::new(std::collections::HashMap::new()),
             graph_source_id: None,
+            graph_source_time: None,
         }
     }
 
@@ -407,18 +425,39 @@ impl GraphDb {
                 .map_err(|e| crate::ApiError::internal(e.to_string()))?;
         }
 
+        // The binary lane resolves overlay flakes through the persisted
+        // dictionary plus `DictNovelty`, both committed-state artefacts: the
+        // subjects and strings this transaction introduces are in neither.
+        // Read through a view-local extension of the base dictionaries, as
+        // SHACL and post-state policy do, so a preview neither fails to
+        // translate its own flakes nor re-walks the whole novelty per scan.
+        let staged_flakes = staged.view.staged_flakes();
+        let (dict_novelty, runtime_small_dicts) =
+            match fluree_db_transact::staged_dicts(base, staged_flakes)? {
+                Some(dicts) => {
+                    let provider = dicts.provider(snapshot.shared_namespaces());
+                    Arc::make_mut(&mut snapshot).range_provider = Some(provider);
+                    (dicts.dict_novelty, dicts.runtime_small_dicts)
+                }
+                None => {
+                    let mut runtime_small_dicts = (*base.runtime_small_dicts).clone();
+                    runtime_small_dicts.populate_from_flakes(staged_flakes);
+                    (
+                        Arc::clone(&base.dict_novelty),
+                        Arc::new(runtime_small_dicts),
+                    )
+                }
+            };
+
         // Clone base novelty and merge staged flakes into it so queries see
         // both committed and staged data.
         let mut combined = (*base.novelty).clone();
-        let staged_flakes = staged.view.staged_flakes().to_vec();
-        let mut runtime_small_dicts = (*base.runtime_small_dicts).clone();
         if !staged_flakes.is_empty() {
-            runtime_small_dicts.populate_from_flakes(&staged_flakes);
             let reverse_graph = snapshot
                 .build_reverse_graph()
                 .map_err(|e| crate::ApiError::internal(e.to_string()))?;
             combined
-                .apply_commit(staged_flakes, staged_t, &reverse_graph)
+                .apply_commit(staged_flakes.to_vec(), staged_t, &reverse_graph)
                 .map_err(|e| {
                     crate::ApiError::internal(format!(
                         "Failed to merge staged flakes into novelty: {e}"
@@ -435,8 +474,8 @@ impl GraphDb {
             staged_t,
             base.ledger_id(),
         );
-        gdb.dict_novelty = Some(base.dict_novelty.clone());
-        gdb.runtime_small_dicts = Some(Arc::new(runtime_small_dicts));
+        gdb.dict_novelty = Some(dict_novelty);
+        gdb.runtime_small_dicts = Some(runtime_small_dicts);
         // Carry binary store from the base ledger state
         gdb.binary_store = base
             .binary_store
@@ -496,6 +535,9 @@ impl GraphDb {
     /// let view = view.as_of(50);
     /// ```
     pub fn as_of(mut self, t: i64) -> Self {
+        if self.t != t {
+            self.clear_config_resolution();
+        }
         self.t = t;
         self
     }
@@ -513,6 +555,16 @@ impl GraphDb {
     /// `range_with_overlay()` must ensure the underlying `LedgerSnapshot.range_provider`
     /// is scoped appropriately for the chosen graph.
     pub fn with_graph_id(mut self, graph_id: GraphId) -> Self {
+        if self.graph_id != graph_id {
+            self.clear_config_resolution();
+            // Only the default graph routes to a virtual source's provider.
+            // Its system graphs read the empty genesis snapshot; dropping the
+            // model config must also drop the virtual-data routing tag.
+            if graph_id != fluree_db_core::DEFAULT_GRAPH_ID {
+                self.graph_source_id = None;
+                self.graph_source_time = None;
+            }
+        }
         self.graph_id = graph_id;
         self
     }
@@ -584,6 +636,28 @@ impl GraphDb {
         self
     }
 
+    fn clear_config_resolution(&mut self) {
+        self.config_absent = false;
+        self.resolved_config = None;
+        self.ledger_config = None;
+        self.rules_source_g_id = None;
+    }
+
+    pub(crate) fn config_is_resolved(&self) -> bool {
+        self.config_absent || self.resolved_config.is_some()
+    }
+
+    /// Set whether a query on this view reads its default graph as the union
+    /// of the ledger's default graph and its named graphs, whatever the
+    /// ledger's `f:unionDefaultGraph` says. A query's own switch still wins.
+    ///
+    /// A write-branch probe sets it off: it must see what the write will
+    /// stage against, and writes go to the default graph alone.
+    pub(crate) fn with_union_default_graph(mut self, on: bool) -> Self {
+        self.union_default_graph = Some(on);
+        self
+    }
+
     /// Get the full ledger config (if any).
     pub fn ledger_config(&self) -> Option<&LedgerConfig> {
         self.ledger_config.as_deref()
@@ -651,14 +725,16 @@ impl GraphDb {
     /// `resolved_t`s seen so far in this logical request).
     pub fn with_cross_ledger_resolved_ts(
         mut self,
-        ts: Arc<std::collections::HashMap<String, i64>>,
+        ts: Arc<std::collections::HashMap<fluree_db_core::LedgerId, i64>>,
     ) -> Self {
         self.cross_ledger_resolved_ts = ts;
         self
     }
 
     /// Read the carried governance-context capture.
-    pub fn cross_ledger_resolved_ts(&self) -> &Arc<std::collections::HashMap<String, i64>> {
+    pub fn cross_ledger_resolved_ts(
+        &self,
+    ) -> &Arc<std::collections::HashMap<fluree_db_core::LedgerId, i64>> {
         &self.cross_ledger_resolved_ts
     }
 }
@@ -749,6 +825,30 @@ impl GraphDb {
             Some(enforcer) => enforcer.is_root(),
             None => true,
         }
+    }
+
+    /// The policy-enforcement state a request against this view executes under,
+    /// or `None` when the view is unenforced (no policy attached, or root).
+    ///
+    /// Read off the policy wrapper the view was built with, so it is settled
+    /// before execution. The wrapper's view set is assembled from stored policy
+    /// nodes selected by the caller's own `f:policyClass` assignments — ledger
+    /// data — but the result is independent of the data the query reads and of
+    /// the query itself, so reporting it cannot disclose whether any particular
+    /// flake exists. See [`fluree_db_core::PolicyEnforcement`].
+    pub fn policy_enforcement(&self) -> Option<fluree_db_core::PolicyEnforcement> {
+        let wrapper = self.policy.as_ref()?.wrapper();
+        if wrapper.is_root() {
+            return None;
+        }
+        Some(fluree_db_core::PolicyEnforcement {
+            enforced: true,
+            // Mirrors the deny path in `policy_builder`: an empty view set with
+            // no permissive default denies every non-schema flake up front, in
+            // `evaluate::allow_view_flake`, before any policy runs.
+            denies_all_data: wrapper.view().restrictions.is_empty() && !wrapper.default_allow(),
+            unevaluable_policies: Vec::new(),
+        })
     }
 }
 

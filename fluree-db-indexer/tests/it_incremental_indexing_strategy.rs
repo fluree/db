@@ -79,6 +79,7 @@ fn incremental_branch_only_fetches_and_rewrites_touched_leaves() {
         zstd_level: 1,
         leaflet_target_rows: 50, // avoid splits in this test
         leaf_target_rows: 200,   // irrelevant unless split
+        collect_matched: false,
     };
 
     let fetched: std::cell::RefCell<Vec<ContentId>> = std::cell::RefCell::new(Vec::new());
@@ -92,6 +93,8 @@ fn incremental_branch_only_fetches_and_rewrites_touched_leaves() {
         &branch_bytes,
         &novelty,
         &novelty_ops,
+        &[],
+        &[],
         &config,
         &fetch_leaf,
         &fetch_sidecar,
@@ -156,6 +159,11 @@ fn incremental_branch_only_fetches_and_rewrites_touched_leaves() {
     assert_eq!(update.branch_cid, expected_branch_cid);
 }
 
+/// The *build* step is append-only: it never rewrites an existing pack.
+///
+/// Bounding the routing table is a separate stage — the indexer compacts the
+/// tail after these packs are uploaded (`compact_forward_packs`), so a
+/// steady pack count here does not mean packs are never merged.
 #[test]
 fn forward_dict_incremental_appends_new_packs_and_reuses_existing_refs() {
     // Existing routing table with two packs (fake CIDs are fine for this invariant).

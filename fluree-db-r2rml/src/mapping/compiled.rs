@@ -171,6 +171,22 @@ impl CompiledR2rmlMapping {
     }
 
     /// Get all unique table names referenced by the mapping
+    /// The `rr:sqlQuery` text behind a query alias returned by
+    /// [`TriplesMap::table_name`], if `table_name` is one.
+    pub fn sql_query_for_table(&self, table_name: &str) -> Option<&str> {
+        self.triples_maps
+            .values()
+            .find(|tm| tm.table_name() == Some(table_name))
+            .and_then(|tm| tm.sql_query())
+    }
+
+    /// Whether any map is `rr:sqlQuery`-backed.
+    pub fn has_sql_queries(&self) -> bool {
+        self.triples_maps
+            .values()
+            .any(|tm| tm.sql_query().is_some())
+    }
+
     pub fn table_names(&self) -> Vec<&str> {
         self.table_to_maps
             .keys()

@@ -18,7 +18,6 @@ use fluree_db_nameservice_sync::{
     ingest_pack_stream, ingest_pack_stream_with_header, peek_pack_header, FetchResult,
     HttpRemoteClient, MultiOriginFetcher, RemoteEndpoint, SyncConfigStore, SyncDriver,
 };
-use futures::StreamExt;
 use std::sync::Arc;
 
 fn token_has_storage_permissions(token: &str) -> Option<bool> {
@@ -117,7 +116,7 @@ fn map_sync_auth_error(remote: &str, err: &str) -> Option<CliError> {
 
 /// Build a SyncDriver with all configured remotes
 async fn build_sync_driver(dirs: &FlureeDir) -> CliResult<(SyncDriver, Arc<TomlSyncConfigStore>)> {
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let config_store = Arc::new(TomlSyncConfigStore::new(dirs.config_dir().to_path_buf()));
 
     // Get the nameservice as RefPublisher
@@ -227,7 +226,7 @@ fn print_fetch_result(result: &FetchResult) {
 /// no upstream remote is configured.
 pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) -> CliResult<()> {
     let ledger_id = context::resolve_ledger(ledger, dirs)?;
-    let ledger_id = context::to_ledger_id(&ledger_id);
+    let ledger_id = context::to_ledger_id(&ledger_id)?;
 
     let config_store = TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
     let upstream = config_store
@@ -281,7 +280,7 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
         .ok_or_else(|| CliError::Config("remote ledger-info response missing 't'".into()))?;
 
     // Resolve local head.
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let storage = fluree
         .backend()
         .admin_storage_cloned()
@@ -525,15 +524,21 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
         }
     }
 
-    // Fetch pages (newest→oldest) until we reach local history.
-    let mut all_commits: Vec<fluree_db_api::Base64Bytes> = Vec::new();
-    let mut all_blobs: std::collections::HashMap<String, fluree_db_api::Base64Bytes> =
-        std::collections::HashMap::new();
+    // Fetch pages (newest→oldest) until we reach local history. The request
+    // asks for the first-parent line and the commits its merges brought in.
+    // A server predating that mode answers with every parent in one list,
+    // which imports only when the history has no merge.
+    let mut pages: Vec<fluree_db_api::ExportCommitsResponse> = Vec::new();
     let mut cursor: Option<String> = None;
 
     loop {
         let page = client
-            .fetch_commits(remote_ledger_id, cursor.as_deref(), 100)
+            .fetch_commits(
+                remote_ledger_id,
+                cursor.as_deref(),
+                local_ref.id.as_ref(),
+                100,
+            )
             .await
             .map_err(|e| {
                 let msg = e.to_string();
@@ -542,39 +547,27 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
                 })
             })?;
 
-        for commit in &page.commits {
-            all_commits.push(commit.clone());
-        }
-        for (addr, blob) in &page.blobs {
-            all_blobs
-                .entry(addr.clone())
-                .or_insert_with(|| blob.clone());
-        }
-
-        // If this page reached our local history, stop fetching.
-        if page.oldest_t <= local_ref.t + 1 {
+        // A `lineage` export stops at our head by itself. The default export
+        // has to be cut off once a page reaches our history.
+        let reached_local = !page.lineage && page.oldest_t <= local_ref.t + 1;
+        let next = page.next_cursor_id.clone();
+        pages.push(page);
+        if reached_local {
             break;
         }
-        match page.next_cursor_id {
+        match next {
             Some(cid) => cursor = Some(cid.to_string()),
-            None => break, // Reached genesis.
+            None => break, // Reached our head, or genesis.
         }
     }
 
-    // Filter to only commits with t > local_t, then reverse to oldest→newest.
-    use fluree_db_core::commit::codec::format::{CommitHeader, HEADER_LEN};
-    let mut to_import: Vec<fluree_db_api::Base64Bytes> = Vec::new();
-    for commit in &all_commits {
-        if commit.0.len() < HEADER_LEN {
-            continue;
-        }
-        let header = CommitHeader::read_from(&commit.0)
-            .map_err(|e| CliError::Config(format!("invalid commit in pull response: {e}")))?;
-        if header.t > local_ref.t {
-            to_import.push(commit.clone());
+    let (to_import, merged_commits) = pull_import_set(&pages, local_ref.t)?;
+    let mut all_blobs = std::collections::HashMap::new();
+    for page in pages {
+        for (addr, blob) in page.blobs {
+            all_blobs.entry(addr).or_insert(blob);
         }
     }
-    to_import.reverse(); // oldest→newest
 
     if to_import.is_empty() {
         println!("{} '{}' is already up to date", "✓".green(), ledger_id);
@@ -586,7 +579,7 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
 
     // Import incrementally (validates chain, ancestry, writes blobs, advances head, updates novelty).
     let result = fluree
-        .import_commits_incremental(&ledger_id, to_import, all_blobs)
+        .import_commits_incremental(&ledger_id, to_import, merged_commits, all_blobs)
         .await
         .map_err(|e| CliError::Config(format!("pull failed (import): {e}")))?;
 
@@ -603,10 +596,187 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
     Ok(())
 }
 
+/// The commits a paginated pull imports: the line oldest first, and the
+/// merged-in commits parents before children.
+///
+/// `pages` are in the order they were fetched, newest first. A `lineage`
+/// export holds only new commits. The default export also holds commits at
+/// or below `local_t`, which are dropped.
+fn pull_import_set(
+    pages: &[fluree_db_api::ExportCommitsResponse],
+    local_t: i64,
+) -> CliResult<(
+    Vec<fluree_db_api::Base64Bytes>,
+    Vec<fluree_db_api::Base64Bytes>,
+)> {
+    use fluree_db_core::commit::codec::format::{CommitHeader, HEADER_LEN};
+
+    let lineage = pages.iter().all(|page| page.lineage);
+    let mut to_import = Vec::new();
+    for commit in pages.iter().flat_map(|page| &page.commits) {
+        if commit.0.len() < HEADER_LEN {
+            continue;
+        }
+        let header = CommitHeader::read_from(&commit.0)
+            .map_err(|e| CliError::Config(format!("invalid commit in pull response: {e}")))?;
+        if lineage || header.t > local_t {
+            to_import.push(commit.clone());
+        }
+    }
+    to_import.reverse(); // oldest→newest
+
+    // Older pages first, so parents stay ahead of children. A commit that
+    // merges on two pages brought in arrives twice and is kept once.
+    let mut seen = std::collections::HashSet::new();
+    let merged = pages
+        .iter()
+        .rev()
+        .flat_map(|page| &page.merged_commits)
+        .filter(|commit| seen.insert(fluree_db_core::sha256_hex(&commit.0)))
+        .cloned()
+        .collect();
+    Ok((to_import, merged))
+}
+
+/// The remote head a push plans from, or `None` when the remote has no
+/// commits.
+///
+/// A remote that reports a head `t` without a commit id is matched to the
+/// local line's commit at that `t`.
+async fn remote_base(
+    store: &dyn ContentStore,
+    local_head: &fluree_db_core::ContentId,
+    remote_t: i64,
+    remote_commit_id: Option<fluree_db_core::ContentId>,
+) -> CliResult<Option<fluree_db_core::ContentId>> {
+    if remote_commit_id.is_some() || remote_t == 0 {
+        return Ok(remote_commit_id);
+    }
+    let line = fluree_db_core::collect_first_parent_cids(store, local_head, remote_t - 1)
+        .await
+        .map_err(|e| CliError::Config(e.to_string()))?;
+    line.into_iter()
+        .find(|(t, _)| *t == remote_t)
+        .map(|(_, id)| Some(id))
+        .ok_or_else(|| {
+            CliError::Config(
+                "cannot push: remote head not found in local history. Pull first.".into(),
+            )
+        })
+}
+
+/// Refuse a push whose history contains a merge when the remote does not
+/// accept the commits that merge brought in.
+async fn ensure_merges_supported(
+    client: &crate::remote_client::RemoteLedgerClient,
+    plan: &fluree_db_core::CommitTransferPlan,
+) -> CliResult<()> {
+    if plan.merged.is_empty() || client.supports_push_merges().await {
+        return Ok(());
+    }
+    Err(CliError::Config(format!(
+        "cannot push: this history contains a merge, which brings in {} commit(s) \
+         from other branches. The remote does not accept those commits. Upgrade the \
+         remote server, then push again.",
+        plan.merged.len()
+    )))
+}
+
+/// Read a plan's commits, and the txn blobs they reference, into a push
+/// request.
+async fn build_push_request(
+    store: &dyn ContentStore,
+    plan: &fluree_db_core::CommitTransferPlan,
+) -> CliResult<fluree_db_api::PushCommitsRequest> {
+    let mut blobs = std::collections::HashMap::new();
+    let mut missing_blobs = Vec::new();
+    let commits = read_push_commits(store, &plan.lineage, &mut blobs, &mut missing_blobs).await?;
+    let merged_commits =
+        read_push_commits(store, &plan.merged, &mut blobs, &mut missing_blobs).await?;
+    Ok(fluree_db_api::PushCommitsRequest {
+        commits,
+        blobs,
+        missing_blobs,
+        merged_commits,
+    })
+}
+
+/// Read commit bytes in order, collecting each commit's txn blob into
+/// `blobs`.
+///
+/// A txn blob missing locally is declared in `missing_blobs` rather than
+/// left for the receiver to infer from an absent key.
+async fn read_push_commits(
+    store: &dyn ContentStore,
+    cids: &[fluree_db_core::ContentId],
+    blobs: &mut std::collections::HashMap<String, fluree_db_api::Base64Bytes>,
+    missing_blobs: &mut Vec<String>,
+) -> CliResult<Vec<fluree_db_api::Base64Bytes>> {
+    let mut commits = Vec::with_capacity(cids.len());
+    for cid in cids {
+        let bytes = store
+            .get(cid)
+            .await
+            .map_err(|e| CliError::Config(format!("failed to read local commit {cid}: {e}")))?;
+        let commit = fluree_db_core::commit::codec::read_commit(&bytes)
+            .map_err(|e| CliError::Config(format!("failed to decode local commit {cid}: {e}")))?;
+        commits.push(fluree_db_api::Base64Bytes(bytes));
+
+        if let Some(txn_cid) = &commit.txn {
+            let txn_key = txn_cid.to_string();
+            if let std::collections::hash_map::Entry::Vacant(e) = blobs.entry(txn_key.clone()) {
+                match store.get(txn_cid).await {
+                    Ok(txn_bytes) => {
+                        e.insert(fluree_db_api::Base64Bytes(txn_bytes));
+                    }
+                    Err(fluree_db_core::Error::NotFound(_)) => {
+                        eprintln!(
+                            "  warning: commit t={} references txn blob '{txn_key}' which is missing locally; pushing without it",
+                            commit.t
+                        );
+                        missing_blobs.push(txn_key);
+                    }
+                    Err(e) => {
+                        return Err(CliError::Config(format!(
+                            "commit references txn blob '{txn_key}' but it is not readable locally: {e}"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(commits)
+}
+
+/// Send a push to the remote.
+async fn send_push(
+    client: &crate::remote_client::RemoteLedgerClient,
+    remote_ledger_id: &str,
+    req: &fluree_db_api::PushCommitsRequest,
+) -> CliResult<fluree_db_api::PushCommitsResponse> {
+    client
+        .push_commits(remote_ledger_id, req)
+        .await
+        .map_err(|e| match e {
+            // The remote advertised `push-merges`, so a 404 there most likely
+            // came from a node that has not been upgraded yet.
+            crate::remote_client::RemoteLedgerError::NotFound(msg)
+                if !req.merged_commits.is_empty() =>
+            {
+                CliError::Config(format!(
+                    "push failed: the remote answered 404 for a push containing a merge \
+                     ({msg}). It advertises support for such pushes. A node serving the \
+                     request may still run an earlier release."
+                ))
+            }
+            e => CliError::Config(format!("push failed: {e}")),
+        })
+}
+
 /// Push a ledger to its upstream remote
 pub async fn run_push(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> {
     let ledger_id = context::resolve_ledger(ledger, dirs)?;
-    let ledger_id = context::to_ledger_id(&ledger_id);
+    let ledger_id = context::to_ledger_id(&ledger_id)?;
 
     let config_store = TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
     let upstream = config_store
@@ -666,7 +836,7 @@ pub async fn run_push(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> {
         .and_then(|s| s.parse().ok());
 
     // Resolve local head.
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let local_ref = fluree
         .nameservice_mode()
         .get_ref(&ledger_id, RefKind::CommitHead)
@@ -681,7 +851,6 @@ pub async fn run_push(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> {
         )));
     }
 
-    // Collect commits to push (oldest -> newest), ensuring the remote head is in our history.
     let local_head_cid = local_ref.id.clone().ok_or_else(|| {
         CliError::Config(format!(
             "local ledger '{ledger_id}' has no commit head; nothing to push"
@@ -696,95 +865,36 @@ pub async fn run_push(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> {
         .await
         .map_err(|e| CliError::Config(format!("failed to build branched store: {e}")))?;
 
-    let mut to_push_cids: Vec<fluree_db_core::ContentId> = Vec::new();
+    let base = remote_base(
+        content_store.as_ref(),
+        &local_head_cid,
+        remote_t,
+        remote_commit_id,
+    )
+    .await?;
+    let plan = fluree_db_core::plan_commit_transfer(
+        content_store.as_ref(),
+        &local_head_cid,
+        base.as_ref(),
+    )
+    .await
+    .map_err(|e| CliError::Config(e.to_string()))?
+    .ok_or_else(|| {
+        CliError::Config(format!(
+            "cannot push: histories diverged at t={remote_t} \
+             (the remote head is not on this branch's line of commits). Pull first."
+        ))
+    })?;
 
-    // trace_commit_envelopes_by_id yields commits where t > stop_at_t (exclusive
-    // of stop_at_t), so when local_t == remote_t the stream yields nothing —
-    // that means there is nothing to push and we should short-circuit.
-    let mut found_base = local_ref.t == remote_t || (remote_t == 0 && remote_commit_id.is_none());
-
-    if !found_base {
-        let stream = fluree_db_core::trace_commit_envelopes_by_id(
-            content_store.clone(),
-            local_head_cid.clone(),
-            remote_t,
-        );
-        futures::pin_mut!(stream);
-        while let Some(item) = stream.next().await {
-            let (cid, env) = item.map_err(|e| CliError::Config(e.to_string()))?;
-            if env.t > remote_t {
-                to_push_cids.push(cid);
-            }
-        }
-
-        // Verify chain continuity: the oldest local commit we want to push
-        // should have a previous_id that matches the remote's commitId.
-        // If the remote didn't provide commitId, we trust t-based matching.
-        if let Some(remote_cid) = remote_commit_id.as_ref() {
-            if let Some(oldest_cid) = to_push_cids.last() {
-                let oldest_env =
-                    fluree_db_core::load_commit_envelope_by_id(&content_store, oldest_cid)
-                        .await
-                        .map_err(|e| CliError::Config(e.to_string()))?;
-                if !oldest_env.parent_ids().any(|id| id == remote_cid) {
-                    return Err(CliError::Config(format!(
-                        "cannot push: histories diverged at t={remote_t} \
-                         (remote head != local history). Pull first."
-                    )));
-                }
-            }
-        }
-
-        found_base = !to_push_cids.is_empty();
-    }
-
-    if !found_base {
-        return Err(CliError::Config(
-            "cannot push: remote head not found in local history. Pull first.".into(),
-        ));
-    }
-
-    if to_push_cids.is_empty() {
+    if plan.lineage.is_empty() {
         println!("{} '{}' is already up to date", "✓".green(), ledger_id);
         context::persist_refreshed_tokens(&client, upstream.remote.as_str(), dirs).await;
         return Ok(());
     }
 
-    to_push_cids.reverse(); // oldest -> newest
-
-    // Build request: commit bytes + any referenced txn blobs.
-    let mut commits = Vec::with_capacity(to_push_cids.len());
-    let mut blobs: std::collections::HashMap<String, fluree_db_api::Base64Bytes> =
-        std::collections::HashMap::new();
-
-    for cid in &to_push_cids {
-        use fluree_db_core::ContentStore;
-        let bytes = content_store
-            .get(cid)
-            .await
-            .map_err(|e| CliError::Config(format!("failed to read local commit {cid}: {e}")))?;
-        let commit = fluree_db_core::commit::codec::read_commit(&bytes)
-            .map_err(|e| CliError::Config(format!("failed to decode local commit {cid}: {e}")))?;
-        commits.push(fluree_db_api::Base64Bytes(bytes));
-
-        if let Some(txn_cid) = &commit.txn {
-            let txn_key = txn_cid.to_string();
-            if let std::collections::hash_map::Entry::Vacant(e) = blobs.entry(txn_key.clone()) {
-                let txn_bytes = content_store.get(txn_cid).await.map_err(|e| {
-                    CliError::Config(format!(
-                        "commit references txn blob '{txn_key}' but it is not readable locally: {e}"
-                    ))
-                })?;
-                e.insert(fluree_db_api::Base64Bytes(txn_bytes));
-            }
-        }
-    }
-
-    let req = fluree_db_api::PushCommitsRequest { commits, blobs };
-    let resp = client
-        .push_commits(remote_ledger_id, &req)
-        .await
-        .map_err(|e| CliError::Config(format!("push failed: {e}")))?;
+    ensure_merges_supported(&client, &plan).await?;
+    let req = build_push_request(content_store.as_ref(), &plan).await?;
+    let resp = send_push(&client, remote_ledger_id, &req).await?;
 
     println!(
         "{} '{}' pushed {} commit(s) (new head t={})",
@@ -812,9 +922,10 @@ pub async fn run_publish(
     dirs: &FlureeDir,
 ) -> CliResult<()> {
     let ledger_id = context::resolve_ledger(explicit_ledger, dirs)?;
-    let ledger_id = context::to_ledger_id(&ledger_id);
+    let ledger_id = context::to_ledger_id(&ledger_id)?;
     let remote_ledger_id = remote_ledger_name
         .map(context::to_ledger_id)
+        .transpose()?
         .unwrap_or_else(|| ledger_id.clone());
 
     // Resolve remote config.
@@ -842,6 +953,36 @@ pub async fn run_publish(
         remote_name.cyan(),
         remote_ledger_id.cyan(),
     );
+
+    // Resolve local head.
+    let fluree = context::build_fluree(dirs).await?;
+    let local_ref = fluree
+        .nameservice_mode()
+        .get_ref(&ledger_id, RefKind::CommitHead)
+        .await
+        .map_err(|e| CliError::Config(e.to_string()))?
+        .ok_or_else(|| CliError::NotFound(format!("local ledger '{ledger_id}' not found")))?;
+
+    let local_head_cid = local_ref.id.clone().ok_or_else(|| {
+        CliError::Config(format!(
+            "local ledger '{ledger_id}' has no commits; nothing to publish"
+        ))
+    })?;
+
+    // Walking to genesis on a branched ledger always crosses the fork point,
+    // so we need the branch-aware store to resolve pre-fork ancestors.
+    let content_store = fluree
+        .branched_content_store(&ledger_id)
+        .await
+        .map_err(|e| CliError::Config(format!("failed to build branched store: {e}")))?;
+
+    // Planned before the remote ledger is created, so a remote that cannot
+    // take this history is refused before anything is written to it.
+    let plan = fluree_db_core::plan_commit_transfer(content_store.as_ref(), &local_head_cid, None)
+        .await
+        .map_err(|e| CliError::Config(e.to_string()))?
+        .expect("every line reaches genesis when there is no base");
+    ensure_merges_supported(&client, &plan).await?;
 
     // Check if remote ledger already exists.
     let remote_exists = client
@@ -881,85 +1022,9 @@ pub async fn run_publish(
         );
     }
 
-    // Resolve local head.
-    let fluree = context::build_fluree(dirs)?;
-    let local_ref = fluree
-        .nameservice_mode()
-        .get_ref(&ledger_id, RefKind::CommitHead)
-        .await
-        .map_err(|e| CliError::Config(e.to_string()))?
-        .ok_or_else(|| CliError::NotFound(format!("local ledger '{ledger_id}' not found")))?;
-
-    let local_head_cid = local_ref.id.clone().ok_or_else(|| {
-        CliError::Config(format!(
-            "local ledger '{ledger_id}' has no commits; nothing to publish"
-        ))
-    })?;
-
-    // Walk the full commit chain (oldest → newest). Walking to genesis on
-    // a branched ledger always crosses the fork point, so we need the
-    // branch-aware store to resolve pre-fork ancestors.
-    let content_store = fluree
-        .branched_content_store(&ledger_id)
-        .await
-        .map_err(|e| CliError::Config(format!("failed to build branched store: {e}")))?;
-
-    let mut to_push_cids: Vec<fluree_db_core::ContentId> = Vec::new();
-    {
-        let stream = fluree_db_novelty::trace_commit_envelopes_by_id(
-            content_store.clone(),
-            local_head_cid.clone(),
-            0, // walk all the way to genesis
-        );
-        futures::pin_mut!(stream);
-        while let Some(item) = stream.next().await {
-            let (cid, _env) = item.map_err(|e| CliError::Config(e.to_string()))?;
-            to_push_cids.push(cid);
-        }
-    }
-
-    if to_push_cids.is_empty() {
-        println!("{} '{}' has no commits to publish", "✓".green(), ledger_id);
-        return Ok(());
-    }
-
-    to_push_cids.reverse(); // oldest → newest
-
-    // Build push request: commit bytes + txn blobs.
-    let mut commits = Vec::with_capacity(to_push_cids.len());
-    let mut blobs: std::collections::HashMap<String, fluree_db_api::Base64Bytes> =
-        std::collections::HashMap::new();
-
-    for cid in &to_push_cids {
-        use fluree_db_core::ContentStore;
-        let bytes = content_store
-            .get(cid)
-            .await
-            .map_err(|e| CliError::Config(format!("failed to read local commit {cid}: {e}")))?;
-        let commit = fluree_db_core::commit::codec::read_commit(&bytes)
-            .map_err(|e| CliError::Config(format!("failed to decode local commit {cid}: {e}")))?;
-        commits.push(fluree_db_api::Base64Bytes(bytes));
-
-        if let Some(txn_cid) = &commit.txn {
-            let txn_key = txn_cid.to_string();
-            if let std::collections::hash_map::Entry::Vacant(e) = blobs.entry(txn_key.clone()) {
-                let txn_bytes = content_store.get(txn_cid).await.map_err(|e| {
-                    CliError::Config(format!(
-                        "commit references txn blob '{txn_key}' but it is not readable locally: {e}"
-                    ))
-                })?;
-                e.insert(fluree_db_api::Base64Bytes(txn_bytes));
-            }
-        }
-    }
-
-    eprint!("  Pushing {} commit(s)...\r", commits.len());
-
-    let req = fluree_db_api::PushCommitsRequest { commits, blobs };
-    let resp = client
-        .push_commits(&remote_ledger_id, &req)
-        .await
-        .map_err(|e| CliError::Config(format!("push failed: {e}")))?;
+    let req = build_push_request(content_store.as_ref(), &plan).await?;
+    eprint!("  Pushing {} commit(s)...\r", req.commits.len());
+    let resp = send_push(&client, &remote_ledger_id, &req).await?;
 
     // Configure upstream tracking.
     use fluree_db_nameservice_sync::UpstreamConfig;
@@ -1007,8 +1072,8 @@ pub async fn run_clone(
     no_txns: bool,
     dirs: &FlureeDir,
 ) -> CliResult<()> {
-    let ledger_id = context::to_ledger_id(ledger);
-    let local_id = alias.map_or_else(|| ledger_id.clone(), context::to_ledger_id);
+    let ledger_id = context::to_ledger_id(ledger)?;
+    let local_id = alias.map_or_else(|| Ok(ledger_id.clone()), context::to_ledger_id)?;
 
     // Clone aliasing is supported: commits use CID-based references (not
     // storage addresses), so the local ledger ID can differ from the remote.
@@ -1068,7 +1133,7 @@ pub async fn run_clone(
     }
 
     // Create the local ledger.
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let storage = fluree
         .backend()
         .admin_storage_cloned()
@@ -1236,7 +1301,7 @@ pub async fn run_clone(
         let mut cursor: Option<String> = None;
         loop {
             let page = client
-                .fetch_commits(&ledger_id, cursor.as_deref(), 500)
+                .fetch_commits(&ledger_id, cursor.as_deref(), None, 500)
                 .await
                 .map_err(|e| {
                     let msg = e.to_string();
@@ -1345,8 +1410,8 @@ pub async fn run_clone_origin(
     no_txns: bool,
     dirs: &FlureeDir,
 ) -> CliResult<()> {
-    let ledger_id = context::to_ledger_id(ledger);
-    let local_id = alias.map_or_else(|| ledger_id.clone(), context::to_ledger_id);
+    let ledger_id = context::to_ledger_id(ledger)?;
+    let local_id = alias.map_or_else(|| Ok(ledger_id.clone()), context::to_ledger_id)?;
 
     // 1. Build bootstrap fetcher from the single origin URI.
     let mut fetcher = MultiOriginFetcher::from_bootstrap(origin_uri, token.map(String::from));
@@ -1386,7 +1451,7 @@ pub async fn run_clone_origin(
     }
 
     // 4. Create the local ledger.
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let storage = fluree
         .backend()
         .admin_storage_cloned()
@@ -1579,16 +1644,37 @@ pub async fn run_clone_origin(
             if !no_txns {
                 if let Some(txn_cid) = &envelope.txn {
                     if !content_store.has(txn_cid).await.unwrap_or(false) {
-                        let txn_bytes = fetcher.fetch(txn_cid, &ledger_id).await.map_err(|e| {
-                            CliError::Config(format!("clone failed (fetch txn blob): {e}"))
-                        })?;
-                        // Txn blobs use full-bytes SHA-256, so put_with_id is safe.
-                        content_store
-                            .put_with_id(txn_cid, &txn_bytes)
-                            .await
-                            .map_err(|e| {
-                                CliError::Config(format!("clone failed (store txn blob): {e}"))
-                            })?;
+                        // A txn blob the origin does not HAVE is a provenance
+                        // gap on the source, not a reason to abandon the
+                        // clone — the commit itself carries the flakes. Only
+                        // a genuine all-origins 404 is tolerated: an auth
+                        // failure, a 5xx, a network blip, or an integrity
+                        // failure still aborts, so a transient fault can't
+                        // masquerade as a provenance gap.
+                        match fetcher.fetch(txn_cid, &ledger_id).await {
+                            Ok(txn_bytes) => {
+                                // Txn blobs use full-bytes SHA-256, so put_with_id is safe.
+                                content_store
+                                    .put_with_id(txn_cid, &txn_bytes)
+                                    .await
+                                    .map_err(|e| {
+                                        CliError::Config(format!(
+                                            "clone failed (store txn blob): {e}"
+                                        ))
+                                    })?;
+                            }
+                            Err(fluree_db_nameservice_sync::SyncError::NotFound(_)) => {
+                                eprintln!(
+                                    "  warning: commit t={} references txn blob {txn_cid} which no origin has; continuing without it",
+                                    envelope.t
+                                );
+                            }
+                            Err(e) => {
+                                return Err(CliError::Config(format!(
+                                    "clone failed (fetch txn blob {txn_cid}): {e}"
+                                )));
+                            }
+                        }
                     }
                 }
             }
@@ -1703,7 +1789,7 @@ async fn run_pull_via_origins(
     no_indexes: bool,
     dirs: &FlureeDir,
 ) -> CliResult<()> {
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let storage = fluree
         .backend()
         .admin_storage_cloned()
@@ -2034,4 +2120,67 @@ async fn run_pull_via_origins(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_api::{Base64Bytes, ExportCommitsResponse};
+    use fluree_db_core::{Commit, ContentId, ContentKind};
+
+    /// Commit bytes at `t`, distinct per `tag`.
+    fn commit(t: i64, tag: &str) -> Base64Bytes {
+        let parent = ContentId::new(ContentKind::Commit, tag.as_bytes());
+        let commit = Commit::new(t, Vec::new()).with_parent(parent);
+        let written = fluree_db_core::commit::codec::write_commit(&commit, false, None).unwrap();
+        Base64Bytes(written.bytes)
+    }
+
+    fn page(
+        commits: Vec<Base64Bytes>,
+        merged_commits: Vec<Base64Bytes>,
+        lineage: bool,
+    ) -> ExportCommitsResponse {
+        ExportCommitsResponse {
+            ledger: "mydb:main".to_string(),
+            head_commit_id: ContentId::new(ContentKind::Commit, b"head"),
+            head_t: 0,
+            count: commits.len(),
+            commits,
+            blobs: Default::default(),
+            missing_blobs: Vec::new(),
+            newest_t: 0,
+            oldest_t: 0,
+            next_cursor_id: None,
+            effective_limit: 100,
+            lineage,
+            merged_commits,
+        }
+    }
+
+    #[test]
+    fn pull_import_set_orders_lineage_pages_oldest_first() {
+        let (c2, c3, c4) = (commit(2, "c2"), commit(3, "c3"), commit(4, "c4"));
+        let (a, b) = (commit(7, "a"), commit(8, "b"));
+        // Fetched newest first. `b` was brought in by merges on both pages.
+        let pages = [
+            page(vec![c4.clone(), c3.clone()], vec![b.clone()], true),
+            page(vec![c2.clone()], vec![a.clone(), b.clone()], true),
+        ];
+
+        let (to_import, merged) = pull_import_set(&pages, 1).unwrap();
+        assert_eq!(to_import, [c2, c3, c4]);
+        // The older page's commits come first, and `b` is kept once.
+        assert_eq!(merged, [a, b]);
+    }
+
+    #[test]
+    fn pull_import_set_drops_known_commits_from_the_default_export() {
+        let (c1, c2, c3) = (commit(1, "c1"), commit(2, "c2"), commit(3, "c3"));
+        let pages = [page(vec![c3.clone(), c2.clone(), c1], Vec::new(), false)];
+
+        let (to_import, merged) = pull_import_set(&pages, 1).unwrap();
+        assert_eq!(to_import, [c2, c3]);
+        assert!(merged.is_empty());
+    }
 }

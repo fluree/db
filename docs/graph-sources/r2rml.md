@@ -26,7 +26,7 @@ If you use **Direct S3** mode, Fluree resolves the current Iceberg metadata by r
 ```rust
 use fluree_db_api::{FlureeBuilder, R2rmlCreateConfig};
 
-let fluree = FlureeBuilder::default().build().await?;
+let fluree = FlureeBuilder::file("/path/to/data").build_async().await?;
 
 let config = R2rmlCreateConfig::new_direct(
     "airlines-rdf",
@@ -263,17 +263,24 @@ WHERE {
 
 ## Combining with Fluree Data
 
-Join Iceberg data with Fluree ledgers:
+Join Iceberg data with Fluree ledgers by naming the graph source in
+`fromNamed` (SPARQL: `FROM NAMED`) and reading it inside a `graph` block. A
+graph source cannot share the default graph with a ledger; such a query is
+refused.
 
 ```json
 {
-  "from": ["products:main", "warehouse-inventory:main"],
+  "from": "products:main",
+  "fromNamed": "warehouse-inventory:main",
   "select": ["?productName", "?stockLevel"],
   "where": [
     { "@id": "?product", "schema:name": "?productName" },
     { "@id": "?product", "ex:sku": "?sku" },
-    { "@id": "?inventory", "ex:sku": "?sku" },
-    { "@id": "?inventory", "ex:stockLevel": "?stockLevel" }
+    ["graph", "warehouse-inventory:main", {
+      "@id": "?inventory",
+      "ex:sku": "?sku",
+      "ex:stockLevel": "?stockLevel"
+    }]
   ]
 }
 ```
@@ -344,11 +351,49 @@ Query Iceberg tables containing large-scale analytical data alongside Fluree led
 
 A single R2RML mapping file can define multiple `TriplesMap` entries, each targeting a different Iceberg table or logical view. This enables querying across related tables through a single graph source.
 
+## Materializing a Native Twin
+
+An R2RML graph source is *virtual* — every query re-reads the underlying tables. To snapshot it into a native, fully-indexed Fluree ledger (a *twin*), use [`fluree materialize`](../cli/materialize.md). The twin bulk-materializes every triple the mapping produces (foreign keys resolved into RDF references), stamps the mapping hash and per-table Iceberg watermark into its final commit, and verifies itself against the source before it is announced. See [Iceberg → Materializing a native twin](iceberg.md#materializing-a-native-twin) for the stamp/watermark contract and verification modes.
+
 ## Limitations
 
 1. **Read-Only:** R2RML graph sources are read-only (no writes via Fluree)
 2. **Performance:** Complex joins across Fluree + Iceberg may be slow
 3. **Schema Changes:** Requires mapping updates when referenced columns change
+4. **No index-walking query patterns (fail-closed):** Property-path quantifiers
+   (`p+`, `p*`, `p?`, and quantified combinations like `^p+` or `(a|b)+`),
+   `shortestPath`, and subqueries cannot be evaluated over a mapped source — it
+   has no native index for them to walk. A query using one is **refused** with
+   HTTP 400 `err:db/InvalidQuery` naming the pattern, rather than returning the
+   empty result it would otherwise produce as a success. Fixed-length patterns
+   (`p`, `p/p`, …) and unquantified `a|b` / `^p` lower to table scans and run
+   normally. Over a SQL source, a sub-`SELECT` the
+   [pushdown lane](sql.md#the-pushdown-lane-one-statement-per-block) admits
+   runs as a derived table of the block's statement; one it does not take is
+   refused the same way. See [Graph Sources Overview → Query Patterns a Graph
+   Source Cannot Evaluate](overview.md#query-patterns-a-graph-source-cannot-evaluate)
+   for the bounded workaround, or materialize a native twin (below) for
+   unbounded traversal.
+5. **One object map per predicate on a projected scan:** when a query names a
+   predicate, the scan reads the first `rr:predicateObjectMap` of the triples
+   map that carries it. A second predicate-object map for the same predicate
+   on the same map is not materialized there; give it its own triples map
+   (same table and subject template) if both values must come back.
+6. **Named-graph routing is a subset of R2RML, refused outside it:** a subject
+   map may carry one `rr:graph <iri>`, or one `rr:graphMap` with exactly one of
+   `rr:template`, `rr:column` or `rr:constant`; `rr:defaultGraph` names the
+   default graph, as in the spec. A mapping outside that subset fails to load
+   with an error naming the construct, rather than placing rows in the default
+   graph unannounced: several graph maps on one term map (cumulative in R2RML),
+   a graph map on a predicate-object map, a graph that is not an IRI, a graph
+   map with no value source or more than one, or an `rr:termType` other than
+   `rr:IRI`. Only
+   [materialization into a native ledger](iceberg.md#materialization-into-a-native-ledger)
+   honors the graph map today. The
+   [native twin](iceberg.md#materializing-a-native-twin) builder refuses a
+   mapping that carries one, since it would place every triple in the default
+   graph and its parity gate would not notice; the virtual query path still
+   reads everything from the default graph (tracked in #1607).
 
 ## Troubleshooting
 
@@ -397,4 +442,5 @@ A single R2RML mapping file can define multiple `TriplesMap` entries, each targe
 
 - [Graph Sources Overview](overview.md) - Graph source concepts
 - [Iceberg](iceberg.md) - Data lake integration
+- [materialize](../cli/materialize.md) - Build a native twin ledger from a mapping
 - [Query Datasets](../query/datasets.md) - Multi-graph queries

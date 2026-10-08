@@ -8,9 +8,10 @@
 
 use crate::service::FlureeMcpService;
 use fluree_db_memory::{
-    detect_git_branch_from, format_context_paged, format_json, format_related_memories,
-    format_status_text, MemoryFilter, MemoryInput, MemoryKind, MemoryStore, MemoryUpdate,
-    RecallEngine, Scope, SecretDetector, Severity, MAX_CONTENT_LENGTH,
+    audit_memories, detect_git_branch_from, format_audit_markdown, format_context_paged,
+    format_json, format_related_memories, format_status_text, AuditOptions, AuditScope,
+    MemoryFilter, MemoryInput, MemoryKind, MemoryStore, MemoryUpdate, RecallEngine, Scope,
+    SecretDetector, Severity, MAX_CONTENT_LENGTH,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
@@ -132,6 +133,20 @@ pub struct MemoryForgetRequest {
 /// (including Claude Code) to fail tool registration.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct MemoryStatusRequest {}
+
+/// Request parameters for the `memory_audit` tool.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct MemoryAuditRequest {
+    /// branch | all (default: branch)
+    #[schemars(
+        description = "branch (default: memories from this branch plus any that reference files it changed) or all"
+    )]
+    pub scope: Option<String>,
+
+    /// Base ref for the branch diff
+    #[schemars(description = "Base ref the branch is compared against (default: main)")]
+    pub base: Option<String>,
+}
 
 /// Request parameters for the `kg_query` tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -425,8 +440,15 @@ impl FlureeMcpService {
 
                 let has_more = next_score.is_some();
                 info!(query = %req.query, shown = page.len(), offset = offset, has_more = has_more, "Memory recall complete");
-                let context =
-                    format_context_paged(&page, offset, req.limit, all.len(), has_more, next_score);
+                let context = format_context_paged(
+                    &page,
+                    offset,
+                    req.limit,
+                    all.len(),
+                    has_more,
+                    next_score,
+                    store.repo_root(),
+                );
                 Ok(CallToolResult::success(vec![Content::text(context)]))
             }
             Err(e) => {
@@ -440,7 +462,7 @@ impl FlureeMcpService {
 
     /// Update an existing memory in place.
     #[tool(
-        description = "Patch an existing memory in place. Pass only the fields you want to change (content, tags, refs, rationale, alternatives) — omitted fields stay as-is. The memory keeps its ID. Git tracks history."
+        description = "Patch an existing memory in place. Pass only the fields you want to change (content, tags, refs, rationale, alternatives) — omitted fields stay as-is. The memory keeps its ID. Git tracks history. Every update stamps updatedAt, including a call that changes no field at all: that no-op is how you record \"I re-verified this memory against HEAD and it still holds\"."
     )]
     async fn memory_update(
         &self,
@@ -544,6 +566,76 @@ impl FlureeMcpService {
         }
     }
 
+    /// Audit the memory store against the hygiene rubric.
+    #[tool(
+        description = "Checkpoint audit of the memory store: flags progress/status narration, unportable paths and handles, over-cap content, bad tags, refs that no longer resolve or whose files changed after the memory did, and files this branch changed that no memory covers. Call it when an effort branch is about to be reviewed or merged — that is when effort notes must become durable memories or be retired. Read-only; act on the findings with memory_update, memory_forget, and memory_add."
+    )]
+    async fn memory_audit(
+        &self,
+        Parameters(req): Parameters<MemoryAuditRequest>,
+        _context: rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let Some(store) = self.memory() else {
+            return Ok(memory_disabled());
+        };
+        if let Err(e) = ensure_initialized(store).await {
+            return Ok(init_error(&e));
+        }
+
+        let branch = detect_git_branch_from(store.memory_dir());
+        let scope = match req.scope.as_deref() {
+            Some("all") => AuditScope::All,
+            None | Some("branch") => match branch {
+                Some(b) => AuditScope::Branch(b),
+                // Detached HEAD or no repo — nothing to scope by, so audit
+                // everything rather than silently reporting an empty set.
+                None => AuditScope::All,
+            },
+            Some(other) => {
+                return Err(rmcp::ErrorData::invalid_params(
+                    format!("Invalid scope '{other}'. Valid: branch, all"),
+                    None,
+                ))
+            }
+        };
+
+        let Some(repo_root) = store.repo_root().map(std::path::Path::to_path_buf) else {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "Audit needs a file-backed memory store (`.fluree-memory/` in the project) to \
+                 resolve refs against."
+                    .to_string(),
+            )]));
+        };
+
+        match store.current_memories(&MemoryFilter::default()).await {
+            Ok(all) => {
+                let report = audit_memories(
+                    &all,
+                    Some(&repo_root),
+                    &AuditOptions {
+                        scope,
+                        base_ref: req.base,
+                    },
+                );
+                info!(
+                    scope = %report.scope,
+                    in_scope = report.entries.len(),
+                    total = report.total_memories,
+                    "Memory audit complete"
+                );
+                Ok(CallToolResult::success(vec![Content::text(
+                    format_audit_markdown(&report),
+                )]))
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to load memories for audit");
+                Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Failed to audit memories: {e}"
+                ))]))
+            }
+        }
+    }
+
     /// Execute a raw SPARQL query against the memory knowledge graph.
     #[tool(
         description = "Escape hatch: raw SPARQL against the memory graph (prefix `mem:` → https://ns.flur.ee/memory#). Prefer memory_recall for normal use. Classes: mem:Fact, mem:Decision, mem:Constraint."
@@ -642,5 +734,8 @@ pub(crate) const MEMORY_INSTRUCTIONS: &str =
        (e.g. 'indexer leaflet cache', 'sparql federation'). Use memory_status first if you don't \
        know what topics are stored.\n\
      - End of a task, when you learned something non-obvious: call memory_add.\n\
+     - PR-ready checkpoint (an effort branch about to be reviewed/merged): call memory_audit and \
+       reconcile — retire effort narration, update stale refs, capture durable residue. Effort \
+       notes become authoritative here, not later.\n\
      RECALL QUERIES must use specific topic words. Generic queries ('all', 'everything') return \
      nothing — BM25 needs content terms.";

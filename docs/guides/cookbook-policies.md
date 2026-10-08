@@ -94,7 +94,7 @@ fluree insert '{
       "f:required": true,
       "f:onProperty": [{"@id": "ex:salary"}],
       "f:action": [{"@id": "f:view"}],
-      "f:query": "{\"where\": {\"@id\": \"?$identity\", \"http://example.org/user\": {\"@id\": \"?$subject\"}, \"http://example.org/role\": \"manager\", \"http://example.org/department\": \"?dept\"}, \"$where\": {\"@id\": \"?$this\", \"http://example.org/department\": \"?dept\"}}"
+      "f:query": "{\"where\": [{\"@id\": \"?$identity\", \"http://example.org/role\": \"manager\", \"http://example.org/department\": \"?dept\"}, {\"@id\": \"?$this\", \"http://example.org/department\": \"?dept\"}]}"
     },
     {
       "@id": "ex:default-view",
@@ -188,11 +188,13 @@ A default-allow policy with no targeting applies to every flake.
   "@type": ["f:AccessPolicy", "ex:CorpPolicy"],
   "f:required": true,
   "f:action": [{"@id": "f:view"}, {"@id": "f:modify"}],
-  "f:query": "{\"where\": {\"@id\": \"?$identity\", \"http://example.org/user\": {\"@id\": \"?$user\"}}, \"$where\": {\"@id\": \"?$this\", \"http://example.org/owner\": {\"@id\": \"?$user\"}}}"
+  "f:query": "{\"where\": [{\"@id\": \"?$identity\", \"http://example.org/user\": {\"@id\": \"?user\"}}, {\"@id\": \"?$this\", \"http://example.org/owner\": {\"@id\": \"?user\"}}]}"
 }
 ```
 
 The query resolves `?$identity → user`, then checks that `?$this` (the entity being read or written) has that user as its `ex:owner`.
+
+> **Correlation lives in one `where`.** `f:query` takes a single `where` — an object, or an array of patterns joined by shared variables. The pattern that mentions `?$this` must appear *inside* that `where`, sharing a variable (here `?user`) with the identity pattern. There is no second clause key: an unrecognized key in the query is silently ignored, and a policy whose `where` never constrains `?$this` matches every flake — it silently allows everything it was meant to restrict. Verify with `--track-policy` (direct/local execution): the `allowed/evaluated` counts expose an uncorrelated policy immediately.
 
 ### Property redaction (hide a property unless permitted)
 
@@ -240,7 +242,7 @@ Anyone querying for `ex:Employee` instances must themselves be tagged as an empl
   "@type": ["f:AccessPolicy", "ex:CorpPolicy"],
   "f:required": true,
   "f:action": [{"@id": "f:view"}, {"@id": "f:modify"}],
-  "f:query": "{\"where\": {\"@id\": \"?$identity\", \"http://example.org/tenant\": \"?tenant\"}, \"$where\": {\"@id\": \"?$this\", \"http://example.org/tenant\": \"?tenant\"}}"
+  "f:query": "{\"where\": [{\"@id\": \"?$identity\", \"http://example.org/tenant\": \"?tenant\"}, {\"@id\": \"?$this\", \"http://example.org/tenant\": \"?tenant\"}]}"
 }
 ```
 
@@ -254,7 +256,7 @@ Each tenant only sees and writes data tagged with their own `ex:tenant`. Require
   "@type": ["f:AccessPolicy", "ex:CorpPolicy"],
   "f:onClass": [{"@id": "schema:Person"}],
   "f:action": [{"@id": "f:view"}],
-  "f:query": "{\"where\": {\"@id\": \"?$identity\", \"http://example.org/user\": {\"@id\": \"?$mgr\"}}, \"$where\": {\"@id\": \"?$this\", \"http://example.org/reportsTo\": {\"@id\": \"?$mgr\"}}}"
+  "f:query": "{\"where\": [{\"@id\": \"?$identity\", \"http://example.org/user\": {\"@id\": \"?mgr\"}}, {\"@id\": \"?$this\", \"http://example.org/reportsTo\": {\"@id\": \"?mgr\"}}]}"
 }
 ```
 
@@ -282,7 +284,7 @@ When multiple policies match a flake:
 - If no required policy applies, **any** allow is enough — Fluree uses *allow-overrides* over the non-required set.
 - If no policy applies, the request falls back to `default-allow`. Setting `default-allow: false` is the fail-closed default for production.
 
-See [Policy model and inputs](../security/policy-model.md#policy-combining-algorithm) for the full state diagram.
+See [Policy model and inputs](../security/policy-model.md#combining-algorithm) for the full state diagram.
 
 ## Invoking policies via HTTP
 
@@ -306,7 +308,22 @@ curl -X POST 'http://localhost:8090/v1/fluree/query?ledger=mydb:main' \
   }'
 ```
 
-### SPARQL (headers — no `opts` block in SPARQL)
+### SPARQL (pragmas or headers)
+
+SPARQL carries the same options as `# PRAGMA` comments in the query text (see
+[Request options](../query/sparql.md#request-options--pragma)). On an
+unauthenticated request they win over the headers below; on an authenticated one,
+a policy pragma may only repeat the selection the headers make:
+
+```sparql
+# PRAGMA identity: ex:aliceIdentity
+# PRAGMA policy-class: ex:CorpPolicy
+# PRAGMA default-allow: false
+PREFIX ex: <http://example.org/ns/>
+SELECT ?name WHERE { ?p <http://schema.org/name> ?name }
+```
+
+Or as headers:
 
 ```bash
 curl -X POST 'http://localhost:8090/v1/fluree/query?ledger=mydb:main' \

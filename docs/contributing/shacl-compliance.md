@@ -1,9 +1,11 @@
 # W3C SHACL Compliance Testing
 
 The `testsuite-shacl/` crate runs the official [W3C data-shapes test
-suite](https://github.com/w3c/data-shapes) (core section) against the SHACL
-engine, through the same `fluree_db_api::validate` core that powers
-`fluree validate` and the `/validate` HTTP endpoint.
+suite](https://github.com/w3c/data-shapes) (the `core` and `sparql`
+sections, as separate test fns `shacl_core_w3c_testsuite` /
+`shacl_sparql_w3c_testsuite`) against the SHACL engine, through the same
+`fluree_db_api::validate` core that powers `fluree validate` and the
+`/validate` HTTP endpoint.
 
 The crate is **excluded from the workspace** — `cd testsuite-shacl/` before
 running any cargo or make commands. The W3C tests are vendored as a git
@@ -70,7 +72,14 @@ Failures are expected in these areas (honest gaps, not harness bugs):
   `validation-reports/shared`).
 - Custom severity IRIs (`sh:severity ex:MySeverity`) collapse to
   `sh:Violation` (`severity-002`).
-- `sh:sparql` (the whole `sparql/` section of the suite is not wired in).
+- SPARQL-based constraint *components* (`sh:ConstraintComponent` /
+  `sh:validator` / `sh:parameter`) are not implemented — the whole
+  `sparql/component/` group fails, plus `pre-binding/unsupported-sparql-006`
+  (an ASK-validator test). `sh:sparql` itself IS implemented: the
+  `sparql/node/`, `sparql/property/`, and the rest of `sparql/pre-binding/`
+  pass.
+- `$shapesGraph` / `$currentShape` pre-bound variables (optional per spec)
+  raise a failure instead of validating (`pre-binding/shapesGraph-001`).
 - `complex/shacl-shacl` (validating shapes against the SHACL-SHACL meta
   shapes) depends on several of the above.
 

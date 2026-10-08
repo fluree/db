@@ -12,12 +12,14 @@ members = [
     "fluree-db-query",
     "fluree-db-sparql",
     "fluree-db-cypher",
+    "fluree-db-graphql",
     "fluree-db-nameservice",
     "fluree-db-novelty",
     "fluree-db-ledger",
     "fluree-db-transact",
     "fluree-db-binary-index",
     "fluree-db-indexer",
+    "fluree-db-stats",
     "fluree-db-spatial",
     "fluree-db-policy",
     "fluree-db-shacl",
@@ -27,26 +29,37 @@ members = [
     "fluree-db-storage-aws",
     "fluree-db-storage-ipfs",
     "fluree-db-iceberg",
+    "fluree-db-delta",
     "fluree-db-tabular",
     "fluree-db-r2rml",
+    "fluree-db-sql",
     "fluree-db-server",
+    "fluree-db-bolt",
     "fluree-db-peer",
     "fluree-sse",
     "fluree-db-nameservice-sync",
+    "fluree-db-browser",
     "fluree-search-protocol",
     "fluree-search-service",
     "fluree-search-httpd",
     "fluree-db-cli",
     "fluree-db-memory",
     "fluree-db-docs",
+    "fluree-db-doc",
     "fluree-db-mcp",
     "fluree-bench-support",
+    "fluree-bench-alloc",
+    "fluree-bench-virtual",
+    "fluree-test-support",
     "fluree-db-consensus",
+    "fluree-raft-core",
+    "fluree-db-wasm",
+    "fluree-db-python",
 ]
-exclude = ["testsuite-sparql", "testsuite-shacl", "scripts/local/load"]
+exclude = ["testsuite-sparql", "testsuite-shacl", "scripts/local/load", "fluree-sql-bridge"]
 
 [workspace.package]
-version = "4.1.1"
+version = "4.2.4-beta.1"
 edition = "2021"
 license = "BUSL-1.1"
 repository = "https://github.com/fluree/db"
@@ -63,6 +76,12 @@ thiserror = "1.0"
 # Used by fluree-db-novelty's current-state fact index.
 imbl = "3"
 winnow = "0.7"
+
+# GraphQL runtime (fluree-db-graphql): parse/validate/introspect/execute over a
+# schema built at runtime from ledger metadata. `default-features = false` drops
+# the multipart-upload (`tempfile`) and bundled GraphiQL (`askama`) features; the
+# `dynamic-schema` API is all this repo uses.
+async-graphql = { version = "7.2", default-features = false, features = ["dynamic-schema"] }
 indexmap = { version = "2", features = ["serde"] }
 
 # For content addressing and hashing
@@ -93,8 +112,8 @@ aws-config = "1.8.15"
 aws-sdk-s3 = "1.124.0"
 aws-sdk-dynamodb = "1.109.0"
 aws-sdk-sts = "1.101.0"
-aws-sdk-glue = "1.153.0"
-aws-sdk-s3tables = "1.59.0"
+aws-sdk-glue = "1.142.1"
+aws-sdk-s3tables = "1.54.0"
 aws-credential-types = "1.2"
 aws-smithy-types = "1.4.7"
 # HTTP/1.1-pinned transport for the S3 SDK. GCS's S3-interop endpoint negotiates
@@ -113,7 +132,11 @@ aws-smithy-http-client = { version = "1.1.12", default-features = false }
 hyper-rustls = { version = "0.24", default-features = false, features = ["http1", "native-tokio", "tls12"] }
 once_cell = "1.19"
 smallvec = "1.13"
-chrono = { version = "0.4", features = ["serde"] }
+# wasmbind only activates chrono's wasm32 cfg branch (js-sys/wasm-bindgen are
+# target-gated optional deps inside chrono); the native build is unchanged —
+# verified via cargo tree before/after. On wasm32-unknown-unknown it makes
+# Utc::now() read Date.now() instead of aborting in SystemTime::now().
+chrono = { version = "0.4", features = ["serde", "wasmbind"] }
 rand = "0.8"
 
 # System info for memory detection (cache sizing)
@@ -153,12 +176,35 @@ http = "1.1"
 http-body-util = "0.1"
 bytes = "1.4"
 
-# HTTP client for REST catalog (Iceberg)
-reqwest = { version = "0.12", default-features = false, features = [
-    "rustls-tls",
+# Shared HTTP client. Callers opt into form/query/stream/multipart as needed.
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
     "json",
 ] }
 urlencoding = "2"
+
+# Keep CLI and server telemetry on the same HTTP/SDK stack.
+tracing-opentelemetry = "0.33.0"
+opentelemetry = "0.32.0"
+# Both consumers use the Tokio batch processor, so export over async reqwest.
+# The default blocking client can panic when invoked from that async worker.
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = [
+    "trace",
+    "internal-logs",
+    "reqwest-client",
+] }
+opentelemetry_sdk = "0.32.1"
+
+# Document parsing engine (fluree-doc-parse). Pin by rev; bump
+# `fluree_db_doc::parse::DOC_PARSE_REV` in step so the parse cache invalidates.
+fluree-doc-model = { git = "https://github.com/fluree/fluree-doc-parse", rev = "407daa034aeca0de1a70a53eac7899d94c52bb5d" }
+fluree-doc-pdf = { git = "https://github.com/fluree/fluree-doc-parse", rev = "407daa034aeca0de1a70a53eac7899d94c52bb5d" }
+fluree-doc-markdown = { git = "https://github.com/fluree/fluree-doc-parse", rev = "407daa034aeca0de1a70a53eac7899d94c52bb5d" }
+fluree-doc-docx = { git = "https://github.com/fluree/fluree-doc-parse", rev = "407daa034aeca0de1a70a53eac7899d94c52bb5d" }
+fluree-doc-html = { git = "https://github.com/fluree/fluree-doc-parse", rev = "407daa034aeca0de1a70a53eac7899d94c52bb5d" }
+fluree-doc-pptx = { git = "https://github.com/fluree/fluree-doc-parse", rev = "407daa034aeca0de1a70a53eac7899d94c52bb5d" }
+hayro-syntax = "0.7"
+walkdir = "2"
 
 # JWT verification (standard OIDC JWT with JWKS support)
 jsonwebtoken = "9"
@@ -173,9 +219,13 @@ flate2 = "1"
 # Iceberg format support (manifest Avro, data Parquet)
 apache-avro = "0.21.0"
 # Parquet compression codecs. `snap` (Snappy) is the Spark/Hive default and `zstd`
-# is common; the Apache Iceberg Kafka Connect connector writes GZIP, which needs
-# `flate2`. Keep all enabled so Iceberg data files from any engine decode.
-parquet = { version = "54", default-features = false, features = ["zstd", "snap", "flate2"] }
+# is common; the Apache Iceberg Kafka Connect connector writes GZIP.
+# Select the same Rust flate2 backend used by Parquet 54 explicitly;
+# `flate2-rust_backened` is the upstream feature spelling in Parquet 58.
+parquet = { version = "58.4", default-features = false, features = ["zstd", "snap", "flate2-rust_backened"] }
+# Keep the Iceberg decoder aligned with the Delta Kernel experiment. The shared
+# tabular interface remains Arrow-free; consumers enable Arrow only when needed.
+arrow = { version = "58.4", default-features = false }
 
 # LRU cache for Parquet footers
 lru = "0.12"
@@ -235,6 +285,25 @@ strip = false
 codegen-units = 16
 opt-level = 2
 
+[profile.dev]
+split-debuginfo = "unpacked"
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
+
+# Browser artifact profile (`fluree-db-wasm`, `--target wasm32-unknown-unknown`).
+# Inert for every native build: profiles only apply when selected with
+# `--profile wasm-release`. Inherits release's fat LTO / strip / single
+# codegen unit; overrides opt-level because the shipped .wasm is download-
+# size-bound (see fluree-db-wasm/README.md for the measured level trade-off).
+[profile.wasm-release]
+inherits = "release"
+opt-level = "s"
+
+# openraft 0.9.25 + per-campaign election-timeout resampling (upstream
+# databendlabs/openraft#1838, on 0.10 only). 0.9 samples one timeout per
+# process, so two surviving voters can split every vote after a leader loss.
+# Drop this once a 0.9 release on crates.io carries the fix.
+[patch.crates-io]
+openraft = { git = "https://github.com/fluree/openraft", rev = "53f0341425c5ae6d82a0e454f554b77afc6c69e7" }

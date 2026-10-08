@@ -8,6 +8,7 @@ mod rest;
 mod table_identifier;
 
 pub use direct::DirectCatalogClient;
+pub use direct::{match_warehouse_table_dir, warehouse_dir_name};
 pub use rest::{RestCatalogClient, RestCatalogConfig};
 pub use table_identifier::{encode_namespace_for_rest, parse_table_identifier, TableIdentifier};
 

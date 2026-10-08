@@ -146,6 +146,11 @@ Temporal types:
 Additional types include:
 - **xsd:anyURI**: Web addresses and identifiers
 - **xsd:duration**: Time periods (ISO 8601 format)
+- **xsd:dayTimeDuration**, **xsd:yearMonthDuration**: The two `xsd:duration`
+  subtypes. Unlike `xsd:duration` these are totally ordered, so they sort and
+  compare. `xsd:dayTimeDuration` is also the type queries *produce* when
+  subtracting two temporal values — see
+  [Date/Time Arithmetic](../query/sparql.md#datetime-arithmetic).
 - **xsd:gYear**, **xsd:gMonth**, **xsd:gDay**: Partial date components
 
 ## RDF Datatypes
@@ -174,6 +179,8 @@ Beyond XSD, Fluree supports RDF-specific datatypes:
 
 **rdf:langString** represents strings with language tags. This is distinct from plain strings and enables language-aware queries.
 
+> **Matching a string literal in a query.** `"bob"`, `"bob"@en` and `"bob"@fr` are three different RDF terms. In SPARQL a constant object matches only its own term: `?s ex:name "bob"@en` returns just the English value, `?s ex:name "bob"` (an `xsd:string`) does not match tagged values, and a variable bound to a string joins only against its own term — the same language tag, or the same datatype, which holds for `xsd:anyURI`, `xsd:token` and customer-defined datatypes exactly as it does for `xsd:string`. In a JSON-LD query, `{"@value": "bob", "@language": "en"}` and `{"@value": "bob", "@type": "xsd:string"}` are likewise exact, while a bare JSON string **as a constant object** (`"ex:name": "bob"`) matches the lexical value under any string datatype or language tag. That leniency is specific to the constant-object position: the same bare string in a `values` cell is an `xsd:string` term and matches only `xsd:string` rows. An explicitly typed literal is exact for its datatype in both surfaces: `"25"^^xsd:int` (or `{"@value": "25", "@type": "xsd:int"}`) matches `xsd:int` rows only, not the same number stored as `xsd:long`, and `"25"^^xsd:integer` written out matches `xsd:integer` rows only. Bare numeric literals (`25`, `25.0`, and a JSON number in a JSON-LD query) are the one lenient form — they match an equal value under any numeric datatype, so `25` finds `xsd:integer`, `xsd:long`, `xsd:int` and `xsd:double` values alike. Language tags are case-insensitive (BCP 47) and are stored and compared in lowercase: `"chat"@FR` is written, matched, and returned by `LANG()` as `fr`.
+
 > **Annotating literal values.** Any literal — plain, typed, or language-tagged — can carry statement-level metadata (source, confidence, timestamp) via an edge annotation. Because a JSON scalar has no room for sibling keys, an annotated literal must be written in value-object form (`@value` plus `@annotation`); language-tagged annotations are language-pinned, so `"chat"@fr` and `"chat"@en` annotate independently. See [Edge annotations → Annotating literal-valued edges](edge-annotations.md#annotating-literal-valued-edges).
 
 ### JSON Data
@@ -193,6 +200,40 @@ Beyond XSD, Fluree supports RDF-specific datatypes:
 ```
 
 **rdf:JSON** stores JSON data as typed literals. This is useful for storing complex structured data that doesn't fit the RDF model.
+
+A JSON literal is stored in canonical form, per [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785). JSON-LD 1.1 requires this. Members are sorted by key, insignificant whitespace is dropped, and numbers are rendered as ECMAScript renders them.
+
+A literal's value is its text. Without canonical form, `{"a":1,"b":2}` and `{"b":2,"a":1}` would be two different facts. A delete, an upsert, or a merge that matched one would miss the other.
+
+Two consequences are worth knowing:
+
+- **A value reads back canonicalized, not as written.** Members come back in key order. A number written as `1.0` reads back as `1`. The JSON is the same. Only its spelling changes.
+- **Integers keep their exact value.** RFC 8785 treats every number as a double, which rounds integers past 2^53. Fluree keeps them exact instead.
+
+`@value` may be a JSON document or a string holding one. Either is canonicalized. A string that is not valid JSON is stored as written.
+
+Ledgers written before canonicalization keep the text their writers produced. Reindexing does not change that: it rebuilds the index from the commits, and the commits hold the original text. Those values stay readable, and new writes are canonical.
+
+Two things follow for a ledger with older values.
+
+- **Naming a value no longer matches it.** A literal in a `where`, a `delete`, or a `FILTER` is canonicalized before it is compared, so it misses a value stored under another spelling. Bind the value with a variable instead.
+- **Re-asserting a value can leave two of them.** An upsert writes the canonical spelling. If its delete names the old text, the delete misses and both spellings end up on the subject. Any duplicates the missing canonicalization already created stay as they are.
+
+Repair a subject by binding the old value and writing it back:
+
+```json
+{
+  "@context": {"ex": "http://example.org/ns/"},
+  "where": {"@id": "ex:config", "ex:items": "?old"},
+  "delete": {"@id": "ex:config", "ex:items": "?old"},
+  "insert": {
+    "@id": "ex:config",
+    "ex:items": {"@value": [{"name": "alpha", "qty": 1}], "@type": "@json"}
+  }
+}
+```
+
+The `where` clause binds every spelling on that property, so this collapses duplicates as well. History keeps the original text; only the current state changes. `fluree validate` finds the properties worth repairing wherever a shape constrains them.
 
 ### Geographic Data
 
@@ -276,6 +317,66 @@ Without this type annotation, strings are stored as plain `xsd:string` values an
 
 See [Inline Fulltext Search](../indexing-and-search/fulltext.md) for complete documentation.
 
+## Custom Datatypes
+
+Any IRI can serve as a datatype. A literal with a datatype Fluree does not
+recognize is stored with that datatype and returned exactly as written.
+
+```json
+{
+  "@context": {"unit": "http://example.org/unit/"},
+  "@id": "ex:room1",
+  "ex:area": {"@value": "42.5", "@type": "unit:SquareMetre"}
+}
+```
+
+In Turtle and SPARQL, use the `^^` syntax: `"42.5"^^unit:SquareMetre`.
+
+### Datatype Limit
+
+A ledger holds at most 16,369 distinct datatypes, plus 15 reserved ones that
+never count toward the limit. The reserved datatypes are `@id`,
+`xsd:string`, `xsd:boolean`, `xsd:integer`, `xsd:long`, `xsd:decimal`,
+`xsd:double`, `xsd:float`, `xsd:dateTime`, `xsd:date`, `xsd:time`,
+`rdf:langString`, `rdf:JSON`, `@vector`, and `@fulltext`. Every other
+datatype counts, including other XSD types such as `xsd:int` and
+`xsd:anyURI`.
+
+A datatype counts from the first write that uses it. It still counts after
+its data is retracted, because the index never releases a datatype's ID.
+
+A write that would pass the limit is refused, and the ledger is left
+unchanged:
+
+- Transactions and SPARQL updates fail with HTTP 422 and
+  `err:db/DatatypeLimitExceeded`. See [Common Errors](../troubleshooting/common-errors.md#datatype_limit_exceeded).
+- Pushed commits are refused with the same error.
+- A bulk import (`fluree create --from`) fails with a "datatype limit
+  exceeded" error.
+
+#### Upgrading and Downgrading
+
+Fluree 4.2.1 and earlier cannot index a ledger that holds more than 241
+non-reserved datatypes. Those releases still accept writes past that point,
+so such a ledger may already exist. Later releases index it with no
+migration.
+
+Rolling back to 4.2.1 or earlier affects any ledger that holds more than 241
+non-reserved datatypes. The older release can read the ledger's existing
+index, but its index builds can fail. When they do, new data stays in
+novelty, where queries are slower, and writes are refused once novelty
+reaches its size limit. Moving the ledger back to a newer release clears
+both.
+
+Vocabularies of units or currencies can define hundreds of datatypes. If
+data needs more distinct datatypes than the limit allows, record the unit
+in its own property instead of in the datatype:
+
+```turtle
+ex:room1 ex:area "42.5"^^xsd:decimal ;
+         ex:areaUnit unit:SquareMetre .
+```
+
 ## Type Coercion and Compatibility
 
 ### Automatic Type Promotion
@@ -300,6 +401,15 @@ When a filter compares values of incompatible types (e.g., a number and a string
 - **Ordering** (`<`, `<=`, `>`, `>=`) raises an error — ordering between incompatible types is undefined
 
 Numeric types (long, double, bigint, decimal) are mutually comparable via automatic promotion, so cross-numeric comparisons work as expected. Similarly, temporal types can be compared with string representations that parse to the same temporal type.
+
+### Text That Is Not a Value of Its Datatype
+
+A literal such as `"2024-02-30"^^xsd:date` or `"300"^^xsd:byte` names a
+built-in datatype but is not one of its values. JSON-LD transactions and
+SPARQL UPDATE reject it, naming the datatype in the error. Turtle
+transactions and bulk import keep it, as RDF allows: the literal is stored with
+its text and its datatype and reads back exactly as written, but it is not a
+date or a number, so it never equals one.
 
 ### Type Casting in Queries
 
@@ -328,7 +438,8 @@ WHERE {
    - String types support text search
 
 3. **Standards Alignment**: Use standard datatypes where possible
-   - Prefer XSD types over custom types
+   - Prefer XSD types over custom types; a ledger has a
+     [limit on distinct datatypes](#datatype-limit)
    - Use established vocabularies with well-defined ranges
 
 ### Type Consistency

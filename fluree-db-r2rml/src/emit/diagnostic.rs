@@ -30,6 +30,14 @@ pub enum DiagCode {
     NoSafeSubjectKey,
     /// A subject key was chosen but its uniqueness is unverifiable metadata-only.
     SubjectKeyUnverified,
+    /// No key-like column existed, so (under `SubjectStrategy::Auto`) a deterministic
+    /// composite subject over the row's columns was synthesized — every selected
+    /// table stays saveable, but the subject is neither unique nor an FK parent.
+    SubjectKeySynthesized,
+    /// A `*_KEY`/`*_ID`-named column was excluded from FK inference because its TYPE
+    /// is not key-like (not an integer or scale-0 decimal) — surfaced so the miss is
+    /// explainable instead of a silent drop before the name match.
+    NonKeyTypeSkipped,
     /// A `*_KEY`/`*_ID` column looks like an FK but resolves to no known PK — kept literal, no join fabricated.
     UnresolvedFkCandidate,
     /// A key column matched more than one candidate parent — kept literal, no join fabricated.

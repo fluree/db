@@ -1,0 +1,8 @@
+# q050 products_optional_supplier
+# Intent: OPTIONAL over a dims-only join (nullable supplier rating).
+# BI lineage (BI-23): "List current products with their supplier rating where known."
+# Predicates verified against enterprise.ttl — DimProduct: isCurrent, name, supplier; DimSupplier: rating.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?pn ?r
+WHERE { ?p a edw:Product ; edw:isCurrent true ; edw:name ?pn .
+        OPTIONAL { ?p edw:supplier ?s . ?s edw:rating ?r . } }

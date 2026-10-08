@@ -29,6 +29,11 @@ pub struct S3VendScope {
     /// Non-AWS endpoint override (LocalStack, MinIO), passed through to
     /// consumers.
     pub endpoint: Option<String>,
+    /// Path-style addressing for the endpoint above, passed through to
+    /// consumers. Travels with `endpoint` because it is meaningless
+    /// without one, and an endpoint without it addresses virtual-hosted
+    /// — which a plain MinIO rejects.
+    pub force_path_style: Option<bool>,
 }
 
 impl S3VendScope {
@@ -65,6 +70,7 @@ impl S3VendScope {
                 .endpoint
                 .as_ref()
                 .map(std::string::ToString::to_string),
+            force_path_style: index.force_path_style,
         })
     }
 }
@@ -85,6 +91,10 @@ pub struct VendedS3Grant {
     pub region: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub endpoint: Option<String>,
+    /// Path-style addressing for `endpoint`. Optional and defaulted, so a
+    /// grant minted by an older server still deserializes.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub force_path_style: Option<bool>,
     /// Root key prefix to configure on the consumer's S3 storage
     /// (`S3StorageConfig.prefix`) so address→key mapping matches the origin.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -193,6 +203,7 @@ pub async fn mint_scoped_credentials(
         bucket: scope.bucket.clone(),
         region: region.to_string(),
         endpoint: scope.endpoint.clone(),
+        force_path_style: scope.force_path_style,
         key_prefix: scope.root_prefix.clone(),
         scoped_prefix,
     })
@@ -277,6 +288,7 @@ mod tests {
             bucket: "b".into(),
             region: "us-east-1".into(),
             endpoint: None,
+            force_path_style: None,
             key_prefix: Some("ledgers".into()),
             scoped_prefix: "ledgers/inventory".into(),
         };
@@ -285,5 +297,37 @@ mod tests {
         assert_eq!(back.bucket, "b");
         assert_eq!(back.key_prefix.as_deref(), Some("ledgers"));
         assert!(!json.contains("endpoint"), "None endpoint omitted: {json}");
+        assert!(
+            !json.contains("force_path_style"),
+            "None force_path_style omitted: {json}"
+        );
+    }
+
+    /// The MinIO knob rides the grant so a vended consumer addresses the
+    /// endpoint the same way the origin does. It must serialize when set,
+    /// and a grant minted before the field existed must still parse.
+    #[test]
+    fn grant_carries_path_style_and_tolerates_its_absence() {
+        let grant = VendedS3Grant {
+            access_key_id: "AKIA".into(),
+            secret_access_key: "secret".into(),
+            session_token: "token".into(),
+            expires_at_epoch_secs: 1_700_000_000,
+            bucket: "b".into(),
+            region: "us-east-1".into(),
+            endpoint: Some("http://minio:9000".into()),
+            force_path_style: Some(true),
+            key_prefix: None,
+            scoped_prefix: "inventory".into(),
+        };
+        let json = serde_json::to_string(&grant).unwrap();
+        let back: VendedS3Grant = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.force_path_style, Some(true));
+
+        let legacy = r#"{"access_key_id":"AKIA","secret_access_key":"secret",
+            "session_token":"token","expires_at_epoch_secs":1700000000,
+            "bucket":"b","region":"us-east-1","scoped_prefix":"inventory"}"#;
+        let old: VendedS3Grant = serde_json::from_str(legacy).expect("pre-field grant parses");
+        assert_eq!(old.force_path_style, None);
     }
 }

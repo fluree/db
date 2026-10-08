@@ -99,6 +99,7 @@ pub enum TokenKind {
     Percent,        // %
     Caret,          // ^
     PlusEq,         // +=
+    RegexEq,        // =~
     Pipe,           // |
     DashArrowRight, // ->
     LArrowDash,     // <-
@@ -236,6 +237,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::Percent => write!(f, "%"),
             TokenKind::Caret => write!(f, "^"),
             TokenKind::PlusEq => write!(f, "+="),
+            TokenKind::RegexEq => write!(f, "=~"),
             TokenKind::Pipe => write!(f, "|"),
             TokenKind::DashArrowRight => write!(f, "->"),
             TokenKind::LArrowDash => write!(f, "<-"),

@@ -1,12 +1,18 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_commit_identity.rs"]
+mod it_commit_identity;
 #[path = "it_event_time.rs"]
 mod it_event_time;
 #[path = "it_query_history_combinations.rs"]
 mod it_query_history_combinations;
 #[path = "it_query_history_range.rs"]
 mod it_query_history_range;
+#[path = "it_query_history_reasoning.rs"]
+mod it_query_history_reasoning;
+#[path = "it_query_history_sparql.rs"]
+mod it_query_history_sparql;
 #[path = "it_query_time_travel.rs"]
 mod it_query_time_travel;
 #[path = "it_query_time_travel_bgp.rs"]

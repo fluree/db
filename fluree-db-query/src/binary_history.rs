@@ -431,8 +431,22 @@ impl BinaryHistoryScanOperator {
         Ok(flakes)
     }
 
-    /// Wrap `self.pattern` to derive the same `IndexType` the inner
-    /// scan would have picked. Kept private to keep the ctor uniform.
+    /// Pick the `IndexType` used to order the unbounded overlay walk in
+    /// `collect_history_flakes`. Kept private to keep the ctor uniform.
+    ///
+    /// NOTE: this is *not* the index `BinaryScanOperator` would pick for the
+    /// same pattern. That operator applies two adjustments after
+    /// `IndexType::for_query` which are deliberately not replicated here:
+    /// the `Psot -> Post` promotion when object bounds are present, and the
+    /// broadening to `Opst` for any encodable constant object with an unbound
+    /// subject (`for_query` gates `Opst` on `o_is_ref`, but OPST holds every
+    /// object type — see `fluree-db-core/src/comparator.rs`).
+    ///
+    /// The divergence is safe here because the caller passes
+    /// `first = None, rhs = None, leftmost = true`, so the whole overlay is
+    /// yielded regardless of index — the choice only affects iteration order,
+    /// not which flakes are collected. Do not reuse this helper anywhere the
+    /// index narrows a range.
     fn inner_index(&self) -> IndexType {
         let s_bound = self.pattern.s_bound();
         let p_bound = self.pattern.p_bound();

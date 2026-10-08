@@ -5,9 +5,9 @@
 //! solution modifiers (ORDER BY, LIMIT, OFFSET), and update operations.
 
 use super::expr::Expression;
-use super::pattern::{GraphPattern, TriplePattern};
+use super::pattern::{GraphName, GraphPattern, TriplePattern};
 use super::term::{Iri, Var};
-use super::update::UpdateOperation;
+use super::update::UpdateRequest;
 use crate::span::SourceSpan;
 use std::sync::Arc;
 
@@ -36,7 +36,8 @@ impl SparqlAst {
     }
 }
 
-/// Fluree-specific directives extracted from comments.
+/// Fluree request options carried in `# PRAGMA name: value` comments — the
+/// SPARQL counterpart of a JSON-LD request's `opts`.
 ///
 /// Comments are identified by the lexer, so `#` inside string literals or
 /// IRIs is never treated as a directive. Pragmas keep the query text valid
@@ -44,11 +45,19 @@ impl SparqlAst {
 ///
 /// ```sparql
 /// # PRAGMA reasoning: owl2rl
+/// # PRAGMA max-fuel: 5000
 /// SELECT ?s WHERE { ?s a ex:Student }
 /// ```
 ///
-/// Unrecognized pragma names are ignored (they are comments); recognized
-/// pragmas with invalid values error during lowering.
+/// A comment whose first word is `PRAGMA` is a directive: an unknown name, a
+/// pragma that does not apply to the request form (a query option on an
+/// UPDATE, or the reverse), or a malformed value fails the parse. The
+/// reasoning values are the exception — collected verbatim and validated
+/// during lowering. When a pragma repeats, the last one wins.
+///
+/// Query behaviour (`reasoning*`, `include-system-facts`) is applied by
+/// lowering. The rest are request options the host applies, exactly where it
+/// applies the matching JSON-LD `opts` key or `fluree-*` header.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Pragmas {
     /// `# PRAGMA reasoning: <mode>[, <mode>...]` — per-query reasoning modes
@@ -58,9 +67,67 @@ pub struct Pragmas {
     /// `# PRAGMA reasoning-max-facts: <n>` — OWL2-RL materialization budget
     /// (max derived facts). Collected verbatim; validates during lowering.
     pub reasoning_max_facts: Option<String>,
+    /// `# PRAGMA reasoning-max-memory-mb: <n>` — materialization memory cap.
+    pub reasoning_max_memory_mb: Option<String>,
     /// `# PRAGMA reasoning-max-seconds: <n>` — OWL2-RL materialization budget
     /// (max wall-clock seconds). Collected verbatim; validates during lowering.
     pub reasoning_max_seconds: Option<String>,
+    /// `# PRAGMA include-system-facts: true` — surface the `f:reifies*`
+    /// edge-annotation encoding in variable-predicate scans (JSON-LD
+    /// `opts.includeSystemFacts`). Queries only.
+    pub include_system_facts: Option<bool>,
+    /// `# PRAGMA union-default-graph: true | false` — read the default graph
+    /// as the union of the ledger's graphs, or not, whatever the ledger's
+    /// `f:unionDefaultGraph` says (JSON-LD `opts.unionDefaultGraph`). Queries
+    /// only.
+    pub union_default_graph: Option<bool>,
+    /// `# PRAGMA meta: true | false | time, fuel, policy` — report tracking
+    /// metadata (JSON-LD `opts.meta`).
+    pub meta: Option<MetaPragma>,
+    /// `# PRAGMA max-fuel: <n>` — fail once this much fuel is spent; decimals
+    /// allowed (JSON-LD `opts.max-fuel`).
+    pub max_fuel: Option<f64>,
+    /// `# PRAGMA min-t: <t>` — wait until the ledger reaches `t` before
+    /// running (JSON-LD `opts.min-t`). Queries only.
+    pub min_t: Option<i64>,
+    /// `# PRAGMA identity: <iri>` — identity whose policies apply.
+    pub identity: Option<String>,
+    /// `# PRAGMA policy-class: <iri>[, <iri>...]` — policy classes to apply.
+    pub policy_class: Option<Vec<String>>,
+    /// `# PRAGMA policy-values: {"?var": ...}` — values bound into policy
+    /// queries, as a one-line JSON object.
+    pub policy_values: Option<serde_json::Map<String, serde_json::Value>>,
+    /// `# PRAGMA default-allow: true | false` — access when no policy matches.
+    pub default_allow: Option<bool>,
+    /// `# PRAGMA event-time: <RFC 3339 timestamp>` — the commit's event time,
+    /// for backdated loads (JSON-LD `opts.eventTime`). Updates only; the host
+    /// validates the timestamp.
+    pub event_time: Option<String>,
+    /// `# PRAGMA validation-mode: warn | reject` — requested SHACL posture,
+    /// lower-cased (JSON-LD `opts.validationMode`). Updates only.
+    pub validation_mode: Option<String>,
+    /// `# PRAGMA unique-properties: <iri>[, <iri>...]` — properties whose
+    /// values must be unique, for this transaction only (JSON-LD
+    /// `opts.uniqueProperties`). Updates only.
+    pub unique_properties: Option<Vec<String>>,
+}
+
+/// Which tracking metadata `# PRAGMA meta` asks for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MetaPragma {
+    pub time: bool,
+    pub fuel: bool,
+    pub policy: bool,
+}
+
+impl Pragmas {
+    /// Whether any policy-selection pragma is present.
+    pub fn has_policy_selection(&self) -> bool {
+        self.identity.is_some()
+            || self.policy_class.is_some()
+            || self.policy_values.is_some()
+            || self.default_allow.is_some()
+    }
 }
 
 /// The body of a SPARQL query (SELECT, CONSTRUCT, ASK, DESCRIBE, or UPDATE).
@@ -74,8 +141,10 @@ pub enum QueryBody {
     Ask(AskQuery),
     /// DESCRIBE query
     Describe(DescribeQuery),
-    /// SPARQL Update operation (INSERT DATA, DELETE DATA, DELETE WHERE, etc.)
-    Update(UpdateOperation),
+    /// SPARQL Update request: one or more `;`-separated operations
+    /// (INSERT DATA, DELETE DATA, DELETE WHERE, Modify, ...) sharing an
+    /// accumulating prologue. Zero operations = valid no-op request.
+    Update(UpdateRequest),
 }
 
 /// The query prologue containing BASE and PREFIX declarations.
@@ -516,6 +585,11 @@ impl ConstructQuery {
 pub struct ConstructTemplate {
     /// Triple patterns in the template
     pub triples: Vec<TriplePattern>,
+    /// The `GRAPH` block each triple sits in, parallel to `triples` (`None`:
+    /// outside any block). Empty when the template has no `GRAPH` blocks.
+    /// `GRAPH` in a CONSTRUCT template is an extension (as in Jena ARQ); it
+    /// makes the result a dataset.
+    pub graphs: Vec<Option<GraphName>>,
     /// Source span (including braces)
     pub span: SourceSpan,
 }
@@ -523,7 +597,21 @@ pub struct ConstructTemplate {
 impl ConstructTemplate {
     /// Create a new construct template.
     pub fn new(triples: Vec<TriplePattern>, span: SourceSpan) -> Self {
-        Self { triples, span }
+        Self {
+            triples,
+            graphs: Vec::new(),
+            span,
+        }
+    }
+
+    /// The `GRAPH` block `triples[i]` sits in.
+    pub fn graph(&self, i: usize) -> Option<&GraphName> {
+        self.graphs.get(i).and_then(Option::as_ref)
+    }
+
+    /// Whether any triple sits in a `GRAPH` block.
+    pub fn names_graphs(&self) -> bool {
+        self.graphs.iter().any(Option::is_some)
     }
 }
 
@@ -577,6 +665,9 @@ pub struct DescribeQuery {
     pub where_clause: Option<WhereClause>,
     /// Solution modifiers
     pub modifiers: SolutionModifiers,
+    /// Byte offset just after the describe targets: where a dataset clause
+    /// belongs when the query has neither one nor a WHERE clause to precede.
+    pub dataset_offset: usize,
     /// Source span
     pub span: SourceSpan,
 }
@@ -589,6 +680,7 @@ impl DescribeQuery {
             dataset: None,
             where_clause: None,
             modifiers: SolutionModifiers::new(),
+            dataset_offset: span.end,
             span,
         }
     }

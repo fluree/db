@@ -36,12 +36,15 @@ Available feature flags:
 - `credential` (default in server/CLI) - DID/JWS/VerifiableCredential support for signed queries and transactions
 - `shacl` (default in server/CLI) - SHACL constraint validation
 - `iceberg` (default in server/CLI) - Apache Iceberg/R2RML graph source support
+- `sql` (default in server/CLI) - SQL graph sources (R2RML over a Trino-protocol endpoint); implies `iceberg`
+- `delta` (default in server/CLI) - Delta Lake graph sources (R2RML over Delta tables); implies `iceberg`
+- `graphql` (default in server/CLI) - GraphQL over the schema derived from a ledger's data; implies `shacl`
 - `aws` - AWS-backed storage support (S3, storage-backed nameservice). Enables `FlureeBuilder::s3()` and S3-based JSON-LD configs.
 - `ipfs` - IPFS-backed storage via Kubo HTTP RPC
 - `vector` - Embedded vector similarity search (HNSW indexes via usearch)
 - `search-remote-client` - Remote search service client (HTTP client for remote BM25 and vector search services)
 - `aws-testcontainers` - Opt-in LocalStack-backed S3/DynamoDB tests (auto-start via testcontainers)
-- `full` - Convenience bundle: `native`, `credential`, `iceberg`, `shacl`, `ipfs`
+- `full` - Convenience bundle: `native`, `credential`, `iceberg`, `sql`, `shacl`, `ipfs`, `graphql` (excludes `delta`, `aws`, `vector`, `search-remote-client`)
 
 ## Quick Start
 
@@ -72,7 +75,7 @@ use fluree_db_api::{FlureeBuilder, Result};
 #[tokio::main]
 async fn main() -> Result<()> {
     // Use file-backed storage for persistence
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // Create a new ledger (or load an existing one)
     let ledger = fluree.create_ledger("mydb").await?;
@@ -84,6 +87,9 @@ async fn main() -> Result<()> {
 }
 ```
 
+`build_async()` replays the storage's write-ahead log without blocking the async runtime.
+`build()` builds the same instance from synchronous code that has entered a Tokio runtime (for example with `Runtime::enter`), replaying the log on the calling thread.
+
 ### Bulk import (high throughput)
 
 For initial ledger bootstraps (large Turtle or JSON-LD datasets), Fluree exposes a bulk import
@@ -94,7 +100,7 @@ use fluree_db_api::{FlureeBuilder, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // `chunks_dir` can be:
     // - a directory containing *.ttl, *.trig, or *.jsonld files (sorted lexicographically), OR
@@ -139,8 +145,16 @@ use fluree_db_api::{FlureeBuilder, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // LocalStack/MinIO: endpoint is required
+    // LocalStack: an endpoint override is enough.
     let fluree = FlureeBuilder::s3("my-bucket", "http://localhost:4566")
+        .build_client()
+        .await?;
+
+    // MinIO also needs path-style addressing: without it the SDK emits
+    // `http://my-bucket.minio:9000/key`, which a plain MinIO (no wildcard
+    // bucket-subdomain DNS) rejects.
+    let _minio = FlureeBuilder::s3("my-bucket", "http://minio:9000")
+        .s3_force_path_style(true)
         .build_client()
         .await?;
 
@@ -201,7 +215,8 @@ Connection node:
 - `primaryPublisher` (publisher node)
 
 Storage node:
-- File: `filePath`, `AES256Key`
+- Any storage: `AES256Key`, or `AES256Keys` + `AES256CurrentKey` (mutually exclusive; put the key on `indexStorage`)
+- File: `filePath`, `durability`
 - S3: `s3Bucket`, `s3Prefix`, `s3Endpoint`, `s3ReadTimeoutMs`, `s3WriteTimeoutMs`, `s3ListTimeoutMs`, `s3MaxRetries`, `s3RetryBaseDelayMs`, `s3RetryMaxDelayMs`, `s3MaxConcurrentRequests`
 
 Publisher node:
@@ -378,6 +393,44 @@ async fn main() -> Result<()> {
 }
 ```
 
+#### Parameters
+
+`params` binds variables to values: each named variable (`?name` or `$name`,
+the same variable) is replaced by its value wherever it appears — subqueries,
+`OPTIONAL`, `FILTER`s and update templates included — before the query is
+planned, so it runs exactly as if the value had been written inline. Values
+take the JSON-LD forms: a JSON string, number or boolean; `{"@id": iri}`;
+`{"@value": v, "@type": datatype}` (`"@type": "@id"` reads `v` as an IRI);
+`{"@value": s, "@language": tag}`; and an embedding vector as its numbers,
+`{"@value": [0.1, 0.2], "@type": "https://ns.flur.ee/db#embeddingVector"}`.
+IRIs are full IRIs — neither the query's `PREFIX`es nor a `@context` apply. A
+blank node is the `_:fdb-…` id a query returned for a stored node; any other
+label is refused, since written inline it would be a variable and match every
+node.
+
+```rust
+let params = json!({ "name": "Alice", "min": 21 });
+let result = fluree.graph("mydb:main")
+    .query()
+    .sparql("PREFIX schema: <http://schema.org/>
+             SELECT ?person WHERE { ?person schema:name $name ; schema:age ?age FILTER(?age > $min) }")
+    .params(params.as_object().unwrap().clone())
+    .execute_formatted()
+    .await?;
+```
+
+A projected parameter stays a column holding its value. A parameter the query
+never mentions is an error — its misspelt variable would otherwise be unbound
+and match everything — as is one the query assigns itself (`BIND`, `VALUES`,
+`AS`), one used inside a remote `SERVICE` (whose body is sent as written), and
+any parameter on a JSON-LD query. Without parameters nothing changes: the
+query is not rewritten at all.
+
+The same parameters go on `QueryExecutionOptions::with_params`,
+`Fluree::explain_sparql_with_params`, a transact builder's
+`sparql_update_with_params(sparql, &params)`, and
+`TxnOperation::SparqlUpdate(sparql, Some(params))`.
+
 ### Streaming Query Results (NDJSON)
 
 The buffered `.query()` paths above collect the whole result set into a
@@ -414,7 +467,7 @@ use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = Arc::new(FlureeBuilder::file("./data").build()?);
+    let fluree = Arc::new(FlureeBuilder::file("./data").build_async().await?);
 
     // Plan against a borrowed GraphDb, then move the owned LedgerState into the
     // spawned producer (GraphDb borrows the state, so plan first).
@@ -531,7 +584,7 @@ use fluree_db_api::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // Get a cached ledger handle
     let handle = fluree.ledger_cached("mydb:main").await?;
@@ -637,7 +690,80 @@ async fn main() -> Result<()> {
 }
 ```
 
-**Note:** `StagedGraph` currently supports querying only. Staging on top of a staged transaction and committing from a `StagedGraph` are not yet supported.
+`StagedGraph` is a read-only preview of one transaction. To stage several
+writes, read between them, and commit them as one commit, use a
+`Transaction`.
+
+### Multi-Write Transactions
+
+`Fluree::begin_transaction` opens a transaction at the ledger's current head.
+Each `stage` applies its write over the ones before it (an update's `WHERE`
+sees an earlier insert), and is validated as it is staged: a write that fails
+to parse, is denied by policy, or violates SHACL returns an error and is left
+out, and the transaction carries on without it. `db()` reads the staged state.
+`commit` writes everything as one commit, keeping only the net change: a fact
+one write adds and a later one removes is not committed. If another commit
+lands first, a transaction that was never read is re-based over it when they
+touched different subjects, and otherwise staged again on the new head, under
+the policy the ledger has then. One that was read through `db()` fails with
+`TransactError::CommitConflict` instead — its writes may rest on what it read —
+and should be run again. A write that fails to stage doesn't count as a read:
+if what you stage next depends on that error, read the transaction through
+`db()` first.
+
+```rust
+use fluree_db_api::{CommitOpts, FlureeBuilder, Result, TransactionOptions, TxnOperation};
+use serde_json::json;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await?;
+
+    let mut txn = fluree
+        .begin_transaction("mydb:main", TransactionOptions::default())
+        .await?;
+    txn.stage(TxnOperation::Insert(json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:alice", "ex:age": 30
+    })))
+    .await?;
+    txn.stage(TxnOperation::SparqlUpdate(
+        "PREFIX ex: <http://example.org/ns/> \
+         DELETE { ex:alice ex:age ?a } INSERT { ex:alice ex:age ?b } \
+         WHERE { ex:alice ex:age ?a BIND(?a + 1 AS ?b) }"
+            .into(),
+        None, // parameters
+    ))
+    .await?;
+
+    let staged = txn.db().await?; // alice is 31 here; the ledger is unchanged
+    let result = txn.commit(CommitOpts::default()).await?;
+    println!("committed t={}", result.receipt.t);
+    Ok(())
+}
+```
+
+`TransactionOptions` sets what the transaction runs under: `governance`
+checks every write against that policy; `tracking` accounts for fuel, time and
+policy across every operation, so a `max_fuel` limit bounds the transaction as
+a whole and the tally comes back with the commit; `index_config` sets the
+novelty limits the commit is held to. `stage_cypher(query, params)` stages a
+Cypher write alongside the other operations — its `MATCH` and `MERGE` see
+them — and returns the rows of its `RETURN`, if any. Receiving those rows
+counts as reading the transaction, as `db()` does. Dropping a `Transaction`
+discards it.
+
+`savepoint()` marks the operations staged so far, and `rollback_to(savepoint)`
+discards the ones after it. The operations before the savepoint are staged
+again, so values computed as they stage — `NOW()`, `UUID()`, `STRUUID()`, a
+SPARQL update's blank nodes — can change; JSON-LD, Turtle and Cypher blank
+nodes keep their identities. Rolling back past a savepoint discards it, and
+returning to it later is an error.
+
+`commit` commits on the process's own write path, as Bolt's explicit
+transactions do, so transactions are for local-commit deployments: a Raft or
+peer host must not offer them to its clients.
 
 ### Export Data
 
@@ -651,7 +777,7 @@ use std::fs::File;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // Export as Turtle to a file
     let file = File::create("backup.ttl").unwrap();
@@ -687,7 +813,7 @@ All formats stream directly from the binary SPOT index. Memory usage is O(leafle
 - `.format(ExportFormat)` — output format (default: Turtle)
 - `.all_graphs()` — include all named graphs including system graphs (requires TriG or NQuads)
 - `.graph("iri")` — export a specific named graph by IRI
-- `.as_of(TimeSpec)` — time-travel export (transaction number, ISO-8601 datetime, or commit CID prefix)
+- `.as_of(TimeSpec)` — time-travel export (`AtT`, `AtTime`/`AtRecorded` for the event and recorded time axes, `AtCommit`, or `Latest`; parse a user-supplied string with `TimeSpec::parse_at`)
 - `.context(&json)` — override prefix map (default: ledger's context from nameservice)
 - `.write_to(&mut writer)` — stream to any `Write` sink
 - `.to_stdout()` — convenience for stdout output
@@ -742,7 +868,7 @@ use fluree_db_api::{FlureeBuilder, Result};
 #[tokio::main]
 async fn main() -> Result<()> {
     // Caching is on by default — no extra call needed
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // First call loads from storage
     let ledger = fluree.ledger("mydb:main").await?;
@@ -759,7 +885,8 @@ To **disable** caching (e.g., for a CLI tool that runs once and exits):
 ```rust
 let fluree = FlureeBuilder::file("./data")
     .without_ledger_caching()
-    .build()?;
+    .build_async()
+    .await?;
 ```
 
 #### Disconnecting Ledgers
@@ -771,7 +898,7 @@ use fluree_db_api::{FlureeBuilder, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // Load and use ledger
     let ledger = fluree.ledger("mydb:main").await?;
@@ -805,7 +932,7 @@ use fluree_db_api::{FlureeBuilder, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // Check if ledger exists (lightweight nameservice lookup)
     if fluree.ledger_exists("mydb:main").await? {
@@ -841,7 +968,7 @@ use fluree_db_api::{FlureeBuilder, DropMode, DropStatus, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // Soft drop: retract every branch in the nameservice, preserve artifacts
     let report = fluree.drop_ledger("mydb", DropMode::Soft).await?;
@@ -940,7 +1067,7 @@ use fluree_db_api::{FlureeBuilder, NotifyResult, RefreshOpts, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // Load ledger into cache
     let _ledger = fluree.ledger_cached("mydb:main").await?;
@@ -1013,7 +1140,7 @@ use serde_json::json;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
     let handle = fluree.ledger_cached("mydb:main").await?;
 
     // Transaction returns the commit's t value
@@ -1089,7 +1216,8 @@ integration test with immediate assertion) each wrap the same primitive differen
 ### Branch Diff (Merge Preview)
 
 `Fluree::merge_preview` returns the rich diff between two branches —
-ahead/behind commit summaries, the common ancestor, conflict keys, and
+ahead/behind commit summaries, the commit both branches last shared,
+conflict keys, and
 fast-forward eligibility — **without mutating any state**. It uses the
 same primitives as `merge_branch` but skips the publish/copy steps,
 making it cheap enough to call on every UI render.
@@ -1120,9 +1248,24 @@ async fn main() -> Result<()> {
             println!("  - s={} p={}", k.s, k.p);
         }
     }
+
+    // `mergeable` is the answer to "will `merge_branch` go through?": the
+    // strategy applies without aborting AND the merged state conforms to
+    // the target's SHACL shapes. The preview stages the resolved change
+    // set and runs the same validation the merge runs, so the two agree.
+    if let Some(v) = &preview.validation {
+        if !v.conforms {
+            println!("merge would be rejected:\n{}", v.report.as_deref().unwrap_or(""));
+        }
+    }
+    println!("mergeable: {}", preview.mergeable);
     Ok(())
 }
 ```
+
+`validation` is present for every non-fast-forward preview unless
+`MergePreviewOpts::include_validation` is `false`. A fast-forward adopts
+commits that were validated when they were authored, so it carries none.
 
 #### Tuning the preview
 
@@ -1146,6 +1289,8 @@ async fn main() -> Result<()> {
                 max_commits: Some(0),       // counts only — no commit summaries
                 max_conflict_keys: Some(0),
                 include_conflicts: false,
+                include_validation: false,  // skip the target-state load + SHACL pass
+                ..MergePreviewOpts::default()
             },
         )
         .await?;
@@ -1162,6 +1307,7 @@ async fn main() -> Result<()> {
                 max_commits: None,
                 max_conflict_keys: None,
                 include_conflicts: true,
+                ..MergePreviewOpts::default()
             },
         )
         .await?;
@@ -1170,16 +1316,85 @@ async fn main() -> Result<()> {
 }
 ```
 
+#### The aggregate change set (`include_changes`)
+
+For a merge-request "Changes" panel, `include_changes` returns the **net**
+set of facts the merge would apply: the source side's commits since the
+two branches diverged, folded per fact, each keeping its newest op. A branch with
+40 commits that ultimately touches 12 facts reviews as 12 facts, and a fact
+the branch created and then deleted shows as the deletion the merge
+applies:
+
+```rust
+use fluree_db_api::{FlureeBuilder, MergePreviewOpts, Result};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // ... create ledger, branch, transact on dev, etc.
+
+    let preview = fluree
+        .merge_preview_with(
+            "mydb",
+            "dev",
+            None,
+            MergePreviewOpts {
+                include_changes: true,
+                // Cap the payload at 100 flakes, cut at subject boundaries.
+                // Some(0) = stats-only; None = unbounded (Rust-only escape hatch).
+                max_changes: Some(100),
+                ..MergePreviewOpts::default()
+            },
+        )
+        .await?;
+
+    let changes = preview.changes.expect("include_changes was set");
+    println!(
+        "+{} -{} across {} subject(s)",
+        changes.assert_count, changes.retract_count, changes.subject_count,
+    );
+    for entry in &changes.entries {
+        println!("{}: +{} -{}", entry.subject, entry.asserts.len(), entry.retracts.len());
+    }
+    // Page through a large diff: subjects are ordered by full IRI and a
+    // truncated page carries a resume cursor.
+    if let Some(cursor) = changes.next_cursor {
+        let _next_page = fluree
+            .merge_preview_with(
+                "mydb",
+                "dev",
+                None,
+                MergePreviewOpts {
+                    include_changes: true,
+                    max_changes: Some(100),
+                    changes_after_subject: Some(cursor),
+                    ..MergePreviewOpts::default()
+                },
+            )
+            .await?;
+    }
+    Ok(())
+}
+```
+
+Exact counts (`assert_count` / `retract_count` / `subject_count`) are never
+truncated, so a UI can render "showing X of Y". The change set is
+strategy-independent — the raw source-vs-ancestor delta before conflict
+resolution; conflicting keys resolve per `conflicts.details`. Each page
+re-pays the source-side replay cost (there is no cache), matching what the
+merge itself would pay.
+
 #### What the caps do (and don't) control
 
 `max_commits` and `max_conflict_keys` cap the **size of the returned
 lists**, not the cost of computing them:
 
 - `BranchDelta::count` on each side reflects the full unbounded
-  divergence — computed by walking every commit envelope between HEAD and
-  the common ancestor — regardless of `max_commits`.
-- When `include_conflicts: true`, both `compute_delta_keys` walks scan
-  the full per-side delta regardless of `max_conflict_keys`.
+  divergence, computed by walking every commit envelope down to the commit
+  the other side holds, regardless of `max_commits`.
+- When `include_conflicts: true`, both delta-key walks scan the full
+  per-side delta regardless of `max_conflict_keys`.
 - When `include_conflict_details: true`, value details are collected only
   for the returned `conflicts.keys` after the `max_conflict_keys` cap is
   applied.
@@ -1196,12 +1411,16 @@ lists**, not the cost of computing them:
 | `ConflictSummary` | `count` (unbounded), `keys: Vec<ConflictKey>` (sorted, capped), `truncated`, `strategy`, `details` |
 | `ConflictDetail` | `key`, `source_values`, `target_values`, `resolution` (values are the current asserted values at each branch HEAD) |
 | `ConflictKey` | `s: Sid`, `p: Sid`, `g: Option<Sid>` |
+| `ValidationSummary` | `conforms`, `report: Option<String>` (present only when `conforms` is false; the message the merge would fail with) |
 
-`mergeable` only reflects whether the selected strategy would abort due to
-detected conflicts; it is not full validation of every constraint the eventual
-merge commit may encounter. `mergeable=true` does not guarantee a subsequent
-merge will succeed; it only reflects the conflict/strategy interaction at
-preview time.
+`mergeable` is `false` when the selected strategy would abort on detected
+conflicts or, when `validation` is present, when the merged state fails the
+target's SHACL shapes. The preview stages the resolved change set and runs
+the same validation `merge_branch` runs, so with `include_validation` on
+(the default) `mergeable=true` means neither the strategy nor the target's
+shapes will reject the merge. Other conditions still apply when the commit
+is built, novelty backpressure among them. With it off, `mergeable`
+reflects only the conflict/strategy interaction.
 
 All types derive `Serialize` so the response is wire-stable; the HTTP
 endpoint at `GET /v1/fluree/merge-preview/{ledger...}` returns the same struct.
@@ -1214,11 +1433,11 @@ The per-commit summary types and DAG walker are factored into core for
 reuse outside the merge-preview flow (e.g., git-log-style commit history
 viewers, indexer integration). Re-exported from `fluree-db-api`:
 
-- `walk_commit_summaries(store, head, stop_at_t, max) -> Result<(Vec<CommitSummary>, usize)>`
-  — newest-first walk that returns both the (capped) summary list and the
-  unbounded total count.
+- `diff_branches(store, source_head, target_head) -> Result<BranchDiff>`
+  — each side's commits since the two branches diverged, by commit
+  identity, plus the most recent commit both hold and whether the merge
+  fast-forwards.
 - `commit_to_summary(commit) -> CommitSummary` — pure function, no I/O.
-- `find_common_ancestor(store, head_a, head_b)` — dual-frontier BFS.
 
 ### Time Travel Queries
 
@@ -1298,7 +1517,7 @@ async fn main() -> Result<()> {
             "https://acme-fluree.example.com",
             Some("eyJhbG...".to_string()),
         )
-        .build()?;
+        .build_async().await?;
 
     let db = fluree.view("local-ledger:main").await?;
 
@@ -1367,7 +1586,7 @@ use tokio::time::{sleep, Duration};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = Arc::new(FlureeBuilder::file("./data").build()?);
+    let fluree = Arc::new(FlureeBuilder::file("./data").build_async().await?);
 
     // Start background indexer
     let indexer = BackgroundIndexerWorker::new(
@@ -1617,7 +1836,7 @@ async fn test_persistence() -> Result<()> {
 
     // Create ledger and write data
     {
-        let fluree = FlureeBuilder::file(path).build()?;
+        let fluree = FlureeBuilder::file(path).build_async().await?;
         let ledger = fluree.create_ledger("test").await?;
 
         let data = json!({"@context": {}, "@graph": [{"@id": "ex:test"}]});
@@ -1630,7 +1849,7 @@ async fn test_persistence() -> Result<()> {
 
     // Verify persistence by reopening
     {
-        let fluree = FlureeBuilder::file(path).build()?;
+        let fluree = FlureeBuilder::file(path).build_async().await?;
         let ledger = fluree.ledger("test:main").await?;
 
         assert!(ledger.t() > 0);
@@ -1920,7 +2139,7 @@ use serde_json::json;
 #[tokio::main]
 async fn main() -> Result<()> {
     // Caching is on by default (required for stage)
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // Get a cached handle
     let handle = fluree.ledger_cached("mydb:main").await?;
@@ -2010,8 +2229,8 @@ let result = fluree.stage(&handle)  // or stage_owned(ledger)
 | `.insert(&json)` | Insert JSON-LD data |
 | `.upsert(&json)` | Upsert JSON-LD data |
 | `.update(&json)` | Update with WHERE/DELETE/INSERT |
-| `.insert_turtle(&ttl)` | Insert Turtle data |
-| `.upsert_turtle(&ttl)` | Upsert Turtle data |
+| `.insert_turtle(&ttl)` | Insert Turtle or TriG data (graph blocks land in their named graphs) |
+| `.upsert_turtle(&ttl)` | Upsert Turtle or TriG data |
 | `.txn_opts(opts)` | Set transaction options (branch, context) |
 | `.commit_opts(opts)` | Set commit options (identity, raw_txn) |
 | `.policy(ctx)` | Set policy enforcement |
@@ -2049,7 +2268,7 @@ use serde_json::json;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // Get ledger info with optional context for IRI compaction
     let context = json!({
@@ -2124,7 +2343,7 @@ use serde_json::json;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // Find all ledgers on main branch
     let query = json!({

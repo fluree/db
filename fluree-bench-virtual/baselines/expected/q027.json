@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "query_id": "q027",
+  "result_hash": "8a94647580d8b901dd838e4d10307260760f41ff9764950c2e56e17c1af5d712",
+  "rows": 18,
+  "head_rows": [
+    "desktop\u001fadd_to_cart\u001f49905",
+    "desktop\u001fcheckout\u001f50009",
+    "desktop\u001fpage_view\u001f149581",
+    "desktop\u001fpurchase\u001f50530",
+    "desktop\u001fremove_from_cart\u001f50111",
+    "desktop\u001fsearch\u001f50144",
+    "mobile\u001fadd_to_cart\u001f50123",
+    "mobile\u001fcheckout\u001f50036",
+    "mobile\u001fpage_view\u001f150232",
+    "mobile\u001fpurchase\u001f49946",
+    "mobile\u001fremove_from_cart\u001f49472",
+    "mobile\u001fsearch\u001f50138",
+    "tablet\u001fadd_to_cart\u001f24918",
+    "tablet\u001fcheckout\u001f25083",
+    "tablet\u001fpage_view\u001f74884",
+    "tablet\u001fpurchase\u001f25046",
+    "tablet\u001fremove_from_cart\u001f25143",
+    "tablet\u001fsearch\u001f24699"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

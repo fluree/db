@@ -79,7 +79,7 @@ fn walk(manifest_path: &Path, out: &mut Vec<TestCase>) -> Result<()> {
     let mut sink = GraphCollectorSink::new();
     parse(&content, &mut sink)
         .with_context(|| format!("parsing manifest {}", manifest_path.display()))?;
-    let graph = sink.finish();
+    let graph = sink.into_graph();
 
     let manifest_subject = find_manifest_subject(&graph, &base)
         .ok_or_else(|| anyhow!("no mf:Manifest subject in {}", manifest_path.display()))?;

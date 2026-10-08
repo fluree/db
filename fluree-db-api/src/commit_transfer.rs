@@ -26,6 +26,7 @@ use crate::{Fluree, IndexConfig, LedgerHandle};
 use base64::Engine as _;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::ContentId;
+use fluree_db_core::LedgerId;
 use fluree_db_core::{
     range_with_overlay, ContentAddressedWrite, ContentKind, Flake, GraphId, IndexType, Sid,
     TXN_META_GRAPH_ID,
@@ -34,8 +35,12 @@ use fluree_db_core::{RangeMatch, RangeOptions, RangeTest, Storage};
 use fluree_db_core::{CODEC_FLUREE_COMMIT, CODEC_FLUREE_TXN};
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{CasResult, NsRecordSnapshot, RefKind, RefValue};
-use fluree_db_novelty::{generate_commit_flakes, stamp_graph_on_commit_flakes, Novelty};
+use fluree_db_novelty::{
+    drop_forged_commit_flakes, generate_commit_flakes, is_forged_commit_flake,
+    stamp_graph_on_commit_flakes, warn_if_forged_commit_flakes_dropped, Novelty,
+};
 use fluree_db_policy::PolicyContext;
+use fluree_db_transact::datatype_limit;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -189,7 +194,7 @@ impl<'de> Deserialize<'de> for Base64Bytes {
 }
 
 /// Request body for pushing commits to a transactor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PushCommitsRequest {
     /// Commit v2 blobs, in order (oldest -> newest).
     pub commits: Vec<Base64Bytes>,
@@ -198,6 +203,28 @@ pub struct PushCommitsRequest {
     /// Map key is a CID string or legacy address string.
     #[serde(default)]
     pub blobs: HashMap<String, Base64Bytes>,
+    /// CIDs the sender knows it cannot supply — a provenance gap it is
+    /// declaring rather than hiding. Mirrors `missing_blobs` on
+    /// [`ExportCommitsResponse`], so the two halves of the replication
+    /// protocol describe a gap the same way.
+    ///
+    /// Additive on the wire. The receiver currently tolerates *undeclared*
+    /// gaps too (see [`validate_required_blobs`]) so that a sender predating
+    /// this field can still replicate a ledger that has one; declaring is
+    /// what lets a later release tighten that back to a 400 without
+    /// stranding those ledgers.
+    #[serde(default)]
+    pub missing_blobs: Vec<String>,
+    /// Commit v2 blobs that merges in `commits` brought in, parents before
+    /// children. The receiver stores these commits and never replays them.
+    /// A merge commit already carries the combined changes of the branch it
+    /// merged, so replaying that branch's commits would apply them twice.
+    ///
+    /// Storing them is still required. They are what a later walk of the
+    /// commit DAG reads, and a merge commit whose parent is absent breaks
+    /// every such walk.
+    #[serde(default)]
+    pub merged_commits: Vec<Base64Bytes>,
 }
 
 /// Response body for a successful push.
@@ -233,7 +260,7 @@ pub struct PushedHead {
 /// left is the single ref advance.
 pub struct StagedPush {
     /// Target ledger id (`"<name>:<branch>"`).
-    pub ledger: String,
+    pub ledger: LedgerId,
     /// Number of commits accepted in this push.
     pub accepted: usize,
     /// Branch's pre-push head snapshot. The local apply path passes
@@ -312,6 +339,7 @@ impl Fluree {
         if request.commits.is_empty() {
             return Err(ApiError::http(400, "missing required field 'commits'"));
         }
+        let ledger_id = &LedgerId::parse(ledger_id)?;
 
         // 0) Lock ledger state for write (serialize with transactions).
         let guard = self
@@ -346,8 +374,18 @@ impl Fluree {
         preflight_strict_next_t_and_prev(&current_ref, &decoded)
             .map_err(PushError::into_api_error)?;
 
+        // 2.1) Decode the commits the chain's merges brought in, and check
+        //      that no parent the bundle names is missing here.
+        let merged = decode_merged_commits(&request).map_err(PushError::into_api_error)?;
+        validate_merged_reachable(&decoded, &merged).map_err(PushError::into_api_error)?;
+        let content_store = self.branched_content_store(base_state.ledger_id()).await?;
+        validate_ancestry_present(content_store.as_ref(), &decoded, &merged)
+            .await
+            .map_err(PushError::into_api_error)?;
+
         // 3) Validate referenced blobs are provided (if any) and pre-validate hashes.
-        validate_required_blobs(&decoded, &request.blobs).map_err(PushError::into_api_error)?;
+        validate_required_blobs(&decoded, &merged, &request.blobs, &request.missing_blobs)
+            .map_err(PushError::into_api_error)?;
 
         // 4) Validate each commit against evolving server view.
         //
@@ -384,9 +422,26 @@ impl Fluree {
             PushError::Invalid(format!("base snapshot namespace corruption: {e}")).into_api_error()
         })?;
 
+        // The namespaces these commits introduce, which reach the snapshot only
+        // in `apply_pushed_commits_to_state` — after validation. Kept as a plain
+        // map so a rejected commit's violation can name the terms it brought in,
+        // including ones an earlier commit of the same push introduced.
+        let mut pushed_namespaces: HashMap<u16, String> = HashMap::new();
+
+        // Datatypes the ledger holds, and those earlier commits of this push
+        // add, so every commit is checked against both.
+        let base_datatypes = datatype_limit::known_datatypes(&base_state);
+        let mut pushed_datatypes: HashSet<Sid> = HashSet::new();
+
         for c in &decoded {
             // Current state is base db + evolving novelty.
             let current_t = base_state.snapshot.t.max(evolving_novelty.t);
+            pushed_namespaces.extend(
+                c.commit
+                    .namespace_delta
+                    .iter()
+                    .map(|(code, prefix)| (*code, prefix.clone())),
+            );
 
             // 4.0.1 Cross-commit namespace validation: namespace delta must be
             // conflict-free against the accumulated namespace table from parent + prior commits.
@@ -407,6 +462,40 @@ impl Fluree {
                     .map_err(|e| PushError::Invalid(e.to_string()).into_api_error())?;
             }
 
+            // 4.0.2 Datatype limit, ahead of the costlier validation below. A
+            // sender that does not enforce it can push commits the index could
+            // never hold. The datatypes are those that reach novelty at 4.5:
+            // the blob's flakes other than forged commit records, and the
+            // typed txn-meta values. The other generated metadata flakes have
+            // reserved datatypes.
+            let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(base_state.ledger_id());
+            let txn_meta_g = base_state.snapshot.encode_iri(&txn_meta_iri);
+            let blob_datatypes = c
+                .commit
+                .flakes
+                .iter()
+                .filter(|f| {
+                    !txn_meta_g
+                        .as_ref()
+                        .is_some_and(|g| is_forged_commit_flake(f, g))
+                })
+                .map(|f| &f.dt);
+            let meta_datatypes = datatype_limit::txn_meta_datatypes(&c.commit.txn_meta);
+            let adding: Vec<Sid> = datatype_limit::new_datatypes(
+                &base_datatypes,
+                blob_datatypes.chain(&meta_datatypes),
+            )
+            .into_iter()
+            .filter(|dt| !pushed_datatypes.contains(*dt))
+            .cloned()
+            .collect();
+            datatype_limit::check_datatype_capacity(
+                &base_datatypes,
+                pushed_datatypes.len() + adding.len(),
+            )
+            .map_err(ApiError::Transact)?;
+            pushed_datatypes.extend(adding);
+
             // 4.1 Retraction invariant (strict).
             assert_retractions_exist(
                 &base_state.snapshot,
@@ -425,7 +514,7 @@ impl Fluree {
 
             // 4.3 Stage flakes (policy/backpressure). No WHERE/cancellation; flakes are prebuilt.
             let evolving_state = base_state.clone_with_novelty(Arc::new(evolving_novelty.clone()));
-            let staged_view = stage_commit_flakes(
+            let staged_view = match stage_commit_flakes(
                 evolving_state,
                 &c.commit.flakes,
                 index_config,
@@ -433,7 +522,23 @@ impl Fluree {
                 &routing.graph_sids,
             )
             .await
-            .map_err(PushError::into_api_error)?;
+            {
+                Ok(view) => view,
+                Err(e) => {
+                    // Replication is a write family like any other, and it hits
+                    // the same accumulated-novelty gate. Without this, a
+                    // follower whose novelty is past `reindex_max_bytes`
+                    // rejects every incoming commit and never asks for the
+                    // build that would drain it.
+                    self.request_index_after_novelty_rejection(
+                        base_state.ledger_id(),
+                        current_t,
+                        &e,
+                    )
+                    .await;
+                    return Err(push_error_for_stage(e).into_api_error());
+                }
+            };
 
             // 4.4 SHACL (optional feature).
             //
@@ -448,13 +553,15 @@ impl Fluree {
             // the binary store) are intentionally absent from `graph_iris` and
             // therefore fall back to the ledger-wide baseline, which is the
             // correct behavior: config cannot exist for a graph not yet known.
+            // The SHACL pass attaches the staged dictionaries to the view.
+            #[cfg(feature = "shacl")]
+            let mut staged_view = staged_view;
             #[cfg(feature = "shacl")]
             {
                 crate::tx::apply_shacl_policy_to_staged_view(
-                    &staged_view,
+                    &mut staged_view,
                     crate::tx::StagedShaclContext {
                         graph_delta: Some(&routing.graph_iris),
-                        graph_sids: Some(&routing.graph_sids),
                         tracker: None,
                         // Commit replay doesn't engage the
                         // cross-ledger dispatch (the leader
@@ -463,12 +570,27 @@ impl Fluree {
                         // re-validate same-ledger only.
                         cross_ledger_shapes: None,
                         staged_ns: None,
+                        // These commits' own namespaces do not reach the
+                        // snapshot until after validation, so a violation on a
+                        // term they introduce resolves through here or not at
+                        // all.
+                        uncommitted_namespaces: Some(&pushed_namespaces),
+                        // Replay carries no `opts` payload, so there is no
+                        // authoring context to compact against — violations
+                        // here name full IRIs.
+                        txn_context: None,
                         cross_ledger_schema: None,
                         // Inline shapes are an authoring-time
                         // construct; commit replay carries no
                         // `opts` payload.
                         inline_shape_bundle: None,
                         cross_ledger_membership: None,
+                        // Replay re-validates under the configured posture:
+                        // any authoring-time softening was already applied
+                        // (or denied) when the commit was first staged.
+                        requested_validation_mode: None,
+                        request_identity: None,
+                        origin_validated_replay: true,
                     },
                     // Commit replay resolves config internally.
                     None,
@@ -482,11 +604,20 @@ impl Fluree {
             }
 
             // 4.5 Advance evolving novelty with this commit's flakes + derived metadata flakes.
+            //
+            // These commits come from a peer, so the blob's flakes are screened
+            // before they reach novelty: a flake claiming commit provenance
+            // cannot have come from any legitimate writer, since genuine commit
+            // records are derived from the envelope just below and never ride
+            // the flake stream. Without this an ingested ledger serves forged
+            // commit records until it is indexed (#1846).
             let mut all_flakes = c.commit.flakes.clone();
             let mut meta_flakes =
                 generate_commit_flakes(&c.commit, base_state.ledger_id(), c.commit.t);
             let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(base_state.ledger_id());
             if let Some(g_sid) = base_state.snapshot.encode_iri(&txn_meta_iri) {
+                let dropped = drop_forged_commit_flakes(&mut all_flakes, &g_sid);
+                warn_if_forged_commit_flakes_dropped(dropped, base_state.ledger_id(), c.commit.t);
                 stamp_graph_on_commit_flakes(&mut meta_flakes, &g_sid);
             }
             all_flakes.extend(meta_flakes);
@@ -506,7 +637,20 @@ impl Fluree {
             .backend()
             .admin_storage_cloned()
             .ok_or_else(|| ApiError::config("push_commits requires a managed storage backend"))?;
-        write_required_blobs(&storage, base_state.ledger_id(), &request.blobs, &decoded)
+        write_required_blobs(
+            &storage,
+            base_state.ledger_id(),
+            &request.blobs,
+            &decoded,
+            &merged,
+        )
+        .await
+        .map_err(PushError::into_api_error)?;
+
+        // Merged-in commits are written first. They are the parents, and a
+        // failure part way through then leaves no stored commit whose parent
+        // is absent.
+        write_commit_blobs(&storage, base_state.ledger_id(), &merged)
             .await
             .map_err(PushError::into_api_error)?;
 
@@ -542,7 +686,7 @@ impl Fluree {
         };
 
         Ok(StagedPush {
-            ledger: ledger_id.to_string(),
+            ledger: ledger_id.clone(),
             accepted,
             rollback_snapshot,
             pre_push_head: current_ref,
@@ -612,7 +756,7 @@ impl Fluree {
         }
 
         Ok(PushCommitsResponse {
-            ledger,
+            ledger: ledger.to_string(),
             accepted,
             head: PushedHead {
                 t: new_head_t,
@@ -780,8 +924,11 @@ fn decode_and_validate_commit_chain(
         let commit = fluree_db_core::commit::codec::read_commit(&bytes)
             .map_err(|e| PushError::Invalid(format!("invalid commit[{idx}]: {e}")))?;
 
-        // Reject empty commits (no flakes) - keep semantics clear.
-        if commit.flakes.is_empty() {
+        // Reject empty commits (no flakes) - keep semantics clear. A merge
+        // commit is exempt: it records the merge even when the strategy
+        // resolved every flake away, and dropping it would let the same
+        // branch be merged again.
+        if commit.flakes.is_empty() && commit.parents.len() < 2 {
             return Err(PushError::Invalid(format!(
                 "invalid commit[{idx}]: empty commit (no flakes)"
             )));
@@ -806,14 +953,16 @@ fn decode_and_validate_commit_chain(
             }
         }
 
-        // Chain validation: at least one parent reference must match the prior
-        // commit's hash. For normal commits this is the single parent; for merge
-        // commits one parent is the prior commit and others are pre-existing.
+        // Chain validation: the first parent must be the prior commit. A
+        // merge commit's remaining parents are the branches it merged, and
+        // they arrive in `merged_commits`. Accepting a match on one of those
+        // would let a push rewrite the branch's own line of descent, which
+        // is the line this receiver replays.
         if let Some(prev_hash_hex) = &prev_hash {
             let ok = commit
                 .parents
-                .iter()
-                .any(|r| r.digest_hex() == *prev_hash_hex);
+                .first()
+                .is_some_and(|r| r.digest_hex() == *prev_hash_hex);
             if !ok {
                 return Err(PushError::Invalid(format!(
                     "commit chain previous mismatch at commit[{idx}]: expected previous digest '{prev_hash_hex}'"
@@ -834,6 +983,114 @@ fn decode_and_validate_commit_chain(
     Ok(out)
 }
 
+/// Decode the commits that merges in the bundle brought in.
+///
+/// These commits carry none of the chain's rules. They belong to other
+/// branches, so their `t` values come from other clocks and need not be
+/// contiguous with anything. The receiver stores them without replaying
+/// them.
+fn decode_merged_commits(
+    request: &PushCommitsRequest,
+) -> std::result::Result<Vec<PushCommitDecoded>, PushError> {
+    request
+        .merged_commits
+        .iter()
+        .enumerate()
+        .map(|(idx, b64)| {
+            let bytes = b64.0.clone();
+            let commit = fluree_db_core::commit::codec::read_commit(&bytes)
+                .map_err(|e| PushError::Invalid(format!("invalid merged_commits[{idx}]: {e}")))?;
+            let digest_hex = fluree_db_core::sha256_hex(&bytes);
+            Ok(PushCommitDecoded {
+                commit,
+                bytes,
+                digest_hex,
+            })
+        })
+        .collect()
+}
+
+/// Check that every merged commit is reachable from a merge in the chain.
+///
+/// A merged commit is stored without being replayed or validated. One that
+/// no merge references would sit in the ledger's storage unreachable. It
+/// would also survive `drop`, which finds what to delete by walking the
+/// history.
+fn validate_merged_reachable(
+    chain: &[PushCommitDecoded],
+    merged: &[PushCommitDecoded],
+) -> std::result::Result<(), PushError> {
+    let by_digest: HashMap<&str, &PushCommitDecoded> =
+        merged.iter().map(|c| (c.digest_hex.as_str(), c)).collect();
+    // Walk from the chain's merge parents through the merged commits.
+    let mut reached = HashSet::new();
+    let mut stack: Vec<String> = chain
+        .iter()
+        .flat_map(|c| c.commit.parents.iter().skip(1))
+        .map(ContentId::digest_hex)
+        .collect();
+    while let Some(digest) = stack.pop() {
+        let Some(c) = by_digest.get(digest.as_str()) else {
+            continue;
+        };
+        if reached.insert(c.digest_hex.as_str()) {
+            stack.extend(c.commit.parents.iter().map(ContentId::digest_hex));
+        }
+    }
+
+    match merged
+        .iter()
+        .find(|c| !reached.contains(c.digest_hex.as_str()))
+    {
+        Some(c) => Err(PushError::Invalid(format!(
+            "merged commit {} is not reachable from any merge in the push",
+            c.digest_hex
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Check that every parent the bundle references is either in the bundle or
+/// already in storage.
+///
+/// A commit whose parent is missing breaks every later walk of the DAG:
+/// verification, merge, and export all read parents. The push is rejected
+/// instead, which leaves the branch where it was.
+///
+/// `store` is branch-aware. A merge parent of a branch push often lives in
+/// the source branch's namespace rather than the pushed branch's own.
+async fn validate_ancestry_present<S: fluree_db_core::ContentStore + ?Sized>(
+    store: &S,
+    chain: &[PushCommitDecoded],
+    merged: &[PushCommitDecoded],
+) -> std::result::Result<(), PushError> {
+    let bundled: HashSet<&str> = chain
+        .iter()
+        .chain(merged)
+        .map(|c| c.digest_hex.as_str())
+        .collect();
+
+    for c in chain.iter().chain(merged) {
+        for parent in &c.commit.parents {
+            if bundled.contains(parent.digest_hex().as_str()) {
+                continue;
+            }
+            let present = store
+                .has(parent)
+                .await
+                .map_err(|e| PushError::Internal(format!("failed to read {parent}: {e}")))?;
+            if !present {
+                return Err(PushError::Invalid(format!(
+                    "commit {} references parent {parent}, which is neither in the push nor in storage",
+                    c.digest_hex
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn preflight_strict_next_t_and_prev(
     current: &RefValue,
     decoded: &[PushCommitDecoded],
@@ -848,12 +1105,18 @@ fn preflight_strict_next_t_and_prev(
         )));
     }
 
-    // Validate that at least one parent reference matches the current head CID.
+    // Validate that the first parent is the current head CID. As in
+    // `decode_and_validate_commit_chain`, a match on a merge parent is not
+    // enough: the branch's line of descent has to continue from the head.
     if let Some(expected_id) = &current.id {
-        let ok = first.commit.parents.iter().any(|r| r == expected_id);
+        let ok = first
+            .commit
+            .parents
+            .first()
+            .is_some_and(|r| r == expected_id);
         if !ok {
             return Err(PushError::Conflict(format!(
-                "first commit previous mismatch: no parent matches expected head {expected_id:?}"
+                "first commit previous mismatch: first parent is not the expected head {expected_id:?}"
             )));
         }
     } else if !first.commit.parents.is_empty() {
@@ -865,26 +1128,56 @@ fn preflight_strict_next_t_and_prev(
     Ok(())
 }
 
+/// Check the txn blobs a push bundle carries against what its commits
+/// reference. A referenced blob the client did not provide is tolerated
+/// (logged): the source may itself have a dangling reference, and refusing
+/// the push would make that ledger impossible to replicate. Blobs that ARE
+/// provided must hash-verify.
+///
+/// A gap the sender listed in `declared_missing` is expected and logged at
+/// debug. An undeclared gap is accepted too — a sender predating
+/// `PushCommitsRequest::missing_blobs` cannot declare one — but warns,
+/// because it is indistinguishable from a client that simply forgot to
+/// attach `blobs`.
 fn validate_required_blobs(
     decoded: &[PushCommitDecoded],
+    merged: &[PushCommitDecoded],
     provided: &HashMap<String, Base64Bytes>,
+    declared_missing: &[String],
 ) -> std::result::Result<(), PushError> {
-    let mut required: HashSet<String> = HashSet::new();
-    for c in decoded {
-        if let Some(txn_cid) = &c.commit.txn {
-            required.insert(txn_cid.to_string());
-        }
-    }
+    let required = required_txn_cids(decoded, merged);
 
+    let declared: HashSet<&str> = declared_missing.iter().map(String::as_str).collect();
     for addr in &required {
-        if !provided.contains_key(addr) {
-            return Err(PushError::Invalid(format!(
-                "missing required blob for referenced address: {addr}"
-            )));
+        if provided.contains_key(addr) {
+            continue;
+        }
+        if declared.contains(addr.as_str()) {
+            tracing::debug!(
+                txn_cid = %addr,
+                "pushed commit references a txn blob the sender declared missing; accepting commit without it"
+            );
+        } else {
+            tracing::warn!(
+                txn_cid = %addr,
+                "pushed commit references a txn blob the client neither provided nor declared missing; accepting commit without it"
+            );
         }
     }
 
     Ok(())
+}
+
+/// The txn blob CIDs a bundle's commits reference.
+fn required_txn_cids(
+    decoded: &[PushCommitDecoded],
+    merged: &[PushCommitDecoded],
+) -> HashSet<String> {
+    decoded
+        .iter()
+        .chain(merged)
+        .filter_map(|c| c.commit.txn.as_ref().map(ToString::to_string))
+        .collect()
 }
 
 async fn build_policy_ctx_for_push(
@@ -909,27 +1202,39 @@ async fn build_policy_ctx_for_push(
     .await
 }
 
+/// Map a staging failure onto the push surface.
+///
+/// Split out from `stage_commit_flakes` so the caller sees the typed
+/// `TransactError` first: novelty backpressure has to be recognised by variant
+/// to ask the indexer for a build, and it is indistinguishable once flattened
+/// into `PushError::Invalid(String)`.
+fn push_error_for_stage(e: fluree_db_transact::TransactError) -> PushError {
+    match e {
+        fluree_db_transact::TransactError::PolicyViolation(p) => {
+            PushError::Forbidden(p.to_string())
+        }
+        other => PushError::Invalid(other.to_string()),
+    }
+}
+
 async fn stage_commit_flakes(
     ledger: LedgerState,
     flakes: &[Flake],
     index_config: &IndexConfig,
     policy_ctx: Option<&PolicyContext>,
     graph_sids: &HashMap<GraphId, Sid>,
-) -> std::result::Result<fluree_db_ledger::StagedLedger, PushError> {
+) -> std::result::Result<fluree_db_ledger::StagedLedger, fluree_db_transact::TransactError> {
     let mut options = fluree_db_transact::StageOptions::new()
         .with_index_config(index_config)
-        .with_graph_sids(graph_sids);
+        .with_graph_sids(graph_sids)
+        // Push applies commits that were authored and written elsewhere, so
+        // authoring invariants are advisory here. See
+        // `StageOptions::replaying_commit`.
+        .replaying_commit();
     if let Some(policy_ctx) = policy_ctx.filter(|p| !p.wrapper().is_root()) {
         options = options.with_policy(policy_ctx);
     }
-    fluree_db_transact::stage_flakes(ledger, flakes.to_vec(), options)
-        .await
-        .map_err(|e| match e {
-            fluree_db_transact::TransactError::PolicyViolation(p) => {
-                PushError::Forbidden(p.to_string())
-            }
-            other => PushError::Invalid(other.to_string()),
-        })
+    fluree_db_transact::stage_flakes(ledger, flakes.to_vec(), options).await
 }
 
 async fn assert_retractions_exist(
@@ -1016,17 +1321,12 @@ async fn write_required_blobs<S>(
     ledger_id: &str,
     provided: &HashMap<String, Base64Bytes>,
     decoded: &[PushCommitDecoded],
+    merged: &[PushCommitDecoded],
 ) -> std::result::Result<(), PushError>
 where
     S: Storage + Send + Sync,
 {
-    // Build required set (txn CID strings, for now).
-    let mut required: HashSet<String> = HashSet::new();
-    for c in decoded {
-        if let Some(txn_cid) = &c.commit.txn {
-            required.insert(txn_cid.to_string());
-        }
-    }
+    let required = required_txn_cids(decoded, merged);
 
     for addr in &required {
         let txn_id: ContentId = addr
@@ -1040,11 +1340,10 @@ where
             )));
         }
 
-        let bytes = provided
-            .get(addr)
-            .ok_or_else(|| PushError::Invalid(format!("missing required blob: {addr}")))?
-            .0
-            .clone();
+        let Some(bytes) = provided.get(addr).map(|b| b.0.clone()) else {
+            // Tolerated — see `validate_required_blobs`.
+            continue;
+        };
 
         // Integrity: server MUST re-hash bytes and verify the derived CID.
         if !txn_id.verify(&bytes) {
@@ -1152,7 +1451,16 @@ fn apply_pushed_commits_to_state(
 
     // Apply all flakes to novelty (we already validated them; re-apply for state).
     let mut novelty = (*base.novelty).clone();
+    // Detach the range provider first: it pins `dict_novelty`, so mutating
+    // with it attached deep-clones the dictionary and leaves the provider —
+    // the copy every read through `base.snapshot` resolves against — without
+    // the subjects and strings these commits introduce.
+    let provider_store = fluree_db_transact::detach_binary_provider(&mut base);
     let mut dict_novelty = base.dict_novelty.clone();
+    // Like the commit path, extend the runtime dictionaries with every
+    // predicate and datatype these commits introduce. Queries resolve through
+    // them, and the datatype limit counts them.
+    let mut runtime_small_dicts = base.runtime_small_dicts.clone();
 
     let store_opt: Option<&BinaryIndexStore> = base
         .binary_store
@@ -1169,6 +1477,7 @@ fn apply_pushed_commits_to_state(
         .map_err(|e| {
             PushError::Internal(format!("populate_dict_novelty_safe failed at t={t}: {e}"))
         })?;
+        Arc::make_mut(&mut runtime_small_dicts).populate_from_flakes(flakes);
         // Apply to novelty.
         novelty
             .apply_commit(flakes.clone(), *t, &reverse_graph)
@@ -1179,6 +1488,10 @@ fn apply_pushed_commits_to_state(
 
     base.novelty = Arc::new(novelty);
     base.dict_novelty = dict_novelty;
+    base.runtime_small_dicts = runtime_small_dicts;
+    if let Some(store) = provider_store {
+        fluree_db_transact::attach_binary_provider(&mut base, store);
+    }
     base.head_commit_id = stored_commits.last().map(|c| c.commit_id.clone());
     if let Some(ref mut r) = base.ns_record {
         if let Some(last) = stored_commits.last() {
@@ -1212,7 +1525,7 @@ const EXPORT_MAX_LIMIT: usize = 500;
 const EXPORT_DEFAULT_LIMIT: usize = 100;
 
 /// Query parameters for paginated commit export.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExportCommitsRequest {
     /// Commit cursor to start from.
     ///
@@ -1231,6 +1544,19 @@ pub struct ExportCommitsRequest {
     /// Maximum commits per page. Clamped to server max (500).
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Export the branch's first-parent line as `commits`, and the commits
+    /// its merges brought in as `merged_commits`.
+    ///
+    /// Without it, `commits` walks every parent, and a history containing a
+    /// merge cannot be imported. The flag is opt-in so that a client
+    /// predating it keeps the format it understands. A response that does
+    /// not echo `lineage` came from a server predating it.
+    #[serde(default)]
+    pub lineage: bool,
+    /// The client's head, in `lineage` mode. The export stops above it.
+    /// When `None`, it runs to genesis.
+    #[serde(default)]
+    pub base_id: Option<ContentId>,
 }
 
 /// Paginated response containing commit blobs (newest → oldest).
@@ -1247,6 +1573,12 @@ pub struct ExportCommitsResponse {
     /// Referenced blobs (txn blobs) keyed by CID string.
     #[serde(default)]
     pub blobs: HashMap<String, Base64Bytes>,
+    /// Txn CIDs referenced by commits in this page that the source could
+    /// not read (dangling provenance). The commits themselves are intact
+    /// and exported; consumers should carry the reference without the
+    /// bytes rather than refuse the chain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_blobs: Vec<String>,
     /// Highest `t` in this page.
     pub newest_t: i64,
     /// Lowest `t` in this page.
@@ -1258,6 +1590,15 @@ pub struct ExportCommitsResponse {
     pub count: usize,
     /// Actual limit used (after server clamping).
     pub effective_limit: usize,
+    /// Echoes [`ExportCommitsRequest::lineage`]. A server predating that flag
+    /// leaves it `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lineage: bool,
+    /// In `lineage` mode, the commits that merges in `commits` brought in,
+    /// parents before children. See
+    /// [`PushCommitsRequest::merged_commits`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merged_commits: Vec<Base64Bytes>,
 }
 
 /// Export a paginated range of commits from a ledger.
@@ -1317,8 +1658,22 @@ impl Fluree {
             head_commit_id.clone()
         };
 
+        if request.lineage {
+            return export_lineage_page(
+                content_store.as_ref(),
+                &start_cid,
+                request.base_id.as_ref(),
+                ledger_id,
+                head_commit_id,
+                head_t,
+                effective_limit,
+            )
+            .await;
+        }
+
         let mut commits = Vec::with_capacity(effective_limit);
         let mut blobs: HashMap<String, Base64Bytes> = HashMap::new();
+        let mut missing_blobs: Vec<String> = Vec::new();
         let mut newest_t: Option<i64> = None;
         let mut oldest_t: Option<i64> = None;
         let mut frontier = vec![start_cid];
@@ -1363,14 +1718,30 @@ impl Fluree {
 
             commits.push(Base64Bytes(raw_bytes));
 
-            // Collect referenced txn blob via ContentStore.
+            // Collect referenced txn blob via ContentStore. A missing blob is
+            // a provenance gap, not a chain break: report it and keep going.
             if let Some(ref txn_cid) = env.txn {
                 let txn_key = txn_cid.to_string();
                 if let std::collections::hash_map::Entry::Vacant(e) = blobs.entry(txn_key.clone()) {
-                    let txn_bytes = content_store.get(txn_cid).await.map_err(|e| {
-                        ApiError::internal(format!("failed to read txn blob {txn_key}: {e}"))
-                    })?;
-                    e.insert(Base64Bytes(txn_bytes));
+                    match content_store.get(txn_cid).await {
+                        Ok(txn_bytes) => {
+                            e.insert(Base64Bytes(txn_bytes));
+                        }
+                        Err(fluree_db_core::Error::NotFound(_)) => {
+                            tracing::warn!(
+                                commit = %current_cid,
+                                t,
+                                txn_cid = %txn_key,
+                                "commit references a txn blob that is missing from storage; exporting without it"
+                            );
+                            missing_blobs.push(txn_key);
+                        }
+                        Err(e) => {
+                            return Err(ApiError::internal(format!(
+                                "failed to read txn blob {txn_key}: {e}"
+                            )));
+                        }
+                    }
                 }
             }
 
@@ -1391,13 +1762,107 @@ impl Fluree {
             head_t,
             commits,
             blobs,
+            missing_blobs,
             newest_t: newest_t.unwrap_or(0),
             oldest_t: oldest_t.unwrap_or(0),
             next_cursor_id,
             count,
             effective_limit,
+            lineage: false,
+            merged_commits: Vec::new(),
         })
     }
+}
+
+/// Read commits in order, with their `t`, collecting each one's txn blob
+/// into `blobs`. A txn blob missing from storage is listed in
+/// `missing_blobs`, as in the default export.
+async fn read_export_commits(
+    store: &dyn fluree_db_core::ContentStore,
+    cids: &[ContentId],
+    blobs: &mut HashMap<String, Base64Bytes>,
+    missing_blobs: &mut Vec<String>,
+) -> Result<Vec<(i64, Base64Bytes)>> {
+    let mut out = Vec::with_capacity(cids.len());
+    for cid in cids {
+        let bytes = store
+            .get(cid)
+            .await
+            .map_err(|e| ApiError::internal(format!("failed to read commit {cid}: {e}")))?;
+        let envelope = fluree_db_core::commit::codec::read_commit_envelope(&bytes)
+            .map_err(|e| ApiError::internal(format!("invalid commit {cid}: {e}")))?;
+        if let Some(txn_cid) = &envelope.txn {
+            let key = txn_cid.to_string();
+            if let std::collections::hash_map::Entry::Vacant(entry) = blobs.entry(key.clone()) {
+                match store.get(txn_cid).await {
+                    Ok(txn_bytes) => {
+                        entry.insert(Base64Bytes(txn_bytes));
+                    }
+                    Err(fluree_db_core::Error::NotFound(_)) => {
+                        tracing::warn!(
+                            commit = %cid,
+                            txn_cid = %key,
+                            "commit references a txn blob that is missing from storage; exporting without it"
+                        );
+                        missing_blobs.push(key);
+                    }
+                    Err(e) => {
+                        return Err(ApiError::internal(format!(
+                            "failed to read txn blob {key}: {e}"
+                        )));
+                    }
+                }
+            }
+        }
+        out.push((envelope.t, Base64Bytes(bytes)));
+    }
+    Ok(out)
+}
+
+/// One page of a `lineage` export: commits of the first-parent line, plus the
+/// commits their merges brought in. `limit` counts both.
+async fn export_lineage_page(
+    store: &dyn fluree_db_core::ContentStore,
+    from: &ContentId,
+    base: Option<&ContentId>,
+    ledger_id: &str,
+    head_commit_id: ContentId,
+    head_t: i64,
+    limit: usize,
+) -> Result<ExportCommitsResponse> {
+    let page = fluree_db_core::plan_commit_transfer_page(store, from, base, limit)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to plan export from {from}: {e}")))?
+        .ok_or_else(|| {
+            ApiError::http(
+                409,
+                "base_id is not on this branch's first-parent line; the histories have diverged",
+            )
+        })?;
+
+    let mut blobs = HashMap::new();
+    let mut missing_blobs = Vec::new();
+    // Newest first, as in the default export.
+    let lineage: Vec<ContentId> = page.plan.lineage.iter().rev().cloned().collect();
+    let commits = read_export_commits(store, &lineage, &mut blobs, &mut missing_blobs).await?;
+    let merged_commits =
+        read_export_commits(store, &page.plan.merged, &mut blobs, &mut missing_blobs).await?;
+
+    Ok(ExportCommitsResponse {
+        ledger: ledger_id.to_string(),
+        head_commit_id,
+        head_t,
+        newest_t: commits.first().map_or(0, |(t, _)| *t),
+        oldest_t: commits.last().map_or(0, |(t, _)| *t),
+        count: commits.len(),
+        commits: commits.into_iter().map(|(_, bytes)| bytes).collect(),
+        blobs,
+        missing_blobs,
+        next_cursor_id: page.next,
+        effective_limit: limit,
+        lineage: true,
+        merged_commits: merged_commits.into_iter().map(|(_, bytes)| bytes).collect(),
+    })
 }
 
 // ============================================================================
@@ -1445,7 +1910,9 @@ impl Fluree {
         let mut blobs_stored = 0usize;
 
         // Write commit blobs to local CAS (v4: CID = SHA-256 of full blob).
-        for b64 in &response.commits {
+        // A `lineage` page carries the commits its merges brought in
+        // separately. Clone stores them like any other.
+        for b64 in response.commits.iter().chain(&response.merged_commits) {
             let bytes = &b64.0;
             storage
                 .content_write_bytes(ContentKind::Commit, ledger_id, bytes)
@@ -1607,8 +2074,7 @@ impl Fluree {
         // callers may pass a bare `name` (the CLI does), which `create_ledger`
         // would register as `name:main` while raw-id storage writes would land
         // in the wrong namespace.
-        let new_ledger_id = fluree_db_core::ledger_id::normalize_ledger_id(new_ledger_id)
-            .unwrap_or_else(|_| new_ledger_id.to_string());
+        let new_ledger_id = LedgerId::parse(new_ledger_id)?.to_string();
         let new_ledger_id = new_ledger_id.as_str();
 
         // Create the empty target first. `create_ledger` errors if the name is
@@ -1616,7 +2082,13 @@ impl Fluree {
         self.create_ledger(new_ledger_id).await?;
 
         match self.restore_into_created(new_ledger_id, reader).await {
-            Ok(result) => Ok(result),
+            Ok(result) => {
+                // `create_ledger` cached the empty genesis state, and the
+                // restore then moved the heads underneath it; drop that handle
+                // so the next read loads the restored ledger.
+                self.disconnect_ledger(new_ledger_id).await;
+                Ok(result)
+            }
             Err(e) => {
                 // Roll back so we never leave a ledger whose head points at
                 // partially-ingested data. `restore_ledger` only reaches here
@@ -1628,6 +2100,14 @@ impl Fluree {
                 // already written are harmless content-addressed orphans (a
                 // retry rewrites identical bytes; GC reclaims them otherwise).
                 // `drop_ledger` takes the bare name, so strip the branch suffix.
+                // (admin::drop_ledger is native-only; on wasm32 the orphaned
+                // name is left for the server/external admin to reap.)
+                #[cfg(target_arch = "wasm32")]
+                error!(
+                    ledger = %new_ledger_id,
+                    "restore rollback (drop_ledger) unavailable on wasm32"
+                );
+                #[cfg(not(target_arch = "wasm32"))]
                 match fluree_db_core::ledger_id::split_ledger_id(new_ledger_id) {
                     Ok((name, _branch)) => {
                         if let Err(drop_err) = self.drop_ledger(&name, crate::DropMode::Soft).await
@@ -1962,16 +2442,20 @@ impl Fluree {
     /// Validates the commit chain, verifies ancestry against the local head,
     /// writes blobs to CAS, advances `CommitHead`, and updates in-memory novelty.
     ///
-    /// `commits` must be ordered oldest → newest.
+    /// `commits` must be ordered oldest → newest. `merged_commits` carries
+    /// the commits that merges in `commits` brought in, parents before
+    /// children. See [`PushCommitsRequest::merged_commits`].
     pub async fn import_commits_incremental(
         &self,
         ledger_id: &str,
         commits: Vec<Base64Bytes>,
+        merged_commits: Vec<Base64Bytes>,
         blobs: HashMap<String, Base64Bytes>,
     ) -> Result<CommitImportResult> {
         if commits.is_empty() {
             return Err(ApiError::http(400, "no commits to import"));
         }
+        let ledger_id = &LedgerId::parse(ledger_id)?;
 
         let mut guard = self
             .lock_ledger(ledger_id)
@@ -1995,6 +2479,8 @@ impl Fluree {
         let request = PushCommitsRequest {
             commits,
             blobs: blobs.clone(),
+            missing_blobs: Vec::new(),
+            merged_commits,
         };
 
         // 3) Decode and validate chain.
@@ -2005,14 +2491,35 @@ impl Fluree {
         preflight_strict_next_t_and_prev(&current_ref, &decoded)
             .map_err(PushError::into_api_error)?;
 
+        // 4.1) Decode the commits the chain's merges brought in, and check
+        //      that no parent the bundle names is missing here.
+        let merged = decode_merged_commits(&request).map_err(PushError::into_api_error)?;
+        validate_merged_reachable(&decoded, &merged).map_err(PushError::into_api_error)?;
+        let content_store = self.branched_content_store(base_state.ledger_id()).await?;
+        validate_ancestry_present(content_store.as_ref(), &decoded, &merged)
+            .await
+            .map_err(PushError::into_api_error)?;
+
         // 5) Validate referenced blobs are provided.
-        validate_required_blobs(&decoded, &request.blobs).map_err(PushError::into_api_error)?;
+        validate_required_blobs(&decoded, &merged, &request.blobs, &request.missing_blobs)
+            .map_err(PushError::into_api_error)?;
 
         // 6) Write blobs + commit bytes to local CAS.
         let storage = self.backend().admin_storage_cloned().ok_or_else(|| {
             ApiError::config("push_commits_strict requires a managed storage backend")
         })?;
-        write_required_blobs(&storage, base_state.ledger_id(), &request.blobs, &decoded)
+        write_required_blobs(
+            &storage,
+            base_state.ledger_id(),
+            &request.blobs,
+            &decoded,
+            &merged,
+        )
+        .await
+        .map_err(PushError::into_api_error)?;
+
+        // Parents before children, as in `prepare_push`.
+        write_commit_blobs(&storage, base_state.ledger_id(), &merged)
             .await
             .map_err(PushError::into_api_error)?;
 
@@ -2055,10 +2562,19 @@ impl Fluree {
         let all_flakes: Vec<(i64, Vec<Flake>)> = decoded
             .iter()
             .map(|c| {
+                // Pushed commits come from a peer; screen the blob's flakes for
+                // impersonated commit provenance before they reach novelty. See
+                // the note on the clone path above and #1846.
                 let mut flakes = c.commit.flakes.clone();
                 let mut meta_flakes =
                     generate_commit_flakes(&c.commit, base_state.ledger_id(), c.commit.t);
                 if let Some(ref g_sid) = txn_meta_g_sid {
+                    let dropped = drop_forged_commit_flakes(&mut flakes, g_sid);
+                    warn_if_forged_commit_flakes_dropped(
+                        dropped,
+                        base_state.ledger_id(),
+                        c.commit.t,
+                    );
                     stamp_graph_on_commit_flakes(&mut meta_flakes, g_sid);
                 }
                 flakes.extend(meta_flakes);

@@ -333,7 +333,11 @@ async fn min_max_value_ordered_alongside_group_concat() {
 
             for (pred, expect_min, expect_max) in [
                 ("ex:word", json!("apple"), json!("zebra")),
-                ("ex:link", json!("ex:aaa"), json!("ex:zzz")),
+                (
+                    "ex:link",
+                    json!("http://example.org/ns/aaa"),
+                    json!("http://example.org/ns/zzz"),
+                ),
             ] {
                 let q = format!(
                     r#"PREFIX ex: <http://example.org/ns/>

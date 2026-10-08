@@ -49,8 +49,23 @@ pub struct SubqueryPattern {
     /// joined). SPARQL 1.1 §18.2 sub-`SELECT`s are always uncorrelated and set
     /// this; the executor then never seeds the inner query per parent row (which
     /// would correlate it / let an inner LIMIT apply per row). JSON-LD subqueries
-    /// default to `false`, preserving their per-row-seeding (LATERAL) behavior.
+    /// default to `false` (per-row seeding). Note this is NOT a pure LATERAL pin:
+    /// per-row mode seeds only the self-produced correlation vars (`join_keys`)
+    /// and RECONCILES the OPTIONAL/UNION-produced ones (`reconcile_vars`) at merge
+    /// (Family B, W3C join-scope-1) instead of pinning them — so an OPTIONAL/UNION
+    /// -bound correlation var of an existing JSON-LD `["query"]` subquery now
+    /// joins per §18.4 rather than being forced to the parent value. See
+    /// `SubqueryOperator::reconcile_vars`.
     pub uncorrelated: bool,
+    /// Correlation variables with EXPLICIT lateral-import semantics — Cypher's
+    /// `CALL (p) { … }` scope clause. A pinned var is always seeded to the
+    /// parent's value in per-row mode (never left to the Family-B reconcile,
+    /// even when the body binds it only via OPTIONAL — openCypher defines the
+    /// import as a per-row binding), and a pinned var the body does not itself
+    /// produce forces per-row evaluation (evaluate-once + hash-join cannot
+    /// retain zero-match parents). Empty for SPARQL/JSON-LD subqueries, whose
+    /// correlation semantics are inferred (§18.2/§18.4).
+    pub pinned_vars: Vec<VarId>,
 }
 
 impl SubqueryPattern {
@@ -66,7 +81,15 @@ impl SubqueryPattern {
             order_binds: Vec::new(),
             grouping: None,
             uncorrelated: false,
+            pinned_vars: Vec::new(),
         }
+    }
+
+    /// Pin explicit lateral-import variables (Cypher `CALL (p)`); see
+    /// [`Self::pinned_vars`].
+    pub fn with_pinned_vars(mut self, pinned: Vec<VarId>) -> Self {
+        self.pinned_vars = pinned;
+        self
     }
 
     /// Mark this subquery as uncorrelated (SPARQL 1.1 §18.2 — evaluated
@@ -227,6 +250,21 @@ pub struct ServicePattern {
     /// Used by `ServiceOperator` to send the body verbatim to remote endpoints
     /// without needing an IR-to-SPARQL serializer.
     pub source_body: Option<Arc<str>>,
+    /// The parent query's prologue, re-rendered as SPARQL, to prepend to the
+    /// outgoing sub-query.
+    ///
+    /// Because `source_body` is a verbatim slice of the SERVICE block, any
+    /// prefixed name or relative IRI in it is only meaningful under the parent
+    /// query's `PREFIX` / `BASE` declarations — which live outside that slice.
+    /// Shipping the body without them changes what the query means: a prefixed
+    /// name fails at the remote with "Undefined prefix", and a relative IRI
+    /// silently resolves against a different base and matches a different term.
+    ///
+    /// Rendered from the lowerer's already-resolved prefix map rather than
+    /// sliced out of the source, so relative `PREFIX` IRIs arrive base-resolved
+    /// and no literal in the body is ever rewritten. Empty string when the query
+    /// declared no prologue; `None` for JSON-LD originated queries.
+    pub source_prologue: Option<Arc<str>>,
 }
 
 impl ServicePattern {
@@ -237,22 +275,43 @@ impl ServicePattern {
             endpoint,
             patterns,
             source_body: None,
+            source_prologue: None,
         }
     }
 
-    /// Create a new SERVICE pattern with captured source body text
+    /// Create a new SERVICE pattern with captured source body text and the
+    /// prologue that body's prefixed names and relative IRIs resolve under.
+    ///
+    /// The two are captured together because the body is only interpretable
+    /// under that prologue — see [`source_prologue`](Self::source_prologue).
     pub fn with_source_body(
         silent: bool,
         endpoint: ServiceEndpoint,
         patterns: Vec<Pattern>,
         source_body: Arc<str>,
+        source_prologue: Arc<str>,
     ) -> Self {
         Self {
             silent,
             endpoint,
             patterns,
             source_body: Some(source_body),
+            source_prologue: Some(source_prologue),
         }
+    }
+
+    /// The complete SPARQL query text to send to a remote endpoint for this
+    /// SERVICE block, or `None` when no source body was captured.
+    ///
+    /// Prologue first, so the body's prefixed names and relative IRIs resolve
+    /// remotely to exactly the IRIs they resolve to locally. The body is wrapped
+    /// in braces unconditionally: `parse_group_graph_pattern` unwraps a
+    /// single-pattern group, so the slice may or may not carry its own, and
+    /// double braces are legal SPARQL.
+    pub fn remote_query_text(&self) -> Option<String> {
+        let body = self.source_body.as_deref()?;
+        let prologue = self.source_prologue.as_deref().unwrap_or("");
+        Some(format!("{prologue}SELECT * WHERE {{ {body} }}"))
     }
 
     /// Variables this service pattern adds to the row's binding set: the
@@ -476,6 +535,30 @@ pub enum Pattern {
         /// Patterns about the annotation subject.
         body: Vec<Pattern>,
     },
+}
+
+/// Columns of a VALUES table that bind their variable on every row: those with
+/// no UNDEF cell. A table with no rows binds every column vacuously.
+pub fn values_bound_in_every_row<'a>(
+    vars: &'a [VarId],
+    rows: &'a [Vec<Binding>],
+) -> impl Iterator<Item = VarId> + 'a {
+    vars.iter()
+        .enumerate()
+        .filter(|(col, _)| {
+            rows.iter()
+                .all(|row| row.get(*col).is_some_and(Binding::is_bound))
+        })
+        .map(|(_, var)| *var)
+}
+
+/// Whether column `col` of a VALUES table is UNDEF on every row. A table with
+/// no rows has no such column: it emits no solution, not one of any value.
+pub fn values_column_all_undef(rows: &[Vec<Binding>], col: usize) -> bool {
+    !rows.is_empty()
+        && rows
+            .iter()
+            .all(|row| matches!(row.get(col), Some(Binding::Unbound)))
 }
 
 impl Pattern {

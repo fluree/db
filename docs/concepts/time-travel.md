@@ -71,12 +71,13 @@ Query data as it existed at a specific transaction using the `from` field with `
 
 ### Query at ISO Timestamp
 
-Query using ISO 8601 datetime with `@iso:`:
+Query using ISO 8601 datetime with `@time:` (`@iso:` is its original spelling
+and remains accepted as an alias):
 
 ```json
 {
   "@context": { "ex": "http://example.org/ns/" },
-  "from": "ledger:main@iso:2024-01-15T10:30:00Z",
+  "from": "ledger:main@time:2024-01-15T10:30:00Z",
   "select": ["?name"],
   "where": [
     { "@id": "?person", "ex:name": "?name" }
@@ -99,6 +100,14 @@ Query at a specific commit using `@commit:` with a commit ContentId:
 }
 ```
 
+### Pinning the Ledger in the Request Path
+
+Over HTTP, the pin can go on the ledger in the path of a ledger-scoped query instead of in the body. `POST /v1/fluree/query/ledger:main@t:100` (or `@time:`, `@recorded:`, `@commit:`) reads the whole ledger as of that point, including its named graphs: `GRAPH ?g` enumerates the graphs that existed then. A time the body names for the same ledger must agree with the path's. See [`POST /query/{ledger}`](../api/endpoints.md#post-queryledger).
+
+### Policy at a Past Point
+
+A read at a past point is governed by the ledger's policy as it stood at that point, however the time is given (a path pin, `from: "ledger:main@t:1"`, or `FROM <ledger:main@t:1>`): its configured policy defaults, such as `f:defaultAllow`, and its policy rules are read from the pinned state. Tightening policy later does not protect earlier states. A ledger that allowed anonymous reads at t=1 and denies them from t=2 still answers a read pinned to t=1. To keep a reader away from a ledger's history, restrict the reader's access to the ledger itself, for example with token ledger scopes. See [Policy in queries](../security/policy-in-queries.md#time-travel-queries).
+
 ## Event Time: Backdated Commits
 
 Every commit carries an **event time** (`db:time` in the txn-meta graph) — the
@@ -113,15 +122,18 @@ with the current time at commit, but a transaction may supply its own:
 }
 ```
 
+A SPARQL UPDATE supplies it with `# PRAGMA event-time: 2021-03-15T00:00:00Z`
+(see [Request options](../query/sparql.md#request-options--pragma)).
+
 This is how historical data gets *real* time travel: replay a year of history
 as ordinary transactions, each stamped with the date the change actually
-happened, and `@iso:` queries work over that custom timeline with no further
+happened, and `@time:` queries work over that custom timeline with no further
 setup. (The Rust API equivalent is `CommitOpts::with_timestamp`.)
 
 Two rules keep the timeline coherent — both enforced at commit time:
 
 1. **Monotonic**: a commit's event time must be `>=` the head commit's event
-   time. `@iso:` resolution depends on this ordering; a fresh ledger's first
+   time. `@time:` resolution depends on this ordering; a fresh ledger's first
    commit can carry any past time (there is no floor — pre-1970 works).
 2. **No future times**: event time may not exceed the current wall clock
    (plus a small skew allowance). Commits are immutable, so one future-dated
@@ -129,7 +141,7 @@ Two rules keep the timeline coherent — both enforced at commit time:
    reality.
 
 The default stamp is also clamped to the head's event time, so a system clock
-that steps backwards can no longer corrupt `@iso:` resolution.
+that steps backwards can no longer corrupt `@time:` resolution.
 
 ### Recorded Time: the Audit Axis (`@recorded:`)
 
@@ -158,14 +170,27 @@ The `@recorded:` selector time-travels along that axis:
 }
 ```
 
-- `@iso:` answers *"what was true at this time?"* (event axis)
+- `@time:` answers *"what was true at this time?"* (event axis)
 - `@recorded:` answers *"what had been loaded into the ledger by this
   time?"* (audit axis)
 
 On a ledger that never used `eventTime`, the two axes are identical and
-`@recorded:` behaves exactly like `@iso:`. Both timestamps live inside the
+`@recorded:` behaves exactly like `@time:`. Both timestamps live inside the
 signed commit envelope, so a signature attests to the claimed event time and
 the recording time together.
+
+### Graph Sources (`@snapshot:`)
+
+A virtual graph source backed by a versioned table (Iceberg, Delta) has no
+transaction numbers or commit hashes, so `@t:` and `@commit:` are rejected on
+its alias. It is pinned instead with `@time:` / `@recorded:` (the latest table
+state committed at or before that instant — a table commit has one time, so
+the two coincide) or with the table format's own identifier, `@snapshot:<id>`
+— an Iceberg snapshot id, or a Delta table version — which is meaningless on a
+native ledger and rejected there. A pin no retained state satisfies is an
+error, never the current state. See
+[Iceberg time travel](../graph-sources/iceberg.md#time-travel) and
+[Delta time travel](../graph-sources/delta.md#time-travel).
 
 ## Temporal Data Model
 
@@ -213,7 +238,7 @@ This allows you to query by both:
 - **Transaction time**: When was this recorded? (using `@t:`, `@recorded:`, `@commit:`)
 - **Valid time**: When was this true? (using standard WHERE clause filters on `ex:validFrom`/`ex:validTo`)
 
-For commit-granular valid time — importing historical data so `@iso:` time
+For commit-granular valid time — importing historical data so `@time:` time
 travel works over the dates things actually changed — see
 [Event Time: Backdated Commits](#event-time-backdated-commits) above. Explicit
 `validFrom`/`validTo` properties remain the right model for *fact*-granular
@@ -376,6 +401,19 @@ WHERE {
 ORDER BY ?t
 ```
 
+The `<< ... >>` bindings are what populate `?t` and `?op`. Selecting those
+variables without them is **not** an error — the query returns history rows
+with both columns null, and no way to tell an assert from a retract. The
+quoted triple's object must be a variable; a constant object is rejected.
+
+Two restrictions on the SPARQL form:
+
+- `FROM ... TO ...` is accepted only on the **connection-scoped** endpoint
+  (`POST /v1/fluree/query`). The ledger-scoped path (`/v1/fluree/query/{ledger}`)
+  and the streaming path (`/v1/fluree/stream/query`) reject it.
+- History mode and [reasoning](../query/reasoning.md) are mutually exclusive;
+  a history-range query that requests reasoning is rejected.
+
 ### Property-Specific History
 
 Query changes for specific properties:
@@ -417,8 +455,8 @@ Query history using ISO 8601 datetime strings:
 ```json
 {
   "@context": { "ex": "http://example.org/ns/" },
-  "from": "ledger:main@iso:2024-01-01T00:00:00Z",
-  "to": "ledger:main@iso:2024-12-31T23:59:59Z",
+  "from": "ledger:main@time:2024-01-01T00:00:00Z",
+  "to": "ledger:main@time:2024-12-31T23:59:59Z",
   "select": ["?name", "?t", "?op"],
   "where": [
     { "@id": "ex:alice", "ex:name": { "@value": "?name", "@t": "?t", "@op": "?op" } }
@@ -428,7 +466,9 @@ Query history using ISO 8601 datetime strings:
 
 ### Filter by Operation Type
 
-Filter to show only assertions or only retractions:
+Filter to show only assertions or only retractions. `@op` is a **boolean**
+(`true` = assert, `false` = retract), so filter against `true` / `false` —
+the strings `"assert"` / `"retract"` are not accepted and match nothing:
 
 ```json
 {
@@ -438,9 +478,16 @@ Filter to show only assertions or only retractions:
   "select": ["?name", "?t"],
   "where": [
     { "@id": "ex:alice", "ex:name": { "@value": "?name", "@t": "?t", "@op": "?op" } },
-    ["filter", "(= ?op \"retract\")"]
+    ["filter", "(= ?op false)"]
   ]
 }
+```
+
+The constant shorthand is equivalent and shorter — `"@op": false` lowers to
+the same filter without binding a variable:
+
+```json
+{ "@id": "ex:alice", "ex:name": { "@value": "?name", "@t": "?t", "@op": false } }
 ```
 
 ### Pattern History Across Subjects
@@ -467,8 +514,8 @@ Query changes for a specific property across all subjects:
 Different time specifiers have different performance characteristics:
 
 - **@t:NNN** (fastest): Direct transaction number, no resolution needed
-- **@iso:DATETIME**: O(log n) binary search through commit event timestamps using POST index
-- **@recorded:DATETIME**: Same POST-index probes over `db:receivedAt`; identical to `@iso:` cost (and identical *behavior* on ledgers that never used `eventTime`)
+- **@time:DATETIME**: O(log n) binary search through commit event timestamps using POST index
+- **@recorded:DATETIME**: Same POST-index probes over `db:receivedAt`; identical to `@time:` cost (and identical *behavior* on ledgers that never used `eventTime`)
 - **@commit:CID**: Bounded SPOT scan, O(k) where k is commits matching prefix (use longer prefixes for better performance)
 
 ### Index Selection
@@ -490,7 +537,7 @@ History queries scan flakes within the specified time range:
 
 ### Optimization Strategies
 
-1. **Use Transaction Numbers**: When possible, use `@t:NNN` instead of `@iso:DATETIME`
+1. **Use Transaction Numbers**: When possible, use `@t:NNN` instead of `@time:DATETIME`
 2. **Narrow History Patterns**: Use `[subject, predicate]` instead of `[subject]` when you only need specific properties
 3. **Limit Time Ranges**: Specify realistic `from`/`to` bounds rather than querying all history
 4. **ContentId Prefix Length**: Use sufficiently long ContentId prefixes to avoid ambiguity checks
@@ -527,7 +574,7 @@ Maintain complete audit trails - query data as it existed at time of consent:
 ```json
 {
   "@context": { "ex": "http://example.org/ns/" },
-  "from": "users:main@iso:2024-05-25T14:30:00Z",
+  "from": "users:main@time:2024-05-25T14:30:00Z",
   "select": ["?predicate", "?data"],
   "where": [
     { "@id": "ex:alice", "?predicate": "?data" }
@@ -542,8 +589,8 @@ Track how data evolved over time:
 ```json
 {
   "@context": { "ex": "http://example.org/ns/" },
-  "from": "sales:main@iso:2024-01-01T00:00:00Z",
-  "to": "sales:main@iso:2024-12-31T23:59:59Z",
+  "from": "sales:main@time:2024-01-01T00:00:00Z",
+  "to": "sales:main@time:2024-12-31T23:59:59Z",
   "select": ["?order", "?amount", "?t", "?op"],
   "where": [
     { "@id": "?order", "ex:amount": { "@value": "?amount", "@t": "?t", "@op": "?op" } }
@@ -559,7 +606,7 @@ Investigate system state at time of incident:
 ```json
 {
   "@context": { "ex": "http://example.org/ns/" },
-  "from": "system:config@iso:2024-01-15T09:15:00Z",
+  "from": "system:config@time:2024-01-15T09:15:00Z",
   "select": ["?setting", "?config"],
   "where": [
     { "@id": "?setting", "ex:value": "?config" }
@@ -659,7 +706,7 @@ Generate a complete audit trail for a sensitive entity:
 ```json
 {
   "@context": { "schema": "http://schema.org/" },
-  "from": "users:main@iso:2024-01-01T00:00:00Z",
+  "from": "users:main@time:2024-01-01T00:00:00Z",
   "to": "users:main@t:latest",
   "select": ["?property", "?value", "?t", "?op"],
   "where": [
@@ -698,8 +745,8 @@ Query the exact state of the system when a bug was reported:
 {
   "@context": { "ex": "http://example.org/ns/" },
   "from": [
-    "products:main@iso:2024-06-15T14:30:00Z",
-    "inventory:main@iso:2024-06-15T14:30:00Z"
+    "products:main@time:2024-06-15T14:30:00Z",
+    "inventory:main@time:2024-06-15T14:30:00Z"
   ],
   "select": ["?product", "?stock", "?reserved"],
   "where": [
@@ -715,7 +762,7 @@ This recreates the exact state across multiple ledgers at the time the bug occur
 
 ### Time Travel Guidelines
 
-1. **Explicit Time References**: Always specify clear time references (`@t:`, `@iso:`, or `@commit:`) for reproducible queries
+1. **Explicit Time References**: Always specify clear time references (`@t:`, `@time:`, or `@commit:`) for reproducible queries
 2. **Time Zone Awareness**: Use UTC for ISO timestamps to avoid ambiguity
 3. **ContentId Length**: Use sufficiently long ContentId prefixes to avoid collisions
 4. **Performance Testing**: Test query performance across different time ranges and ledger sizes
@@ -738,7 +785,7 @@ This recreates the exact state across multiple ledgers at the time the bug occur
 
 1. **Index Maintenance**: Monitor and tune background indexing for optimal historical query performance
 2. **Storage Planning**: Plan storage growth for historical data (all history is preserved)
-3. **Query Optimization**: Use time-specific queries (`@t:`) rather than datetime resolution (`@iso:`) when transaction numbers are known
+3. **Query Optimization**: Use time-specific queries (`@t:`) rather than datetime resolution (`@time:`) when transaction numbers are known
 4. **Backup Strategy**: Include temporal aspects in backup/recovery plans - commits and indexes are both critical
 
 ## Implementation Architecture
@@ -754,10 +801,10 @@ This recreates the exact state across multiple ledgers at the time the bug occur
 
 ### Time Travel Resolution
 
-When you query with `@t:`, `@iso:`, `@recorded:`, or `@commit:`:
+When you query with `@t:`, `@time:`, `@recorded:`, or `@commit:`:
 
 1. **@t:NNN** - Direct transaction number (fastest)
-2. **@iso:DATETIME** - Binary search through commit event timestamps using POST index
+2. **@time:DATETIME** - Binary search through commit event timestamps using POST index
 3. **@recorded:DATETIME** - Same probes over `db:receivedAt` (audit axis), falling back to the event axis for history before the first backdated commit
 4. **@commit:CID** - Bounded SPOT scan to find matching commit
 

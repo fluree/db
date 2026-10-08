@@ -65,6 +65,9 @@ pub async fn run(
                 graph: graph.map(String::from),
                 shapes,
                 include_attached,
+                // Operator-run and local: no request deadline to inherit and
+                // no untrusted caller to bound.
+                ..Default::default()
             };
             let report = fluree.validate_ledger(&alias, &options).await?;
             finish(&report, format, fail_on)
@@ -99,7 +102,10 @@ async fn validate_file(
 
     let ledger_graph = fluree.graph(alias);
     match data_format {
+        detect::DataFormat::Trig => return Err(detect::trig_refused("validate")),
         detect::DataFormat::Turtle => {
+            // `insert_turtle` would accept TriG and load it into named graphs.
+            detect::refuse_trig_body("validate", &content)?;
             ledger_graph
                 .transact()
                 .insert_turtle(&content)
@@ -116,6 +122,7 @@ async fn validate_file(
         graph: graph.map(String::from),
         shapes,
         include_attached,
+        ..Default::default()
     };
     Ok(fluree.validate_ledger(alias, &options).await?)
 }
@@ -153,7 +160,11 @@ fn resolve_shapes_source(
         })?;
         return Ok(
             match detect::detect_data_format(Some(path), &content, None)? {
-                detect::DataFormat::Turtle => ShapesSource::InlineTurtle(content),
+                detect::DataFormat::Turtle => {
+                    detect::refuse_trig_body("--shacl", &content)?;
+                    ShapesSource::InlineTurtle(content)
+                }
+                detect::DataFormat::Trig => return Err(detect::trig_refused("--shacl")),
                 detect::DataFormat::JsonLd => {
                     ShapesSource::InlineJsonLd(serde_json::from_str(&content)?)
                 }
@@ -233,12 +244,13 @@ fn print_table(report: &ValidateReport) {
         println!();
     }
     println!(
-        "Conforms: {} — {} violation(s), {} warning(s), {} info ({} shape(s) checked)",
+        "Conforms: {} — {} violation(s), {} warning(s), {} info ({} shape(s) checked at t={})",
         report.conforms,
         report.violation_count(),
         report.warning_count(),
         report.info_count(),
-        report.shape_count
+        report.shape_count,
+        report.t
     );
 }
 

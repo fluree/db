@@ -214,6 +214,12 @@ Enable RDFS + OWL 2 RL + Datalog together:
 OWL 2 RL facts are materialized first, then Datalog rules run over the
 combined base + OWL data, and finally RDFS query rewriting is applied.
 
+A rule that fails to parse or validate — a stored `f:rule` as much as a
+query-time one — fails the query with an error naming the rule and the
+offending construct. Rules are never skipped silently, because a reasoning
+query answered over a partial rule set is wrong in a way the caller cannot
+see. See [Datalog rules](datalog-rules.md#validation-a-rule-that-cannot-run-is-an-error).
+
 ## SPARQL
 
 In SPARQL queries, reasoning is controlled via the Fluree-specific
@@ -283,10 +289,23 @@ query-time overrides are allowed. See
 
 ## Materialization budget
 
-OWL 2 RL materialization runs under a budget (default: 1,000,000 derived
-facts / 30 seconds). When the closure exceeds the budget it is **capped**:
-the query still answers, but over an incomplete closure — results may be
-missing entailments. A capped run is therefore surfaced, not just logged:
+Materialization — OWL 2 RL and datalog rules alike — runs under a budget
+(default: 1,000,000 derived facts / 30 seconds). The limits are checked as
+work is dispatched rather than once a round, so a long round is bounded far
+more tightly than it used to be. They are not checked between every derived
+fact everywhere: an OWL 2 RL property chain, and the rules that produce
+`owl:sameAs`, each run to completion before the next check, so a single
+high-fan-out input can still carry a round past a limit before it is noticed.
+
+There is a third limit on the bytes those derived facts occupy. It has no
+default of its own: it is derived from the fact ceiling, at an allowance well
+above what an ordinary fact costs, so the **fact** cap is what binds on normal
+data and the memory cap only fires when facts are abnormally large — long
+IRIs, or big string and JSON literals. Raising `maxFacts` raises it with them.
+Both limits count only *derived* facts, not the base data the fixpoint reads. When the closure exceeds the budget it is
+**capped**: the query still answers, but over an incomplete closure —
+results may be missing entailments. A capped run is therefore surfaced, not
+just logged:
 
 - Tracked responses (`"opts": {"meta": true}` or the `fluree-track-*`
   headers) carry a top-level `reasoning` block:
@@ -306,19 +325,27 @@ missing entailments. A capped run is therefore surfaced, not just logged:
   ```
 
 - The same JSON rides the `x-fdb-reasoning` response header.
+- `capped_reason` is `"facts"`, `"time"`, `"memory"` or, for datalog,
+  `"iterations"` (the fixpoint hit its round limit before converging).
+- `rules_fired` breaks the tally down per rule. It counts derived **facts**
+  per rule, not rule applications: a rule that matches a thousand rows and
+  derives one new fact from them counts once.
 - The server logs a WARN per capped materialization.
 
 The budget is configurable at three levels (highest precedence first):
 
 1. **Per query** — JSON-LD `"reasoningBudget": {"maxFacts": 20000000,
-   "maxSeconds": 300}`, or SPARQL `# PRAGMA reasoning-max-facts: 20000000` /
-   `# PRAGMA reasoning-max-seconds: 300`. Subject to the ledger's
+   "maxSeconds": 300, "maxMemoryMb": 512}`, or SPARQL
+   `# PRAGMA reasoning-max-facts: 20000000` /
+   `# PRAGMA reasoning-max-seconds: 300` /
+   `# PRAGMA reasoning-max-memory-mb: 512`. Subject to the ledger's
    `f:overrideControl` on `f:reasoningDefaults`.
-2. **Per ledger** — `f:reasoningMaxFacts` / `f:reasoningMaxSeconds` in
-   `f:reasoningDefaults` (see
+2. **Per ledger** — `f:reasoningMaxFacts` / `f:reasoningMaxSeconds` /
+   `f:reasoningMaxMemoryMb` in `f:reasoningDefaults` (see
    [Setting groups](../ledger-config/setting-groups.md)).
 3. **Server-wide** — `FLUREE_REASONING_MAX_FACTS` /
-   `FLUREE_REASONING_MAX_SECONDS` environment variables.
+   `FLUREE_REASONING_MAX_SECONDS` / `FLUREE_REASONING_MAX_MEMORY_MB`
+   environment variables.
 
 ## Performance considerations
 
@@ -326,8 +353,8 @@ The budget is configurable at three levels (highest precedence first):
 |------|----------|---------|
 | RDFS | Negligible — query rewriting only | N/A |
 | OWL 2 QL | Negligible — query rewriting only | N/A |
-| OWL 2 RL | First query materializes derived facts; subsequent queries use cache | LRU cache (16 entries), keyed on database state + reasoning modes |
-| Datalog | Each unique rule set + database state combination is cached | Same LRU cache as OWL 2 RL |
+| OWL 2 RL | First query materializes derived facts; subsequent queries use cache | LRU cache (16 entries), keyed on database state + reasoning modes + budget |
+| Datalog | Rule bodies run on the query executor; the first query materializes, later queries with the same rule set hit the cache | Same LRU cache as OWL 2 RL, keyed additionally on a content hash of the rule set (stored and query-time rules) |
 
 **Tips:**
 - Start with **RDFS** if you only need class/property hierarchies — it has

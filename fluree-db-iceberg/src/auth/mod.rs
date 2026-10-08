@@ -8,18 +8,25 @@
 //!
 //! - [`BearerTokenAuth`] - Static bearer token authentication
 //! - [`OAuth2ClientCredentials`] - OAuth2 client credentials flow with token caching
+//! - [`GoogleMetadataAuth`] - Google metadata-server tokens (GKE Workload
+//!   Identity / GCE), refreshed automatically — for Google Iceberg REST catalogs
+//!   (BigLake), where a static bearer would expire
 
 mod bearer;
+mod google_metadata;
 mod oauth2;
+mod token;
 
 pub use bearer::BearerTokenAuth;
+pub use google_metadata::{GoogleMetadataAuth, GoogleMetadataConfig};
 pub use oauth2::{OAuth2ClientCredentials, OAuth2Config};
 
-use crate::config_value::ConfigValue;
+use crate::config_value::{ConfigValue, SecretResolver};
 use crate::error::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
+use std::sync::Arc;
 
 /// Authentication provider for REST catalog requests.
 ///
@@ -82,6 +89,19 @@ pub enum AuthConfig {
         #[serde(default)]
         audience: Option<String>,
     },
+    /// Google metadata-server OAuth (GKE Workload Identity / GCE). Mints and
+    /// refreshes short-lived access tokens from the instance metadata server —
+    /// for Google Iceberg REST catalogs (BigLake), where a static bearer would
+    /// expire after ~1h with no way to renew.
+    #[serde(rename = "google_metadata")]
+    GoogleMetadata {
+        /// OAuth scopes (comma-separated). Defaults to cloud-platform.
+        #[serde(default)]
+        scopes: Option<String>,
+        /// Token endpoint override (defaults to the metadata server). For tests.
+        #[serde(default)]
+        metadata_url: Option<String>,
+    },
 }
 
 impl AuthConfig {
@@ -109,6 +129,13 @@ impl AuthConfig {
                 };
                 Ok(Box::new(OAuth2ClientCredentials::new(config)?))
             }
+            AuthConfig::GoogleMetadata {
+                scopes,
+                metadata_url,
+            } => Ok(Box::new(GoogleMetadataAuth::new(google_metadata_config(
+                scopes,
+                metadata_url,
+            ))?)),
         }
     }
 
@@ -139,8 +166,73 @@ impl AuthConfig {
                 };
                 Ok(std::sync::Arc::new(OAuth2ClientCredentials::new(config)?))
             }
+            AuthConfig::GoogleMetadata {
+                scopes,
+                metadata_url,
+            } => Ok(std::sync::Arc::new(GoogleMetadataAuth::new(
+                google_metadata_config(scopes, metadata_url),
+            )?)),
         }
     }
+
+    /// Resolve every [`ConfigValue::SecretRef`] auth field via `resolver`,
+    /// returning a config whose secret-bearing values are all literal (or
+    /// env-var / `None`) and therefore safe to hand to the SYNCHRONOUS
+    /// [`create_provider`](Self::create_provider) /
+    /// [`create_provider_arc`](Self::create_provider_arc).
+    ///
+    /// This is the single async step in the auth pipeline; call it once (with the
+    /// host's injected resolver) before building a provider. Fields carrying no
+    /// secret reference clone through untouched, and a `None` resolver only
+    /// errors when a `SecretRef` is actually present (fail closed).
+    pub async fn hydrate(&self, resolver: Option<&Arc<dyn SecretResolver>>) -> Result<AuthConfig> {
+        match self {
+            AuthConfig::None => Ok(AuthConfig::None),
+            AuthConfig::Bearer { token } => Ok(AuthConfig::Bearer {
+                token: token.hydrate(resolver).await?,
+            }),
+            AuthConfig::OAuth2ClientCredentials {
+                token_url,
+                client_id,
+                client_secret,
+                scope,
+                audience,
+            } => Ok(AuthConfig::OAuth2ClientCredentials {
+                token_url: token_url.clone(),
+                client_id: client_id.hydrate(resolver).await?,
+                client_secret: client_secret.hydrate(resolver).await?,
+                scope: scope.clone(),
+                audience: audience.clone(),
+            }),
+            // No secret material to hydrate: the credential is minted per call from
+            // the instance metadata server and lives only in an in-memory
+            // `CachedToken`. Written out rather than matched by a wildcard so a NEW
+            // variant still fails compilation here and earns an explicit decision.
+            AuthConfig::GoogleMetadata {
+                scopes,
+                metadata_url,
+            } => Ok(AuthConfig::GoogleMetadata {
+                scopes: scopes.clone(),
+                metadata_url: metadata_url.clone(),
+            }),
+        }
+    }
+}
+
+/// Build a [`GoogleMetadataConfig`], applying optional overrides over the
+/// defaults (metadata-server URL + cloud-platform scope).
+fn google_metadata_config(
+    scopes: &Option<String>,
+    metadata_url: &Option<String>,
+) -> GoogleMetadataConfig {
+    let mut config = GoogleMetadataConfig::default();
+    if let Some(scopes) = scopes {
+        config.scopes = scopes.clone();
+    }
+    if let Some(metadata_url) = metadata_url {
+        config.metadata_url = metadata_url.clone();
+    }
+    config
 }
 
 /// No-op authentication (for testing or public catalogs).
@@ -193,6 +285,21 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_google_metadata_auth() {
+        // Minimal form (no overrides) — defaults to the metadata server + cloud-platform.
+        let config: AuthConfig = serde_json::from_str(r#"{"type": "google_metadata"}"#).unwrap();
+        assert!(matches!(
+            config,
+            AuthConfig::GoogleMetadata {
+                scopes: None,
+                metadata_url: None
+            }
+        ));
+        // Provider construction succeeds (no network I/O at build time).
+        assert!(config.create_provider_arc().is_ok());
+    }
+
+    #[test]
     fn test_parse_oauth2_auth() {
         let json = r#"{
             "type": "oauth2_client_credentials",
@@ -217,5 +324,57 @@ mod tests {
             }
             _ => panic!("Expected OAuth2 auth"),
         }
+    }
+
+    #[derive(Debug)]
+    struct StubResolver;
+
+    #[async_trait]
+    impl SecretResolver for StubResolver {
+        async fn resolve_secret(
+            &self,
+            secret_ref: &str,
+        ) -> std::result::Result<String, crate::config_value::SecretResolveError> {
+            Ok(format!("resolved:{secret_ref}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_oauth2_resolves_secret_ref_client_secret() {
+        let resolver: Arc<dyn SecretResolver> = Arc::new(StubResolver);
+        let auth = AuthConfig::OAuth2ClientCredentials {
+            token_url: "https://c.example.com/token".to_string(),
+            client_id: ConfigValue::literal("svc-client"),
+            client_secret: ConfigValue::SecretRef {
+                secret_ref: "vault://cs".to_string(),
+            },
+            scope: Some("session:role:ANALYST".to_string()),
+            audience: None,
+        };
+        let hydrated = auth.hydrate(Some(&resolver)).await.unwrap();
+        match hydrated {
+            AuthConfig::OAuth2ClientCredentials {
+                client_id,
+                client_secret,
+                scope,
+                ..
+            } => {
+                // client_id (no ref) untouched; client_secret ref resolved.
+                assert_eq!(client_id.resolve().unwrap(), "svc-client");
+                assert_eq!(client_secret.resolve().unwrap(), "resolved:vault://cs");
+                assert_eq!(scope, Some("session:role:ANALYST".to_string()));
+            }
+            _ => panic!("expected OAuth2 auth"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_bearer_secret_ref_without_resolver_fails_closed() {
+        let auth = AuthConfig::Bearer {
+            token: ConfigValue::SecretRef {
+                secret_ref: "vault://tok".to_string(),
+            },
+        };
+        assert!(auth.hydrate(None).await.is_err());
     }
 }

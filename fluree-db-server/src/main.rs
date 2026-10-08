@@ -17,6 +17,10 @@ use fluree_db_server::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Best-effort raise of the open-file soft limit (macOS defaults to 256,
+    // which large imports exceed). Done before logging init; logged after.
+    let fd_raise = fluree_db_core::fd_limit::raise_nofile_soft_to_hard();
+
     // 1. Parse CLI + env via clap (get both typed config and raw matches)
     let matches = ServerConfig::command().get_matches();
     let mut config = ServerConfig::from_arg_matches(&matches)?;
@@ -34,9 +38,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Warning: {e}");
     }
 
+    // 3. Publish the Iceberg local-table allowlist into the environment the
+    //    guard reads. Done here so a value that arrived from the config file
+    //    (rather than `FLUREE_ICEBERG_LOCAL_ROOTS` directly) reaches the guard,
+    //    and before any graph source is built — the allowlist is captured on
+    //    first use.
+    if let Some(ref roots) = config.iceberg_local_roots {
+        // SAFETY: single-threaded startup, before any storage or scan is built.
+        std::env::set_var("FLUREE_ICEBERG_LOCAL_ROOTS", roots);
+    }
+
     // Initialize telemetry (logging + optional tracing)
     let telemetry_config = TelemetryConfig::with_server_config(&config);
     init_logging(&telemetry_config);
+    fluree_db_core::fd_limit::log_raise_outcome(&fd_raise);
 
     // Log startup info
     tracing::info!(
@@ -62,17 +77,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Bootstrap the Raft integration when raft mode is enabled in
     // config. Validation guarantees node_id / storage_path /
     // listen_addr are all set if we get here with raft_enabled.
-    #[allow(unused_mut)]
+    // Only the `raft` path below reassigns `builder` (via
+    // `with_raft`); bind it `mut` only there so a non-raft build
+    // doesn't warn on an unused `mut`.
+    #[cfg(feature = "raft")]
     let mut builder = FlureeServerBuilder::for_config(config.clone());
+    #[cfg(not(feature = "raft"))]
+    let builder = FlureeServerBuilder::for_config(config.clone());
     #[cfg(feature = "raft")]
     if config.raft_enabled {
         use fluree_db_server::raft::{RaftBootstrapConfig, RaftIntegration};
         use std::sync::Arc;
 
-        let bootstrap = RaftBootstrapConfig::new(
+        let mut bootstrap = RaftBootstrapConfig::new(
             config.raft_node_id.expect("validated"),
             config.raft_storage_path.clone().expect("validated"),
         );
+        // Followers buffering a body the leader's routes would
+        // refuse is wasted memory; cap the forward relay at the
+        // same limit the public routes enforce.
+        bootstrap.network_config.transport.forward_max_body_bytes = config.body_limit;
         let raft_listen = config.raft_listen_addr.expect("validated");
         tracing::info!(
             node_id = config.raft_node_id.unwrap(),

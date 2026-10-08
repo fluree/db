@@ -328,6 +328,67 @@ fn parse_range_header(headers: &HeaderMap) -> Option<std::ops::Range<u64>> {
 }
 
 // ============================================================================
+// Conditional Requests
+// ============================================================================
+
+/// Cache policy for CAS object responses: the payload is content-addressed
+/// and immutable, so a cached copy is valid forever. `private` because the
+/// response was authorized by a bearer token; the public-visibility tier
+/// will relax this to `public` for ledgers that opt in.
+const OBJECT_CACHE_CONTROL: &str = "private, max-age=31536000, immutable";
+
+/// Paired with [`OBJECT_CACHE_CONTROL`], and load-bearing rather than
+/// decorative.
+///
+/// `private` keeps these bodies out of shared caches, but the browser's own
+/// cache is per *profile*, not per principal — and `immutable` means it never
+/// revalidates. Without the token in the cache key, principal A reading a
+/// ledger leaves entries that principal B, on the same browser profile, is
+/// served directly: the server never sees B's token and never gets to refuse
+/// it. `Vary` puts `Authorization` in that key, so a different token is a
+/// different entry.
+///
+/// The nameservice routes do not need this: [`NS_CACHE_CONTROL`] is
+/// `no-cache`, so every use revalidates and authorization re-runs on the
+/// server before anything is served.
+const OBJECT_VARY: &str = "Authorization";
+
+/// Cache policy for nameservice records: mutable state, so require
+/// revalidation — paired with the `ETag` this makes head polling a cheap
+/// 304 round-trip. `private` keeps shared caches from storing per-URL
+/// bodies once the public-visibility tier lifts the `Authorization` bar.
+const NS_CACHE_CONTROL: &str = "private, no-cache";
+
+/// True when an `If-None-Match` header names the given entity tag.
+///
+/// Handles comma-separated lists, comparing weakly (a `W/` prefix on
+/// either side is ignored) as RFC 9110 §13.1.2 prescribes for
+/// `If-None-Match`. The `*` form is deliberately not honored: it matches
+/// only when a current representation exists, and the object route
+/// answers before consulting storage.
+fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
+    let Some(value) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let target = etag.trim_start_matches("W/");
+    value
+        .split(',')
+        .map(str::trim)
+        .any(|candidate| candidate.trim_start_matches("W/") == target)
+}
+
+/// Entity tag for a serialized representation: a truncated SHA-256 of the
+/// exact bytes served, so any field change — heads, watermarks,
+/// `retracted`, `branches`, `serving` — yields a new validator.
+fn representation_etag(body: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("\"{}\"", hex::encode(&Sha256::digest(body)[..16]))
+}
+
+// ============================================================================
 // Ledger Resolution
 // ============================================================================
 
@@ -345,7 +406,7 @@ async fn resolve_block_ledger(
     fluree: &fluree_db_api::Fluree,
     kind: ContentKind,
     ledger: &str,
-) -> Result<Option<String>, ServerError> {
+) -> Result<Option<fluree_db_api::LedgerId>, ServerError> {
     let ns = fluree.nameservice();
     if let Some(record) = ns
         .lookup(ledger)
@@ -388,9 +449,10 @@ pub async fn get_ns_record(
     State(state): State<Arc<AppState>>,
     Path(ledger_id): Path<String>,
     StorageProxyBearer(principal): StorageProxyBearer,
-) -> Result<Json<NsRecordResponse>, ServerError> {
+    headers: HeaderMap,
+) -> Result<Response, ServerError> {
     // Check authorization for this specific ledger
-    if !principal.is_authorized_for_ledger(&ledger_id) {
+    if !principal.is_authorized_for_ledger(&crate::error::scope_id(&ledger_id)?) {
         // Return 404 for unauthorized (no existence leak)
         return Err(ServerError::not_found("Ledger not found"));
     }
@@ -416,11 +478,11 @@ pub async fn get_ns_record(
         }
     };
 
-    Ok(Json(NsRecordResponse {
+    let body = NsRecordResponse {
         // IMPORTANT: this endpoint is consumed by `fluree-db-nameservice-sync` which
         // deserializes into `NsRecord`. Therefore we must include all required
         // `NsRecord` fields with matching names and semantics.
-        ledger_id: ns_record.ledger_id.clone(),
+        ledger_id: ns_record.ledger_id.clone().to_string(),
         name: ns_record.name.clone(),
         branch: ns_record.branch.clone(),
         commit_head_id: ns_record
@@ -445,7 +507,31 @@ pub async fn get_ns_record(
         source_branch: ns_record.source_branch.clone(),
         branches: ns_record.branches,
         serving,
-    }))
+    };
+    let body_bytes = serde_json::to_vec(&body).map_err(|e| ServerError::internal(e.to_string()))?;
+
+    // Conditional GET: the validator identifies the whole representation
+    // (heads, watermarks, `retracted`, `branches`, `serving`), so an
+    // `If-None-Match` hit means the caller's copy is byte-identical to what
+    // would be served. Checked only after the authorization above — a 304
+    // must not become an existence oracle.
+    let etag = representation_etag(&body_bytes);
+    if if_none_match_matches(&headers, &etag) {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, &etag)
+            .header(header::CACHE_CONTROL, NS_CACHE_CONTROL)
+            .body(Body::empty())
+            .map_err(|e| ServerError::internal(e.to_string()));
+    }
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ETAG, &etag)
+        .header(header::CACHE_CONTROL, NS_CACHE_CONTROL)
+        .body(Body::from(body_bytes))
+        .map_err(|e| ServerError::internal(e.to_string()))
 }
 
 /// POST /fluree/storage/block
@@ -601,13 +687,31 @@ pub struct ObjectQuery {
 
 /// Content kinds allowed through the CID object endpoint.
 ///
-/// All replication-relevant kinds are served (commits, txns, config, and
-/// index artifacts). Only `GarbageRecord` (internal GC metadata) is excluded.
+/// All replication- and mount-relevant *ledger-scoped* kinds are served:
+/// commits, txns, config, the core index tree (roots/branches/leaves), dict
+/// blobs, and the ledger-scoped advanced index kinds (planner statistics,
+/// spatial, history sidecars). Excluded:
+///
+/// - `GarbageRecord` (internal GC metadata) — never fetched over a mount.
+/// - The edge-annotation arenas — `content_path` gives them no distinct
+///   address (shared `blob/` catch-all), so they cannot be resolved by CID.
+/// - `GraphSourceSnapshot` / `GraphSourceMapping` — these are addressed by
+///   **graph_source_id**, not ledger id, so `resolve_block_ledger` cannot
+///   resolve them (`ns.lookup()` deliberately skips graph-source records) and
+///   the token-scope / serving-gate semantics for gs artifacts are undecided
+///   (a graph source can depend on *multiple* ledgers). Serving them is
+///   tracked in #1539; until then they 404 here at the kind gate.
+///
+/// The Filtered tier (`POST /storage/block`, `is_allowed_block_kind` in
+/// fluree-db-api) intentionally excludes *all* advanced kinds per the v1
+/// all-or-nothing serving design — that asymmetry with this list is
+/// deliberate, not an oversight.
 ///
 /// **Security note:** This endpoint requires a `fluree.storage.*` bearer
-/// token (peer-replication scope). Raw index leaves and dict blobs bypass
-/// policy filtering — this is intentional for peer-to-peer replication but
-/// means `fluree.storage.*` tokens must not be issued to untrusted callers.
+/// token (peer-replication scope). Raw index artifacts bypass policy filtering
+/// — intentional for peer-to-peer replication and remote mounts, but means
+/// `fluree.storage.*` tokens must not be issued to untrusted callers. The
+/// advanced kinds are no more sensitive than the index leaves they derive from.
 fn is_allowed_object_kind(kind: ContentKind) -> bool {
     matches!(
         kind,
@@ -618,6 +722,9 @@ fn is_allowed_object_kind(kind: ContentKind) -> bool {
             | ContentKind::IndexBranch
             | ContentKind::IndexLeaf
             | ContentKind::DictBlob { .. }
+            | ContentKind::StatsSketch
+            | ContentKind::SpatialIndex
+            | ContentKind::HistorySidecar
     )
 }
 
@@ -648,7 +755,7 @@ fn verify_object_integrity(id: &ContentId, bytes: &[u8]) -> bool {
 ///
 /// # Kind Allowlist
 ///
-/// All replication-relevant kinds are served:
+/// All replication- and mount-relevant ledger-scoped kinds are served:
 /// - `Commit` — commit chain blobs
 /// - `Txn` — transaction data blobs
 /// - `LedgerConfig` — origin discovery config
@@ -656,8 +763,13 @@ fn verify_object_integrity(id: &ContentId, bytes: &[u8]) -> bool {
 /// - `IndexBranch` — index branch manifests
 /// - `IndexLeaf` — index leaf files
 /// - `DictBlob` — dictionary artifacts (predicates, subjects, strings, etc.)
+/// - `StatsSketch` — query-planner statistics (HLL/NDV)
+/// - `SpatialIndex` — spatial index artifacts
+/// - `HistorySidecar` — time-travel / history sidecars
 ///
-/// Only `GarbageRecord` (internal GC metadata) returns 404.
+/// `GarbageRecord`, the edge-annotation arenas, and the graph-source kinds
+/// (`GraphSourceSnapshot` / `GraphSourceMapping` — addressed by graph_source_id,
+/// serving tracked in #1539) return 404. See [`is_allowed_object_kind`].
 ///
 /// # Path Parameters
 /// - `cid`: CIDv1 string (base32-lower, e.g., `"bafybeig..."`)
@@ -720,6 +832,22 @@ pub async fn get_object_by_cid(
         return Err(ServerError::not_found("Object not found"));
     }
 
+    // 3d. Conditional GET: the CID is the entity tag (content-addressed, so
+    //     the representation can never change under it). Checked only after
+    //     the authorization and serving gates above so a 304 can't become an
+    //     existence oracle, and before the storage read so revalidation
+    //     costs no I/O.
+    let etag = format!("\"{id}\"");
+    if if_none_match_matches(&headers, &etag) {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, &etag)
+            .header(header::CACHE_CONTROL, OBJECT_CACHE_CONTROL)
+            .header(header::VARY, OBJECT_VARY)
+            .body(Body::empty())
+            .map_err(|e| ServerError::internal(e.to_string()));
+    }
+
     // 4. Resolve CID → storage address and read bytes
     let admin_storage = state
         .fluree
@@ -763,6 +891,9 @@ pub async fn get_object_by_cid(
             .status(StatusCode::PARTIAL_CONTENT)
             .header(header::CONTENT_TYPE, "application/octet-stream")
             .header("X-Fluree-Content-Kind", kind_label)
+            .header(header::ETAG, &etag)
+            .header(header::CACHE_CONTROL, OBJECT_CACHE_CONTROL)
+            .header(header::VARY, OBJECT_VARY)
             .header(
                 header::CONTENT_RANGE,
                 format!("bytes {}-{}/{total}", range.start, end - 1),
@@ -775,6 +906,55 @@ pub async fn get_object_by_cid(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header("X-Fluree-Content-Kind", kind_label)
+        .header(header::ETAG, &etag)
+        .header(header::CACHE_CONTROL, OBJECT_CACHE_CONTROL)
+        .header(header::VARY, OBJECT_VARY)
         .body(Body::from(bytes))
         .map_err(|e| ServerError::internal(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::DictKind;
+
+    /// Direct pin of the object-endpoint kind allowlist. The integration
+    /// tests exercise the endpoint end-to-end, but a re-widened allowlist
+    /// could still 404 there for downstream reasons (unresolvable gs id,
+    /// missing bytes) — this asserts the gate itself, so serving a new kind
+    /// is always a deliberate edit here plus #1539-style design work.
+    #[test]
+    fn object_kind_allowlist_pins_served_and_excluded_kinds() {
+        for kind in [
+            ContentKind::Commit,
+            ContentKind::Txn,
+            ContentKind::LedgerConfig,
+            ContentKind::IndexRoot,
+            ContentKind::IndexBranch,
+            ContentKind::IndexLeaf,
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            ContentKind::StatsSketch,
+            ContentKind::SpatialIndex,
+            ContentKind::HistorySidecar,
+        ] {
+            assert!(is_allowed_object_kind(kind), "{kind:?} must be served");
+        }
+        for kind in [
+            // Graph-source kinds: addressed by graph_source_id; serving
+            // (resolution + token-scope semantics) is tracked in #1539.
+            ContentKind::GraphSourceSnapshot,
+            ContentKind::GraphSourceMapping,
+            // Internal GC metadata — never served.
+            ContentKind::GarbageRecord,
+            // Annotation arenas — no distinct CAS address (shared blob/).
+            ContentKind::AnnotationForwardBranch,
+            ContentKind::AnnotationForwardLeaf,
+            ContentKind::AnnotationReverseBranch,
+            ContentKind::AnnotationReverseLeaf,
+        ] {
+            assert!(!is_allowed_object_kind(kind), "{kind:?} must NOT be served");
+        }
+    }
 }

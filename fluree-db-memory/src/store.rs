@@ -163,6 +163,14 @@ impl MemoryStore {
         self.memory_dir.as_deref()
     }
 
+    /// The project root that repo-relative `artifactRef` paths resolve against.
+    ///
+    /// The memory directory always sits directly under it (`<root>/.fluree-memory`),
+    /// so `None` here means the store is ledger-only and refs cannot be resolved.
+    pub fn repo_root(&self) -> Option<&Path> {
+        self.memory_dir.as_deref().and_then(Path::parent)
+    }
+
     /// The file-content hash this process's ledger currently reflects.
     pub(crate) fn synced_hash(&self) -> Option<String> {
         self.synced_hash
@@ -399,6 +407,7 @@ impl MemoryStore {
             artifact_refs: input.artifact_refs,
             branch: input.branch,
             created_at,
+            updated_at: None,
             rationale: input.rationale,
             alternatives: input.alternatives,
         };
@@ -452,7 +461,7 @@ impl MemoryStore {
         let id = &expanded;
         let optional = optional_memory_clauses_for_subject(id);
         let sparql = format!(
-            "SELECT ?type ?content ?scope ?severity ?tag ?artifactRef ?branch ?createdAt ?rationale ?alternatives\n\
+            "SELECT ?type ?content ?scope ?severity ?tag ?artifactRef ?branch ?createdAt ?rationale ?alternatives ?updatedAt\n\
 WHERE {{\n\
   <{id}> a ?type .\n\
   <{id}> <https://ns.flur.ee/memory#content> ?content .\n\
@@ -494,7 +503,9 @@ WHERE {{\n\
             .await?
             .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
 
-        // Merge updates over existing values, keeping the same ID
+        // Merge updates over existing values, keeping the same ID. The stamp is
+        // unconditional: an update that changes no field is how a caller records
+        // "I re-verified this memory against HEAD".
         let merged = Memory {
             id: compact.clone(),
             kind: existing.kind,
@@ -505,6 +516,7 @@ WHERE {{\n\
             artifact_refs: update.artifact_refs.unwrap_or(existing.artifact_refs),
             branch: existing.branch,
             created_at: existing.created_at,
+            updated_at: Some(Utc::now().to_rfc3339()),
             rationale: update.rationale.or(existing.rationale),
             alternatives: update.alternatives.or(existing.alternatives),
         };
@@ -656,7 +668,7 @@ WHERE {{\n\
         }
 
         let sparql = format!(
-            "SELECT ?id ?type ?content ?scope ?severity ?tag ?artifactRef ?branch ?createdAt ?rationale ?alternatives\nWHERE {{\n  {}\n  {}\n}}\nORDER BY ASC(?id)",
+            "SELECT ?id ?type ?content ?scope ?severity ?tag ?artifactRef ?branch ?createdAt ?rationale ?alternatives ?updatedAt\nWHERE {{\n  {}\n  {}\n}}\nORDER BY ASC(?id)",
             where_clauses.join(" .\n  "),
             optional_memory_clauses(),
         );
@@ -715,7 +727,7 @@ WHERE {{\n\
         }
 
         let sparql = format!(
-            "SELECT ?id ?type ?content ?scope ?severity ?tag ?artifactRef ?branch ?createdAt ?rationale ?alternatives\nWHERE {{\n  {}\n  {}\n}}\nORDER BY DESC(?createdAt)",
+            "SELECT ?id ?type ?content ?scope ?severity ?tag ?artifactRef ?branch ?createdAt ?rationale ?alternatives ?updatedAt\nWHERE {{\n  {}\n  {}\n}}\nORDER BY DESC(?createdAt)",
             where_clauses.join(" .\n  "),
             optional_memory_clauses(),
         );
@@ -1092,6 +1104,7 @@ fn merge_bindings_to_memory(id: &str, bindings: &[&Value]) -> Option<Memory> {
         artifact_refs,
         branch: extract_binding_value(first, "branch"),
         created_at,
+        updated_at: extract_binding_value(first, "updatedAt"),
         rationale: extract_binding_value(first, "rationale"),
         alternatives: extract_binding_value(first, "alternatives"),
     })
@@ -1106,7 +1119,7 @@ fn merge_flat_rows_to_memory(id: &str, rows: &[&Value]) -> Option<Memory> {
     // Column indices match SELECT order:
     // 0=id, 1=type, 2=content, 3=scope, 4=severity,
     // 5=tag, 6=artifactRef, 7=branch, 8=createdAt,
-    // 9=rationale, 10=alternatives
+    // 9=rationale, 10=alternatives, 11=updatedAt
     let type_str = first.get(1)?.as_str()?;
     let content = first.get(2)?.as_str()?.to_string();
     let created_at = first.get(8)?.as_str()?.to_string();
@@ -1151,6 +1164,7 @@ fn merge_flat_rows_to_memory(id: &str, rows: &[&Value]) -> Option<Memory> {
         artifact_refs,
         branch: first.get(7).and_then(|v| v.as_str()).map(String::from),
         created_at,
+        updated_at: first.get(11).and_then(|v| v.as_str()).map(String::from),
         rationale: first.get(9).and_then(|v| v.as_str()).map(String::from),
         alternatives: first.get(10).and_then(|v| v.as_str()).map(String::from),
     })
@@ -1188,6 +1202,7 @@ fn merge_memory_rows(id: &str, memories: &[Memory]) -> Option<Memory> {
         artifact_refs,
         branch: first.branch.clone(),
         created_at: first.created_at.clone(),
+        updated_at: first.updated_at.clone(),
         rationale: first.rationale.clone(),
         alternatives: first.alternatives.clone(),
     })
@@ -1263,6 +1278,117 @@ mod tests {
         assert!(
             !hits.is_empty(),
             "the just-added memory should match its own content"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_with_no_fields_stamps_updated_at() {
+        // A no-field update is the "I re-verified this at HEAD" signal, so it
+        // must move the timestamp even though nothing else changes.
+        let fluree = FlureeBuilder::memory().build_memory();
+        let store = MemoryStore::new(fluree, None);
+        store.initialize().await.expect("initialize");
+
+        let id = store
+            .add(crate::types::MemoryInput {
+                kind: MemoryKind::Fact,
+                content: "Ledger ids normalize to `<name>:<branch>`".to_string(),
+                tags: vec!["ledger".to_string()],
+                scope: crate::types::Scope::Repo,
+                severity: None,
+                artifact_refs: vec![],
+                branch: None,
+                rationale: None,
+                alternatives: None,
+            })
+            .await
+            .expect("add");
+
+        let before = store.get(&id).await.expect("get").expect("memory exists");
+        assert!(
+            before.updated_at.is_none(),
+            "a freshly added memory has never been updated"
+        );
+
+        store
+            .update(
+                &id,
+                MemoryUpdate {
+                    content: None,
+                    tags: None,
+                    severity: None,
+                    artifact_refs: None,
+                    rationale: None,
+                    alternatives: None,
+                },
+            )
+            .await
+            .expect("no-op update");
+
+        let after = store.get(&id).await.expect("get").expect("memory exists");
+        assert_eq!(after.content, before.content, "content must be untouched");
+        assert!(
+            after.updated_at.is_some(),
+            "a no-field update must still stamp updated_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn updated_at_survives_a_rebuild_from_files() {
+        // The `.ttl` file is the source of truth, so a stamp that only lives in
+        // this process's ledger would silently vanish on the next `git pull`
+        // rebuild. Write with one store, read with a second that must rebuild.
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path().join(".fluree-memory");
+
+        let writer = MemoryStore::new(
+            FlureeBuilder::memory().build_memory(),
+            Some(memory_dir.clone()),
+        );
+        writer.initialize().await.expect("initialize");
+        let id = writer
+            .add(crate::types::MemoryInput {
+                kind: MemoryKind::Fact,
+                content: "Refs are repo-relative and must resolve at HEAD".to_string(),
+                tags: vec!["memory".to_string()],
+                scope: crate::types::Scope::Repo,
+                severity: None,
+                artifact_refs: vec![],
+                branch: None,
+                rationale: None,
+                alternatives: None,
+            })
+            .await
+            .expect("add");
+        writer
+            .update(
+                &id,
+                MemoryUpdate {
+                    content: None,
+                    tags: None,
+                    severity: None,
+                    artifact_refs: None,
+                    rationale: None,
+                    alternatives: None,
+                },
+            )
+            .await
+            .expect("re-verify");
+
+        let reader = MemoryStore::new_ephemeral_ledger(
+            FlureeBuilder::memory().build_memory(),
+            Some(memory_dir),
+        );
+        reader.ensure_synced().await.expect("rebuild from files");
+
+        let loaded = reader
+            .get(&id)
+            .await
+            .expect("get")
+            .expect("memory survives the rebuild");
+        assert!(
+            loaded.updated_at.is_some(),
+            "updatedAt must survive the .ttl round trip"
         );
     }
 

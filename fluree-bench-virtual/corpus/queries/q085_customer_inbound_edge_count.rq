@@ -1,0 +1,11 @@
+# q085 customer_inbound_edge_count — browse-parity: the "Referenced-By" count for
+#   a KNOWN inbound predicate (shape 9), which already executes correctly today —
+#   a CONSTANT predicate + bound-IRI object CONVERTS and runs, contradicting the
+#   handoff's 2a claim that all inbound edges are refused. This pins the
+#   works-today contract as a regression guard: the count of fact rows whose
+#   edw:customer references customer/1 (multiple fact tables carry edw:customer, so
+#   this fans across FactOrder/FactPayment/FactWebEvent/FactSupportTicket). The
+#   oracle is the native COUNT; deterministic, so hash-gated Full.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT (COUNT(?s) AS ?n)
+WHERE { ?s edw:customer <http://data.fluree.dev/edw/customer/1> . }

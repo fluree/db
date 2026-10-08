@@ -51,6 +51,7 @@ fn mem(id: &str, content: &str, branch: &str) -> Memory {
         artifact_refs: vec![],
         branch: Some(branch.to_string()),
         created_at: "2026-06-26T00:00:00+00:00".to_string(),
+        updated_at: None,
         rationale: None,
         alternatives: None,
     }

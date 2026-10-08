@@ -1,0 +1,8 @@
+# q047 distinct_channels_limit
+# Intent: DISTINCT + LIMIT over a fact (H2 DISTINCT drains despite the LIMIT).
+# BI lineage (BI-21): "What order channels exist (first five)?"
+# Predicates verified against enterprise.ttl — FactOrder: orderChannel.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT DISTINCT ?orderChannel
+WHERE { ?o a edw:Order ; edw:orderChannel ?orderChannel . }
+LIMIT 5

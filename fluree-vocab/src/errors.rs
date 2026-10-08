@@ -61,6 +61,34 @@ pub const LEDGER_EXISTS: &str = "err:db/LedgerExists";
 /// Novelty at maximum size (backpressure)
 pub const NOVELTY_AT_MAX: &str = "err:db/NoveltyAtMax";
 
+/// A single transaction's delta alone meets or exceeds `reindex_max_bytes`,
+/// so it can never be accepted by waiting for the indexer to drain novelty.
+///
+/// Distinct from [`NOVELTY_AT_MAX`] (retryable backpressure, HTTP 503 +
+/// `Retry-After`): this is a permanent refusal of this transaction at this
+/// configuration, surfaced as HTTP 413 with no `Retry-After` — split the
+/// transaction into smaller pieces or raise `reindex_max_bytes`.
+pub const NOVELTY_DELTA_TOO_LARGE: &str = "err:db/NoveltyDeltaTooLarge";
+
+/// The HTTP request body exceeds the server's configured body-size limit
+/// (`--body-limit`), refused before any parsing or staging.
+///
+/// The other 413 this server emits: distinct from
+/// [`NOVELTY_DELTA_TOO_LARGE`], which means the *parsed transaction's
+/// novelty delta* alone meets or exceeds `reindex_max_bytes`. Clients must
+/// branch on `@type`, not the 413 status — the remedies differ (raise the
+/// HTTP body limit / send a smaller request here, vs. split the transaction
+/// or raise `reindex_max_bytes` there).
+pub const PAYLOAD_TOO_LARGE: &str = "err:db/PayloadTooLarge";
+
+/// The write would bring the ledger past the number of distinct datatypes
+/// its index can store.
+///
+/// A permanent refusal, surfaced as HTTP 422 with no `Retry-After`.
+/// Datatype IDs are never released, so neither retrying nor waiting for the
+/// indexer admits the write. The ledger is left unchanged.
+pub const DATATYPE_LIMIT_EXCEEDED: &str = "err:db/DatatypeLimitExceeded";
+
 /// Commit conflict (concurrent modification)
 pub const COMMIT_CONFLICT: &str = "err:db/CommitConflict";
 
@@ -69,6 +97,12 @@ pub const EMPTY_TRANSACTION: &str = "err:db/EmptyTransaction";
 
 /// Graph source not found
 pub const GRAPH_SOURCE_NOT_FOUND: &str = "err:db/GraphSourceNotFound";
+
+/// A graph the target ledger does not have
+pub const GRAPH_NOT_FOUND: &str = "err:db/GraphNotFound";
+
+/// A commit reference that names no commit of the ledger
+pub const COMMIT_NOT_FOUND: &str = "err:db/CommitNotFound";
 
 /// Graph source index stale
 pub const GRAPH_SOURCE_STALE: &str = "err:db/GraphSourceStale";
@@ -97,6 +131,9 @@ pub const NOT_FOUND: &str = "err:api/NotFound";
 
 /// Not acceptable (content negotiation failure)
 pub const NOT_ACCEPTABLE: &str = "err:api/NotAcceptable";
+
+/// Unsupported media type (request body format not accepted)
+pub const UNSUPPORTED_MEDIA_TYPE: &str = "err:api/UnsupportedMediaType";
 
 // =============================================================================
 // Parsing Errors (parse)
@@ -136,8 +173,48 @@ pub const STORAGE_READ: &str = "err:storage/ReadFailure";
 /// Storage write failure
 pub const STORAGE_WRITE: &str = "err:storage/WriteFailure";
 
+/// Object storage denied a read (S3 403 / `AccessDenied`).
+///
+/// Distinct from the policy-layer [`ACCESS_DENIED`]: this is the external
+/// object store (S3/GCS) refusing a read of an Iceberg data/metadata/manifest
+/// file, not a Fluree policy decision. Because S3 also returns `AccessDenied`
+/// for a missing object when the caller lacks `s3:ListBucket`, this means the
+/// credentials lack access **or** the object was moved/removed.
+pub const STORAGE_ACCESS_DENIED: &str = "err:storage/AccessDenied";
+
+/// The catalog authorized the table but vended no storage credentials while the
+/// source is configured to require them (`vended_credentials = true`).
+///
+/// Fail-closed signal: the query/preview is refused rather than silently
+/// downgrading to ambient (process-default) AWS credentials.
+pub const CATALOG_CREDENTIALS_NOT_VENDED: &str = "err:catalog/CredentialsNotVended";
+
+/// A catalog refused access to a table (HTTP 401/403 from the catalog), e.g. a
+/// Unity Catalog principal lacking `SELECT` or `EXTERNAL USE SCHEMA`.
+///
+/// Distinct from [`STORAGE_ACCESS_DENIED`] (the object store refused a read)
+/// and from the policy-layer [`ACCESS_DENIED`].
+pub const CATALOG_ACCESS_DENIED: &str = "err:catalog/AccessDenied";
+
 /// Connection error
 pub const CONNECTION: &str = "err:storage/ConnectionError";
+
+// =============================================================================
+// R2RML / virtual-dataset Errors (r2rml)
+// =============================================================================
+
+/// A syntactically valid query used a pattern shape the R2RML rewrite cannot
+/// convert to a table scan on a virtual (graph-source) dataset — currently a
+/// VARIABLE predicate paired with a BOUND term (`?s ?p <iri>` / `?s ?p "x"`), or
+/// a top-level VALUES clause on a subgraph crawl.
+///
+/// Distinct from the generic [`INVALID_QUERY`] (which means *malformed*): the
+/// request is well-formed, just unsupported ON THIS SOURCE, so it stays HTTP 400
+/// but carries this stable machine code so callers (Solo's virtual-dataset
+/// browse UI) can branch on the condition instead of matching the human-readable
+/// message. Mirrors the distinct-code precedent of [`STORAGE_ACCESS_DENIED`] /
+/// [`CATALOG_CREDENTIALS_NOT_VENDED`], but keeps the 400 status.
+pub const R2RML_UNSUPPORTED_PATTERN: &str = "err:r2rml/UnsupportedPattern";
 
 // =============================================================================
 // Policy/Auth Errors (policy)
@@ -158,6 +235,17 @@ pub const POLICY_VIOLATION: &str = "err:policy/PolicyViolation";
 // =============================================================================
 // System Errors (system)
 // =============================================================================
+
+/// Materialization deferred by novelty backpressure — retryable, not a fault.
+/// Distinct from INTERNAL so a client can branch on "try again shortly" rather than
+/// treating normal capacity pressure as a server defect.
+pub const NOVELTY_DEFERRED: &str = "err:db/NoveltyDeferred";
+
+/// A fan-out materialize window in which some target ledgers succeeded and at least one
+/// FAILED. Distinct from NOVELTY_DEFERRED (which is pure capacity, and retryable on its
+/// own) and from INTERNAL (which implies nothing was accomplished) — here some targets
+/// hold new data while the window as a whole will be retried.
+pub const MATERIALIZE_PARTIAL: &str = "err:db/MaterializePartial";
 
 /// Internal server error (catch-all)
 pub const INTERNAL: &str = "err:system/InternalError";

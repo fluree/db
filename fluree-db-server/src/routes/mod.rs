@@ -2,12 +2,21 @@
 
 mod admin;
 pub(crate) mod admin_auth;
+mod bm25;
 mod commits;
 mod context;
+#[cfg(feature = "delta")]
+mod delta;
+mod encryption;
 mod events;
+pub(crate) use encryption::rotation_holder;
 mod export;
+mod graph_store;
+#[cfg(feature = "graphql")]
+pub mod graphql;
 #[cfg(feature = "iceberg")]
 mod iceberg;
+#[cfg(feature = "iceberg")]
 mod iceberg_ssrf;
 mod import;
 mod ledger;
@@ -19,18 +28,21 @@ mod push;
 pub(crate) mod query;
 pub(crate) mod serving;
 mod show;
+mod sparql_protocol;
+#[cfg(feature = "sql")]
+mod sql;
 mod storage_proxy;
 mod stream_query;
 mod stubs;
 mod submissions;
-mod transact;
+pub(crate) mod transact;
 #[cfg(feature = "shacl")]
 mod validate;
 
 use crate::state::AppState;
 use axum::{
     middleware,
-    routing::{get, post},
+    routing::{get, post, put, MethodRouter},
     Router,
 };
 use std::sync::Arc;
@@ -57,6 +69,36 @@ where
     }
 }
 
+/// [`apply_leader_forward`] for one route's method router.
+#[cfg(feature = "raft")]
+fn apply_leader_forward_methods<S>(
+    methods: MethodRouter<S>,
+    state: &Arc<AppState>,
+) -> MethodRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    if let Some(integration) = &state.raft {
+        methods.layer(middleware::from_fn_with_state(
+            Arc::clone(&integration.forwarder),
+            fluree_db_consensus::raft::forward::forward_to_leader,
+        ))
+    } else {
+        methods
+    }
+}
+
+#[cfg(not(feature = "raft"))]
+fn apply_leader_forward_methods<S>(
+    methods: MethodRouter<S>,
+    _state: &Arc<AppState>,
+) -> MethodRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    methods
+}
+
 #[cfg(not(feature = "raft"))]
 fn apply_leader_forward<S>(router: Router<S>, _state: &Arc<AppState>) -> Router<S>
 where
@@ -80,12 +122,30 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/create", post(ledger::create))
         .route("/drop", post(ledger::drop))
         .route("/reindex", post(ledger::reindex))
+        // Reclaims index artifacts no index chain references. Deletes storage
+        // and holds the ledger against indexing, so it is admin-gated and
+        // runs where the indexer does.
+        .route("/sweep", post(ledger::sweep))
+        .route("/sweep/plan", post(ledger::sweep_plan))
+        // Encryption key rotation: rewrites storage and holds the sweep on
+        // one node, so it is admin-gated and runs where the indexer does.
+        .route("/encryption/rotate", post(encryption::rotate))
+        .route("/encryption/rotate/pause", post(encryption::rotate_pause))
+        .route("/encryption/rotate/cancel", post(encryption::rotate_cancel))
+        .route("/encryption/rotate/verify", post(encryption::rotate_verify))
         .route("/branch", post(ledger::create_branch))
         .route("/drop-branch", post(ledger::drop_branch))
         .route("/drop-graph", post(ledger::drop_named_graph))
         .route("/rebase", post(ledger::rebase))
         .route("/merge", post(ledger::merge))
         .route("/revert", post(ledger::revert))
+        // BM25 full-text index creation and sync. Both publish through
+        // `GraphSourcePublisher`, which under Raft proposes
+        // `PublishGraphSource` / `PublishGraphSourceIndex` — so they have to
+        // originate on the leader. Listing, inspection, and drop reuse the
+        // graph-source fallbacks in `/ledgers`, `/info`, and `/drop`.
+        .route("/bm25/create", post(bm25::bm25_create))
+        .route("/bm25/sync", post(bm25::bm25_sync))
         // Wholesale .flpack restore: creates a new ledger from a trusted
         // archive. Writes prebuilt index artifacts, so admin-gated.
         .route("/import/*ledger", post(import::import_ledger_tail))
@@ -99,12 +159,29 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         );
 
     #[cfg(feature = "iceberg")]
-    let v1_admin_protected_writes =
-        v1_admin_protected_writes.route("/iceberg/map", post(iceberg::iceberg_map));
+    let v1_admin_protected_writes = v1_admin_protected_writes
+        .route("/iceberg/map", post(iceberg::iceberg_map))
+        .route("/iceberg/materialize", post(iceberg::iceberg_materialize))
+        .route("/iceberg/track", post(iceberg::iceberg_track))
+        .route("/iceberg/untrack", post(iceberg::iceberg_untrack));
 
-    // Forward to the Raft leader (when running in Raft mode) before
-    // admin-token auth: an out-of-date follower with stale credentials
-    // shouldn't reject a request the leader would accept.
+    #[cfg(feature = "sql")]
+    let v1_admin_protected_writes = v1_admin_protected_writes.route("/sql/map", post(sql::sql_map));
+    #[cfg(feature = "delta")]
+    let v1_admin_protected_writes =
+        v1_admin_protected_writes.route("/delta/map", post(delta::delta_map));
+
+    // Admin auth runs BEFORE leader-forward. Axum runs the
+    // last-applied layer outermost, so `require_admin_token`
+    // (applied after `apply_leader_forward`) is the outer layer and
+    // gates the request first: an unauthenticated write is rejected
+    // locally with 401 rather than relayed across the cluster —
+    // forwarding an unauthenticated request would be a DoS
+    // amplifier. The trade-off is that a follower whose JWKS cache
+    // is stale during a key rotation 401s a request the leader
+    // would accept, instead of forwarding it; that's the safe
+    // direction to fail. The gate is pinned by
+    // `tests/admin_auth_layering.rs`.
     let v1_admin_protected_writes = apply_leader_forward(v1_admin_protected_writes, &state);
 
     let v1_admin_protected_writes = v1_admin_protected_writes
@@ -127,7 +204,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/export/*ledger", post(export::export_ledger_tail))
         // Status of a negotiated upload — reads this node's
         // `state.import_jobs` map (each node owns the jobs it minted).
-        .route("/import-upload/:import_id", get(import::import_status));
+        .route("/import-upload/:import_id", get(import::import_status))
+        // Held encryption key ids and the rotation record; the record is
+        // storage-resident, so any node answers.
+        .route("/encryption", get(encryption::encryption))
+        .route("/encryption/rotate/status", get(encryption::rotate_status));
 
     // Read-only Iceberg catalog browse / metadata preview. POSTs (the inline
     // connection carries a secret in the body) but they mutate nothing and
@@ -143,6 +224,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(iceberg::iceberg_catalog_preview),
         )
         .route(
+            "/iceberg/catalog/verify",
+            post(iceberg::iceberg_catalog_verify),
+        )
+        .route(
             "/iceberg/r2rml/generate",
             post(iceberg::iceberg_r2rml_generate),
         )
@@ -150,6 +235,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/iceberg/r2rml/validate",
             post(iceberg::iceberg_r2rml_validate),
         );
+    // The same for a Delta source on Unity Catalog.
+    #[cfg(feature = "delta")]
+    let v1_admin_protected_reads = v1_admin_protected_reads
+        .route("/delta/catalog/browse", post(delta::delta_catalog_browse))
+        .route("/delta/catalog/preview", post(delta::delta_catalog_preview))
+        .route("/delta/catalog/verify", post(delta::delta_catalog_verify))
+        .route("/delta/r2rml/generate", post(delta::delta_r2rml_generate))
+        .route("/delta/r2rml/validate", post(delta::delta_r2rml_validate));
+    // Materialization tracking-worker status — reads this node's worker state.
+    #[cfg(feature = "iceberg")]
+    let v1_admin_protected_reads =
+        v1_admin_protected_reads.route("/iceberg/tracking", get(iceberg::iceberg_tracking_status));
 
     let v1_admin_protected_reads = v1_admin_protected_reads
         .layer(middleware::from_fn_with_state(
@@ -170,9 +267,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/insert", post(transact::insert))
         .route("/insert/*ledger", post(transact::insert_ledger_tail))
         .route("/upsert", post(transact::upsert))
+        .route("/sync", post(transact::sync))
         .route("/upsert/*ledger", post(transact::upsert_ledger_tail))
-        // Commit-push endpoint (precomputed commits)
+        .route("/sync/*ledger", post(transact::sync_ledger))
+        // Commit-push endpoints (precomputed commits). The second takes a
+        // push whose commits include a merge; see `routes::push`.
         .route("/push/*ledger", post(push::push_ledger_tail))
+        .route("/push-merges/*ledger", post(push::push_merges_ledger_tail))
         // Nameservice ref endpoints (for remote sync)
         .route(
             "/nameservice/refs/:alias/commit",
@@ -187,6 +288,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(nameservice_refs::init_ledger),
         );
     let v1_leader_only_routes = apply_leader_forward(v1_leader_only_routes, &state);
+
+    // Graph Store Protocol: reads run locally like `/query`; writes are
+    // leader-only like `/sync`. One path, so one method router (axum refuses
+    // a path registered in two merged routers).
+    let graph_store_writes = put(graph_store::put)
+        .post(graph_store::post)
+        .delete(graph_store::delete);
+    let graph_store =
+        get(graph_store::get).merge(apply_leader_forward_methods(graph_store_writes, &state));
 
     // Read-only routes that nonetheless need leader-forward because
     // their backing state lives in the leader's per-process caches.
@@ -225,12 +335,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Merge leader-only routes (Raft-forwarded when applicable)
         .merge(v1_leader_only_routes)
         // Query endpoints
-        .route("/query", get(query::query).post(query::query))
+        .route("/query", get(query::query_get).post(query::query))
         .route(
             "/query/*ledger",
-            get(query::query_ledger_tail).post(query::query_ledger_tail),
+            get(query::query_ledger_get).post(query::query_ledger_tail),
         )
         .route("/multi-query", post(query::multi_query))
+        .route("/data/*ledger", graph_store)
         // Streaming SELECT results as NDJSON. Separate route family so the
         // standard /query path is untouched. Connection-scoped (no path ledger)
         // and ledger-scoped (greedy tail) forms.
@@ -301,10 +412,23 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         get(validate::validate_ledger_tail).post(validate::validate_ledger_tail),
     );
 
+    // GraphQL over the schema derived from the ledger's own data. The SDL sits
+    // on its own path rather than a `/schema` suffix: the ledger tail is greedy
+    // and ledger names may contain `/`.
+    #[cfg(feature = "graphql")]
+    let v1 = v1
+        .route(
+            "/graphql/*ledger",
+            get(graphql::graphql_ledger_tail).post(graphql::graphql_ledger_tail),
+        )
+        .route(
+            "/graphql-schema/*ledger",
+            get(graphql::graphql_schema_ledger_tail),
+        );
+
     let mut router = Router::new()
         // Health check
         .route("/health", get(admin::health))
-        // Diagnostic: binary-scan leaflet-loop counters (GET, ?reset=true to zero)
         // Auth discovery (CLI auto-configuration)
         .route("/.well-known/fluree.json", get(admin::discovery))
         // Versioned API
@@ -321,15 +445,68 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // Add state
     let mut router = router.with_state(state.clone());
 
+    // Enforce the configured request-body cap on every public
+    // route. Without this layer, body-consuming extractors fall
+    // back to axum's 2 MiB default and `--body-limit` is a no-op.
+    router = router.layer(axum::extract::DefaultBodyLimit::max(
+        state.config.body_limit,
+    ));
+
     // Add CORS if enabled
     if state.config.cors_enabled {
-        router = router.layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        );
+        router = router.layer(cors_layer());
     }
 
     router
+}
+
+/// CORS layer for browser clients.
+///
+/// Allowed request headers mirror the preflight's
+/// `Access-Control-Request-Headers`. The Fetch spec excludes
+/// `Authorization` from the `*` wildcard (it is a "CORS non-wildcard
+/// request-header name"), so `allow_headers(Any)` — which emits the literal
+/// `*` — broke bearer-token requests from browsers that enforce the rule.
+/// Mirroring covers `authorization` and every other header the API reads
+/// (the `fluree-*` policy/tracking headers, `idempotency-key`, trace ids,
+/// `range`, `if-none-match`, `last-event-id`, …) without a list to keep in
+/// sync.
+///
+/// This is **strictly more permissive** than the `*` it replaces, and
+/// deliberately so — the difference is the point of the change, not a side
+/// effect of it. Because `*` excludes `Authorization`, cross-origin
+/// *authenticated* requests were impossible before and are possible now. The
+/// consequence is real for an internal deployment: a page the user visits can
+/// reach an internal Fluree server with an `Authorization` header and read the
+/// response. That is not CSRF — there are no ambient credentials, so the page
+/// must already hold a token — but it does widen the browser-as-pivot surface,
+/// and it is the reason browser clients being first-class now makes an origin
+/// allow-list worth having (`cors_enabled` is currently a bool with
+/// `allow_origin(Any)` hardcoded).
+///
+/// The expose list makes response metadata — the
+/// Range/CAS headers and the `x-fdb-*` tracking headers — readable by
+/// browser JavaScript, which otherwise sees only the CORS-safelisted
+/// response headers.
+fn cors_layer() -> CorsLayer {
+    use axum::http::{header, HeaderName};
+    use tower_http::cors::AllowHeaders;
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(AllowHeaders::mirror_request())
+        .expose_headers([
+            header::CONTENT_RANGE,
+            header::ETAG,
+            HeaderName::from_static("x-fluree-content-kind"),
+            HeaderName::from_static("x-fluree-block-type"),
+            HeaderName::from_static("x-fluree-policy-applied"),
+            HeaderName::from_static("x-fdb-time"),
+            HeaderName::from_static("x-fdb-fuel"),
+            HeaderName::from_static("x-fdb-policy"),
+            HeaderName::from_static("x-fdb-policy-enforcement"),
+            HeaderName::from_static("x-fdb-reasoning"),
+            HeaderName::from_static("x-fdb-warning"),
+        ])
+        .max_age(std::time::Duration::from_secs(86400))
 }

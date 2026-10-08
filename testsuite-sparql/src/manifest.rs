@@ -5,7 +5,7 @@ use fluree_graph_ir::{Graph, GraphCollectorSink, Term};
 use fluree_graph_turtle::parse;
 
 use crate::files::{read_file_to_string, resolve_relative_iri};
-use crate::vocab::{mf, qt, rdf, rdfs, rdft};
+use crate::vocab::{mf, qt, rdf, rdfs, rdft, ut};
 
 /// A single W3C test case extracted from a manifest.
 #[derive(Debug)]
@@ -28,6 +28,33 @@ pub struct Test {
     pub graph_data: Vec<(String, String)>,
     /// Expected result URL.
     pub result: Option<String>,
+    /// Update request file URL (`ut:request`, for UpdateEvaluationTest).
+    pub update_request: Option<String>,
+    /// Expected default-graph state after an update (`ut:data` on mf:result).
+    pub result_data: Option<String>,
+    /// Expected named-graph state after an update: (graph_name, data_url)
+    /// (`ut:graphData` on mf:result).
+    pub result_graph_data: Vec<(String, String)>,
+    /// Whether the update result carried an explicit `ut:result` marker
+    /// (e.g. `ut:success`) — distinguishes "expected: empty store" declared
+    /// on purpose from an unrecognized/mis-parsed `mf:result` shape.
+    pub result_success: bool,
+    /// Whether an `mf:result` node was present at all (as an IRI or a blank
+    /// node). Many W3C graph-management tests (`DROP ALL`, the `update-silent`
+    /// cases) express "expected: empty store" as a bare `mf:result []` with no
+    /// `ut:data`/`ut:graphData`/`ut:result` — a legitimate, deliberate empty
+    /// expectation. This flag distinguishes that from an `mf:result` that was
+    /// entirely absent (a genuine manifest mis-parse).
+    pub result_present: bool,
+    /// Whether a blank `mf:result` node carried ANY outgoing predicate. A bare
+    /// `mf:result []` has none (the deliberate empty-store expectation); a
+    /// `mf:result [ ut:graphData [ ut:graph <g> ] ]` missing its `rdfs:label`
+    /// (or one carrying only non-content predicates) resolves no content yet
+    /// has ≥1. This distinguishes the two so a present-but-empty result is
+    /// treated as a parse/skip rather than "expected empty store". (An IRI
+    /// object like `ut:graphData <file>` resolves at PARSE time regardless of
+    /// file existence, so it never trips this guard — it fails at load.)
+    pub result_has_predicates: bool,
 }
 
 /// Iterator over W3C test cases, loading manifests lazily.
@@ -91,7 +118,7 @@ impl TestManifest {
         // each test ID *before* the next `load_manifest()` call (enforced by the
         // `loop` in `Iterator::next`). Cross-manifest test references are not
         // supported by the W3C test suite structure.
-        self.graph = sink.finish();
+        self.graph = sink.into_graph();
 
         // Find the manifest subject (type mf:Manifest or has mf:entries/mf:include)
         let manifest_subject = self.find_manifest_subject(url);
@@ -167,13 +194,15 @@ impl TestManifest {
             }
         }
 
-        // Extract kinds (rdf:type values, excluding generic types)
+        // Extract kinds (rdf:type values, excluding generic types): the
+        // SPARQL manifests type tests in the `mf:` namespace, the RDF
+        // syntax manifests (Turtle, N-Triples, …) in `rdft:`.
         let kinds: Vec<String> = self
             .graph
             .iter()
             .filter(|t| t.s == subject && t.p.as_iri() == Some(rdf::TYPE))
             .filter_map(|t| t.o.as_iri().map(String::from))
-            .filter(|iri| iri.starts_with(mf::NS))
+            .filter(|iri| iri.starts_with(mf::NS) || iri.starts_with(rdft::NS))
             .collect();
 
         let name = self.object_for(&subject, mf::NAME).and_then(term_to_string);
@@ -184,24 +213,61 @@ impl TestManifest {
 
         // Parse action — can be a simple IRI or a blank node with structured data
         let action_term = self.object_for(&subject, mf::ACTION);
-        let (action, query, data, graph_data) = match action_term {
+        let (action, query, data, graph_data, update_request) = match action_term {
             Some(term) if term.is_iri() => {
                 // Simple action: just a URL (used for syntax tests)
-                (term_to_string(term), None, None, vec![])
+                (term_to_string(term), None, None, vec![], None)
             }
             Some(term) if term.is_blank() => {
-                // Structured action: blank node with qt:query, qt:data, etc.
+                // Structured action: blank node with qt:query / qt:data /
+                // qt:graphData (query eval) or ut:request / ut:data /
+                // ut:graphData (update eval).
                 let query = self.object_for(term, qt::QUERY).and_then(term_to_string);
-                let data = self.object_for(term, qt::DATA).and_then(term_to_string);
-                let graph_data = self.get_graph_data(term);
-                (None, query, data, graph_data)
+                let update_request = self.object_for(term, ut::REQUEST).and_then(term_to_string);
+                let data = self
+                    .object_for(term, qt::DATA)
+                    .or_else(|| self.object_for(term, ut::DATA))
+                    .and_then(term_to_string);
+                let mut graph_data = self.get_graph_data(term, qt::GRAPH_DATA);
+                graph_data.extend(self.get_graph_data(term, ut::GRAPH_DATA));
+                (None, query, data, graph_data, update_request)
             }
-            _ => (None, None, None, vec![]),
+            _ => (None, None, None, vec![], None),
         };
 
-        let result = self
-            .object_for(&subject, mf::RESULT)
-            .and_then(term_to_string);
+        // Parse result — a simple IRI (query eval: expected result file) or a
+        // blank node with ut:data / ut:graphData (update eval: expected
+        // post-update graph store state).
+        let result_term = self.object_for(&subject, mf::RESULT);
+        let (
+            result,
+            result_data,
+            result_graph_data,
+            result_success,
+            result_present,
+            result_has_predicates,
+        ) = match result_term {
+            Some(term) if term.is_iri() => (term_to_string(term), None, vec![], false, true, false),
+            Some(term) if term.is_blank() => {
+                let result_data = self.object_for(term, ut::DATA).and_then(term_to_string);
+                let result_graph_data = self.get_graph_data(term, ut::GRAPH_DATA);
+                let result_success = self.object_for(term, ut::RESULT).is_some();
+                // A deliberate empty-store expectation is a bare `mf:result []`
+                // (zero outgoing predicates). A blank result that carries
+                // predicates but whose recognized ones all resolved to nothing
+                // is a parse/resolution failure, not "expected empty".
+                let has_predicates = self.graph.iter().any(|t| t.s == *term);
+                (
+                    None,
+                    result_data,
+                    result_graph_data,
+                    result_success,
+                    true,
+                    has_predicates,
+                )
+            }
+            _ => (None, None, vec![], false, false, false),
+        };
 
         Ok(Some(Test {
             id: test_id.to_string(),
@@ -213,6 +279,12 @@ impl TestManifest {
             data,
             graph_data,
             result,
+            update_request,
+            result_data,
+            result_graph_data,
+            result_success,
+            result_present,
+            result_has_predicates,
         }))
     }
 
@@ -224,22 +296,29 @@ impl TestManifest {
             .map(|t| &t.o)
     }
 
-    /// Extract named graph data from a structured action node.
-    fn get_graph_data(&self, action: &Term) -> Vec<(String, String)> {
+    /// Extract named graph data from a structured action/result node.
+    ///
+    /// Two W3C shapes:
+    /// - `qt:graphData <url>` — the IRI is both the graph name and data URL
+    ///   (query eval tests)
+    /// - `ut:graphData [ ut:graph <url> ; rdfs:label "name" ]` — labeled form
+    ///   (update eval tests): `rdfs:label` is the graph name, `ut:graph` the
+    ///   data file URL
+    fn get_graph_data(&self, node: &Term, predicate: &str) -> Vec<(String, String)> {
         self.graph
             .iter()
-            .filter(|t| t.s == *action && t.p.as_iri() == Some(qt::GRAPH_DATA))
+            .filter(|t| t.s == *node && t.p.as_iri() == Some(predicate))
             .filter_map(|t| {
                 if t.o.is_iri() {
                     // Simple named graph: IRI is both the graph name and data URL
                     let url = t.o.as_iri()?.to_string();
                     Some((url.clone(), url))
                 } else if t.o.is_blank() {
-                    // Labeled graph data
+                    // Labeled graph data: name from rdfs:label, URL from ut:graph
                     let label = self
                         .object_for(&t.o, rdfs::LABEL)
                         .and_then(term_to_string)?;
-                    let graph_url = term_to_string(&t.o)?;
+                    let graph_url = self.object_for(&t.o, ut::GRAPH).and_then(term_to_string)?;
                     Some((label, graph_url))
                 } else {
                     None
@@ -255,5 +334,80 @@ fn term_to_string(term: &Term) -> Option<String> {
         Term::Iri(iri) => Some(iri.to_string()),
         Term::Literal { value, .. } => Some(value.lexical()),
         Term::BlankNode(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vocab::{mf, ut};
+
+    const TEST_ID: &str = "http://example.org/manifest#t1";
+
+    /// A `TestManifest` over a hand-built graph (no file I/O), so `parse_test`
+    /// can be exercised on synthetic `mf:result` shapes.
+    fn manifest_over(graph: Graph) -> TestManifest {
+        TestManifest {
+            graph,
+            tests_to_do: VecDeque::new(),
+            manifests_to_do: VecDeque::new(),
+        }
+    }
+
+    /// A minimal `mf:result <result_object>` graph, with optional outgoing
+    /// triples on the result node.
+    fn result_graph(result_object: Term, result_children: &[(Term, Term)]) -> Graph {
+        let mut graph = Graph::new();
+        graph.add_triple(
+            Term::iri(TEST_ID),
+            Term::iri(mf::RESULT),
+            result_object.clone(),
+        );
+        for (p, o) in result_children {
+            graph.add_triple(result_object.clone(), p.clone(), o.clone());
+        }
+        graph
+    }
+
+    #[test]
+    fn bare_blank_result_has_no_predicates() {
+        // `mf:result []` — the deliberate empty-store expectation. Zero outgoing
+        // predicates, so the flag is false and the guard leaves it alone.
+        let graph = result_graph(Term::blank("res"), &[]);
+        let test = manifest_over(graph).parse_test(TEST_ID).unwrap().unwrap();
+        assert!(test.result_present);
+        assert!(!test.result_has_predicates);
+        assert!(test.result_data.is_none());
+        assert!(test.result_graph_data.is_empty());
+    }
+
+    #[test]
+    fn present_but_content_empty_blank_result_has_predicates() {
+        // `mf:result [ ut:graphData _:g ]` where `_:g` carries no ut:graph /
+        // rdfs:label → get_graph_data resolves nothing, yet the result blank DID
+        // carry a predicate. This is the false-pass shape the tightened guard
+        // must reject rather than treat as "expected empty store".
+        let graph = result_graph(
+            Term::blank("res"),
+            &[(Term::iri(ut::GRAPH_DATA), Term::blank("g"))],
+        );
+        let test = manifest_over(graph).parse_test(TEST_ID).unwrap().unwrap();
+        assert!(test.result_present);
+        assert!(test.result_has_predicates);
+        // Recognized content still resolved to nothing — the false-pass shape.
+        assert!(test.result_data.is_none());
+        assert!(test.result_graph_data.is_empty());
+        assert!(!test.result_success);
+    }
+
+    #[test]
+    fn iri_result_reports_no_blank_predicates() {
+        // An IRI `mf:result <file>` is not a blank node; the flag is false (the
+        // guard keys on `result.is_none()`, so this path is never guarded).
+        let graph = result_graph(Term::iri("http://example.org/expected.ttl"), &[]);
+        let test = manifest_over(graph).parse_test(TEST_ID).unwrap().unwrap();
+        assert!(test.result_present);
+        assert!(!test.result_has_predicates);
+        assert!(test.result.is_some());
     }
 }

@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "query_id": "q063",
+  "result_hash": "b8cc94563ff04bcefcb634dbf495aee30b6dc3707606b89545416c2235218426",
+  "rows": 8,
+  "head_rows": [
+    "Education\u001f1527",
+    "Energy\u001f1466",
+    "Finance\u001f1493",
+    "Government\u001f1469",
+    "Logistics\u001f1467",
+    "Manufacturing\u001f1522",
+    "Media\u001f1465",
+    "Technology\u001f1501"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KXR4D5S2VWQXKDPS98KBYZC9",
+    "commit": "ac562d8a4"
+  }
+}

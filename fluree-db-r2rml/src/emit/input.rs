@@ -18,6 +18,8 @@
 
 use fluree_db_tabular::FieldType;
 
+use crate::emit::{naming, SubjectStrategy};
+
 /// A comparable typed bound for range-containment FK confirmation.
 ///
 /// Integers suffice for the surrogate `*_KEY` spaces exercised by this spike;
@@ -81,14 +83,31 @@ impl EmitColumn {
         self.required || self.stats.null_fraction == Some(0.0)
     }
 
-    /// Whether this column is integer-typed (FK candidacy is integer-only).
+    /// Whether this column is strictly integer-typed (`Int32`/`Int64`).
     pub fn is_integer(&self) -> bool {
         matches!(self.field_type, FieldType::Int32 | FieldType::Int64)
     }
 
+    /// Whether this column's TYPE is key-like — an integer OR a scale-0 decimal.
+    ///
+    /// This is the FK-candidacy type gate. Snowflake `NUMBER(38,0)` surrogate
+    /// keys arrive as Iceberg `decimal(38,0)` (scale 0), NOT `long`; gating FK
+    /// inference on [`Self::is_integer`] alone silently drops every such key
+    /// before the name match. A scale-0 decimal is an exact integer, so it is a
+    /// valid key both as an FK child and as a parent PK. A scaled decimal
+    /// (`scale > 0`, e.g. money) is NOT key-like.
+    pub fn is_key_type(&self) -> bool {
+        matches!(
+            self.field_type,
+            FieldType::Int32 | FieldType::Int64 | FieldType::Decimal { scale: 0, .. }
+        )
+    }
+
     /// Whether the column name looks like a key by convention (`*_KEY` / `*_ID`).
     pub fn is_key_like(&self) -> bool {
-        self.name.ends_with("_KEY") || self.name.ends_with("_ID")
+        ["_KEY", "_ID"]
+            .iter()
+            .any(|suffix| naming::strip_suffix_ignore_case(&self.name, suffix).is_some())
     }
 }
 
@@ -121,14 +140,23 @@ impl TableKey {
 /// all) leaves the deterministic stem-derived defaults untouched.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TableOverride {
-    /// REPLACES `identifier_field_ids` as the subject key K. The named column must
-    /// exist and still pass the `required` / `null_fraction == 0` gate (else
-    /// `NoSafeSubjectKey`); because uniqueness is unprovable metadata-only, an
-    /// override PK ALWAYS attaches a `SubjectKeyUnverified` diagnostic.
-    pub primary_key: Option<String>,
+    /// REPLACES `identifier_field_ids` as the subject key K — a list of one or
+    /// more columns. A single column yields a simple key (indexed as an FK
+    /// parent); multiple columns yield a composite subject template (joined by
+    /// `/`, never indexed as a single-column PK — composite rendering already
+    /// works, so the only prior blocker was this being a single `Option<String>`).
+    /// Every named column must exist and (under [`SubjectStrategy::Identifier`])
+    /// pass the `required` / `null_fraction == 0` gate (else `NoSafeSubjectKey`);
+    /// because uniqueness is unprovable metadata-only, an override key ALWAYS
+    /// attaches a `SubjectKeyUnverified` diagnostic.
+    pub primary_key: Option<Vec<String>>,
     /// Overrides the stem-derived class name (`rr:class` local name) and the
     /// subject-template `classSlug` for the table.
     pub class_name: Option<String>,
+    /// Per-table override of the global [`crate::emit::EmitOptions::subject_strategy`].
+    /// `None` inherits the global strategy; `Some(..)` forces this table to
+    /// `Auto` (always emit) or `Identifier` (strict) regardless of the global.
+    pub subject_strategy: Option<SubjectStrategy>,
 }
 
 /// A table's schema + PK hint + per-column stats — one emitter input unit.
@@ -142,6 +170,18 @@ pub struct EmitTableSchema {
     pub columns: Vec<EmitColumn>,
     /// Iceberg's declared row-identity hint — the primary PK signal.
     pub identifier_field_ids: Vec<i32>,
+    /// Foreign keys the catalog declares. One takes precedence over anything
+    /// inferred for its columns. Empty where the catalog records none.
+    pub foreign_keys: Vec<DeclaredForeignKey>,
+}
+
+/// A foreign key as a catalog declares it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredForeignKey {
+    pub child_columns: Vec<String>,
+    /// The parent's [`EmitTableSchema::qualified_name`].
+    pub parent_table: String,
+    pub parent_columns: Vec<String>,
 }
 
 impl EmitTableSchema {
@@ -170,7 +210,7 @@ impl EmitTableSchema {
     /// Whether this is a fact table (`FACT_*`) — used for the child-fact→hub
     /// join advisory.
     pub fn is_fact(&self) -> bool {
-        self.name.starts_with("FACT_")
+        naming::strip_prefix_ignore_case(&self.name, "FACT_").is_some()
     }
 
     /// Look up a column by field id.

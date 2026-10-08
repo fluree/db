@@ -1,0 +1,10 @@
+# q057 distinct_predicates
+# Intent: Schema discovery — "what properties / fields exist here?".
+# BI lineage (BI-explore-3): the distinct set of predicates in the dataset.
+# Exploration family: DISTINCT over the object-position-free ?p of an
+# unconstrained pattern. The predicate set is finite (the mapping's POMs), but
+# there is no mapping-metadata short-circuit — it scans + dedups.
+# Determinism: the ~120 distinct predicates (119 rr:predicate + rdf:type) exceed LIMIT 100, so the returned 100-subset is unordered/nondeterministic -> hash_gate=rows_only; gated on row count, not an exact hash.
+SELECT DISTINCT ?p
+WHERE { ?s ?p ?o }
+LIMIT 100

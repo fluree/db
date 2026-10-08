@@ -6,7 +6,7 @@ instead of rejecting a transaction the way staging-time enforcement does,
 result it finds.
 
 ```bash
-fluree validate [<ledger[:branch]> | <file.ttl|file.jsonld>] [options]
+fluree validate [<ledger[:branch]> | <file.ttl|file.nt|file.jsonld>] [options]
 ```
 
 Requires the `shacl` build feature (enabled by default).
@@ -25,7 +25,7 @@ fluree validate mydb --shacl-graph http://example.org/graphs/shapes
 
 **File mode** validates an RDF file with no ledger at all: the data loads
 into an ephemeral in-memory ledger, the report prints, and nothing persists.
-This is the recommended pre-flight for [bulk import](import.md), which
+This is the recommended pre-flight for [bulk import](create.md#description), which
 deliberately never runs SHACL:
 
 ```bash
@@ -38,12 +38,18 @@ A file that embeds its own shapes validates against them (staging-time
 enforcement is disabled during the ephemeral load, so violating data can't
 be rejected before the report is produced).
 
+File mode reads Turtle (`.ttl`, or `.nt` for N-Triples) and JSON-LD. It
+validates one graph, so a TriG file is refused, including one saved under
+another extension. To validate TriG data, load it into a ledger with
+`fluree insert` and validate that ledger with `--graph <iri>` for each named
+graph.
+
 ## Options
 
 | Option | Description |
 |--------|-------------|
 | `--graph <iri>` | Validate a named data graph instead of the default graph |
-| `--shacl <file>` | Shapes file (Turtle or JSON-LD). **Replaces** the ledger's attached shapes by default |
+| `--shacl <file>` | Shapes file (Turtle, N-Triples or JSON-LD; TriG is refused). **Replaces** the ledger's attached shapes by default |
 | `--shacl-graph <iri>` | Named graph in the target ledger holding the shapes (conflicts with `--shacl`) |
 | `--include-attached` | Union ad-hoc shapes with the attached shapes instead of replacing them |
 | `--format <fmt>` | `table` (default, human), `jsonld`, or `turtle` (W3C `sh:ValidationReport`) |
@@ -81,14 +87,23 @@ Violation: http://example.org/ns/bob
     component: MinCountConstraintComponent
     message:   Expected at least 1 value(s) but found 0
 
-Conforms: false — 1 violation(s), 0 warning(s), 0 info (1 shape(s) checked)
+Conforms: false — 1 violation(s), 0 warning(s), 0 info (1 shape(s) checked at t=3)
 ```
+
+`t` is the ledger commit the report describes — the exact state (index plus
+unindexed commits) the shapes were evaluated against. Anything you measure
+alongside the results, such as record counts for a violation rate, should be
+read at that same `t` (`fluree query --at 3 ...`), or the two numbers come
+from different states.
 
 `jsonld` and `turtle` emit a W3C-shaped `sh:ValidationReport` with
 `sh:focusNode`, `sh:resultPath` (single-predicate paths only — complex paths
 are omitted rather than misrepresented), `sh:resultSeverity`,
 `sh:sourceShape`, `sh:sourceConstraintComponent`, `sh:resultMessage`, and
-`sh:value`.
+`sh:value`. The validated `t` rides on the report node as `f:t`
+(`f` = `https://ns.flur.ee/db#`), since `sh:ValidationReport` has no slot
+for a ledger time. In file mode `t` is the ephemeral ledger's head: `2`, since
+the loader commits the staging-SHACL-disable config before your data.
 
 If the shapes source produces no shapes, the report is vacuously conforming
 and a warning is printed to stderr.
@@ -104,4 +119,4 @@ and a warning is printed to stderr.
 
 - [Cookbook: SHACL validation](../guides/cookbook-shacl.md) — shape authoring
   and transaction-time enforcement
-- [import](import.md) — bulk import (SHACL-exempt by design; validate first)
+- [create](create.md#description) — bulk import via `--from` (SHACL-exempt by design; validate first)

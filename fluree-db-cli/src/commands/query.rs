@@ -69,7 +69,11 @@ impl TrackingFlags {
 
     /// Build the HTTP request headers that map 1:1 to the flag set.
     /// Empty when no tracking was requested.
-    fn as_request_headers(&self) -> Vec<(&'static str, String)> {
+    ///
+    /// Public so the seam against the server's `fluree-*` header parser can be
+    /// tested from one place — this producer and that consumer drifted apart
+    /// once already (`fluree-track-policy` went unparsed).
+    pub fn as_request_headers(&self) -> Vec<(&'static str, String)> {
         let mut out = Vec::new();
         if !self.any() {
             return out;
@@ -99,10 +103,15 @@ impl TrackingFlags {
 /// Append fuel/time/policy fields from a tracked response to the existing
 /// row/time footer. `metrics` is `(track_fuel, track_time, track_policy)` —
 /// only requested fields are shown, even if the server returned more.
+///
+/// `enforcement` covers the case per-policy counts cannot: a request that ran
+/// under a policy context where nothing executed. Without it, `--track-policy`
+/// prints nothing at all for the fail-closed case.
 fn format_tally_suffix(
     fuel: Option<f64>,
     time: Option<&str>,
     policy: Option<&std::collections::HashMap<String, fluree_db_api::PolicyStats>>,
+    enforcement: Option<&fluree_db_api::PolicyEnforcement>,
     metrics: (bool, bool, bool),
 ) -> String {
     let (want_fuel, want_time, want_policy) = metrics;
@@ -118,11 +127,22 @@ fn format_tally_suffix(
         }
     }
     if want_policy {
-        if let Some(p) = policy {
-            if !p.is_empty() {
+        match policy.filter(|p| !p.is_empty()) {
+            Some(p) => {
                 let total_exec: u64 = p.values().map(|s| s.executed).sum();
                 let total_allowed: u64 = p.values().map(|s| s.allowed).sum();
                 parts.push(format!("policy {total_allowed}/{total_exec}"));
+            }
+            // No policy ran. Say whether that was because none applied under an
+            // active policy context, or because there was no policy at all.
+            None => {
+                if let Some(state) = enforcement.filter(|e| e.enforced) {
+                    if state.denies_all_data {
+                        parts.push("policy enforced (grants no data)".to_string());
+                    } else {
+                        parts.push("policy enforced (none ran)".to_string());
+                    }
+                }
             }
         }
     }
@@ -135,20 +155,25 @@ fn format_tally_suffix(
 
 /// Parse a `--at` value into a `TimeSpec`.
 ///
-/// Accepts:
-/// - Integer → `TimeSpec::AtT(n)`
-/// - ISO-8601 datetime string (contains `-` and `:`) → `TimeSpec::AtTime(s)`
-/// - Otherwise → `TimeSpec::AtCommit(s)` (commit CID prefix)
-pub fn parse_time_spec(at: &str) -> fluree_db_api::TimeSpec {
-    if let Ok(t) = at.parse::<i64>() {
-        fluree_db_api::TimeSpec::at_t(t)
-    } else if at.contains('-') && at.contains(':') {
-        // Looks like ISO-8601 timestamp (e.g., "2024-01-15T10:30:00Z")
-        fluree_db_api::TimeSpec::at_time(at.to_string())
-    } else {
-        // Treat as commit CID prefix
-        fluree_db_api::TimeSpec::at_commit(at.to_string())
-    }
+/// The grammar lives in [`fluree_db_api::TimeSpec::parse_at`] — the same
+/// canonical suffix grammar a ledger address uses (`mydb:main@t:5`) minus the
+/// `@`, plus the bare integer / bare ISO-8601 / bare commit-prefix spellings
+/// the CLI has always taken. This wrapper exists only to put the failure into
+/// `CliError::Usage`, which renders it without the API layer's framing.
+///
+/// Before #1805 this was a local three-way heuristic whose catch-all arm turned
+/// every tagged spelling — `t:2`, `t:latest`, `iso:…`, `recorded:…`, even
+/// `commit:…` — into a commit prefix named after the tag. Do not reintroduce a
+/// parser here; extend the shared one.
+pub fn parse_time_spec(at: &str) -> CliResult<fluree_db_api::TimeSpec> {
+    parse_time_spec_for("--at", at)
+}
+
+/// [`parse_time_spec`], but naming the option in the error. `fluree history`
+/// spells the same grammar `--from` / `--to`.
+pub fn parse_time_spec_for(flag: &str, value: &str) -> CliResult<fluree_db_api::TimeSpec> {
+    fluree_db_api::TimeSpec::parse_at(value)
+        .map_err(|e| CliError::Usage(format!("invalid {flag} value: {e}")))
 }
 
 /// Format a Duration for human display.
@@ -180,13 +205,23 @@ fn format_count(n: usize) -> String {
     result
 }
 
-fn time_spec_to_suffix(spec: &fluree_db_api::TimeSpec) -> String {
+/// Render a `TimeSpec` as the `@`-suffix a ledger address carries — the form
+/// the CLI puts on the wire to a remote server.
+///
+/// An inverse of [`parse_time_spec`]; the round trip is pinned by
+/// `time_spec_suffix_round_trips_through_parse`. `AtTime` renders as `@iso:`,
+/// not the canonical `@time:`: every server release accepts `@iso:`, while a
+/// server older than the `@time:` alias rejects the address outright, and a
+/// CLI is routinely newer than the server it talks to. Switch once `@time:` is
+/// the floor of supported servers.
+pub(crate) fn time_spec_to_suffix(spec: &fluree_db_api::TimeSpec) -> String {
     match spec {
         fluree_db_api::TimeSpec::Latest => "@t:latest".to_string(),
         fluree_db_api::TimeSpec::AtT(t) => format!("@t:{t}"),
         fluree_db_api::TimeSpec::AtTime(iso) => format!("@iso:{iso}"),
         fluree_db_api::TimeSpec::AtRecorded(iso) => format!("@recorded:{iso}"),
         fluree_db_api::TimeSpec::AtCommit(prefix) => format!("@commit:{prefix}"),
+        fluree_db_api::TimeSpec::AtSnapshot(id) => format!("@snapshot:{id}"),
     }
 }
 
@@ -368,7 +403,7 @@ pub async fn run(
             Ok(gs) => gs,
             Err(CliError::NoActiveLedger) if force_connection => {
                 context::QueryTarget::Ledger(LedgerMode::Local {
-                    fluree: Box::new(context::build_fluree(dirs)?),
+                    fluree: Box::new(context::build_fluree(dirs).await?),
                     alias: String::new(),
                 })
             }
@@ -405,6 +440,7 @@ pub async fn run(
             &tracking,
             at,
             policy,
+            dirs,
         )
         .await;
     }
@@ -435,10 +471,11 @@ pub async fn run(
     // (subject to the same restrictions the server enforces for graph sources).
     let mode = match target {
         context::QueryTarget::GraphSource { fluree, alias } => {
-            reject_graph_source_unsupported(at, explain, output_format)?;
+            reject_graph_source_unsupported(explain, output_format)?;
             return run_graph_source_query(
                 &fluree,
                 &alias,
+                at,
                 query_format,
                 &content,
                 output_format,
@@ -503,7 +540,7 @@ pub async fn run(
                     (detect::QueryFormat::JsonLd, at) => {
                         let mut json_query: serde_json::Value = serde_json::from_str(&content)?;
                         if let Some(at_str) = at {
-                            let spec = parse_time_spec(at_str);
+                            let spec = parse_time_spec(at_str)?;
                             let suffix = time_spec_to_suffix(&spec);
                             let from_id =
                                 attach_time_suffix_preserving_fragment(&remote_alias, &suffix);
@@ -564,7 +601,7 @@ pub async fn run(
                                     .to_string(),
                             ));
                         }
-                        let spec = parse_time_spec(at_str);
+                        let spec = parse_time_spec(at_str)?;
                         let suffix = time_spec_to_suffix(&spec);
                         let from_iri =
                             attach_time_suffix_preserving_fragment(&remote_alias, &suffix);
@@ -620,7 +657,7 @@ pub async fn run(
                                 .to_string(),
                         ));
                     }
-                    let spec = parse_time_spec(at_str);
+                    let spec = parse_time_spec(at_str)?;
                     let suffix = time_spec_to_suffix(&spec);
                     let from_iri = attach_time_suffix_preserving_fragment(&remote_alias, &suffix);
                     let injected = inject_sparql_from_before_where(&content, &from_iri).ok_or_else(
@@ -639,7 +676,7 @@ pub async fn run(
                     // time-suffixed `from` into the body and POST to the
                     // ledger-scoped explain endpoint. Path drives auth,
                     // body's `from` drives snapshot selection.
-                    let spec = parse_time_spec(at_str);
+                    let spec = parse_time_spec(at_str)?;
                     let suffix = time_spec_to_suffix(&spec);
                     let from_id = attach_time_suffix_preserving_fragment(&remote_alias, &suffix);
                     let mut json_query: serde_json::Value = serde_json::from_str(&content)?;
@@ -677,7 +714,7 @@ pub async fn run(
                                 .to_string(),
                         ));
                     }
-                    let spec = parse_time_spec(at_str);
+                    let spec = parse_time_spec(at_str)?;
                     let suffix = time_spec_to_suffix(&spec);
                     let from_iri = attach_time_suffix_preserving_fragment(&remote_alias, &suffix);
                     let injected = inject_sparql_from_before_where(&content, &from_iri).ok_or_else(
@@ -700,7 +737,7 @@ pub async fn run(
                 (detect::QueryFormat::JsonLd, Some(at_str), false) => {
                     // Remote time-travel via ledger-scoped JSON-LD: path
                     // drives auth, body's `from` carries the @t:N suffix.
-                    let spec = parse_time_spec(at_str);
+                    let spec = parse_time_spec(at_str)?;
                     let suffix = time_spec_to_suffix(&spec);
                     let from_id = attach_time_suffix_preserving_fragment(&remote_alias, &suffix);
                     let mut json_query: serde_json::Value = serde_json::from_str(&content)?;
@@ -778,7 +815,10 @@ pub async fn run(
                     >(v.clone())
                     .ok()
                 });
-                (inner, Some((fuel, time, policy)))
+                let enforcement = envelope.get("policy_enforcement").and_then(|v| {
+                    serde_json::from_value::<fluree_db_api::PolicyEnforcement>(v.clone()).ok()
+                });
+                (inner, Some((fuel, time, policy, enforcement)))
             } else {
                 (result, None)
             };
@@ -804,12 +844,24 @@ pub async fn run(
                 limit
             };
 
+            // A JSON-LD SELECT result is an array of *arrays*, which the
+            // JSON-LD table renderer cannot column-ise — it must be shown as
+            // JSON. Every other `format_result` call site coerces through this
+            // helper; this one (the untracked-remote convergence point) did
+            // not, which is why `--remote ... --format table` rendered `++`/
+            // `||` for JSON-LD while `--format json` and SPARQL were fine.
+            let display_format = json_path_display_format(query_format, output_format);
             let output =
-                output::format_result(&result, output_format, query_format, effective_limit)?;
+                output::format_result(&result, display_format, query_format, effective_limit)?;
             println!("{}", output.text);
-            if let Some((fuel, time, policy)) = tracked_tally {
-                let tally_suffix =
-                    format_tally_suffix(fuel, time.as_deref(), policy.as_ref(), tracking_metrics);
+            if let Some((fuel, time, policy, enforcement)) = tracked_tally {
+                let tally_suffix = format_tally_suffix(
+                    fuel,
+                    time.as_deref(),
+                    policy.as_ref(),
+                    enforcement.as_ref(),
+                    tracking_metrics,
+                );
                 let time_str = format_duration(elapsed);
                 let total = output.total_rows;
                 match effective_limit {
@@ -845,17 +897,27 @@ pub async fn run(
             // Load a single view (optionally time-traveled) and execute against it.
             // This avoids the redundant `fluree.ledger()` load (and duplicate BinaryIndexStore load)
             // that previously occurred before the lazy graph query loaded its own view.
+            let load_started = Instant::now();
+            tracing::debug!(target: "fluree::open", ledger = %alias, "CLI database view load starting");
             let view = match at {
                 Some(at_str) => {
-                    let spec = parse_time_spec(at_str);
+                    let spec = parse_time_spec(at_str)?;
                     fluree.db_at_with_default_context(&alias, spec).await?
                 }
                 None => fluree.db_with_default_context(&alias).await?,
             };
+            tracing::debug!(
+                target: "fluree::open",
+                ledger = %alias,
+                elapsed_us = load_started.elapsed().as_micros() as u64,
+                "CLI database view ready"
+            );
 
+            // No auth layer here: `to_options` leaves `server_identity` unset, so an
+            // `f:IdentityRestricted` override control denies CLI requests by design.
             let view = if policy.is_set() {
                 let opts = policy.to_options().map_err(CliError::Usage)?;
-                fluree.wrap_policy(view, &opts, None).await?
+                fluree.wrap_policy(view, &opts).await?
             } else {
                 view
             };
@@ -900,11 +962,7 @@ pub async fn run(
 
                 // Render the formatted result through the existing output pipeline so
                 // --format {json,typed-json,table} continues to apply.
-                let display_format = match output_format {
-                    OutputFormatKind::TypedJson => OutputFormatKind::TypedJson,
-                    _ if query_format == detect::QueryFormat::JsonLd => OutputFormatKind::Json,
-                    _ => output_format,
-                };
+                let display_format = json_path_display_format(query_format, output_format);
                 let output =
                     output::format_result(&response.result, display_format, query_format, None)?;
                 println!("{}", output.text);
@@ -913,6 +971,7 @@ pub async fn run(
                     response.fuel,
                     response.time.as_deref(),
                     response.policy.as_ref(),
+                    response.policy_enforcement.as_ref(),
                     tracking_metrics,
                 );
                 eprintln!(
@@ -974,7 +1033,7 @@ pub async fn run(
                         } else {
                             // Rare fallback: GROUP BY produces grouped bindings requiring
                             // disaggregation, so fall back to the existing JSON-based formatter.
-                            let formatted_json = result.to_sparql_json(&view.snapshot)?;
+                            let formatted_json = cli_sparql_json(&result, &view.snapshot)?;
                             let output = output::format_result(
                                 &formatted_json,
                                 OutputFormatKind::Table,
@@ -987,8 +1046,11 @@ pub async fn run(
                     }
                     detect::QueryFormat::JsonLd => {
                         // JSON-LD can be nested; keep bench output in the lightweight TSV form.
-                        let (text, total_rows) =
-                            result.to_tsv_limited(&view.snapshot, BENCH_ROWS)?;
+                        let (text, total_rows) = result.to_delimited_limited(
+                            &view.snapshot,
+                            BENCH_ROWS,
+                            &cli_delimited_config(OutputFormatKind::Tsv),
+                        )?;
                         print!("{text}");
                         print_footer(total_rows, Some(BENCH_ROWS), elapsed);
                     }
@@ -997,11 +1059,8 @@ pub async fn run(
                 // Delimited fast path: write bytes directly to stdout (no JSON intermediate).
                 let total_rows = result.row_count();
                 let fmt_timer = Instant::now();
-                let bytes = if output_format == OutputFormatKind::Tsv {
-                    result.to_tsv_bytes(&view.snapshot)?
-                } else {
-                    result.to_csv_bytes(&view.snapshot)?
-                };
+                let bytes = result
+                    .to_delimited_bytes(&view.snapshot, &cli_delimited_config(output_format))?;
                 let fmt_elapsed = fmt_timer.elapsed();
                 use std::io::Write;
                 std::io::stdout().write_all(&bytes)?;
@@ -1013,11 +1072,7 @@ pub async fn run(
                 );
             } else {
                 // JSON-LD queries can produce nested expansion results; always render as JSON.
-                let display_format = match output_format {
-                    OutputFormatKind::TypedJson => OutputFormatKind::TypedJson,
-                    _ if query_format == detect::QueryFormat::JsonLd => OutputFormatKind::Json,
-                    _ => output_format,
-                };
+                let display_format = json_path_display_format(query_format, output_format);
 
                 // Graph results (SPARQL CONSTRUCT/DESCRIBE) don't have a meaningful table view.
                 let display_format = if query_format == detect::QueryFormat::Sparql
@@ -1095,7 +1150,7 @@ pub async fn run(
                     result.format_async(view.as_graph_db_ref(), &config).await?
                 } else {
                     match query_format {
-                        detect::QueryFormat::Sparql => result.to_sparql_json(&view.snapshot)?,
+                        detect::QueryFormat::Sparql => cli_sparql_json(&result, &view.snapshot)?,
                         detect::QueryFormat::JsonLd => {
                             result.to_jsonld_async(view.as_graph_db_ref()).await?
                         }
@@ -1146,7 +1201,7 @@ fn inject_remote_time_travel_sparql(
                 .to_string(),
         ));
     }
-    let spec = parse_time_spec(at_str);
+    let spec = parse_time_spec(at_str)?;
     let suffix = time_spec_to_suffix(&spec);
     let from_iri = attach_time_suffix_preserving_fragment(remote_alias, &suffix);
     inject_sparql_from_before_where(sparql, &from_iri).ok_or_else(|| {
@@ -1248,7 +1303,7 @@ async fn run_local_ndjson_stream_dataset(
     } else {
         fluree_db_api::GovernanceOptions::default()
     };
-    let time_spec = at.map(parse_time_spec);
+    let time_spec = at.map(parse_time_spec).transpose()?;
 
     let (mut dataset, input) = match query_format {
         detect::QueryFormat::Sparql => {
@@ -1353,15 +1408,26 @@ fn print_stream_footer(outcome: &query_stream::StreamOutcome, elapsed: std::time
     if let Some(fuel) = outcome.fuel {
         parts.push(format!("fuel {fuel}"));
     }
+    // Only the enforced case says anything; an unenforced stream reports
+    // nothing, as before.
+    if let Some(state) = outcome.policy_enforcement.as_ref().filter(|e| e.enforced) {
+        parts.push(if state.denies_all_data {
+            "policy enforced (grants no data)".to_string()
+        } else {
+            "policy enforced".to_string()
+        });
+    }
     eprintln!("({})", parts.join(", "));
 }
 
-/// Execute a Cypher read query against a local ledger view.
+/// Execute a Cypher read query against a local ledger view or a remote server.
 ///
 /// Cypher rides a separate API method (`query_cypher`) and renders its
-/// SELECT-shaped results as JSON-LD (the documented default). Remote/HTTP
-/// execution is not yet available, so a server-routed ledger errors with a
-/// pointer to `--direct`.
+/// SELECT-shaped results as cypher-json (the documented default). A local
+/// ledger executes in-process; a server-routed (`Tracked`) ledger POSTs the
+/// `application/cypher` envelope to the ledger-scoped `/query` endpoint. The
+/// remote path emits cypher-json only — the server does not negotiate the
+/// other `--format` shapes for Cypher, so those (and `--at`) require `--direct`.
 #[allow(clippy::too_many_arguments)]
 async fn run_cypher_query(
     mode: LedgerMode,
@@ -1372,12 +1438,8 @@ async fn run_cypher_query(
     tracking: &TrackingFlags,
     at: Option<&str>,
     policy: &PolicyArgs,
+    dirs: &FlureeDir,
 ) -> CliResult<()> {
-    if explain {
-        return Err(CliError::Usage(
-            "--explain is not yet supported for Cypher queries".to_string(),
-        ));
-    }
     if bench {
         return Err(CliError::Usage(
             "--bench is not yet supported for Cypher queries".to_string(),
@@ -1402,26 +1464,39 @@ async fn run_cypher_query(
 
     let (fluree, alias) = match mode {
         LedgerMode::Local { fluree, alias } => (fluree, alias),
-        LedgerMode::Tracked { .. } => {
-            return Err(CliError::Usage(
-                "Cypher queries are only supported on local ledgers; the HTTP Cypher \
-                 endpoint is not yet available.\n  \
-                 Retry with --direct to bypass the server route."
-                    .to_string(),
-            ));
+        LedgerMode::Tracked {
+            client,
+            remote_alias,
+            remote_name,
+            ..
+        } => {
+            return run_remote_cypher_query(
+                *client,
+                &remote_alias,
+                &remote_name,
+                content,
+                output_format,
+                explain,
+                at,
+                policy,
+                dirs,
+            )
+            .await;
         }
     };
 
     let view = match at {
         Some(at_str) => {
-            let spec = parse_time_spec(at_str);
+            let spec = parse_time_spec(at_str)?;
             fluree.db_at_with_default_context(&alias, spec).await?
         }
         None => fluree.db_with_default_context(&alias).await?,
     };
+    // No auth layer here: `to_options` leaves `server_identity` unset, so an
+    // `f:IdentityRestricted` override control denies CLI requests by design.
     let view = if policy.is_set() {
         let opts = policy.to_options().map_err(CliError::Usage)?;
-        fluree.wrap_policy(view, &opts, None).await?
+        fluree.wrap_policy(view, &opts).await?
     } else {
         view
     };
@@ -1429,6 +1504,18 @@ async fn run_cypher_query(
     // Accept either raw Cypher or a `{"cypher": "...", "params": {...}}`
     // envelope (the latter carries parameters).
     let (cypher, params) = fluree_db_api::extract_cypher_envelope(content);
+
+    if explain {
+        let timer = Instant::now();
+        let resp = fluree
+            .explain_cypher(&view, &cypher, params.as_ref())
+            .await?;
+        let elapsed = timer.elapsed();
+        println!("{}", serde_json::to_string_pretty(&resp)?);
+        eprintln!("(explain, {})", format_duration(elapsed));
+        return Ok(());
+    }
+
     let timer = Instant::now();
     let result = fluree
         .query_cypher_with_params(&view, &cypher, params.as_ref())
@@ -1438,11 +1525,8 @@ async fn run_cypher_query(
     // Delimited fast path mirrors the SPARQL/JSON-LD handler.
     if matches!(output_format, OutputFormatKind::Tsv | OutputFormatKind::Csv) {
         let total_rows = result.row_count();
-        let bytes = if output_format == OutputFormatKind::Tsv {
-            result.to_tsv_bytes(&view.snapshot)?
-        } else {
-            result.to_csv_bytes(&view.snapshot)?
-        };
+        let bytes =
+            result.to_delimited_bytes(&view.snapshot, &cli_delimited_config(output_format))?;
         use std::io::Write;
         std::io::stdout().write_all(&bytes)?;
         eprintln!(
@@ -1477,6 +1561,80 @@ async fn run_cypher_query(
     let output = output::format_result(
         &formatted_json,
         display_format,
+        detect::QueryFormat::JsonLd,
+        None,
+    )?;
+    println!("{}", output.text);
+    print_footer(output.total_rows, None, elapsed);
+    Ok(())
+}
+
+/// Execute a Cypher read query against a remote server via the ledger-scoped
+/// `/query` endpoint (`Content-Type: application/cypher`).
+///
+/// The server renders Cypher as cypher-json only — it does not negotiate the
+/// RDF JSON-LD / typed-json / delimited shapes the local path builds
+/// client-side, nor does it honor `--at` for Cypher. Those cases are rejected
+/// here with a pointer to `--direct` (local execution). Policy flags ride
+/// through as request headers + body opts via `with_policy`.
+#[allow(clippy::too_many_arguments)]
+async fn run_remote_cypher_query(
+    client: crate::remote_client::RemoteLedgerClient,
+    remote_alias: &str,
+    remote_name: &str,
+    content: &str,
+    output_format: OutputFormatKind,
+    explain: bool,
+    at: Option<&str>,
+    policy: &PolicyArgs,
+    dirs: &FlureeDir,
+) -> CliResult<()> {
+    // The remote Cypher endpoints have no time-travel handling; local does.
+    if at.is_some() {
+        return Err(CliError::Usage(
+            "--at is not supported for Cypher over a remote server; retry with --direct."
+                .to_string(),
+        ));
+    }
+    if explain {
+        // The body is sent verbatim (raw Cypher or a `{cypher, params}`
+        // envelope); the server's /explain handler extracts it.
+        let timer = Instant::now();
+        let resp = client.explain_cypher(remote_alias, content).await?;
+        let elapsed = timer.elapsed();
+        context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+        println!("{}", serde_json::to_string_pretty(&resp)?);
+        eprintln!("(explain, {})", format_duration(elapsed));
+        return Ok(());
+    }
+    // Only cypher-json-producing formats have a remote equivalent: the default
+    // global `--format table` and explicit `--format cypher-json`. RDF JSON-LD,
+    // typed-json, and delimited (csv/tsv) are rendered client-side on the local
+    // path and have no server negotiation yet.
+    if !matches!(
+        output_format,
+        OutputFormatKind::Table | OutputFormatKind::CypherJson
+    ) {
+        return Err(CliError::Usage(format!(
+            "--format {output_format} is not supported for Cypher over a remote server; \
+             the server renders Cypher as cypher-json.\n  \
+             Use --format cypher-json, or retry with --direct for local rendering."
+        )));
+    }
+    // Attach policy flags so headers + body opts ride through on the request.
+    let client = client.with_policy(policy.clone());
+
+    // The body is sent verbatim (raw Cypher or a `{cypher, params}` envelope);
+    // the server extracts the envelope itself.
+    let timer = Instant::now();
+    let result = client.query_cypher(remote_alias, content).await?;
+    let elapsed = timer.elapsed();
+
+    context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+
+    let output = output::format_result(
+        &result,
+        OutputFormatKind::CypherJson,
         detect::QueryFormat::JsonLd,
         None,
     )?;
@@ -1569,21 +1727,14 @@ fn target_endpoint_id(target: &context::QueryTarget) -> String {
     }
 }
 
-/// Reject the flags the server also refuses for graph-source targets: time
-/// travel, explain plans, and the streaming / delimited output formats. A graph
-/// source is queried at its live source state and returns JSON only.
+/// Reject the flags the server also refuses for graph-source targets: explain
+/// plans and the streaming / delimited output formats. `--at` is not among
+/// them: the API decides which selectors a source honors (`snapshot:` and
+/// `time:` on table sources) and refuses the rest with its own error.
 fn reject_graph_source_unsupported(
-    at: Option<&str>,
     explain: bool,
     output_format: OutputFormatKind,
 ) -> CliResult<()> {
-    if at.is_some() {
-        return Err(CliError::Usage(
-            "`--at` (time travel) is not supported for graph source targets; a graph source is \
-             queried at its live source state"
-                .to_string(),
-        ));
-    }
     if explain {
         return Err(CliError::Usage(
             "`--explain` is not supported for graph source targets".to_string(),
@@ -1601,6 +1752,46 @@ fn reject_graph_source_unsupported(
     Ok(())
 }
 
+/// The SPARQL-JSON config the CLI renders with.
+///
+/// The CLI is a display surface: its output is read by a human in a terminal or
+/// piped into a shell one-liner, and the query's own PREFIX declarations are
+/// right there on screen to expand a CURIE with. So it deliberately opts out of
+/// the W3C absolute-IRI profile that the HTTP/API surfaces serialize under
+/// (issue #45) and keeps the abbreviated form issue #1466 established.
+///
+/// Every CLI call site that reaches a W3C writer goes through this (or
+/// [`cli_delimited_config`]) so the deviation is a visible decision, not a
+/// default it inherited.
+fn cli_sparql_json_config() -> fluree_db_api::FormatterConfig {
+    fluree_db_api::FormatterConfig::sparql_json().with_compact_iris()
+}
+
+/// The CSV/TSV config the CLI renders with — same rationale as
+/// [`cli_sparql_json_config`].
+fn cli_delimited_config(output_format: OutputFormatKind) -> fluree_db_api::FormatterConfig {
+    let config = if output_format == OutputFormatKind::Csv {
+        fluree_db_api::FormatterConfig::csv()
+    } else {
+        fluree_db_api::FormatterConfig::tsv()
+    };
+    config.with_compact_iris()
+}
+
+/// Format a result as SPARQL JSON for CLI display (compacted; see
+/// [`cli_sparql_json_config`]).
+fn cli_sparql_json(
+    result: &fluree_db_api::QueryResult,
+    snapshot: &fluree_db_core::LedgerSnapshot,
+) -> Result<serde_json::Value, CliError> {
+    Ok(fluree_db_api::format::format_results(
+        result,
+        &result.context,
+        snapshot,
+        &cli_sparql_json_config(),
+    )?)
+}
+
 /// Build the formatter config for the JSON-returning graph-source / connection
 /// paths from the requested output format.
 fn json_path_formatter_config(
@@ -1611,7 +1802,7 @@ fn json_path_formatter_config(
     match output_format {
         OutputFormatKind::TypedJson => fluree_db_api::FormatterConfig::typed_json(),
         _ => match query_format {
-            detect::QueryFormat::Sparql => fluree_db_api::FormatterConfig::sparql_json(),
+            detect::QueryFormat::Sparql => cli_sparql_json_config(),
             detect::QueryFormat::JsonLd => {
                 let config = fluree_db_api::FormatterConfig::jsonld();
                 if normalize_arrays {
@@ -1659,9 +1850,11 @@ fn render_json_path_result(
 /// the R2RML-aware `graph().query()` builder — the same path the server uses for
 /// `POST /query/<graph-source>`. Requires the `iceberg` feature.
 #[cfg(feature = "iceberg")]
+#[allow(clippy::too_many_arguments)]
 async fn run_graph_source_query(
     fluree: &fluree_db_api::Fluree,
     alias: &str,
+    at: Option<&str>,
     query_format: detect::QueryFormat,
     content: &str,
     output_format: OutputFormatKind,
@@ -1669,11 +1862,15 @@ async fn run_graph_source_query(
     limit: Option<usize>,
 ) -> CliResult<()> {
     let fmt = json_path_formatter_config(query_format, output_format, normalize_arrays);
+    let spec = at
+        .map(parse_time_spec)
+        .transpose()?
+        .unwrap_or(fluree_db_api::TimeSpec::Latest);
     let timer = Instant::now();
     let result_json = match query_format {
         detect::QueryFormat::Sparql => {
             fluree
-                .graph(alias)
+                .graph_at(alias, spec)
                 .query()
                 .sparql(content)
                 .format(fmt)
@@ -1683,7 +1880,7 @@ async fn run_graph_source_query(
         detect::QueryFormat::JsonLd => {
             let json: serde_json::Value = serde_json::from_str(content)?;
             fluree
-                .graph(alias)
+                .graph_at(alias, spec)
                 .query()
                 .jsonld(&json)
                 .format(fmt)
@@ -1699,9 +1896,11 @@ async fn run_graph_source_query(
 /// so a graph-source single-target query can't run locally. Resolution still
 /// succeeds (so the message is clear), but execution points the user at the fix.
 #[cfg(not(feature = "iceberg"))]
+#[allow(clippy::too_many_arguments)]
 async fn run_graph_source_query(
     _fluree: &fluree_db_api::Fluree,
     alias: &str,
+    _at: Option<&str>,
     _query_format: detect::QueryFormat,
     _content: &str,
     _output_format: OutputFormatKind,
@@ -1827,12 +2026,191 @@ async fn connection_query_local(
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_time_suffix_preserving_fragment, base_ledger_id, inject_sparql_from_before_where,
-        json_path_display_format, jsonld_from_targets, query_targets_foreign_source,
-        reject_graph_source_unsupported,
+        attach_time_suffix_preserving_fragment, base_ledger_id, cli_delimited_config,
+        cli_sparql_json_config, format_tally_suffix, inject_sparql_from_before_where,
+        json_path_display_format, json_path_formatter_config, jsonld_from_targets, parse_time_spec,
+        query_targets_foreign_source, reject_graph_source_unsupported, time_spec_to_suffix,
     };
     use crate::detect::QueryFormat;
     use crate::output::OutputFormatKind;
+    use fluree_db_api::{PolicyEnforcement, PolicyStats};
+
+    const POLICY_ONLY: (bool, bool, bool) = (false, false, true);
+
+    // ---- #1805: `--at` time-spec parsing -----------------------------------
+    //
+    // `parse_time_spec` had zero tests before this. It was an infallible
+    // three-way heuristic — integer, then "contains `-` and `:`", then *every
+    // other string* as a commit prefix — so `--at t:2` reached the resolver as
+    // the literal `"t:2"` and died on "Commit prefix must be at least 6
+    // characters, got 3". The grammar now lives in
+    // `fluree_db_api::TimeSpec::parse_at`; these pin the CLI boundary.
+
+    use fluree_db_api::TimeSpec;
+
+    /// The CLI's own output grammar must be an input it accepts.
+    ///
+    /// `time_spec_to_suffix` renders the `@`-suffix the CLI puts on a ledger
+    /// address; `parse_time_spec` reads what the user typed. This round trip
+    /// would have caught #1805 at write time: the old parser turned
+    /// `time_spec_to_suffix(AtT(2))` = `"@t:2"` back into
+    /// `AtCommit("t:2")` — the exact string that showed up on the wire as
+    /// `@commit:t:2`.
+    #[test]
+    fn time_spec_suffix_round_trips_through_parse() {
+        let all = [
+            TimeSpec::Latest,
+            TimeSpec::AtT(2),
+            TimeSpec::AtT(0),
+            TimeSpec::AtTime("2024-01-15T10:30:00Z".to_string()),
+            TimeSpec::AtRecorded("2024-01-15T10:30:00Z".to_string()),
+            TimeSpec::AtCommit("abc123def".to_string()),
+            TimeSpec::AtSnapshot(5_648_190_075_564_901_028),
+        ];
+        for spec in all {
+            let suffix = time_spec_to_suffix(&spec);
+            let bare = suffix
+                .strip_prefix('@')
+                .unwrap_or_else(|| panic!("suffix {suffix:?} must start with '@'"));
+            assert_eq!(
+                parse_time_spec(bare).unwrap(),
+                spec,
+                "round trip failed for {spec:?} via {suffix:?}"
+            );
+        }
+    }
+
+    /// The wire spelling of a timestamp stays `@iso:` (see `time_spec_to_suffix`):
+    /// a newer CLI must keep working against a server that predates `@time:`.
+    #[test]
+    fn timestamp_renders_with_the_universally_accepted_tag() {
+        assert_eq!(
+            time_spec_to_suffix(&TimeSpec::AtTime("2024-01-15T10:30:00Z".to_string())),
+            "@iso:2024-01-15T10:30:00Z"
+        );
+    }
+
+    /// Both spellings of every shared form must reach the same `TimeSpec`.
+    #[test]
+    fn tagged_and_bare_spellings_agree() {
+        assert_eq!(
+            parse_time_spec("t:2").unwrap(),
+            parse_time_spec("2").unwrap()
+        );
+        assert_eq!(
+            parse_time_spec("t:latest").unwrap(),
+            parse_time_spec("latest").unwrap()
+        );
+        assert_eq!(
+            parse_time_spec("iso:2024-01-15T10:30:00Z").unwrap(),
+            parse_time_spec("2024-01-15T10:30:00Z").unwrap()
+        );
+        assert_eq!(
+            parse_time_spec("commit:abc123def").unwrap(),
+            parse_time_spec("abc123def").unwrap()
+        );
+    }
+
+    /// `recorded:` is the axis the write side could already emit
+    /// (`time_spec_to_suffix` renders `@recorded:`) but no CLI input could
+    /// produce — `--at recorded:<ts>` hit the catch-all and became a commit
+    /// prefix. Pinned separately because it is the one spelling with no
+    /// pre-#1805 spelling at all.
+    #[test]
+    fn recorded_axis_is_reachable_from_the_cli() {
+        assert_eq!(
+            parse_time_spec("recorded:2024-01-15T10:30:00Z").unwrap(),
+            TimeSpec::AtRecorded("2024-01-15T10:30:00Z".to_string())
+        );
+    }
+
+    /// A malformed tagged spec is a usage error naming the accepted spellings,
+    /// not a silent reinterpretation as a commit prefix.
+    #[test]
+    fn malformed_tagged_spec_is_a_usage_error_that_names_the_flag() {
+        let err = parse_time_spec("t:abc").unwrap_err().to_string();
+        assert!(err.contains("--at"), "error must name the flag: {err}");
+        assert!(
+            err.contains("Accepted: t:<N>"),
+            "error must list the accepted spellings: {err}"
+        );
+
+        // `fluree history` spells the same grammar differently.
+        let err = super::super::query::parse_time_spec_for("--from/--to", "t:abc")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--from/--to"), "got: {err}");
+    }
+
+    #[test]
+    fn policy_footer_reports_counts_when_policies_ran() {
+        let stats = std::collections::HashMap::from([(
+            "ex:pol".to_string(),
+            PolicyStats {
+                executed: 10,
+                allowed: 8,
+            },
+        )]);
+        assert_eq!(
+            format_tally_suffix(None, None, Some(&stats), None, POLICY_ONLY),
+            ", policy 8/10"
+        );
+    }
+
+    /// The case that used to print nothing: enforcement was active but no
+    /// policy executed, so the counts are empty.
+    #[test]
+    fn policy_footer_reports_enforcement_when_no_policy_ran() {
+        let empty = std::collections::HashMap::new();
+        let deny_all = PolicyEnforcement {
+            enforced: true,
+            denies_all_data: true,
+            unevaluable_policies: Vec::new(),
+        };
+        assert_eq!(
+            format_tally_suffix(None, None, Some(&empty), Some(&deny_all), POLICY_ONLY),
+            ", policy enforced (grants no data)"
+        );
+
+        let some_grants = PolicyEnforcement {
+            enforced: true,
+            denies_all_data: false,
+            unevaluable_policies: Vec::new(),
+        };
+        assert_eq!(
+            format_tally_suffix(None, None, Some(&empty), Some(&some_grants), POLICY_ONLY),
+            ", policy enforced (none ran)"
+        );
+    }
+
+    /// An unenforced request has nothing to report, and must not gain a footer.
+    #[test]
+    fn policy_footer_silent_when_unenforced() {
+        let empty = std::collections::HashMap::new();
+        assert_eq!(
+            format_tally_suffix(None, None, Some(&empty), None, POLICY_ONLY),
+            ""
+        );
+    }
+
+    /// #1466: the CLI renders SPARQL results with CURIEs, opting out of the
+    /// W3C absolute-IRI profile the API/HTTP surfaces use (#45). Pinned here so
+    /// the deviation cannot be lost to a default change.
+    #[test]
+    fn cli_display_configs_compact_iris() {
+        assert!(!cli_sparql_json_config().absolute_iris);
+        for fmt in [OutputFormatKind::Csv, OutputFormatKind::Tsv] {
+            assert!(!cli_delimited_config(fmt).absolute_iris, "{fmt}");
+        }
+        // ...including the graph-source / connection path, which builds its
+        // config separately.
+        assert!(
+            !json_path_formatter_config(QueryFormat::Sparql, OutputFormatKind::Json, false)
+                .absolute_iris
+        );
+        // The W3C constructors themselves are unchanged (absolute).
+        assert!(fluree_db_api::FormatterConfig::sparql_json().absolute_iris);
+    }
 
     #[test]
     fn attach_time_suffix_preserves_fragment() {
@@ -1936,17 +2314,14 @@ mod tests {
 
     #[test]
     fn graph_source_guardrails_reject_unsupported_flags() {
-        assert!(
-            reject_graph_source_unsupported(Some("3"), false, OutputFormatKind::Table).is_err()
-        );
-        assert!(reject_graph_source_unsupported(None, true, OutputFormatKind::Table).is_err());
-        assert!(reject_graph_source_unsupported(None, false, OutputFormatKind::Ndjson).is_err());
-        assert!(reject_graph_source_unsupported(None, false, OutputFormatKind::Csv).is_err());
-        assert!(reject_graph_source_unsupported(None, false, OutputFormatKind::Tsv).is_err());
+        assert!(reject_graph_source_unsupported(true, OutputFormatKind::Table).is_err());
+        assert!(reject_graph_source_unsupported(false, OutputFormatKind::Ndjson).is_err());
+        assert!(reject_graph_source_unsupported(false, OutputFormatKind::Csv).is_err());
+        assert!(reject_graph_source_unsupported(false, OutputFormatKind::Tsv).is_err());
         // Supported combinations pass.
-        assert!(reject_graph_source_unsupported(None, false, OutputFormatKind::Json).is_ok());
-        assert!(reject_graph_source_unsupported(None, false, OutputFormatKind::Table).is_ok());
-        assert!(reject_graph_source_unsupported(None, false, OutputFormatKind::TypedJson).is_ok());
+        assert!(reject_graph_source_unsupported(false, OutputFormatKind::Json).is_ok());
+        assert!(reject_graph_source_unsupported(false, OutputFormatKind::Table).is_ok());
+        assert!(reject_graph_source_unsupported(false, OutputFormatKind::TypedJson).is_ok());
     }
 
     #[test]

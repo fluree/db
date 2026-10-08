@@ -1,0 +1,11 @@
+# q031 inventory_below_reorder
+# Intent: Var-vs-var FILTER (never pushable) + fact->dim join.
+# BI lineage (BI-16): "Which products are below their reorder point (stockout risk)?"
+# Predicates verified against enterprise.ttl — FactInventorySnapshot: onHandQty, reorderPoint, product; DimProduct: name.
+# Determinism: unordered LIMIT truncates a larger set (any k rows are valid) -> hash_gate=rows_only; gated on row count + invariants, not an exact hash.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?pn ?oh ?rp
+WHERE { ?inv a edw:InventorySnapshot ; edw:onHandQty ?oh ; edw:reorderPoint ?rp ; edw:product ?p .
+        ?p edw:name ?pn .
+        FILTER(?oh < ?rp) }
+LIMIT 5000

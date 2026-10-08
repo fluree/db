@@ -1,8 +1,11 @@
 //! Forward dictionary pack format: large immutable blobs containing many pages.
 //!
 //! Replaces the per-leaf CAS object model (DLF1) with packed pages inside
-//! large (~256 MiB) immutable pack files. IDs within a page are **contiguous**,
+//! immutable pack files (16 MiB target). IDs within a page are **contiguous**,
 //! enabling O(1) value lookup via an offsets-of-next layout.
+//!
+//! Packs are append-only per index build and merged back down by
+//! [`concat_forward_packs`]; see `dict::incremental::plan_compaction`.
 //!
 //! ## Pack wire format (`FPK1`)
 //!
@@ -706,6 +709,173 @@ fn encode_page_into(entries: &[(u64, &[u8])], buf: &mut Vec<u8>) -> io::Result<(
 }
 
 // ============================================================================
+// Compaction
+// ============================================================================
+
+/// Encoded byte length of a pack, derived from its 40-byte header alone.
+///
+/// The page directory is the final section, so the total length is
+/// `page_dir_offset + page_count * PAGE_DIR_ENTRY_SIZE`. Lets compaction size
+/// a candidate from a 40-byte range read instead of fetching the whole object.
+///
+/// This is a planning hint only — the full bytes must still be parsed and
+/// validated before they are merged.
+pub fn pack_encoded_len_from_header(header_bytes: &[u8]) -> io::Result<u64> {
+    let header = PackHeader::decode(header_bytes)?;
+    let dir_size = (header.page_count as u64)
+        .checked_mul(PAGE_DIR_ENTRY_SIZE as u64)
+        .ok_or_else(|| io::Error::other("pack header: directory size overflow"))?;
+    header
+        .page_dir_offset
+        .checked_add(dir_size)
+        .ok_or_else(|| io::Error::other("pack header: encoded length overflow"))
+}
+
+/// Merge adjacent forward packs into one, preserving their pages verbatim.
+///
+/// FPK1 pages are self-contained (`[entry_count][offsets][data]`), so merging
+/// copies page payloads and rebases their offsets rather than decoding and
+/// re-encoding every dictionary value. Page boundaries are therefore inherited
+/// from the inputs; the output is not re-paged.
+///
+/// Inputs must be in ascending ID order, share a `kind` and `ns_code`, and be
+/// strictly adjacent (`next.first_id == prev.last_id + 1`) so the result stays
+/// gap-free. Any violation is an error — a silently mismerged pack would
+/// corrupt ID resolution.
+pub fn concat_forward_packs(packs: &[&[u8]]) -> io::Result<Vec<u8>> {
+    if packs.len() < 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("pack concat: need at least 2 packs, got {}", packs.len()),
+        ));
+    }
+
+    let metas: Vec<ParsedPackMeta> = packs
+        .iter()
+        .map(|bytes| parse_pack_meta(bytes))
+        .collect::<io::Result<_>>()?;
+
+    let kind = metas[0].kind;
+    let ns_code = metas[0].ns_code;
+
+    let mut total_page_bytes: usize = 0;
+    let mut total_pages: usize = 0;
+    for (i, meta) in metas.iter().enumerate() {
+        if meta.directory.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("pack concat: pack {i} has no pages"),
+            ));
+        }
+        if meta.kind != kind || meta.ns_code != ns_code {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "pack concat: pack {} is kind {}/ns {} but pack 0 is kind {}/ns {}",
+                    i, meta.kind, meta.ns_code, kind, ns_code
+                ),
+            ));
+        }
+
+        // The header range must be exactly what the pages cover, or rebasing
+        // would produce a pack whose routing entry lies about its contents.
+        let covered: u64 = meta.directory.iter().map(|d| d.entry_count as u64).sum();
+        let declared = meta
+            .last_id
+            .checked_sub(meta.first_id)
+            .and_then(|span| span.checked_add(1))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("pack concat: pack {i} has last_id < first_id"),
+                )
+            })?;
+        if covered != declared || meta.directory[0].page_first_id != meta.first_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "pack concat: pack {i} pages cover {covered} ids but header declares {declared}"
+                ),
+            ));
+        }
+
+        if i > 0 {
+            let prev = &metas[i - 1];
+            if meta.first_id != prev.last_id + 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "pack concat: pack {} starts at {} but pack {} ends at {} (must be adjacent)",
+                        i,
+                        meta.first_id,
+                        i - 1,
+                        prev.last_id
+                    ),
+                ));
+            }
+        }
+
+        for dir in &meta.directory {
+            total_page_bytes = total_page_bytes
+                .checked_add(dir.page_len as usize)
+                .ok_or_else(|| io::Error::other("pack concat: total page size overflow"))?;
+        }
+        total_pages += meta.directory.len();
+    }
+
+    let page_dir_offset = PACK_HEADER_SIZE
+        .checked_add(total_page_bytes)
+        .ok_or_else(|| io::Error::other("pack concat: page directory offset overflow"))?;
+    let dir_size = total_pages
+        .checked_mul(PAGE_DIR_ENTRY_SIZE)
+        .ok_or_else(|| io::Error::other("pack concat: directory size overflow"))?;
+    let total = page_dir_offset
+        .checked_add(dir_size)
+        .ok_or_else(|| io::Error::other("pack concat: total size overflow"))?;
+
+    let mut buf = Vec::with_capacity(total);
+    let header = PackHeader {
+        version: PACK_VERSION,
+        kind,
+        ns_code,
+        first_id: metas[0].first_id,
+        last_id: metas[metas.len() - 1].last_id,
+        page_count: u32::try_from(total_pages)
+            .map_err(|_| io::Error::other("pack concat: page count exceeds u32"))?,
+        page_dir_offset: page_dir_offset as u64,
+    };
+    header.encode(&mut buf);
+
+    // Copy page payloads, recording each page's new offset.
+    let mut dir_entries: Vec<PageDirEntry> = Vec::with_capacity(total_pages);
+    for (meta, bytes) in metas.iter().zip(packs.iter()) {
+        for dir in &meta.directory {
+            let page_offset = u32::try_from(buf.len())
+                .map_err(|_| io::Error::other("pack concat: page offset exceeds u32"))?;
+            let start = dir.page_offset as usize;
+            buf.extend_from_slice(&bytes[start..start + dir.page_len as usize]);
+            dir_entries.push(PageDirEntry {
+                page_first_id: dir.page_first_id,
+                entry_count: dir.entry_count,
+                page_offset,
+                page_len: dir.page_len,
+            });
+        }
+    }
+
+    for entry in &dir_entries {
+        entry.encode(&mut buf);
+    }
+
+    debug_assert_eq!(buf.len(), total);
+
+    // Structural re-validation of the produced bytes before they can be uploaded.
+    parse_pack_meta(&buf)?;
+
+    Ok(buf)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -963,5 +1133,204 @@ mod tests {
 
         assert!(lookup_in_pack(&pack_bytes, &meta, 99).is_none());
         assert!(lookup_in_pack(&pack_bytes, &meta, 600).is_none());
+    }
+
+    // ---- Compaction ----
+
+    /// One pack per `(first, count)` run, encoded with the given page target.
+    fn packs_for(runs: &[(u64, usize)], kind: u8, ns_code: u16, page_bytes: usize) -> Vec<Vec<u8>> {
+        runs.iter()
+            .map(|&(first, count)| {
+                let entries = make_entries(first, count);
+                encode_forward_pack(&as_refs(&entries), kind, ns_code, page_bytes).unwrap()
+            })
+            .collect()
+    }
+
+    fn concat(packs: &[Vec<u8>]) -> io::Result<Vec<u8>> {
+        let borrowed: Vec<&[u8]> = packs.iter().map(Vec::as_slice).collect();
+        concat_forward_packs(&borrowed)
+    }
+
+    #[test]
+    fn concat_two_adjacent_packs_preserves_every_lookup() {
+        let packs = packs_for(&[(0, 10), (10, 15)], KIND_STRING_FWD, 0, 1024 * 1024);
+        let merged = concat(&packs).unwrap();
+
+        let pack = ForwardPack::from_bytes(&merged).unwrap();
+        assert_eq!(pack.header().first_id, 0);
+        assert_eq!(pack.header().last_id, 24);
+        for id in 0..=24u64 {
+            assert_eq!(
+                pack.lookup_str(id).unwrap(),
+                Some(format!("value_{id}")),
+                "mismatch at id={id}"
+            );
+        }
+    }
+
+    #[test]
+    fn concat_eight_multi_page_packs_conserves_pages_and_values() {
+        // 512-byte page target against ~12-byte values forces several pages each.
+        let runs: Vec<(u64, usize)> = (0..8).map(|i| (i as u64 * 100, 100)).collect();
+        let packs = packs_for(&runs, KIND_STRING_FWD, 0, 512);
+
+        let expected_pages: u32 = packs
+            .iter()
+            .map(|p| ForwardPack::from_bytes(p).unwrap().page_count())
+            .sum();
+        assert!(expected_pages > 8, "test needs genuinely multi-page inputs");
+
+        let merged = concat(&packs).unwrap();
+        let pack = ForwardPack::from_bytes(&merged).unwrap();
+
+        // Pages are copied verbatim, never re-paged or dropped.
+        assert_eq!(pack.page_count(), expected_pages);
+        assert_eq!(pack.total_entries(), 800);
+        assert_eq!(pack.header().first_id, 0);
+        assert_eq!(pack.header().last_id, 799);
+        for id in 0..=799u64 {
+            assert_eq!(
+                pack.lookup_str(id).unwrap(),
+                Some(format!("value_{id}")),
+                "mismatch at id={id}"
+            );
+        }
+    }
+
+    #[test]
+    fn concat_rejects_gaps_overlaps_and_mismatched_streams() {
+        let page = 1024 * 1024;
+
+        // Gap: 0..=9 then 11.. — merging would produce a pack spanning a hole.
+        let gap = packs_for(&[(0, 10), (11, 5)], KIND_STRING_FWD, 0, page);
+        assert!(concat(&gap).is_err(), "adjacent-id gap must be rejected");
+
+        // Overlap: both packs claim id 9.
+        let overlap = packs_for(&[(0, 10), (9, 5)], KIND_STRING_FWD, 0, page);
+        assert!(concat(&overlap).is_err(), "overlap must be rejected");
+
+        // Out of order.
+        let reversed = packs_for(&[(10, 5), (0, 10)], KIND_STRING_FWD, 0, page);
+        assert!(
+            concat(&reversed).is_err(),
+            "descending order must be rejected"
+        );
+
+        // Strings must never merge with subjects.
+        let s = packs_for(&[(0, 10)], KIND_STRING_FWD, 0, page);
+        let subj = packs_for(&[(10, 10)], KIND_SUBJECT_FWD, 0, page);
+        assert!(
+            concat(&[s[0].clone(), subj[0].clone()]).is_err(),
+            "kind mismatch must be rejected"
+        );
+
+        // Nor may two namespaces merge.
+        let ns1 = packs_for(&[(0, 10)], KIND_SUBJECT_FWD, 1, page);
+        let ns2 = packs_for(&[(10, 10)], KIND_SUBJECT_FWD, 2, page);
+        assert!(
+            concat(&[ns1[0].clone(), ns2[0].clone()]).is_err(),
+            "ns_code mismatch must be rejected"
+        );
+
+        // A single pack is not a merge.
+        assert!(
+            concat(&s).is_err(),
+            "fewer than two inputs must be rejected"
+        );
+    }
+
+    /// The structural check: a header whose declared span disagrees with what
+    /// its pages actually cover must be rejected rather than merged.
+    ///
+    /// `encode_forward_pack` validates contiguity on every write, so no legally
+    /// written pack can reach this — it only fires on a corrupt or truncated
+    /// object. That is exactly why it is worth pinning: without it, a header
+    /// that lies about its span yields a merged pack whose routing entry claims
+    /// IDs it holds no values for, and a lookup for one of those IDs lands in
+    /// the wrong page. Corruption that presents as wrong answers rather than a
+    /// read error is the hardest kind to trace back.
+    #[test]
+    fn concat_rejects_a_header_that_misdeclares_its_span() {
+        let page = 1024 * 1024;
+
+        // Baseline: these two merge cleanly. Both mangles below target the LAST
+        // pack, whose end no following pack is checked against — so the
+        // adjacency rule cannot reach them and only this guard can.
+        let good = packs_for(&[(0, 10), (10, 15)], KIND_STRING_FWD, 0, page);
+        assert!(concat(&good).is_ok(), "unmangled inputs must merge");
+
+        // `last_id` (header bytes 16..24) bumped by one: the header claims one
+        // more id than its pages carry.
+        let mut over = good.clone();
+        let bumped = u64::from_le_bytes(over[1][16..24].try_into().unwrap()) + 1;
+        over[1][16..24].copy_from_slice(&bumped.to_le_bytes());
+        let err = concat(&over)
+            .map(|_| ())
+            .expect_err("over-declared span must be rejected");
+        assert!(
+            err.to_string().contains("ids but header declares"),
+            "error names the span disagreement: {err}"
+        );
+
+        // Span left honest, but the first page directory entry no longer starts
+        // where the header says the pack does — the second half of the guard.
+        // The directory sits at `page_dir_offset` (header bytes 28..36), and its
+        // first entry opens with `page_first_id`.
+        let mut shifted = good.clone();
+        let dir_at = u64::from_le_bytes(shifted[1][28..36].try_into().unwrap()) as usize;
+        let page_first = u64::from_le_bytes(shifted[1][dir_at..dir_at + 8].try_into().unwrap()) + 1;
+        shifted[1][dir_at..dir_at + 8].copy_from_slice(&page_first.to_le_bytes());
+        assert!(
+            concat(&shifted).is_err(),
+            "a pack whose first page does not start at first_id must be rejected"
+        );
+    }
+
+    #[test]
+    fn header_derived_length_matches_actual_bytes() {
+        // The size probe reads 40 bytes and must agree with the object length,
+        // or compaction plans against wrong sizes.
+        for &(page_bytes, count) in &[(512usize, 500usize), (1024 * 1024, 10)] {
+            let entries = make_entries(0, count);
+            let bytes =
+                encode_forward_pack(&as_refs(&entries), KIND_STRING_FWD, 0, page_bytes).unwrap();
+            assert_eq!(
+                pack_encoded_len_from_header(&bytes[..PACK_HEADER_SIZE]).unwrap(),
+                bytes.len() as u64
+            );
+        }
+
+        // And for a merged pack, whose directory is rebuilt.
+        let packs = packs_for(&[(0, 50), (50, 50), (100, 50)], KIND_STRING_FWD, 0, 512);
+        let merged = concat(&packs).unwrap();
+        assert_eq!(
+            pack_encoded_len_from_header(&merged[..PACK_HEADER_SIZE]).unwrap(),
+            merged.len() as u64
+        );
+    }
+
+    #[test]
+    fn concat_is_associative_over_repeated_merges() {
+        // A pack absorbs new material repeatedly; each generation must stay
+        // structurally valid and value-identical to a single wide merge.
+        let runs: Vec<(u64, usize)> = (0..6).map(|i| (i as u64 * 20, 20)).collect();
+        let packs = packs_for(&runs, KIND_SUBJECT_FWD, 3, 256);
+
+        let one_shot = concat(&packs).unwrap();
+
+        let mut acc = packs[0].clone();
+        for next in &packs[1..] {
+            acc = concat(&[acc, next.clone()]).unwrap();
+        }
+
+        let a = ForwardPack::from_bytes(&acc).unwrap();
+        let b = ForwardPack::from_bytes(&one_shot).unwrap();
+        assert_eq!(a.header().first_id, b.header().first_id);
+        assert_eq!(a.header().last_id, b.header().last_id);
+        assert_eq!(a.page_count(), b.page_count());
+        for id in 0..=119u64 {
+            assert_eq!(a.lookup(id), b.lookup(id), "mismatch at id={id}");
+        }
     }
 }

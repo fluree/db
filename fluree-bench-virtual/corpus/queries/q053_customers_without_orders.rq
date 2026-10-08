@@ -1,0 +1,10 @@
+# q053 customers_without_orders
+# Intent: Anti-join (customer NOT EXISTS order); dims subject + fact in NOT EXISTS.
+# BI lineage (BI-25): "Which current customers have never placed an order?"
+# Predicates verified against enterprise.ttl — DimCustomer: isCurrent, customerId; FactOrder: customer.
+# Determinism: unordered LIMIT truncates a larger set (any k rows are valid) -> hash_gate=rows_only; gated on row count + invariants, not an exact hash.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?cid
+WHERE { ?c a edw:Customer ; edw:isCurrent true ; edw:customerId ?cid .
+        FILTER NOT EXISTS { ?o a edw:Order ; edw:customer ?c . } }
+LIMIT 5000

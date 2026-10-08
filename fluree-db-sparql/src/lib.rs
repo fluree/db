@@ -36,7 +36,9 @@
 pub mod ast;
 pub mod diag;
 pub mod lex;
+pub mod params;
 pub mod parse;
+pub mod protocol;
 pub mod span;
 pub mod validate;
 
@@ -44,11 +46,15 @@ pub mod validate;
 pub mod lower;
 
 // Re-exports
-pub use ast::{Prologue, QueryBody, SparqlAst, UpdateOperation};
+pub use ast::{MetaPragma, Pragmas, Prologue, QueryBody, SparqlAst, UpdateOperation};
 pub use diag::{DiagCode, Diagnostic, ParseOutput, Severity};
-pub use parse::parse_sparql;
+pub use params::{substitute_params, ParamError, ParamMap};
+pub use parse::{parse_sparql, pragma_names, request_pragmas};
 pub use span::SourceSpan;
 pub use validate::{validate, Capabilities};
 
 #[cfg(feature = "lowering")]
-pub use lower::{lower_sparql, lower_sparql_with_source, LowerError};
+pub use lower::{
+    lower_sparql, lower_sparql_with_source, resolve_dataset_clause, LowerError,
+    ResolvedDatasetClause,
+};

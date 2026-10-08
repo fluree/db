@@ -10,6 +10,7 @@
 use fluree_db_core::Sid;
 use fluree_graph_json_ld::{ContextCompactor, ParsedContext};
 use fluree_vocab::namespaces;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
@@ -58,6 +59,32 @@ pub struct IriCompactor {
     /// (SPARQL XML/JSON, TSV/CSV) never touch it, so they must not pay this
     /// per-query construction cost — hence the `OnceLock`.
     fallback_prefixes: OnceLock<Vec<(String, String)>>,
+
+    /// When true, the `sparql_json` formatter CURIE-compacts raw graph-source
+    /// `Binding::Iri` node references (via `compact_id_iri`) instead of emitting
+    /// them verbatim, so virtual (R2RML) output matches native's `Binding::Sid`
+    /// compaction (F9). Defaults **false**: it is set true ONLY when building the
+    /// compactor for a `SparqlJson` render of a graph-source result — every other
+    /// formatter (JSON-LD/XML/typed/delimited) leaves it false and keeps raw
+    /// graph-source IRIs (that consistency follow-up is register entry F16).
+    compact_graph_source_iris: bool,
+
+    /// When true the writer is rendering one of the W3C result serializations
+    /// (SPARQL Results JSON / CSV / TSV), so every node reference must come out
+    /// as the absolute IRI: those formats carry no prefix map and no `@base` slot,
+    /// so a CURIE or a relative reference in one of them cannot be expanded back
+    /// by the consumer (issue #45).
+    ///
+    /// Carried on the compactor rather than passed alongside it because the
+    /// term-rendering helpers (`sparql::write_term`, `delimited::write_binding_cell`)
+    /// receive the compactor and nothing else — including on the NDJSON streaming
+    /// path, which has no `FormatterConfig` in scope.
+    ///
+    /// Defaults **false** (compact), matching every JSON-LD-flavored formatter.
+    /// [`crate::FormatterConfig::absolute_iris`] is what sets it and documents
+    /// where the boundary sits; it also governs the strict `datatype` rule for
+    /// string-backed literals.
+    absolute_iris: bool,
 }
 
 impl IriCompactor {
@@ -80,6 +107,8 @@ impl IriCompactor {
             reverse_terms,
             // Lazily built on first display-compaction call — see field docs.
             fallback_prefixes: OnceLock::new(),
+            compact_graph_source_iris: false,
+            absolute_iris: false,
         }
     }
 
@@ -97,6 +126,81 @@ impl IriCompactor {
             reverse_terms: HashMap::new(),
             // Empty default context → lazy build yields no fallbacks (unchanged behavior).
             fallback_prefixes: OnceLock::new(),
+            compact_graph_source_iris: false,
+            absolute_iris: false,
+        }
+    }
+
+    /// Enable (or disable) CURIE-compaction of raw graph-source `Binding::Iri`
+    /// node references in the `sparql_json` formatter (F9). Builder-style; see the
+    /// `compact_graph_source_iris` field docs for the scoping rationale.
+    pub fn with_graph_source_iri_compaction(mut self, enabled: bool) -> Self {
+        self.compact_graph_source_iris = enabled;
+        self
+    }
+
+    /// True when the `sparql_json` formatter should CURIE-compact raw
+    /// graph-source `Binding::Iri` node references (see the field docs).
+    pub fn compacts_graph_source_iris(&self) -> bool {
+        self.compact_graph_source_iris
+    }
+
+    /// Select the strict W3C result-format profile: absolute IRIs, and the
+    /// tightened `datatype` rule for string-backed literals. Builder-style; see
+    /// the `absolute_iris` field docs and [`crate::FormatterConfig::absolute_iris`].
+    pub fn with_absolute_iris(mut self, enabled: bool) -> Self {
+        self.absolute_iris = enabled;
+        self
+    }
+
+    /// True when this render must emit absolute IRIs (a W3C result format).
+    pub fn emits_absolute_iris(&self) -> bool {
+        self.absolute_iris
+    }
+
+    /// Render a Sid as a node identifier **for the current output profile**.
+    ///
+    /// The `render_*` family is what result writers should call: it applies the
+    /// profile, where the `compact_*` family is the raw compaction mechanism and
+    /// always compacts. Under [`emits_absolute_iris`](Self::emits_absolute_iris)
+    /// this is [`decode_sid`](Self::decode_sid); otherwise it is
+    /// [`compact_id_sid`](Self::compact_id_sid).
+    pub fn render_id_sid(&self, sid: &Sid) -> Result<String> {
+        if self.absolute_iris {
+            self.decode_sid(sid)
+        } else {
+            self.compact_id_sid(sid)
+        }
+    }
+
+    /// Render an already-decoded IRI as a node identifier for the current
+    /// output profile. See [`render_id_sid`](Self::render_id_sid).
+    pub fn render_id_iri<'a>(&self, iri: &'a str) -> Cow<'a, str> {
+        if self.absolute_iris {
+            Cow::Borrowed(iri)
+        } else {
+            Cow::Owned(self.compact_id_iri(iri))
+        }
+    }
+
+    /// Render an IRI in a predicate / `@type` position for the current output
+    /// profile — the vocab-rules counterpart of
+    /// [`render_id_iri`](Self::render_id_iri), used by the delimited writers.
+    pub fn render_vocab_iri<'a>(&self, iri: &'a str) -> Cow<'a, str> {
+        if self.absolute_iris {
+            Cow::Borrowed(iri)
+        } else {
+            Cow::Owned(self.compact_vocab_iri(iri))
+        }
+    }
+
+    /// Render a Sid in a predicate / `@type` position for the current output
+    /// profile. See [`render_vocab_iri`](Self::render_vocab_iri).
+    pub fn render_vocab_sid(&self, sid: &Sid) -> Result<String> {
+        if self.absolute_iris {
+            self.decode_sid(sid)
+        } else {
+            self.compact_sid(sid)
         }
     }
 
@@ -115,7 +219,7 @@ impl IriCompactor {
     /// Returns an error if the namespace code is not registered (this indicates
     /// a serious invariant violation: we should never have Sids we cannot decode).
     pub fn decode_sid(&self, sid: &Sid) -> Result<String> {
-        if sid.namespace_code == namespaces::EMPTY || sid.namespace_code == namespaces::OVERFLOW {
+        if namespaces::is_full_iri(sid.namespace_code) {
             return Ok(sid.name.to_string());
         }
         let prefix = self
@@ -123,6 +227,26 @@ impl IriCompactor {
             .get(&sid.namespace_code)
             .ok_or(FormatError::UnknownNamespace(sid.namespace_code))?;
         Ok(format!("{}{}", prefix, sid.name))
+    }
+
+    /// Decode a Sid to a full IRI as a shared string. Empty/overflow
+    /// namespace codes — and any namespace whose prefix is empty — return
+    /// the Sid's own name: a refcount bump, no allocation. That is the hot
+    /// path once Cypher identifiers default to namespace 0 (no prefix),
+    /// and the general path still pays only one allocation per distinct
+    /// Sid instead of one per use.
+    pub fn decode_sid_shared(&self, sid: &Sid) -> Result<std::sync::Arc<str>> {
+        if namespaces::is_full_iri(sid.namespace_code) {
+            return Ok(std::sync::Arc::clone(&sid.name));
+        }
+        let prefix = self
+            .namespace_codes
+            .get(&sid.namespace_code)
+            .ok_or(FormatError::UnknownNamespace(sid.namespace_code))?;
+        if prefix.is_empty() {
+            return Ok(std::sync::Arc::clone(&sid.name));
+        }
+        Ok(std::sync::Arc::from(format!("{}{}", prefix, sid.name)))
     }
 
     /// Look up the namespace prefix for a Sid without allocating.
@@ -139,7 +263,7 @@ impl IriCompactor {
     /// consumer that frames `Some(prefix)` as a `<uri>` / `@id` must special-case
     /// the `"_:"` prefix (or `sid.namespace_code == namespaces::BLANK_NODE`).
     pub fn namespace_prefix(&self, sid: &Sid) -> Result<Option<&str>> {
-        if sid.namespace_code == namespaces::EMPTY || sid.namespace_code == namespaces::OVERFLOW {
+        if namespaces::is_full_iri(sid.namespace_code) {
             return Ok(None);
         }
         self.namespace_codes
@@ -686,6 +810,40 @@ mod tests {
             compactor.compact_id_iri("http://example.org/lists/summer"),
             "http://example.org/lists/summer"
         );
+    }
+
+    /// F9 mechanism proof: `compact_id_iri` compacts a raw graph-source IRI
+    /// STRING purely from the query context's declared prefix — the namespace-code
+    /// map need NOT contain the vocabulary namespace. This is why the F9 fix routes
+    /// `Binding::Iri` through `compact_id_iri` (not namespace-map seeding), and why
+    /// an undeclared namespace (`rdf:type`) correctly stays a full IRI, matching
+    /// native's sparql_json output. Also covers the graph-source flag accessor.
+    #[test]
+    fn test_compact_id_iri_is_context_driven_not_namespace_map() {
+        // Namespace-code map deliberately WITHOUT the edw# vocabulary namespace.
+        let mut namespaces = HashMap::new();
+        namespaces.insert(0, String::new());
+        namespaces.insert(2, xsd::NS.to_string());
+        // Context DECLARES edw: (as a SPARQL PREFIX / @context would).
+        let context =
+            ParsedContext::parse(None, &json!({ "edw": "http://ns.fluree.dev/edw#" })).unwrap();
+        let compactor = IriCompactor::new(Arc::new(namespaces), &context);
+
+        assert_eq!(
+            compactor.compact_id_iri("http://ns.fluree.dev/edw#name"),
+            "edw:name"
+        );
+        // Undeclared namespace stays full (rdf:type parity with native).
+        assert_eq!(
+            compactor.compact_id_iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+        );
+
+        // Graph-source flag: default false, builder flips it.
+        assert!(!compactor.compacts_graph_source_iris());
+        assert!(IriCompactor::new(Arc::new(HashMap::new()), &context)
+            .with_graph_source_iri_compaction(true)
+            .compacts_graph_source_iris());
     }
 
     /// With BOTH `@base` and `@vocab` set to distinct namespaces, each governs

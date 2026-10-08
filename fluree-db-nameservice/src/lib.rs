@@ -110,14 +110,17 @@ pub(crate) fn ref_values_match(a: &RefValue, b: &RefValue) -> bool {
 ///
 /// Used when constructing storage addresses for BM25, vector, and other graph
 /// source index artifacts, e.g. `fluree:file://graph-sources/{name}/{branch}/bm25/...`.
-pub const STORAGE_SEGMENT_GRAPH_SOURCES: &str = "graph-sources";
+///
+/// Aliased to the canonical constant next to `content_path` in fluree-db-core
+/// so the forward layout and every reverse parser share one definition.
+pub const STORAGE_SEGMENT_GRAPH_SOURCES: &str = fluree_db_core::storage::GRAPH_SOURCES_PATH_SEGMENT;
 pub use storage_ns::StorageNameService;
 pub use tracking::{MemoryTrackingStore, RemoteName, RemoteTrackingStore, TrackingRecord};
 #[cfg(feature = "native")]
 pub use tracking_file::FileTrackingStore;
 
 use async_trait::async_trait;
-use fluree_db_core::{format_ledger_id, ContentId};
+use fluree_db_core::{format_ledger_id, ContentId, IntoLedgerId, LedgerId};
 use fluree_vocab::ns_types;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -141,8 +144,9 @@ pub struct NsRecord {
     /// Canonical ledger ID with branch (e.g., "mydb:main")
     ///
     /// This is the primary cache key and the fully-qualified identifier.
-    /// Use this for cache lookups and as the canonical form.
-    pub ledger_id: String,
+    /// Always equal to `name:branch`.
+    #[serde(deserialize_with = "LedgerId::deserialize_persisted")]
+    pub ledger_id: LedgerId,
 
     /// Ledger name without branch suffix (e.g., "mydb")
     pub name: String,
@@ -199,15 +203,12 @@ pub(crate) fn is_zero(v: &u32) -> bool {
 
 impl NsRecord {
     /// Create a new NsRecord with minimal required fields
-    pub fn new(name: impl Into<String>, branch: impl Into<String>) -> Self {
-        let name = name.into();
-        let branch = branch.into();
-        let ledger_id = format_ledger_id(&name, &branch);
-
+    pub fn new(ledger_id: impl IntoLedgerId) -> Self {
+        let ledger_id = ledger_id.into_ledger_id();
         Self {
+            name: ledger_id.name().to_string(),
+            branch: ledger_id.branch().to_string(),
             ledger_id,
-            name,
-            branch,
             commit_head_id: None,
             commit_t: 0,
             index_head_id: None,
@@ -265,6 +266,10 @@ pub enum GraphSourceType {
     R2rml,
     /// Apache Iceberg table
     Iceberg,
+    /// R2RML mapping over tables reached through a SQL endpoint
+    Sql,
+    /// R2RML mapping over Delta Lake tables
+    Delta,
     /// Unknown/custom graph source type
     Unknown(String),
 }
@@ -276,7 +281,10 @@ impl GraphSourceType {
             GraphSourceType::Bm25 | GraphSourceType::Vector | GraphSourceType::Geo => {
                 GraphSourceKind::Index
             }
-            GraphSourceType::R2rml | GraphSourceType::Iceberg => GraphSourceKind::Mapped,
+            GraphSourceType::R2rml
+            | GraphSourceType::Iceberg
+            | GraphSourceType::Sql
+            | GraphSourceType::Delta => GraphSourceKind::Mapped,
             GraphSourceType::Unknown(_) => GraphSourceKind::Index, // default assumption
         }
     }
@@ -292,6 +300,8 @@ impl GraphSourceType {
             GraphSourceType::Geo => "f:GeoIndex".to_string(),
             GraphSourceType::R2rml => "f:R2rmlMapping".to_string(),
             GraphSourceType::Iceberg => "f:IcebergMapping".to_string(),
+            GraphSourceType::Sql => "f:SqlMapping".to_string(),
+            GraphSourceType::Delta => "f:DeltaMapping".to_string(),
             GraphSourceType::Unknown(s) => s.clone(),
         }
     }
@@ -308,12 +318,16 @@ impl GraphSourceType {
             "f:GeoIndex" => GraphSourceType::Geo,
             "f:R2rmlMapping" => GraphSourceType::R2rml,
             "f:IcebergMapping" => GraphSourceType::Iceberg,
+            "f:SqlMapping" => GraphSourceType::Sql,
+            "f:DeltaMapping" => GraphSourceType::Delta,
             // Full IRI forms
             ns_types::BM25_INDEX => GraphSourceType::Bm25,
             ns_types::HNSW_INDEX => GraphSourceType::Vector,
             ns_types::GEO_INDEX => GraphSourceType::Geo,
             ns_types::R2RML_MAPPING => GraphSourceType::R2rml,
             ns_types::ICEBERG_MAPPING => GraphSourceType::Iceberg,
+            ns_types::SQL_MAPPING => GraphSourceType::Sql,
+            ns_types::DELTA_MAPPING => GraphSourceType::Delta,
             _ => GraphSourceType::Unknown(s.to_string()),
         }
     }
@@ -327,7 +341,8 @@ impl GraphSourceType {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphSourceRecord {
     /// Canonical identifier for this graph source (e.g., "my-search:main")
-    pub graph_source_id: String,
+    #[serde(deserialize_with = "LedgerId::deserialize_persisted")]
+    pub graph_source_id: LedgerId,
 
     /// Base name of the graph source (e.g., "my-search")
     pub name: String,
@@ -365,7 +380,7 @@ impl GraphSourceRecord {
     ) -> Self {
         let name = name.into();
         let branch = branch.into();
-        let graph_source_id = format_ledger_id(&name, &branch);
+        let graph_source_id = format_ledger_id(&name, &branch).as_str().into_ledger_id();
 
         Self {
             graph_source_id,
@@ -413,7 +428,7 @@ pub enum NsLookupResult {
 /// Read-only nameservice lookup surface.
 ///
 /// Implementations provide ledger discovery by ledger ID and the
-/// associated read concerns (refs, graph sources, status, config).
+/// associated per-branch reads (refs, graph sources, status, config).
 /// This is the read-only counterpart to [`NameService`].
 ///
 /// Callers that only need to read should bind this trait — that lets
@@ -447,6 +462,37 @@ pub trait NameServiceLookup:
             .into_iter()
             .filter(|r| r.name == ledger_name && !r.retracted)
             .collect())
+    }
+
+    /// Read both head pointers without assembling a full [`NsRecord`].
+    ///
+    /// Prefer this (or [`RefLookup::get_ref`] for a single head) over
+    /// [`lookup`](Self::lookup) whenever only `commit`/`index` identity or
+    /// `t` is needed: the full record costs config/context/status parsing
+    /// and, on remote backends, more items per read.
+    ///
+    /// `None` follows [`RefLookup::get_ref`] on the same backend — an
+    /// unknown ledger, and (where the backend tombstones) a retracted one.
+    /// That correspondence is about **existence only**, not values: the file
+    /// backend's `get_ref(IndexHead)` prefers the separate index file
+    /// unconditionally, where this and [`lookup`](Self::lookup) apply the
+    /// read-time `>=` merge, so the two can disagree on a stale index file.
+    /// Where they differ, `heads` sides with `lookup`.
+    ///
+    /// Retraction is not applied uniformly across backends — raft tombstones
+    /// on this surface, file/DynamoDB/memory do not. See #1670.
+    ///
+    /// The default reads the two refs separately; backends override when
+    /// they can serve both in one read.
+    async fn heads(&self, ledger_id: &str) -> Result<Option<LedgerHeads>> {
+        let Some(commit) = self.get_ref(ledger_id, RefKind::CommitHead).await? else {
+            return Ok(None);
+        };
+        let index = self
+            .get_ref(ledger_id, RefKind::IndexHead)
+            .await?
+            .unwrap_or(RefValue { id: None, t: 0 });
+        Ok(Some(LedgerHeads { commit, index }))
     }
 }
 
@@ -796,15 +842,15 @@ pub trait GraphSourcePublisher: GraphSourceLookup {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubscriptionScope {
     /// Subscribe to events for a specific resource (ledger_id or graph_source_id)
-    ResourceId(String),
+    ResourceId(LedgerId),
     /// Subscribe to all events (all ledgers and graph sources)
     All,
 }
 
 impl SubscriptionScope {
     /// Create a scope for a specific resource ID (ledger_id or graph_source_id)
-    pub fn resource_id(id: impl Into<String>) -> Self {
-        Self::ResourceId(id.into())
+    pub fn resource_id(id: LedgerId) -> Self {
+        Self::ResourceId(id)
     }
 
     /// Create a scope for all events
@@ -813,7 +859,7 @@ impl SubscriptionScope {
     }
 
     /// Check if this scope matches a given event's resource_id
-    pub fn matches(&self, event_resource_id: &str) -> bool {
+    pub fn matches(&self, event_resource_id: &LedgerId) -> bool {
         match self {
             Self::All => true,
             Self::ResourceId(id) => id == event_resource_id,
@@ -830,32 +876,45 @@ impl SubscriptionScope {
 pub enum NameServiceEvent {
     /// A ledger commit head was advanced.
     LedgerCommitPublished {
-        ledger_id: String,
+        ledger_id: LedgerId,
         commit_id: ContentId,
         commit_t: i64,
     },
     /// A ledger index head was advanced.
     LedgerIndexPublished {
-        ledger_id: String,
+        ledger_id: LedgerId,
         index_id: ContentId,
         index_t: i64,
     },
-    /// A ledger was retracted.
-    LedgerRetracted { ledger_id: String },
+    /// A branch's authoritative state went away: fired for retract
+    /// (soft tombstone), `drop_branch`, and purge alike. The event
+    /// carries only the exact `ledger:branch` id, and consumers use
+    /// it uniformly to evict per-branch state, so the distinction
+    /// between those transitions isn't conveyed.
+    ///
+    /// Known limitation: a query peer reacting to this always
+    /// applies a local retract (tombstone), even when the origin
+    /// hard-dropped or purged the branch. The divergence is benign
+    /// and self-healing — a later re-creation of the alias overwrites
+    /// the peer's tombstone via `init`, and `retracted` reads
+    /// identically to `not-found` for a peer's query path.
+    /// Distinguishing the transitions would need separate event
+    /// variants threaded through the SSE peer-sync protocol.
+    LedgerRetracted { ledger_id: LedgerId },
     /// A graph source config was published/updated.
     GraphSourceConfigPublished {
-        graph_source_id: String,
+        graph_source_id: LedgerId,
         source_type: GraphSourceType,
-        dependencies: Vec<String>,
+        dependencies: Vec<LedgerId>,
     },
     /// A graph source index head pointer was advanced.
     GraphSourceIndexPublished {
-        graph_source_id: String,
+        graph_source_id: LedgerId,
         index_id: ContentId,
         index_t: i64,
     },
     /// A graph source was retracted.
-    GraphSourceRetracted { graph_source_id: String },
+    GraphSourceRetracted { graph_source_id: LedgerId },
 }
 
 /// Subscription handle for receiving ledger updates
@@ -895,6 +954,49 @@ pub struct RefValue {
     pub id: Option<ContentId>,
     /// Monotonic watermark (transaction time).
     pub t: i64,
+}
+
+/// Both head pointers of a ledger branch, read together.
+///
+/// The cheapest backend-agnostic "where is this ledger" read: every
+/// [`NameServiceLookup`] returns it via [`NameServiceLookup::heads`], and
+/// backends that can fetch both refs in one round trip override the default.
+/// Carries identities (CIDs), not just watermarks, so the values can feed
+/// staleness checks and [`RefPublisher::compare_and_set_ref`] directly.
+///
+/// The two refs are read together but not necessarily atomically (file
+/// backends keep them in separate files), so `index.t > commit.t` is a
+/// transient state callers must tolerate — the same rule as [`NsRecord`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerHeads {
+    pub commit: RefValue,
+    pub index: RefValue,
+}
+
+impl LedgerHeads {
+    pub fn from_record(record: &NsRecord) -> Self {
+        Self {
+            commit: RefValue {
+                id: record.commit_head_id.clone(),
+                t: record.commit_t,
+            },
+            index: RefValue {
+                id: record.index_head_id.clone(),
+                t: record.index_t,
+            },
+        }
+    }
+}
+
+impl From<&LedgerHeads> for NsRecordSnapshot {
+    fn from(heads: &LedgerHeads) -> Self {
+        Self {
+            commit_head_id: heads.commit.id.clone(),
+            commit_t: heads.commit.t,
+            index_head_id: heads.index.id.clone(),
+            index_t: heads.index.t,
+        }
+    }
 }
 
 /// Outcome of a compare-and-set operation.
@@ -1006,38 +1108,8 @@ pub trait RefPublisher: RefLookup {
 }
 
 // ---------------------------------------------------------------------------
-// V2 Concern Types (Status and Config extensions)
+// V2 Status and Config values
 // ---------------------------------------------------------------------------
-
-/// Which concern is being read or updated (v2 extension).
-///
-/// Extends the concept of `RefKind` to include Status and Config concerns.
-/// Head and Index concerns map directly to `RefKind::CommitHead` and
-/// `RefKind::IndexHead` respectively.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ConcernKind {
-    /// Commit head pointer - equivalent to RefKind::CommitHead
-    Head,
-    /// Index state - equivalent to RefKind::IndexHead
-    Index,
-    /// Status state (queue depth, locks, progress, etc.)
-    Status,
-    /// Config state (default context, settings)
-    Config,
-}
-
-impl ConcernKind {
-    /// Convert to RefKind if applicable (Head/Index only).
-    ///
-    /// Returns `None` for Status and Config since they don't map to RefKind.
-    pub fn as_ref_kind(&self) -> Option<RefKind> {
-        match self {
-            ConcernKind::Head => Some(RefKind::CommitHead),
-            ConcernKind::Index => Some(RefKind::IndexHead),
-            ConcernKind::Status | ConcernKind::Config => None,
-        }
-    }
-}
 
 /// Status payload with extensible metadata.
 ///
@@ -1125,7 +1197,7 @@ impl ConfigPayload {
     }
 }
 
-/// Status concern value (watermark + payload).
+/// Status value (watermark + payload).
 ///
 /// The watermark `v` is a monotonically increasing counter that changes
 /// on every status update. Status always has a payload (never unborn).
@@ -1152,7 +1224,7 @@ impl StatusValue {
     }
 }
 
-/// Config concern value (watermark + optional payload).
+/// Config value (watermark + optional payload).
 ///
 /// The watermark `v` is a monotonically increasing counter. Config can be
 /// "unborn" (v=0, payload=None) if no config has been set yet.
@@ -1231,7 +1303,7 @@ pub trait StatusLookup: Debug + Send + Sync {
     async fn get_status(&self, ledger_id: &str) -> Result<Option<StatusValue>>;
 }
 
-/// Publisher for status concern (v2 extension).
+/// Publisher for the status value (v2 extension).
 ///
 /// Status tracks operational metadata like queue depth, locks, progress,
 /// and error states. It uses a monotonically increasing watermark and
@@ -1274,7 +1346,7 @@ pub trait ConfigLookup: Debug + Send + Sync {
     async fn get_config(&self, ledger_id: &str) -> Result<Option<ConfigValue>>;
 }
 
-/// Publisher for config concern (v2 extension).
+/// Publisher for the config value (v2 extension).
 ///
 /// Config tracks settings like default context, index thresholds, and other
 /// configuration options. It uses a monotonically increasing watermark and
@@ -1398,6 +1470,10 @@ where
 
     async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
         (**self).list_branches(ledger_name).await
+    }
+
+    async fn heads(&self, ledger_id: &str) -> Result<Option<LedgerHeads>> {
+        (**self).heads(ledger_id).await
     }
 }
 
@@ -1600,7 +1676,7 @@ mod tests {
 
     #[test]
     fn test_ns_record_new() {
-        let record = NsRecord::new("mydb", "main");
+        let record = NsRecord::new("mydb:main");
         assert_eq!(record.name, "mydb");
         assert_eq!(record.branch, "main");
         assert_eq!(record.ledger_id, "mydb:main");
@@ -1611,7 +1687,7 @@ mod tests {
 
     #[test]
     fn test_ns_record_has_novelty() {
-        let mut record = NsRecord::new("mydb", "main");
+        let mut record = NsRecord::new("mydb:main");
         assert!(!record.has_novelty());
 
         record.commit_t = 10;
@@ -1722,15 +1798,7 @@ mod tests {
         assert!(record.has_index());
     }
 
-    // ========== V2 Concern Type Tests ==========
-
-    #[test]
-    fn test_concern_kind_as_ref_kind() {
-        assert_eq!(ConcernKind::Head.as_ref_kind(), Some(RefKind::CommitHead));
-        assert_eq!(ConcernKind::Index.as_ref_kind(), Some(RefKind::IndexHead));
-        assert_eq!(ConcernKind::Status.as_ref_kind(), None);
-        assert_eq!(ConcernKind::Config.as_ref_kind(), None);
-    }
+    // ========== V2 Status/Config Value Tests ==========
 
     #[test]
     fn test_status_payload_new() {
@@ -1825,5 +1893,66 @@ mod tests {
 
         assert!(matches!(updated, ConfigCasResult::Updated));
         assert!(matches!(conflict, ConfigCasResult::Conflict { .. }));
+    }
+
+    /// Exercises the trait-default `heads()` — only `get_ref` is implemented,
+    /// and the index ref is deliberately reported as unknown.
+    #[derive(Debug)]
+    struct RefOnlyNs;
+
+    #[async_trait]
+    impl RefLookup for RefOnlyNs {
+        async fn get_ref(&self, ledger_id: &str, kind: RefKind) -> Result<Option<RefValue>> {
+            Ok(match (ledger_id, kind) {
+                ("db:main", RefKind::CommitHead) => Some(RefValue {
+                    id: Some(ContentId::new(ContentKind::Commit, b"c")),
+                    t: 7,
+                }),
+                _ => None,
+            })
+        }
+    }
+    #[async_trait]
+    impl GraphSourceLookup for RefOnlyNs {
+        async fn lookup_graph_source(&self, _: &str) -> Result<Option<GraphSourceRecord>> {
+            Ok(None)
+        }
+        async fn lookup_any(&self, _: &str) -> Result<NsLookupResult> {
+            Ok(NsLookupResult::NotFound)
+        }
+        async fn all_graph_source_records(&self) -> Result<Vec<GraphSourceRecord>> {
+            Ok(vec![])
+        }
+    }
+    #[async_trait]
+    impl StatusLookup for RefOnlyNs {
+        async fn get_status(&self, _: &str) -> Result<Option<StatusValue>> {
+            Ok(None)
+        }
+    }
+    #[async_trait]
+    impl ConfigLookup for RefOnlyNs {
+        async fn get_config(&self, _: &str) -> Result<Option<ConfigValue>> {
+            Ok(None)
+        }
+    }
+    #[async_trait]
+    impl NameServiceLookup for RefOnlyNs {
+        async fn lookup(&self, _: &str) -> Result<Option<NsRecord>> {
+            Ok(None)
+        }
+        async fn all_records(&self) -> Result<Vec<NsRecord>> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn heads_default_composes_get_ref() {
+        let heads = RefOnlyNs.heads("db:main").await.unwrap().unwrap();
+        assert_eq!(heads.commit.t, 7);
+        assert_eq!(heads.index, RefValue { id: None, t: 0 });
+        assert_eq!(RefOnlyNs.heads("other:main").await.unwrap(), None);
+        let snap = NsRecordSnapshot::from(&heads);
+        assert_eq!((snap.commit_t, snap.index_t), (7, 0));
     }
 }

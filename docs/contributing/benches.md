@@ -109,8 +109,20 @@ Numbers are percent regression allowed vs. the committed baseline. Omit a
 scale to fall back to `default_budget_pct` (5%). The CI gate fails if an
 observed run exceeds the budget for any listed scale.
 
-If you don't yet have a baseline, leave the entries empty — `default_budget_pct`
-applies. After your first nightly run lands a baseline, tighten the budget.
+Give every bench at least one scale. The reconciler treats an empty map the
+same as a missing one (`workspace_reconcile.rs` tests `!m.is_empty()`), so
+`"<category>_<name>": {}` fails the gate rather than falling back to
+`default_budget_pct`. If you don't yet have a baseline, copy the numbers from
+a sibling bench in the same category — they are placeholders until the first
+nightly run lands a baseline, and you tighten them in a follow-up once it
+exists.
+
+Verify before you push — this is the gate that catches a missing entry, and it
+is much cheaper than a CI round-trip:
+
+```bash
+cargo test -p fluree-bench-support --test workspace_reconcile
+```
 
 ### 6. Document if you added a new category
 
@@ -208,7 +220,7 @@ future micro-bench wants to exercise `fluree-db-indexer`,
 | `import` | bulk Turtle / N-Quads / JSON-LD ingest | `fluree-db-api/benches/import_bulk.rs` |
 | `transact` | stage + commit | `fluree-db-api/benches/transact_commit.rs` |
 | `reindex` | full reindex; incremental | `fluree-db-api/benches/reindex_full.rs`, `fluree-db-api/benches/reindex_incremental.rs` |
-| `query_hot` | BSBM-shape SPARQL on warm cache | `fluree-db-api/benches/query_hot_bsbm.rs` (Explore Q3/Q5/Q9), `fluree-db-api/benches/query_hot_bsbm_bi.rs` (BI-F2 bowtie / seed tie-break) |
+| `query_hot` | warm-cache query latency | `fluree-db-api/benches/query_hot_bsbm.rs` (BSBM Explore Q3/Q5/Q9), `fluree-db-api/benches/query_hot_bsbm_bi.rs` (BI-F2 bowtie / seed tie-break), `fluree-db-api/benches/query_hot_property_path.rs` (property-path traversal), `fluree-db-api/benches/query_hot_whole_graph_agg.rs` (Cypher metadata-lane aggregate folds vs. pipeline baseline), `fluree-db-api/benches/query_hot_fanout_star.rs` (same-subject star with an unprojected fan-out object — the property-join semijoin demotion), `fluree-db-api/benches/query_hot_construct_formats.rs` (CONSTRUCT serialized as JSON-LD, RDF/XML, Turtle and N-Triples, with allocation peak and churn; plus the Graph Store `GET` queries, plain and with the annotation `UNION`, over the default and a named graph, before and after the ledger holds an annotation), `fluree-db-api/benches/query_hot_negation_count.rs` (MINUS and NOT EXISTS lanes, join COUNT(*) folds), `fluree-db-api/benches/query_hot_limit_startup.rs` (LIMIT startup goals and star probe windows) |
 | `query_cold` | reload + first-query latency | `fluree-db-api/benches/query_cold_reload.rs` |
 | `novelty` | replay, catch-up, bulk-apply | `fluree-db-api/benches/novelty_replay.rs` |
 | `vector_math` | SIMD vs scalar math micro-benches | `fluree-db-query/benches/vector_math.rs` |
@@ -216,6 +228,8 @@ future micro-bench wants to exercise `fluree-db-indexer`,
 | `insert_formats` | JSON-LD vs Turtle insert format comparison | `fluree-db-api/benches/insert_formats.rs` |
 | `vector_query` | end-to-end vector similarity through the query engine | `fluree-db-api/benches/vector_query.rs` |
 | `fulltext_query` | full-text scoring through novelty + index | `fluree-db-api/benches/fulltext_query.rs` |
+| `graphql_schema` | GraphQL schema derivation + registration, and the GraphQL request path against the JSON-LD query it lowers to | `fluree-db-api/benches/graphql_schema.rs` |
+| `policy` | verified-claim parsing and request authorization binding | `fluree-db-api/benches/policy_authorization.rs` |
 
 **Reserved categories** (not yet in use; add a row here when you ship
 the first bench under that prefix): `core` (foundational ops —
@@ -331,12 +345,11 @@ Don't read `FLUREE_BENCH_*` env vars in your bench's hot loop —
 hand-rolled `std::env::var` call inside `b.iter` is a system call per
 iteration. Read once, reuse.
 
-### `iter_batched` setup needs a tokio reactor for file-backed Fluree
+### `iter_batched` setup needs a tokio reactor to build Fluree
 
 `criterion::iter_batched`'s `setup` closure runs **synchronously**, outside
 any `block_on`. If `setup` calls anything that requires a running tokio
-reactor — most notably `FlureeBuilder::file(...).build()` and any path
-that touches the file storage backend during construction — you'll get:
+reactor — including every `FlureeBuilder::build*` method — you'll get:
 
 ```
 thread 'main' panicked: there is no reactor running, must be called from
@@ -349,12 +362,13 @@ The fix is to wrap setup work that touches the runtime in `rt.block_on`:
 let rt = bench_runtime();
 
 b.iter_batched(
-    // setup — wrap in block_on so the reactor is alive while
-    // FlureeBuilder::file(...).build() runs.
+    // Setup runs in block_on, so the reactor is alive while
+    // FlureeBuilder::file(...).build_async() runs.
     || rt.block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
-            .build()
+            .build_async()
+            .await
             .unwrap();
         (dir, fluree)
     }),
@@ -365,10 +379,12 @@ b.iter_batched(
 );
 ```
 
-`FlureeBuilder::memory().build_memory()` does **not** have this constraint
-— it constructs synchronously without a reactor. Use the memory builder
-when the bench's hot path doesn't actually need disk I/O; reach for the
-file builder only when you need to exercise persistence/load paths.
+`FlureeBuilder::memory().build_memory()` has the same constraint: even
+though it is synchronous, it spawns the ledger-cache event listener task
+whenever ledger caching is enabled (the default), so it too must run
+inside `rt.block_on`. Use the memory builder when the bench's hot path
+doesn't actually need disk I/O; reach for the file builder only when you
+need to exercise persistence/load paths.
 
 ### Workspace clippy lints apply to bench code
 
@@ -467,3 +483,36 @@ When reviewing someone else's bench, check:
   integration test (`fluree-bench-support/tests/workspace_reconcile.rs`)
   and is invoked by the `bench-gate` CI job — there is no library
   function for it.
+
+## Policy authorization
+
+Run `cargo bench -p fluree-db-api --features credential --bench policy_authorization`
+to measure fixed policy binding. It compares ordinary and delegated claim parsing
+and simple/multiple-source normalization, reporting latency and allocation bytes.
+Tracking-allocator overhead is included; signature verification, issuer lookup,
+networking, and database policy evaluation are excluded. Use `CRITERION_HOME` to
+choose the output directory.
+
+Authorization reuses token verification and adds claim parsing, an authority check,
+and request validation/normalization. It adds no ledger lookup, network request,
+or per-fact authorization work. Embedded binding clones query JSON; large inline
+policies increase parsing and cloning cost.
+
+### Full HTTP policy path
+
+Run `cargo bench -p fluree-db-server --bench policy_http` to compare warm,
+in-process HTTP queries with auth disabled, ordinary credentials, fixed
+selections, request selections, and 32 inline rules. Every case must return the
+same one-row result before timing. This benchmark includes signature verification,
+credential validation, body/header binding, config resolution, database execution,
+and response serialization. Socket/TLS costs are excluded. The fixture uses 256
+novelty-resident records with indexing disabled; these numbers do not characterize
+cold storage, indexed workloads, or large federated queries.
+
+Use the same benchmark source, build features, and machine on both revisions
+when comparing the no-auth case against `main`. For a quick correctness check,
+run `cargo test -p fluree-db-server --bench policy_http -- --test`. The bench
+declares `required-features = ["native", "credential"]`; both are default
+features, so it is silently skipped only under `--no-default-features`. Config
+absence is cached on each view, and regression tests verify that wrapping
+followed by execution does not repeat the config scan.

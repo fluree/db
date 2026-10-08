@@ -5,6 +5,9 @@ on:
     branches: [main]
     paths:
       - 'docs/**'
+      - 'fluree-db-python/docs/**'
+      - 'fluree-db-python/python/**'
+      - 'fluree-db-python/README.md'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
@@ -22,9 +25,10 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup mdBook
         uses: peaceiris/actions-mdbook@v2
@@ -39,6 +43,16 @@ jobs:
       # into docs/.llms-staging. Copy them into the published site root.
       - name: Stage llms.txt artifacts into the published site
         run: cp -R docs/.llms-staging/. docs/book/
+
+      # The Python API reference, read from the package source (no engine
+      # build), published under /python/.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Build the Python API reference
+        run: |
+          python -m pip install -r fluree-db-python/docs/requirements.txt
+          python -m sphinx -q -b html -d "$RUNNER_TEMP/python-doctrees" fluree-db-python/docs docs/book/python
 
       - name: Configure Pages
         uses: actions/configure-pages@v5

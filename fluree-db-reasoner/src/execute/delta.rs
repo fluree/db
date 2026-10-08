@@ -8,7 +8,7 @@
 use fluree_db_core::flake::Flake;
 use fluree_db_core::value::FlakeValue;
 use fluree_db_core::Sid;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 
 use super::util::canonicalize_flake;
 use crate::same_as::SameAsTracker;
@@ -30,6 +30,14 @@ pub struct DeltaSet {
     /// Index by (predicate, object_sid) -> list of flake indices
     /// Only includes flakes where object is a Ref
     by_po: HashMap<(Sid, Sid), Vec<usize>>,
+    /// Term-identity keys of the flakes held, so a fact derived by several
+    /// rules (or several paths) in one round is stored once. Without this a
+    /// round's delta grew with every duplicate derivation, which is what let
+    /// a transitive closure overshoot the fact budget twentyfold inside a
+    /// single round.
+    seen: HashSet<(Sid, Sid, u64)>,
+    /// Approximate heap footprint of the flakes held, for the memory budget.
+    approx_bytes: usize,
 }
 
 impl DeltaSet {
@@ -45,11 +53,23 @@ impl DeltaSet {
             by_p: HashMap::new(),
             by_ps: HashMap::new(),
             by_po: HashMap::new(),
+            seen: HashSet::new(),
+            approx_bytes: 0,
         }
     }
 
-    /// Add a flake to the delta set
+    /// Add a flake to the delta set. A flake already in this delta (same
+    /// subject, predicate and object) is dropped.
     pub fn push(&mut self, flake: Flake) {
+        let key = (
+            flake.s.clone(),
+            flake.p.clone(),
+            super::derived::DerivedSet::object_hash(&flake.o),
+        );
+        if !self.seen.insert(key) {
+            return;
+        }
+        self.approx_bytes += crate::cache::approx_flake_bytes(&flake);
         let idx = self.flakes.len();
 
         // Index by predicate
@@ -107,6 +127,11 @@ impl DeltaSet {
         self.flakes.len()
     }
 
+    /// Approximate heap footprint of the flakes held.
+    pub fn approx_bytes(&self) -> usize {
+        self.approx_bytes
+    }
+
     /// Iterate over all flakes
     pub fn iter(&self) -> impl Iterator<Item = &Flake> {
         self.flakes.iter()
@@ -126,6 +151,8 @@ impl DeltaSet {
         self.by_p.clear();
         self.by_ps.clear();
         self.by_po.clear();
+        self.seen.clear();
+        self.approx_bytes = 0;
     }
 
     /// Recanonicalize all flakes using sameAs equivalence (eq-rep-s/o)

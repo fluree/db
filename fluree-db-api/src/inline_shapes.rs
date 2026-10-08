@@ -79,7 +79,7 @@ pub(crate) fn parse_inline_shapes_turtle_to_bundle(
 }
 
 fn bundle_from_sink(sink: FlakeSink<'_>) -> Result<Option<Arc<SchemaBundleFlakes>>, TransactError> {
-    let flakes: Vec<Flake> = sink.finish()?;
+    let flakes: Vec<Flake> = sink.into_flakes()?;
     if flakes.is_empty() {
         return Ok(None);
     }

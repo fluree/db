@@ -1,5 +1,6 @@
 //! Error types for the indexer
 
+use fluree_db_core::task::TaskFailure;
 use thiserror::Error;
 
 /// Indexer errors
@@ -49,6 +50,11 @@ pub enum IndexerError {
     #[error("Background indexer has shut down")]
     IndexerShutdown,
 
+    /// A build task was cancelled: the runtime is shutting down underneath
+    /// the indexer. Not a failed build — nothing for this process to retry.
+    #[error("{0} was cancelled (runtime shutdown or abort)")]
+    Cancelled(String),
+
     /// Error applying index to ledger state
     #[error("Ledger apply error: {0}")]
     LedgerApply(String),
@@ -67,6 +73,20 @@ pub enum IndexerError {
     /// a limited tracker.
     #[error("Indexer fuel limit exceeded: {0}")]
     FuelExceeded(#[from] fluree_db_core::tracking::FuelExceededError),
+}
+
+impl IndexerError {
+    /// Classify a joined build task's `JoinError`. Cancellation gets its own
+    /// variant so the orchestrator can decline to retry; a panic keeps its
+    /// payload text and stays a `StorageWrite` failure as before.
+    pub fn from_join(task: &str, e: tokio::task::JoinError) -> Self {
+        let failure = TaskFailure::from(e);
+        if failure.is_cancelled() {
+            Self::Cancelled(task.to_string())
+        } else {
+            Self::StorageWrite(failure.describe(task))
+        }
+    }
 }
 
 impl From<serde_json::Error> for IndexerError {

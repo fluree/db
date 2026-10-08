@@ -31,6 +31,73 @@ pub struct PropertyStatEntry {
     /// Graph-scoped property stats (authoritative for range narrowing) live under
     /// `IndexStats.graphs[*].properties[*].datatypes`.
     pub datatypes: Vec<(u8, u64)>,
+    /// The datatype tags this property carries in **current state as of this
+    /// stats snapshot** — re-derived from the exact `datatypes` breakdown at
+    /// every index publish and every decode, then unioned at query time with
+    /// the tags novelty *asserted*. Sorted and deduplicated. **Monotone under
+    /// retraction within the novelty window**: a novelty assertion may add a
+    /// tag, a novelty retraction never removes one; the next publish re-derives
+    /// the set from current state, which is what lets a tag whose data is
+    /// genuinely gone age out.
+    ///
+    /// This exists because `datatypes` is not monotone even within the window.
+    /// On the query path the breakdown is the base index merged with novelty as
+    /// a blind ±1 delta log, so a retraction of a fact that was never asserted
+    /// charges a `-1` against a tag it does not own and can drive that tag's
+    /// count to zero — dropping it from `datatypes` while the data it described
+    /// is still there. Anything that reads `datatypes` as a *set* ("does this
+    /// property carry literals?") rather than as counts must read this field
+    /// instead. The counts stay in `datatypes`, unclamped, for the estimators
+    /// that sum them.
+    ///
+    /// Because each publish re-derives it, this field says nothing about a `t`
+    /// below the published index: a read there must consult
+    /// [`Self::historical_datatypes`] (gated by
+    /// [`IndexStats::historical_since_t`]) instead.
+    ///
+    /// Empty means "unknown", not "no datatypes": consumers must fail closed.
+    pub observed_datatypes: Vec<u8>,
+    /// The datatype tags this property has carried at **any** `t` in
+    /// `[IndexStats::historical_since_t, index_t]`, sorted and deduplicated.
+    /// **Monotone across publishes**: each index build unions the prior
+    /// persisted set with every tag it observes, so unlike
+    /// [`Self::observed_datatypes`] a publish never resets it. Persisted on the
+    /// stats wire (the historical tail section); empty on blobs that predate it.
+    ///
+    /// This is the sound licence for time travel: for any read at
+    /// `t >= historical_since_t`, this set contains every tag visible at that
+    /// `t`, so a consumer that treats it as an over-approximation (extra tags
+    /// only *decline* an optimization) may use it below the published index `t`
+    /// where `observed_datatypes` is a fact about the wrong graph. Below
+    /// `historical_since_t` — or when the boundary is absent — there is no
+    /// licence and consumers must fall back to "unknown".
+    ///
+    /// Empty means "unknown", not "no datatypes": consumers must fail closed.
+    pub historical_datatypes: Vec<u8>,
+}
+
+impl PropertyStatEntry {
+    /// The distinct datatype tags of an exact breakdown, sorted — the value for
+    /// [`Self::observed_datatypes`] on every path whose `datatypes` counts are
+    /// exact (the base index and its decoders). Only the novelty merge, which
+    /// arithmetically applies deltas it cannot reconcile against the base, has
+    /// to derive the tag set some other way.
+    pub fn tags_of(datatypes: &[(u8, u64)]) -> Vec<u8> {
+        let mut tags: Vec<u8> = datatypes.iter().map(|&(tag, _)| tag).collect();
+        tags.sort_unstable();
+        tags.dedup();
+        tags
+    }
+
+    /// Union two tag sets into a sorted, deduplicated one.
+    pub fn union_tags(a: &[u8], b: &[u8]) -> Vec<u8> {
+        let mut tags: Vec<u8> = Vec::with_capacity(a.len() + b.len());
+        tags.extend_from_slice(a);
+        tags.extend_from_slice(b);
+        tags.sort_unstable();
+        tags.dedup();
+        tags
+    }
 }
 
 // === Index Statistics ===
@@ -66,6 +133,31 @@ pub struct IndexStats {
     /// Each entry contains per-property stats including datatype usage.
     /// Sorted by g_id for determinism.
     pub graphs: Option<Vec<GraphStatsEntry>>,
+    /// The `t` since which the `historical_datatypes` sets (aggregate and
+    /// graph-scoped) have been accumulated monotonically across publishes.
+    /// `None` means no accumulation exists — an old wire blob, or a build that
+    /// had no sound base to accumulate from — and consumers must treat every
+    /// historical set as absent.
+    ///
+    /// Soundness invariant, maintained inductively by the three build
+    /// pipelines: for every property P and every `t` in
+    /// `[historical_since_t, index_t]`, every datatype tag on a P-flake
+    /// visible at `t` is contained in P's `historical_datatypes`.
+    ///
+    /// - Full rebuild and import replay the entire commit history, observing
+    ///   the tag of every record ever written, so they claim `Some(0)`.
+    /// - An incremental publish over a base that carries the boundary unions
+    ///   the base's persisted sets with every tag in its novelty window: a tag
+    ///   visible at `t` in `(base_t, index_t]` was either visible at `base_t`
+    ///   (covered by the base sets) or asserted in the window (covered by the
+    ///   walk), so the base's boundary carries forward.
+    /// - An incremental publish over a base *without* the boundary can still
+    ///   adopt: the base's exact current-state tags cover `t = base_t`, and
+    ///   the window walk covers `(base_t, index_t]`, so it claims
+    ///   `Some(base_t)`. Anything below that adoption boundary stays
+    ///   unknown — permanently for that chain, until a full rebuild resets
+    ///   the boundary to genesis.
+    pub historical_since_t: Option<i64>,
 }
 
 impl IndexStats {
@@ -177,6 +269,20 @@ pub struct GraphPropertyStatEntry {
     pub last_modified_t: i64,
     /// Per-datatype flake counts: (ValueTypeTag.0, count).
     pub datatypes: Vec<(u8, u64)>,
+    /// The datatype tags this property carries in this graph in current state
+    /// as of this stats snapshot, unioned at query time with the tags novelty
+    /// asserted — the graph-scoped twin of
+    /// [`PropertyStatEntry::observed_datatypes`], with the same semantics: the
+    /// `datatypes` counts are a blind ±1 delta log on the query path and may
+    /// drop a tag whose data still exists, so anything reading the breakdown
+    /// as a *set* (scan narrowing to an exact datatype) must read this field.
+    /// Empty means "unknown": consumers must fail closed.
+    pub observed_datatypes: Vec<u8>,
+    /// The datatype tags this property has carried in this graph at any `t` in
+    /// `[IndexStats::historical_since_t, index_t]` — the graph-scoped twin of
+    /// [`PropertyStatEntry::historical_datatypes`], persisted on the stats
+    /// wire and monotone across publishes. Empty means "unknown".
+    pub historical_datatypes: Vec<u8>,
 }
 
 /// Stats for a single named graph within a ledger.

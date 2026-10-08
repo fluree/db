@@ -128,6 +128,37 @@ impl ContentId {
         hex::encode(self.0.hash().digest())
     }
 
+    /// Parse a string as a CID, but only in the canonical spelling
+    /// [`Display`](std::fmt::Display) produces.
+    ///
+    /// Use this, not [`FromStr`], wherever the input might instead be a hex
+    /// digest — which is how commits and index nodes are keyed on disk and in
+    /// the indexes, so it is most places a user types one in.
+    ///
+    /// `FromStr` goes through multibase, where a leading `f` means base16. A
+    /// bare hex digest of even length after that `f` therefore decodes, and if
+    /// the bytes happen to form a valid CIDv1 it parses — `f01550003000102` is
+    /// all hex and yields `bafkqaayaaeba`, because the identity multihash makes
+    /// a valid CID out of very few bytes. Taking that as a CID silently
+    /// addresses content nobody named. Re-encoding and comparing rejects it,
+    /// because `Display` always emits base32-lower.
+    ///
+    /// ```
+    /// use fluree_db_core::{ContentId, ContentKind};
+    /// use std::str::FromStr;
+    ///
+    /// let id = ContentId::new(ContentKind::Commit, b"payload");
+    /// assert_eq!(ContentId::parse_canonical(&id.to_string()), Some(id));
+    ///
+    /// // All hex, and FromStr accepts it — but it is not a CID anyone wrote.
+    /// assert!(ContentId::from_str("f01550003000102").is_ok());
+    /// assert_eq!(ContentId::parse_canonical("f01550003000102"), None);
+    /// ```
+    pub fn parse_canonical(s: &str) -> Option<Self> {
+        let cid: Self = s.parse().ok()?;
+        (cid.to_string() == s).then_some(cid)
+    }
+
     /// Construct a `ContentId` from a raw SHA-256 digest and multicodec.
     ///
     /// Used for backward compatibility with v2 commit format, where the

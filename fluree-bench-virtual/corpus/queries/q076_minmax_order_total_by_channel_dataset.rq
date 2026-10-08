@@ -1,0 +1,11 @@
+# q076 minmax_order_total_by_channel_dataset — audit item 9 (F-AUD-8), grouped MIN/MAX
+# Coverage: GROUPED MIN/MAX over a numeric (xsd:double) fact column, keyed by a fact-inline
+#   scalar column (orderChannel). Exercises the fused single-table fold with MIN/MAX
+#   aggregates AND a GROUP BY key together (one MinMax accumulator per group). Native
+#   oracle = the materialized per-channel min/max; a fused mis-fold would disagree.
+# Exec path: query_from() FROM <enterprise-sf01-v:main> (the deployed solo/chat shape).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?ch (MIN(?tot) AS ?lo) (MAX(?tot) AS ?hi)
+FROM <enterprise-sf01-v:main>
+WHERE { ?o a edw:Order ; edw:orderTotal ?tot ; edw:orderChannel ?ch . }
+GROUP BY ?ch

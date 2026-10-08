@@ -4,12 +4,17 @@ Temporal, verifiable, standards-compliant, git-like branching and merging, and [
 
 RDF 1.1 / 1.2, [SPARQL](docs/guides/cookbook-sparql.md), [JSON-LD](docs/guides/cookbook-query-patterns.md), and [openCypher](docs/guides/cookbook-cypher.md) query (includes history query and other Fluree feature extensions).
 
-Billions of graph facts on commodity hardware. Over 2M facts/second bulk import. [Benchmark leader](https://labs.flur.ee), 10.4x faster than next  database. On the full 21.5-billion-triple Wikidata dump, all 850/850 WGPB graph-pattern queries complete with a 43 ms geometric mean.
+Billions of graph facts on commodity hardware. Over 2M facts/second bulk import. On the full 21.5-billion-triple Wikidata dump, all 850/850 WGPB graph-pattern queries complete with a 43 ms geometric mean — and on Wikidata-truthy (8.19B triples) the next fastest engine is 10.4x slower. Reproducible head-to-head benchmarks against QLever, Virtuoso, MillenniumDB, Memgraph, Neo4j, FalkorDB and others: **[fluree/benchmark-db](https://github.com/fluree/benchmark-db)**. Why it's fast: **[Performance architecture](docs/design/performance.md)**.
 
 > [!NOTE]
 > **Fluree Memory** — is part of the Fluree DB CLI.
 > Persistent, searchable memory for AI coding assistants. Give Claude Code, Cursor, and other AI tools long-term project memory: facts, decisions, and preferences persist across sessions in a Fluree ledger you control — scoped per-repo or per-user, shareable via git.
 > [Fluree Memory docs →](https://labs.flur.ee/docs)
+
+> [!NOTE]
+> **Fluree Unstructured** — is part of the Fluree DB CLI.
+> Unstructured documents in, a knowledge graph out. `fluree doc ingest ./folder` turns PDFs, Office files, Markdown and scans into a searchable, citable graph — structure, chunks and embeddings in a ledger you control. Deterministic and offline by default, with the best model-free parsing engine on a public 200-document benchmark — ahead of Nutrient, Docling, Marker, Unstructured, MinerU and PyMuPDF4LLM; add your own vision model or a Fluree AI account and it outscores every engine measured, OpenDataLoader's hybrid included.
+> [Fluree Unstructured docs →](docs/unstructured/README.md)
 
 ## Install
 
@@ -135,6 +140,29 @@ fluree query 'SELECT ?title ?genre WHERE {
 Every change is preserved. Query any point in history by transaction number, ISO timestamp, or commit ID.
 
 ## What makes Fluree different
+
+### Performance
+
+Systems with time travel, triple-level policy, and reasoning are assumed to trade speed for capability. Fluree is faster than the specialist engines that have none of it.
+
+SPARQLoscope on DBLP-core (561M triples, 105 queries, m7a.4xlarge):
+
+| | Fluree | QLever | Virtuoso | MillenniumDB | Jena | Oxigraph | Blazegraph |
+|---|---|---|---|---|---|---|---|
+| Queries passed | 105/105 | 105/105 | 103/105 | 103/105 | 34/105 | 39/105 | 3/105 |
+| Geo mean | **17.5 ms** | 202.4 ms | 299.7 ms | 1,664 ms | 67.7 s | 87.0 s | 332.9 s |
+| vs. Fluree | — | 11.5x | 17.1x | 95x | — | — | — |
+
+Pokec / openCypher (Memgraph's benchgraph suite, 1.6M nodes / 30.6M edges, r8a.4xlarge) — Fluree's writes are *durable*:
+
+| | Fluree | Memgraph | Neo4j | FalkorDB |
+|---|---|---|---|---|
+| Durable writes | **1.73 ms** | 4.46 ms | 4.07 ms | 4.57 ms |
+| Read-only | **1.47 ms** | 4.41 ms | 6.80 ms | 4.57 ms |
+
+Dictionary-encoded integer-ID execution, columnar leaflets with region-selective decompression, aggregates answered from index directories in `O(leaflets)` rather than `O(rows)`, a regression-tested cost model, and 16 fast-path operators that fuse scan and aggregate — each with a correctness fallback to the generic pipeline.
+
+Learn more: [Performance architecture](docs/design/performance.md) — including a frank account of the current limits. Reproduce it yourself: [fluree/benchmark-db](https://github.com/fluree/benchmark-db) ships pinned datasets, per-engine setup, and full result sets.
 
 ### Time travel
 
@@ -263,7 +291,8 @@ fluree mcp serve            # stdio transport for Claude Desktop, Cursor, etc.
 
 | | |
 |---|---|
-| **Query languages** | [SPARQL 1.1](docs/query/sparql.md), [JSON-LD Query](docs/query/jsonld-query.md), [openCypher](docs/query/cypher.md) |
+| **Performance** | [Columnar integer-ID engine, cost-based planner, fused fast-path operators](docs/design/performance.md) — [benchmarks](https://github.com/fluree/benchmark-db) |
+| **Query languages** | [SPARQL 1.1](docs/query/sparql.md), [JSON-LD Query](docs/query/jsonld-query.md), [openCypher](docs/query/cypher.md), [GraphQL](docs/query/graphql.md) (schema derived from your data) |
 | **Data formats** | JSON-LD, [Turtle, TriG](docs/transactions/turtle.md), N-Triples, N-Quads |
 | **Edge annotations** | [Property-graph edges & statement-level metadata (RDF 1.2 / SPARQL 1.2)](docs/concepts/edge-annotations.md) |
 | **Time travel** | [Transaction number, ISO timestamp, commit ID](docs/concepts/time-travel.md) |
@@ -296,8 +325,9 @@ Full documentation also lives in [`docs/`](docs/README.md):
 - [CLI reference](docs/cli/README.md) — All commands and options
 - [HTTP API](docs/api/README.md) — Server endpoints and authentication
 - [Operations](docs/operations/README.md) — Configuration, deployment, telemetry
+- [Performance architecture](docs/design/performance.md) — Why Fluree is fast, layer by layer, and where the limits are
+- [Competitive benchmarks](https://github.com/fluree/benchmark-db) — Reproducible head-to-head results vs. other engines
 - [Contributing](docs/contributing/README.md) — Build from source, run tests, PR workflow
-- [Benchmarking](BENCHMARKING.md) — Run, understand, and add performance benchmarks
 
 ### For AI agents
 
@@ -310,3 +340,9 @@ The published docs are available as LLM-readable text following the [`llms.txt`]
 
 Licensed under the [Business Source License 1.1](LICENSE), with a Change Date
 to Apache License 2.0 as specified in that file.
+
+In short: you may use Fluree in production for anything except offering
+Fluree itself to others as a hosted or managed database. Building your own
+applications and data products on Fluree is permitted, including publishing a
+dataset you curate with a public, read-only query endpoint. See the
+[License FAQ](docs/reference/license-faq.md) for details.

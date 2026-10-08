@@ -65,6 +65,12 @@ fn cast_to_boolean(v: ComparableValue) -> Option<ComparableValue> {
             }
             d != 0.0
         }
+        ComparableValue::Float(f) => {
+            if f.is_nan() {
+                return None;
+            }
+            f != 0.0
+        }
         ComparableValue::BigInt(n) => !num_traits::Zero::is_zero(&*n),
         ComparableValue::Decimal(d) => !num_traits::Zero::is_zero(&*d),
         ComparableValue::String(s) => match s.as_ref() {
@@ -99,6 +105,13 @@ fn cast_to_integer(v: ComparableValue) -> Option<ComparableValue> {
         ComparableValue::Long(n) => n,
         ComparableValue::Bool(b) => i64::from(b),
         ComparableValue::Double(d) => {
+            if !d.is_finite() || d > i64::MAX as f64 || d < i64::MIN as f64 {
+                return None;
+            }
+            d.trunc() as i64
+        }
+        ComparableValue::Float(f) => {
+            let d = f as f64;
             if !d.is_finite() || d > i64::MAX as f64 || d < i64::MIN as f64 {
                 return None;
             }
@@ -150,6 +163,7 @@ fn cast_to_float(v: ComparableValue) -> Option<ComparableValue> {
         }
         ComparableValue::Long(n) => n as f32,
         ComparableValue::Double(d) => d as f32,
+        ComparableValue::Float(f) => f,
         ComparableValue::BigInt(n) => n.to_f32()?,
         ComparableValue::Decimal(d) => d.to_f64()? as f32,
         ComparableValue::String(s) => s.parse::<f32>().ok()?,
@@ -173,22 +187,45 @@ fn float_typed_literal(f: f32) -> ComparableValue {
     }
 }
 
-/// Format an f32 value for xsd:float output.
+/// Format an `f32` the way an XSD *cast* renders it.
 ///
-/// Rust's default f32 Display uses minimal decimal digits. This is acceptable
-/// for the W3C tests which compare float values numerically.
-fn format_f32(f: f32) -> String {
-    if f.is_nan() {
-        "NaN".to_string()
-    } else if f.is_infinite() {
-        if f.is_sign_positive() {
-            "INF".to_string()
-        } else {
-            "-INF".to_string()
-        }
+/// Deliberately NOT always the canonical XSD lexical form `STR()` produces
+/// (`fluree_graph_ir::canonical_xsd_float`): SPARQL §17.5 defers casting to
+/// XPath, whose float/double→string rule converts a value with absolute
+/// value in `[1e-6, 1e6)` through `xs:decimal` — plain decimal notation,
+/// shortest round-trip digits (Rust's `Display`). W3C `cast-string` pins
+/// it: `xsd:string("1E0"^^xsd:float)` is `"1"`, not `"1.0E0"`. Outside that
+/// range (both sides — `1.0E-7` no less than `1.0E30`) XPath prescribes the
+/// canonical lexical representation, which IS the canonical form, so the two
+/// renderings converge there and this reuses the canonical writer. The
+/// special values agree everywhere: `NaN`/`INF`/`-INF` in both.
+pub(crate) fn format_f32(f: f32) -> String {
+    if let Some(s) = fluree_graph_ir::XsdFloat::nonfinite_xsd(f) {
+        return s.to_string();
+    }
+    let a = f.abs();
+    if a != 0.0 && !(1e-6..1e6).contains(&a) {
+        fluree_graph_ir::canonical_xsd_float(f)
     } else {
-        // Use f32 Display which gives minimal-length representation
         f.to_string()
+    }
+}
+
+/// `f64` counterpart of [`format_f32`], for the `xsd:string()` cast of a
+/// double: `xs:decimal` (plain, shortest round-trip) notation inside
+/// `[1e-6, 1e6)`, the canonical lexical form outside it, XSD spellings for
+/// the special values — `f64::to_string()` alone yields `"inf"`, which is
+/// not a valid lexical form under either the cast rules or the canonical
+/// ones (#1695).
+fn format_f64(d: f64) -> String {
+    if let Some(s) = fluree_graph_ir::XsdFloat::nonfinite_xsd(d) {
+        return s.to_string();
+    }
+    let a = d.abs();
+    if a != 0.0 && !(1e-6..1e6).contains(&a) {
+        fluree_graph_ir::canonical_xsd_double(d)
+    } else {
+        d.to_string()
     }
 }
 
@@ -220,6 +257,7 @@ fn cast_to_double(v: ComparableValue) -> Option<ComparableValue> {
         }
         ComparableValue::Long(n) => n as f64,
         ComparableValue::Double(d) => d,
+        ComparableValue::Float(f) => f as f64,
         ComparableValue::BigInt(n) => n.to_f64()?,
         ComparableValue::Decimal(dec) => dec.to_f64()?,
         ComparableValue::String(s) => s.parse::<f64>().ok()?,
@@ -251,6 +289,13 @@ fn cast_to_decimal(v: ComparableValue) -> Option<ComparableValue> {
         ComparableValue::Bool(b) => BigDecimal::from(i64::from(b)),
         ComparableValue::Long(n) => BigDecimal::from(n),
         ComparableValue::Double(d) => {
+            if !d.is_finite() {
+                return None;
+            }
+            BigDecimal::try_from(d).ok()?
+        }
+        ComparableValue::Float(f) => {
+            let d = f as f64;
             if !d.is_finite() {
                 return None;
             }
@@ -298,8 +343,104 @@ fn cast_to_string(
         let s = canonical_decimal_string(d);
         return Some(ComparableValue::String(Arc::from(s)));
     }
+    // Doubles and floats likewise render by the XPath *cast* rule, not the
+    // canonical XSD lexical form `STR()` returns — see `format_f32` (#1695).
+    // Without these arms the cast would fall through to `into_string_value`
+    // and pick up STR()'s canonical form, failing W3C `cast-string`.
+    match &v {
+        // The `TypedLiteral` arm deliberately ignores `dtc`: no producer in
+        // the engine wraps a `FlakeValue::Double` in a `TypedLiteral` today
+        // (a stored float materializes as `Float` via `lit_to_comparable`;
+        // STRDT/cast results are string-backed; `TryFrom<FlakeValue>` maps
+        // `Double` to the bare variant), so a float-datatyped `Double`
+        // cannot reach the f64 branch. If such a producer ever appears,
+        // this arm must split on the datatype — the same variant-vs-datatype
+        // conflation the serializers carry (#1776).
+        ComparableValue::Double(d)
+        | ComparableValue::TypedLiteral {
+            val: FlakeValue::Double(d),
+            ..
+        } => return Some(ComparableValue::String(Arc::from(format_f64(*d)))),
+        ComparableValue::Float(f) => {
+            return Some(ComparableValue::String(Arc::from(format_f32(*f))))
+        }
+        _ => {}
+    }
     let namespace_codes = ctx.map(|c| c.active_snapshot.namespaces());
     v.into_string_value_with_namespaces(namespace_codes)
+}
+
+// ---------------------------------------------------------------------------
+// xsd:dateTime / xsd:date / xsd:time
+// ---------------------------------------------------------------------------
+
+/// Extract the string form of a castable temporal source value: a plain or
+/// typed string literal. Non-string, non-temporal values (numbers, booleans,
+/// IRIs) are not castable to temporal types (W3C SPARQL 1.1 §17.5 / XPath
+/// casting) — the cast produces no value.
+fn temporal_source_string(v: &ComparableValue) -> Option<&str> {
+    match v {
+        ComparableValue::String(s) => Some(s.as_ref()),
+        ComparableValue::TypedLiteral {
+            val: FlakeValue::String(s),
+            ..
+        } => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+pub fn eval_xsd_datetime<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 1, "xsd:dateTime")?;
+    let Some(v) = args[0].eval_to_comparable(row, ctx)? else {
+        return Ok(None);
+    };
+    Ok(match v {
+        // Identity cast.
+        ComparableValue::DateTime(_) => Some(v),
+        other => temporal_source_string(&other)
+            .and_then(|s| fluree_db_core::temporal::DateTime::parse(s).ok())
+            .map(ComparableValue::DateTime),
+    })
+}
+
+pub fn eval_xsd_date<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 1, "xsd:date")?;
+    let Some(v) = args[0].eval_to_comparable(row, ctx)? else {
+        return Ok(None);
+    };
+    Ok(match v {
+        // Identity cast.
+        ComparableValue::Date(_) => Some(v),
+        other => temporal_source_string(&other)
+            .and_then(|s| fluree_db_core::temporal::Date::parse(s).ok())
+            .map(ComparableValue::Date),
+    })
+}
+
+pub fn eval_xsd_time<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 1, "xsd:time")?;
+    let Some(v) = args[0].eval_to_comparable(row, ctx)? else {
+        return Ok(None);
+    };
+    Ok(match v {
+        // Identity cast.
+        ComparableValue::Time(_) => Some(v),
+        other => temporal_source_string(&other)
+            .and_then(|s| fluree_db_core::temporal::Time::parse(s).ok())
+            .map(ComparableValue::Time),
+    })
 }
 
 /// Produce the XSD canonical string form of a decimal value.
@@ -704,5 +845,40 @@ mod tests {
             eval_xsd_double(&[double(-2.75)], &row, None).unwrap(),
             Some(ComparableValue::Double(-2.75))
         );
+    }
+
+    // === the XPath cast range, both sides (F&O: xs:decimal notation inside
+    // [1e-6, 1e6), canonical scientific outside) ===
+
+    #[test]
+    fn format_f64_xpath_range_is_two_sided() {
+        // Inside the range: plain decimal, shortest round-trip.
+        assert_eq!(format_f64(1.0), "1");
+        assert_eq!(format_f64(0.001), "0.001");
+        assert_eq!(format_f64(1e-6), "0.000001"); // lower bound is inclusive
+        assert_eq!(format_f64(999_999.5), "999999.5");
+        assert_eq!(format_f64(0.0), "0");
+        assert_eq!(format_f64(-12.5), "-12.5");
+        // Outside the range: the canonical (scientific) lexical form.
+        assert_eq!(format_f64(1e-7), "1.0E-7"); // NOT "0.0000001"
+        assert_eq!(format_f64(1e6), "1.0E6"); // upper bound is exclusive
+        assert_eq!(format_f64(1e30), "1.0E30"); // NOT a 31-digit integer
+        assert_eq!(format_f64(-2.5e6), "-2.5E6");
+        // Specials keep the XSD spellings on every path.
+        assert_eq!(format_f64(f64::NAN), "NaN");
+        assert_eq!(format_f64(f64::INFINITY), "INF");
+        assert_eq!(format_f64(f64::NEG_INFINITY), "-INF");
+    }
+
+    #[test]
+    fn format_f32_xpath_range_is_two_sided() {
+        assert_eq!(format_f32(1.0), "1");
+        assert_eq!(format_f32(33.33), "33.33");
+        assert_eq!(format_f32(0.0), "0");
+        assert_eq!(format_f32(1e-7), "1.0E-7");
+        assert_eq!(format_f32(1e6), "1.0E6");
+        assert_eq!(format_f32(1e30), "1.0E30");
+        assert_eq!(format_f32(f32::NAN), "NaN");
+        assert_eq!(format_f32(f32::NEG_INFINITY), "-INF");
     }
 }

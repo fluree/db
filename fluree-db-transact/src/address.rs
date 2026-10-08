@@ -12,11 +12,9 @@ pub fn parse_commit_id(address: &str) -> Option<String> {
     let path = if let Some(rest) = address.strip_prefix("fluree:") {
         let pos = rest.find("://")?;
         &rest[pos + 3..]
-    } else if let Some(pos) = address.find("://") {
-        &address[pos + 3..]
     } else {
-        // Not a Fluree address, cannot reliably parse
-        return None;
+        let pos = address.find("://")?;
+        &address[pos + 3..]
     };
 
     // Strip any file extension from the last path segment

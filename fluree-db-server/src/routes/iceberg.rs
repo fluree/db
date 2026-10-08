@@ -44,16 +44,28 @@ pub struct IcebergMapRequest {
     pub branch: Option<String>,
     /// Bearer token for catalog auth
     pub auth_bearer: Option<String>,
+    /// Environment variable of this server holding the bearer token; see
+    /// [`secret_value`].
+    pub auth_bearer_env: Option<String>,
     /// OAuth2 token URL
     pub oauth2_token_url: Option<String>,
     /// OAuth2 client ID
     pub oauth2_client_id: Option<String>,
     /// OAuth2 client secret
     pub oauth2_client_secret: Option<String>,
+    /// Environment variable of this server holding the OAuth2 client secret.
+    pub oauth2_client_secret_env: Option<String>,
     /// OAuth2 scope (e.g. "session:role:<ROLE>" for Snowflake Horizon / Polaris)
     pub oauth2_scope: Option<String>,
     /// OAuth2 audience
     pub oauth2_audience: Option<String>,
+    /// Use Google metadata-server auth (GKE Workload Identity / GCE) for the REST
+    /// catalog, minting + auto-refreshing short-lived tokens — for Google Iceberg
+    /// REST catalogs (BigLake), where a static `auth_bearer` would expire.
+    #[serde(default)]
+    pub auth_google_metadata: bool,
+    /// Optional OAuth scopes for `auth_google_metadata` (defaults to cloud-platform).
+    pub auth_google_scopes: Option<String>,
     /// Warehouse identifier
     pub warehouse: Option<String>,
     /// Disable vended credentials
@@ -66,6 +78,22 @@ pub struct IcebergMapRequest {
     /// Use path-style S3 URLs
     #[serde(default)]
     pub s3_path_style: bool,
+    /// Tombstone/delete convention: source column inspected to classify a row
+    /// as a delete during materialization. Omit to disable retraction.
+    pub delete_column: Option<String>,
+    /// Column values that mark a row as a delete. A `null` element matches a NULL
+    /// `delete_column` value (null-payload tombstone), e.g. `["d", "delete"]`,
+    /// `[null]`, or `["d", null]`. Required when `delete_column` is set.
+    #[serde(default)]
+    pub delete_values: Vec<Option<String>>,
+    /// Ordering column for latest-by-key materialization (e.g. `event_timestamp`).
+    pub order_by: Option<String>,
+    /// Model ledger (`name:branch`) whose default graph supplies the source's
+    /// view policies and class/property hierarchy.
+    pub model: Option<String>,
+    /// `default-allow` for governed requests that match no policy (`true`
+    /// keeps the source readable under authentication without a model).
+    pub default_allow: Option<bool>,
 }
 
 fn default_mode() -> String {
@@ -89,6 +117,10 @@ pub struct IcebergMapResponse {
     pub table_names: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mapping_validated: Option<bool>,
+    /// Warnings about the `model` reference (policies a virtual source cannot
+    /// evaluate).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_warnings: Vec<String>,
 }
 
 /// Map an Iceberg table as a graph source
@@ -154,6 +186,7 @@ async fn iceberg_map_local(state: Arc<AppState>, request: Request) -> Result<imp
                 .map_err(ServerError::Api)?;
 
             IcebergMapResponse {
+                model_warnings: result.model_warnings,
                 graph_source_id: result.graph_source_id,
                 table_identifier: result.table_identifier,
                 catalog_uri: result.catalog_uri,
@@ -172,6 +205,7 @@ async fn iceberg_map_local(state: Arc<AppState>, request: Request) -> Result<imp
                 .map_err(ServerError::Api)?;
 
             IcebergMapResponse {
+                model_warnings: result.model_warnings,
                 graph_source_id: result.graph_source_id,
                 table_identifier: result.table_identifier,
                 catalog_uri: result.catalog_uri,
@@ -195,95 +229,504 @@ async fn iceberg_map_local(state: Arc<AppState>, request: Request) -> Result<imp
     .await
 }
 
-fn build_iceberg_config(req: &IcebergMapRequest) -> Result<fluree_db_api::IcebergCreateConfig> {
-    let mode = req.mode.to_lowercase();
-    let mut config = match mode.as_str() {
-        "rest" => {
-            let catalog_uri = req
-                .catalog_uri
-                .as_ref()
-                .ok_or_else(|| ServerError::bad_request("catalog_uri is required for rest mode"))?;
-            let table = req.table.as_deref().unwrap_or_default();
-            if table.is_empty() && req.r2rml.is_none() {
-                return Err(ServerError::bad_request(
-                    "table is required for rest mode (or provide r2rml to define tables via mapping)",
-                ));
+/// Request body for `POST /v1/fluree/iceberg/materialize`
+#[derive(Deserialize)]
+pub struct IcebergMaterializeRequest {
+    /// Source graph source id (the R2RML/Iceberg source to read).
+    pub source: String,
+    /// Target native ledger to materialize into (created if absent).
+    pub target: String,
+    /// Force a full re-read, ignoring the watermark persisted in the target
+    /// ledger. Default `false`: resolve the watermark and refresh incrementally
+    /// (full only on the first run or a non-incremental-safe window).
+    #[serde(default)]
+    pub force_full: bool,
+}
+
+/// Response for `POST /v1/fluree/iceberg/materialize`
+#[derive(Serialize)]
+pub struct IcebergMaterializeResponse {
+    pub source: String,
+    pub target: String,
+    /// The watermark this pass started from (previously-materialized snapshot).
+    pub from_snapshot_id: Option<i64>,
+    /// The source snapshot now materialized (the persisted watermark).
+    pub to_snapshot_id: Option<i64>,
+    /// Whether an incremental (added-files-only) scan was used.
+    pub incremental: bool,
+    /// Whether anything was committed (false on a no-delta poll).
+    pub committed: bool,
+    pub rows_read: usize,
+    pub subjects_upserted: usize,
+    pub subjects_retracted: usize,
+}
+
+/// Materialize an R2RML / Iceberg graph source into a native ledger.
+///
+/// POST /v1/fluree/iceberg/materialize
+pub async fn iceberg_materialize(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+
+    iceberg_materialize_local(state, request)
+        .await
+        .into_response()
+}
+
+async fn iceberg_materialize_local(
+    state: Arc<AppState>,
+    request: Request,
+) -> Result<impl IntoResponse> {
+    let headers = FlureeHeaders::from_headers(request.headers())?;
+
+    let body_bytes = axum::body::to_bytes(request.into_body(), 50 * 1024 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+    let req: IcebergMaterializeRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))?;
+
+    let request_id = extract_request_id(&headers.raw, &state.telemetry_config);
+    let trace_id = extract_trace_id(&headers.raw);
+
+    let span = create_request_span(
+        "iceberg:materialize",
+        request_id.as_deref(),
+        trace_id.as_deref(),
+        Some(&req.source),
+        None,
+        None,
+    );
+    async move {
+        tracing::info!(
+            status = "start",
+            source = %req.source,
+            target = %req.target,
+            force_full = req.force_full,
+            "iceberg materialize requested"
+        );
+
+        let result = state
+            .fluree
+            .materialize_r2rml_graph_source(&req.source, &req.target, req.force_full)
+            .await
+            .map_err(ServerError::Api)?;
+
+        let response = IcebergMaterializeResponse {
+            source: req.source.clone(),
+            target: req.target.clone(),
+            from_snapshot_id: result.from_snapshot_id,
+            to_snapshot_id: result.to_snapshot_id,
+            incremental: result.incremental,
+            committed: result.committed,
+            rows_read: result.rows_read,
+            subjects_upserted: result.subjects_upserted,
+            subjects_retracted: result.subjects_retracted,
+        };
+
+        tracing::info!(
+            status = "success",
+            source = %response.source,
+            target = %response.target,
+            to_snapshot_id = ?response.to_snapshot_id,
+            incremental = response.incremental,
+            committed = response.committed,
+            rows_read = response.rows_read,
+            subjects_upserted = response.subjects_upserted,
+            subjects_retracted = response.subjects_retracted,
+            "iceberg materialize complete"
+        );
+        Ok((StatusCode::OK, Json(response)))
+    }
+    .instrument(span)
+    .await
+}
+
+/// Request body for `POST /v1/fluree/iceberg/track` and `/untrack`.
+#[derive(Deserialize)]
+pub struct IcebergTrackRequest {
+    /// Source graph source id to track.
+    pub source: String,
+    /// Target native ledger to keep materialized.
+    pub target: String,
+    /// How often the worker re-syncs this job, in seconds. Omit to use the
+    /// worker's default (30s). Ignored by `/untrack`. Must be > 0.
+    #[serde(default)]
+    pub poll_interval_secs: Option<u64>,
+    /// Block the response until the opportunistic first sync finishes.
+    ///
+    /// Defaults to FALSE: registration is durable the moment it is persisted, and
+    /// the worker polls regardless, so the first sync is a latency optimisation
+    /// rather than part of the operation. Waiting for it made `track` take as long
+    /// as a full materialize — on a fresh volume, bootstrap registers 17 sources
+    /// and each one blocked on a FULL read, serialising 17 backfills inside pod
+    /// startup.
+    ///
+    /// Set true when a caller genuinely wants the first sync's numbers in the
+    /// response (tests, one-off manual runs on a small source).
+    #[serde(default)]
+    pub wait_for_first_sync: bool,
+}
+
+/// Response for `POST /v1/fluree/iceberg/track`.
+#[derive(Serialize)]
+pub struct IcebergTrackResponse {
+    pub source: String,
+    pub target: String,
+    /// Whether the worker is now tracking this pair.
+    pub tracked: bool,
+    /// The effective poll interval for this job, in seconds.
+    pub poll_interval_secs: u64,
+    /// Number of jobs the worker is tracking.
+    pub tracked_jobs: usize,
+    /// What happened to the opportunistic first sync: `scheduled` (left to the
+    /// tracking worker's next tick), `completed`, or `failed`.
+    ///
+    /// Separate from `tracked` because the two are genuinely independent, and
+    /// conflating them was a real defect: a first sync that lost a commit race made
+    /// the whole call return an error even though the job was registered AND
+    /// persisted beforehand. Operators reasonably read `track ERROR` as "tracking
+    /// did not happen" when it had.
+    pub first_sync: &'static str,
+    /// Numbers from the first sync — only present when `wait_for_first_sync` was set
+    /// and it succeeded. `null` otherwise, which existing consumers already tolerate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial: Option<IcebergMaterializeResponse>,
+    /// Why the first sync failed, when it did. Never fails the call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_sync_error: Option<String>,
+}
+
+/// Register a `source → target` materialization tracking job and run an
+/// immediate first sync. The worker then keeps the target fresh on its poll
+/// interval (incremental when safe).
+///
+/// POST /v1/fluree/iceberg/track
+pub async fn iceberg_track(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+    iceberg_track_local(state, request).await.into_response()
+}
+
+async fn iceberg_track_local(state: Arc<AppState>, request: Request) -> Result<impl IntoResponse> {
+    let _headers = FlureeHeaders::from_headers(request.headers())?;
+    let body_bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+    let req: IcebergTrackRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))?;
+
+    if req.poll_interval_secs == Some(0) {
+        return Err(ServerError::bad_request(
+            "poll_interval_secs must be greater than 0",
+        ));
+    }
+
+    let worker = state.materialize_worker.as_ref().ok_or_else(|| {
+        ServerError::bad_request(
+            "materialization tracking worker is not running on this node (peer role, or \
+             indexing disabled — materialization needs a local indexer to drain novelty)",
+        )
+    })?;
+
+    let interval = worker.track(
+        &req.source,
+        &req.target,
+        req.poll_interval_secs.map(std::time::Duration::from_secs),
+    );
+
+    // Persist the job so a restart restores it instead of silently stopping
+    // materialization until a client re-issues this call. Written after the
+    // in-memory registration and before the first sync, so the durable record
+    // and the running worker never disagree in the direction that loses work.
+    state
+        .fluree
+        .persist_materialize_job(&fluree_db_api::PersistedMaterializeJob {
+            source: req.source.clone(),
+            target: req.target.clone(),
+            poll_interval_secs: interval.as_secs(),
+        })
+        .await
+        .map_err(ServerError::Api)?;
+
+    // The opportunistic first sync — populate the target without waiting a poll cycle.
+    //
+    // It is NOT part of registration, and the code above is what makes that true: the
+    // job is in the worker AND persisted before we get here. So this must neither
+    // block the response nor be able to fail it. Previously it did both:
+    //
+    //   * `?` on its error made `track` report failure for a job that was already
+    //     registered and durable. A first sync losing a commit race produced
+    //     `track ERROR: Commit conflict ...`, which reads as "tracking did not happen".
+    //   * awaiting it made `track` cost a full materialize. On a fresh volume nothing
+    //     is tracked, so bootstrap registers all 17 sources and each blocked on a FULL
+    //     read — 17 backfills serialised inside pod startup.
+    let tracked_jobs = worker.tracked_jobs().len();
+    let (first_sync, initial, first_sync_error) = if req.wait_for_first_sync {
+        match state
+            .fluree
+            .materialize_r2rml_graph_source(&req.source, &req.target, false)
+            .await
+        {
+            Ok(result) => (
+                "completed",
+                Some(IcebergMaterializeResponse {
+                    source: req.source.clone(),
+                    target: req.target.clone(),
+                    from_snapshot_id: result.from_snapshot_id,
+                    to_snapshot_id: result.to_snapshot_id,
+                    incremental: result.incremental,
+                    committed: result.committed,
+                    rows_read: result.rows_read,
+                    subjects_upserted: result.subjects_upserted,
+                    subjects_retracted: result.subjects_retracted,
+                }),
+                None,
+            ),
+            // Reported, never fatal: the job is tracked and the worker will retry.
+            Err(e) => {
+                tracing::warn!(
+                    source = %req.source,
+                    target = %req.target,
+                    error = %e,
+                    "iceberg/track: first sync failed; the job IS tracked and the worker \
+                     will retry on its next poll"
+                );
+                ("failed", None, Some(e.to_string()))
             }
-            let table = if table.is_empty() {
-                "default.default"
-            } else {
-                table
-            };
-            fluree_db_api::IcebergCreateConfig::new(&req.name, catalog_uri, table)
         }
-        "direct" => {
-            let location = req.table_location.as_ref().ok_or_else(|| {
-                ServerError::bad_request("table_location is required for direct mode")
-            })?;
-            fluree_db_api::IcebergCreateConfig::new_direct(&req.name, location)
-        }
-        "glue" => {
-            let table = req.table.as_deref().unwrap_or_default();
-            if table.is_empty() {
-                return Err(ServerError::bad_request(
-                    "table is required for glue mode (namespace.table)",
-                ));
-            }
-            let connection = fluree_db_api::IcebergConnectionConfig::glue(
-                req.region.clone(),
-                req.catalog_id.clone(),
-            );
-            fluree_db_api::IcebergCreateConfig {
-                name: req.name.clone(),
-                branch: None,
-                connection,
-                table_identifier: table.to_string(),
-            }
-        }
-        "s3tables" => {
-            let arn = req.table_bucket_arn.as_ref().ok_or_else(|| {
-                ServerError::bad_request("table_bucket_arn is required for s3tables mode")
-            })?;
-            let table = req.table.as_deref().unwrap_or_default();
-            if table.is_empty() {
-                return Err(ServerError::bad_request(
-                    "table is required for s3tables mode (namespace.table)",
-                ));
-            }
-            let connection =
-                fluree_db_api::IcebergConnectionConfig::s3_tables(req.region.clone(), arn);
-            fluree_db_api::IcebergCreateConfig {
-                name: req.name.clone(),
-                branch: None,
-                connection,
-                table_identifier: table.to_string(),
-            }
-        }
-        other => {
-            return Err(ServerError::bad_request(format!(
-                "unknown catalog mode '{other}'. Use 'rest', 'direct', 'glue', or 's3tables'."
-            )));
-        }
+    } else {
+        // DELIBERATELY NOT SPAWNED. Leave it to the tracking worker's next tick.
+        //
+        // Spawning looked like the obvious way to keep the latency benefit without
+        // blocking, and it is a trap: the worker polls jobs through a SERIAL outer loop,
+        // but spawned tasks bypass that entirely. Registering 17 sources therefore
+        // launched 17 unbounded concurrent materializes — and the per-window accumulator
+        // is the one memory term nothing currently bounds (~10 GiB for a single
+        // ~800k-row window). Measured locally: 873 % CPU, i.e. ~9 cores, on what should
+        // be background work.
+        //
+        // The synchronous version was accidentally providing the serialisation. Removing
+        // the await must not also remove the brake.
+        //
+        // Cost of leaving it to the worker: up to one poll interval before data appears
+        // (30 s default, and the caller can pass poll_interval_secs to shorten it). That
+        // is a small price for keeping first-sync concurrency equal to the worker's,
+        // which is the only place it is bounded.
+        ("scheduled", None, None)
     };
+
+    let response = IcebergTrackResponse {
+        source: req.source,
+        target: req.target,
+        tracked: true,
+        poll_interval_secs: interval.as_secs(),
+        tracked_jobs,
+        first_sync,
+        initial,
+        first_sync_error,
+    };
+    Ok((StatusCode::OK, Json(response)))
+}
+
+/// Stop tracking a `source → target` pair (leaves already-materialized data).
+///
+/// POST /v1/fluree/iceberg/untrack
+pub async fn iceberg_untrack(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+    iceberg_untrack_local(state, request).await.into_response()
+}
+
+async fn iceberg_untrack_local(
+    state: Arc<AppState>,
+    request: Request,
+) -> Result<impl IntoResponse> {
+    let _headers = FlureeHeaders::from_headers(request.headers())?;
+    let body_bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+    let req: IcebergTrackRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))?;
+
+    let worker = state.materialize_worker.as_ref().ok_or_else(|| {
+        ServerError::bad_request("materialization tracking worker is not running on this node")
+    })?;
+    let removed = worker.untrack(&req.source, &req.target);
+
+    // Durable too, or a restart would resurrect the job.
+    state
+        .fluree
+        .forget_materialize_job(&req.source, &req.target)
+        .await
+        .map_err(ServerError::Api)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "source": req.source,
+            "target": req.target,
+            "removed": removed,
+            "tracked_jobs": worker.tracked_jobs().len(),
+        })),
+    ))
+}
+
+/// Tracking-worker status: tracked jobs + cumulative stats.
+///
+/// GET /v1/fluree/iceberg/tracking
+pub async fn iceberg_tracking_status(State(state): State<Arc<AppState>>) -> Response {
+    let Some(worker) = state.materialize_worker.as_ref() else {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "running": false, "jobs": [] })),
+        )
+            .into_response();
+    };
+    let jobs: Vec<_> = worker
+        .job_infos()
+        .into_iter()
+        .map(|j| {
+            serde_json::json!({
+                "source": j.source,
+                "target": j.target,
+                "poll_interval_secs": j.poll_interval_secs,
+            })
+        })
+        .collect();
+    let stats = worker.stats();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "running": true,
+            "jobs": jobs,
+            "stats": {
+                "polls": stats.polls,
+                "syncs_committed": stats.syncs_committed,
+                "syncs_noop": stats.syncs_noop,
+                // Surfaced separately from failures on purpose: a non-zero rate here
+                // means the INDEXER is the bottleneck, which is a capacity signal, not
+                // a fault. Counting deferrals as failures is how 1,050 of them once
+                // presented as an outage and hid the real cause.
+                "syncs_deferred": stats.syncs_deferred,
+                "syncs_failed": stats.syncs_failed,
+                // Polls where the targets did not land uniformly. For a fan-out job this
+                // is the normal steady state, not an anomaly.
+                "syncs_partial": stats.syncs_partial,
+
+                // READ THESE for progress. The counters above are per POLL, and a poll
+                // fans out to many independent target ledgers, so they cannot express
+                // partial progress: a window with 21 of 22 targets committed scored zero
+                // commits and one deferral, and was consequently diagnosed as a stall.
+                "targets_committed": stats.targets_committed,
+                "targets_deferred": stats.targets_deferred,
+                "targets_failed": stats.targets_failed,
+
+                "tracked_jobs": stats.tracked_jobs,
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// The environment variables a request may name as a secret (comma-separated).
+pub(crate) const SECRET_ENV_ALLOWLIST: &str = "FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS";
+
+pub(crate) fn allowed_secret_env() -> String {
+    std::env::var(SECRET_ENV_ALLOWLIST).unwrap_or_default()
+}
+
+/// One secret, given as a literal or as the name of an environment variable.
+///
+/// The request also chooses where the secret is sent — the catalog or the
+/// token URL — so it may name only a variable the operator has listed.
+/// Anything else would let a caller send this server's environment to a host
+/// of their choosing.
+pub(crate) fn secret_value(
+    field: &str,
+    literal: Option<&str>,
+    env: Option<&str>,
+    allowed: &str,
+) -> Result<Option<fluree_db_api::IcebergConfigValue>> {
+    use fluree_db_api::IcebergConfigValue as ConfigValue;
+    match (literal, env) {
+        (Some(_), Some(_)) => Err(ServerError::bad_request(format!(
+            "give {field} or {field}_env, not both"
+        ))),
+        (Some(value), None) => Ok(Some(ConfigValue::literal(value))),
+        (None, Some(name)) => {
+            if allowed.split(',').any(|listed| listed.trim() == name) {
+                Ok(Some(ConfigValue::from_env(name)))
+            } else {
+                Err(ServerError::bad_request(format!(
+                    "{field}_env names '{name}', which this server does not list in {SECRET_ENV_ALLOWLIST}"
+                )))
+            }
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+fn build_iceberg_config(req: &IcebergMapRequest) -> Result<fluree_db_api::IcebergCreateConfig> {
+    build_iceberg_config_allowing(req, &allowed_secret_env())
+}
+
+fn build_iceberg_config_allowing(
+    req: &IcebergMapRequest,
+    allowed_env: &str,
+) -> Result<fluree_db_api::IcebergCreateConfig> {
+    // One mode dispatch for every surface (the CLI parses its flags the same way).
+    let mut config = fluree_db_api::IcebergCreateConfig::from_mode(
+        &req.name,
+        fluree_db_api::CatalogModeArgs {
+            mode: &req.mode,
+            catalog_uri: req.catalog_uri.as_deref(),
+            table_location: req.table_location.as_deref(),
+            region: req.region.as_deref(),
+            catalog_id: req.catalog_id.as_deref(),
+            table_bucket_arn: req.table_bucket_arn.as_deref(),
+        },
+        req.table.as_deref(),
+        req.r2rml.is_some(),
+    )
+    .map_err(|e| ServerError::bad_request(e.message(str::to_string)))?;
 
     if let Some(ref branch) = req.branch {
         config = config.with_branch(branch);
     }
-    if let Some(ref token) = req.auth_bearer {
-        config = config.with_auth_bearer(token);
+    if let Some(token) = secret_value(
+        "auth_bearer",
+        req.auth_bearer.as_deref(),
+        req.auth_bearer_env.as_deref(),
+        allowed_env,
+    )? {
+        config = config.with_auth_bearer_value(token);
     }
     // OAuth2 activates on oauth2_token_url + oauth2_client_secret; client_id
     // defaults to "" so Horizon / PAT callers can omit it (Snowflake Horizon's
     // `session:role:` token exchange requires an absent/empty client_id).
-    if let (Some(ref url), Some(ref secret)) = (&req.oauth2_token_url, &req.oauth2_client_secret) {
+    let oauth2_secret = secret_value(
+        "oauth2_client_secret",
+        req.oauth2_client_secret.as_deref(),
+        req.oauth2_client_secret_env.as_deref(),
+        allowed_env,
+    )?;
+    if let (Some(ref url), Some(secret)) = (&req.oauth2_token_url, oauth2_secret) {
         let id = req.oauth2_client_id.as_deref().unwrap_or("");
-        config = config.with_auth_oauth2(url, id, secret);
+        config = config.with_auth_oauth2_secret_value(url, id, secret);
         if let Some(ref scope) = req.oauth2_scope {
             config = config.with_oauth2_scope(scope);
         }
         if let Some(ref audience) = req.oauth2_audience {
             config = config.with_oauth2_audience(audience);
         }
+    }
+    // Google metadata-server auth (refreshable) — for BigLake / GKE Workload
+    // Identity. Overrides any static bearer configured above.
+    if req.auth_google_metadata {
+        config = config.with_auth_google_metadata(req.auth_google_scopes.clone());
     }
     if let Some(ref wh) = req.warehouse {
         config = config.with_warehouse(wh);
@@ -299,6 +742,25 @@ fn build_iceberg_config(req: &IcebergMapRequest) -> Result<fluree_db_api::Iceber
     }
     if req.s3_path_style {
         config = config.with_s3_path_style(true);
+    }
+    if let Some(ref column) = req.delete_column {
+        let convention = fluree_db_api::DeleteConvention {
+            column: column.clone(),
+            deleted_values: req.delete_values.clone(),
+        };
+        convention
+            .validate()
+            .map_err(|e| ServerError::bad_request(format!("invalid delete convention: {e}")))?;
+        config = config.with_delete_convention(convention);
+    }
+    if let Some(ref order_by) = req.order_by {
+        config = config.with_order_by(order_by);
+    }
+    if let Some(ref model) = req.model {
+        config = config.with_model(model);
+    }
+    if let Some(allow) = req.default_allow {
+        config = config.with_default_allow(allow);
     }
 
     Ok(config)
@@ -329,12 +791,17 @@ pub struct IcebergConnectionRequest {
     pub table_bucket_arn: Option<String>,
     /// Bearer token for catalog auth
     pub auth_bearer: Option<String>,
+    /// Environment variable of this server holding the bearer token; see
+    /// [`secret_value`].
+    pub auth_bearer_env: Option<String>,
     /// OAuth2 token URL
     pub oauth2_token_url: Option<String>,
     /// OAuth2 client ID
     pub oauth2_client_id: Option<String>,
     /// OAuth2 client secret
     pub oauth2_client_secret: Option<String>,
+    /// Environment variable of this server holding the OAuth2 client secret.
+    pub oauth2_client_secret_env: Option<String>,
     /// OAuth2 scope (e.g. "session:role:<ROLE>" for Snowflake Horizon / Polaris)
     pub oauth2_scope: Option<String>,
     /// OAuth2 audience
@@ -356,45 +823,44 @@ pub struct IcebergConnectionRequest {
 fn build_iceberg_connection(
     req: &IcebergConnectionRequest,
 ) -> Result<fluree_db_api::IcebergConnectionConfig> {
+    build_iceberg_connection_allowing(req, &allowed_secret_env())
+}
+
+fn build_iceberg_connection_allowing(
+    req: &IcebergConnectionRequest,
+    allowed_env: &str,
+) -> Result<fluree_db_api::IcebergConnectionConfig> {
     use fluree_db_api::IcebergConnectionConfig;
 
-    let mode = req.mode.to_lowercase();
-    let mut conn = match mode.as_str() {
-        "rest" => {
-            let catalog_uri = req
-                .catalog_uri
-                .as_ref()
-                .ok_or_else(|| ServerError::bad_request("catalog_uri is required for rest mode"))?;
-            IcebergConnectionConfig::rest(catalog_uri)
-        }
-        "direct" => {
-            let location = req.table_location.as_ref().ok_or_else(|| {
-                ServerError::bad_request("table_location is required for direct mode")
-            })?;
-            IcebergConnectionConfig::direct(location)
-        }
-        "glue" => IcebergConnectionConfig::glue(req.region.clone(), req.catalog_id.clone()),
-        "s3tables" => {
-            let arn = req.table_bucket_arn.as_ref().ok_or_else(|| {
-                ServerError::bad_request("table_bucket_arn is required for s3tables mode")
-            })?;
-            IcebergConnectionConfig::s3_tables(req.region.clone(), arn)
-        }
-        other => {
-            return Err(ServerError::bad_request(format!(
-                "unknown catalog mode '{other}'. Use 'rest', 'direct', 'glue', or 's3tables'."
-            )));
-        }
-    };
+    let mut conn = IcebergConnectionConfig::from_mode(fluree_db_api::CatalogModeArgs {
+        mode: &req.mode,
+        catalog_uri: req.catalog_uri.as_deref(),
+        table_location: req.table_location.as_deref(),
+        region: req.region.as_deref(),
+        catalog_id: req.catalog_id.as_deref(),
+        table_bucket_arn: req.table_bucket_arn.as_deref(),
+    })
+    .map_err(|e| ServerError::bad_request(e.message(str::to_string)))?;
 
-    if let Some(ref token) = req.auth_bearer {
-        conn = conn.with_auth_bearer(token);
+    if let Some(token) = secret_value(
+        "auth_bearer",
+        req.auth_bearer.as_deref(),
+        req.auth_bearer_env.as_deref(),
+        allowed_env,
+    )? {
+        conn = conn.with_auth_bearer_value(token);
     }
     // OAuth2 activates on token_url + client_secret; client_id defaults to ""
     // so Horizon / PAT callers can omit it (mirrors iceberg/map).
-    if let (Some(ref url), Some(ref secret)) = (&req.oauth2_token_url, &req.oauth2_client_secret) {
+    let oauth2_secret = secret_value(
+        "oauth2_client_secret",
+        req.oauth2_client_secret.as_deref(),
+        req.oauth2_client_secret_env.as_deref(),
+        allowed_env,
+    )?;
+    if let (Some(ref url), Some(secret)) = (&req.oauth2_token_url, oauth2_secret) {
         let id = req.oauth2_client_id.as_deref().unwrap_or("");
-        conn = conn.with_auth_oauth2(url, id, secret);
+        conn = conn.with_auth_oauth2_secret_value(url, id, secret);
         if let Some(ref scope) = req.oauth2_scope {
             conn = conn.with_oauth2_scope(scope);
         }
@@ -585,6 +1051,77 @@ async fn iceberg_catalog_preview_local(
     .await
 }
 
+/// Request body for `POST /v1/fluree/iceberg/catalog/verify`
+#[derive(Deserialize)]
+pub struct IcebergVerifyRequest {
+    #[serde(flatten)]
+    pub connection: IcebergConnectionRequest,
+    /// Table identifier (`"NAMESPACE.NAME"`, byte-for-byte catalog casing).
+    pub table: String,
+}
+
+/// Verify that the connection's resolved credentials can READ a table's storage
+/// (the onboarding "Test" probe). Read-only: creates no graph source, writes
+/// nothing; it goes through the engine's own credential + storage path and proves
+/// both the `metadata/` and `data/` S3 prefixes are readable. A table that cannot
+/// be read answers `200` with `readable: false` and the reason in `error`.
+///
+/// POST /v1/fluree/iceberg/catalog/verify
+pub async fn iceberg_catalog_verify(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Response {
+    iceberg_catalog_verify_local(state, request)
+        .await
+        .into_response()
+}
+
+async fn iceberg_catalog_verify_local(
+    state: Arc<AppState>,
+    request: Request,
+) -> Result<impl IntoResponse> {
+    let headers = FlureeHeaders::from_headers(request.headers())?;
+    let request_id = extract_request_id(&headers.raw, &state.telemetry_config);
+    let trace_id = extract_trace_id(&headers.raw);
+    let req: IcebergVerifyRequest = parse_iceberg_body(request).await?;
+
+    let span = create_request_span(
+        "iceberg:catalog:verify",
+        request_id.as_deref(),
+        trace_id.as_deref(),
+        Some(&req.table),
+        None,
+        None,
+    );
+    async move {
+        guard_connection_urls(
+            req.connection.catalog_uri.as_deref(),
+            req.connection.oauth2_token_url.as_deref(),
+            req.connection.s3_endpoint.as_deref(),
+        )?;
+        let conn = build_iceberg_connection(&req.connection)?;
+
+        let report = state
+            .fluree
+            .verify_iceberg_storage_access(conn, &req.table)
+            .await
+            .map_err(ServerError::Api)?;
+
+        tracing::info!(
+            status = "success",
+            table = %req.table,
+            readable = report.readable,
+            credential_source = report.credential_source,
+            data_file_count = report.data_file_count,
+            data_probe_skipped = report.data_probe_skipped,
+            "iceberg storage access verified"
+        );
+        Ok((StatusCode::OK, Json(report)))
+    }
+    .instrument(span)
+    .await
+}
+
 // =============================================================================
 // Deterministic R2RML generation (metadata-only; creates no graph source).
 // =============================================================================
@@ -598,10 +1135,18 @@ pub struct TableOverrideEntry {
     pub namespace: String,
     /// Table name (e.g. "DIM_STORE").
     pub name: String,
-    /// Replaces identifier_field_ids as the subject key (still gated on
-    /// required / null_fraction==0; always earns a SubjectKeyUnverified diagnostic).
+    /// Replaces identifier_field_ids with a SINGLE-column subject key (kept for
+    /// backward compatibility). Always earns a SubjectKeyUnverified diagnostic.
     #[serde(default)]
     pub primary_key: Option<String>,
+    /// Replaces identifier_field_ids with a COMPOSITE (one-or-more-column) subject
+    /// key. Takes precedence over `primary_key` when both are present.
+    #[serde(default)]
+    pub subject_key: Option<Vec<String>>,
+    /// Per-table subject-key strategy: `auto` (always emit) or `identifier`
+    /// (strict). `null` inherits the request-level `options.subject_strategy`.
+    #[serde(default)]
+    pub subject_strategy: Option<fluree_db_api::SubjectStrategy>,
     /// Overrides the derived class name / subject slug for the table.
     #[serde(default)]
     pub class_name: Option<String>,
@@ -675,11 +1220,15 @@ async fn iceberg_r2rml_generate_local(
             .per_table_overrides
             .into_iter()
             .map(|e| {
+                // A composite `subject_key` wins; else the single `primary_key`
+                // is lifted into a one-element column list.
+                let primary_key = e.subject_key.or_else(|| e.primary_key.map(|pk| vec![pk]));
                 (
                     TableIdentifier::new(e.namespace, e.name),
                     TableOverride {
-                        primary_key: e.primary_key,
+                        primary_key,
                         class_name: e.class_name,
+                        subject_strategy: e.subject_strategy,
                     },
                 )
             })
@@ -816,6 +1365,77 @@ mod tests {
         assert_eq!(auth["audience"], "polaris");
     }
 
+    fn map_request(extra: serde_json::Value) -> IcebergMapRequest {
+        let mut body = serde_json::json!({
+            "name": "gs", "mode": "rest",
+            "catalog_uri": "https://catalog.example.com", "table": "ns.tbl",
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(body).unwrap()
+    }
+
+    fn stored_auth(config: fluree_db_api::IcebergCreateConfig) -> serde_json::Value {
+        serde_json::to_value(config.to_iceberg_gs_config()).unwrap()["catalog"]["auth"].clone()
+    }
+
+    #[test]
+    fn a_listed_variable_is_stored_as_its_name() {
+        let req = map_request(serde_json::json!({"auth_bearer_env": "CATALOG_TOKEN"}));
+        let auth =
+            stored_auth(build_iceberg_config_allowing(&req, "OTHER, CATALOG_TOKEN").unwrap());
+        assert_eq!(auth["type"], "bearer");
+        assert_eq!(auth["token"]["env_var"], "CATALOG_TOKEN");
+
+        let req = map_request(serde_json::json!({
+            "oauth2_token_url": "https://catalog.example.com/token",
+            "oauth2_client_id": "app",
+            "oauth2_client_secret_env": "CATALOG_SECRET",
+        }));
+        let auth = stored_auth(build_iceberg_config_allowing(&req, "CATALOG_SECRET").unwrap());
+        assert_eq!(auth["type"], "oauth2_client_credentials");
+        assert_eq!(auth["client_secret"]["env_var"], "CATALOG_SECRET");
+    }
+
+    #[test]
+    fn a_variable_the_operator_did_not_list_is_refused() {
+        for allowed in ["", "CATALOG_TOKEN_2", "XCATALOG_TOKEN,CATALOG"] {
+            for field in ["auth_bearer_env", "oauth2_client_secret_env"] {
+                let req = map_request(serde_json::json!({
+                    "oauth2_token_url": "https://catalog.example.com/token",
+                    field: "CATALOG_TOKEN",
+                }));
+                let err = build_iceberg_config_allowing(&req, allowed)
+                    .err()
+                    .unwrap_or_else(|| panic!("{field} accepted with allowlist {allowed:?}"));
+                assert!(err.to_string().contains(SECRET_ENV_ALLOWLIST), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_secret_given_both_ways_is_refused() {
+        let req = map_request(serde_json::json!({
+            "auth_bearer": "t", "auth_bearer_env": "CATALOG_TOKEN",
+        }));
+        assert!(build_iceberg_config_allowing(&req, "CATALOG_TOKEN").is_err());
+    }
+
+    #[test]
+    fn browse_and_preview_hold_a_named_variable_to_the_same_list() {
+        let req = |allowed: &str| {
+            let req: IcebergConnectionRequest = serde_json::from_value(serde_json::json!({
+                "mode": "rest", "catalog_uri": "https://catalog.example.com",
+                "auth_bearer_env": "CATALOG_TOKEN",
+            }))
+            .unwrap();
+            build_iceberg_connection_allowing(&req, allowed)
+        };
+        assert!(req("CATALOG_TOKEN").is_ok());
+        assert!(req("").is_err());
+    }
+
     #[test]
     fn request_without_secret_does_not_activate_oauth2() {
         let body = serde_json::json!({
@@ -856,6 +1476,10 @@ mod tests {
             branch: None,
             connection: build_iceberg_connection(&req.connection).unwrap(),
             table_identifier: "ns.tbl".to_string(),
+            delete_convention: None,
+            order_by: None,
+            model: None,
+            default_allow: None,
         };
         assert!(create.is_rest());
         let gs = create.to_iceberg_gs_config();
@@ -912,6 +1536,31 @@ mod tests {
     }
 
     #[test]
+    fn map_request_glue_mode_is_mapping_driven() {
+        // Like rest, a glue source whose tables come from its R2RML mapping needs
+        // no `table` of its own; each rr:tableName is a Glue `<database>.<table>`.
+        let body = serde_json::json!({
+            "name": "orders",
+            "mode": "glue",
+            "region": "us-east-1",
+            "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> ."
+        });
+        let req: IcebergMapRequest = serde_json::from_value(body).unwrap();
+        let config = build_iceberg_config(&req).unwrap();
+        assert!(config.connection.is_glue());
+        config.validate().unwrap();
+
+        // Without a mapping it needs one, and says so in the wire spelling.
+        let body = serde_json::json!({ "name": "orders", "mode": "glue" });
+        let req: IcebergMapRequest = serde_json::from_value(body).unwrap();
+        let err = build_iceberg_config(&req).unwrap_err().to_string();
+        assert!(
+            err.contains("table is required for glue mode (or provide r2rml"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn generate_request_flattens_connection_tables_overrides_and_options() {
         // The flattened connection fields deserialize alongside the generate
         // body: tables, base_namespace, an overrides list, options, and the
@@ -959,6 +1608,40 @@ mod tests {
         // The flattened connection builds a REST connection carrying the scope.
         let conn = build_iceberg_connection(&req.connection).unwrap();
         assert!(conn.is_rest());
+    }
+
+    #[test]
+    fn verify_request_flattens_connection_and_table() {
+        // The flattened connection fields must deserialize alongside `table`, and
+        // build a REST connection carrying the OAuth2 scope.
+        let body = serde_json::json!({
+            "mode": "rest",
+            "catalog_uri": "https://catalog.example.com",
+            "warehouse": "wh1",
+            "oauth2_token_url": "https://catalog.example.com/v1/oauth/tokens",
+            "oauth2_client_secret": "pat",
+            "oauth2_scope": "session:role:ICEBERG_READER",
+            "table": "DW.DIM_STORE"
+        });
+        let req: IcebergVerifyRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(req.table, "DW.DIM_STORE");
+        assert_eq!(req.connection.warehouse.as_deref(), Some("wh1"));
+
+        let conn = build_iceberg_connection(&req.connection).unwrap();
+        assert!(conn.is_rest());
+    }
+
+    #[test]
+    fn verify_request_direct_mode_builds_direct_connection() {
+        let body = serde_json::json!({
+            "mode": "direct",
+            "table_location": "s3://bucket/warehouse/ns/table",
+            "table": "ns.table"
+        });
+        let req: IcebergVerifyRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(req.table, "ns.table");
+        let conn = build_iceberg_connection(&req.connection).unwrap();
+        assert!(conn.is_direct());
     }
 
     #[test]

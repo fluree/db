@@ -1,17 +1,22 @@
 //! RDF 1.2 annotation syntax AST nodes.
 //!
-//! Covers the three SPARQL 1.2 / RDF 1.2 surfaces that lower to Fluree's
+//! Covers the SPARQL 1.2 / RDF 1.2 surfaces that lower to Fluree's
 //! edge-annotation primitive:
 //!
 //! - Anonymous annotation block: `s p o {| pred obj ; ... |}`
 //! - Named annotation block:     `s p o ~ <reifier> {| pred obj ; ... |}`
 //! - Bare reifier:               `s p o ~ <reifier>`
+//! - Multiple reifications:      `s p o ~ :r1 {| ... |} ~ :r2 {| ... |}`
 //! - Reifier via `rdf:reifies`:  `?ann rdf:reifies <<( s p o )>>`
+//!
+//! (Reified triples `<< s p o ~ r? >>` used *as terms* live on
+//! `ast::term::QuotedTriple` — see its `reifier` field.)
 //!
 //! See `docs/concepts/edge-annotations.md` "SPARQL 1.2 / RDF 1.2
 //! surface" for the surface contract, including the per-operation
 //! blank-node / variable rules.
 
+use super::path::PropertyPath;
 use super::term::{BlankNode, Iri, ObjectTerm, PredicateTerm, SubjectTerm, Var};
 use crate::span::SourceSpan;
 
@@ -21,12 +26,35 @@ use crate::span::SourceSpan;
 /// annotation ::= ( reifier | annotationBlock )*
 /// ```
 ///
-/// In v1 we accept at most one reifier and one block in any order. The
-/// parser collapses repeated `~` / `{| ... |}` runs into a single
-/// `Annotation` node and rejects multi-reifier shapes with a deferred-
-/// feature error pointing at the JSON-LD multi-triple-reifier rejection.
+/// The parser groups the element sequence into [`AnnotationUnit`]s —
+/// one reification of the base triple per unit — following the RDF 1.2
+/// attachment rule: an annotation block combines with an immediately
+/// preceding `~ reifier` element; a block with no immediately preceding
+/// reifier mints a fresh one. So `~ :r1 {| … |} ~ :r2` is two units,
+/// and `{| … |} {| … |}` is two units with two fresh reifiers.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Annotation {
+    /// The reification units, in source order. Non-empty by
+    /// construction (an absent tail parses as no `Annotation` at all).
+    pub units: Vec<AnnotationUnit>,
+    pub span: SourceSpan,
+}
+
+impl Annotation {
+    /// The single annotation unit, when the tail has exactly one (the
+    /// common `~ r? {| … |}?` shape).
+    pub fn single_unit(&self) -> Option<&AnnotationUnit> {
+        match self.units.as_slice() {
+            [unit] => Some(unit),
+            _ => None,
+        }
+    }
+}
+
+/// One reification of the annotated triple: an optional explicit
+/// reifier id plus an optional `{| ... |}` body attached to it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnnotationUnit {
     /// Optional explicit reifier id. `None` means "mint fresh".
     /// A bare `~` (no following IRI/BlankNode) also lowers to `None`.
     pub reifier: Option<ReifierId>,
@@ -66,31 +94,58 @@ impl ReifierId {
 
 /// Body of a `{| ... |}` annotation block.
 ///
-/// Each entry is a (predicate, object) pair applied to the reifier in
-/// the enclosing `Annotation`. The body itself is a flat list — nested
-/// annotation tails on body entries are deferred per the design doc and
-/// rejected at parse time.
+/// Each entry is a (verb, object) pair applied to the reifier in the
+/// enclosing [`AnnotationUnit`]. The body itself is a flat list —
+/// nested annotation tails on body entries are illegal per the RDF 1.2
+/// grammar and rejected at parse time.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AnnotationBlock {
     pub entries: Vec<AnnotationEntry>,
     pub span: SourceSpan,
 }
 
-/// One predicate-object pair inside a `{| ... |}` block.
+/// One verb-object pair inside a `{| ... |}` block.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AnnotationEntry {
-    pub predicate: PredicateTerm,
+    pub verb: AnnotationVerb,
     pub object: ObjectTerm,
     pub span: SourceSpan,
 }
 
+/// Verb of an annotation-block entry. The RDF 1.2 grammar's block body
+/// is a `PropertyListPathNotEmpty`, so property paths are legal here
+/// (W3C `annotation-*reifier-06`: `{| :r/:q 'ABC' |}`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum AnnotationVerb {
+    /// Plain predicate (IRI or variable).
+    Simple(PredicateTerm),
+    /// Property path (`:r/:q`, `:q1+`, ...).
+    Path(PropertyPath),
+}
+
+impl AnnotationVerb {
+    pub fn span(&self) -> SourceSpan {
+        match self {
+            AnnotationVerb::Simple(p) => p.span(),
+            AnnotationVerb::Path(p) => p.span(),
+        }
+    }
+}
+
 /// RDF 1.2 triple term: `<<( subject predicate object )>>`.
 ///
-/// In v1 a `TripleTerm` is **only** valid as the object of `rdf:reifies`.
-/// Any other use is a parse-time deferred-feature error. We do NOT add
-/// `TripleTerm` as a `Term` / `ObjectTerm` variant for that reason —
-/// the parser surfaces it via `parse_reifies_object` and never lets it
-/// flow through ordinary object-position handling.
+/// In v1 a `TripleTerm` is **only** valid as the object of `rdf:reifies`
+/// (bare triple-term *values* are deferred to the wave-2 PR-W2BC /
+/// first-class-value epic — see the burn-down roadmap D-1). The parser
+/// surfaces it via `parse_reifies_object` and the reified-triple
+/// desugaring; it never flows through ordinary object-position
+/// handling.
+///
+/// Note: `subject`/`object` may be reified triples (`SubjectTerm::
+/// QuotedTriple` / `Term::QuotedTriple`) when this node was produced by
+/// desugaring a *reified triple* — those denote reifier nodes and are
+/// desugared recursively at lowering. A user-written `<<( ... )>>`
+/// triple term still rejects nesting at parse time.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TripleTerm {
     pub subject: SubjectTerm,

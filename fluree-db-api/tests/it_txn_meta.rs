@@ -499,8 +499,6 @@ async fn test_trig_txn_meta_basic() {
             let ledger = genesis_ledger(&fluree, ledger_id);
 
             // TriG format with GRAPH block for txn-meta
-            // Note: We use upsert_turtle via the builder because insert_turtle has
-            // a direct flake path that bypasses TriG extraction.
             let turtle = r#"
                 @prefix ex: <http://example.org/> .
                 @prefix fluree: <https://ns.flur.ee/db#> .
@@ -515,7 +513,6 @@ async fn test_trig_txn_meta_basic() {
                 }
             "#;
 
-            // Use the builder with upsert_turtle which goes through the TriG extraction path
             let result = fluree
                 .stage_owned(ledger)
                 .upsert_turtle(turtle)

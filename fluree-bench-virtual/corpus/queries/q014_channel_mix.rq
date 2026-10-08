@@ -1,0 +1,8 @@
+# q014 channel_mix
+# Intent: Single-table fact GROUP BY (fused-agg positive; still a full scan).
+# BI lineage (BI-09): "What is order volume and revenue by channel?"
+# Predicates verified against enterprise.ttl — FactOrder: orderChannel, orderTotal.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?ch (COUNT(?o) AS ?n) (SUM(?tot) AS ?rev)
+WHERE { ?o a edw:Order ; edw:orderChannel ?ch ; edw:orderTotal ?tot . }
+GROUP BY ?ch

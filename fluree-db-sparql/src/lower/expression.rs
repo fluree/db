@@ -5,12 +5,16 @@
 
 use crate::ast::expr::{BinaryOp, Expression as AstExpression, FunctionName, UnaryOp};
 use crate::ast::term::{Literal, LiteralValue};
+use crate::span::SourceSpan;
 use fluree_db_core::FlakeValue;
 use fluree_db_query::ir::{Expression, Function};
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_vocab::xsd;
 
 use super::{LowerError, LoweringContext, Result};
+
+/// `f:fulltext(?text, "query")`, the namespaced spelling of `fulltext`.
+const FULLTEXT_FUNCTION: &str = "https://ns.flur.ee/db#fulltext";
 
 impl<E: IriEncoder> LoweringContext<'_, E> {
     pub(super) fn lower_expression(&mut self, expr: &AstExpression) -> Result<Expression> {
@@ -90,7 +94,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 }
             },
 
-            AstExpression::FunctionCall { name, args, .. } => self.lower_function_call(name, args),
+            AstExpression::FunctionCall {
+                name, args, span, ..
+            } => self.lower_function_call(name, args, *span),
 
             agg @ AstExpression::Aggregate { function, span, .. } => {
                 if let Some(aliases) = &self.aggregate_aliases {
@@ -208,7 +214,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                         | FlakeValue::Decimal(_)
                         | FlakeValue::BigInt(_)
                         | FlakeValue::Boolean(_)
-                        | FlakeValue::String(_),
+                        | FlakeValue::String(_)
+                        | FlakeValue::Vector(_)
+                        | FlakeValue::GeoPoint(_),
                 ) || fv.is_temporal()
                     || fv.is_duration()
                 {
@@ -224,7 +232,26 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         &mut self,
         name: &FunctionName,
         args: &[AstExpression],
+        span: SourceSpan,
     ) -> Result<Expression> {
+        // SPARQL 1.2 triple-term functions are accepted and arity-validated at
+        // parse time, but have no evaluable implementation yet: defer per
+        // burn-down decision D-1 (accept-then-defer). A query that reaches here
+        // fails at lower time with a clean `not_implemented`, not a parse error.
+        if matches!(
+            name,
+            FunctionName::Triple
+                | FunctionName::Subject
+                | FunctionName::Predicate
+                | FunctionName::Object
+                | FunctionName::IsTriple
+        ) {
+            return Err(LowerError::not_implemented(
+                "SPARQL 1.2 triple-term functions (TRIPLE/SUBJECT/PREDICATE/OBJECT/isTRIPLE)",
+                span,
+            ));
+        }
+
         let func = match name {
             // Type checking functions
             FunctionName::Bound => Function::Bound,
@@ -233,9 +260,11 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             FunctionName::IsLiteral => Function::IsLiteral,
             FunctionName::IsNumeric => Function::IsNumeric,
 
-            // RDF term functions
-            FunctionName::Lang => Function::Lang,
-            FunctionName::Datatype => Function::Datatype,
+            // RDF term functions — SPARQL semantics: a non-literal argument is
+            // a type error (strict), per §17.4.2.2/§17.4.2.3. The JSON-LD
+            // surface keeps the lenient extension (decision D-12).
+            FunctionName::Lang => Function::Lang { strict: true },
+            FunctionName::Datatype => Function::Datatype { strict: true },
 
             // String functions
             FunctionName::Strlen => Function::Strlen,
@@ -302,6 +331,16 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             FunctionName::DotProduct => Function::DotProduct,
             FunctionName::CosineSimilarity => Function::CosineSimilarity,
             FunctionName::EuclideanDistance => Function::EuclideanDistance,
+            FunctionName::Fulltext => Function::Fulltext,
+
+            // Handled by the `not_implemented` early return above.
+            FunctionName::Triple
+            | FunctionName::Subject
+            | FunctionName::Predicate
+            | FunctionName::Object
+            | FunctionName::IsTriple => {
+                unreachable!("triple-term functions defer via the early return")
+            }
 
             // Extension functions
             FunctionName::Extension(iri) => {
@@ -310,6 +349,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     "http://www.opengis.net/def/function/geosparql/distance" => {
                         Function::GeofDistance
                     }
+                    FULLTEXT_FUNCTION => Function::Fulltext,
                     // XSD datatype constructor (cast) functions — W3C SPARQL 1.1 §17.5
                     xsd::BOOLEAN => Function::XsdBoolean,
                     xsd::INTEGER => Function::XsdInteger,
@@ -317,15 +357,34 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     xsd::DOUBLE => Function::XsdDouble,
                     xsd::DECIMAL => Function::XsdDecimal,
                     xsd::STRING => Function::XsdString,
+                    xsd::DATE_TIME => Function::XsdDateTime,
+                    xsd::DATE => Function::XsdDate,
+                    xsd::TIME => Function::XsdTime,
                     _ => Function::Custom(full_iri),
                 }
             }
         };
 
-        let lowered_args: Vec<Expression> = args
+        let mut lowered_args: Vec<Expression> = args
             .iter()
             .map(|a| self.lower_expression(a))
             .collect::<Result<Vec<_>>>()?;
+
+        // IRI()/URI() resolve relative arguments against the query BASE
+        // (SPARQL 1.1 §17.4.2.8). Constant-fold at lowering time so the eval
+        // path stays base-free (zero per-row cost): a constant string argument
+        // is rewritten to its resolved absolute form here. Variable/computed
+        // arguments are not resolved (no per-row resolution by design).
+        if matches!(func, Function::Iri) {
+            if let (Some(base), Some(Expression::Const(FlakeValue::String(s)))) =
+                (&self.base, lowered_args.first())
+            {
+                if !fluree_vocab::iri::is_absolute_iri(s) {
+                    let resolved = fluree_vocab::iri::resolve_iri(base, s);
+                    lowered_args[0] = Expression::Const(FlakeValue::String(resolved));
+                }
+            }
+        }
 
         Ok(Expression::call(func, lowered_args))
     }

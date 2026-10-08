@@ -610,6 +610,54 @@ async fn vector_collection_exists() {
     assert!(!after_drop, "dropped collection should not exist");
 }
 
+/// A dropped vector index stays as a tombstone, and its snapshots are kept,
+/// but a search no longer resolves it.
+#[tokio::test]
+async fn vector_search_after_drop_is_not_found() {
+    use fluree_db_query::vector::{VectorIndexProvider, VectorSearchParams};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "vector/dropped:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc",
+              "ex:embedding": { "@value": [0.9, 0.1, 0.0], "@type": "@vector" } },
+            { "@id":"ex:doc2", "@type":"ex:Doc",
+              "ex:embedding": { "@value": [0.1, 0.9, 0.0], "@type": "@vector" } }
+        ]
+    });
+    fluree.insert(ledger0, &tx).await.unwrap();
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+    let cfg = VectorCreateConfig::new("dropped-vectors", ledger_id, query, "ex:embedding", 3);
+    let created = fluree.create_vector_index(cfg).await.unwrap();
+
+    let provider = FlureeIndexProvider::new(&fluree);
+    let query_vector = [1.0_f32, 0.0, 0.0];
+    let search = || {
+        provider.search(
+            &created.graph_source_id,
+            VectorSearchParams::new(&query_vector, DistanceMetric::Cosine, 10),
+        )
+    };
+    assert_eq!(search().await.expect("search before drop").len(), 2);
+
+    fluree
+        .drop_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    let err = search().await.expect_err("search after drop");
+    assert!(
+        err.to_string().contains("Graph source not found"),
+        "search after drop: {err}"
+    );
+}
+
 /// End-to-end test for f:queryVector query syntax through the query pipeline.
 ///
 /// This test verifies that vector search patterns in queries work correctly:
@@ -830,5 +878,194 @@ async fn vector_search_enforces_view_policy_on_embedding_flake() {
     assert!(
         !rendered.contains("doc2"),
         "doc2 (hidden embedding) must not leak through vector search; got {rendered}"
+    );
+}
+
+/// A commit that touches NO indexed property must advance the watermark, not
+/// rebuild the index. The vector twin of the BM25 test of the same name: the
+/// sync path is a copy, and a vector rebuild is dearer still because a resync
+/// re-embeds every document.
+///
+/// As there, the fixture must touch no dependent predicate at all — this
+/// query's deps are `rdf:type` and `ex:embedding`, so the new subject carries
+/// neither a type nor an embedding — and `was_full_resync` is the only
+/// observable that separates the two paths.
+#[tokio::test]
+async fn vector_sync_without_indexed_changes_advances_watermark_without_resync() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "vector/noop:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx1 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ {
+            "@id":"ex:doc1", "@type":"ex:Doc",
+            "ex:embedding": { "@value": [0.5, 0.5, 0.0], "@type": "@vector" }
+        } ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+    let created = fluree
+        .create_vector_index(VectorCreateConfig::new(
+            "noop-test",
+            ledger_id,
+            query,
+            "ex:embedding",
+            3,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.vector_count, 1);
+
+    let tx2 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ { "@id":"ex:note1", "ex:reading":"42" } ]
+    });
+    let ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+
+    let synced = fluree
+        .sync_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        !synced.was_full_resync,
+        "a commit touching no indexed property must NOT re-embed the corpus"
+    );
+    assert_eq!(synced.upserted, 0);
+    assert_eq!(synced.new_watermark, ledger2.t());
+
+    let idx = fluree
+        .load_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert_eq!(idx.len(), 1, "an untouched index must keep its vectors");
+}
+
+/// A wildcard select cannot be tracked incrementally, so the sync must decline
+/// to the full rebuild rather than trust an empty change set. The embedding
+/// property is always tracked, which is why the index is correct on either
+/// path here — the routing is the assertion.
+#[tokio::test]
+async fn vector_sync_with_wildcard_select_always_rebuilds() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "vector/wildcard:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx1 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ {
+            "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Initial document",
+            "ex:embedding": { "@value": [0.5, 0.5, 0.0], "@type": "@vector" }
+        } ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["*"] }
+    });
+    let created = fluree
+        .create_vector_index(VectorCreateConfig::new(
+            "wildcard",
+            ledger_id,
+            query,
+            "ex:embedding",
+            3,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.vector_count, 1);
+
+    // A property the wildcard covers and no explicit dependency names.
+    let tx2 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ { "@id":"ex:doc1", "ex:title":"Renamed" } ]
+    });
+    let ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+
+    let synced = fluree
+        .sync_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        synced.was_full_resync,
+        "a wildcard select cannot be tracked incrementally; the sync must rebuild"
+    );
+    assert_eq!(synced.new_watermark, ledger2.t());
+}
+
+/// A pattern on a second subject decides membership, and the flake that
+/// changes it is not on the document. Incremental sync would attribute the
+/// change to the author, re-run the query for the author, find no rows, and
+/// leave the document in place. The sync must rebuild instead, and the index
+/// must shrink.
+#[tokio::test]
+async fn vector_sync_with_nested_pattern_rebuilds_when_membership_changes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "vector/nested:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx1 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ {
+            "@id":"ex:doc1", "@type":"ex:Doc",
+            "ex:author": { "@id":"ex:author1", "ex:active": true },
+            "ex:embedding": { "@value": [0.5, 0.5, 0.0], "@type": "@vector" }
+        } ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{
+            "@id":"?x", "@type":"ex:Doc",
+            "ex:author": { "@id":"?a", "ex:active": true }
+        }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+    let created = fluree
+        .create_vector_index(VectorCreateConfig::new(
+            "nested",
+            ledger_id,
+            query,
+            "ex:embedding",
+            3,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.vector_count, 1);
+
+    // Deactivate the author: the document no longer matches the query.
+    let update = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where":  { "@id":"ex:author1", "ex:active":"?was" },
+        "delete": { "@id":"ex:author1", "ex:active":"?was" },
+        "insert": { "@id":"ex:author1", "ex:active": false }
+    });
+    let _ledger2 = fluree.update(ledger1, &update).await.unwrap().ledger;
+
+    let synced = fluree
+        .sync_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        synced.was_full_resync,
+        "a pattern on another subject cannot be tracked incrementally; the sync must rebuild"
+    );
+
+    let idx = fluree
+        .load_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        idx.len(),
+        0,
+        "the document no longer matches the indexing query and must be gone"
     );
 }

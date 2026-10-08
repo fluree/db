@@ -380,15 +380,18 @@ pub fn coerce_value(value: FlakeValue, datatype_iri: &str) -> CoercionResult<Fla
             )),
         },
 
-        // String → rdf:JSON: validate as JSON
-        (FlakeValue::String(s), dt) if dt == rdf::JSON => {
-            serde_json::from_str::<serde_json::Value>(s)
-                .map(|_| FlakeValue::Json(s.clone()))
-                .map_err(|e| CoercionError::parse_failed(s, "rdf:JSON", Some(&e.to_string())))
-        }
+        // Canonicalizing gives one term per value (#1781). It validates the
+        // string on the way.
+        (FlakeValue::String(s), dt) if dt == rdf::JSON => fluree_graph_ir::canonicalize_json(s)
+            .map(FlakeValue::Json)
+            .map_err(|e| CoercionError::parse_failed(s, "rdf:JSON", Some(&e.to_string()))),
 
         // Already JSON → rdf:JSON
         (FlakeValue::Json(j), dt) if dt == rdf::JSON => Ok(FlakeValue::Json(j.clone())),
+
+        // String → geo:wktLiteral: a POINT becomes the GeoPoint it is stored
+        // as, so a constant matches it; other WKT stays a string.
+        (FlakeValue::String(s), geo::WKT_LITERAL) => coerce_string_value(s, geo::WKT_LITERAL),
 
         // ====================================================================
         // Pass-through: already correct type or unknown datatype
@@ -534,9 +537,10 @@ pub fn coerce_string_value(s: &str, datatype_iri: &str) -> CoercionResult<FlakeV
             .map(|d| FlakeValue::YearMonthDuration(Box::new(d)))
             .map_err(|e| CoercionError::parse_failed(s, "xsd:yearMonthDuration", Some(&e))),
 
-        // rdf:JSON (validate as JSON)
-        dt if dt == rdf::JSON => serde_json::from_str::<serde_json::Value>(s)
-            .map(|_| FlakeValue::Json(s.to_string()))
+        // Canonicalizing gives one term per value (#1781). It validates the
+        // string on the way.
+        dt if dt == rdf::JSON => fluree_graph_ir::canonicalize_json(s)
+            .map(FlakeValue::Json)
             .map_err(|e| CoercionError::parse_failed(s, "rdf:JSON", Some(&e.to_string()))),
 
         // f:embeddingVector — parse JSON array lexical form (e.g. "[0.1, 0.2]")
@@ -852,6 +856,25 @@ fn validate_bigint_range(value: &BigInt, datatype_iri: &str) -> CoercionResult<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Query constants and STRDT go through `coerce_value`; a WKT POINT must
+    /// become the GeoPoint a write stores, or it matches nothing.
+    #[test]
+    fn test_coerce_wkt_point_as_written() {
+        let point = "POINT(-0.1278 51.5074)";
+        let coerced = coerce_value(FlakeValue::String(point.to_string()), geo::WKT_LITERAL);
+        let written = coerce_string_value(point, geo::WKT_LITERAL);
+        assert!(
+            matches!(coerced, Ok(FlakeValue::GeoPoint(_))),
+            "{coerced:?}"
+        );
+        assert_eq!(coerced.unwrap(), written.unwrap());
+        let line = "LINESTRING(0 0, 1 1)";
+        assert_eq!(
+            coerce_value(FlakeValue::String(line.to_string()), geo::WKT_LITERAL).unwrap(),
+            FlakeValue::String(line.to_string())
+        );
+    }
 
     #[test]
     fn test_coerce_long_to_integer() {

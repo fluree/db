@@ -30,6 +30,7 @@ use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::{BinaryIndexStore, ColumnProjection, ColumnSet};
 use fluree_db_core::o_type::{DecodeKind, OType};
+use fluree_db_core::temporal::{CalendarField, TemporalKind};
 use fluree_db_core::value_id::ObjKey;
 use fluree_db_core::{FlakeValue, GraphId, Sid};
 use std::sync::Arc;
@@ -66,7 +67,8 @@ impl SumExprI64 {
     fn constant_for_otype(self, o_type: u16) -> Option<i64> {
         match self {
             Self::Identity | Self::AddSelf => None,
-            Self::DateComponent(component) => constant_component_for_otype(o_type, component),
+            Self::DateComponent(component) => constant_component_for_otype(o_type, component)
+                .and_then(ComponentFold::sum_contribution),
             Self::NumericUnary(_) => None,
         }
     }
@@ -91,7 +93,9 @@ impl SumExprI64 {
                 // consistent with the overall overflow strategy.
                 Some(ObjKey::from_u64(o_key).decode_i64().saturating_mul(2))
             }
-            Self::DateComponent(component) => component_from_otype_okey(o_type, o_key, component),
+            Self::DateComponent(component) => {
+                component_from_otype_okey(o_type, o_key, component).sum_contribution()
+            }
             Self::NumericUnary(func) => {
                 let ot = OType::from_u16(o_type);
                 if ot.decode_kind() != DecodeKind::I64 {
@@ -171,11 +175,7 @@ pub fn predicate_scalar_agg_operator(
             // constant-folding / directory shortcuts). An uncommitted overlay or
             // `to_t < max_t` would make that scan stale, so fold the same
             // aggregate over a POST overlay cursor instead.
-            let has_overlay = ctx
-                .overlay
-                .map(fluree_db_core::OverlayProvider::epoch)
-                .unwrap_or(0)
-                != 0;
+            let has_overlay = crate::fast_path_common::overlay_has_novelty(ctx);
             let result = if !has_overlay && ctx.to_t == store.max_t() {
                 scan_predicate_scalar_agg(store, ctx.binary_g_id, &predicate, kind)?
             } else {
@@ -192,7 +192,7 @@ pub fn predicate_scalar_agg_operator(
 }
 
 /// The folded result of a scalar aggregate, before batch construction.
-enum AggOutput {
+pub(crate) enum AggOutput {
     /// `xsd:integer` value (SUM, COUNT-DISTINCT, and the empty-group identity 0
     /// for AVG).
     Integer(i64),
@@ -201,6 +201,14 @@ enum AggOutput {
 }
 
 impl AggOutput {
+    /// The result as a bare binding (for folds that assemble multi-column rows).
+    pub(crate) fn into_binding(self) -> Binding {
+        match self {
+            AggOutput::Integer(v) => Binding::lit(FlakeValue::Long(v), Sid::xsd_integer()),
+            AggOutput::Binding(b) => b,
+        }
+    }
+
     fn into_batch(self, out_var: VarId) -> Result<Batch> {
         match self {
             AggOutput::Integer(v) => build_i64_singleton_batch(out_var, v, "scalar-agg"),
@@ -220,9 +228,16 @@ enum AggState {
     },
     Avg {
         required_otype: Option<u16>,
-        // Kahan compensated summation state.
-        sum: f64,
-        compensation: f64,
+        // Only the integer lane fast-paths. It sums exactly in i64 (checked;
+        // falls back on overflow) and finalizes via BigDecimal division, so the
+        // output is byte-identical to the generic pipeline's finalize_avg
+        // (SPARQL: AVG over integers is xsd:decimal; differential harness FD-1).
+        // xsd:double and other numeric encodings decline in fold_row: f64
+        // addition is non-associative and this lane folds in POST (value) order
+        // while the generic pipeline folds in scan order, so a fast double sum
+        // is NOT guaranteed to match the generic one (harness `avg_double`).
+        // Integer arithmetic is exact and order-free, so it is safe to fast-path.
+        int_sum: i64,
         count: u64,
     },
     CountDistinct {
@@ -237,8 +252,7 @@ impl AggState {
             ScalarAggKind::Sum(scalar) => AggState::Sum { scalar, sum: 0 },
             ScalarAggKind::AvgNumeric => AggState::Avg {
                 required_otype: None,
-                sum: 0.0,
-                compensation: 0.0,
+                int_sum: 0,
                 count: 0,
             },
             ScalarAggKind::CountDistinctObject => AggState::CountDistinct {
@@ -251,15 +265,23 @@ impl AggState {
     fn finalize(self) -> Result<AggOutput> {
         Ok(match self {
             AggState::Sum { sum, .. } => AggOutput::Integer(sum),
-            AggState::Avg { sum, count, .. } => {
+            AggState::Avg { int_sum, count, .. } => {
                 if count == 0 {
                     // AVG of the empty multiset is the identity `"0"^^xsd:integer`
                     // (SPARQL 1.1 §18.5.1.4), matching the generic aggregate path.
                     AggOutput::Integer(0)
                 } else {
+                    // Only the integer lane accumulates (fold_row declines every
+                    // other numeric encoding), so the result is always exact
+                    // xsd:decimal — byte-identical to the generic finalize_avg
+                    // for integer inputs (differential harness FD-1).
+                    let avg = (bigdecimal::BigDecimal::from(int_sum)
+                        / bigdecimal::BigDecimal::from(count as i64))
+                    .with_prec(crate::aggregate::AVG_DECIMAL_PRECISION)
+                    .normalized();
                     AggOutput::Binding(Binding::lit(
-                        FlakeValue::Double(sum / count as f64),
-                        Sid::xsd_double(),
+                        FlakeValue::Decimal(Box::new(avg)),
+                        Sid::xsd_decimal(),
                     ))
                 }
             }
@@ -297,8 +319,7 @@ impl AggState {
             }
             AggState::Avg {
                 required_otype,
-                sum,
-                compensation,
+                int_sum,
                 count,
             } => {
                 if !OType::from_u16(o_type).is_numeric() {
@@ -309,12 +330,24 @@ impl AggState {
                     Some(existing) if existing != o_type => return Ok(false),
                     Some(_) => {}
                 }
-                let val = decode_numeric_as_f64(o_type, o_key)?;
-                // Kahan summation: compensate for lost low-order bits.
-                let y = val - *compensation;
-                let t = *sum + y;
-                *compensation = (t - *sum) - y;
-                *sum = t;
+                match OType::from_u16(o_type).decode_kind() {
+                    DecodeKind::I64 => {
+                        // Exact, order-free integer accumulation; overflow →
+                        // generic pipeline (which sums in BigDecimal).
+                        let Some(next) = int_sum.checked_add(ObjKey::from_u64(o_key).decode_i64())
+                        else {
+                            return Ok(false);
+                        };
+                        *int_sum = next;
+                    }
+                    // xsd:double and every other numeric encoding decline to the
+                    // generic pipeline. f64 addition is non-associative and this
+                    // lane folds in POST (value) order while the generic pipeline
+                    // folds in scan order, so a fast double sum is NOT guaranteed
+                    // to match (differential harness `avg_double`). Only the exact
+                    // integer lane is order-free and safe to fast-path.
+                    _ => return Ok(false),
+                }
                 *count = count.saturating_add(1);
             }
             AggState::CountDistinct {
@@ -352,7 +385,7 @@ fn empty_result(kind: ScalarAggKind) -> AggOutput {
 /// Shared POST-leaflet scan driver. Returns `Ok(None)` when a variant hits a
 /// runtime-unsupported leaflet (mixed/non-matching datatypes) and the caller
 /// must fall back to the planned pipeline.
-fn scan_predicate_scalar_agg(
+pub(crate) fn scan_predicate_scalar_agg(
     store: &BinaryIndexStore,
     g_id: GraphId,
     predicate: &Ref,
@@ -383,7 +416,7 @@ fn scan_predicate_scalar_agg(
     for leaf_entry in leaves {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         let dir = handle.dir();
 
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
@@ -472,7 +505,7 @@ fn leaflet_scan_plan(
 /// [`AggState`] over a POST overlay cursor that merges uncommitted novelty and
 /// honors `to_t`. Used when an overlay carries novelty or `to_t < max_t`, where
 /// the leaflet-metadata scan would be stale.
-fn scan_predicate_scalar_agg_overlay(
+pub(crate) fn scan_predicate_scalar_agg_overlay(
     ctx: &crate::context::ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
     g_id: GraphId,
@@ -484,11 +517,7 @@ fn scan_predicate_scalar_agg_overlay(
         // Predicate absent from the persisted dictionary. With novelty present it
         // may exist only in the overlay (no `p_id` to range-bound a cursor), so
         // fall back to the planned pipeline; otherwise the input is genuinely empty.
-        let overlay_has_rows = ctx
-            .overlay
-            .map(fluree_db_core::OverlayProvider::epoch)
-            .unwrap_or(0)
-            != 0;
+        let overlay_has_rows = crate::fast_path_common::overlay_has_novelty(ctx);
         return if overlay_has_rows {
             Ok(None)
         } else {
@@ -529,81 +558,107 @@ fn scan_predicate_scalar_agg_overlay(
 // Decode helpers
 // ---------------------------------------------------------------------------
 
-fn decode_numeric_as_f64(o_type: u16, o_key: u64) -> Result<f64> {
-    let ot = OType::from_u16(o_type);
-    let key = ObjKey::from_u64(o_key);
-    match ot.decode_kind() {
-        DecodeKind::I64 => Ok(key.decode_i64() as f64),
-        DecodeKind::F64 => Ok(key.decode_f64()),
-        _ => Err(QueryError::execution(format!(
-            "unsupported numeric decode kind for AVG fast-path: {ot:?}"
-        ))),
-    }
+/// What one row contributes to a fused date-component fold.
+///
+/// `Absent` is the case that matters: the value's datatype does not carry the
+/// field (`DAY` of an `xsd:gYear`), so the per-row expression is unbound. SUM
+/// skips unbound, hence [`Self::sum_contribution`] scores it 0 — but any future
+/// non-SUM consumer (an AVG that must not count the row, a COUNT that must not
+/// either) has to make that decision for itself rather than inherit a silent 0.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ComponentFold {
+    Value(i64),
+    Absent,
+    /// The datatype is not one this fold can read at all — decline the fast path.
+    Unsupported,
 }
 
-fn constant_component_for_otype(o_type: u16, component: DateComponentFn) -> Option<i64> {
-    let ot = OType::from_u16(o_type);
-    match component {
-        DateComponentFn::Year => None,
-        DateComponentFn::Month => {
-            if ot == OType::XSD_G_YEAR || ot == OType::XSD_G_DAY {
-                Some(1)
-            } else {
-                None
-            }
-        }
-        DateComponentFn::Day => {
-            if ot == OType::XSD_G_YEAR || ot == OType::XSD_G_YEAR_MONTH || ot == OType::XSD_G_MONTH
-            {
-                Some(1)
-            } else {
-                None
-            }
+impl ComponentFold {
+    /// Contribution to a SUM, or `None` to decline the fast path.
+    fn sum_contribution(self) -> Option<i64> {
+        match self {
+            Self::Value(v) => Some(v),
+            Self::Absent => Some(0),
+            Self::Unsupported => None,
         }
     }
 }
 
-fn component_from_otype_okey(o_type: u16, o_key: u64, component: DateComponentFn) -> Option<i64> {
+impl DateComponentFn {
+    fn field(self) -> CalendarField {
+        match self {
+            Self::Year => CalendarField::Year,
+            Self::Month => CalendarField::Month,
+            Self::Day => CalendarField::Day,
+        }
+    }
+}
+
+/// The fold for a whole leaflet, when its homogeneous `o_type` settles the
+/// field without reading a single column.
+///
+/// A field the datatype does not carry is `Absent` for every row — the whole
+/// leaflet folds to nothing, with no IO. (Before #1652's sibling fix this
+/// returned the promotion's `1` here, which is precisely how a year-only
+/// leaflet came to contribute a day per row.)
+fn constant_component_for_otype(o_type: u16, component: DateComponentFn) -> Option<ComponentFold> {
+    let kind = TemporalKind::from_o_type(OType::from_u16(o_type))?;
+    if !kind.carries(component.field()) {
+        return Some(ComponentFold::Absent);
+    }
+    // Carried fields are constant only where the datatype pins them: a gMonth's
+    // month varies per row, but a gYear has no month to vary.
+    None
+}
+
+fn component_from_otype_okey(o_type: u16, o_key: u64, component: DateComponentFn) -> ComponentFold {
     let ot = OType::from_u16(o_type);
+    let Some(kind) = TemporalKind::from_o_type(ot) else {
+        return ComponentFold::Unsupported;
+    };
+    if !kind.carries(component.field()) {
+        return ComponentFold::Absent;
+    }
     let key = ObjKey::from_u64(o_key);
 
-    // Defaulting semantics match helpers.rs promotion:
-    // - gYear → Jan 1, 00:00:00
-    // - gYearMonth → day=1
-    // - gMonth/gDay/gMonthDay → year=1970, missing parts default to 1
-    const DEFAULT_YEAR: i64 = 1970;
-    const DEFAULT_MONTH: i64 = 1;
-
-    let (year, month, day) = if ot == OType::XSD_G_YEAR {
-        (key.decode_g_year() as i64, 1, 1)
+    let parts = if ot == OType::XSD_G_YEAR {
+        Some((key.decode_g_year() as i64, 0, 0))
     } else if ot == OType::XSD_G_YEAR_MONTH {
         let (y, m) = key.decode_g_year_month();
-        (y as i64, m as i64, 1)
+        Some((y as i64, m as i64, 0))
     } else if ot == OType::XSD_G_MONTH {
-        (DEFAULT_YEAR, key.decode_g_month() as i64, 1)
+        Some((0, key.decode_g_month() as i64, 0))
     } else if ot == OType::XSD_G_DAY {
-        (DEFAULT_YEAR, DEFAULT_MONTH, key.decode_g_day() as i64)
+        Some((0, 0, key.decode_g_day() as i64))
     } else if ot == OType::XSD_G_MONTH_DAY {
         let (m, d) = key.decode_g_month_day();
-        (DEFAULT_YEAR, m as i64, d as i64)
+        Some((0, m as i64, d as i64))
     } else if ot == OType::XSD_DATE {
         // xsd:date: days since Unix epoch (1970-01-01)
-        let days = key.decode_date() as i64;
-        let base = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?;
-        let dt = base.checked_add_signed(chrono::Duration::days(days))?;
-        (dt.year() as i64, dt.month() as i64, dt.day() as i64)
+        chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+            .and_then(|base| {
+                base.checked_add_signed(chrono::Duration::days(key.decode_date() as i64))
+            })
+            .map(|dt| (dt.year() as i64, dt.month() as i64, dt.day() as i64))
     } else if ot == OType::XSD_DATE_TIME {
-        // xsd:dateTime: epoch micros; interpret in UTC for component extraction.
-        let micros = key.decode_datetime();
-        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(micros)?;
-        (dt.year() as i64, dt.month() as i64, dt.day() as i64)
+        // xsd:dateTime: epoch micros. Offsets are normalized to UTC at ingest,
+        // so reading the components in UTC matches the generic pipeline.
+        chrono::DateTime::<chrono::Utc>::from_timestamp_micros(key.decode_datetime())
+            .map(|dt| (dt.year() as i64, dt.month() as i64, dt.day() as i64))
     } else {
-        return None;
+        // xsd:time carries no date fields, and `carries` already returned above
+        // for those; anything else this fold cannot read.
+        None
     };
 
-    match component {
-        DateComponentFn::Year => Some(year),
-        DateComponentFn::Month => Some(month),
-        DateComponentFn::Day => Some(day),
+    // Only carried fields are read, so the zero placeholders above are never
+    // the value selected here.
+    match parts {
+        Some((year, month, day)) => ComponentFold::Value(match component {
+            DateComponentFn::Year => year,
+            DateComponentFn::Month => month,
+            DateComponentFn::Day => day,
+        }),
+        None => ComponentFold::Unsupported,
     }
 }

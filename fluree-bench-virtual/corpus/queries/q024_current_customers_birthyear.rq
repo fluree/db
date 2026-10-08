@@ -1,0 +1,8 @@
+# q024 current_customers_birthyear
+# Intent: Integer-range FILTER on a dimension (isCurrent-pinned).
+# BI lineage (BI-13): "How many current customers were born in the 1980s?"
+# Predicates verified against enterprise.ttl — DimCustomer: isCurrent, birthYear.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?c
+WHERE { ?c a edw:Customer ; edw:isCurrent true ; edw:birthYear ?by .
+        FILTER(?by >= 1980 && ?by <= 1989) }

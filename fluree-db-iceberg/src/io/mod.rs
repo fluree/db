@@ -10,6 +10,7 @@
 pub mod batch;
 #[cfg(feature = "aws")]
 pub mod chunk_reader;
+pub mod file_storage;
 pub mod parquet;
 #[cfg(feature = "aws")]
 pub mod send_parquet;
@@ -21,11 +22,12 @@ pub mod storage;
 pub(crate) mod arrow_reader;
 
 pub use batch::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType};
-pub use storage::{IcebergStorage, MemoryStorage, RangeOnlyStorage};
+pub use file_storage::FileIcebergStorage;
+pub use storage::{IcebergStorage, MemoryStorage, RangeOnlyStorage, SendIcebergStorage};
 
 #[cfg(feature = "aws")]
 pub use chunk_reader::RangeBackedChunkReader;
 #[cfg(feature = "aws")]
 pub use send_parquet::SendParquetReader;
 #[cfg(feature = "aws")]
-pub use storage::{S3IcebergStorage, SendIcebergStorage};
+pub use storage::{IcebergStorageBackend, S3IcebergStorage};

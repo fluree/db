@@ -9,6 +9,7 @@ description = "SHACL validation engine for Fluree DB"
 [dependencies]
 fluree-db-core = { path = "../fluree-db-core" }
 fluree-db-query = { path = "../fluree-db-query" }
+fluree-db-sparql = { path = "../fluree-db-sparql" }
 fluree-vocab = { path = "../fluree-vocab" }
 async-trait = { workspace = true }
 thiserror = { workspace = true }

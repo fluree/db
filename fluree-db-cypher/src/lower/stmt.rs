@@ -1,7 +1,7 @@
 //! Statement-level read-path lowering.
 
 use fluree_db_core::{FlakeValue, Sid};
-use fluree_db_query::binding::Binding;
+use fluree_db_query::binding::{Binding, UnmatchedOptional};
 use fluree_db_query::ir::grouping::{AggregateFn, AggregateSpec, Grouping};
 use fluree_db_query::ir::{Pattern, Query, QueryOutput, SubqueryPattern};
 use fluree_db_query::parse::encode::IriEncoder;
@@ -52,6 +52,11 @@ pub fn lower_query<E: IriEncoder>(
         post_values: None,
         // System-fact filter ON — hides f:reifies* from untyped relationship matches.
         include_system_facts: false,
+        union_default_graph: None,
+        cypher_vocab: None,
+        // Cypher null: a later pattern using a var an OPTIONAL MATCH left
+        // null matches nothing (SPARQL's unbound would match anything).
+        unmatched_optional: UnmatchedOptional::Poisoned,
     })
 }
 
@@ -144,6 +149,11 @@ fn lower_union_query<E: IriEncoder>(
         reasoning: Default::default(),
         post_values: None,
         include_system_facts: false,
+        union_default_graph: None,
+        cypher_vocab: None,
+        // Cypher null: a later pattern using a var an OPTIONAL MATCH left
+        // null matches nothing (SPARQL's unbound would match anything).
+        unmatched_optional: UnmatchedOptional::Poisoned,
     })
 }
 
@@ -224,6 +234,48 @@ impl SingleBranch {
 }
 
 fn lower_single_branch<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    q: &crate::ast::Query,
+    outer_scope: &[VarId],
+) -> Result<SingleBranch> {
+    // Anonymous-hop chains may fuse to a frontier-BFS path only when walk
+    // multiplicity is unobservable: DISTINCT output, no aggregates anywhere
+    // in the projection or ORDER BY, and no clause that could observe or
+    // aggregate per-walk rows (WITH / CALL). See
+    // `LoweringContext::fuse_reachability_chains`.
+    // Every `Query` node reaches lowering through here — the top level, each
+    // UNION branch, and each `CALL { … }` body — so this is the one place the
+    // annotation-surface / element-property sets need to be scoped. Save and
+    // restore rather than reset: CALL bodies nest inside an enclosing scope.
+    let saved_uses = ctx.swap_scope_uses(super::annotation_use::scope_uses(q));
+    let saved_fusion = ctx.fuse_reachability_chains;
+    ctx.fuse_reachability_chains = q.return_clause.distinct
+        && !q
+            .return_clause
+            .items
+            .iter()
+            .any(|item| expr_has_aggregate(&item.expr))
+        && !q
+            .return_clause
+            .order_by
+            .iter()
+            .any(|o| expr_has_aggregate(&o.expr))
+        && q.clauses.iter().all(|c| {
+            matches!(
+                c,
+                ReadClause::Match(_)
+                    | ReadClause::OptionalMatch(_)
+                    | ReadClause::Unwind(_)
+                    | ReadClause::InlineRows { .. }
+            )
+        });
+    let result = lower_single_branch_inner(ctx, q, outer_scope);
+    ctx.fuse_reachability_chains = saved_fusion;
+    ctx.swap_scope_uses(saved_uses);
+    result
+}
+
+fn lower_single_branch_inner<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     q: &crate::ast::Query,
     outer_scope: &[VarId],
@@ -650,7 +702,8 @@ fn expr_touches_list<E: IriEncoder>(
         | Expr::In(a, b, _)
         | Expr::StartsWith(a, b, _)
         | Expr::EndsWith(a, b, _)
-        | Expr::Contains(a, b, _) => {
+        | Expr::Contains(a, b, _)
+        | Expr::RegexMatch(a, b, _) => {
             expr_touches_list(ctx, a, list_outputs) || expr_touches_list(ctx, b, list_outputs)
         }
         Expr::UnaryOp(_, a, _)
@@ -717,6 +770,7 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         | Expr::StartsWith(l, r, _)
         | Expr::EndsWith(l, r, _)
         | Expr::Contains(l, r, _)
+        | Expr::RegexMatch(l, r, _)
         | Expr::Index(l, r, _) => expr_has_aggregate(l) || expr_has_aggregate(r),
         Expr::UnaryOp(_, x, _)
         | Expr::IsNull(x, _)
@@ -805,6 +859,7 @@ fn extract_aggregates_inner<E: IriEncoder>(
         | Expr::StartsWith(l, r, _)
         | Expr::EndsWith(l, r, _)
         | Expr::Contains(l, r, _)
+        | Expr::RegexMatch(l, r, _)
         | Expr::Index(l, r, _) => {
             extract_aggregates_inner(ctx, l, patterns, aggregates, counter, false)?;
             extract_aggregates_inner(ctx, r, patterns, aggregates, counter, false)
@@ -880,6 +935,7 @@ fn composite_references_grouping_value(e: &Expr) -> bool {
         | Expr::StartsWith(l, r, _)
         | Expr::EndsWith(l, r, _)
         | Expr::Contains(l, r, _)
+        | Expr::RegexMatch(l, r, _)
         | Expr::Index(l, r, _) => {
             composite_references_grouping_value(l) || composite_references_grouping_value(r)
         }
@@ -1120,6 +1176,31 @@ fn const_usize(e: &Option<Expr>) -> Result<Option<usize>> {
 /// WITH's projection items become the subquery's select list.
 /// WITH-induced modifiers (WHERE, ORDER BY, SKIP, LIMIT) and
 /// aggregates apply inside the subquery.
+/// Keep a bounded fixed-chain expansion's identity-carrying relationship list
+/// alive across a `WITH` that projects its path variable. Without this the
+/// list is dropped at the projection boundary, and `relationships(p)` after
+/// the `WITH` falls back to the path value — which carries no per-hop
+/// reifier, so `r.prop` over it reads nothing.
+///
+/// **Only valid for a non-aggregating `WITH`.** A grouping projection has
+/// already fixed its group keys, so a variable added to `select` here is
+/// neither a key nor an aggregate output and reaches the outer scope as a
+/// `Binding::Grouped` — which the evaluator asserts against. The caller gates
+/// on that; see `lower_with`.
+fn augment_select_with_path_rel_lists<E: IriEncoder>(
+    ctx: &LoweringContext<'_, E>,
+    mut select: Vec<VarId>,
+) -> Vec<VarId> {
+    for path in select.clone() {
+        if let Some(list) = ctx.path_rel_list(path) {
+            if !select.contains(&list) {
+                select.push(list);
+            }
+        }
+    }
+    select
+}
+
 fn lower_with<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     w: &WithClause,
@@ -1135,6 +1216,10 @@ fn lower_with<E: IriEncoder>(
     // Captured before `projection` is partially moved below; used to reject an
     // ORDER BY on a collect() list (sorting a list value is unsound in v1).
     let list_outputs = projection.list_outputs.clone();
+    // Same reason: `projection.aggregates` is moved into `Grouping::assemble`
+    // below, but the select-list augmentation that runs after it has to know
+    // whether this `WITH` groups.
+    let has_aggregates = !projection.aggregates.is_empty();
 
     // WITH WHERE routing:
     //
@@ -1202,6 +1287,19 @@ fn lower_with<E: IriEncoder>(
     // ordering references (the synthetic `?#__prop_*` names stay
     // hidden from `RETURN *` via the wildcard formatter filter).
     let augmented_select = augment_select_with_sort_vars(projection.vars, &ordering);
+    // An aggregating `WITH` cannot carry the identity list. `Grouping::assemble`
+    // has fixed the group keys by this point, so a list pushed into `select`
+    // here is neither a key nor an aggregate output: it arrives at the RETURN
+    // as `Binding::Grouped` and trips the evaluator's grouped-binding
+    // assertion on any read of it. Dropping it is the documented fallback —
+    // `relationships(p)` coalesces back to the path value, which answers
+    // `size()`, `type()` and the endpoints correctly and reads `null` for the
+    // per-hop properties it cannot carry (see `lower/expr.rs`).
+    let augmented_select = if has_aggregates {
+        augmented_select
+    } else {
+        augment_select_with_path_rel_lists(ctx, augmented_select)
+    };
     let mut sq = SubqueryPattern::new(augmented_select, inner_patterns);
 
     if !ordering.is_empty() {
@@ -1450,7 +1548,13 @@ fn lower_call_branch<E: IriEncoder>(
     }
 
     match branch.into_subquery_pattern(select) {
-        Pattern::Subquery(sq) => Ok((sq, return_vars)),
+        // Pin the CALL imports: openCypher defines `CALL (p)` as a per-row
+        // lateral binding, so `p` must be SEEDED even when the body binds it
+        // only via OPTIONAL MATCH (the shared engine's Family-B rule would
+        // otherwise leave it unseeded and reconcile at merge, dropping a
+        // zero-match parent that `OPTIONAL MATCH … RETURN count(…)` must
+        // retain as 0).
+        Pattern::Subquery(sq) => Ok((sq.with_pinned_vars(import_vars.to_vec()), return_vars)),
         _ => unreachable!("into_subquery_pattern always yields Pattern::Subquery"),
     }
 }
@@ -1568,10 +1672,29 @@ fn lower_inline_rows<E: IriEncoder>(
 }
 
 fn literal_to_binding(e: &Expr) -> Result<Binding> {
-    let Expr::Lit(lit) = e else {
-        return Err(LowerError::unsupported(
-            "UNWIND list elements must be literals in v1 (no nested expressions yet)",
-        ));
+    let lit = match e {
+        Expr::Lit(lit) => lit,
+        // Constant list/map cells (procedure-shim rows like dbms.components'
+        // `versions` column) recurse element-wise.
+        Expr::List(items, _) => {
+            return items
+                .iter()
+                .map(literal_to_binding)
+                .collect::<Result<Vec<_>>>()
+                .map(Binding::List);
+        }
+        Expr::Map(entries, _) => {
+            return entries
+                .iter()
+                .map(|(k, v)| Ok((std::sync::Arc::from(k.as_str()), literal_to_binding(v)?)))
+                .collect::<Result<Vec<_>>>()
+                .map(Binding::Map);
+        }
+        _ => {
+            return Err(LowerError::unsupported(
+                "UNWIND list elements must be literals in v1 (no nested expressions yet)",
+            ));
+        }
     };
     Ok(match lit {
         Literal::Integer(n, _) => {

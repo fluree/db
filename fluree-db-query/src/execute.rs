@@ -48,11 +48,12 @@ pub use runner::ExecutableQuery;
 
 // Re-export internal helpers for use in lib.rs
 pub use where_plan::build_where_operators_seeded;
+pub(crate) use where_plan::collect_var_stats;
 pub use where_plan::expand_edge_annotation_patterns;
 pub(crate) use where_plan::{analyze_property_join_plan, collect_inner_join_block};
 
 // Re-export operator tree builder and runner for custom execution pipelines
-pub use operator_tree::build_operator_tree;
+pub use operator_tree::{build_operator_tree, fast_paths_disabled, set_fast_paths_disabled};
 pub use runner::{run_operator, run_operator_streaming};
 
 // Re-export pushdown utilities for tests
@@ -84,7 +85,7 @@ mod tests {
     use where_plan::collect_inner_join_block;
 
     fn make_test_snapshot() -> LedgerSnapshot {
-        LedgerSnapshot::genesis("test/main")
+        LedgerSnapshot::genesis("test:main")
     }
 
     fn make_pattern(s_var: VarId, p_name: &str, o_var: VarId) -> TriplePattern {
@@ -114,6 +115,9 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
+            cypher_vocab: None,
+            unmatched_optional: Default::default(),
         };
         let executable = ExecutableQuery::simple(query);
         let results = execute(db, &vars, &executable, ContextConfig::default())
@@ -143,6 +147,9 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
+            cypher_vocab: None,
+            unmatched_optional: Default::default(),
         };
 
         let result = build_operator_tree(
@@ -171,6 +178,9 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
+            cypher_vocab: None,
+            unmatched_optional: Default::default(),
         };
 
         let result = build_operator_tree(

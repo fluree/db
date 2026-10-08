@@ -35,7 +35,7 @@ Standards and feature-flag reference:
 
 Naming conventions for graphs, ledgers, and identifiers:
 - User-facing terminology (ledger, graph IRI, graph source, graph snapshot)
-- Time pinning syntax (`@t:`, `@iso:`, `@commit:`)
+- Time pinning syntax (`@t:`, `@time:`, `@commit:`)
 - Named graphs within a ledger
 - Base resolution for graph references
 
@@ -47,6 +47,14 @@ Overview of Fluree's Rust crate architecture:
 - Query engine crates
 - Storage crates
 - Dependency relationships
+
+### [License FAQ](license-faq.md)
+
+What the Business Source License allows:
+- Production use and the Database Service restriction
+- Building applications and data products on Fluree
+- Change Date and version coverage
+- Contributions and commercial licensing
 
 ## Quick Reference
 
@@ -71,7 +79,7 @@ Overview of Fluree's Rust crate architecture:
 
 ```text
 ledger:branch@t:123             # Transaction number
-ledger:branch@iso:2024-01-22    # ISO timestamp
+ledger:branch@time:2024-01-22    # ISO timestamp
 ledger:branch@commit:bafybeig...  # Commit ContentId
 ```
 

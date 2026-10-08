@@ -17,6 +17,7 @@ rustc-hash = "2"
 
 [dev-dependencies]
 tempfile = "3"
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

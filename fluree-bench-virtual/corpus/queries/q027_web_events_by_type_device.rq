@@ -1,0 +1,8 @@
+# q027 web_events_by_type_device
+# Intent: Largest single-table fact GROUP BY (1M rows; H1 heaviest).
+# BI lineage (BI-15): "What are web event counts by type and device?"
+# Predicates verified against enterprise.ttl — FactWebEvent: eventType, deviceType.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?et ?dev (COUNT(?e) AS ?n)
+WHERE { ?e a edw:WebEvent ; edw:eventType ?et ; edw:deviceType ?dev . }
+GROUP BY ?et ?dev

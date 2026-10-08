@@ -10,7 +10,7 @@ description = "Ledger state combining indexed Db with novelty overlay"
 fluree-db-core = { path = "../fluree-db-core" }
 parking_lot = "0.12"
 fluree-db-novelty = { path = "../fluree-db-novelty" }
-fluree-db-nameservice = { path = "../fluree-db-nameservice" }
+fluree-db-nameservice = { path = "../fluree-db-nameservice", default-features = false }
 fluree-vocab = { path = "../fluree-vocab" }
 async-trait = { workspace = true }
 serde_json = { workspace = true }

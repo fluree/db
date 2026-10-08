@@ -25,6 +25,8 @@
 //! }
 //! ```
 
+#[cfg(feature = "bolt")]
+pub mod bolt;
 pub mod config;
 pub mod config_file;
 pub mod error;
@@ -52,14 +54,128 @@ pub use state::AppState;
 pub use telemetry::{init_logging, shutdown_tracer, TelemetryConfig};
 
 use axum::Router;
+use fluree_db_api::{Bm25MaintenanceWorker, Bm25WorkerHandle, Fluree};
+use fluree_db_nameservice::GraphSourceRecord;
 use std::sync::Arc;
+
+/// Whether this process runs a Raft node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Consensus {
+    /// Raft is configured, so the leader watcher owns leader-only tasks.
+    Raft,
+    /// No consensus layer; this process owns its tasks outright.
+    Standalone,
+}
+
+/// Which part of the deployment runs the BM25 maintenance worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bm25WorkerOwner {
+    /// Nothing: `--bm25-auto-sync` is off.
+    Disabled,
+    /// Nothing on this server. A peer forwards its writes, so the commit
+    /// events that drive a sync are published on the transaction server's
+    /// event bus rather than this one.
+    PeerForwardsWrites,
+    /// The Raft leader watcher, which spawns the worker on election. A sync
+    /// proposes `PublishGraphSourceIndex`, so it must originate on the leader.
+    RaftLeader,
+    /// This server, for the life of `serve()`.
+    ThisServer,
+}
+
+/// Decide who runs the BM25 maintenance worker for this deployment.
+fn bm25_worker_owner(config: &ServerConfig, consensus: Consensus) -> Bm25WorkerOwner {
+    if !config.bm25_auto_sync {
+        Bm25WorkerOwner::Disabled
+    } else if config.server_role == ServerRole::Peer {
+        Bm25WorkerOwner::PeerForwardsWrites
+    } else if consensus == Consensus::Raft {
+        Bm25WorkerOwner::RaftLeader
+    } else {
+        Bm25WorkerOwner::ThisServer
+    }
+}
+
+/// Select the graph sources the startup registration pass hands to the worker.
+///
+/// Retracted indexes are left out: syncing one is refused, so registering it
+/// would only log a failed sync on every commit to its source ledger.
+pub fn indexes_to_auto_sync(records: &[GraphSourceRecord]) -> Vec<&GraphSourceRecord> {
+    records
+        .iter()
+        .filter(|gs| gs.is_bm25() && !gs.retracted)
+        .collect()
+}
+
+/// Build a BM25 maintenance worker seeded with the indexes that already exist.
+///
+/// `auto_register` only picks up indexes created while the worker is running,
+/// so without this pass an index created before startup would never sync.
+/// Failing to enumerate is not fatal: those indexes stay unregistered until
+/// their next config publish, and ones created from here on still register.
+async fn build_bm25_worker(fluree: Arc<Fluree>) -> (Bm25MaintenanceWorker, Bm25WorkerHandle) {
+    let worker = Bm25MaintenanceWorker::new(Arc::clone(&fluree));
+    let handle = worker.handle();
+
+    match fluree.nameservice().all_graph_source_records().await {
+        Ok(records) => {
+            let indexes = indexes_to_auto_sync(&records);
+            for gs in &indexes {
+                // A persisted dependency that no longer parses cannot name a
+                // ledger any commit event will carry; skip it, loudly.
+                if let Err(e) =
+                    handle.register_graph_source_with_deps(&gs.graph_source_id, &gs.dependencies)
+                {
+                    tracing::warn!(graph_source = %gs.graph_source_id, error = %e, "Skipping BM25 index with unparseable dependencies");
+                }
+            }
+            info!(registered = indexes.len(), "BM25 auto-sync starting");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to enumerate BM25 indexes for auto-sync");
+        }
+    }
+
+    (worker, handle)
+}
+
+/// Leader-scope key rotation task: resume a pending sweep, then hold. The
+/// guard releases the sweep when the task is aborted on leadership loss.
+#[cfg(feature = "raft")]
+async fn run_key_rotation_on_leader(fluree: Arc<fluree_db_api::Fluree>, holder: String) {
+    struct ReleaseOnDrop(Arc<fluree_db_api::Fluree>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release_key_rotation();
+        }
+    }
+    let _release = ReleaseOnDrop(Arc::clone(&fluree));
+    match fluree.resume_pending_key_rotation(&holder).await {
+        Ok(Some(progress)) => tracing::info!(
+            retire_key_id = progress.retire_key_id,
+            units_done = progress.units_done,
+            units_total = progress.units_total,
+            "resumed a pending key rotation on the leader"
+        ),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(%e, "could not resume a pending key rotation on the leader"),
+    }
+    std::future::pending::<()>().await;
+}
+
+/// Drive a BM25 maintenance worker to completion, logging an unexpected exit.
+///
+/// Used by the Raft leader watcher, whose task-spawning closure is synchronous
+/// and so cannot do the registration pass itself.
+#[cfg(feature = "raft")]
+async fn run_bm25_worker(fluree: Arc<Fluree>) {
+    let (worker, _handle) = build_bm25_worker(fluree).await;
+    if let Err(e) = worker.run().await {
+        tracing::error!(error = %e, "BM25 maintenance worker exited");
+    }
+}
 use tokio::net::TcpListener;
 use tracing::info;
-
-#[cfg(feature = "raft")]
-use fluree_db_consensus::raft::commit_worker::{
-    PublishingChannel, QueuePoisonPublisher, StagingContext, WorkerSupervisor,
-};
 
 /// Private listener config for the Raft inter-node RPC + admin
 /// routers. Only populated when the server is constructed with a
@@ -85,40 +201,45 @@ pub struct FlureeServer {
     /// Optional private Raft listener (consensus + admin).
     #[cfg(feature = "raft")]
     raft_listener: Option<RaftListener>,
-    /// Leader-aware watcher driving every leader-only background
-    /// task (indexer, idempotency evictor). `Some` when raft mode is
-    /// on. Aborted on shutdown so the spawned tasks tear down with
-    /// the rest of the server.
+    /// The committer, worker supervisor, leader watcher, and release
+    /// task, owned together so they shut down in the order that keeps
+    /// the content store consistent. `Some` when raft mode is on.
     #[cfg(feature = "raft")]
-    raft_leader_watcher: Option<crate::raft::CancellableTaskHandle>,
-    /// Per-node worker supervisor. Runs on every node (independent
-    /// of leadership) and drives per-branch [`Worker`] tasks for
-    /// branches this node owns under rendezvous assignment. Shut
-    /// down gracefully so in-flight workers stop before the runtime
-    /// goes away.
-    ///
-    /// [`Worker`]: fluree_db_consensus::raft::commit_worker::Worker
-    #[cfg(feature = "raft")]
-    raft_worker_supervisor: Option<crate::raft::CancellableTaskHandle>,
-    /// Per-node release task that drains the state-machine adapter's
-    /// CAS release channel. Runs on every node (not just the leader)
-    /// so admin-cleared queue entries and idempotency-evicted
-    /// envelopes don't orphan their bodies in the content store.
-    ///
-    /// Holds the task's `JoinHandle` and a `CancellationToken`.
-    /// Shutdown cancels the token, the task drains any messages
-    /// already buffered in the channel, then exits; the
-    /// `JoinHandle` is awaited so leftover releases land in the
-    /// content store before the process goes away. A naked
-    /// `task.abort()` here would drop in-flight releases and leak
-    /// the envelopes — the channel is `mpsc::unbounded`, so
-    /// whatever the adapter pushed between the last `recv` and the
-    /// abort is gone.
-    #[cfg(feature = "raft")]
-    raft_release_task: Option<(
-        tokio::task::JoinHandle<()>,
-        tokio_util::sync::CancellationToken,
-    )>,
+    raft_node: Option<fluree_db_consensus::raft::embedded::EmbeddedRaftNode>,
+}
+
+/// How long in-flight requests get to complete after a shutdown
+/// signal before remaining connections are closed. Long-lived
+/// response streams (the SSE events endpoint) never complete on
+/// their own — without this bound they would hold graceful shutdown
+/// open past the process supervisor's kill deadline, and the
+/// post-serve teardown below (worker drain, CAS release drain)
+/// would never run at all.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Resolves when the process receives SIGTERM (unix service
+/// managers, Kubernetes) or SIGINT (ctrl-c).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("SIGINT handler installs on any supported platform");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler installs on unix")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
 }
 
 impl FlureeServer {
@@ -287,6 +408,33 @@ impl FlureeServer {
         // Start ledger manager maintenance task for idle eviction
         let ledger_maintenance_task = self.state.fluree.spawn_maintenance();
 
+        // BM25 auto-sync.
+        #[cfg(feature = "raft")]
+        let consensus = if self.state.raft.is_some() {
+            Consensus::Raft
+        } else {
+            Consensus::Standalone
+        };
+        #[cfg(not(feature = "raft"))]
+        let consensus = Consensus::Standalone;
+
+        let bm25_auto_sync = match bm25_worker_owner(&self.state.config, consensus) {
+            Bm25WorkerOwner::Disabled | Bm25WorkerOwner::RaftLeader => None,
+            Bm25WorkerOwner::PeerForwardsWrites => {
+                info!("BM25 auto-sync requested but does not run in peer mode");
+                None
+            }
+            Bm25WorkerOwner::ThisServer => {
+                let (worker, handle) = build_bm25_worker(Arc::clone(&self.state.fluree)).await;
+                let task = tokio::spawn(async move {
+                    if let Err(e) = worker.run().await {
+                        tracing::error!(error = %e, "BM25 maintenance worker exited");
+                    }
+                });
+                Some((handle, task))
+            }
+        };
+
         // Spawn the private Raft listener. Carries the inter-node
         // RPC + cluster admin routers — mount on a VPC-internal
         // interface (no auth on these endpoints by design).
@@ -299,6 +447,38 @@ impl FlureeServer {
                 }
             })
         });
+
+        // Bolt protocol listener (Neo4j drivers). Auth is enforced
+        // per-session against `data_auth_mode`, same as the HTTP data plane.
+        #[cfg(feature = "bolt")]
+        let bolt_task = match self.state.config.bolt_listen_addr {
+            Some(bolt_addr) => Some(
+                bolt::spawn_listener(Arc::clone(&self.state), bolt_addr)
+                    .await?
+                    .1,
+            ),
+            None => None,
+        };
+        if self.state.config.events_open_under_data_auth() {
+            tracing::warn!(
+                "data auth is required but events auth is off: /v1/fluree/events lists every \
+                 ledger and its nameservice record to anyone; set --events-auth-mode to require \
+                 tokens there too"
+            );
+        }
+        if let Some(displaced) = &self.state.config.memory_displaced {
+            tracing::warn!(
+                "memory storage replaces the configured {displaced}; everything written \
+                 is lost when the server stops"
+            );
+        }
+        #[cfg(not(feature = "bolt"))]
+        if self.state.config.bolt_listen_addr.is_some() {
+            tracing::warn!(
+                "bolt_listen_addr is set but this binary was built without the `bolt` \
+                 feature; the Bolt listener will not start"
+            );
+        }
 
         // Warm ledger caches + forward-dict pages in the BACKGROUND, after the
         // listener is bound, so the server accepts requests immediately rather
@@ -317,52 +497,93 @@ impl FlureeServer {
             "Fluree server starting"
         );
 
-        // Run server
-        let result = axum::serve(listener, self.router).await;
+        // Run the server until it errors or a shutdown signal
+        // arrives. On signal, stop accepting and give in-flight
+        // requests `SHUTDOWN_GRACE` to finish; then fall through to
+        // the teardown below regardless, closing whatever remains
+        // (long-lived SSE streams never finish on their own). The
+        // teardown is what drains the raft workers and the CAS
+        // release channel — reaching it on SIGTERM is the entire
+        // point of handling the signal.
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        {
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                info!("shutdown signal received; draining");
+                shutdown.cancel();
+            });
+        }
+        let graceful = shutdown.clone();
+        let serve = axum::serve(listener, self.router).with_graceful_shutdown(async move {
+            graceful.cancelled().await;
+        });
+        let result = tokio::select! {
+            result = serve => result,
+            () = async {
+                shutdown.cancelled().await;
+                tokio::time::sleep(SHUTDOWN_GRACE).await;
+            } => {
+                tracing::warn!(
+                    grace_secs = SHUTDOWN_GRACE.as_secs(),
+                    "drain window elapsed; closing remaining connections"
+                );
+                Ok(())
+            }
+        };
 
         // Cancel background tasks on shutdown
         warm_task.abort();
+        #[cfg(feature = "bolt")]
+        if let Some(task) = bolt_task {
+            task.abort();
+        }
         if let Some(task) = subscription_task {
             task.abort();
         }
         if let Some(task) = ledger_maintenance_task {
             task.abort();
         }
+        // Ask the BM25 worker to stop rather than aborting it, then await the
+        // task: `run()` drains the syncs already in flight before returning, so
+        // a publish in progress completes instead of being cut mid-write. The
+        // `stop()` alone only sets a flag — without the await, the runtime goes
+        // away underneath the sync and cancels it at its next await point.
+        //
+        // Bounded, because a sync re-runs the whole indexing query over the
+        // source ledger; a large corpus must not hold teardown open.
+        if let Some((handle, task)) = bm25_auto_sync {
+            handle.stop();
+            if tokio::time::timeout(SHUTDOWN_GRACE, task).await.is_err() {
+                tracing::warn!(
+                    grace_secs = SHUTDOWN_GRACE.as_secs(),
+                    "BM25 worker did not finish its in-flight syncs; abandoning them"
+                );
+            }
+        }
         #[cfg(feature = "raft")]
         if let Some(task) = raft_listener_task {
             task.abort();
         }
         #[cfg(feature = "raft")]
-        if let Some(handle) = self.raft_worker_supervisor {
-            // Drain workers before the leader-only background tasks
-            // (indexer, evictor) shut down — they touch the same
-            // shared state the workers' final publishes go through,
-            // and ordering matters when this node is itself the
-            // leader. The supervisor aborts each per-branch worker
-            // and returns only after they've stopped.
-            handle.shutdown().await;
+        if let Some(node) = self.raft_node {
+            // Workers, then leader tasks, then the raft core, then the
+            // release drain — the node owns that ordering and the
+            // reasons for it.
+            node.shutdown().await;
         }
-        #[cfg(feature = "raft")]
-        if let Some(handle) = self.raft_leader_watcher {
-            // Cooperative shutdown: cancel the watcher's token, then
-            // await its `JoinHandle`. The watcher exits its select
-            // loop, abort-and-awaits every in-flight leader task,
-            // and only then returns — so this `await` resolves with
-            // a guarantee that every leader-only task (indexer,
-            // eviction scheduler) has actually stopped, not just
-            // been signalled.
-            handle.shutdown().await;
-        }
-        #[cfg(feature = "raft")]
-        if let Some((task, cancel)) = self.raft_release_task {
-            // Cooperative: cancel the recv loop, the task drains
-            // any messages still buffered in the unbounded channel,
-            // then exits. Awaiting the `JoinHandle` is what makes
-            // the drain actually happen before the process tears
-            // down — a bare `abort()` here would skip the drain
-            // and leak the envelopes.
-            cancel.cancel();
-            let _ = task.await;
+
+        // Last: stop the indexer, drop cached ledgers and retire the storage
+        // root's WAL, so a stop that was not a crash leaves nothing for
+        // the next start to replay and the root reads the same to any binary.
+        if tokio::time::timeout(SHUTDOWN_GRACE, self.state.fluree.disconnect())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                grace_secs = SHUTDOWN_GRACE.as_secs(),
+                "storage did not finish closing; the next start replays its WAL"
+            );
         }
 
         result
@@ -415,7 +636,8 @@ pub struct FlureeServerBuilder {
 }
 
 impl FlureeServerBuilder {
-    /// Create a new builder with default config (memory storage)
+    /// Create a new builder with default config (file storage in
+    /// `.fluree/storage`)
     pub fn new() -> Self {
         Self::for_config(ServerConfig::default())
     }
@@ -434,7 +656,9 @@ impl FlureeServerBuilder {
 
     /// Create a builder configured for memory storage
     pub fn memory() -> Self {
-        Self::new()
+        let mut builder = Self::new();
+        builder.config.memory = true;
+        builder
     }
 
     /// Create a builder configured for file storage
@@ -529,14 +753,32 @@ impl FlureeServerBuilder {
         let raft_nameservice = self
             .raft
             .as_ref()
-            .map(|(integration, _)| integration.nameservice());
+            .map(|(integration, _)| (integration.nameservice(), integration.id));
 
         // Build `Fluree` with the right nameservice for the
         // deployment mode. Raft mode wires `RaftNameService` so
         // every node's reads observe replicated state; default mode
         // uses whatever the storage backend implies.
+        //
+        // Raft-mode also threads the integration's
+        // `LedgerEventBus` into Fluree. Without this, the
+        // state-machine adapter emits `NameServiceEvent`s on the
+        // integration's private bus while the events endpoint and
+        // Fluree's own cache reconciler subscribe on
+        // `Fluree::event_bus()` — a different bus instance.
+        // Runtime raft commits then never surface to SSE
+        // subscribers (peers, external tools), because nothing
+        // bridges the two. Passing the same `Arc` here makes both
+        // sides observe the same broadcast channel.
         #[cfg(feature = "raft")]
-        let (fluree, cache_stats_handle) = if let Some(raft_ns) = raft_nameservice.as_ref() {
+        let raft_event_bus = self
+            .raft
+            .as_ref()
+            .map(|(integration, _)| std::sync::Arc::clone(&integration.event_bus));
+        #[cfg(feature = "raft")]
+        let (fluree, cache_stats_handle) = if let Some((raft_ns, node_id)) =
+            raft_nameservice.as_ref()
+        {
             // RaftNameService satisfies the full
             // `NameServicePublisher` surface (refs, admin reindex,
             // status / config push, graph-source publish / index /
@@ -544,198 +786,169 @@ impl FlureeServerBuilder {
             let publisher: std::sync::Arc<dyn fluree_db_nameservice::NameServicePublisher> =
                 raft_ns.clone();
             let ns_mode = fluree_db_api::NameServiceMode::ReadWrite(publisher);
-            state::build_fluree_with_nameservice(&self.config, ns_mode).await?
+            state::build_fluree_with_nameservice(&self.config, ns_mode, raft_event_bus, *node_id)
+                .await?
         } else {
-            state::build_default_fluree(&self.config).await?
+            state::build_default_fluree(&self.config, raft_event_bus).await?
         };
         #[cfg(not(feature = "raft"))]
-        let (fluree, cache_stats_handle) = state::build_default_fluree(&self.config).await?;
+        let (fluree, cache_stats_handle) = state::build_default_fluree(&self.config, None).await?;
 
-        #[allow(unused_mut)]
+        // Only the raft path below mutates `state_inner` (swapping in
+        // the queued committer + adapter wiring); a non-raft build
+        // leaves it untouched, so bind it `mut` only under `raft`.
+        #[cfg(feature = "raft")]
         let mut state_inner =
             AppState::with_fluree(self.config, telemetry_config, fluree, cache_stats_handle)
                 .await?;
+        #[cfg(not(feature = "raft"))]
+        let state_inner =
+            AppState::with_fluree(self.config, telemetry_config, fluree, cache_stats_handle)
+                .await?;
 
+        // Everything node-scoped that isn't the HTTP listener —
+        // committer, worker supervisor, leader watcher, release task —
+        // is assembled by `EmbeddedRaftNode`, the same entry point an
+        // embedding process uses. The server contributes only what
+        // `fluree-db-consensus` cannot: the background indexer (a
+        // dependency-direction constraint) and BM25 auto-sync.
         #[cfg(feature = "raft")]
-        let raft_listener_parts = self.raft.as_ref().map(|(integration, listen_addr)| {
-            // Consensus-side committer stack: `QueuedTransactor`
-            // routes all five `Committer` methods through
-            // `EnqueueCommand` plus the per-process `WaiterMap` and
-            // `StagedReceiptMap`; `CachingCommitter` sits on top so
-            // keyed retries dedupe before the queue propose.
-            let queued = fluree_db_consensus::raft::queued_transactor::QueuedTransactor::new(
-                Arc::clone(&integration.raft),
-                Arc::clone(&state_inner.fluree),
-                Arc::clone(&integration.waiter_map),
-                integration.shared_state.clone(),
-            );
-            state_inner.committer =
-                Arc::new(fluree_db_consensus::CachingCommitter::wrapping(queued));
-            state_inner.raft = Some(Arc::clone(integration));
-            // The actual `RaftListener` is assembled after `state` is
-            // Arc-wrapped below so the admin-auth middleware can be
-            // layered onto the `/cluster` subtree with `Arc<AppState>`.
-            (Arc::clone(integration), *listen_addr)
-        });
-
-        // Per-node CAS release task. The state-machine adapter pushes
-        // `(ledger_id, request_cid)` pairs through the integration's
-        // release channel whenever an apply surfaces evictable
-        // envelopes (idempotency eviction, admin clears). Followers
-        // see the same applies as the leader, so running this task on
-        // every node keeps the content store consistent across the
-        // cluster.
-        #[cfg(feature = "raft")]
-        let raft_release_task = match self.raft.as_ref() {
+        let raft_node = match self.raft.as_ref() {
             Some((integration, _)) => {
-                let rx = integration.take_release_receiver().await;
-                rx.map(|mut rx| {
-                    let fluree = Arc::clone(&state_inner.fluree);
-                    let cancel = tokio_util::sync::CancellationToken::new();
-                    let cancel_for_task = cancel.clone();
-                    let join = tokio::spawn(async move {
-                        loop {
-                            tokio::select! {
-                                biased;
-                                () = cancel_for_task.cancelled() => break,
-                                msg = rx.recv() => {
-                                    match msg {
-                                        Some((ledger_id, cid)) => {
-                                            release_one(&fluree, &ledger_id, &cid).await;
-                                        }
-                                        // Sender side closed (Raft adapter
-                                        // gone): no more releases possible.
-                                        None => return,
-                                    }
-                                }
-                            }
-                        }
-                        // Shutdown drain: between the last `recv` and the
-                        // cancel signal the adapter may have buffered
-                        // releases for evictions / admin clears applied
-                        // moments before stop. Drop them and the
-                        // envelopes leak in the content store with no
-                        // path to GC; pull whatever's buffered and
-                        // release it before the task exits.
-                        while let Ok((ledger_id, cid)) = rx.try_recv() {
-                            release_one(&fluree, &ledger_id, &cid).await;
-                        }
-                    });
-                    (join, cancel)
-                })
-            }
-            None => None,
-        };
-
-        // Subscribe Fluree's `LedgerManager` to the raft integration's
-        // event bus so commit / index applies reconcile cached state
-        // on every node, not just the one that staged the commit.
-        #[cfg(feature = "raft")]
-        if let Some(((integration, _), mgr)) =
-            self.raft.as_ref().zip(state_inner.fluree.ledger_manager())
-        {
-            fluree_db_api::spawn_local_cache_event_listener(
-                Arc::clone(&integration.event_bus),
-                Arc::clone(mgr),
-            );
-        }
-
-        // Per-node worker supervisor. Runs on every node (leader and
-        // followers alike) because distributed workers can land
-        // anywhere under rendezvous assignment. Spawned here so its
-        // lifecycle is independent of the leader watcher's; followers'
-        // workers ferry their apply through the leader via
-        // `RaftNameService::apply_staged_commit`.
-        #[cfg(feature = "raft")]
-        let raft_worker_supervisor = self.raft.as_ref().map(|(integration, _)| {
-            let raft_ns = std::sync::Arc::clone(
-                raft_nameservice
-                    .as_ref()
-                    .expect("raft_nameservice present whenever self.raft is Some"),
-            );
-            let commits: std::sync::Arc<dyn fluree_db_nameservice::CommitPublisher> =
-                std::sync::Arc::clone(&raft_ns) as _;
-            // Same `RaftNameService` Arc upcast a second time, this
-            // time to the queue-poison publisher trait so a follower-
-            // owned worker can ferry deterministic poisons to the
-            // leader instead of looping forever on `client_write`
-            // returning `ForwardToLeader`.
-            let poison: Arc<dyn QueuePoisonPublisher> = Arc::clone(&raft_ns) as _;
-            let supervisor = WorkerSupervisor::new(
-                integration.id,
-                Arc::clone(&integration.raft),
-                integration.shared_state.clone(),
-                PublishingChannel {
-                    commits,
-                    poison,
-                    staged_receipts: Arc::clone(&integration.staged_receipts),
-                },
-                StagingContext {
-                    fluree: Arc::clone(&state_inner.fluree),
+                let raft_ns = std::sync::Arc::clone(
+                    raft_nameservice
+                        .as_ref()
+                        .map(|(ns, _)| ns)
+                        .expect("raft_nameservice present whenever self.raft is Some"),
+                );
+                let backend = state_inner.fluree.backend().clone();
+                let bm25_auto_sync = state_inner.config.bm25_auto_sync;
+                let bm25_fluree = Arc::clone(&state_inner.fluree);
+                // The leader-scope worker is the one that sweeps under raft
+                // (the node-scope worker every node builds through
+                // `build_direct_fluree` has its sweeps delegated here), so the
+                // operator's catch-up interval has to reach THIS config or the
+                // flag governs nothing in a raft deployment — including `0`,
+                // which is the documented off switch.
+                //
+                // The rest of `IndexerConfig` is still defaulted here, which is
+                // pre-existing: `data_dir`, `run_budget_bytes`, the GC knobs and
+                // the fulltext / attachment / warm-cache providers that
+                // `build_direct_fluree` assembles for the node-scope worker do
+                // not reach the leader-scope one.
+                let indexer_config = fluree_db_indexer::IndexerConfig::default()
+                    .with_catchup_interval(std::time::Duration::from_secs(
+                        state_inner.config.indexer_catchup_interval_secs,
+                    ));
+                let event_bus = Arc::clone(&integration.event_bus);
+                let rotation_fluree = Arc::clone(&state_inner.fluree);
+                let rotation_holder = routes::rotation_holder(&state_inner);
+                let leader_tasks = move || {
+                    let nameservice: std::sync::Arc<
+                        dyn fluree_db_nameservice::IndexingNameService,
+                    > = raft_ns.clone();
+                    let (worker, handle) = fluree_db_indexer::BackgroundIndexerWorker::new(
+                        backend.clone(),
+                        nameservice,
+                        indexer_config.clone(),
+                    );
+                    let worker = worker.with_event_bus(Arc::clone(&event_bus));
+                    // The handle owns the worker's ShutdownTrigger:
+                    // dropping it fires the shutdown oneshot and `run()`
+                    // exits on its FIRST select — silently, before its
+                    // first log line — leaving a raft cluster with no
+                    // indexer at all and every read walking the commit
+                    // chain unindexed. Move it into the worker's task so
+                    // they live and die together; the leader watcher's
+                    // abort on leadership loss releases both.
+                    let mut tasks = vec![tokio::spawn(async move {
+                        let _keepalive = handle;
+                        worker.run().await;
+                    })];
+                    // BM25 auto-sync is leader-only for the same reason
+                    // the indexer is: it publishes through the
+                    // nameservice, which under Raft proposes to the
+                    // state machine. Registration happens inside the
+                    // task because this closure re-runs on every
+                    // leadership acquisition, by which point the set of
+                    // indexes may have changed. Losing leadership
+                    // abort-and-awaits it — an ex-leader's publish no
+                    // longer carries, so finishing would only delay the
+                    // handover.
+                    if bm25_auto_sync {
+                        tasks.push(tokio::spawn(run_bm25_worker(Arc::clone(&bm25_fluree))));
+                    }
+                    // A key rotation in progress continues on the new leader
+                    // and is handed off when leadership is lost: the guard's
+                    // drop, run by the abort, releases the record so the next
+                    // leader takes it over without waiting for staleness.
+                    tasks.push(tokio::spawn(run_key_rotation_on_leader(
+                        Arc::clone(&rotation_fluree),
+                        rotation_holder.clone(),
+                    )));
+                    tasks
+                };
+                let config = fluree_db_consensus::raft::embedded::EmbeddedRaftConfig {
                     index_config: state_inner
                         .index_config
                         .clone()
                         .expect("index_config set by AppState::new"),
-                },
-            );
-            crate::raft::spawn_worker_supervisor(supervisor)
-        });
-
-        // Wire the leader-aware launcher. Bundles the background
-        // indexer and the periodic idempotency evictor — both
-        // leader-only tasks. The worker supervisor lives at node
-        // scope (above) and is *not* in this set.
-        #[cfg(feature = "raft")]
-        let raft_leader_watcher = self.raft.as_ref().map(|(integration, _)| {
-            let raft_ns = std::sync::Arc::clone(
-                raft_nameservice
-                    .as_ref()
-                    .expect("raft_nameservice present whenever self.raft is Some"),
-            );
-            let backend = state_inner.fluree.backend().clone();
-            let indexer_config = fluree_db_indexer::IndexerConfig::default();
-            let event_bus = Arc::clone(&integration.event_bus);
-            let eviction_scheduler =
-                fluree_db_consensus::raft::eviction_scheduler::EvictionScheduler::new(Arc::clone(
-                    &integration.raft,
-                ));
-            let liveness_monitor =
-                fluree_db_consensus::raft::liveness_monitor::LivenessMonitor::new(
-                    Arc::clone(&integration.raft),
-                    integration.shared_state.clone(),
+                    liveness: self.liveness_config.clone(),
+                    extra_leader_tasks: Some(Box::new(leader_tasks)),
+                    // Transactor defaults. Operator tuning of the write
+                    // path's timeouts is tracked under #1382.
+                    submit_wait: None,
+                    submit_max_wait: None,
+                };
+                let node = fluree_db_consensus::raft::embedded::EmbeddedRaftNode::attach(
+                    Arc::clone(integration),
+                    Arc::clone(&state_inner.fluree),
+                    config,
                 )
-                .with_config(self.liveness_config.clone());
-            let spawn_leader_tasks = move || {
-                let nameservice: std::sync::Arc<dyn fluree_db_nameservice::IndexingNameService> =
-                    raft_ns.clone();
-                let (worker, _handle) = fluree_db_indexer::BackgroundIndexerWorker::new(
-                    backend.clone(),
-                    nameservice,
-                    indexer_config.clone(),
-                );
-                let worker = worker.with_event_bus(Arc::clone(&event_bus));
-                vec![
-                    tokio::spawn(worker.run()),
-                    tokio::spawn(eviction_scheduler.clone().run()),
-                    tokio::spawn(liveness_monitor.clone().run()),
-                ]
-            };
-            crate::raft::spawn_leader_watcher(
-                Arc::clone(&integration.raft),
-                integration.id,
-                spawn_leader_tasks,
-            )
-        });
+                .await;
+                state_inner.committer = Arc::clone(&node.committer);
+                state_inner.raft = Some(Arc::clone(integration));
+                Some(node)
+            }
+            None => None,
+        };
+        #[cfg(feature = "raft")]
+        let raft_listener_parts = self
+            .raft
+            .as_ref()
+            .map(|(integration, listen_addr)| (Arc::clone(integration), *listen_addr));
 
-        // The raft tuple is no longer needed beyond this point —
-        // both raft_listener and raft_leader_watcher captured what
-        // they need. Drop the rest.
+        // The raft tuple is no longer needed beyond this point.
         #[cfg(feature = "raft")]
         drop(self.raft);
         #[cfg(feature = "raft")]
         drop(raft_nameservice);
 
         let state = Arc::new(state_inner);
+
+        // Without Raft this process is the only holder: a rotation that a
+        // previous run left `Running` continues here. Under Raft the
+        // leader tasks above own it.
+        #[cfg(feature = "raft")]
+        let standalone = raft_listener_parts.is_none();
+        #[cfg(not(feature = "raft"))]
+        let standalone = true;
+        if standalone {
+            let fluree = Arc::clone(&state.fluree);
+            let holder = routes::rotation_holder(&state);
+            tokio::spawn(async move {
+                match fluree.resume_pending_key_rotation(&holder).await {
+                    Ok(Some(progress)) => tracing::info!(
+                        retire_key_id = progress.retire_key_id,
+                        units_done = progress.units_done,
+                        units_total = progress.units_total,
+                        "resumed a pending key rotation"
+                    ),
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(%e, "could not resume a pending key rotation"),
+                }
+            });
+        }
 
         // Assemble the private-listener router now that `state` is an
         // `Arc<AppState>` — `require_admin_token` needs that shape. The
@@ -800,11 +1013,7 @@ impl FlureeServerBuilder {
             #[cfg(feature = "raft")]
             raft_listener,
             #[cfg(feature = "raft")]
-            raft_leader_watcher,
-            #[cfg(feature = "raft")]
-            raft_worker_supervisor,
-            #[cfg(feature = "raft")]
-            raft_release_task,
+            raft_node,
         })
     }
 }
@@ -815,21 +1024,116 @@ impl Default for FlureeServerBuilder {
     }
 }
 
-/// One-shot release of a `(ledger_id, content_id)` pair from the
-/// content store. Pulled out so the steady-state release loop and
-/// the shutdown drain don't drift apart on error handling.
-#[cfg(feature = "raft")]
-async fn release_one(
-    fluree: &fluree_db_api::Fluree,
-    ledger_id: &str,
-    cid: &fluree_db_core::ContentId,
-) {
-    if let Err(err) = fluree.content_store(ledger_id).release(cid).await {
-        tracing::warn!(
-            %ledger_id,
-            %cid,
-            error = %err,
-            "failed to release envelope from content store"
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_nameservice::GraphSourceType;
+
+    #[test]
+    fn memory_builder_selects_memory_storage() {
+        let storage = |b: FlureeServerBuilder| b.config.storage_type_str();
+        assert_eq!(storage(FlureeServerBuilder::memory()), "memory");
+        assert_eq!(storage(FlureeServerBuilder::new()), "file");
+    }
+
+    fn auto_sync_config(server_role: ServerRole) -> ServerConfig {
+        ServerConfig {
+            bm25_auto_sync: true,
+            server_role,
+            ..ServerConfig::default()
+        }
+    }
+
+    fn record(name: &str, source_type: GraphSourceType) -> GraphSourceRecord {
+        GraphSourceRecord::new(
+            name,
+            "main",
+            source_type,
+            "{}",
+            vec!["docs:main".to_string()],
+        )
+    }
+
+    fn retracted(name: &str, source_type: GraphSourceType) -> GraphSourceRecord {
+        GraphSourceRecord {
+            retracted: true,
+            ..record(name, source_type)
+        }
+    }
+
+    #[test]
+    fn auto_sync_is_off_unless_the_flag_is_set() {
+        let config = ServerConfig::default();
+
+        assert!(!config.bm25_auto_sync, "the flag must default off");
+        assert_eq!(
+            bm25_worker_owner(&config, Consensus::Standalone),
+            Bm25WorkerOwner::Disabled
         );
+    }
+
+    #[test]
+    fn the_flag_alone_runs_the_worker_on_this_server() {
+        assert_eq!(
+            bm25_worker_owner(
+                &auto_sync_config(ServerRole::Transaction),
+                Consensus::Standalone
+            ),
+            Bm25WorkerOwner::ThisServer
+        );
+    }
+
+    #[test]
+    fn a_peer_does_not_run_the_worker() {
+        assert_eq!(
+            bm25_worker_owner(&auto_sync_config(ServerRole::Peer), Consensus::Standalone),
+            Bm25WorkerOwner::PeerForwardsWrites
+        );
+    }
+
+    #[test]
+    fn raft_hands_the_worker_to_the_leader_watcher() {
+        assert_eq!(
+            bm25_worker_owner(&auto_sync_config(ServerRole::Transaction), Consensus::Raft),
+            Bm25WorkerOwner::RaftLeader
+        );
+    }
+
+    /// Peer mode wins over Raft: a peer has no commit events to act on at all,
+    /// so there is nothing for a leader watcher to own either.
+    #[test]
+    fn a_raft_peer_does_not_run_the_worker() {
+        assert_eq!(
+            bm25_worker_owner(&auto_sync_config(ServerRole::Peer), Consensus::Raft),
+            Bm25WorkerOwner::PeerForwardsWrites
+        );
+    }
+
+    #[test]
+    fn registration_selects_live_bm25_indexes() {
+        let records = vec![record("search", GraphSourceType::Bm25)];
+
+        let selected = indexes_to_auto_sync(&records);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].graph_source_id, "search:main");
+    }
+
+    #[test]
+    fn registration_skips_retracted_indexes() {
+        let records = vec![retracted("search", GraphSourceType::Bm25)];
+
+        assert!(indexes_to_auto_sync(&records).is_empty());
+    }
+
+    #[test]
+    fn registration_skips_other_graph_source_types() {
+        let records = vec![
+            record("vectors", GraphSourceType::Vector),
+            record("tables", GraphSourceType::Iceberg),
+            record("geo", GraphSourceType::Geo),
+        ];
+
+        assert!(indexes_to_auto_sync(&records).is_empty());
     }
 }

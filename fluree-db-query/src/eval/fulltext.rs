@@ -23,6 +23,13 @@ use std::sync::Arc;
 
 use once_cell::sync::Lazy;
 
+// moka's eviction clock reads std::time::Instant at cache construction, which
+// aborts on wasm32-unknown-unknown; use core's clock-free LRU stand-in there.
+#[cfg(target_arch = "wasm32")]
+use fluree_db_core::wasm_cache::Cache as SyncCache;
+#[cfg(not(target_arch = "wasm32"))]
+use moka::sync::Cache as SyncCache;
+
 use crate::binding::RowAccess;
 use crate::context::ExecutionContext;
 use crate::error::Result;
@@ -117,8 +124,8 @@ impl Hash for NoveltyCacheKey {
     }
 }
 
-static NOVELTY_CACHE: Lazy<moka::sync::Cache<NoveltyCacheKey, Arc<NoveltyFulltextDelta>>> =
-    Lazy::new(|| moka::sync::Cache::builder().max_capacity(64).build());
+static NOVELTY_CACHE: Lazy<SyncCache<NoveltyCacheKey, Arc<NoveltyFulltextDelta>>> =
+    Lazy::new(|| SyncCache::builder().max_capacity(64).build());
 
 // =============================================================================
 // Delta build
@@ -311,11 +318,11 @@ fn get_or_build_delta(
     p_id: u32,
     lang_id: u16,
 ) -> Option<Arc<NoveltyFulltextDelta>> {
+    if !crate::fast_path_common::overlay_has_novelty(ctx) {
+        return None;
+    }
     let overlay = ctx.overlay?;
     let epoch = overlay.epoch();
-    if epoch == 0 {
-        return None; // No novelty
-    }
     let binary_store = ctx.binary_store.as_ref()?;
 
     // Resolve target predicate Sid for overlay filtering
@@ -544,8 +551,8 @@ struct PreparedKey {
     query: Arc<str>,
 }
 
-static PREPARED_CACHE: Lazy<moka::sync::Cache<PreparedKey, Arc<PreparedFulltextQuery>>> =
-    Lazy::new(|| moka::sync::Cache::builder().max_capacity(64).build());
+static PREPARED_CACHE: Lazy<SyncCache<PreparedKey, Arc<PreparedFulltextQuery>>> =
+    Lazy::new(|| SyncCache::builder().max_capacity(64).build());
 
 thread_local! {
     /// One-slot memo in front of `PREPARED_CACHE`: rows arrive in long runs

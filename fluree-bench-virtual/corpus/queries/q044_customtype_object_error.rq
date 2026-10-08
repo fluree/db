@@ -1,0 +1,8 @@
+# q044 customtype_object_error
+# Intent: Probe a query with a custom (non-XSD) datatype bound object.
+# EMPIRICAL CORRECTION (2026-07-11 SF01 parity run): the design's "virtual fails the GRAPH scope" expectation was WRONG — virtual-sf01 did NOT error; it DNF'd (~120s hard-timeout burn, 0 rows) instead of failing fast. expected_status left out (a dnf is recorded as dnf regardless). Native matches nothing (0 rows). Flagged for the findings register.
+# BI lineage (BI-20): "Find a GL entry by a custom-datatype debit literal."
+# Predicates verified against enterprise.ttl — FactGlJournal: debitAmount (custom-datatype object).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?j
+WHERE { ?j a edw:GlJournalEntry ; edw:debitAmount "1000"^^<http://custom.example/money> . }

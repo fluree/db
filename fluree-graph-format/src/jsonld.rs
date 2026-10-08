@@ -4,13 +4,25 @@
 
 use crate::policy::{BlankNodePolicy, ContextPolicy, TypeHandling};
 use fluree_graph_ir::datatype::iri as dt_iri;
-use fluree_graph_ir::{BlankId, Datatype, Graph, LiteralValue, Term};
+use fluree_graph_ir::{BlankId, Dataset, Datatype, Graph, LiteralValue, Term};
 use serde_json::{json, Map, Value as JsonValue};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 /// Type alias for IRI compaction functions used in JSON-LD formatting.
 type IriCompactor = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
+/// A literal where JSON-LD needs a node: a subject, a graph name or a reifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiteralAsNode;
+
+impl std::fmt::Display for LiteralAsNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a literal cannot be a subject, graph name or reifier in JSON-LD")
+    }
+}
+
+impl std::error::Error for LiteralAsNode {}
 
 /// Configuration for JSON-LD formatting
 #[derive(Clone, Default)]
@@ -30,12 +42,6 @@ pub struct JsonLdFormatConfig {
     /// When false (default), single values are scalars, multiple values are arrays.
     pub multicardinal_arrays: bool,
 
-    /// Deduplicate identical values within a property (CONSTRUCT parity)
-    ///
-    /// When true, duplicate values for the same predicate are removed.
-    /// When false (default), duplicates are preserved.
-    pub dedupe_values: bool,
-
     /// Optional IRI compaction function for vocab positions (predicates and @type values)
     ///
     /// If None, IRIs are output in expanded form.
@@ -54,7 +60,6 @@ impl std::fmt::Debug for JsonLdFormatConfig {
             .field("blank_node_policy", &self.blank_node_policy)
             .field("type_handling", &self.type_handling)
             .field("multicardinal_arrays", &self.multicardinal_arrays)
-            .field("dedupe_values", &self.dedupe_values)
             .field(
                 "compactor_vocab",
                 &self.compactor_vocab.as_ref().map(|_| "<fn>"),
@@ -94,12 +99,6 @@ impl JsonLdFormatConfig {
         self
     }
 
-    /// Enable value deduplication
-    pub fn with_dedupe_values(mut self, enabled: bool) -> Self {
-        self.dedupe_values = enabled;
-        self
-    }
-
     /// Set the IRI compactor function
     pub fn with_compactor<F>(mut self, compactor: F) -> Self
     where
@@ -123,8 +122,12 @@ impl JsonLdFormatConfig {
     /// This convenience builder encapsulates all CONSTRUCT-specific settings:
     /// - `rdf:type` → `@type` conversion
     /// - Singleton values unwrapped (arrays only for multi-values)
-    /// - Value deduplication (duplicate values removed)
     /// - Deterministic blank node IDs
+    ///
+    /// It does NOT deduplicate: a CONSTRUCT result is an RDF graph, and set
+    /// semantics belong to the graph, not the rendering. Call
+    /// [`Graph::canonicalize`](fluree_graph_ir::Graph::canonicalize) before
+    /// formatting.
     ///
     /// # Arguments
     ///
@@ -138,7 +141,6 @@ impl JsonLdFormatConfig {
     ///
     /// let config = JsonLdFormatConfig::construct_parity(None, |iri| iri.to_string());
     /// assert!(config.multicardinal_arrays);
-    /// assert!(config.dedupe_values);
     /// ```
     pub fn construct_parity<F>(orig_context: Option<JsonValue>, compactor: F) -> Self
     where
@@ -156,7 +158,6 @@ impl JsonLdFormatConfig {
             // For CONSTRUCT (JSON-LD): always use arrays for values.
             // (The API layer may override this for SPARQL CONSTRUCT output.)
             .with_multicardinal_arrays(true)
-            .with_dedupe_values(true)
             .with_compactor(compactor)
     }
 
@@ -266,25 +267,67 @@ impl BlankNodeRenamer {
 /// graph.sort();
 ///
 /// let config = JsonLdFormatConfig::default();
-/// let json = format_jsonld(&graph, &config);
+/// let json = format_jsonld(&graph, &config).unwrap();
 /// ```
-pub fn format_jsonld(graph: &Graph, config: &JsonLdFormatConfig) -> JsonValue {
-    let mut output = Map::new();
+pub fn format_jsonld(
+    graph: &Graph,
+    config: &JsonLdFormatConfig,
+) -> Result<JsonValue, LiteralAsNode> {
+    let mut bnode_renamer = BlankNodeRenamer::new(config.blank_node_policy.clone());
+    let nodes = graph_nodes(graph, config, &mut bnode_renamer)?;
+    Ok(document(config, nodes))
+}
 
-    // Add context based on policy
+/// Format a dataset as JSON-LD: the default graph's nodes, then one
+/// `{"@id": <graph name>, "@graph": [...]}` node per named graph. Blank-node
+/// labels are shared across graphs, since a JSON-LD document scopes them to
+/// the whole document. A dataset with no named graphs formats exactly as
+/// [`format_jsonld`] formats its default graph.
+pub fn format_jsonld_dataset(
+    dataset: &Dataset,
+    config: &JsonLdFormatConfig,
+) -> Result<JsonValue, LiteralAsNode> {
+    let mut bnode_renamer = BlankNodeRenamer::new(config.blank_node_policy.clone());
+    let mut nodes = graph_nodes(&dataset.default, config, &mut bnode_renamer)?;
+    for (name, graph) in &dataset.named {
+        let mut node = Map::new();
+        node.insert(
+            "@id".to_string(),
+            JsonValue::String(term_to_subject_key(name, config, &mut bnode_renamer)?),
+        );
+        node.insert(
+            "@graph".to_string(),
+            JsonValue::Array(graph_nodes(graph, config, &mut bnode_renamer)?),
+        );
+        nodes.push(JsonValue::Object(node));
+    }
+    Ok(document(config, nodes))
+}
+
+fn document(config: &JsonLdFormatConfig, nodes: Vec<JsonValue>) -> JsonValue {
+    let mut output = Map::new();
     if let Some(ctx) = config.context_policy.context() {
         output.insert("@context".to_string(), ctx.clone());
     }
+    output.insert("@graph".to_string(), JsonValue::Array(nodes));
+    JsonValue::Object(output)
+}
 
-    // Initialize blank node renamer
-    let mut bnode_renamer = BlankNodeRenamer::new(config.blank_node_policy.clone());
+/// One graph's node objects, in subject order.
+fn graph_nodes(
+    graph: &Graph,
+    config: &JsonLdFormatConfig,
+    bnode_renamer: &mut BlankNodeRenamer,
+) -> Result<Vec<JsonValue>, LiteralAsNode> {
+    // Reifiers by the triple they reify, rendered as `@annotation`.
+    let reifiers = graph.reifiers_by_triple();
 
     // Group triples by subject, then by predicate
     // This allows us to detect and handle list predicates
     let mut subjects: BTreeMap<String, SubjectData> = BTreeMap::new();
 
     for triple in graph.iter() {
-        let subj_key = term_to_subject_key(&triple.s, config, &mut bnode_renamer);
+        let subj_key = term_to_subject_key(&triple.s, config, bnode_renamer)?;
 
         let subj_data = subjects
             .entry(subj_key.clone())
@@ -297,7 +340,7 @@ pub fn format_jsonld(graph: &Graph, config: &JsonLdFormatConfig) -> JsonValue {
     let mut nodes: BTreeMap<String, Map<String, JsonValue>> = BTreeMap::new();
 
     for (subj_key, subj_data) in subjects {
-        let node = subj_data.into_jsonld_node(config, &mut bnode_renamer);
+        let node = subj_data.into_jsonld_node(config, bnode_renamer, &reifiers)?;
         nodes.insert(subj_key, node);
     }
 
@@ -309,12 +352,36 @@ pub fn format_jsonld(graph: &Graph, config: &JsonLdFormatConfig) -> JsonValue {
         }
     }
 
-    // Build @graph array
-    let graph_array: Vec<JsonValue> = nodes.into_values().map(JsonValue::Object).collect();
+    Ok(nodes.into_values().map(JsonValue::Object).collect())
+}
 
-    output.insert("@graph".to_string(), JsonValue::Array(graph_array));
-
-    JsonValue::Object(output)
+/// Attach `@annotation` to a rendered object value: `{"@id": r}` for one
+/// reifier, an array for several. A bare scalar becomes a value object.
+fn annotate(
+    value: JsonValue,
+    reifiers: &[&Term],
+    bnode_renamer: &mut BlankNodeRenamer,
+    config: &JsonLdFormatConfig,
+) -> Result<JsonValue, LiteralAsNode> {
+    let mut refs = reifiers
+        .iter()
+        .map(|r| Ok(json!({"@id": term_to_subject_key(r, config, bnode_renamer)?})))
+        .collect::<Result<Vec<JsonValue>, _>>()?;
+    let annotation = if refs.len() == 1 {
+        refs.remove(0)
+    } else {
+        JsonValue::Array(refs)
+    };
+    let mut obj = match value {
+        JsonValue::Object(obj) => obj,
+        scalar => {
+            let mut obj = Map::new();
+            obj.insert("@value".to_string(), scalar);
+            obj
+        }
+    };
+    obj.insert("@annotation".to_string(), annotation);
+    Ok(JsonValue::Object(obj))
 }
 
 /// Intermediate structure for grouping triples by predicate
@@ -349,21 +416,28 @@ impl SubjectData {
         self,
         config: &JsonLdFormatConfig,
         bnode_renamer: &mut BlankNodeRenamer,
-    ) -> Map<String, JsonValue> {
+        reifiers: &HashMap<&fluree_graph_ir::Triple, Vec<&Term>>,
+    ) -> Result<Map<String, JsonValue>, LiteralAsNode> {
         let mut node = Map::new();
         node.insert("@id".to_string(), JsonValue::String(self.id.clone()));
-
-        // Track seen values for deduplication
-        let mut seen_values: HashSet<String> = HashSet::new();
 
         for (pred_iri, triples) in self.predicates {
             // Check if this predicate is a list (any triple has list_index)
             let is_list = triples.iter().any(|(idx, _)| idx.is_some());
 
-            // Handle rdf:type specially
+            // Handle rdf:type specially. `@type` cannot carry an annotation,
+            // so an annotated type is written as an `rdf:type` property.
             if pred_iri == dt_iri::RDF_TYPE && config.type_handling.use_at_type() {
                 for (_, triple) in &triples {
-                    add_type_value(&mut node, &triple.o, config, bnode_renamer);
+                    match reifiers.get(triple) {
+                        Some(rs) => {
+                            let obj = term_to_object(&triple.o, config, bnode_renamer);
+                            let obj = annotate(obj, rs, bnode_renamer, config)?;
+                            let pred_key = config.compact_vocab_iri(&pred_iri);
+                            add_property(&mut node, &pred_key, obj);
+                        }
+                        None => add_type_value(&mut node, &triple.o, config, bnode_renamer),
+                    }
                 }
                 continue;
             }
@@ -375,25 +449,26 @@ impl SubjectData {
                 let list_value = format_list_value(&triples, config, bnode_renamer);
                 node.insert(pred_key, list_value);
             } else {
-                // Normal multi-valued predicate
+                // Normal multi-valued predicate. Every triple reaching this
+                // point is emitted: the graph is the unit of RDF set
+                // semantics, so callers that need uniqueness apply
+                // `Graph::canonicalize()` before formatting. Deduplicating
+                // here instead would have to compare rendered JSON, and
+                // rendering is lossy — the inferable datatypes all collapse to
+                // bare scalars, so `"1"^^xsd:integer` and `"1"^^xsd:long` are
+                // indistinguishable once rendered despite being distinct RDF
+                // terms.
                 for (_, triple) in triples {
-                    let obj_val = term_to_object(&triple.o, config, bnode_renamer);
-
-                    // Dedupe check
-                    if config.dedupe_values {
-                        let value_str = obj_val.to_string();
-                        if seen_values.contains(&value_str) {
-                            continue; // Skip duplicate
-                        }
-                        seen_values.insert(value_str);
+                    let mut obj_val = term_to_object(&triple.o, config, bnode_renamer);
+                    if let Some(rs) = reifiers.get(&triple) {
+                        obj_val = annotate(obj_val, rs, bnode_renamer, config)?;
                     }
-
                     add_property(&mut node, &pred_key, obj_val);
                 }
             }
         }
 
-        node
+        Ok(node)
     }
 }
 
@@ -454,11 +529,11 @@ fn term_to_subject_key(
     term: &Term,
     config: &JsonLdFormatConfig,
     bnode_renamer: &mut BlankNodeRenamer,
-) -> String {
+) -> Result<String, LiteralAsNode> {
     match term {
-        Term::Iri(iri) => config.compact_id_iri(iri),
-        Term::BlankNode(id) => bnode_renamer.rename(id),
-        Term::Literal { .. } => panic!("Literal cannot be subject"),
+        Term::Iri(iri) => Ok(config.compact_id_iri(iri)),
+        Term::BlankNode(id) => Ok(bnode_renamer.rename(id)),
+        Term::Literal { .. } => Err(LiteralAsNode),
     }
 }
 
@@ -633,7 +708,7 @@ mod tests {
         let graph = make_simple_graph();
         let config = JsonLdFormatConfig::default();
 
-        let result = format_jsonld(&graph, &config);
+        let result = format_jsonld(&graph, &config).unwrap();
 
         assert!(result.get("@graph").is_some());
         let graph_arr = result["@graph"].as_array().unwrap();
@@ -648,7 +723,7 @@ mod tests {
         let graph = make_simple_graph();
         let config = JsonLdFormatConfig::default().with_type_handling(TypeHandling::AsAtType);
 
-        let result = format_jsonld(&graph, &config);
+        let result = format_jsonld(&graph, &config).unwrap();
 
         let node = &result["@graph"][0];
         assert_eq!(node["@type"], "http://xmlns.com/foaf/0.1/Person");
@@ -661,7 +736,7 @@ mod tests {
         let graph = make_simple_graph();
         let config = JsonLdFormatConfig::default().with_type_handling(TypeHandling::AsRdfType);
 
-        let result = format_jsonld(&graph, &config);
+        let result = format_jsonld(&graph, &config).unwrap();
 
         let node = &result["@graph"][0];
         // Should NOT have @type
@@ -677,7 +752,7 @@ mod tests {
         let config =
             JsonLdFormatConfig::default().with_context_policy(ContextPolicy::UseOriginal(context));
 
-        let result = format_jsonld(&graph, &config);
+        let result = format_jsonld(&graph, &config).unwrap();
 
         assert!(result.get("@context").is_some());
         assert_eq!(result["@context"]["foaf"], "http://xmlns.com/foaf/0.1/");
@@ -696,7 +771,7 @@ mod tests {
             }
         });
 
-        let result = format_jsonld(&graph, &config);
+        let result = format_jsonld(&graph, &config).unwrap();
 
         let node = &result["@graph"][0];
         assert_eq!(node["@id"], "ex:alice");
@@ -723,7 +798,7 @@ mod tests {
         graph.sort();
 
         let config = JsonLdFormatConfig::default();
-        let result = format_jsonld(&graph, &config);
+        let result = format_jsonld(&graph, &config).unwrap();
 
         let types = &result["@graph"][0]["@type"];
         assert!(types.is_array());
@@ -750,7 +825,7 @@ mod tests {
         graph.sort();
 
         let config = JsonLdFormatConfig::default();
-        let result = format_jsonld(&graph, &config);
+        let result = format_jsonld(&graph, &config).unwrap();
 
         let nicks = &result["@graph"][0]["http://xmlns.com/foaf/0.1/nick"];
         assert!(nicks.is_array());
@@ -771,7 +846,7 @@ mod tests {
         graph.sort();
 
         let config = JsonLdFormatConfig::default();
-        let result = format_jsonld(&graph, &config);
+        let result = format_jsonld(&graph, &config).unwrap();
 
         let name = &result["@graph"][0]["http://xmlns.com/foaf/0.1/name"];
         assert_eq!(name["@value"], "Alicia");
@@ -791,7 +866,7 @@ mod tests {
         graph.sort();
 
         let config = JsonLdFormatConfig::default();
-        let result = format_jsonld(&graph, &config);
+        let result = format_jsonld(&graph, &config).unwrap();
 
         let age = &result["@graph"][0]["http://xmlns.com/foaf/0.1/age"];
         // Integer should be output as plain JSON number
@@ -811,7 +886,7 @@ mod tests {
         graph.sort();
 
         let config = JsonLdFormatConfig::default();
-        let result = format_jsonld(&graph, &config);
+        let result = format_jsonld(&graph, &config).unwrap();
 
         let node = &result["@graph"][0];
         assert_eq!(node["@id"], "_:person1");
@@ -830,7 +905,7 @@ mod tests {
         graph.sort();
 
         let config = JsonLdFormatConfig::default();
-        let result = format_jsonld(&graph, &config);
+        let result = format_jsonld(&graph, &config).unwrap();
 
         let knows = &result["@graph"][0]["http://xmlns.com/foaf/0.1/knows"];
         assert_eq!(knows["@id"], "_:person1");
@@ -861,7 +936,7 @@ mod tests {
         graph.sort();
 
         let config = JsonLdFormatConfig::default();
-        let result = format_jsonld(&graph, &config);
+        let result = format_jsonld(&graph, &config).unwrap();
 
         let node = &result["@graph"][0];
 
@@ -888,7 +963,7 @@ mod tests {
         graph.sort();
 
         let config = JsonLdFormatConfig::default();
-        let result = format_jsonld(&graph, &config);
+        let result = format_jsonld(&graph, &config).unwrap();
 
         let data = &result["@graph"][0]["http://example.org/data"];
         assert_eq!(data["@type"], "@json");
@@ -920,7 +995,7 @@ mod tests {
 
         let config =
             JsonLdFormatConfig::default().with_blank_node_policy(BlankNodePolicy::Deterministic);
-        let result = format_jsonld(&graph, &config);
+        let result = format_jsonld(&graph, &config).unwrap();
 
         let nodes = result["@graph"].as_array().unwrap();
         // After sorting, abc comes before xyz, so abc becomes _:b0
@@ -942,7 +1017,7 @@ mod tests {
 
         let config =
             JsonLdFormatConfig::default().with_blank_node_policy(BlankNodePolicy::PreserveLabeled);
-        let result = format_jsonld(&graph, &config);
+        let result = format_jsonld(&graph, &config).unwrap();
 
         let node = &result["@graph"][0];
         assert_eq!(node["@id"], "_:myCustomLabel");
@@ -963,7 +1038,7 @@ mod tests {
         graph.sort();
 
         let config = JsonLdFormatConfig::default().with_multicardinal_arrays(true);
-        let result = format_jsonld(&graph, &config);
+        let result = format_jsonld(&graph, &config).unwrap();
 
         let name = &result["@graph"][0]["http://xmlns.com/foaf/0.1/name"];
         // Should be an array even with single value
@@ -972,8 +1047,10 @@ mod tests {
         assert_eq!(name[0], "Alice");
     }
 
+    /// Duplicate triples are collapsed by `Graph::canonicalize()` — the graph
+    /// is the unit of RDF set semantics. The formatter emits what it is given.
     #[test]
-    fn test_dedupe_values() {
+    fn test_canonicalized_graph_has_no_duplicate_values() {
         let mut graph = Graph::new();
 
         // Add duplicate values
@@ -995,16 +1072,104 @@ mod tests {
             Term::string("Ali"),
         );
 
-        graph.sort();
+        graph.canonicalize();
 
-        let config = JsonLdFormatConfig::default().with_dedupe_values(true);
-        let result = format_jsonld(&graph, &config);
+        let config = JsonLdFormatConfig::default();
+        let result = format_jsonld(&graph, &config).unwrap();
 
         let nicks = &result["@graph"][0]["http://xmlns.com/foaf/0.1/nick"];
         assert!(nicks.is_array());
         let arr = nicks.as_array().unwrap();
         // Should have 2 values, not 3
         assert_eq!(arr.len(), 2);
+    }
+
+    #[test]
+    fn reifiers_render_as_annotation() {
+        let ex = |l: &str| Term::iri(format!("http://example.org/{l}"));
+        let mut g = Graph::new();
+        g.add_triple(ex("alice"), ex("knows"), ex("bob"));
+        g.add_triple(ex("alice"), ex("name"), Term::string("Alice"));
+        g.add_triple(ex("alice"), Term::iri(rdf::TYPE), ex("Person"));
+        g.add_triple(ex("alice"), Term::iri(rdf::TYPE), ex("Agent"));
+        g.add_reification(ex("alice"), ex("knows"), ex("bob"), ex("c1"));
+        g.add_reification(ex("alice"), ex("knows"), ex("bob"), ex("c2"));
+        g.add_reification(ex("alice"), ex("name"), Term::string("Alice"), ex("c3"));
+        g.add_reification(ex("alice"), Term::iri(rdf::TYPE), ex("Person"), ex("c4"));
+        g.canonicalize();
+
+        let node = &format_jsonld(&g, &JsonLdFormatConfig::default()).unwrap()["@graph"][0];
+        let p = |l: &str| format!("http://example.org/{l}");
+        assert_eq!(
+            node[p("knows")],
+            json!({"@id": p("bob"), "@annotation": [{"@id": p("c1")}, {"@id": p("c2")}]})
+        );
+        // A plain literal becomes a value object to carry the annotation.
+        assert_eq!(
+            node[p("name")],
+            json!({"@value": "Alice", "@annotation": {"@id": p("c3")}})
+        );
+        // `@type` cannot carry one: the annotated type is an rdf:type value,
+        // the unannotated one stays in `@type`.
+        assert_eq!(node["@type"], json!(p("Agent")));
+        assert_eq!(
+            node[rdf::TYPE],
+            json!({"@id": p("Person"), "@annotation": {"@id": p("c4")}})
+        );
+    }
+
+    /// A literal where a node belongs is an error, not a panic.
+    #[test]
+    fn a_literal_node_is_refused() {
+        let ex = |l: &str| Term::iri(format!("http://example.org/{l}"));
+        let config = JsonLdFormatConfig::default();
+
+        let mut subject = Graph::new();
+        subject.add_triple(Term::string("s"), ex("p"), ex("o"));
+        assert_eq!(format_jsonld(&subject, &config), Err(LiteralAsNode));
+
+        let mut reifier = Graph::new();
+        reifier.add_triple(ex("s"), ex("p"), ex("o"));
+        reifier.add_reification(ex("s"), ex("p"), ex("o"), Term::string("r"));
+        reifier.canonicalize();
+        assert_eq!(format_jsonld(&reifier, &config), Err(LiteralAsNode));
+
+        let mut named = Dataset::new();
+        named
+            .graph_mut(Some(&Term::string("g")))
+            .add_triple(ex("s"), ex("p"), ex("o"));
+        assert_eq!(format_jsonld_dataset(&named, &config), Err(LiteralAsNode));
+    }
+
+    #[test]
+    fn dataset_named_graphs_share_blank_node_labels() {
+        let ex = |l: &str| Term::iri(format!("http://example.org/{l}"));
+        let mut d = Dataset::new();
+        d.graph_mut(None)
+            .add_triple(ex("a"), ex("p"), Term::blank("shared"));
+        d.graph_mut(Some(&ex("g")))
+            .add_triple(Term::blank("shared"), ex("q"), Term::string("x"));
+        d.canonicalize();
+        let config =
+            JsonLdFormatConfig::default().with_blank_node_policy(BlankNodePolicy::Deterministic);
+        let doc = format_jsonld_dataset(&d, &config).unwrap();
+        let nodes = doc["@graph"].as_array().unwrap();
+        let label = nodes[0]["http://example.org/p"]["@id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let graph_node = nodes
+            .iter()
+            .find(|n| n["@id"] == "http://example.org/g")
+            .unwrap_or_else(|| panic!("no named graph node: {doc}"));
+        assert_eq!(graph_node["@graph"][0]["@id"], json!(label), "{doc}");
+
+        // No named graphs: the same document as the default graph alone.
+        let only = Dataset::from(d.default.clone());
+        assert_eq!(
+            format_jsonld_dataset(&only, &config).unwrap(),
+            format_jsonld(&d.default, &config).unwrap()
+        );
     }
 
     #[test]
@@ -1029,14 +1194,12 @@ mod tests {
             Term::string("Al"), // duplicate
         );
 
-        graph.sort();
+        graph.canonicalize();
 
-        // Construct mode: singletons unwrapped + dedupe
-        let config = JsonLdFormatConfig::default()
-            .with_multicardinal_arrays(false)
-            .with_dedupe_values(true);
+        // Construct mode: singletons unwrapped; uniqueness from canonicalize
+        let config = JsonLdFormatConfig::default().with_multicardinal_arrays(false);
 
-        let result = format_jsonld(&graph, &config);
+        let result = format_jsonld(&graph, &config).unwrap();
         let node = &result["@graph"][0];
 
         // name should be scalar (singleton unwrapped)
@@ -1068,7 +1231,7 @@ mod tests {
         graph.sort();
 
         let config = JsonLdFormatConfig::expanded_graph();
-        let result = format_jsonld(&graph, &config);
+        let result = format_jsonld(&graph, &config).unwrap();
 
         // No @context
         assert!(result.get("@context").is_none());
@@ -1114,7 +1277,7 @@ mod tests {
         graph.sort();
 
         let config = JsonLdFormatConfig::default();
-        let result = format_jsonld(&graph, &config);
+        let result = format_jsonld(&graph, &config).unwrap();
         let node = &result["@graph"][0];
 
         // Should have @list with items in order
@@ -1151,7 +1314,7 @@ mod tests {
         graph.sort();
 
         let config = JsonLdFormatConfig::default();
-        let result = format_jsonld(&graph, &config);
+        let result = format_jsonld(&graph, &config).unwrap();
         let node = &result["@graph"][0];
 
         let members = &node["http://example.org/members"];
@@ -1188,9 +1351,10 @@ mod tests {
 
         graph.sort();
 
-        // Even with dedupe_values enabled, list indices should preserve duplicates
-        let config = JsonLdFormatConfig::default().with_dedupe_values(true);
-        let result = format_jsonld(&graph, &config);
+        // List items are index-distinguished, so a repeated value is a
+        // distinct triple and survives canonicalization.
+        let config = JsonLdFormatConfig::default();
+        let result = format_jsonld(&graph, &config).unwrap();
         let node = &result["@graph"][0];
 
         let list = node["http://example.org/p"]["@list"].as_array().unwrap();
@@ -1234,7 +1398,7 @@ mod tests {
         graph.sort();
 
         let config = JsonLdFormatConfig::default();
-        let result = format_jsonld(&graph, &config);
+        let result = format_jsonld(&graph, &config).unwrap();
         let node = &result["@graph"][0];
 
         let list = node["http://example.org/numbers"]["@list"]
@@ -1259,7 +1423,7 @@ mod tests {
         graph.sort();
 
         let config = JsonLdFormatConfig::default();
-        let result = format_jsonld(&graph, &config);
+        let result = format_jsonld(&graph, &config).unwrap();
         let node = &result["@graph"][0];
 
         // Even single-item should be @list
@@ -1289,7 +1453,7 @@ mod tests {
 
         // Even with multicardinal_arrays, @list should not be wrapped
         let config = JsonLdFormatConfig::default().with_multicardinal_arrays(true);
-        let result = format_jsonld(&graph, &config);
+        let result = format_jsonld(&graph, &config).unwrap();
         let node = &result["@graph"][0];
 
         // Should be {"@list": [...]} not [{"@list": [...]}]

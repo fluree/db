@@ -30,8 +30,17 @@ pub struct ExportRequest {
     /// `jsonld`/`json-ld`/`json`. Default: `turtle`.
     pub format: Option<String>,
     /// Export all named graphs. Requires a dataset format (`trig` or `nquads`).
+    /// The ledger's system graphs are excluded unless `system_graphs` is set.
     #[serde(default)]
     pub all_graphs: bool,
+    /// Also emit the ledger's system graphs (`#txn-meta`, `#config`) under
+    /// `all_graphs`. Diagnostic only — see `ExportBuilder::system_graphs`.
+    #[serde(default)]
+    pub system_graphs: bool,
+    /// Emit edge annotations as raw `f:reifies*` triples instead of RDF 1.2
+    /// annotation syntax. Escape hatch for consumers pinned to pre-4.2 bytes.
+    #[serde(default)]
+    pub raw_reifies: bool,
     /// Export a single named graph by IRI. Mutually exclusive with `all_graphs`.
     pub graph: Option<String>,
     /// Override the JSON-LD prefix context. Either a bare object (`{ "ex": "..." }`)
@@ -102,11 +111,17 @@ async fn export_local(
         if req.all_graphs {
             builder = builder.all_graphs();
         }
+        if req.system_graphs {
+            builder = builder.system_graphs();
+        }
+        if req.raw_reifies {
+            builder = builder.raw_reifies();
+        }
         if let Some(iri) = req.graph.as_deref() {
             builder = builder.graph(iri);
         }
         if let Some(at_str) = req.at.as_deref() {
-            builder = builder.as_of(parse_time_spec(at_str));
+            builder = builder.as_of(parse_time_spec(at_str)?);
         }
         if let Some(ctx) = req.context.as_ref() {
             builder = builder.context(ctx);
@@ -117,14 +132,55 @@ async fn export_local(
         tracing::info!(
             status = "success",
             triples = stats.triples_written,
+            graphs = stats.graphs_written,
+            rows_skipped = stats.rows_skipped,
+            named_graphs_omitted = stats.named_graphs_omitted,
+            annotations_out_of_scope = stats.annotations_out_of_scope,
+            annotations_unresolved = stats.annotations_unresolved,
             bytes = buf.len(),
             "ledger export complete"
         );
 
+        // Tell the client what the export left out. Without this, #1847's
+        // complaint — "nothing in the output to suggest anything is missing" —
+        // is fixed on the CLI and still true over HTTP: the same builder that
+        // makes the CLI print `warning: 1 named graph not exported` returns a
+        // bare 200 here. Headers rather than a body field, because the body is
+        // the RDF document and must stay parseable by an ordinary RDF client.
+        // Only emitted when non-zero, so a clean export is byte-for-byte what
+        // it was.
         let content_type = content_type_for(format);
-        let resp = Response::builder()
+        let mut builder = Response::builder()
             .status(200)
-            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_TYPE, content_type);
+        if stats.named_graphs_omitted > 0 {
+            builder = builder.header(
+                "x-fluree-export-named-graphs-omitted",
+                stats.named_graphs_omitted,
+            );
+        }
+        if stats.annotations_unresolved > 0 {
+            builder = builder.header(
+                "x-fluree-export-annotations-unresolved",
+                stats.annotations_unresolved,
+            );
+        }
+        if stats.annotations_out_of_scope > 0 {
+            // The fourth omission class, and the one the HTTP surface was
+            // missing while the CLI warned about it: the body carries
+            // `~ <r>` markers whose reifiers' own properties are not in the
+            // export. A clean 200 with no signal is the same "nothing
+            // suggests anything is missing" problem the other three were
+            // given headers to fix.
+            builder = builder.header(
+                "x-fluree-export-annotations-out-of-scope",
+                stats.annotations_out_of_scope,
+            );
+        }
+        if stats.rows_skipped > 0 {
+            builder = builder.header("x-fluree-export-rows-skipped", stats.rows_skipped);
+        }
+        let resp = builder
             .body(Body::from(buf))
             .map_err(|e| ServerError::internal(format!("failed to build response: {e}")))?;
         Ok(resp)
@@ -146,14 +202,15 @@ fn parse_format(s: &str) -> Result<ExportFormat> {
     }
 }
 
-fn parse_time_spec(at: &str) -> TimeSpec {
-    if let Ok(t) = at.parse::<i64>() {
-        TimeSpec::at_t(t)
-    } else if at.contains('-') && at.contains(':') {
-        TimeSpec::at_time(at.to_string())
-    } else {
-        TimeSpec::at_commit(at.to_string())
-    }
+/// Parse the request's `at` field. `POST /branch` parses its `at` here too.
+///
+/// Shares [`TimeSpec::parse_at`] with `fluree query --at` and `fluree export
+/// --at` (#1805). This was a byte-identical copy of the CLI's old heuristic, so
+/// `POST /export {"at": "t:2"}` sent the literal string `t:2` to the commit
+/// prefix resolver exactly as the CLI did.
+pub(crate) fn parse_time_spec(at: &str) -> Result<TimeSpec> {
+    TimeSpec::parse_at(at)
+        .map_err(|e| ServerError::bad_request(format!("invalid 'at' time spec: {e}")))
 }
 
 fn content_type_for(format: ExportFormat) -> &'static str {

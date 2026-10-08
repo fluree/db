@@ -27,7 +27,6 @@ use fluree_db_core::value_id::{ObjKey, ObjKind};
 use fluree_db_core::vec_bi_dict::VecBiDict;
 use fluree_db_core::GraphId;
 use fluree_db_core::ListIndex;
-use fluree_vocab::namespaces;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
@@ -222,11 +221,7 @@ impl DictOverlay {
             }
             // Ephemeral fallback: namespace-aware sid64 allocation
             if let Some((ns_code, suffix)) = self.ext_subjects.resolve_subject(id) {
-                if ns_code == namespaces::EMPTY || ns_code == namespaces::OVERFLOW {
-                    return Ok(suffix.to_string());
-                }
-                let prefix = self.graph_view.namespace_prefix(ns_code)?;
-                return Ok(format!("{prefix}{suffix}"));
+                return self.graph_view.subject_iri_from_parts(ns_code, suffix);
             }
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -242,22 +237,14 @@ impl DictOverlay {
         }
         // Novel — DictNovelty forward
         if let Some((ns_code, suffix)) = self.dict_novelty.subjects.resolve_subject(id) {
-            if ns_code == namespaces::EMPTY || ns_code == namespaces::OVERFLOW {
-                return Ok(suffix.to_string());
-            }
-            let prefix = self.graph_view.namespace_prefix(ns_code)?;
-            return Ok(format!("{prefix}{suffix}"));
+            return self.graph_view.subject_iri_from_parts(ns_code, suffix);
         }
 
         // Ephemeral fallback: even with DictNovelty initialized, overlay translation
         // may allocate into ext_subjects in certain view paths (e.g., historical overlays
         // where DictNovelty is present but doesn't contain the entry).
         if let Some((ns_code, suffix)) = self.ext_subjects.resolve_subject(id) {
-            if ns_code == namespaces::EMPTY || ns_code == namespaces::OVERFLOW {
-                return Ok(suffix.to_string());
-            }
-            let prefix = self.graph_view.namespace_prefix(ns_code)?;
-            return Ok(format!("{prefix}{suffix}"));
+            return self.graph_view.subject_iri_from_parts(ns_code, suffix);
         }
 
         Err(io::Error::new(
@@ -655,16 +642,6 @@ impl DictOverlay {
         // JsonArena internally — no duplication needed here.
         self.graph_view
             .decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id)
-    }
-
-    /// Decode a datatype ID back to a Sid.
-    pub fn decode_dt_sid(&self, dt_id: u16) -> Sid {
-        self.graph_view
-            .store()
-            .dt_sids()
-            .get(dt_id as usize)
-            .cloned()
-            .unwrap_or_else(|| Sid::new(0, ""))
     }
 
     /// Decode lang_id and i_val into FlakeMeta.

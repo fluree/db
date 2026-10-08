@@ -17,10 +17,13 @@ use axum::http::request::Parts;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use super::CredentialPolicy;
 use crate::config::DataAuthMode;
 use crate::error::ServerError;
 use crate::state::AppState;
+use fluree_db_api::LedgerId;
 use fluree_db_credential::jwt_claims::EventsTokenPayload;
+use fluree_db_credential::jwt_claims::PolicyClaim;
 
 /// Verified principal from a data API Bearer token
 #[derive(Debug, Clone)]
@@ -33,21 +36,53 @@ pub struct DataPrincipal {
     pub identity: Option<String>,
     /// Read access to all ledgers
     pub read_all: bool,
-    /// Read access to specific ledgers (HashSet for O(1) lookup)
-    pub read_ledgers: HashSet<String>,
+    /// Read access to specific ledgers. A bare `mydb` scope means `mydb:main`;
+    /// there is no whole-ledger scope.
+    pub read_ledgers: HashSet<LedgerId>,
     /// Write access to all ledgers
     pub write_all: bool,
-    /// Write access to specific ledgers (HashSet for O(1) lookup)
-    pub write_ledgers: HashSet<String>,
+    /// Write access to specific ledgers, parsed like `read_ledgers`.
+    pub write_ledgers: HashSet<LedgerId>,
+    /// Token expiry (Unix seconds). HTTP re-verifies per request so this is
+    /// redundant there; long-lived transports (Bolt sessions) re-check it
+    /// before each statement.
+    pub expires_unix: u64,
+    /// Policy selection constructed from verified claims and server configuration.
+    pub policy_authorization: CredentialPolicy,
 }
 
 impl DataPrincipal {
-    pub fn can_read(&self, ledger_id: &str) -> bool {
-        self.read_all || self.read_ledgers.contains(ledger_id)
+    pub fn can_read(&self, ledger_id: &LedgerId) -> bool {
+        let allowed = self.read_all || self.read_ledgers.contains(ledger_id);
+        self.audit_scope(ledger_id, "read", allowed);
+        allowed
     }
 
-    pub fn can_write(&self, ledger_id: &str) -> bool {
-        self.write_all || self.write_ledgers.contains(ledger_id)
+    pub fn can_write(&self, ledger_id: &LedgerId) -> bool {
+        let allowed = self.write_all || self.write_ledgers.contains(ledger_id);
+        self.audit_scope(ledger_id, "write", allowed);
+        allowed
+    }
+
+    /// Request/statement-level evidence of the authority used for a scope
+    /// check, not a claim that subsequent per-fact policy enforcement allowed
+    /// the operation. Disabled unless this tracing target is enabled at DEBUG.
+    fn audit_scope(&self, ledger_id: &LedgerId, action: &str, allowed: bool) {
+        let effective_identity = self
+            .policy_authorization
+            .fixed_options()
+            .and_then(|o| o.identity.as_deref());
+        let mode = self.policy_authorization.mode();
+        tracing::debug!(
+            target: "fluree_db_server::authorization",
+            issuer = %self.issuer,
+            effective_identity = ?effective_identity,
+            authorization_mode = mode,
+            ledger = %ledger_id,
+            action,
+            scope_allowed = allowed,
+            "data authorization scope check"
+        );
     }
 }
 
@@ -83,15 +118,23 @@ impl FromRequestParts<Arc<AppState>> for MaybeDataBearer {
             }
         };
 
-        verify_data_token(&token, state).await
+        verify_data_principal(&token, state)
+            .await
+            .map(|p| MaybeDataBearer(Some(p)))
     }
 }
 
-/// Verify token and build `DataPrincipal`.
+/// Verify a data-plane bearer token and build the `DataPrincipal`.
 ///
-/// When `oidc` feature is enabled, uses dual-path dispatch (embedded JWK or JWKS).
-/// When `oidc` feature is disabled, only the embedded JWK path is available.
-async fn verify_data_token(token: &str, state: &AppState) -> Result<MaybeDataBearer, ServerError> {
+/// The complete, transport-agnostic identity pipeline: signature
+/// verification (dual-path dispatch when `oidc` is enabled), claim
+/// validation, issuer trust for did:key tokens, and the permission-scope
+/// check. Every transport that accepts data-plane tokens (HTTP extractor,
+/// Bolt LOGON) must resolve identity through this one function.
+pub(crate) async fn verify_data_principal(
+    token: &str,
+    state: &AppState,
+) -> Result<DataPrincipal, ServerError> {
     let config = state.config.data_auth();
 
     // Verify the token and extract claims
@@ -148,31 +191,86 @@ async fn verify_data_token(token: &str, state: &AppState) -> Result<MaybeDataBea
         return Err(ServerError::unauthorized("token authorizes no resources"));
     }
 
-    let principal = build_principal(&payload);
-    Ok(MaybeDataBearer(Some(principal)))
+    if payload.fluree_policy.is_some()
+        && (!config.policy_authorities.contains(&issuer)
+            || config.audience.as_deref().is_none_or(str::is_empty))
+    {
+        return Err(ServerError::unauthorized(
+            "Issuer is not a configured policy authority",
+        ));
+    }
+    let authorization = if matches!(payload.fluree_policy, Some(PolicyClaim::Request(_))) {
+        CredentialPolicy::Request
+    } else if let Some(PolicyClaim::Fixed(policy)) = &payload.fluree_policy {
+        CredentialPolicy::Fixed(fluree_db_api::PolicyAuthorization::from_trusted_options(
+            fluree_db_api::GovernanceOptions {
+                identity: payload.resolve_identity(),
+                policy_class: policy.policy_class.clone(),
+                policy: policy.policy.clone(),
+                policy_values: policy.policy_values.clone(),
+                default_allow: policy.default_allow,
+                ..Default::default()
+            },
+        ))
+    } else if payload.resolve_identity().is_none() && config.default_policy_class.is_none() {
+        CredentialPolicy::ScopeOnly
+    } else {
+        CredentialPolicy::Fixed(fluree_db_api::PolicyAuthorization::from_trusted_options(
+            fluree_db_api::GovernanceOptions {
+                identity: payload.resolve_identity(),
+                policy_class: config.default_policy_class.map(|c| vec![c]),
+                ..Default::default()
+            },
+        ))
+    };
+    Ok(build_principal(&payload, authorization))
+}
+
+/// Parse token ledger scopes once, at verification. An entry that is not a
+/// ledger id grants nothing (fail closed) rather than matching itself.
+pub(crate) fn parse_scopes(scopes: Option<&Vec<String>>) -> HashSet<LedgerId> {
+    scopes
+        .into_iter()
+        .flatten()
+        .filter_map(|s| match LedgerId::parse(s) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!(scope = %s, error = %e, "ignoring token ledger scope that is not a ledger id");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Read access a token grants: `fluree.ledger.read.*`, falling back to the
+/// `fluree.storage.*` claims. Shared by every surface that reads ledger data.
+pub(crate) fn read_scopes(payload: &EventsTokenPayload) -> (bool, HashSet<LedgerId>) {
+    (
+        payload.ledger_read_all.unwrap_or(false) || payload.storage_all.unwrap_or(false),
+        parse_scopes(
+            payload
+                .ledger_read_ledgers
+                .as_ref()
+                .or(payload.storage_ledgers.as_ref()),
+        ),
+    )
 }
 
 /// Build a `DataPrincipal` from verified claims.
-fn build_principal(payload: &EventsTokenPayload) -> DataPrincipal {
+fn build_principal(
+    payload: &EventsTokenPayload,
+    policy_authorization: CredentialPolicy,
+) -> DataPrincipal {
+    let (read_all, read_ledgers) = read_scopes(payload);
     DataPrincipal {
+        policy_authorization,
         issuer: payload.iss.clone(),
         subject: payload.sub.clone(),
         identity: payload.resolve_identity(),
-        // Read: use explicit ledger.read.* if present, else fall back to storage.*
-        read_all: payload.ledger_read_all.unwrap_or(false) || payload.storage_all.unwrap_or(false),
-        read_ledgers: payload
-            .ledger_read_ledgers
-            .clone()
-            .or_else(|| payload.storage_ledgers.clone())
-            .unwrap_or_default()
-            .into_iter()
-            .collect(),
+        read_all,
+        read_ledgers,
         write_all: payload.ledger_write_all.unwrap_or(false),
-        write_ledgers: payload
-            .ledger_write_ledgers
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .collect(),
+        write_ledgers: parse_scopes(payload.ledger_write_ledgers.as_ref()),
+        expires_unix: payload.exp,
     }
 }

@@ -190,6 +190,21 @@ pub fn eval_list_fn_to_binding<R: RowAccess>(
     ctx: Option<&ExecutionContext<'_>>,
 ) -> Result<Option<Binding>> {
     match func {
+        // COALESCE in binding position must preserve structured values
+        // (List / Map / Rel / Path) — the scalar path would collapse them to
+        // Unbound. Same rule as the spec's comparable-path coalesce: first
+        // argument that evaluates without error and is bound wins.
+        Function::Coalesce => {
+            for arg in args {
+                match arg.try_eval_to_binding(row, ctx) {
+                    Ok(Binding::Unbound | Binding::Poisoned) => continue,
+                    Ok(b) => return Ok(Some(b)),
+                    Err(err) if err.can_demote_in_expression() => continue,
+                    Err(err) => return Err(err),
+                }
+            }
+            Ok(Some(Binding::Unbound))
+        }
         Function::ListIndex => Ok(Some(eval_list_index_to_binding(args, row, ctx)?)),
         Function::Labels => Ok(Some(metadata::eval_labels_to_binding(args, row, ctx)?)),
         Function::Keys => Ok(Some(metadata::eval_keys_to_binding(args, row, ctx)?)),
@@ -265,6 +280,37 @@ pub fn eval_list_fn_to_binding<R: RowAccess>(
                     }
                 })
                 .collect();
+            Ok(Some(Binding::Path { nodes, edges }))
+        }
+        Function::MakePathHops => {
+            // MakePathHops(node0, rel1, node1, rel2, node2, …) → Path. Nodes
+            // and per-hop relationship values interleave; each rel already
+            // carries the stored edge orientation.
+            if args.len() < 3 || args.len().is_multiple_of(2) {
+                return Err(QueryError::InvalidFilter(
+                    "MakePathHops expects interleaved node, rel, node, … arguments".to_string(),
+                ));
+            }
+            let Some(ctx) = ctx else {
+                return Ok(Some(Binding::Unbound));
+            };
+            let mut nodes = Vec::with_capacity(args.len() / 2 + 1);
+            let mut edges = Vec::with_capacity(args.len() / 2);
+            for (i, a) in args.iter().enumerate() {
+                if i % 2 == 0 {
+                    match arg_to_sid(a, row, ctx)? {
+                        Some(sid) => nodes.push(sid),
+                        None => return Ok(Some(Binding::Unbound)),
+                    }
+                } else {
+                    match resolve_arg_binding(a, row, Some(ctx))? {
+                        Some(Binding::Rel(rel)) => {
+                            edges.push((rel.start, rel.predicate, rel.end));
+                        }
+                        _ => return Ok(Some(Binding::Unbound)),
+                    }
+                }
+            }
             Ok(Some(Binding::Path { nodes, edges }))
         }
         Function::Relationships => {

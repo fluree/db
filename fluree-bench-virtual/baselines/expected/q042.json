@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "query_id": "q042",
+  "result_hash": "33b91b54bd2c2f76c4dbff50ec26288cd9e0487b696faff7999187ee45b87731",
+  "rows": 24,
+  "head_rows": [
+    "2007-08-14\u001f<edw:openDate>",
+    "2021-05-08\u001f<edw:openDate>",
+    "2023-06-27\u001f<edw:openDate>",
+    "<edw:Store>\u001f<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>",
+    "<edw:Store>\u001f<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>",
+    "<edw:Store>\u001f<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>",
+    "<http://data.fluree.dev/edw/employee/4358>\u001f<edw:regionManager>",
+    "<http://data.fluree.dev/edw/employee/4962>\u001f<edw:regionManager>",
+    "<http://data.fluree.dev/edw/employee/604>\u001f<edw:regionManager>",
+    "<http://data.fluree.dev/edw/geography/14509>\u001f<edw:geography>",
+    "<http://data.fluree.dev/edw/geography/23490>\u001f<edw:geography>",
+    "<http://data.fluree.dev/edw/geography/3603>\u001f<edw:geography>",
+    "Online\u001f<edw:channel>",
+    "Online\u001f<edw:channel>",
+    "Popup\u001f<edw:storeType>",
+    "Retail\u001f<edw:channel>",
+    "STORE-00001\u001f<edw:storeId>",
+    "STORE-00002\u001f<edw:storeId>",
+    "STORE-00003\u001f<edw:storeId>",
+    "Standard\u001f<edw:storeType>"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

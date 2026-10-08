@@ -1,6 +1,8 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_annotation_filter_pushdown.rs"]
+mod it_annotation_filter_pushdown;
 #[path = "it_compile_breakdown.rs"]
 mod it_compile_breakdown;
 #[path = "it_count_distinct_objects.rs"]
@@ -19,6 +21,8 @@ mod it_edge_annotations_parse;
 mod it_fast_group_count;
 #[path = "it_file_backed.rs"]
 mod it_file_backed;
+#[path = "it_file_startup_recovery.rs"]
+mod it_file_startup_recovery;
 #[path = "it_file_storage_jsonld.rs"]
 mod it_file_storage_jsonld;
 #[path = "it_fuel_floor.rs"]
@@ -31,8 +35,35 @@ mod it_host_plus_n_e2e;
 mod it_hydration_predicate_gating;
 #[path = "it_join_batched_overlay.rs"]
 mod it_join_batched_overlay;
-#[path = "it_minmax_fast_path_fired.rs"]
-mod it_minmax_fast_path_fired;
+#[path = "it_turtle_star_write_paths.rs"]
+mod it_turtle_star_write_paths;
+// it_minmax_fast_path_fired is a STANDALONE `[[test]]` bin (see its header):
+// its assertions are about instrumentation, and tracing's process-global
+// callsite-interest cache + thread-local capture make that fragile next to
+// parallel siblings under bare `cargo test`.
+// GraphQL is behind a feature flag (async-graphql is a heavy dependency), so
+// this module only compiles when it is on.
+#[cfg(feature = "graphql")]
+#[path = "it_graphql.rs"]
+mod it_graphql;
+#[cfg(feature = "graphql")]
+#[path = "it_graphql_curated.rs"]
+mod it_graphql_curated;
+#[cfg(feature = "graphql")]
+#[path = "it_graphql_limits.rs"]
+mod it_graphql_limits;
+#[cfg(feature = "graphql")]
+#[path = "it_graphql_mutations.rs"]
+mod it_graphql_mutations;
+#[cfg(feature = "graphql")]
+#[path = "it_graphql_policy.rs"]
+mod it_graphql_policy;
+#[cfg(feature = "graphql")]
+#[path = "it_graphql_polish.rs"]
+mod it_graphql_polish;
+#[cfg(feature = "graphql")]
+#[path = "it_graphql_shapes.rs"]
+mod it_graphql_shapes;
 #[path = "it_minmax_string_fast_path.rs"]
 mod it_minmax_string_fast_path;
 #[path = "it_mixed_representation.rs"]

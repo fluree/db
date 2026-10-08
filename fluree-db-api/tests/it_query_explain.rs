@@ -448,3 +448,184 @@ async fn explain_logical_plan_preserves_compound_structure() {
         .expect("required triple present");
     assert_eq!(triple["category"], "source");
 }
+
+/// Count `"op": "DistinctOperator"` nodes in a physical plan tree.
+fn count_distinct_nodes(node: &serde_json::Value) -> usize {
+    let mut n = usize::from(node["op"] == "DistinctOperator");
+    if let Some(children) = node["children"].as_array() {
+        n += children
+            .iter()
+            .map(|e| count_distinct_nodes(&e["node"]))
+            .sum::<usize>();
+    }
+    n
+}
+
+/// Seed a 3-hop chain so `ex:` predicates are encodable, then return the
+/// physical plan for `sparql`.
+async fn chain_physical_plan(sparql: &str) -> serde_json::Value {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "dedup-plan:main");
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/"},
+                "@graph": [
+                    {"@id":"ex:a1","ex:p1":{"@id":"ex:b1"}},
+                    {"@id":"ex:b1","ex:p2":{"@id":"ex:m1"}},
+                    {"@id":"ex:m1","ex:p3":"v"}
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let db = graphdb_from_ledger(&ledger);
+    let resp = fluree
+        .explain_sparql(&db, sparql)
+        .await
+        .expect("explain_sparql");
+    let physical = resp["plan"]["physical"].clone();
+    assert!(physical.is_object(), "plan.physical present: {resp}");
+    physical
+}
+
+/// A chain query whose only aggregate is duplicate-insensitive
+/// (`COUNT(DISTINCT ?x)`) gets WHERE-level early dedup: `DistinctOperator`
+/// nodes are inserted where projection trimming drops a dead variable, so
+/// duplicate multiplicity cannot compound through the join chain. There is no
+/// outer `SELECT DISTINCT` here, so every `DistinctOperator` in the plan is
+/// the early-dedup insertion.
+#[tokio::test]
+async fn explain_chain_count_distinct_inserts_early_dedup() {
+    let _env = HashJoinEnv::acquire();
+    let physical = chain_physical_plan(
+        "PREFIX ex: <http://example.org/>\n\
+         SELECT (COUNT(DISTINCT ?x) AS ?c)\n\
+         WHERE { ?a ex:p1 ?b . ?b ex:p2 ?m . ?m ex:p3 ?x }",
+    )
+    .await;
+    assert!(
+        count_distinct_nodes(&physical) >= 1,
+        "early dedup must fire for an all-duplicate-insensitive aggregate chain: {physical}"
+    );
+}
+
+/// Count `DistinctOperator` nodes strictly below the `ProjectOperator` — the
+/// WHERE-level early-dedup insertions, excluding the outer `SELECT DISTINCT`.
+fn count_early_dedup_nodes(node: &serde_json::Value) -> usize {
+    if node["op"] == "ProjectOperator" {
+        return node["children"]
+            .as_array()
+            .map(|cs| cs.iter().map(|e| count_distinct_nodes(&e["node"])).sum())
+            .unwrap_or(0);
+    }
+    node["children"]
+        .as_array()
+        .map(|cs| cs.iter().map(|e| count_early_dedup_nodes(&e["node"])).sum())
+        .unwrap_or(0)
+}
+
+/// Early dedup is inserted only where a step trims a variable that was still
+/// live before it. The anchored chain plans as `ex:a1 ex:p1 ?b` (nothing dead:
+/// `?b` feeds the next hop), then `?b ex:p2 ?m` (`?b` dies — dedup), then
+/// `?m ex:p3 ?x` (both live and projected — no dedup). A current-state join
+/// step that keeps every variable it produces cannot duplicate an already
+/// distinct stream, so re-deduplicating behind it only re-hashed the whole
+/// intermediate (BSBM Q5's label probe behind its deduplicated candidates).
+#[tokio::test]
+async fn explain_chain_dedups_only_where_a_live_var_dies() {
+    let _env = HashJoinEnv::acquire();
+    let physical = chain_physical_plan(
+        "PREFIX ex: <http://example.org/>\n\
+         SELECT DISTINCT ?m ?x\n\
+         WHERE { ex:a1 ex:p1 ?b . ?b ex:p2 ?m . ?m ex:p3 ?x }",
+    )
+    .await;
+    assert_eq!(
+        count_early_dedup_nodes(&physical),
+        1,
+        "exactly one early dedup (after `?b` dies), none behind the all-live tail step: {physical}"
+    );
+    assert_eq!(
+        count_distinct_nodes(&physical),
+        2,
+        "the outer SELECT DISTINCT is the only other DistinctOperator: {physical}"
+    );
+}
+
+/// `MIN`/`MAX` are duplicate-insensitive without a DISTINCT modifier, so the
+/// same early dedup applies.
+#[tokio::test]
+async fn explain_chain_max_inserts_early_dedup() {
+    let _env = HashJoinEnv::acquire();
+    let physical = chain_physical_plan(
+        "PREFIX ex: <http://example.org/>\n\
+         SELECT (MAX(?x) AS ?mx)\n\
+         WHERE { ?a ex:p1 ?b . ?b ex:p2 ?m . ?m ex:p3 ?x }",
+    )
+    .await;
+    assert!(
+        count_distinct_nodes(&physical) >= 1,
+        "early dedup must fire for MIN/MAX aggregates: {physical}"
+    );
+}
+
+/// A plain `COUNT(?x)` observes row multiplicity — no early dedup may be
+/// inserted anywhere in the chain.
+#[tokio::test]
+async fn explain_chain_plain_count_no_early_dedup() {
+    let _env = HashJoinEnv::acquire();
+    let physical = chain_physical_plan(
+        "PREFIX ex: <http://example.org/>\n\
+         SELECT (COUNT(?x) AS ?c)\n\
+         WHERE { ?a ex:p1 ?b . ?b ex:p2 ?m . ?m ex:p3 ?x }",
+    )
+    .await;
+    assert_eq!(
+        count_distinct_nodes(&physical),
+        0,
+        "plain COUNT is duplicate-sensitive; early dedup would change it: {physical}"
+    );
+}
+
+/// A mix of duplicate-insensitive and duplicate-sensitive aggregates blocks
+/// early dedup (the sensitive one still observes multiplicity).
+#[tokio::test]
+async fn explain_chain_mixed_aggregates_no_early_dedup() {
+    let _env = HashJoinEnv::acquire();
+    let physical = chain_physical_plan(
+        "PREFIX ex: <http://example.org/>\n\
+         SELECT (COUNT(DISTINCT ?x) AS ?c) (COUNT(?x) AS ?n)\n\
+         WHERE { ?a ex:p1 ?b . ?b ex:p2 ?m . ?m ex:p3 ?x }",
+    )
+    .await;
+    assert_eq!(
+        count_distinct_nodes(&physical),
+        0,
+        "a duplicate-sensitive aggregate in the mix must block early dedup: {physical}"
+    );
+}
+
+/// `SELECT DISTINCT` over a plain `COUNT`: the outer DISTINCT dedups *result*
+/// rows after aggregation and must NOT license WHERE-level dedup (that was the
+/// bug — the intermediate relation was collapsed before the count). Exactly
+/// one `DistinctOperator` may appear: the outer one above the aggregation.
+#[tokio::test]
+async fn explain_select_distinct_plain_count_only_outer_distinct() {
+    let _env = HashJoinEnv::acquire();
+    let physical = chain_physical_plan(
+        "PREFIX ex: <http://example.org/>\n\
+         SELECT DISTINCT (COUNT(?x) AS ?c)\n\
+         WHERE { ?a ex:p1 ?b . ?b ex:p2 ?m . ?m ex:p3 ?x }",
+    )
+    .await;
+    assert_eq!(
+        count_distinct_nodes(&physical),
+        1,
+        "only the outer result-row DISTINCT is allowed; WHERE-level dedup \
+         under a plain COUNT is unsound: {physical}"
+    );
+}

@@ -1,195 +1,160 @@
-//! Fast-path operators for "stats queries".
+//! Fast-path operator for per-predicate count queries.
 //!
-//! These operators answer certain aggregate queries directly from `IndexStats`
-//! / `StatsView` without scanning the triple store.
+//! Answers `SELECT ?p (COUNT(?s) AS ?c) WHERE { ?s ?p ?o } GROUP BY ?p`
+//! with **exact** counts read from POST leaf-directory metadata —
+//! `O(leaflets)` directory reads, decoding only the rare mixed-predicate
+//! leaflet — instead of scanning all triples.
+//!
+//! ## Why not answer from `IndexStats` / `StatsView`?
+//!
+//! A previous version of this operator returned `StatsView` property counts
+//! directly. The differential harness
+//! (`fluree-db-api/tests/it_differential_fastpath.rs`, FD-3) showed those
+//! numbers are planner *estimates*, not current-state fact counts: they
+//! count duplicate re-asserts that set-semantics novelty application dedups,
+//! track `rdf:type` asymmetrically between indexer-built and
+//! novelty-accumulated stats, and apply novelty deltas inconsistently per
+//! predicate. Selectivity estimation tolerates all of that; an exact `COUNT`
+//! answer does not.
+//!
+//! V3 leaflets store current-state rows only (history lives in the sidecar),
+//! so per-predicate row counts from leaf directories are exact — but only
+//! for the persisted index, which is why this path is gated by
+//! [`fast_path_store`] (binary store present, no overlay novelty, query at
+//! the store's `max_t`, root policy, single ledger). Anything else returns
+//! `Ok(None)` and the planned fallback (the generic scan + group + count
+//! pipeline, which applies per-flake policy filtering and honors novelty)
+//! runs instead.
 
 use crate::binding::{Batch, Binding};
-use crate::context::{ExecutionContext, WellKnownDatatypes};
-use crate::dataset::ActiveGraphs;
+use crate::context::WellKnownDatatypes;
 use crate::error::{QueryError, Result};
-use crate::operator::{BoxedOperator, Operator, OperatorState};
+use crate::fast_path_common::{fast_path_store, FastPathOperator};
+use crate::operator::BoxedOperator;
 use crate::var_registry::VarId;
-use async_trait::async_trait;
-use fluree_db_core::{FlakeValue, StatsView};
+use fluree_db_binary_index::format::column_block::ColumnId;
+use fluree_db_binary_index::format::run_record::RunSortOrder;
+use fluree_db_binary_index::{BinaryIndexStore, ColumnProjection, ColumnSet};
+use fluree_db_core::{FlakeValue, GraphId};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// Emit per-predicate counts using `StatsView` (no triple scan).
+/// Build the per-predicate count operator. Emits `(pred, count)` rows from
+/// exact POST leaf-directory metadata when the fast-path gate holds; defers
+/// to `fallback` (the generic GROUP BY pipeline) otherwise.
 ///
-/// Intended to fast-path queries like:
-/// `SELECT ?p (COUNT(?s) AS ?count) WHERE { ?s ?p ?o } GROUP BY ?p ORDER BY DESC(?count)`
-///
-/// The `StatsView` counts are whole-index totals with no per-flake policy
-/// filtering, so under a non-root view policy they would leak restricted
-/// predicates' existence and cardinality. When a policy is active this operator
-/// delegates to `fallback` — the equivalent generic GROUP BY pipeline, whose
-/// scan applies the per-flake filter — instead of emitting stats rows.
-pub struct StatsCountByPredicateOperator {
-    stats: Arc<StatsView>,
-    schema: Arc<[VarId]>,
-    state: OperatorState,
-    rows: Vec<(Binding, Binding)>,
-    pos: usize,
-    /// Policy-enforced generic GROUP BY producing the same `[pred, count]`
-    /// schema. Used when a view policy is active (the stats counts can't be
-    /// trusted then). Built unconditionally so the operator tree stays
-    /// policy-agnostic (it is prepared once and reused across policies).
+/// Because the exact count is only valid for the persisted index at HEAD
+/// under a root policy, the gate ([`fast_path_store`]) also discharges the
+/// old policy-leak concern: under any non-root view policy the gate declines
+/// and the policy-enforced fallback runs, so restricted predicates never
+/// leak their existence or cardinality.
+pub fn stats_count_by_predicate_operator(
+    pred_var: VarId,
+    count_var: VarId,
     fallback: Option<BoxedOperator>,
-    /// Set in `open()` when a policy is active: subsequent `next_batch` calls
-    /// stream from `fallback` rather than the stats rows.
-    use_fallback: bool,
-}
+) -> FastPathOperator {
+    let schema: Arc<[VarId]> = Arc::from(vec![pred_var, count_var].into_boxed_slice());
+    let batch_schema = schema.clone();
+    FastPathOperator::with_schema(
+        schema,
+        move |ctx| {
+            let Some(store) = fast_path_store(ctx) else {
+                return Ok(None);
+            };
+            let Some(counts) = exact_count_by_predicate_post(store, ctx.binary_g_id)? else {
+                return Ok(None);
+            };
 
-impl StatsCountByPredicateOperator {
-    pub fn new(
-        stats: Arc<StatsView>,
-        pred_var: VarId,
-        count_var: VarId,
-        fallback: Option<BoxedOperator>,
-    ) -> Self {
-        let schema: Arc<[VarId]> = Arc::from(vec![pred_var, count_var].into_boxed_slice());
-        Self {
-            stats,
-            schema,
-            state: OperatorState::Created,
-            rows: Vec::new(),
-            pos: 0,
-            fallback,
-            use_fallback: false,
-        }
-    }
-
-    /// True when a non-root view policy is active on the scope this operator
-    /// runs against (single-ledger or any graph of a dataset). The stats counts
-    /// are only valid when no such policy can hide flakes.
-    fn policy_active(ctx: &ExecutionContext<'_>) -> bool {
-        match ctx.active_graphs() {
-            ActiveGraphs::Single => ctx.has_policy(),
-            ActiveGraphs::Many(graphs) => graphs.iter().any(|g| g.has_policy()),
-        }
-    }
-
-    fn build_rows(&self, ctx: &ExecutionContext<'_>) -> Result<Vec<(Binding, Binding)>> {
-        let dt = WellKnownDatatypes::new().xsd_long;
-        let store = ctx.binary_store.as_deref();
-
-        // Prefer graph-scoped stats if present (and we can resolve p_id → Sid).
-        if let Some(props) = self.stats.get_graph_properties(ctx.binary_g_id) {
-            let mut out = Vec::with_capacity(props.len());
-            for (&p_id, data) in props {
-                let pred_sid = ctx
-                    .runtime_small_dicts
-                    .and_then(|dicts| dicts.predicate_sid(p_id))
-                    .cloned()
-                    .or_else(|| {
-                        // Safe only for persisted-range IDs: runtime-only predicate IDs are
-                        // resolved above through `runtime_small_dicts`, so reaching this
-                        // fallback implies `p_id` can be interpreted in persisted store space.
-                        store
-                            .and_then(|store| store.resolve_predicate_iri(p_id.as_u32()))
-                            .map(|iri| store.expect("store already used above").encode_iri(iri))
-                    });
-                let Some(pred_sid) = pred_sid else {
-                    continue;
+            // SPARQL COUNT yields xsd:integer (§18.5.1.6); the materialized and
+            // streaming aggregate paths already tag it so — this per-predicate
+            // fast-path must match or a COUNT re-typed as xsd:long leaks (agg02).
+            let dt = WellKnownDatatypes::new().xsd_integer;
+            let mut pred_col: Vec<Binding> = Vec::with_capacity(counts.len());
+            let mut count_col: Vec<Binding> = Vec::with_capacity(counts.len());
+            for (p_id, count) in counts {
+                // Directory p_ids are persisted-store IDs by construction; an
+                // unresolvable one means the store and its directories
+                // disagree — fall back rather than emit a partial result.
+                let Some(iri) = store.resolve_predicate_iri(p_id) else {
+                    return Ok(None);
                 };
-                let pred = Binding::sid(pred_sid);
-                let count = Binding::lit(FlakeValue::Long(data.count as i64), dt.clone());
-                out.push((pred, count));
+                pred_col.push(Binding::sid(store.encode_iri(iri)));
+                count_col.push(Binding::lit(FlakeValue::Long(count), dt.clone()));
             }
-            return Ok(out);
-        }
-
-        // Fallback: aggregate SID-keyed stats (across graphs).
-        if !self.stats.properties.is_empty() {
-            let mut out = Vec::with_capacity(self.stats.properties.len());
-            for (sid, data) in &self.stats.properties {
-                let pred = Binding::sid(sid.clone());
-                let count = Binding::lit(FlakeValue::Long(data.count as i64), dt.clone());
-                out.push((pred, count));
-            }
-            return Ok(out);
-        }
-
-        Err(QueryError::InvalidQuery(
-            "stats query fast-path requires IndexStats/StatsView".to_string(),
-        ))
-    }
+            let batch = Batch::new(batch_schema.clone(), vec![pred_col, count_col])
+                .map_err(|e| QueryError::execution(format!("stats count batch: {e}")))?;
+            Ok(Some(batch))
+        },
+        fallback,
+        "COUNT by predicate (directory)",
+    )
 }
 
-#[async_trait]
-impl Operator for StatsCountByPredicateOperator {
-    fn schema(&self) -> &[VarId] {
-        &self.schema
+/// Exact per-predicate row counts from POST leaf directories.
+///
+/// Homogeneous leaflets (`p_const = Some(p)`) contribute `row_count` without
+/// any payload read; mixed-predicate leaflets decode only the `PId` column.
+/// Returns `Ok(None)` when the graph has no POST branch, or when a leaf read
+/// fails — either way the caller declines to the generic scan (the fast-path
+/// "degrade to the correct slower path" contract) rather than asserting
+/// emptiness from absence or hard-failing on a transient IO fault. Declining is
+/// lossless here: this function only accumulates a local map and has emitted
+/// nothing, and a genuine IO fault will resurface in the generic scan.
+fn exact_count_by_predicate_post(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+) -> Result<Option<Vec<(u32, i64)>>> {
+    let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Post) else {
+        return Ok(None);
+    };
+
+    let pid_projection = ColumnProjection {
+        output: ColumnSet::EMPTY,
+        internal: {
+            let mut s = ColumnSet::EMPTY;
+            s.insert(ColumnId::PId);
+            s
+        },
+    };
+
+    let mut counts: BTreeMap<u32, i64> = BTreeMap::new();
+    for leaf_entry in &branch.leaves {
+        let handle = match store.open_leaf_handle(
+            &leaf_entry.leaf_cid,
+            leaf_entry.sidecar_cid.as_ref(),
+            false,
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(error = %e, "stats count-by-predicate: leaf open failed; declining to generic scan");
+                return Ok(None);
+            }
+        };
+        let dir = handle.dir();
+        for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
+            if entry.row_count == 0 {
+                continue;
+            }
+            if let Some(p) = entry.p_const {
+                *counts.entry(p).or_insert(0) += i64::from(entry.row_count);
+            } else {
+                let batch = match handle.load_columns(
+                    leaflet_idx,
+                    &pid_projection,
+                    RunSortOrder::Post,
+                ) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "stats count-by-predicate: load columns failed; declining to generic scan");
+                        return Ok(None);
+                    }
+                };
+                for row in 0..batch.row_count {
+                    *counts.entry(batch.p_id.get(row)).or_insert(0) += 1;
+                }
+            }
+        }
     }
 
-    async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        if !self.state.can_open() {
-            return Err(QueryError::OperatorAlreadyOpened);
-        }
-        // Under a view policy the whole-index stats counts can't be trusted, so
-        // stream from the policy-enforced generic fallback instead. If a policy
-        // is active but no fallback was wired, fail closed rather than leak.
-        if Self::policy_active(ctx) {
-            let fallback = self.fallback.as_mut().ok_or_else(|| {
-                QueryError::Policy(
-                    "stats count-by-predicate fast path has no policy-enforced fallback"
-                        .to_string(),
-                )
-            })?;
-            fallback.open(ctx).await?;
-            self.use_fallback = true;
-        } else {
-            self.rows = self.build_rows(ctx)?;
-            self.pos = 0;
-        }
-        self.state = OperatorState::Open;
-        Ok(())
-    }
-
-    async fn next_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
-        if self.state != OperatorState::Open {
-            return Ok(None);
-        }
-        if self.use_fallback {
-            return self
-                .fallback
-                .as_mut()
-                .expect("use_fallback implies fallback is Some")
-                .next_batch(ctx)
-                .await;
-        }
-        if self.pos >= self.rows.len() {
-            self.state = OperatorState::Exhausted;
-            return Ok(None);
-        }
-
-        let end = (self.pos + ctx.batch_size).min(self.rows.len());
-        let slice = &self.rows[self.pos..end];
-        self.pos = end;
-
-        let mut pred_col: Vec<Binding> = Vec::with_capacity(slice.len());
-        let mut count_col: Vec<Binding> = Vec::with_capacity(slice.len());
-        for (p, c) in slice {
-            pred_col.push(p.clone());
-            count_col.push(c.clone());
-        }
-
-        Ok(Some(Batch::new(
-            self.schema.clone(),
-            vec![pred_col, count_col],
-        )?))
-    }
-
-    fn close(&mut self) {
-        if let Some(fallback) = self.fallback.as_mut() {
-            fallback.close();
-        }
-        self.use_fallback = false;
-        self.state = OperatorState::Closed;
-        self.rows.clear();
-        self.pos = 0;
-    }
-
-    fn estimated_rows(&self) -> Option<usize> {
-        Some(self.rows.len())
-    }
+    Ok(Some(counts.into_iter().collect()))
 }

@@ -24,12 +24,11 @@ use std::time::Instant;
 use fluree_db_binary_index::format::branch::LeafEntry;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
-use fluree_db_binary_index::{BinaryGarbageRef, BinaryPrevIndexRef, LeafletCache};
+use fluree_db_binary_index::{BinaryPrevIndexRef, LeafletCache};
 use fluree_db_core::{ContentId, ContentKind, ContentStore};
 use futures::stream::{self, StreamExt, TryStreamExt};
 
 use crate::error::{IndexerError, Result};
-use crate::gc;
 use crate::run_index::build::incremental_branch::{
     touched_leaf_refs, update_branch_streaming, BranchUpdateConfig, BranchUpdateMeta,
     BranchUpdateResult,
@@ -41,14 +40,6 @@ use crate::run_index::build::incremental_resolve::{
 use crate::run_index::build::incremental_root::IncrementalRootBuilder;
 use crate::{IndexResult, IndexStats, IndexerConfig};
 use tokio::sync::Semaphore;
-
-fn artifact_cache_dir(config: &IndexerConfig) -> std::path::PathBuf {
-    config
-        .data_dir
-        .as_ref()
-        .map(|d| d.join("binary_artifact_cache"))
-        .unwrap_or_else(|| std::env::temp_dir().join("fluree_binary_cache"))
-}
 
 #[derive(Default)]
 struct Phase2FetchStats {
@@ -98,24 +89,30 @@ impl Phase2FetchStats {
     }
 }
 
+/// Seed the read-through artifact cache with bytes this build just uploaded,
+/// so the first reader does not re-fetch them — when the store is one the
+/// cache serves at all (see `uses_disk_cache`).
 fn cache_artifact_bytes(
+    content_store: &dyn ContentStore,
     cache_dir: &std::path::Path,
     cid: &ContentId,
     bytes: &[u8],
     artifact_kind: &'static str,
 ) {
-    fluree_db_binary_index::read::artifact_cache::best_effort_cache_bytes_to_path(
+    if fluree_db_binary_index::read::artifact_cache::seed_disk_cache(
+        content_store,
+        cid,
         cache_dir,
-        &cache_dir.join(cid.to_string()),
         bytes,
-    );
-    tracing::trace!(
-        %cid,
-        artifact_kind,
-        bytes = bytes.len(),
-        cache_dir = %cache_dir.display(),
-        "V6 incremental: seeded artifact cache"
-    );
+    ) {
+        tracing::trace!(
+            %cid,
+            artifact_kind,
+            bytes = bytes.len(),
+            cache_dir = %cache_dir.display(),
+            "V6 incremental: seeded artifact cache"
+        );
+    }
 }
 
 async fn fetch_cached_index_bytes(
@@ -142,7 +139,7 @@ async fn upload_dict_blob_cached(
     cache_dir: &std::path::Path,
 ) -> Result<ContentId> {
     let cid = super::upload::upload_dict_blob(content_store, dict, bytes, msg).await?;
-    cache_artifact_bytes(cache_dir, &cid, bytes, "dict_blob");
+    cache_artifact_bytes(content_store, cache_dir, &cid, bytes, "dict_blob");
     Ok(cid)
 }
 
@@ -170,6 +167,8 @@ async fn run_update_branch(
     branch_bytes: Vec<u8>,
     sorted_records: Vec<RunRecordV2>,
     sorted_ops: Vec<u8>,
+    sorted_superseded: Vec<RunRecordV2>,
+    sorted_superseded_ops: Vec<u8>,
     branch_config: BranchUpdateConfig,
     content_store: Arc<dyn fluree_db_core::storage::ContentStore>,
     tracker: fluree_db_core::tracking::Tracker,
@@ -311,6 +310,8 @@ async fn run_update_branch(
             &branch_bytes,
             &sorted_records,
             &sorted_ops,
+            &sorted_superseded,
+            &sorted_superseded_ops,
             &branch_config,
             &|cid| {
                 leaf_map
@@ -359,7 +360,7 @@ async fn run_update_branch(
     let (cow_join, upload_res) = tokio::join!(cow, uploader);
     let upload_totals = upload_res?;
     let meta = cow_join
-        .map_err(|e| IndexerError::StorageWrite(format!("branch update task panicked: {e}")))?
+        .map_err(|e| IndexerError::from_join("branch update task", e))?
         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
 
     tracing::debug!(
@@ -387,7 +388,26 @@ struct Phase2Task {
     order: RunSortOrder,
     sorted_records: Vec<RunRecordV2>,
     sorted_ops: Vec<u8>,
+    /// Superseded events for this (graph, order), sorted like
+    /// `sorted_records`. Their real-transition subset becomes history-sidecar
+    /// entries in the leaf merge.
+    sorted_superseded: Vec<RunRecordV2>,
+    sorted_superseded_ops: Vec<u8>,
     kind: Phase2TaskKind,
+}
+
+/// Graph-scoped V2 fact identity: `(g_id, s_id, p_id, o_type, o_key, o_i)`.
+type FactIdentityKey = (u16, u64, u32, u16, u64, u32);
+
+fn fact_identity_key(rec: &RunRecordV2) -> FactIdentityKey {
+    (
+        rec.g_id,
+        rec.s_id.as_u64(),
+        rec.p_id,
+        rec.o_type,
+        rec.o_key,
+        rec.o_i,
+    )
 }
 
 enum Phase2TaskUpdate {
@@ -404,6 +424,9 @@ struct Phase2TaskOutput {
     replaced_sidecar_cids: Vec<ContentId>,
     new_leaf_count: usize,
     fetch_stats: Phase2FetchStatsSnapshot,
+    /// Novelty ops whose identity matched an existing base row (SPOT task
+    /// only; fresh-graph tasks have no base rows to match).
+    matched: Vec<RunRecordV2>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -422,6 +445,8 @@ async fn execute_phase2_task(
         order,
         sorted_records,
         sorted_ops,
+        sorted_superseded,
+        sorted_superseded_ops,
         kind,
     } = task;
 
@@ -434,6 +459,9 @@ async fn execute_phase2_task(
             .leaflet_rows
             .max(1)
             .saturating_mul(config.leaflets_per_leaf.max(1)),
+        // Fact identity is order-independent; collect base-row matches from
+        // the SPOT task only (they feed the Phase 3b stats deltas).
+        collect_matched: order == RunSortOrder::Spot,
     };
 
     let started = Instant::now();
@@ -452,6 +480,8 @@ async fn execute_phase2_task(
                 branch_bytes,
                 sorted_records,
                 sorted_ops,
+                sorted_superseded,
+                sorted_superseded_ops,
                 branch_config,
                 Arc::clone(&content_store),
                 tracker.clone(),
@@ -472,9 +502,26 @@ async fn execute_phase2_task(
                 replaced_sidecar_cids: meta.replaced_sidecar_cids,
                 new_leaf_count: meta.new_leaf_count,
                 fetch_stats,
+                matched: meta.matched,
             }
         }
         Phase2TaskKind::DefaultFresh => {
+            if !sorted_superseded.is_empty() {
+                // Permanent gap: these are real in-window transitions (e.g. a
+                // fact born and deleted between two index builds) and the next
+                // window's novelty never re-sees them. Reachable beyond
+                // genesis — the root format permits graphs with fewer than
+                // four materialized orders, so a newly added order takes this
+                // arm for an existing graph, leaving that order's replay
+                // without history its sibling orders have.
+                tracing::warn!(
+                    g_id,
+                    ?order,
+                    dropped = sorted_superseded.len(),
+                    "fresh default-graph order has no sidecar to merge into; \
+                     dropping this window's intra-window transition history"
+                );
+            }
             let BranchUpdateResult {
                 leaf_entries,
                 new_leaf_blobs,
@@ -499,6 +546,7 @@ async fn execute_phase2_task(
                 replaced_sidecar_cids: Vec::new(),
                 new_leaf_count,
                 fetch_stats: Phase2FetchStatsSnapshot::default(),
+                matched: Vec::new(),
             }
         }
         Phase2TaskKind::NamedExisting { branch_cid } => {
@@ -513,6 +561,8 @@ async fn execute_phase2_task(
                 branch_bytes,
                 sorted_records,
                 sorted_ops,
+                sorted_superseded,
+                sorted_superseded_ops,
                 branch_config,
                 Arc::clone(&content_store),
                 tracker.clone(),
@@ -527,7 +577,13 @@ async fn execute_phase2_task(
                 .await
                 .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
             debug_assert!(branch_cid == meta.branch_cid);
-            cache_artifact_bytes(&cache_dir, &branch_cid, &meta.branch_bytes, "index_branch");
+            cache_artifact_bytes(
+                &*content_store,
+                &cache_dir,
+                &branch_cid,
+                &meta.branch_bytes,
+                "index_branch",
+            );
             Phase2TaskOutput {
                 seq,
                 g_id,
@@ -537,9 +593,20 @@ async fn execute_phase2_task(
                 replaced_sidecar_cids: meta.replaced_sidecar_cids,
                 new_leaf_count: meta.new_leaf_count,
                 fetch_stats,
+                matched: meta.matched,
             }
         }
         Phase2TaskKind::NamedFresh => {
+            if !sorted_superseded.is_empty() {
+                // Permanent gap; see the DefaultFresh arm above.
+                tracing::warn!(
+                    g_id,
+                    ?order,
+                    dropped = sorted_superseded.len(),
+                    "fresh named-graph order has no sidecar to merge into; \
+                     dropping this window's intra-window transition history"
+                );
+            }
             let BranchUpdateResult {
                 new_leaf_blobs,
                 replaced_leaf_cids,
@@ -563,7 +630,13 @@ async fn execute_phase2_task(
                 .await
                 .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
             debug_assert!(branch_cid == expected_branch_cid);
-            cache_artifact_bytes(&cache_dir, &branch_cid, &branch_bytes, "index_branch");
+            cache_artifact_bytes(
+                &*content_store,
+                &cache_dir,
+                &branch_cid,
+                &branch_bytes,
+                "index_branch",
+            );
             Phase2TaskOutput {
                 seq,
                 g_id,
@@ -573,6 +646,7 @@ async fn execute_phase2_task(
                 replaced_sidecar_cids,
                 new_leaf_count,
                 fetch_stats: Phase2FetchStatsSnapshot::default(),
+                matched: Vec::new(),
             }
         }
     };
@@ -626,7 +700,7 @@ pub async fn incremental_index(
         "starting incremental index build"
     );
 
-    let cache_dir = artifact_cache_dir(&config);
+    let cache_dir = config.artifact_cache_dir();
     let _ = std::fs::create_dir_all(&cache_dir);
 
     // Single global S3 budget shared across the whole fold: the reconcile
@@ -661,7 +735,7 @@ pub async fn incremental_index(
         return Ok(IndexResult {
             root_id: base_root_id,
             index_t: novelty.max_t,
-            ledger_id: ledger_id.to_string(),
+            ledger_id: fluree_db_core::IntoLedgerId::into_ledger_id(ledger_id),
             stats: IndexStats::default(),
             fuel: None,
         });
@@ -689,9 +763,15 @@ pub async fn incremental_index(
     for (idx, rec) in novelty.records.iter().enumerate() {
         by_graph.entry(rec.g_id).or_default().push(idx);
     }
+    let mut superseded_by_graph: std::collections::BTreeMap<u16, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (idx, rec) in novelty.superseded.iter().enumerate() {
+        superseded_by_graph.entry(rec.g_id).or_default().push(idx);
+    }
 
     let base_root = &novelty.base_root;
-    let mut root_builder = IncrementalRootBuilder::from_old_root(novelty.base_root.clone());
+    let mut root_builder =
+        IncrementalRootBuilder::from_old_root(novelty.base_root.clone(), ledger_id);
     root_builder.set_index_t(novelty.max_t);
     root_builder.add_commit_stats(
         novelty.delta_commit_size,
@@ -708,6 +788,13 @@ pub async fn incremental_index(
         let indices = &by_graph[&g_id];
         let graph_records: Vec<RunRecordV2> = indices.iter().map(|&i| novelty.records[i]).collect();
         let graph_ops: Vec<u8> = indices.iter().map(|&i| novelty.ops[i]).collect();
+        let superseded_indices = superseded_by_graph.get(&g_id);
+        let graph_superseded: Vec<RunRecordV2> = superseded_indices
+            .map(|idxs| idxs.iter().map(|&i| novelty.superseded[i]).collect())
+            .unwrap_or_default();
+        let graph_superseded_ops: Vec<u8> = superseded_indices
+            .map(|idxs| idxs.iter().map(|&i| novelty.superseded_ops[i]).collect())
+            .unwrap_or_default();
 
         for &order in &all_orders {
             let cmp = cmp_v2_for_order(order);
@@ -716,6 +803,17 @@ pub async fn incremental_index(
             let sorted_records: Vec<RunRecordV2> =
                 sorted_indices.iter().map(|&i| graph_records[i]).collect();
             let sorted_ops: Vec<u8> = sorted_indices.iter().map(|&i| graph_ops[i]).collect();
+            let mut sorted_superseded_indices: Vec<usize> = (0..graph_superseded.len()).collect();
+            sorted_superseded_indices
+                .sort_unstable_by(|&a, &b| cmp(&graph_superseded[a], &graph_superseded[b]));
+            let sorted_superseded: Vec<RunRecordV2> = sorted_superseded_indices
+                .iter()
+                .map(|&i| graph_superseded[i])
+                .collect();
+            let sorted_superseded_ops: Vec<u8> = sorted_superseded_indices
+                .iter()
+                .map(|&i| graph_superseded_ops[i])
+                .collect();
 
             let kind = if g_id == 0 {
                 match base_root
@@ -746,6 +844,8 @@ pub async fn incremental_index(
                 order,
                 sorted_records,
                 sorted_ops,
+                sorted_superseded,
+                sorted_superseded_ops,
                 kind,
             });
         }
@@ -788,9 +888,16 @@ pub async fn incremental_index(
         phase2_results.into_iter().collect::<Result<Vec<_>>>()?;
     phase2_outputs.sort_unstable_by_key(|output| output.seq);
 
+    // Fact identities the SPOT merges matched against existing base rows.
+    // Phase 3b derives materialized-state stat deltas from this: an assert of
+    // a base-present fact and a retract of a base-absent fact change no rows.
+    let mut base_matched: std::collections::HashSet<FactIdentityKey> =
+        std::collections::HashSet::new();
+
     let mut phase2_fetch_totals = Phase2FetchStatsSnapshot::default();
     for output in phase2_outputs {
         total_new_leaves += output.new_leaf_count;
+        base_matched.extend(output.matched.iter().map(fact_identity_key));
         phase2_fetch_totals.leaf_fetches += output.fetch_stats.leaf_fetches;
         phase2_fetch_totals.leaf_cache_hits += output.fetch_stats.leaf_cache_hits;
         phase2_fetch_totals.leaf_cache_misses += output.fetch_stats.leaf_cache_misses;
@@ -880,14 +987,28 @@ pub async fn incremental_index(
         new_dict_refs.string_reverse = updated.tree_refs;
     }
 
-    // Forward pack updates (FPK1): append new pack artifacts for new subjects/strings.
-    // Forward packs are append-only: existing pack refs are preserved, new entries get
-    // their own pack artifacts appended to the routing list.
+    // Forward pack updates (FPK1): append new pack artifacts for new subjects/strings,
+    // then compact the tail of each stream that was touched. Appending alone adds a
+    // routing entry per build forever; compaction is what bounds the table by data size.
     {
         use fluree_db_binary_index::dict::incremental::{
             build_incremental_string_packs, build_incremental_subject_packs_for_ns,
         };
         use fluree_db_binary_index::PackBranchEntry;
+
+        let mut compaction_budget = if compaction_enabled() {
+            CompactionBudget::new()
+        } else {
+            CompactionBudget::disabled()
+        };
+        let mut pack_sizes = PackSizeCache::new();
+        // Every pack CID this cycle uploads, so any that compaction consumes
+        // before publication can be garbaged explicitly.
+        let mut uploaded_pack_cids: Vec<ContentId> = Vec::new();
+        // Streams compacted alongside their own novelty; the rest are swept
+        // afterwards with whatever budget survives.
+        let mut compacted_streams: std::collections::HashSet<Option<u16>> =
+            std::collections::HashSet::new();
 
         // String forward packs.
         // Invariant: new_strings is sorted by string_id ascending (enforced by resolver).
@@ -917,17 +1038,36 @@ pub async fn incremental_index(
                     .put(kind, &pack.bytes)
                     .await
                     .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+                pack_sizes.insert(pack_cid.clone(), pack.bytes.len() as u64);
+                uploaded_pack_cids.push(pack_cid.clone());
                 updated_refs.push(PackBranchEntry {
                     first_id: pack.first_id,
                     last_id: pack.last_id,
                     pack_cid,
                 });
             }
+
+            uploaded_pack_cids.extend(
+                compact_forward_packs(
+                    content_store.as_ref(),
+                    kind,
+                    &mut updated_refs,
+                    &mut pack_sizes,
+                    &mut compaction_budget,
+                    CompactionSpans::default(),
+                    "string",
+                )
+                .await?,
+            );
+            compacted_streams.insert(None);
+
+            let total_packs = updated_refs.len();
             new_dict_refs.forward_packs.string_fwd_packs = updated_refs;
 
             tracing::debug!(
                 new_packs = pack_result.new_packs.len(),
                 new_strings = novelty.new_strings.len(),
+                total_packs,
                 "V6 Phase 3: string forward packs updated"
             );
         }
@@ -989,12 +1129,30 @@ pub async fn incremental_index(
                         .put(kind, &pack.bytes)
                         .await
                         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+                    pack_sizes.insert(pack_cid.clone(), pack.bytes.len() as u64);
+                    uploaded_pack_cids.push(pack_cid.clone());
                     updated_refs.push(PackBranchEntry {
                         first_id: pack.first_id,
                         last_id: pack.last_id,
                         pack_cid,
                     });
                 }
+
+                uploaded_pack_cids.extend(
+                    compact_forward_packs(
+                        content_store.as_ref(),
+                        kind,
+                        &mut updated_refs,
+                        &mut pack_sizes,
+                        &mut compaction_budget,
+                        CompactionSpans::default(),
+                        &format!("subject ns={ns_code}"),
+                    )
+                    .await?,
+                );
+                compacted_streams.insert(Some(*ns_code));
+
+                let total_packs = updated_refs.len();
 
                 // Update or insert namespace entry.
                 if let Some(entry) = new_dict_refs
@@ -1015,9 +1173,99 @@ pub async fn incremental_index(
                     ns_code,
                     new_packs = pack_result.new_packs.len(),
                     new_subjects = entries.len(),
+                    total_packs,
                     "V6 Phase 3: subject forward packs updated"
                 );
             }
+        }
+
+        // Maintenance: a stream that received no novelty this cycle still
+        // carries whatever fragmentation it accumulated, and its packs are
+        // still loaded and mapped with the index. A namespace that goes quiet
+        // would otherwise keep its tiny packs forever. Sweep those with the
+        // leftover budget.
+        //
+        // Coverage rotates with `index_t` so that a ledger with more streams
+        // than one cycle's budget can service still reaches all of them over
+        // time, without persisting a cursor anywhere.
+        {
+            let mut pending: Vec<Option<u16>> = Vec::new();
+            if !compacted_streams.contains(&None) {
+                pending.push(None);
+            }
+            pending.extend(
+                new_dict_refs
+                    .forward_packs
+                    .subject_fwd_ns_packs
+                    .iter()
+                    .map(|(ns, _)| Some(*ns))
+                    .filter(|key| !compacted_streams.contains(key)),
+            );
+
+            if !pending.is_empty() {
+                let offset = (base_root.index_t.unsigned_abs() as usize) % pending.len();
+                pending.rotate_left(offset);
+            }
+
+            for key in pending {
+                if compaction_budget.exhausted() {
+                    break;
+                }
+                let (kind, label, refs) = match key {
+                    None => (
+                        ContentKind::DictBlob {
+                            dict: fluree_db_core::DictKind::StringForward,
+                        },
+                        "string (maintenance)".to_string(),
+                        &mut new_dict_refs.forward_packs.string_fwd_packs,
+                    ),
+                    Some(ns_code) => {
+                        let Some(entry) = new_dict_refs
+                            .forward_packs
+                            .subject_fwd_ns_packs
+                            .iter_mut()
+                            .find(|(ns, _)| *ns == ns_code)
+                        else {
+                            continue;
+                        };
+                        (
+                            ContentKind::DictBlob {
+                                dict: fluree_db_core::DictKind::SubjectForward,
+                            },
+                            format!("subject ns={ns_code} (maintenance)"),
+                            &mut entry.1,
+                        )
+                    }
+                };
+
+                uploaded_pack_cids.extend(
+                    compact_forward_packs(
+                        content_store.as_ref(),
+                        kind,
+                        refs,
+                        &mut pack_sizes,
+                        &mut compaction_budget,
+                        CompactionSpans::default(),
+                        &label,
+                    )
+                    .await?,
+                );
+            }
+        }
+
+        // Packs created and consumed within this cycle are referenced by no
+        // root, so the base-vs-new diff in `set_dict_refs` cannot see them.
+        let transient = unreferenced_uploads(
+            &uploaded_pack_cids,
+            &new_dict_refs.forward_packs,
+            &base_root.dict_refs.forward_packs,
+        );
+        if !transient.is_empty() {
+            tracing::debug!(
+                count = transient.len(),
+                "V6 Phase 3: forward packs created and compacted within one cycle"
+            );
+            root_builder.add_replaced_cids(transient);
         }
     }
 
@@ -1034,6 +1282,7 @@ pub async fn incremental_index(
 
     let new_pred_sids = build_predicate_sids(&novelty.shared, &new_ns_codes);
     root_builder.set_predicate_sids(new_pred_sids);
+    root_builder.note_list_meta(novelty.shared.saw_list_meta);
 
     let new_graph_iris: Vec<String> = (0..novelty.shared.graphs.len())
         .filter_map(|id| {
@@ -1559,7 +1808,13 @@ pub async fn incremental_index(
                         .map_err(|e| {
                             IndexerError::StorageWrite(format!("fulltext CAS write: {e}"))
                         })?;
-                    cache_artifact_bytes(&cache_dir, &arena_cid, &blob, "fulltext_arena");
+                    cache_artifact_bytes(
+                        &*content_store,
+                        &cache_dir,
+                        &arena_cid,
+                        &blob,
+                        "fulltext_arena",
+                    );
 
                     let new_ref = FulltextArenaRef {
                         p_id,
@@ -1758,7 +2013,13 @@ pub async fn incremental_index(
                             .put(ContentKind::SpatialIndex, blob_bytes)
                             .await
                             .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                        cache_artifact_bytes(&cache_dir, &cid, blob_bytes, "spatial_blob");
+                        cache_artifact_bytes(
+                            &*content_store,
+                            &cache_dir,
+                            &cid,
+                            blob_bytes,
+                            "spatial_blob",
+                        );
                     }
 
                     // Build CIDs.
@@ -1769,7 +2030,13 @@ pub async fn incremental_index(
                         .put(ContentKind::SpatialIndex, &root_json)
                         .await
                         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                    cache_artifact_bytes(&cache_dir, &root_cid, &root_json, "spatial_root");
+                    cache_artifact_bytes(
+                        &*content_store,
+                        &cache_dir,
+                        &root_cid,
+                        &root_json,
+                        "spatial_root",
+                    );
                     let manifest_cid =
                         ContentId::from_hex_digest(spatial_codec, &write_result.manifest_address)
                             .ok_or_else(|| {
@@ -1881,10 +2148,9 @@ pub async fn incremental_index(
             )
             .await
             {
-                Ok(bytes) => match stats::HllSketchBlob::from_json_bytes(&bytes)
-                    .and_then(stats::HllSketchBlob::into_properties)
-                {
-                    Ok(props) => {
+                Ok(bytes) => match stats::HllSketchBlob::from_bytes(&bytes) {
+                    Ok(blob) => {
+                        let props = blob.into_properties();
                         tracing::debug!(
                             entries = props.len(),
                             bytes = bytes.len(),
@@ -1892,25 +2158,92 @@ pub async fn incremental_index(
                         );
                         props
                     }
+                    // A newer format means a downgraded indexer. Reseeding
+                    // would silently thin NDV on every build; fail instead.
+                    Err(e @ stats::SketchDecodeError::Unsupported(_)) => return Err(e.into()),
                     Err(e) => {
-                        tracing::warn!(error = %e, "failed to decode prior sketches, starting fresh");
+                        tracing::error!(error = %e, %cid, "failed to decode prior sketches, starting fresh");
                         std::collections::HashMap::new()
                     }
                 },
-                Err(IndexerError::StorageRead(e)) if e.contains("not found") => {
-                    tracing::debug!(
-                        "sketch blob CID present but content not found, starting fresh"
-                    );
-                    std::collections::HashMap::new()
-                }
                 Err(e) => {
-                    tracing::warn!(error = %e, "failed to load sketch blob, starting fresh");
+                    tracing::error!(error = %e, %cid, "failed to load sketch blob, starting fresh");
                     std::collections::HashMap::new()
                 }
             }
         } else {
             std::collections::HashMap::new()
         };
+
+        // Base carry-forward must not depend on the sketch blob alone. When
+        // it is absent or unreadable, the hook would start from zero and the
+        // new root would persist DELTA-ONLY per-graph property stats — base
+        // predicates vanish and net-zero churn shows count 0, compounding on
+        // every subsequent incremental (observed: 4 of 8 predicates left
+        // after one incremental over a sketchless bulk import). Seed
+        // counts/datatypes/last_modified_t from the base root's persisted
+        // per-graph property stats instead. HLL registers cannot be
+        // reconstructed from the persisted ndv ESTIMATES, so remember those
+        // estimates and clamp the finalized ndv below — HLL ndv is monotone
+        // (registers only grow), so the base estimate is a valid floor. The
+        // clamp applies on every incremental (not just the fallback) so ndv
+        // survives register loss in a previously fallback-seeded sketch.
+        let mut prior_properties = prior_properties;
+        let mut base_ndv_floor: std::collections::HashMap<stats::GraphPropertyKey, (u64, u64)> =
+            std::collections::HashMap::new();
+        if let Some(graphs) = base_root.stats.as_ref().and_then(|s| s.graphs.as_ref()) {
+            for g in graphs {
+                for prop in &g.properties {
+                    let key = stats::GraphPropertyKey {
+                        g_id: g.g_id,
+                        p_id: prop.p_id,
+                    };
+                    base_ndv_floor.insert(key.clone(), (prop.ndv_values, prop.ndv_subjects));
+                    // Per-key fallback: a blob entry (with real HLL registers)
+                    // wins; a key the blob lacks is seeded from the base
+                    // root's persisted per-graph stats.
+                    let entry = prior_properties.entry(key).or_insert_with(|| {
+                        let datatypes = prop
+                            .datatypes
+                            .iter()
+                            .map(|&(tag, c)| (tag, c as i64))
+                            .collect();
+                        stats::IdPropertyHll::from_sketches(
+                            prop.count as i64,
+                            crate::hll::HllSketch256::new(),
+                            crate::hll::HllSketch256::new(),
+                            prop.last_modified_t,
+                            datatypes,
+                        )
+                    });
+                    // Historical accumulation (monotone across publishes): the
+                    // base's persisted historical set, plus the base's exact
+                    // current-state tags — the latter is what makes adoption
+                    // sound when the base predates the historical wire tail.
+                    entry.seed_historical_tags(
+                        prop.historical_datatypes
+                            .iter()
+                            .copied()
+                            .chain(prop.datatypes.iter().map(|&(tag, _)| tag)),
+                    );
+                }
+            }
+        }
+
+        // Historical accumulation boundary (`IndexStats::historical_since_t`).
+        // With per-graph base stats in hand, the seeding above covers state at
+        // the base publish exactly, and the novelty walk observes every tag in
+        // the window `(base_t, index_t]` — a tag visible at any `t` in that
+        // window was either visible at `base_t` (seeded) or asserted in the
+        // window (walked). So a base that carries a boundary passes it
+        // forward, and a base that predates the tail adopts at its own `t`.
+        // Without per-graph base stats there is nothing sound to seed from and
+        // no boundary is claimed.
+        let historical_since_t: Option<i64> = base_root
+            .stats
+            .as_ref()
+            .filter(|s| s.graphs.is_some())
+            .map(|s| s.historical_since_t.unwrap_or(base_root.index_t));
 
         // Seed hook with prior properties.
         let rdf_type_p_id = novelty
@@ -1931,36 +2264,31 @@ pub async fn incremental_index(
             }
         }
 
-        // Feed all novelty records.
+        // Feed all novelty records. Counts are base-seeded, so each record's
+        // signed delta reflects its materialized state transition (derived
+        // from the SPOT merge's base-row matches), not its raw op: a
+        // re-assert of a base-present fact and a retract of a base-absent
+        // fact change no rows and contribute 0.
         for (i, rec) in novelty.records.iter().enumerate() {
             let op = novelty.ops[i];
             let sr = stats::stats_record_from_v2(rec, op);
-            stats_hook.on_record(&sr);
+            let base_present = base_matched.contains(&fact_identity_key(rec));
+            stats_hook.on_record_with_base_presence(&sr, base_present);
         }
 
         // Upload HLL sketches (before finalize consumes the hook).
-        let sketch_ref = {
-            let sketch_blob =
-                stats::HllSketchBlob::from_properties(novelty.max_t, stats_hook.properties());
-            if !sketch_blob.entries.is_empty() {
-                let sketch_bytes = sketch_blob
-                    .to_json_bytes()
-                    .map_err(|e| IndexerError::StorageWrite(format!("sketch serialize: {e}")))?;
-                let cid = content_store
-                    .put(ContentKind::StatsSketch, &sketch_bytes)
-                    .await
-                    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                cache_artifact_bytes(&cache_dir, &cid, &sketch_bytes, "stats_sketch");
-                tracing::debug!(
-                    %cid,
-                    bytes = sketch_bytes.len(),
-                    entries = sketch_blob.entries.len(),
-                    "incremental V6: HLL sketch uploaded"
-                );
+        let sketch_ref = match super::upload::upload_stats_sketch(
+            content_store.as_ref(),
+            novelty.max_t,
+            stats_hook.properties(),
+        )
+        .await?
+        {
+            Some((cid, bytes)) => {
+                cache_artifact_bytes(&*content_store, &cache_dir, &cid, &bytes, "stats_sketch");
                 Some(cid)
-            } else {
-                None
             }
+            None => None,
         };
 
         // Move per-subject maps out of the hook (avoids cloning).
@@ -1979,18 +2307,6 @@ pub async fn incremental_index(
         let db_stats = {
             use fluree_db_core::index_stats as is;
 
-            let properties = crate::stats::aggregate_property_entries_from_graphs(
-                &id_stats_result.graphs,
-                &trie,
-                |p_id| {
-                    novelty
-                        .shared
-                        .predicates
-                        .resolve(p_id)
-                        .map(ToString::to_string)
-                },
-            );
-
             // Class-property attribution: build full ClassStatEntry with property usage.
             //
             // Strategy:
@@ -2001,6 +2317,41 @@ pub async fn incremental_index(
             // 5. Build ClassStatEntry with datatypes, langs, ref-class edges
             // 6. Apply count deltas to base entries, add new entries
             let mut final_graphs = id_stats_result.graphs;
+
+            // ndv floor from the base root (see the seeding block above).
+            if !base_ndv_floor.is_empty() {
+                for g in &mut final_graphs {
+                    for prop in &mut g.properties {
+                        if let Some(&(nv, ns)) = base_ndv_floor.get(&stats::GraphPropertyKey {
+                            g_id: g.g_id,
+                            p_id: prop.p_id,
+                        }) {
+                            prop.ndv_values = prop.ndv_values.max(nv);
+                            prop.ndv_subjects = prop.ndv_subjects.max(ns);
+                        }
+                    }
+                }
+            }
+
+            // The planner reads this roll-up, not the per-graph entries, so it
+            // must be taken AFTER the floor: rolled up before it, a seeded
+            // property (empty registers) published ndv 0 and every
+            // bound-subject probe on it was estimated at the 10-row fallback —
+            // one write to a bulk-imported ledger made BSBM Q5 4x slower.
+            // The floor preserves the prior NDV estimate without restoring
+            // missing HLL registers. Follow-up: persist sketches during bulk
+            // import so incremental NDV merging includes the imported data.
+            let properties = crate::stats::aggregate_property_entries_from_graphs(
+                &final_graphs,
+                &trie,
+                |p_id| {
+                    novelty
+                        .shared
+                        .predicates
+                        .resolve(p_id)
+                        .map(ToString::to_string)
+                },
+            );
 
             let has_class_changes =
                 !class_count_deltas.is_empty() || !novelty_subject_class_deltas.is_empty();
@@ -2706,13 +3057,20 @@ pub async fn incremental_index(
                             }
                             // Resolve classes for endpoints not already known from this batch
                             // (stable base entities) via one batched rdf:type lookup; endpoints
-                            // in base_subject_classes (re-typed / novelty) use those maps.
+                            // in either batch map (re-typed / novelty) use those maps. A subject
+                            // typed for the FIRST time this batch has no base entry — only a net
+                            // one — so both maps must be checked or it would be mistaken for a
+                            // stable (still class-less) base entity.
                             let mut external_sids: Vec<u64> = Vec::new();
                             for &(s, _p, o) in &edges {
-                                if !base_subject_classes.contains_key(&(g_id, s)) {
+                                if !base_subject_classes.contains_key(&(g_id, s))
+                                    && !subject_classes.contains_key(&(g_id, s))
+                                {
                                     external_sids.push(s);
                                 }
-                                if !base_subject_classes.contains_key(&(g_id, o)) {
+                                if !base_subject_classes.contains_key(&(g_id, o))
+                                    && !subject_classes.contains_key(&(g_id, o))
+                                {
                                     external_sids.push(o);
                                 }
                             }
@@ -2744,11 +3102,21 @@ pub async fn incremental_index(
                             };
                             // (base_classes, net_classes) for an endpoint. A stable base
                             // entity has base == net (its type did not change this batch).
+                            // Batch-local membership is keyed on EITHER map: a first-time-typed
+                            // subject is absent from base but present in net; keying on base
+                            // alone would resolve it externally as class-less and drop the +1
+                            // side of its edge moves.
                             let resolve = |sid: u64| -> (Vec<u64>, Vec<u64>) {
-                                if let Some(b) = base_subject_classes.get(&(g_id, sid)) {
-                                    let base: Vec<u64> = b.iter().copied().collect();
+                                let key = (g_id, sid);
+                                if base_subject_classes.contains_key(&key)
+                                    || subject_classes.contains_key(&key)
+                                {
+                                    let base: Vec<u64> = base_subject_classes
+                                        .get(&key)
+                                        .map(|b| b.iter().copied().collect())
+                                        .unwrap_or_default();
                                     let net: Vec<u64> = subject_classes
-                                        .get(&(g_id, sid))
+                                        .get(&key)
                                         .map(|s| s.iter().copied().collect())
                                         .unwrap_or_default();
                                     (base, net)
@@ -3312,6 +3680,7 @@ pub async fn incremental_index(
                 properties: Some(properties),
                 classes: root_classes,
                 graphs: Some(final_graphs),
+                historical_since_t,
             }
         };
 
@@ -3615,139 +3984,76 @@ pub async fn incremental_index(
         "Phase 4: root builder finalized"
     );
 
-    // Write garbage manifest.
-    if !replaced_cids.is_empty() {
-        let garbage_strings: Vec<String> = replaced_cids
-            .iter()
-            .map(std::string::ToString::to_string)
-            .collect();
-        let garbage_write_started = Instant::now();
-        tracing::debug!(
-            replaced_cids = garbage_strings.len(),
-            index_t = new_root.index_t,
-            "Phase 4: writing garbage record"
-        );
-        let garbage_cid = gc::write_garbage_record(
-            content_store.as_ref(),
-            ledger_id,
-            new_root.index_t,
-            garbage_strings,
-        )
+    let mut final_root = new_root;
+    super::root_assembly::attach_garbage_manifest(
+        content_store.as_ref(),
+        &mut final_root,
+        ledger_id,
+        &replaced_cids,
+    )
+    .await?;
+
+    if let Some(stats) = final_root.stats.as_mut() {
+        stats.distribute_total_size_by_flakes(final_root.total_commit_size);
+    }
+
+    super::root_assembly::reconcile_ns_at_publish(
+        &final_root.namespace_codes,
+        &novelty.shared.ns_prefixes,
+        final_root.index_t,
+    )?;
+    // Bail to a full rebuild rather than panicking in encode(); a rebuild
+    // re-cuts packs by size and is the only thing that shrinks this table.
+    super::root_assembly::ensure_pack_counts_encodable(&final_root)?;
+
+    let root_encode_started = Instant::now();
+    let root_bytes = final_root.encode();
+    tracing::debug!(
+        bytes = root_bytes.len(),
+        elapsed_ms = root_encode_started.elapsed().as_millis() as u64,
+        "Phase 4: encoded incremental index root"
+    );
+    let root_write_started = Instant::now();
+    tracing::debug!(
+        bytes = root_bytes.len(),
+        index_t = final_root.index_t,
+        "Phase 4: writing incremental index root"
+    );
+    let root_id = content_store
+        .put(ContentKind::IndexRoot, &root_bytes)
         .await
         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-        tracing::debug!(
-            %garbage_cid,
-            elapsed_ms = garbage_write_started.elapsed().as_millis() as u64,
-            "Phase 4: garbage record written"
-        );
+    cache_artifact_bytes(
+        &*content_store,
+        &cache_dir,
+        &root_id,
+        &root_bytes,
+        "index_root",
+    );
 
-        // Set garbage on the root before encoding.
-        let mut final_root = new_root;
-        final_root.garbage = Some(BinaryGarbageRef { id: garbage_cid });
-        if let Some(stats) = final_root.stats.as_mut() {
-            stats.distribute_total_size_by_flakes(final_root.total_commit_size);
-        }
+    tracing::debug!(
+        %root_id,
+        index_t = final_root.index_t,
+        replaced = replaced_cids.len(),
+        new_leaves = total_new_leaves,
+        root_write_ms = root_write_started.elapsed().as_millis() as u64,
+        phase4_elapsed_ms = phase4_started.elapsed().as_millis() as u64,
+        "V6 incremental index root published"
+    );
 
-        super::root_assembly::reconcile_ns_at_publish(
-            &final_root.namespace_codes,
-            &novelty.shared.ns_prefixes,
-            final_root.index_t,
-        )?;
-
-        let root_encode_started = Instant::now();
-        let root_bytes = final_root.encode();
-        tracing::debug!(
-            bytes = root_bytes.len(),
-            elapsed_ms = root_encode_started.elapsed().as_millis() as u64,
-            "Phase 4: encoded incremental index root"
-        );
-        let root_write_started = Instant::now();
-        tracing::debug!(
-            bytes = root_bytes.len(),
-            index_t = final_root.index_t,
-            "Phase 4: writing incremental index root"
-        );
-        let root_id = content_store
-            .put(ContentKind::IndexRoot, &root_bytes)
-            .await
-            .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-        cache_artifact_bytes(&cache_dir, &root_id, &root_bytes, "index_root");
-
-        tracing::debug!(
-            %root_id,
-            index_t = final_root.index_t,
-            replaced = replaced_cids.len(),
-            new_leaves = total_new_leaves,
-            root_write_ms = root_write_started.elapsed().as_millis() as u64,
-            phase4_elapsed_ms = phase4_started.elapsed().as_millis() as u64,
-            "V6 incremental index root published"
-        );
-
-        Ok(IndexResult {
-            root_id,
-            index_t: final_root.index_t,
-            ledger_id: ledger_id.to_string(),
-            stats: IndexStats {
-                flake_count: novelty.records.len(),
-                leaf_count: total_new_leaves,
-                branch_count: by_graph.len(),
-                total_bytes: root_bytes.len(),
-            },
-            // Outer entry point fills fuel from the tracker tally.
-            fuel: None,
-        })
-    } else {
-        let mut final_root = new_root;
-        if let Some(stats) = final_root.stats.as_mut() {
-            stats.distribute_total_size_by_flakes(final_root.total_commit_size);
-        }
-
-        super::root_assembly::reconcile_ns_at_publish(
-            &final_root.namespace_codes,
-            &novelty.shared.ns_prefixes,
-            final_root.index_t,
-        )?;
-        let root_encode_started = Instant::now();
-        let root_bytes = final_root.encode();
-        tracing::debug!(
-            bytes = root_bytes.len(),
-            elapsed_ms = root_encode_started.elapsed().as_millis() as u64,
-            "Phase 4: encoded incremental index root"
-        );
-        let root_write_started = Instant::now();
-        tracing::debug!(
-            bytes = root_bytes.len(),
-            index_t = final_root.index_t,
-            "Phase 4: writing incremental index root"
-        );
-        let root_id = content_store
-            .put(ContentKind::IndexRoot, &root_bytes)
-            .await
-            .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-        cache_artifact_bytes(&cache_dir, &root_id, &root_bytes, "index_root");
-
-        tracing::debug!(
-            %root_id,
-            index_t = final_root.index_t,
-            new_leaves = total_new_leaves,
-            root_write_ms = root_write_started.elapsed().as_millis() as u64,
-            phase4_elapsed_ms = phase4_started.elapsed().as_millis() as u64,
-            "V6 incremental index root published (no garbage)"
-        );
-
-        Ok(IndexResult {
-            root_id,
-            index_t: final_root.index_t,
-            ledger_id: ledger_id.to_string(),
-            stats: IndexStats {
-                flake_count: novelty.records.len(),
-                leaf_count: total_new_leaves,
-                branch_count: by_graph.len(),
-                total_bytes: root_bytes.len(),
-            },
-            fuel: None,
-        })
-    }
+    Ok(IndexResult {
+        root_id,
+        index_t: final_root.index_t,
+        ledger_id: fluree_db_core::IntoLedgerId::into_ledger_id(ledger_id),
+        stats: IndexStats {
+            flake_count: novelty.records.len(),
+            leaf_count: total_new_leaves,
+            branch_count: by_graph.len(),
+            total_bytes: root_bytes.len(),
+        },
+        // Outer entry point fills fuel from the tracker tally.
+        fuel: None,
+    })
 }
 
 // ============================================================================
@@ -3760,6 +4066,420 @@ struct LeafUploadCounts {
     leaf_bytes: u64,
     sidecar_bytes: u64,
     sidecar_count: u64,
+}
+
+/// Merge input bytes one index cycle may rewrite, shared across every
+/// forward-dictionary stream. Caps the latency compaction adds to a publish;
+/// whatever is left unmerged is picked up by the next cycle.
+const COMPACTION_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Storage operations one index cycle may spend on compaction, shared across
+/// every stream.
+///
+/// A byte budget alone does not bound *requests*: a backlog of 113-byte packs
+/// consumes almost none of it while still costing a size probe and a full GET
+/// per pack. Charging every operation is what actually caps the round trips a
+/// publish waits on, and sharing one counter across streams stops a ledger with
+/// many namespaces from multiplying the cost.
+const COMPACTION_MAX_REQUESTS: usize = 2048;
+
+/// Packs at the end of a stream examined every cycle, whatever else happens.
+///
+/// New packs always land here, so this window is what keeps the table bounded.
+/// It must never be starved by backlog repair — a table larger than the scan
+/// budget would otherwise hide its own tail and grow without limit.
+const COMPACTION_TAIL_SPAN: usize = 64;
+
+/// Packs examined per step when sweeping older regions for fragmentation.
+const COMPACTION_HEAD_SPAN: usize = 256;
+
+/// Concurrent storage operations. Probes and fetches are independent objects,
+/// so serializing them would make a merge cost `run_length` round trips.
+const COMPACTION_CONCURRENCY: usize = 16;
+
+/// How far each scan reaches. Overridable so tests can drive the real windowing
+/// without building a table the size of the production spans.
+#[derive(Clone, Copy)]
+struct CompactionSpans {
+    tail: usize,
+    head: usize,
+}
+
+impl Default for CompactionSpans {
+    fn default() -> Self {
+        Self {
+            tail: COMPACTION_TAIL_SPAN,
+            head: COMPACTION_HEAD_SPAN,
+        }
+    }
+}
+
+/// Whether forward pack compaction runs at all.
+///
+/// Compaction rewrites and re-uploads dictionary data during an index build, so
+/// a deployment needs a way to stop it without a rollback — the same reason
+/// `FLUREE_DICT_PACK_MMAP_MIN_BYTES` exists. Off means packs are appended and
+/// never merged, which is the pre-compaction behaviour exactly.
+///
+/// Defaults to on; only `0`, `false`, `off`, or `no` disable it. Read once per
+/// process — set it at startup, not per build.
+fn compaction_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FLUREE_DICT_COMPACTION") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    })
+}
+
+/// Cycle-wide compaction allowance, shared by every forward-dictionary stream.
+struct CompactionBudget {
+    bytes: u64,
+    requests: usize,
+}
+
+impl CompactionBudget {
+    fn new() -> Self {
+        Self {
+            bytes: COMPACTION_BUDGET_BYTES,
+            requests: COMPACTION_MAX_REQUESTS,
+        }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.bytes == 0 || self.requests == 0
+    }
+
+    /// A budget that permits nothing, so every compaction site is a no-op.
+    fn disabled() -> Self {
+        Self {
+            bytes: 0,
+            requests: 0,
+        }
+    }
+
+    /// Reserve up to `n` operations, returning how many were granted. For work
+    /// that can proceed on a partial grant, such as probing pack sizes until the
+    /// budget runs out.
+    fn take_requests(&mut self, n: usize) -> usize {
+        let granted = n.min(self.requests);
+        self.requests -= granted;
+        granted
+    }
+
+    /// Reserve exactly `n` operations, or nothing at all.
+    ///
+    /// A merge is indivisible — it either fetches every input pack or does not
+    /// happen — so a partial grant must leave the budget untouched for whatever
+    /// smaller work comes next, rather than being spent on a merge that then
+    /// declines to run.
+    fn reserve_requests(&mut self, n: usize) -> bool {
+        if self.requests < n {
+            return false;
+        }
+        self.requests -= n;
+        true
+    }
+}
+
+/// Encoded sizes of forward packs, memoized for one index cycle.
+///
+/// Sizes for packs written during this cycle are known exactly and inserted at
+/// write time, so the common case costs no I/O at all. Only packs inherited
+/// from earlier cycles are probed, and a probe reads 40 bytes.
+type PackSizeCache = HashMap<ContentId, u64>;
+
+/// Encoded byte lengths for `cids`, in order, stopping at the first that cannot
+/// be established or that the request budget will not cover.
+///
+/// Sizes come from the cycle memo, then local file metadata, then a 40-byte
+/// header range read — never a full fetch. Only reads that actually reach
+/// storage are charged. A pack that cannot be sized truncates the candidate
+/// region rather than failing the build: compaction is an optimization and must
+/// never fail a publish.
+async fn pack_encoded_sizes(
+    content_store: &dyn ContentStore,
+    cids: &[ContentId],
+    cache: &mut PackSizeCache,
+    budget: &mut CompactionBudget,
+) -> Vec<u64> {
+    use fluree_db_binary_index::dict::forward_pack::{
+        pack_encoded_len_from_header, PACK_HEADER_SIZE,
+    };
+
+    let mut sizes = Vec::with_capacity(cids.len());
+
+    // Serve memo hits and local metadata without spending budget, and collect
+    // whatever still needs a remote probe.
+    let mut pending: Vec<(usize, &ContentId)> = Vec::new();
+    for (i, cid) in cids.iter().enumerate() {
+        if let Some(&size) = cache.get(cid) {
+            sizes.push(Some(size));
+        } else if let Some(meta) = content_store
+            .resolve_local_path(cid)
+            .and_then(|path| std::fs::metadata(path).ok())
+        {
+            cache.insert(cid.clone(), meta.len());
+            sizes.push(Some(meta.len()));
+        } else {
+            sizes.push(None);
+            pending.push((i, cid));
+        }
+    }
+
+    let grant = budget.take_requests(pending.len());
+    let pending = &pending[..grant];
+    if !pending.is_empty() {
+        let probes: Vec<_> = pending
+            .iter()
+            .map(|(_, cid)| content_store.get_range(cid, 0..PACK_HEADER_SIZE as u64))
+            .collect();
+        let headers: Vec<_> = stream::iter(probes)
+            .buffered(COMPACTION_CONCURRENCY)
+            .collect()
+            .await;
+
+        for ((i, cid), header) in pending.iter().zip(headers) {
+            let Some(size) = header
+                .ok()
+                .and_then(|h| pack_encoded_len_from_header(&h).ok())
+            else {
+                continue;
+            };
+            cache.insert((*cid).clone(), size);
+            sizes[*i] = Some(size);
+        }
+    }
+
+    // Truncate at the first unknown: the planner needs a contiguous prefix.
+    sizes.into_iter().map_while(|s| s).collect()
+}
+
+/// Merge qualifying runs within one forward-dictionary stream, in place.
+///
+/// Examines the **tail** first and unconditionally, because new packs land
+/// there and that window is what keeps the table bounded. Only then does it
+/// sweep older regions for inherited fragmentation, with whatever budget
+/// remains. Doing it the other way round lets a table larger than the scan
+/// budget hide its own tail and grow without limit.
+///
+/// Returns the CIDs of packs this call uploaded, whether or not they survived
+/// into `refs` — a cascade rewrites its own intermediate output, and the caller
+/// must account for anything that did not survive (see `unreferenced_uploads`).
+///
+/// Compaction never fails a build. A pack that cannot be sized or fetched just
+/// makes its region ineligible this cycle. A *structural* failure is different
+/// — a merge that produced a malformed or mis-ranged pack means the inputs were
+/// not what the routing table claimed, so that propagates.
+async fn compact_forward_packs(
+    content_store: &dyn ContentStore,
+    kind: ContentKind,
+    refs: &mut Vec<fluree_db_binary_index::PackBranchEntry>,
+    cache: &mut PackSizeCache,
+    budget: &mut CompactionBudget,
+    spans: CompactionSpans,
+    stream_label: &str,
+) -> Result<Vec<ContentId>> {
+    let mut uploaded = Vec::new();
+
+    // Tail first, and repeatedly: each merge can expose another.
+    while !budget.exhausted() {
+        let start = refs.len().saturating_sub(spans.tail);
+        if !compact_window(
+            content_store,
+            kind,
+            refs,
+            start,
+            spans.tail,
+            cache,
+            budget,
+            stream_label,
+            &mut uploaded,
+        )
+        .await?
+        {
+            break;
+        }
+    }
+
+    // Then sweep older regions. Progress is not persisted between cycles, so
+    // this restarts at the head each time; the request budget is what stops a
+    // long run of mature packs from being re-probed indefinitely.
+    let mut cursor = 0usize;
+    while !budget.exhausted() && cursor + 1 < refs.len().saturating_sub(spans.tail) {
+        if compact_window(
+            content_store,
+            kind,
+            refs,
+            cursor,
+            spans.head,
+            cache,
+            budget,
+            stream_label,
+            &mut uploaded,
+        )
+        .await?
+        {
+            continue; // merged here; try the same region again
+        }
+        cursor += spans.head;
+    }
+
+    Ok(uploaded)
+}
+
+/// Attempt one merge within `refs[start .. start + span]`. Returns whether a
+/// merge happened.
+#[allow(clippy::too_many_arguments)]
+async fn compact_window(
+    content_store: &dyn ContentStore,
+    kind: ContentKind,
+    refs: &mut Vec<fluree_db_binary_index::PackBranchEntry>,
+    start: usize,
+    span: usize,
+    cache: &mut PackSizeCache,
+    budget: &mut CompactionBudget,
+    stream_label: &str,
+    uploaded: &mut Vec<ContentId>,
+) -> Result<bool> {
+    use fluree_db_binary_index::dict::forward_pack::concat_forward_packs;
+    use fluree_db_binary_index::dict::incremental::{plan_compaction, COMPACTION_MAX_OUTPUT_BYTES};
+
+    let end = refs.len().min(start + span);
+    if start + 1 >= end {
+        return Ok(false);
+    }
+
+    let cids: Vec<ContentId> = refs[start..end]
+        .iter()
+        .map(|e| e.pack_cid.clone())
+        .collect();
+    let sizes = pack_encoded_sizes(content_store, &cids, cache, budget).await;
+
+    let window = &refs[start..start + sizes.len()];
+    let Some(plan) = plan_compaction(window, &sizes, COMPACTION_MAX_OUTPUT_BYTES, 0) else {
+        return Ok(false);
+    };
+    let (merge_start, merge_end) = (start + plan.start, start + plan.end);
+
+    if plan.input_bytes > budget.bytes {
+        tracing::debug!(
+            stream = stream_label,
+            input_bytes = plan.input_bytes,
+            bytes_remaining = budget.bytes,
+            "forward pack compaction deferred: cycle byte budget exhausted"
+        );
+        budget.bytes = 0;
+        return Ok(false);
+    }
+
+    let input_packs = merge_end - merge_start;
+    if !budget.reserve_requests(input_packs) {
+        tracing::debug!(
+            stream = stream_label,
+            input_packs,
+            "forward pack compaction deferred: cycle request budget exhausted"
+        );
+        return Ok(false);
+    }
+
+    let started = Instant::now();
+    let input_cids = &cids[plan.start..plan.end];
+    let fetches: Vec<_> = input_cids
+        .iter()
+        .map(|cid| content_store.get(cid))
+        .collect();
+    let fetched: std::result::Result<Vec<Vec<u8>>, fluree_db_core::error::Error> =
+        stream::iter(fetches)
+            .buffered(COMPACTION_CONCURRENCY)
+            .try_collect()
+            .await;
+
+    let bytes = match fetched {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!(
+                stream = stream_label,
+                error = %e,
+                "forward pack compaction skipped: input fetch failed"
+            );
+            return Ok(false);
+        }
+    };
+
+    let borrowed: Vec<&[u8]> = bytes.iter().map(Vec::as_slice).collect();
+    let merged = concat_forward_packs(&borrowed).map_err(|e| {
+        IndexerError::StorageWrite(format!("forward pack compaction ({stream_label}): {e}"))
+    })?;
+    drop(bytes);
+
+    let output_bytes = merged.len() as u64;
+    let first_id = refs[merge_start].first_id;
+    let last_id = refs[merge_end - 1].last_id;
+
+    let pack_cid = content_store
+        .put(kind, &merged)
+        .await
+        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+
+    uploaded.push(pack_cid.clone());
+    cache.insert(pack_cid.clone(), output_bytes);
+    refs.splice(
+        merge_start..merge_end,
+        [fluree_db_binary_index::PackBranchEntry {
+            first_id,
+            last_id,
+            pack_cid,
+        }],
+    );
+
+    budget.bytes = budget.bytes.saturating_sub(plan.input_bytes);
+
+    tracing::debug!(
+        stream = stream_label,
+        input_packs,
+        input_bytes = plan.input_bytes,
+        output_bytes,
+        merged_at = merge_start,
+        packs_remaining = refs.len(),
+        bytes_remaining = budget.bytes,
+        requests_remaining = budget.requests,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "forward packs compacted"
+    );
+
+    Ok(true)
+}
+
+/// Uploads from this cycle that no longer appear in the published routing
+/// tables, and were not inherited from the base root.
+///
+/// `set_dict_refs` records garbage by diffing the base root against the new
+/// one, which cannot see a pack that was created *and* consumed inside a single
+/// cycle — a freshly appended pack that compaction immediately absorbed, or a
+/// cascade's own intermediate output. Those are referenced by no root at all,
+/// so without this they would sit in the store forever.
+fn unreferenced_uploads(
+    uploaded: &[ContentId],
+    live: &fluree_db_binary_index::DictPackRefs,
+    base: &fluree_db_binary_index::DictPackRefs,
+) -> Vec<ContentId> {
+    let referenced: std::collections::HashSet<&ContentId> = live
+        .string_fwd_packs
+        .iter()
+        .chain(live.subject_fwd_ns_packs.iter().flat_map(|(_, v)| v.iter()))
+        .chain(base.string_fwd_packs.iter())
+        .chain(base.subject_fwd_ns_packs.iter().flat_map(|(_, v)| v.iter()))
+        .map(|e| &e.pack_cid)
+        .collect();
+
+    uploaded
+        .iter()
+        .filter(|cid| !referenced.contains(cid))
+        .cloned()
+        .collect()
 }
 
 /// Upload ONE leaf (+ its sidecar) under a single permit from the global
@@ -3792,7 +4512,13 @@ async fn upload_one_leaf_blob(
         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
     crate::fuel::charge_extra_leaflets(tracker, info.re_encoded_leaflet_count)?;
     debug_assert!(leaf_cid == info.leaf_cid);
-    cache_artifact_bytes(cache_dir, &leaf_cid, &info.leaf_bytes, "index_leaf");
+    cache_artifact_bytes(
+        content_store,
+        cache_dir,
+        &leaf_cid,
+        &info.leaf_bytes,
+        "index_leaf",
+    );
     counts.leaf_bytes = info.leaf_bytes.len() as u64;
 
     // Warm-on-write (co-located only): seed the shared read cache with the
@@ -3824,7 +4550,13 @@ async fn upload_one_leaf_blob(
         if let Some(expected) = &info.sidecar_cid {
             debug_assert!(&sidecar_cid == expected);
         }
-        cache_artifact_bytes(cache_dir, &sidecar_cid, sc_bytes, "history_sidecar");
+        cache_artifact_bytes(
+            content_store,
+            cache_dir,
+            &sidecar_cid,
+            sc_bytes,
+            "history_sidecar",
+        );
         counts.sidecar_bytes = sc_bytes.len() as u64;
         counts.sidecar_count = 1;
     }
@@ -3988,6 +4720,7 @@ fn build_fresh_default_graph_v3(
         replaced_sidecar_cids: Vec::new(),
         branch_bytes,
         branch_cid,
+        matched: Vec::new(),
     })
 }
 
@@ -4027,4 +4760,201 @@ fn build_predicate_sids(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::*;
+    use fluree_db_binary_index::dict::forward_pack::{encode_forward_pack, KIND_STRING_FWD};
+    use fluree_db_binary_index::PackBranchEntry;
+    use fluree_db_core::storage::content_store_for;
+    use fluree_db_core::MemoryStorage;
+
+    const LEDGER: &str = "test:main";
+
+    fn dict_kind() -> ContentKind {
+        ContentKind::DictBlob {
+            dict: fluree_db_core::DictKind::StringForward,
+        }
+    }
+
+    /// Upload one small pack covering `[first_id, first_id + count)`.
+    async fn put_pack(store: &dyn ContentStore, first_id: u64, count: usize) -> PackBranchEntry {
+        let owned: Vec<(u64, Vec<u8>)> = (0..count)
+            .map(|i| {
+                let id = first_id + i as u64;
+                (id, format!("value_{id}").into_bytes())
+            })
+            .collect();
+        let refs: Vec<(u64, &[u8])> = owned.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+        let bytes = encode_forward_pack(&refs, KIND_STRING_FWD, 0, 512).unwrap();
+        let pack_cid = store.put(dict_kind(), &bytes).await.unwrap();
+        PackBranchEntry {
+            first_id,
+            last_id: first_id + count as u64 - 1,
+            pack_cid,
+        }
+    }
+
+    /// A prefix of packs separated by ID gaps (so no run through it can ever
+    /// merge), followed by a contiguous run of mergeable packs at the tail.
+    async fn table_with_unmergeable_prefix(
+        store: &dyn ContentStore,
+        prefix: usize,
+        tail: usize,
+    ) -> Vec<PackBranchEntry> {
+        let mut refs = Vec::new();
+        let mut next = 0u64;
+        for _ in 0..prefix {
+            refs.push(put_pack(store, next, 2).await);
+            next += 10; // leave a hole so this pack cannot join its neighbours
+        }
+        for _ in 0..tail {
+            refs.push(put_pack(store, next, 2).await);
+            next += 2; // contiguous
+        }
+        refs
+    }
+
+    #[tokio::test]
+    async fn tail_is_compacted_even_when_the_scan_budget_cannot_reach_it() {
+        // New packs always land at the tail, so a design that sweeps from the
+        // head and runs out of budget first would never see them and the table
+        // would grow without limit. Budget here is far too small to walk the
+        // prefix, so the tail is only reachable if it is examined first.
+        let storage = MemoryStorage::new();
+        let store = content_store_for(storage.clone(), LEDGER);
+        let mut refs = table_with_unmergeable_prefix(&store, 40, 10).await;
+        let before = refs.len();
+
+        let mut cache = PackSizeCache::new();
+        let mut budget = CompactionBudget {
+            bytes: COMPACTION_BUDGET_BYTES,
+            requests: 24,
+        };
+
+        let uploaded = compact_forward_packs(
+            &store,
+            dict_kind(),
+            &mut refs,
+            &mut cache,
+            &mut budget,
+            CompactionSpans { tail: 8, head: 16 },
+            "test",
+        )
+        .await
+        .expect("compaction");
+
+        assert!(
+            refs.len() < before,
+            "tail was never compacted: {before} packs before, {} after",
+            refs.len()
+        );
+        assert!(!uploaded.is_empty(), "a merge must upload its output");
+
+        // The merge must have happened at the tail, not in the prefix.
+        let last = refs.last().unwrap();
+        assert_eq!(last.last_id, 40 * 10 + 10 * 2 - 1);
+        assert!(
+            last.last_id - last.first_id + 1 > 2,
+            "the final entry should span several merged packs"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_id_survives_a_driver_merge() {
+        let storage = MemoryStorage::new();
+        let store = content_store_for(storage.clone(), LEDGER);
+        let mut refs = table_with_unmergeable_prefix(&store, 2, 12).await;
+
+        let mut cache = PackSizeCache::new();
+        let mut budget = CompactionBudget::new();
+        compact_forward_packs(
+            &store,
+            dict_kind(),
+            &mut refs,
+            &mut cache,
+            &mut budget,
+            CompactionSpans { tail: 8, head: 16 },
+            "test",
+        )
+        .await
+        .expect("compaction");
+
+        for entry in &refs {
+            let bytes = store.get(&entry.pack_cid).await.expect("pack bytes");
+            let pack = fluree_db_binary_index::dict::forward_pack::ForwardPack::from_bytes(&bytes)
+                .expect("valid pack");
+            assert_eq!(pack.header().first_id, entry.first_id);
+            assert_eq!(pack.header().last_id, entry.last_id);
+            for id in entry.first_id..=entry.last_id {
+                assert_eq!(
+                    pack.lookup_str(id).unwrap(),
+                    Some(format!("value_{id}")),
+                    "id {id} lost across a merge"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_disabled_budget_merges_nothing() {
+        // The off-switch has to be a true no-op: packs are appended and never
+        // merged, exactly as before compaction existed.
+        let storage = MemoryStorage::new();
+        let store = content_store_for(storage.clone(), LEDGER);
+        let mut refs = table_with_unmergeable_prefix(&store, 0, 20).await;
+        let before = refs.clone();
+
+        let uploaded = compact_forward_packs(
+            &store,
+            dict_kind(),
+            &mut refs,
+            &mut PackSizeCache::new(),
+            &mut CompactionBudget::disabled(),
+            CompactionSpans::default(),
+            "test",
+        )
+        .await
+        .expect("compaction");
+
+        assert!(uploaded.is_empty(), "a disabled budget must upload nothing");
+        assert_eq!(refs.len(), before.len(), "routing table must be untouched");
+        assert!(refs
+            .iter()
+            .zip(&before)
+            .all(|(a, b)| a.pack_cid == b.pack_cid));
+    }
+
+    #[tokio::test]
+    async fn the_request_budget_is_shared_and_charged() {
+        // One stream must not be able to spend a fresh allowance: the counter
+        // is cycle-wide, and every probe and fetch that reaches storage is
+        // charged against it.
+        let storage = MemoryStorage::new();
+        let store = content_store_for(storage.clone(), LEDGER);
+        let mut refs = table_with_unmergeable_prefix(&store, 4, 20).await;
+
+        let mut cache = PackSizeCache::new();
+        let mut budget = CompactionBudget {
+            bytes: COMPACTION_BUDGET_BYTES,
+            requests: 64,
+        };
+        compact_forward_packs(
+            &store,
+            dict_kind(),
+            &mut refs,
+            &mut cache,
+            &mut budget,
+            CompactionSpans { tail: 8, head: 16 },
+            "first",
+        )
+        .await
+        .expect("compaction");
+
+        assert!(
+            budget.requests < 64,
+            "storage operations were not charged to the shared budget"
+        );
+    }
 }

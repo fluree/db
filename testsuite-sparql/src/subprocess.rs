@@ -23,6 +23,16 @@ pub enum TestDescriptor {
         result_url: String,
         graph_data: Vec<(String, String)>,
     },
+    /// Update evaluation test: load initial graph store state, apply the
+    /// SPARQL UPDATE request, compare the resulting graph store state.
+    UpdateEval {
+        test_id: String,
+        request_url: String,
+        data_url: Option<String>,
+        graph_data: Vec<(String, String)>,
+        result_data_url: Option<String>,
+        result_graph_data: Vec<(String, String)>,
+    },
 }
 
 /// Result communicated back from the subprocess via stdout JSON.
@@ -78,7 +88,8 @@ pub fn run_in_subprocess(
                     let _ = child.wait(); // reap the zombie
                     let test_id = match descriptor {
                         TestDescriptor::Syntax { test_id, .. }
-                        | TestDescriptor::Eval { test_id, .. } => test_id,
+                        | TestDescriptor::Eval { test_id, .. }
+                        | TestDescriptor::UpdateEval { test_id, .. } => test_id,
                     };
                     bail!("Test timed out (>{timeout:?}) — subprocess killed.\nTest: {test_id}");
                 }

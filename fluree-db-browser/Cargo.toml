@@ -1,0 +1,80 @@
+[package]
+name = "fluree-db-browser"
+description = "Browser (wasm32) I/O layer for Fluree peer mode: fetch transport bridge, IndexedDB CAS cache, synchronous residency tier"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The crate is meaningful on wasm32, but its protocol, residency, coalescing,
+# eviction, and assembly logic is target-independent and unit-tested natively
+# against a mock job consumer. Only the driver (fetch/IndexedDB via web-sys)
+# is wasm32-only.
+[dependencies]
+fluree-db-core = { path = "../fluree-db-core" }
+fluree-db-api = { path = "../fluree-db-api", default-features = false }
+fluree-db-nameservice = { path = "../fluree-db-nameservice", default-features = false }
+fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync", default-features = false }
+
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+urlencoding = { workspace = true }
+# Channels and the fetch-width semaphore only; no runtime. tokio's sync
+# primitives are executor-agnostic and build for wasm32.
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Native builds of this crate take the same feature set every other native
+# consumer of these crates does.
+fluree-db-api = { path = "../fluree-db-api", default-features = false, features = ["native"] }
+fluree-db-nameservice = { path = "../fluree-db-nameservice", default-features = false, features = ["native"] }
+fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync", default-features = false, features = ["native"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+gloo-timers = { version = "0.3", features = ["futures"] }
+web-sys = { version = "0.3", features = [
+    "AbortController",
+    "AbortSignal",
+    "DomException",
+    "DomStringList",
+    "Event",
+    "EventTarget",
+    "Headers",
+    "IdbCursor",
+    "IdbCursorWithValue",
+    "IdbDatabase",
+    "IdbFactory",
+    "IdbObjectStore",
+    "IdbOpenDbRequest",
+    "IdbRequest",
+    "IdbTransaction",
+    "IdbTransactionMode",
+    "IdbVersionChangeEvent",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "Request",
+    "RequestCredentials",
+    "RequestInit",
+    "RequestMode",
+    "Response",
+] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+# For the end-to-end proof that the engine's landed retry primitives
+# (RetryBudget / fetch_wants) drive this storage through the real
+# StorageContentStore bridge.
+fluree-db-binary-index = { path = "../fluree-db-binary-index" }
+
+[lints]
+workspace = true

@@ -16,6 +16,7 @@ use fluree_db_api::TimeSpec;
 use fluree_db_api::{DataSetDb, DatasetSpec, FlureeBuilder, GraphDb, GraphSource, QueryInput};
 use fluree_db_core::load_commit_by_id;
 use serde_json::json;
+use serde_json::Value as JsonValue;
 
 // =============================================================================
 // Helper functions
@@ -413,12 +414,17 @@ async fn dataset_composed_across_connections_selecting_subgraph_depth_3() {
     );
 }
 
+/// Cross-LEDGER variant of the #1469 set-merge pin: two ledgers with
+/// byte-identical content unioned as default graphs RDF-merge into one triple
+/// set, even though each ledger encodes the same IRIs under its own
+/// dictionary (multi-ledger execution decodes bindings, so the dedup key
+/// compares by value, not by per-ledger sid).
 #[tokio::test]
-async fn dataset_multiple_default_graphs_no_dedup() {
+async fn dataset_multiple_default_graphs_set_merged_across_ledgers() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
 
-    // Create two ledgers with the SAME data (to test no-dedup semantics)
+    // Two ledgers with the SAME data: the set-merge must collapse them.
     let _ledger1 = seed_people_ledger(&fluree, "dup1:main").await;
     let _ledger2 = seed_people_ledger(&fluree, "dup2:main").await;
 
@@ -451,11 +457,13 @@ async fn dataset_multiple_default_graphs_no_dedup() {
         .await
         .expect("query should succeed");
 
-    // Union does NOT deduplicate - should get 4 results (2 people x 2 ledgers)
-    // Note: The exact semantics depend on whether the same SID is generated
-    // across ledgers. In practice, separate ledgers have different namespace
-    // encodings, so we may get 4 distinct rows.
-    assert!(result.row_count() >= 2, "should have results from union");
+    // 2 people, present identically in both ledgers: the RDF merge (§13.2)
+    // yields each person's name triple ONCE — 2 rows, not the bag's 4.
+    assert_eq!(
+        result.row_count(),
+        2,
+        "identical cross-ledger default graphs must set-merge, not double rows"
+    );
 }
 
 // =============================================================================
@@ -1586,16 +1594,19 @@ async fn sparql_single_db_graph_non_matching_alias() {
     assert_eq!(jsonld, json!([]));
 }
 
-/// GRAPH ?g with unbound variable binds to db alias (single-db mode)
+/// Unbound `GRAPH ?g` ranges over NAMED graphs only (W3C semantics, decision
+/// D-2 / issue #1442): with no user named graphs registered, the default
+/// graph is NOT enumerated under the ledger alias, so the result is empty.
+/// (Until #1442 this pinned the #1279 extension that bound ?g to the alias.)
 #[tokio::test]
 async fn sparql_single_db_graph_variable_unbound() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
 
-    // Create a ledger with data
+    // Create a ledger with data (default graph only, no user named graphs)
     let ledger = seed_people_ledger(&fluree, "people:main").await;
 
-    // Query using GRAPH ?g - should bind ?g to db alias
+    // Query using GRAPH ?g — must NOT bind ?g to the ledger alias
     let sparql = r"
         PREFIX schema: <http://schema.org/>
         SELECT ?g ?name
@@ -1612,20 +1623,10 @@ async fn sparql_single_db_graph_variable_unbound() {
 
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
-    // Should return results with ?g bound to "people:main"
-    let normalized = normalize_rows(&jsonld);
-    assert_eq!(normalized.len(), 2);
-
-    // Check that ?g is bound to the alias (first element of each row)
-    for row in &normalized {
-        // row is Vec<serde_json::Value> which is stored as serde_json::Value::Array
-        let first_elem = &row[0];
-        assert_eq!(
-            first_elem,
-            &json!("people:main"),
-            "?g should be bound to db alias"
-        );
-    }
+    // No named graphs registered → GRAPH ?g matches nothing. The default
+    // graph stays reachable explicitly: see
+    // `sparql_single_db_graph_matching_alias` (GRAPH <people:main>).
+    assert_eq!(jsonld, json!([]));
 }
 
 /// GRAPH ?g with bound matching value works (single-db mode)
@@ -1745,9 +1746,10 @@ async fn sparql_single_db_graph_user_named_concrete() {
     assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["Bob"]])));
 }
 
-/// `GRAPH ?g` discovers user-registered named graphs (plus the ledger alias for
-/// the default graph) and EXCLUDES system graphs txn-meta/config (issue #1279
-/// reproducer, step 4 + open decision #1).
+/// `GRAPH ?g` discovers user-registered named graphs ONLY — not the ledger
+/// alias/default graph (W3C semantics, decision D-2 / issue #1442 resolved
+/// #1279's open decision #1 by dropping the implicit enumeration) — and
+/// EXCLUDES system graphs txn-meta/config (issue #1279 reproducer, step 4).
 #[tokio::test]
 async fn sparql_single_db_graph_variable_discovers_user_graphs() {
     assert_index_defaults();
@@ -1765,19 +1767,16 @@ async fn sparql_single_db_graph_variable_discovers_user_graphs() {
         .expect("query should succeed");
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
-    let mut graphs: Vec<String> = normalize_rows(&jsonld)
+    let graphs: Vec<String> = normalize_rows(&jsonld)
         .into_iter()
         .map(|row| row[0].as_str().expect("?g is a string").to_string())
         .collect();
-    graphs.sort();
 
-    // The user named graph and the ledger alias (default graph), and nothing
-    // else — the reserved txn-meta (g_id=1) / config (g_id=2) graphs are not
+    // The user named graph only — the default graph (ledger alias) is not
+    // enumerated (it stays explicitly addressable as GRAPH <ngquirk:main>),
+    // and the reserved txn-meta (g_id=1) / config (g_id=2) graphs are not
     // auto-exposed.
-    assert_eq!(
-        graphs,
-        vec!["ngquirk:main".to_string(), "urn:probegraph".to_string()]
-    );
+    assert_eq!(graphs, vec!["urn:probegraph".to_string()]);
 }
 
 /// Bound `GRAPH ?g` to a user named graph resolves without `FROM NAMED`.
@@ -1914,6 +1913,142 @@ async fn fql_single_db_graph_user_named_concrete() {
         .expect("query should succeed");
 
     assert_eq!(jsonld, json!(["Bob"]));
+}
+
+/// JSON-LD parity for BUG-1 + BUG-2 (issue #1442 / D-2): unbound
+/// `["graph", "?g", {...}]` ranges over user NAMED graphs only — the default
+/// graph (ledger alias) is not enumerated — and `?g` is bound as an IRI term
+/// (`Binding::Iri`), not a string literal. Same `GraphOperator` as SPARQL.
+#[tokio::test]
+async fn fql_single_db_graph_variable_excludes_default_binds_iri() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    // Alice in the default graph, Bob in named graph <urn:probegraph>.
+    let ledger = seed_named_graph_ledger(&fluree, "ngquirk:main").await;
+
+    let query = json!({
+        "@context": {"schema": "http://schema.org/"},
+        "select": ["?g", "?name"],
+        "where": [
+            ["graph", "?g", {"@id": "?s", "schema:name": "?name"}]
+        ]
+    });
+
+    // Formatted: only the named-graph row; no ("ngquirk:main", "Alice") row.
+    let jsonld = support::query_jsonld_formatted(&fluree, &ledger, &query)
+        .await
+        .expect("query should succeed");
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["urn:probegraph", "Bob"]]))
+    );
+
+    // Term kind: ?g is an IRI binding, not an xsd:string literal.
+    let raw = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query should succeed");
+    let mut saw_g = false;
+    for batch in &raw.batches {
+        for row in 0..batch.len() {
+            let b = batch.get_by_col(row, 0); // select order: ?g first
+            assert!(
+                matches!(b, fluree_db_query::binding::Binding::Iri(iri) if iri.as_ref() == "urn:probegraph"),
+                "?g must be an IRI term binding, got {b:?}"
+            );
+            saw_g = true;
+        }
+    }
+    assert!(saw_g, "expected at least one ?g row");
+}
+
+/// JSON-LD parity for BUG-3 (issue #1442): the graph variable is seeded into
+/// the inner subplan, so an inner occurrence of `?g` is CONSTRAINED to the
+/// active graph's name (one variable, SPARQL-style unification) instead of
+/// scanning free and being overwritten at merge time.
+#[tokio::test]
+async fn fql_single_db_graph_variable_join_inner_use() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger0 = genesis_ledger(&fluree, "ngjoin:main");
+    // Named graph <urn:g1> holds two triples; only ONE has the graph's own
+    // name as its subject. `["graph","?g",{"@id":"?g",...}]` must return only
+    // that one (mirror of W3C graph-variable-join).
+    let trig = r#"
+        @prefix ex: <http://example.org/ns/> .
+
+        GRAPH <urn:g1> {
+            <urn:g1> ex:p "in-g1" .
+            ex:other ex:p "other" .
+        }
+    "#;
+    let ledger = fluree
+        .stage_owned(ledger0)
+        .upsert_turtle(trig)
+        .execute()
+        .await
+        .expect("trig upsert should succeed")
+        .ledger;
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "select": ["?g", "?o"],
+        "where": [
+            ["graph", "?g", {"@id": "?g", "ex:p": "?o"}]
+        ]
+    });
+    let jsonld = support::query_jsonld_formatted(&fluree, &ledger, &query)
+        .await
+        .expect("query should succeed");
+
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["urn:g1", "in-g1"]]))
+    );
+}
+
+/// JSON-LD parity for BUG-5 (issue #1443): a `?g` bound by a triple scan and
+/// consumed by a GRAPH pattern inside EXISTS (the late-materialized shape —
+/// a top-level scan-bound `?g` is eagerly resolved and passed even before the
+/// fix) resolves the named graph.
+#[tokio::test]
+async fn fql_single_db_graph_variable_bound_from_scan_exists() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger0 = genesis_ledger(&fluree, "ngscan:main");
+    // Default graph points at the named graph; the named graph has content.
+    let trig = r#"
+        @prefix ex: <http://example.org/ns/> .
+        @prefix schema: <http://schema.org/> .
+
+        ex:doc ex:inGraph <urn:probegraph> .
+
+        GRAPH <urn:probegraph> {
+            ex:bob schema:name "Bob" .
+        }
+    "#;
+    let ledger = fluree
+        .stage_owned(ledger0)
+        .upsert_turtle(trig)
+        .execute()
+        .await
+        .expect("trig upsert should succeed")
+        .ledger;
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "select": "?doc",
+        "where": [
+            {"@id": "?doc", "ex:inGraph": "?g"},
+            ["exists", ["graph", "?g", {"@id": "?s", "schema:name": "?name"}]]
+        ]
+    });
+    let jsonld = support::query_jsonld_formatted(&fluree, &ledger, &query)
+        .await
+        .expect("query should succeed");
+
+    assert_eq!(jsonld, json!(["ex:doc"]));
 }
 
 #[tokio::test]
@@ -2239,4 +2374,1317 @@ async fn dataset_staged_transaction_with_novel_namespace() {
         normalize_rows(&jsonld),
         normalize_rows(&json!([["Alice", "Acme Corp"]]))
     );
+}
+
+// =============================================================================
+// PR-G2: within-ledger SPARQL FROM / FROM NAMED (D-3, Option A)
+//
+// A `FROM` / `FROM NAMED` clause on a single `GraphDb` names graphs *within
+// this ledger*; the engine builds a within-ledger `DataSetDb` over the one
+// snapshot and runs it through the shared dataset path. These mirror the W3C
+// data-r2/dataset semantics on a real Fluree ledger (rather than the harness).
+// =============================================================================
+
+/// Seed ONE ledger whose default graph and two named graphs each carry a
+/// distinct `schema:name`: default = Alice, `<urn:g1>` = Bob, `<urn:g2>` =
+/// Carol. All three live in the same ledger/snapshot.
+async fn seed_within_ledger_dataset(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let trig = r#"
+        @prefix ex: <http://example.org/ns/> .
+        @prefix schema: <http://schema.org/> .
+
+        ex:alice schema:name "Alice" .
+
+        GRAPH <urn:g1> { ex:bob schema:name "Bob" . }
+        GRAPH <urn:g2> { ex:carol schema:name "Carol" . }
+    "#;
+    fluree
+        .stage_owned(ledger0)
+        .upsert_turtle(trig)
+        .execute()
+        .await
+        .expect("trig upsert should succeed")
+        .ledger
+}
+
+/// `FROM <graph>` re-scopes the default graph to that within-ledger named
+/// graph (the query sees the FROM graph, not the ledger's real default graph),
+/// and multiple `FROM` union. W3C dawg-dataset-01/-05/-12b analog on one
+/// ledger, driven through the plain `fluree.query(&db, sparql)` path.
+#[tokio::test]
+async fn sparql_within_ledger_from_scopes_default_graph() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_within_ledger_dataset(&fluree, "wl:main").await;
+
+    // Single FROM: default graph = <urn:g1> = Bob (NOT Alice from the ledger
+    // default graph, NOT Carol from <urn:g2>).
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM <urn:g1> { ?s schema:name ?name }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("within-ledger FROM should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["Bob"]])));
+
+    // Two FROM graphs union into the default graph = Bob + Carol.
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM <urn:g1> FROM <urn:g2> { ?s schema:name ?name }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("within-ledger FROM union should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["Bob"], ["Carol"]]))
+    );
+}
+
+/// `FROM NAMED` exposes a within-ledger graph as a SPARQL named graph without
+/// contributing to the default graph, and plain `FROM` does not create a named
+/// graph. W3C dawg-dataset-02/-03/-04 analog on one ledger.
+#[tokio::test]
+async fn sparql_within_ledger_from_named_semantics() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_within_ledger_dataset(&fluree, "wl:main").await;
+
+    // FROM NAMED only → the default graph is empty (dataset-02).
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM NAMED <urn:g1> { ?s schema:name ?name }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("query should succeed");
+    assert!(
+        result.is_empty(),
+        "FROM NAMED only ⇒ the default graph is empty"
+    );
+
+    // The FROM NAMED graph is addressable via GRAPH <iri> (dataset-03).
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM NAMED <urn:g1> { GRAPH <urn:g1> { ?s schema:name ?name } }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("query should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["Bob"]])));
+
+    // Plain FROM does NOT create a named graph: with no FROM NAMED, GRAPH ?g
+    // ranges over an empty named set → no rows (dataset-04).
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM <urn:g1> { GRAPH ?g { ?s schema:name ?name } }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("query should succeed");
+    assert!(
+        result.is_empty(),
+        "plain FROM creates no named graph ⇒ GRAPH ?g is empty"
+    );
+}
+
+/// P2 (positive): a plain `FROM <ledger-alias>` resolves to THIS ledger's real
+/// default graph — the alias→default-graph branch of
+/// `resolve_within_ledger_graph` (view/query.rs), distinct from the
+/// named-graph `FROM <urn:g1>` cases above where the FROM IRI names a graph in
+/// the registry. Here the FROM IRI is the ledger id itself, so the query sees
+/// the ledger default graph (Alice), not the named graphs (Bob/Carol).
+#[tokio::test]
+async fn sparql_within_ledger_from_alias_scopes_default_graph() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_within_ledger_dataset(&fluree, "wl:main").await;
+
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM <wl:main> { ?s schema:name ?name }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("FROM <ledger-alias> must resolve to the ledger's default graph");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["Alice"]])));
+}
+
+/// P2 (negative): `resolve_within_ledger_graph` matches the alias by EXACT
+/// string (`iri == db.snapshot.ledger_id || iri == db.ledger_id`), so a
+/// mismatched spelling of the ledger id — here `wl`, the name without its
+/// `:main` branch — is not recognized as the default graph and falls through to
+/// the cross-ledger rejection. Documents (locks) the exact-match limitation:
+/// broadening the match is a deliberate DEFER, so this behavior must not
+/// silently change.
+#[tokio::test]
+async fn sparql_within_ledger_from_alias_spelling_mismatch_is_rejected() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_within_ledger_dataset(&fluree, "wl:main").await;
+
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM <wl> { ?s schema:name ?name }
+    ";
+    let err = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect_err("a mismatched alias spelling must be rejected, not silently matched");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not in this ledger"),
+        "expected the within-ledger cross-ledger rejection, got: {msg}"
+    );
+    assert_eq!(err.status_code(), 400, "a graph not in the ledger is a 400");
+}
+
+/// `urn:default`, the name ledger info lists the default graph under, names
+/// the default graph in a within-ledger `FROM` / `FROM NAMED`, as the alias
+/// does.
+#[tokio::test]
+async fn sparql_within_ledger_from_urn_default_scopes_default_graph() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_within_ledger_dataset(&fluree, "wl:main").await;
+
+    for sparql in [
+        "PREFIX schema: <http://schema.org/>
+         SELECT ?name FROM <urn:default> { ?s schema:name ?name }",
+        "PREFIX schema: <http://schema.org/>
+         SELECT ?name FROM NAMED <urn:default> { GRAPH <urn:default> { ?s schema:name ?name } }",
+    ] {
+        let result = support::query_sparql(&fluree, &ledger, sparql)
+            .await
+            .expect("urn:default must resolve to the ledger's default graph");
+        let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+        assert_eq!(
+            normalize_rows(&jsonld),
+            normalize_rows(&json!([["Alice"]])),
+            "{sparql}"
+        );
+    }
+}
+
+/// Query-surface parity (D-3, Option A): the within-ledger SPARQL `FROM` /
+/// `FROM NAMED` dataset the buffered `query` path now builds is the same
+/// engine/view-level `DataSetDb` / `DatasetOperator` construction the JSON-LD
+/// `from` / `fromNamed` surface reaches through `@graph` graph selectors. This
+/// exercises the JSON-LD side over ONE ledger (the W3C submodule only guards
+/// the SPARQL surface, so parity is asserted here).
+#[tokio::test]
+async fn fql_within_ledger_from_named_dataset_parity() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = seed_within_ledger_dataset(&fluree, "wl:main").await;
+
+    // `from` scopes the default graph to <urn:g1>; `fromNamed` exposes <urn:g2>
+    // as a dataset named graph (alias "g2") — both within the one ledger.
+    let query = json!({
+        "@context": {"schema": "http://schema.org/"},
+        "from": {"@id": "wl:main", "graph": "urn:g1"},
+        "fromNamed": {"g2": {"@id": "wl:main", "@graph": "urn:g2"}},
+        "select": "?name",
+        "where": {"@id": "?s", "schema:name": "?name"}
+    });
+
+    let spec = DatasetSpec::from_json(&query).expect("parse dataset spec");
+    let dataset = fluree
+        .build_dataset_view(&spec)
+        .await
+        .expect("build within-ledger dataset");
+
+    // Single-ledger dataset: every graph shares the one ledger, so no
+    // cross-ledger provenance engages (Option A's single-snapshot property).
+    let ledgers: std::collections::HashSet<String> = dataset
+        .default
+        .iter()
+        .chain(dataset.named.values())
+        .map(|g| g.ledger_id.to_string())
+        .collect();
+    assert_eq!(
+        ledgers.len(),
+        1,
+        "within-ledger dataset must span exactly one ledger, got {ledgers:?}"
+    );
+
+    // Default-graph query sees <urn:g1> (Bob): the `from` @graph selector
+    // scoped the default graph to the within-ledger named graph — the JSON-LD
+    // mirror of SPARQL `FROM <urn:g1>`.
+    let result = fluree
+        .query_dataset(&dataset, &query)
+        .await
+        .expect("dataset query should succeed");
+    let primary = dataset.primary().unwrap();
+    let jsonld = result
+        .to_jsonld(primary.snapshot.as_ref())
+        .expect("to_jsonld");
+    assert_eq!(
+        normalize_flat_results(&jsonld),
+        normalize_flat_results(&json!(["Bob"]))
+    );
+
+    // The `fromNamed` graph <urn:g2> is reachable as a named graph (alias
+    // "g2") and stays OUT of the default graph — Carol, absent from the Bob
+    // result above.
+    let named_query = json!({
+        "@context": {"schema": "http://schema.org/"},
+        "from": {"@id": "wl:main", "graph": "urn:g1"},
+        "fromNamed": {"g2": {"@id": "wl:main", "@graph": "urn:g2"}},
+        "select": "?name",
+        "where": [["graph", "g2", {"@id": "?s", "schema:name": "?name"}]]
+    });
+    let result = fluree
+        .query_dataset(&dataset, &named_query)
+        .await
+        .expect("named-graph dataset query should succeed");
+    let jsonld = result
+        .to_jsonld(primary.snapshot.as_ref())
+        .expect("to_jsonld");
+    assert_eq!(
+        normalize_flat_results(&jsonld),
+        normalize_flat_results(&json!(["Carol"]))
+    );
+}
+
+/// **Reserved-graph access contract — the positive half.**
+///
+/// A reserved graph of THIS ledger is reachable through `FROM`/`FROM NAMED`
+/// when the author writes its IRI out in full. Reachability is explicitness;
+/// `f:policyDefaults` on the config graph is the access control
+/// (`docs/ledger-config/README.md`, `writing-config.md`).
+///
+/// This INVERTS `sparql_from_rejects_reserved_system_graphs`, added by
+/// `8d8870ba1` in PR #1462 as a review finding. That commit applied
+/// `single_db_user_graph_id`'s `>= FIRST_USER_GRAPH_ID` ENUMERATION filter to
+/// this ADDRESSING surface. The connection path — which resolves a `FROM`
+/// source through `db()`/`parse_graph_ref` — never had the filter, so the same
+/// IRI resolved on one surface and was refused on the other. The negative half
+/// Policy is the access control, on the surface the reversal actually opens.
+///
+/// The whole case for re-admitting `FROM <urn:fluree:{ledger}#config>` is that
+/// reachability is explicitness and *policy* decides who may read — so the
+/// claim has to hold on the **ledger-scoped** path, which is the one
+/// `8d8870ba1` gated. The PR's supporting measurement was taken on the
+/// connection path; this pins the same property where the gate was relaxed,
+/// through `apply_graph_selector` and the reserved-graph admission, so a
+/// future change to dataset-member policy wrapping fails here rather than
+/// silently widening what the reversal exposed.
+#[tokio::test]
+async fn policy_still_governs_a_reserved_graph_admitted_by_full_iri() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_within_ledger_dataset(&fluree, "wl-policy:main").await;
+    let config_iri = fluree_db_core::config_graph_iri("wl-policy:main");
+
+    // A marker in the config graph, and defaults that deny everything.
+    let trig = format!(
+        r#"@prefix schema: <http://schema.org/> .
+           @prefix f: <https://ns.flur.ee/db#> .
+           @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+           GRAPH <{config_iri}> {{
+               <urn:config:main> rdf:type f:LedgerConfig .
+               <urn:config:main> schema:name "CONFIG-MARKER" .
+               <urn:config:main> f:policyDefaults <urn:config:policy> .
+               <urn:config:policy> f:defaultAllow false .
+           }}"#
+    );
+    let ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config write")
+        .ledger;
+
+    let sparql = format!(
+        "PREFIX schema: <http://schema.org/> \
+         SELECT ?n FROM <{config_iri}> WHERE {{ ?s schema:name ?n }}"
+    );
+
+    // Unwrapped, the marker is readable — otherwise a zero-row result below
+    // would prove nothing about policy.
+    let open = support::query_sparql(&fluree, &ledger, &sparql)
+        .await
+        .expect("unwrapped FROM <#config>")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&open),
+        normalize_rows(&json!([["CONFIG-MARKER"]])),
+        "without policy the reserved graph is readable — the control for the assertion below"
+    );
+
+    // Wrapped in the ledger's own defaults, the same query returns nothing.
+    let db = fluree
+        .wrap_policy_defaults(support::graphdb_from_ledger(&ledger))
+        .await
+        .expect("wrap policy defaults");
+    let denied = fluree
+        .query(&db, &sparql)
+        .await
+        .expect("policy-wrapped FROM <#config>")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&denied),
+        normalize_rows(&json!([])),
+        "f:defaultAllow false must deny the reserved graph on the ledger-scoped path too"
+    );
+}
+
+/// is `sparql_reserved_graphs_stay_unreachable_when_not_named_in_full`.
+#[tokio::test]
+async fn sparql_from_admits_this_ledgers_reserved_graphs_by_full_iri() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_within_ledger_dataset(&fluree, "wl-reserved:main").await;
+    let config_iri = fluree_db_core::config_graph_iri("wl-reserved:main");
+    let txn_meta_iri = fluree_db_core::txn_meta_graph_iri("wl-reserved:main");
+
+    // Put a marker in the config graph so a hit is distinguishable from the
+    // default graph's Alice and <urn:g1>'s Bob.
+    let trig = format!(
+        r#"@prefix schema: <http://schema.org/> .
+           @prefix f: <https://ns.flur.ee/db#> .
+           @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+           GRAPH <{config_iri}> {{
+               <urn:config:main> rdf:type f:LedgerConfig .
+               <urn:config:main> schema:name "CONFIG-MARKER" .
+           }}"#
+    );
+    let ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config write")
+        .ledger;
+
+    for clause in ["FROM", "FROM NAMED"] {
+        for iri in [config_iri.as_str(), txn_meta_iri.as_str()] {
+            let sparql = format!(
+                "PREFIX schema: <http://schema.org/> \
+                 SELECT ?s {clause} <{iri}> WHERE {{ ?s ?p ?o }}"
+            );
+            support::query_sparql(&fluree, &ledger, &sparql)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("{clause} <{iri}> must resolve within this ledger, got: {e}")
+                });
+        }
+    }
+
+    // ...and `FROM <#config>` actually scopes the default graph to the config
+    // graph, rather than resolving to something empty that would pass above.
+    let sparql = format!(
+        "PREFIX schema: <http://schema.org/> \
+         SELECT ?n FROM <{config_iri}> WHERE {{ ?s schema:name ?n }}"
+    );
+    let rows = support::query_sparql(&fluree, &ledger, &sparql)
+        .await
+        .expect("FROM <#config>")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([["CONFIG-MARKER"]])),
+        "FROM <#config> must scope the default graph to the config graph"
+    );
+
+    // An explicit FROM NAMED makes the reserved graph addressable by
+    // `GRAPH <iri>` — the dataset's named set, not enumeration.
+    let sparql = format!(
+        "PREFIX schema: <http://schema.org/> \
+         SELECT ?n FROM NAMED <{config_iri}> \
+         WHERE {{ GRAPH <{config_iri}> {{ ?s schema:name ?n }} }}"
+    );
+    let rows = support::query_sparql(&fluree, &ledger, &sparql)
+        .await
+        .expect("FROM NAMED + GRAPH <#config>")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([["CONFIG-MARKER"]])),
+        "an explicitly-named reserved graph must be addressable via GRAPH <iri>"
+    );
+}
+
+/// **Reserved-graph access contract — the negative half.**
+///
+/// This is what keeps the enumeration decision of `cf1c74291` (PR #1292)
+/// honest. Admitting a fully-spelled reserved IRI must open NOTHING else:
+///
+/// - a bare or relative fragment name is not the graph's IRI;
+/// - another ledger's reserved IRI is not in this ledger;
+/// - `GRAPH <iri>` with no `FROM NAMED` still does not reach it;
+/// - `GRAPH ?g` still does not enumerate it.
+#[tokio::test]
+async fn sparql_reserved_graphs_stay_unreachable_when_not_named_in_full() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_within_ledger_dataset(&fluree, "wl-reserved-neg:main").await;
+    let config_iri = fluree_db_core::config_graph_iri("wl-reserved-neg:main");
+    let txn_meta_iri = fluree_db_core::txn_meta_graph_iri("wl-reserved-neg:main");
+
+    // 1. Bare / relative / foreign spellings are refused by FROM.
+    let foreign_config = fluree_db_core::config_graph_iri("some-other:main");
+    for iri in [
+        "config",
+        "#config",
+        "txn-meta",
+        "#txn-meta",
+        foreign_config.as_str(),
+    ] {
+        let sparql = format!(
+            "PREFIX schema: <http://schema.org/> \
+             SELECT ?s FROM <{iri}> WHERE {{ ?s ?p ?o }}"
+        );
+        let err = support::query_sparql(&fluree, &ledger, &sparql)
+            .await
+            .expect_err(&format!("FROM <{iri}> must be rejected"));
+        assert!(
+            err.to_string().contains("not in this ledger"),
+            "expected the within-ledger rejection for FROM <{iri}>, got: {err}"
+        );
+    }
+
+    // 2. `GRAPH <reserved>` with no FROM NAMED resolves to nothing. The
+    //    reserved graphs hold data here (txn-meta always does), so an empty
+    //    result is the block, not an artifact of an empty graph.
+    for iri in [config_iri.as_str(), txn_meta_iri.as_str()] {
+        let sparql = format!("SELECT ?s WHERE {{ GRAPH <{iri}> {{ ?s ?p ?o }} }}");
+        let rows = support::query_sparql(&fluree, &ledger, &sparql)
+            .await
+            .unwrap_or_else(|e| panic!("GRAPH <{iri}> should not error, got: {e}"))
+            .to_jsonld(&ledger.snapshot)
+            .expect("to_jsonld");
+        assert_eq!(
+            normalize_rows(&rows),
+            Vec::<serde_json::Value>::new(),
+            "GRAPH <{iri}> with no FROM NAMED must not reach the reserved graph"
+        );
+    }
+
+    // 3. `GRAPH ?g` enumerates user graphs only — P15, the canonical check
+    //    that nothing deliberately closed was opened as a side effect.
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        "SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } } ORDER BY ?g",
+    )
+    .await
+    .expect("GRAPH ?g")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([["urn:g1"], ["urn:g2"]])),
+        "GRAPH ?g must enumerate user graphs only, never the reserved graphs"
+    );
+}
+
+/// §13.2: the dataset default graph is a SET — `FROM <g> FROM <g>` (the same
+/// graph named twice) contributes ONE member, so solutions are not
+/// bag-duplicated. Before the build-time dedup the duplicate member doubled
+/// every row.
+#[tokio::test]
+async fn sparql_within_ledger_repeated_from_is_deduped() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_within_ledger_dataset(&fluree, "wl-dup:main").await;
+
+    let once = support::query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX schema: <http://schema.org/> \
+         SELECT ?name FROM <urn:g1> WHERE { ?s schema:name ?name } ORDER BY ?name",
+    )
+    .await
+    .expect("single FROM")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+
+    let twice = support::query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX schema: <http://schema.org/> \
+         SELECT ?name FROM <urn:g1> FROM <urn:g1> WHERE { ?s schema:name ?name } ORDER BY ?name",
+    )
+    .await
+    .expect("repeated FROM")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+
+    assert_eq!(
+        twice, once,
+        "FROM <g> FROM <g> must union the graph ONCE (set semantics), not double rows"
+    );
+}
+
+// =============================================================================
+// #1469: the default-graph union is a SET (RDF merge), not a BAG (SPARQL §13.2)
+//
+// `FROM <g1> FROM <g2>` unions g1 and g2 into the default graph as an RDF
+// *merge*: a triple present in both members is emitted once, while two
+// *distinct* triples that happen to project to the same value keep their
+// multiplicity. These pin the `DatasetOperator` cross-member dedup, the forced
+// full triple identity (so a pruned column can't collapse distinct triples),
+// and the `COUNT(*)` set cardinality. All are new — no prior test seeded a
+// shared triple across default-union members, so the bag/set difference was
+// latent.
+// =============================================================================
+
+/// Seed ONE ledger with two named graphs that deliberately SHARE a triple.
+/// `<urn:s1>` and `<urn:s2>` each carry a private `schema:name`, the
+/// byte-identical shared triple `ex:x schema:name "Shared"`, and a *distinct*
+/// triple whose object is the same string `"Dup"` (different subjects `ex:d1`
+/// / `ex:d2`) to pin the EmitMask pruning trap. The ledger default graph holds
+/// only `ex:alice schema:name "Alice"`.
+async fn seed_union_dataset(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let trig = r#"
+        @prefix ex: <http://example.org/ns/> .
+        @prefix schema: <http://schema.org/> .
+
+        ex:alice schema:name "Alice" .
+
+        GRAPH <urn:s1> {
+            ex:a  schema:name "A1" .
+            ex:x  schema:name "Shared" .
+            ex:d1 schema:name "Dup" .
+        }
+        GRAPH <urn:s2> {
+            ex:b  schema:name "B2" .
+            ex:x  schema:name "Shared" .
+            ex:d2 schema:name "Dup" .
+        }
+    "#;
+    fluree
+        .stage_owned(ledger0)
+        .upsert_turtle(trig)
+        .execute()
+        .await
+        .expect("trig upsert should succeed")
+        .ledger
+}
+
+/// (a) `FROM <g> FROM <g>` names the same graph twice. The default union is a
+/// set, so the graph contributes ONE copy of each of its triples — not two.
+#[tokio::test]
+async fn sparql_within_ledger_from_self_union_is_single_copy() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_union_dataset(&fluree, "wl:main").await;
+
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM <urn:s1> FROM <urn:s1> { ?s schema:name ?name }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("self-union FROM should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // s1's three triples, each once — NOT doubled.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["A1"], ["Dup"], ["Shared"]]))
+    );
+}
+
+/// (b)+(c) `FROM <s1> FROM <s2>` merges the two graphs as a set: the shared
+/// triple `ex:x schema:name "Shared"` is emitted ONCE, while the two *distinct*
+/// triples projecting to `"Dup"` (`ex:d1` / `ex:d2`) both survive. The `?s`
+/// column is unprojected and occurs once, so without the forced full triple
+/// identity it would be pruned and collapse the two `"Dup"` rows — the pruning
+/// trap this pins.
+#[tokio::test]
+async fn sparql_within_ledger_from_union_is_a_set() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_union_dataset(&fluree, "wl:main").await;
+
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM <urn:s1> FROM <urn:s2> { ?s schema:name ?name }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("union FROM should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // "Shared" once (set-merge of the shared triple); "Dup" twice (two distinct
+    // triples, multiplicity preserved); "A1" and "B2" once each.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["A1"], ["B2"], ["Dup"], ["Dup"], ["Shared"]]))
+    );
+}
+
+/// (d) `COUNT(*)` over a default union is the set cardinality — the `drain_count`
+/// fast path must fall back to the deduplicating scan, not sum per-member (bag)
+/// counts. Self-union → 3; two-graph union with one shared triple → 5.
+#[tokio::test]
+async fn sparql_within_ledger_from_union_count_is_set() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_union_dataset(&fluree, "wl:main").await;
+
+    let self_union = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT (COUNT(*) AS ?c) FROM <urn:s1> FROM <urn:s1> { ?s schema:name ?name }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, self_union)
+        .await
+        .expect("self-union COUNT should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([[3]])));
+
+    let two_graph = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT (COUNT(*) AS ?c) FROM <urn:s1> FROM <urn:s2> { ?s schema:name ?name }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, two_graph)
+        .await
+        .expect("union COUNT should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([[5]])));
+}
+
+/// (d2) Ground-pattern set-merge: a fully-constant pattern `{ <s> <p> <o> }`
+/// emits the empty solution mapping with a zero-column schema even under forced
+/// `EmitMask::ALL` (only variable positions form columns), so it can't be keyed
+/// by the row-tuple dedup. The empty mapping is still a single set solution, so
+/// `COUNT(*)` of a ground triple present in both members must be 1, not 2.
+#[tokio::test]
+async fn sparql_within_ledger_from_union_ground_pattern_count_is_set() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_union_dataset(&fluree, "wl:main").await;
+
+    let sparql = r#"
+        PREFIX ex: <http://example.org/ns/>
+        PREFIX schema: <http://schema.org/>
+        SELECT (COUNT(*) AS ?c) FROM <urn:s1> FROM <urn:s2> { ex:x schema:name "Shared" }
+    "#;
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("ground-pattern COUNT should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([[1]])));
+}
+
+/// (d3) A ground pattern that seeds a join must not multiply the join result by
+/// the number of members holding the ground triple. The guard
+/// `ex:x schema:name "Shared"` (present in both s1 and s2) contributes ONE empty
+/// solution, so the joined `?s schema:name ?name` names are the plain set-merged
+/// multiset, not doubled.
+#[tokio::test]
+async fn sparql_within_ledger_from_union_ground_seed_join_not_multiplied() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_union_dataset(&fluree, "wl:main").await;
+
+    let sparql = r#"
+        PREFIX ex: <http://example.org/ns/>
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM <urn:s1> FROM <urn:s2>
+        { ex:x schema:name "Shared" . ?s schema:name ?name }
+    "#;
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("ground-seeded join should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Same 5-row multiset as the guard-free union — NOT doubled to 10.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["A1"], ["B2"], ["Dup"], ["Dup"], ["Shared"]]))
+    );
+}
+
+/// (e) `FROM NAMED` graphs are NOT merged: each named graph keeps its own
+/// triples, so `GRAPH ?g` over two named graphs that share a triple yields that
+/// triple once per graph. Set-merge dedup is scoped to the default union and
+/// must leave named-graph semantics untouched.
+#[tokio::test]
+async fn sparql_within_ledger_from_named_union_not_merged() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_union_dataset(&fluree, "wl:main").await;
+
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM NAMED <urn:s1> FROM NAMED <urn:s2>
+        { GRAPH ?g { ?s schema:name ?name } }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("FROM NAMED GRAPH ?g should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Every triple of both named graphs, unmerged: "Shared" and "Dup" appear
+    // twice (once per graph), "A1" and "B2" once.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([
+            ["A1"],
+            ["B2"],
+            ["Dup"],
+            ["Dup"],
+            ["Shared"],
+            ["Shared"]
+        ]))
+    );
+}
+
+/// (f) The no-FROM and single-FROM paths are byte-identical to before (no
+/// dedup, no forced emit): a plain query sees the ledger default graph, and a
+/// single `FROM` scopes to one graph with each triple once.
+#[tokio::test]
+async fn sparql_within_ledger_no_from_and_single_from_unaffected() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_union_dataset(&fluree, "wl:main").await;
+
+    // No FROM: the ledger's real default graph (only Alice).
+    let no_from = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name { ?s schema:name ?name }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, no_from)
+        .await
+        .expect("no-FROM query should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["Alice"]])));
+
+    // Single FROM: one graph, each triple once.
+    let single_from = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM <urn:s1> { ?s schema:name ?name }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, single_from)
+        .await
+        .expect("single-FROM query should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["A1"], ["Dup"], ["Shared"]]))
+    );
+}
+
+/// (g) JSON-LD parity: the JSON-LD `from` array builds the same within-ledger
+/// `DataSetDb` / `DatasetOperator` as SPARQL `FROM ... FROM ...`, so it enforces
+/// the same set-merge — shared triple once, distinct-but-equal-valued triples
+/// both kept. Mirrors `sparql_within_ledger_from_union_is_a_set`.
+#[tokio::test]
+async fn fql_within_ledger_from_union_is_a_set() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = seed_union_dataset(&fluree, "wl:main").await;
+
+    let query = json!({
+        "@context": {"schema": "http://schema.org/"},
+        "from": [
+            {"@id": "wl:main", "graph": "urn:s1"},
+            {"@id": "wl:main", "graph": "urn:s2"}
+        ],
+        "select": "?name",
+        "where": {"@id": "?s", "schema:name": "?name"}
+    });
+
+    let spec = DatasetSpec::from_json(&query).expect("parse dataset spec");
+    assert_eq!(spec.default_graphs.len(), 2, "two default-union members");
+    let dataset = fluree
+        .build_dataset_view(&spec)
+        .await
+        .expect("build within-ledger union dataset");
+    let result = fluree
+        .query_dataset(&dataset, &query)
+        .await
+        .expect("union dataset query should succeed");
+    let primary = dataset.primary().unwrap();
+    let jsonld = result
+        .to_jsonld(primary.snapshot.as_ref())
+        .expect("to_jsonld");
+    // Same multiset as the SPARQL twin: "Shared" once, "Dup" twice.
+    assert_eq!(
+        normalize_flat_results(&jsonld),
+        normalize_flat_results(&json!(["A1", "B2", "Dup", "Dup", "Shared"]))
+    );
+}
+
+/// Multi-FROM + OFFSET/LIMIT (#1483 review): the §13.2 set-merge happens at
+/// scan time, BELOW the slice — so paging over a deduplicated union is stable
+/// and never re-serves (or skips past) the collapsed duplicate.
+#[tokio::test]
+async fn sparql_within_ledger_from_union_offset_limit_pages_the_set() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_union_dataset(&fluree, "wl-union-page:main").await;
+
+    // Deduped, ordered union = A1, B2, Dup, Dup, Shared (ex:x collapses to
+    // one row; ex:d1/ex:d2 are DISTINCT subjects sharing a value).
+    let all = support::query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX schema: <http://schema.org/> \
+         SELECT ?name FROM <urn:s1> FROM <urn:s2> WHERE { ?s schema:name ?name } ORDER BY ?name ?s",
+    )
+    .await
+    .expect("full union")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+    assert_eq!(
+        all,
+        json!([["A1"], ["B2"], ["Dup"], ["Dup"], ["Shared"]]),
+        "set-merged union baseline"
+    );
+
+    // Page 2 of size 2 must be exactly rows 3-4 of the SET (both Dups) —
+    // a bag would shift the page by the duplicated Shared row.
+    let page = support::query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX schema: <http://schema.org/> \
+         SELECT ?name FROM <urn:s1> FROM <urn:s2> WHERE { ?s schema:name ?name } \
+         ORDER BY ?name ?s OFFSET 2 LIMIT 2",
+    )
+    .await
+    .expect("paged union")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+    assert_eq!(
+        page,
+        json!([["Dup"], ["Dup"]]),
+        "OFFSET/LIMIT must slice the deduplicated sequence"
+    );
+}
+
+/// Var-var multi-pattern join over the union where BOTH patterns carry the
+/// cross-member duplicate and join on the shared subject (#1483 review): each
+/// scan set-merges independently, so the join multiplicity is 1×1 — not the
+/// 2×2 a bag union would produce.
+#[tokio::test]
+async fn sparql_within_ledger_from_union_var_var_join_is_set_merged() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "wl-union-join:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    // ex:x carries BOTH properties in BOTH graphs — the worst case for
+    // bag-union join inflation (2 copies × 2 copies = 4 rows).
+    let trig = r#"
+        @prefix ex: <http://example.org/ns/> .
+        @prefix schema: <http://schema.org/> .
+
+        GRAPH <urn:j1> {
+            ex:x schema:name "Shared" .
+            ex:x schema:jobTitle "Engineer" .
+        }
+        GRAPH <urn:j2> {
+            ex:x schema:name "Shared" .
+            ex:x schema:jobTitle "Engineer" .
+        }
+    "#;
+    let ledger = fluree
+        .stage_owned(ledger0)
+        .upsert_turtle(trig)
+        .execute()
+        .await
+        .expect("trig upsert")
+        .ledger;
+
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX schema: <http://schema.org/> \
+         SELECT ?name ?title FROM <urn:j1> FROM <urn:j2> \
+         WHERE { ?s schema:name ?name . ?s schema:jobTitle ?title }",
+    )
+    .await
+    .expect("join over union")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+    assert_eq!(
+        rows,
+        json!([["Shared", "Engineer"]]),
+        "both scans must set-merge independently: 1×1 join row, not 2×2"
+    );
+}
+
+/// Seed mutual `schema:knows` edges — the shape that makes a join's right
+/// triple bind nothing new (`?a knows ?b . ?b knows ?a`).
+async fn seed_mutual_knows_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "@graph": [
+            {"@id": "ex:alice", "schema:knows": {"@id": "ex:bob"}},
+            {"@id": "ex:bob", "schema:knows": {"@id": "ex:alice"}}
+        ]
+    });
+    fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert mutual knows")
+        .ledger
+}
+
+/// A join whose right triple binds nothing new is evaluated as a membership
+/// probe (`MembershipJoinOperator`) when the shape and cost gates allow. That
+/// rewrite is keep/drop, which is only join-equivalent when a ground triple
+/// matches at most once. Under #1469 the multi-member default union is a SET
+/// (RDF merge, SPARQL §13.2): identical triples across members collapse to
+/// one (see `dataset_multiple_default_graphs_set_merged_across_ledgers`), so
+/// unioning a graph with identical content must leave the mutual-knows join
+/// at its single-graph cardinality — not the pre-#1469 bag answer (8 = one
+/// row per graph per side) and not the half-collapsed 4 the operator's
+/// multi-graph guard was originally added against. That guard stays
+/// load-bearing for multi-graph *named* scopes, where no set-dedup arms and
+/// bag multiplicity is still the contract.
+#[tokio::test]
+async fn dataset_membership_shape_set_merges_identical_graphs() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let _g1 = seed_mutual_knows_ledger(&fluree, "knows1:main").await;
+    let _g2 = seed_mutual_knows_ledger(&fluree, "knows2:main").await;
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "select": ["?a", "?b"],
+        "where": [
+            {"@id": "?a", "schema:knows": "?b"},
+            {"@id": "?b", "schema:knows": "?a"}
+        ]
+    });
+
+    let one_spec = DatasetSpec::new().with_default(GraphSource::new("knows1:main"));
+    let one = fluree
+        .build_dataset_view(&one_spec)
+        .await
+        .expect("single-graph dataset");
+    let single_rows = fluree
+        .query_dataset(&one, &query)
+        .await
+        .expect("single-graph query")
+        .row_count();
+    assert_eq!(
+        single_rows, 2,
+        "one graph: the mutual pair joins both ways (alice/bob, bob/alice)"
+    );
+
+    let two_spec = DatasetSpec::new()
+        .with_default(GraphSource::new("knows1:main"))
+        .with_default(GraphSource::new("knows2:main"));
+    let two = fluree
+        .build_dataset_view(&two_spec)
+        .await
+        .expect("two-graph dataset");
+    let union_rows = fluree
+        .query_dataset(&two, &query)
+        .await
+        .expect("two-graph query")
+        .row_count();
+
+    // The two members carry byte-identical triples, so the RDF merge is the
+    // same set as either member alone: the join must see each triple once,
+    // keeping the single-graph answer. 8 would be the pre-#1469 bag union;
+    // 4 would be the membership keep/drop collapse over a bag.
+    assert_eq!(
+        union_rows, single_rows,
+        "two identical default graphs RDF-merge to one triple set (§13.2); the join must not multiply"
+    );
+}
+
+// =============================================================================
+// HTTP ledger-endpoint dataset semantics (azure-chat#50)
+//
+// The HTTP ledger endpoint builds its own `DatasetSpec` from a SPARQL dataset
+// clause (`ledger_scoped_sparql_dataset_spec` in fluree-db-server) and feeds it
+// to `build_dataset_view`, so its semantics are pinned here — in the crate that
+// owns the builder — as well as through the route itself in
+// fluree-db-server/tests/sparql_dataset_semantics.rs.
+//
+// The spec that endpoint builds for a within-ledger clause sets
+// `identifier` = the ledger id (a loading detail) and `source_alias` = the
+// graph IRI the user wrote. Registering both keys used to inject the ledger
+// alias into the named-graph map pointing at the named graph's view, so
+// `GRAPH ?g` enumerated it and doubled every solution.
+// =============================================================================
+
+const HTTP_DS_LEDGER: &str = "httpds:main";
+const HTTP_DS_G1: &str = "http://ex.org/g1";
+const HTTP_DS_G2: &str = "http://ex.org/g2";
+
+/// One default-graph triple plus a two-triple named graph, so "empty default
+/// graph" and "named graph enumerated once" are separately discriminating.
+async fn seed_http_dataset_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let trig = r#"
+        @prefix ex: <http://ex.org/> .
+
+        ex:d1 ex:name "D" .
+
+        <http://ex.org/g1> {
+            ex:s1 ex:name "A" .
+            ex:s2 ex:name "B" .
+            ex:s1 ex:knows ex:s2 .
+        }
+
+        <http://ex.org/g2> {
+            ex:s3 ex:name "C" .
+        }
+    "#;
+    fluree
+        .stage_owned(ledger0)
+        .upsert_turtle(trig)
+        .execute()
+        .await
+        .expect("trig upsert should succeed")
+        .ledger
+}
+
+/// The spec the ledger endpoint builds for `FROM NAMED <g1>` with no `FROM`:
+/// no default graph (SPARQL 1.1 §13.2) and one named source keyed by the IRI
+/// the user wrote.
+fn http_from_named_only_spec(graphs: &[&str]) -> DatasetSpec {
+    let mut spec = DatasetSpec::new();
+    for g in graphs {
+        spec = spec.with_named(
+            GraphSource::new(HTTP_DS_LEDGER)
+                .with_graph(fluree_db_api::dataset::GraphSelector::Iri((*g).to_string()))
+                .with_alias(*g),
+        );
+    }
+    spec
+}
+
+async fn http_ds_rows(dataset: &DataSetDb, fluree: &MemoryFluree, sparql: &str) -> Vec<JsonValue> {
+    let result = fluree
+        .query_dataset(dataset, sparql)
+        .await
+        .expect("query should succeed");
+    let primary = dataset.primary().expect("primary view");
+    let jsonld = result
+        .to_jsonld(primary.snapshot.as_ref())
+        .expect("to_jsonld");
+    normalize_rows(&jsonld)
+}
+
+/// `FROM NAMED <g1>` + `GRAPH ?g` binds `?g` to the declared graph and nothing
+/// else, once per solution. The ledger alias is not a named-graph key.
+#[tokio::test]
+async fn http_dataset_from_named_binds_only_declared_graph() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = seed_http_dataset_ledger(&fluree, HTTP_DS_LEDGER).await;
+
+    let dataset = fluree
+        .build_dataset_view(&http_from_named_only_spec(&[HTTP_DS_G1]))
+        .await
+        .expect("build_dataset_view should succeed");
+
+    assert!(
+        dataset.get_named(HTTP_DS_LEDGER).is_none(),
+        "the ledger alias must not be registered as a named graph"
+    );
+    assert!(
+        dataset.get_named(HTTP_DS_G1).is_some(),
+        "the declared graph IRI is the dataset-local name"
+    );
+
+    let rows = http_ds_rows(
+        &dataset,
+        &fluree,
+        r"
+        PREFIX ex: <http://ex.org/>
+        SELECT ?g ?n WHERE { GRAPH ?g { ?s ex:name ?n } }
+        ",
+    )
+    .await;
+
+    assert_eq!(
+        rows.len(),
+        2,
+        "one solution per triple, not one per graph key"
+    );
+    for row in &rows {
+        let g = serde_json::to_string(row).expect("row json");
+        assert!(
+            g.contains(HTTP_DS_G1) && !g.contains(HTTP_DS_LEDGER),
+            "?g must bind only the declared graph, got {g}"
+        );
+    }
+}
+
+/// Property-path form of the same shape: the single `ex:knows` edge comes back
+/// once, not once per graph key.
+#[tokio::test]
+async fn http_dataset_from_named_property_path_not_doubled() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = seed_http_dataset_ledger(&fluree, HTTP_DS_LEDGER).await;
+
+    let dataset = fluree
+        .build_dataset_view(&http_from_named_only_spec(&[HTTP_DS_G1]))
+        .await
+        .expect("build_dataset_view should succeed");
+
+    let rows = http_ds_rows(
+        &dataset,
+        &fluree,
+        r"
+        PREFIX ex: <http://ex.org/>
+        SELECT ?x ?y WHERE { GRAPH ?g { ?x ex:knows+ ?y } }
+        ",
+    )
+    .await;
+
+    assert_eq!(rows.len(), 1, "the single knows edge is one solution");
+}
+
+/// N `FROM NAMED` clauses give exactly N graph bindings. The pre-fix shape
+/// gave N+1, the extra key aliasing whichever clause was processed last.
+#[tokio::test]
+async fn http_dataset_two_from_named_give_two_bindings() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = seed_http_dataset_ledger(&fluree, HTTP_DS_LEDGER).await;
+
+    let dataset = fluree
+        .build_dataset_view(&http_from_named_only_spec(&[HTTP_DS_G1, HTTP_DS_G2]))
+        .await
+        .expect("build_dataset_view should succeed");
+
+    assert!(
+        dataset.get_named(HTTP_DS_LEDGER).is_none(),
+        "the ledger alias must not be registered as a named graph"
+    );
+
+    let rows = http_ds_rows(
+        &dataset,
+        &fluree,
+        r"
+        PREFIX ex: <http://ex.org/>
+        SELECT ?g ?n WHERE { GRAPH ?g { ?s ex:name ?n } }
+        ",
+    )
+    .await;
+
+    // g1 carries two names, g2 one — three solutions over exactly two graphs.
+    assert_eq!(rows.len(), 3);
+    let all = serde_json::to_string(&rows).expect("rows json");
+    assert!(all.contains(HTTP_DS_G1) && all.contains(HTTP_DS_G2));
+    assert!(
+        !all.contains(HTTP_DS_LEDGER),
+        "no ledger-alias graph binding, got {all}"
+    );
+}
+
+/// `FROM NAMED` with no `FROM` leaves the default graph empty (§13.2), so a
+/// pattern outside `GRAPH { }` matches nothing — the ledger's default-graph
+/// triple ("D") must not leak in.
+#[tokio::test]
+async fn http_dataset_from_named_only_has_empty_default_graph() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = seed_http_dataset_ledger(&fluree, HTTP_DS_LEDGER).await;
+
+    let dataset = fluree
+        .build_dataset_view(&http_from_named_only_spec(&[HTTP_DS_G1]))
+        .await
+        .expect("build_dataset_view should succeed");
+
+    let rows = http_ds_rows(
+        &dataset,
+        &fluree,
+        r"
+        PREFIX ex: <http://ex.org/>
+        SELECT ?n WHERE { ?s ex:name ?n }
+        ",
+    )
+    .await;
+
+    assert!(
+        rows.is_empty(),
+        "empty default graph matches nothing, got {rows:?}"
+    );
+}
+
+/// Under a dataset clause the ledger alias is not a graph name, so
+/// `GRAPH <ledger-alias>` behaves like any unknown graph name: zero rows, no
+/// error. Before the fix it resolved — to the *named* graph's triples.
+///
+/// Whether a dataset clause should let `GRAPH <ledger-alias>` address the
+/// ledger's default graph is a deliberate feature decision, not something to
+/// inherit by accident; D-2 keeps that spelling only on the no-dataset-clause
+/// path.
+#[tokio::test]
+async fn http_dataset_graph_ledger_alias_is_an_unknown_graph_name() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = seed_http_dataset_ledger(&fluree, HTTP_DS_LEDGER).await;
+
+    let dataset = fluree
+        .build_dataset_view(&http_from_named_only_spec(&[HTTP_DS_G1]))
+        .await
+        .expect("build_dataset_view should succeed");
+
+    let rows = http_ds_rows(
+        &dataset,
+        &fluree,
+        r"
+        PREFIX ex: <http://ex.org/>
+        SELECT ?n WHERE { GRAPH <httpds:main> { ?s ex:name ?n } }
+        ",
+    )
+    .await;
+
+    assert!(
+        rows.is_empty(),
+        "an unnamed graph yields no solutions and no error, got {rows:?}"
+    );
+}
+
+/// The spelling that still reaches the ledger's default graph under a dataset
+/// clause: name it with `FROM`. This is the migration path for queries written
+/// against the pre-4.1.4 fallback.
+#[tokio::test]
+async fn http_dataset_explicit_from_default_keeps_default_graph() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = seed_http_dataset_ledger(&fluree, HTTP_DS_LEDGER).await;
+
+    let spec = DatasetSpec::new()
+        .with_default(
+            GraphSource::new(HTTP_DS_LEDGER)
+                .with_graph(fluree_db_api::dataset::GraphSelector::Default),
+        )
+        .with_named(
+            GraphSource::new(HTTP_DS_LEDGER)
+                .with_graph(fluree_db_api::dataset::GraphSelector::Iri(
+                    HTTP_DS_G1.to_string(),
+                ))
+                .with_alias(HTTP_DS_G1),
+        );
+    let dataset = fluree
+        .build_dataset_view(&spec)
+        .await
+        .expect("build_dataset_view should succeed");
+
+    let rows = http_ds_rows(
+        &dataset,
+        &fluree,
+        r"
+        PREFIX ex: <http://ex.org/>
+        SELECT ?n WHERE { ?s ex:name ?n }
+        ",
+    )
+    .await;
+
+    assert_eq!(rows.len(), 1, "the default-graph triple, and only that");
 }

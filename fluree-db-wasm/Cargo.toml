@@ -1,0 +1,37 @@
+[package]
+name = "fluree-db-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "wasm-bindgen binding layer for the browser build of Fluree"
+# Distributed as the npm package under js/, not on crates.io.
+publish = false
+
+[lib]
+# cdylib is the browser artifact; rlib keeps the crate checkable/clippy-able
+# and lets the wasm-bindgen-test harness link it as a library.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The whole engine with NO default features: this is the same dependency
+# shape the wasm32 CI check job enforces (`-p fluree-db-api
+# --no-default-features`). Native-only subsystems (indexer, import, spatial,
+# memmap) are target-gated inside the api crate, not selected here.
+fluree-db-api = { path = "../fluree-db-api", default-features = false }
+# Only for QueryCancellation (the per-query memory-budget handle).
+fluree-db-core = { path = "../fluree-db-core", default-features = false }
+# Only to name QueryError variants (Cancelled, MemoryBudgetExceeded) when
+# mapping ApiError::Query to the JS error taxonomy.
+fluree-db-query = { path = "../fluree-db-query", default-features = false }
+serde_json = { workspace = true }
+wasm-bindgen = "0.2.108"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[lints]
+workspace = true

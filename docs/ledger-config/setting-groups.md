@@ -10,14 +10,22 @@ When no config graph is present (or a setting group is absent), the system defau
 
 | Setting group | System default |
 |---------------|----------------|
-| Policy | `f:defaultAllow true` — all queries and transactions are permitted |
+| Policy | Enforcement off for requests carrying no policy inputs; **fail-closed** for requests that do (see below) |
 | SHACL | Disabled — no shape validation |
 | Reasoning | Disabled — no OWL/RDFS inference |
 | Datalog | Disabled — no rule evaluation |
 | Transact constraints | Disabled — no uniqueness enforcement |
+| Query defaults | The default graph holds only its own triples (no union default graph) |
 | Override control | `f:OverrideAll` — any request can override any setting |
 
-In other words, an unconfigured ledger is **fully open**: no policy, no validation, no reasoning. This matches the behavior of a fresh ledger and ensures backward compatibility.
+An unconfigured ledger applies no validation and no reasoning. Policy is the one group where "unconfigured" is not the same as "open", because policy enforcement is switched on by the ledger's configuration *or* by the request:
+
+- A request that carries **no policy inputs** — no identity, no `policy-class`, no inline `policy` — is governed by the ledger's [policy defaults](#policy-defaults) when the ledger configures any; `f:defaultAllow false`, for example, denies it. On a ledger with no policy configuration it reads everything. This is the case that makes a fresh ledger feel fully open.
+- A request that carries **any** of those inputs is enforced. If the identity has no policies granting it anything and nothing sets `f:defaultAllow true`, it reads no data — authenticating *reduces* what a caller sees on an unpoliced ledger. Setting `f:defaultAllow true` on the ledger is what opens an unpoliced ledger to identity-carrying requests.
+
+Schema flakes (`rdf:type` with a schema-class object, `rdfs:subClassOf`, `rdfs:subPropertyOf`, `rdfs:domain`, `rdfs:range`) bypass policy, so even a fully denied identity can read the ontology.
+
+To find out whether a given request was enforced, ask for policy tracking — see [Detecting that policy was applied](../security/policy-in-queries.md#detecting-that-policy-was-applied).
 
 ---
 
@@ -29,7 +37,7 @@ Controls default policy enforcement behavior.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `f:defaultAllow` | boolean | `true` | Allow (`true`) or deny (`false`) when no policy rule matches |
+| `f:defaultAllow` | boolean | `false` when unset | Allow (`true`) or deny (`false`) when no policy rule matches. Applies to requests with and without policy inputs |
 | `f:policySource` | `f:GraphRef` | (none) | Graph containing policy rules (`f:Allow`, `f:Modify`, etc.) |
 | `f:policyClass` | IRI or list | (none) | Default policy classes to apply |
 | `f:overrideControl` | IRI or object | `f:OverrideAll` | Override gating (see [Override control](override-control.md)) |
@@ -96,7 +104,13 @@ Controls SHACL shape validation at transaction time.
 | `f:validationMode` | IRI | `f:ValidationReject` | `f:ValidationReject` (reject invalid data) or `f:ValidationWarn` (log warning, allow) |
 | `f:overrideControl` | IRI or object | `f:OverrideAll` | Override gating |
 
-`f:shapesSource` is non-overridable. `f:shaclEnabled` and `f:validationMode` are overridable.
+`f:shapesSource` is non-overridable. `f:shaclEnabled` and `f:validationMode` are overridable per graph.
+
+`f:validationMode` can additionally be overridden per **transaction** via
+`opts.validationMode` (`"warn"` / `"reject"`): strengthening is always
+honored, softening only when `f:overrideControl` permits it for the
+request's verified identity. See
+[Override control](override-control.md#shacl-fshacldefaults).
 
 ### Example
 
@@ -131,6 +145,7 @@ Controls OWL/RDFS reasoning applied at query time.
 | `f:schemaSource` | `f:GraphRef` | (none) | Graph containing schema triples (`rdfs:subClassOf`, etc.) |
 | `f:reasoningMaxFacts` | integer | 1,000,000 | OWL2-RL materialization budget: max derived facts before the closure is capped |
 | `f:reasoningMaxSeconds` | integer | 30 | OWL2-RL materialization budget: max wall-clock seconds before the closure is capped |
+| `f:reasoningMaxMemoryMb` | integer | derived from `f:reasoningMaxFacts` | Materialization budget: max megabytes of derived facts before the closure is capped |
 | `f:overrideControl` | IRI or object | `f:OverrideAll` | Override gating |
 
 `f:schemaSource` is non-overridable. `f:reasoningModes` and the budget fields
@@ -361,7 +376,29 @@ and how configured properties interact with `@fulltext`-datatype values.
 
 Some settings are structurally tied to the ledger as a whole and are **not meaningful per-graph**. They live exclusively on `f:LedgerConfig` and are ignored if present on `f:GraphConfig`.
 
-Override control does not apply to ledger-scoped settings — they are changed only by writing to the config graph.
+Override control does not apply to ledger-scoped settings. `f:servingDefaults` changes only by writing to the config graph; `f:queryDefaults` sets what a query reads when the query does not say, and any request may say.
+
+### `f:queryDefaults` — query defaults
+
+| Field | Type | Meaning |
+|---|---|---|
+| `f:unionDefaultGraph` | boolean | A query that does not choose its own default graph reads the **union** of the ledger's default graph and all its named graphs (default `false`) |
+
+```trig
+GRAPH <urn:fluree:mydb:main#config> {
+    <urn:cfg:main>  a f:LedgerConfig ;
+                    f:queryDefaults <urn:cfg:query> .
+    <urn:cfg:query> f:unionDefaultGraph true .
+}
+```
+
+With the setting on, a query with no `FROM` — or one whose `FROM` names only the ledger itself — matches its default-graph patterns against every graph of the ledger, as one graph: a triple stored in two graphs is one triple, and a property path follows edges from graph to graph. The reserved `#txn-meta` and `#config` graphs are never part of the union. `GRAPH` patterns address the named graphs exactly as before, and a `FROM` naming a graph reads just that graph.
+
+A query can decide for itself either way, with `# PRAGMA union-default-graph: true | false` in SPARQL or `"opts": {"unionDefaultGraph": true | false}` in JSON-LD. The union changes what a query reads, not what it may read: each graph is read under the same policy a `GRAPH` pattern reading it would be.
+
+The setting applies to reads only. Transactions write to the graphs they name, and the `WHERE` of an update — including the reads inside a Cypher write statement — matches the default graph alone. History queries (`FROM … TO …`) also read the default graph alone.
+
+See [Union default graph](../concepts/datasets-and-named-graphs.md#union-default-graph).
 
 ### `f:servingDefaults` — serving posture
 

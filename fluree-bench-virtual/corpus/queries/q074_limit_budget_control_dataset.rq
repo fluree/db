@@ -1,0 +1,12 @@
+# q074 limit_budget_control_dataset — promoted from A3 probe-04b (audit item 11 control)
+# Coverage: the POSITIVE CONTROL for q073 — the same LIMIT shape WITHOUT the OPTIONAL.
+#   Here the LIMIT budget already forwards into the R2RML scan (FLUREE_R2RML_LIMIT_
+#   PUSHDOWN, default on), so the scan window caps to the remaining budget and stops
+#   early. The q073-vs-q074 delta is exactly the OPTIONAL budget-forwarding cliff that
+#   item 11 closes. rows_only: the LIMIT truncates an unordered set.
+# Exec path: query_from() FROM <enterprise-sf01-v:main> (the deployed solo/chat shape).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?oid ?tot
+FROM <enterprise-sf01-v:main>
+WHERE { ?o a edw:Order ; edw:orderId ?oid ; edw:orderTotal ?tot . }
+LIMIT 50

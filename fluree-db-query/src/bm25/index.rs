@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use fluree_db_core::Flake;
+use fluree_graph_json_ld::{parse_context, ParsedContext};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -389,124 +390,465 @@ impl PropertyDeps {
     /// - WHERE clause patterns (predicate keys like "@type", "ex:title")
     /// - SELECT clause property arrays (excluding "@id")
     ///
-    /// The `@context` is used to expand prefixed IRIs to full IRIs.
+    /// Keys expand through the query's `@context` exactly as the query parser
+    /// expands them (prefixes, terms, `@vocab`, `@base`), so a dependency that
+    /// fails to encode against a ledger is one the query cannot match there
+    /// either.
+    ///
+    /// This is the best-effort view. Callers that need to know whether the set
+    /// is *total* — the incremental sync — use [`PropertyDeps::analyze`].
     pub fn from_indexing_query(config: &serde_json::Value) -> Self {
-        let mut deps = PropertyDeps::new();
+        Self::analyze(config).deps
+    }
 
-        // Extract @context for prefix expansion
+    /// Extract property dependencies and establish whether they are complete.
+    ///
+    /// See [`PropertyDepsAnalysis`] for what "complete" means and why the
+    /// incremental sync depends on it.
+    pub fn analyze(config: &serde_json::Value) -> PropertyDepsAnalysis {
         let query = config.get("query").unwrap_or(config);
-        let context = query.get("@context");
+        let mut walker = DepsWalker::new(query);
+        walker.analyze_options(query);
+        walker.root = walker.analyze_select(query);
+        match query.get("where") {
+            Some(where_clause) => walker.analyze_where(where_clause),
+            None => walker.flag("the query has no `where` clause"),
+        }
+        if walker.deps.is_empty() {
+            walker.flag("the query names no properties at all");
+        }
+        PropertyDepsAnalysis {
+            deps: walker.deps,
+            incomplete: walker.incomplete,
+        }
+    }
+}
 
-        // Helper to expand a prefixed IRI using context
-        let expand_iri = |key: &str| -> Option<Arc<str>> {
-            // Variables are not predicates.
-            if key.starts_with('?') {
-                return None;
-            }
+/// What [`PropertyDeps::analyze`] established about an indexing query.
+///
+/// Incremental sync rests on one premise: a commit that touches none of
+/// `deps` cannot change the index, and a commit that touches some of them
+/// changes only the documents whose subject the touched flakes carry. That
+/// holds for the shape the BM25 documentation specifies — an object-form
+/// `select` over one document variable, explicit properties, and `where`
+/// patterns all rooted at that variable — and fails for legal shapes whose
+/// observable predicates cannot be enumerated (`*`, a variable predicate, a
+/// `@path` alias) or whose changed flake sits on a different subject than the
+/// document it changes (nested projections, nested patterns, reverse terms,
+/// `depth`).
+///
+/// `incomplete` is `Some(reason)` whenever the analysis met a construct it
+/// could not prove safe. `deps` is then a lower bound, and a sync that trusted
+/// it would go silently stale: it would see an empty change set for a commit
+/// that did change the index, and advance past it. Callers must fall back to a
+/// full rebuild instead. The reason is worded for an operator's log line.
+#[derive(Debug, Clone, Default)]
+pub struct PropertyDepsAnalysis {
+    /// Every predicate the analysis could see the query observe.
+    pub deps: PropertyDeps,
+    /// Why `deps` is not known to be total, when it is not.
+    pub incomplete: Option<String>,
+}
 
-            // JSON-LD @type is rdf:type, and must be tracked for incremental updates.
-            if key == "@type" {
-                return Some(Arc::from(fluree_vocab::rdf::TYPE));
-            }
+impl PropertyDepsAnalysis {
+    /// `true` when `deps` enumerates every predicate the query can observe and
+    /// every one of them lives on the document subject.
+    pub fn is_complete(&self) -> bool {
+        self.incomplete.is_none()
+    }
+}
 
-            // Other JSON-LD keywords are not tracked as predicates.
-            if key.starts_with('@') {
-                return None;
-            }
+/// Where-clause forms that only group other patterns.
+const PATTERN_GROUPS: [&str; 6] = [
+    "optional",
+    "union",
+    "minus",
+    "exists",
+    "not-exists",
+    "notexists",
+];
 
-            // Handle prefixed IRIs (e.g., "ex:title")
-            if let Some(colon_pos) = key.find(':') {
-                let prefix = &key[..colon_pos];
-                let local = &key[colon_pos + 1..];
+/// Query options that reshape the result set. Incremental sync assumes the
+/// query returns every document it covers, so any truncation makes "a subject
+/// the query did not return" mean something other than "remove it".
+const RESULT_SHAPING_OPTIONS: [(&str, &str); 5] = [
+    ("limit", "`limit` truncates the result set"),
+    ("offset", "`offset` truncates the result set"),
+    ("groupBy", "`groupBy` reshapes the result set"),
+    ("group-by", "`groupBy` reshapes the result set"),
+    ("having", "`having` filters the result set"),
+];
 
-                // Look up prefix in context
-                if let Some(ctx) = context {
-                    if let Some(base) = ctx.get(prefix).and_then(|v| v.as_str()) {
-                        return Some(Arc::from(format!("{base}{local}")));
-                    }
-                }
-            }
+/// One pass over an indexing query, collecting predicates and the first
+/// construct that makes the collection untrustworthy.
+///
+/// Mirrors the query parser's own classification of keys (`@id`/`@type` and
+/// their context aliases, variables, `@`-keywords, everything else a property
+/// expanded through the context), so the dependency set and the executed
+/// query agree on what a key means.
+struct DepsWalker {
+    ctx: ParsedContext,
+    deps: PropertyDeps,
+    incomplete: Option<String>,
+    /// The document variable, once the select has named it.
+    root: Option<String>,
+}
 
-            // Already a full IRI or no context match - use as-is
-            Some(Arc::from(key))
+impl DepsWalker {
+    fn new(query: &serde_json::Value) -> Self {
+        let raw_ctx = query.get("@context").or_else(|| query.get("context"));
+        let mut walker = Self {
+            ctx: ParsedContext::new(),
+            deps: PropertyDeps::new(),
+            incomplete: None,
+            root: None,
         };
-
-        // Extract properties from WHERE clause patterns
-        if let Some(where_clause) = query.get("where") {
-            Self::extract_where_properties(where_clause, &expand_iri, &mut deps);
+        if let Some(raw) = raw_ctx {
+            match parse_context(&crate::parse::normalize_context_value(raw)) {
+                Ok(ctx) => walker.ctx = ctx,
+                Err(e) => walker.flag(format!("the `@context` could not be parsed: {e}")),
+            }
+            if context_defines_path_alias(raw) {
+                walker.flag(
+                    "the `@context` defines a property-path alias (`@path`), \
+                     which reaches predicates on other subjects",
+                );
+            }
         }
-
-        // Extract properties from SELECT clause
-        if let Some(select) = query.get("select") {
-            Self::extract_select_properties(select, &expand_iri, &mut deps);
-        }
-
-        deps
+        walker
     }
 
-    /// Extract properties from WHERE clause patterns (recursive)
-    fn extract_where_properties<F>(
-        value: &serde_json::Value,
-        expand_iri: &F,
-        deps: &mut PropertyDeps,
-    ) where
-        F: Fn(&str) -> Option<Arc<str>>,
-    {
-        match value {
-            serde_json::Value::Array(arr) => {
-                for item in arr {
-                    Self::extract_where_properties(item, expand_iri, deps);
+    /// Record the first reason the dependency set cannot be trusted. Later
+    /// reasons are dropped: one actionable line beats a list.
+    fn flag(&mut self, reason: impl Into<String>) {
+        if self.incomplete.is_none() {
+            self.incomplete = Some(reason.into());
+        }
+    }
+
+    fn is_id_key(&self, key: &str) -> bool {
+        key == "@id" || key == self.ctx.id_key
+    }
+
+    fn is_type_key(&self, key: &str) -> bool {
+        key == "@type" || key == "type" || key == self.ctx.type_key
+    }
+
+    /// Add a property key, expanded as the parser would expand it. A term
+    /// defined with `@reverse` contributes the reverse predicate, but the
+    /// changed flake then sits on the *other* subject, so it is flagged.
+    fn add_property_key(&mut self, key: &str) {
+        let (iri, entry) = fluree_graph_json_ld::details_with_vocab(key, &self.ctx, true);
+        match entry.as_ref().and_then(|e| e.reverse.as_ref()) {
+            Some(rev) => {
+                if self.is_type_key(rev) {
+                    self.deps.add(fluree_vocab::rdf::TYPE);
+                } else {
+                    self.deps.add(rev.as_str());
                 }
+                self.flag(format!(
+                    "`{key}` is a reverse term (`@reverse`), so the flake it observes \
+                     belongs to another subject"
+                ));
             }
-            serde_json::Value::Object(map) => {
-                for (key, val) in map {
-                    // Extract property IRI from predicate key
-                    if let Some(iri) = expand_iri(key) {
-                        deps.add(iri);
+            None => self.deps.add(iri),
+        }
+    }
+
+    fn analyze_options(&mut self, query: &serde_json::Value) {
+        for (key, why) in RESULT_SHAPING_OPTIONS {
+            if query.get(key).is_some() {
+                self.flag(why);
+            }
+        }
+        if query
+            .get("depth")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|d| d > 0)
+        {
+            self.flag("`depth` auto-expands references into other subjects");
+        }
+    }
+
+    /// Returns the document variable when the select names one.
+    fn analyze_select(&mut self, query: &serde_json::Value) -> Option<String> {
+        const SELECT_KEYS: [&str; 5] = [
+            "select",
+            "selectDistinct",
+            "select-distinct",
+            "selectOne",
+            "select-one",
+        ];
+        let Some((key, select)) = SELECT_KEYS
+            .iter()
+            .find_map(|k| query.get(k).map(|v| (*k, v)))
+        else {
+            self.flag("the query has no `select` clause");
+            return None;
+        };
+        if key == "selectOne" || key == "select-one" {
+            self.flag(
+                "`selectOne` returns a single row, so a change can swap which document that is",
+            );
+        }
+
+        match select {
+            serde_json::Value::String(s) if s == "*" => {
+                self.flag("`select: \"*\"` observes every predicate");
+                None
+            }
+            serde_json::Value::String(_) => {
+                self.flag(
+                    "the `select` is not object-form, so it does not name the document variable",
+                );
+                None
+            }
+            serde_json::Value::Array(items) => {
+                // Bare predicate strings in a flat select are not a documented
+                // shape, but they were tracked before and cost nothing to keep.
+                for item in items {
+                    if let Some(s) = item.as_str() {
+                        if !s.starts_with('?') && !s.starts_with('@') {
+                            self.add_property_key(s);
+                        }
                     }
-                    // Recurse into nested patterns
-                    Self::extract_where_properties(val, expand_iri, deps);
                 }
+                self.flag(
+                    "the `select` is not object-form, so it does not name the document variable",
+                );
+                None
             }
-            _ => {}
+            serde_json::Value::Object(map) => {
+                if map.len() != 1 {
+                    self.flag("the `select` object must bind exactly one variable, the document");
+                }
+                let (root, spec) = map.iter().next()?;
+                if !root.starts_with('?') {
+                    self.flag("the `select` root is an IRI constant rather than a variable");
+                }
+                match spec {
+                    serde_json::Value::Array(items) => self.analyze_selection_level(items),
+                    _ => self.flag("the `select` value is not an array of properties"),
+                }
+                Some(root.clone())
+            }
+            _ => {
+                self.flag("the `select` is neither a string, an array, nor an object");
+                None
+            }
         }
     }
 
-    /// Extract properties from SELECT clause
-    fn extract_select_properties<F>(
-        value: &serde_json::Value,
-        expand_iri: &F,
-        deps: &mut PropertyDeps,
-    ) where
-        F: Fn(&str) -> Option<Arc<str>>,
-    {
-        match value {
-            // SELECT as object: {"?x": ["@id", "ex:title", "ex:content"]}
-            serde_json::Value::Object(map) => {
-                for (_var, props) in map {
-                    if let serde_json::Value::Array(arr) = props {
-                        for prop in arr {
-                            if let Some(s) = prop.as_str() {
-                                if let Some(iri) = expand_iri(s) {
-                                    deps.add(iri);
+    fn analyze_selection_level(&mut self, items: &[serde_json::Value]) {
+        for item in items {
+            match item {
+                serde_json::Value::String(s) if s == "*" => {
+                    self.flag("`*` in the select observes every predicate of the document");
+                }
+                serde_json::Value::String(s) if self.is_id_key(s) => {}
+                serde_json::Value::String(s) if self.is_type_key(s) => {
+                    self.deps.add(fluree_vocab::rdf::TYPE);
+                }
+                serde_json::Value::String(s) => match s.strip_prefix("@reverse:") {
+                    Some(rev) => {
+                        self.add_property_key(rev);
+                        self.flag(format!(
+                            "`{s}` is a reverse selection, so the flake it observes belongs to \
+                             another subject"
+                        ));
+                    }
+                    None => self.add_property_key(s),
+                },
+                serde_json::Value::Object(map) => {
+                    self.flag(
+                        "a nested projection follows a reference and indexes text from \
+                         another subject",
+                    );
+                    for (key, sub) in map {
+                        if self.is_type_key(key) {
+                            self.deps.add(fluree_vocab::rdf::TYPE);
+                        } else {
+                            self.add_property_key(key.strip_prefix("@reverse:").unwrap_or(key));
+                        }
+                        match sub {
+                            serde_json::Value::Array(inner) => self.analyze_selection_level(inner),
+                            serde_json::Value::Object(modified) => {
+                                if let Some(serde_json::Value::Array(inner)) = modified.get("select") {
+                                    self.analyze_selection_level(inner);
                                 }
                             }
+                            _ => {}
                         }
                     }
                 }
+                _ => self.flag("the `select` contains an item that is neither a property nor a nested selection"),
             }
-            // SELECT as array of property strings
-            serde_json::Value::Array(arr) => {
-                for prop in arr {
-                    if let Some(s) = prop.as_str() {
-                        if let Some(iri) = expand_iri(s) {
-                            deps.add(iri);
-                        }
+        }
+    }
+
+    fn analyze_where(&mut self, where_clause: &serde_json::Value) {
+        match where_clause {
+            serde_json::Value::Object(map) => self.analyze_pattern(map),
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    self.analyze_where_element(item);
+                }
+            }
+            _ => self.flag("the `where` clause is neither a pattern nor a list of patterns"),
+        }
+    }
+
+    fn analyze_where_element(&mut self, element: &serde_json::Value) {
+        match element {
+            serde_json::Value::Object(map) => self.analyze_pattern(map),
+            serde_json::Value::Array(items) => match items.first().and_then(|v| v.as_str()) {
+                Some(head) if PATTERN_GROUPS.contains(&head) => {
+                    for item in &items[1..] {
+                        self.analyze_where_element(item);
                     }
+                }
+                // ["graph", <name>, <patterns...>]
+                Some("graph") => {
+                    for item in items.iter().skip(2) {
+                        self.analyze_where_element(item);
+                    }
+                }
+                Some("filter") => {
+                    for item in &items[1..] {
+                        self.analyze_filter_expr(item);
+                    }
+                }
+                // Neither introduces a predicate.
+                Some("bind" | "values") => {}
+                Some("query") => {
+                    self.flag("a subquery joins in rows whose subjects the sync cannot attribute");
+                }
+                Some(head) => {
+                    self.flag(format!("unrecognised `where` form `{head}`"));
+                }
+                // A plain list of patterns, as in a union branch.
+                None => {
+                    for item in items {
+                        self.analyze_where_element(item);
+                    }
+                }
+            },
+            _ => self.flag("the `where` clause contains an element that is not a pattern"),
+        }
+    }
+
+    /// Filter expressions bind no predicates, except through an embedded
+    /// `exists` / `not-exists`, whose patterns count like any other.
+    fn analyze_filter_expr(&mut self, expr: &serde_json::Value) {
+        match expr {
+            serde_json::Value::Array(items) => match items.first().and_then(|v| v.as_str()) {
+                Some("exists" | "not-exists" | "notexists") => {
+                    for item in &items[1..] {
+                        self.analyze_where_element(item);
+                    }
+                }
+                _ => {
+                    for item in items {
+                        self.analyze_filter_expr(item);
+                    }
+                }
+            },
+            serde_json::Value::Object(map) if map.contains_key("@value") => {}
+            serde_json::Value::Object(_) => {
+                self.flag("a `filter` contains an object that is not a typed literal");
+            }
+            _ => {}
+        }
+    }
+
+    /// One node-map pattern. Its subject must be the document variable: the
+    /// sync attributes a changed flake to its own subject, so a predicate on
+    /// any other subject changes documents the sync will not revisit.
+    fn analyze_pattern(&mut self, map: &serde_json::Map<String, serde_json::Value>) {
+        let subject = map.get("@id").or_else(|| map.get(self.ctx.id_key.as_str()));
+        match subject {
+            None => self.flag("a `where` pattern without `@id` binds an anonymous subject"),
+            Some(serde_json::Value::String(s)) if s.starts_with('?') => {
+                if let Some(root) = &self.root {
+                    if s != root {
+                        self.flag(format!(
+                            "a `where` pattern is rooted at `{s}` rather than the document \
+                             variable `{root}`"
+                        ));
+                    }
+                }
+            }
+            Some(_) => self.flag("a `where` pattern has a constant subject"),
+        }
+        if subject.is_some() && map.len() == 1 {
+            // `{"@id": "?s"}` alone parses to `?s ?p ?o`: every predicate.
+            self.flag("a bare `{\"@id\": ?var}` pattern scans every predicate");
+        }
+
+        for (key, value) in map {
+            if self.is_id_key(key) {
+                continue;
+            }
+            if self.is_type_key(key) {
+                self.deps.add(fluree_vocab::rdf::TYPE);
+                continue;
+            }
+            if key.starts_with('?') {
+                self.flag(format!(
+                    "`{key}` is a variable predicate, which observes every predicate"
+                ));
+                continue;
+            }
+            if key.starts_with('@') {
+                self.flag(format!(
+                    "`{key}` is not a keyword the dependency analysis understands"
+                ));
+                continue;
+            }
+            self.add_property_key(key);
+            self.analyze_object_value(value);
+        }
+    }
+
+    /// The object side of a property: a literal, a variable, a reference, or
+    /// a nested node. A nested node with properties of its own is a pattern
+    /// on a second subject and is analysed as one — the subject rule flags it.
+    fn analyze_object_value(&mut self, value: &serde_json::Value) {
+        match value {
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    self.analyze_object_value(item);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                if map.contains_key("@value") || map.contains_key("@language") {
+                    if map
+                        .keys()
+                        .any(|k| !matches!(k.as_str(), "@value" | "@type" | "@language"))
+                    {
+                        self.flag("a literal value object carries keys other than `@value`, `@type`, `@language`");
+                    }
+                } else if map.len() == 1 && map.keys().next().is_some_and(|k| self.is_id_key(k)) {
+                    // A reference: `{"@id": "?a"}` or `{"@id": "ex:thing"}`.
+                } else {
+                    self.analyze_pattern(map);
                 }
             }
             _ => {}
         }
+    }
+}
+
+/// Whether a raw `@context` value contains a term definition carrying `@path`.
+/// Mirrors the shapes `parse::extract_path_aliases` accepts: an object, or an
+/// array whose object members are scanned in turn.
+fn context_defines_path_alias(context: &serde_json::Value) -> bool {
+    match context {
+        serde_json::Value::Object(map) => map
+            .values()
+            .any(|def| def.as_object().is_some_and(|d| d.contains_key("@path"))),
+        serde_json::Value::Array(items) => items.iter().any(context_defines_path_alias),
+        _ => false,
     }
 }
 
@@ -1945,5 +2287,305 @@ mod tests {
         assert_eq!(pl.num_blocks(), 2); // ceil(200/128) = 2
         assert_eq!(pl.block_postings(0).len(), 128);
         assert_eq!(pl.block_postings(1).len(), 72);
+    }
+
+    // ------------------------------------------------------------------
+    // PropertyDeps::analyze — what the incremental sync may trust
+    // ------------------------------------------------------------------
+
+    fn analyze(query: serde_json::Value) -> PropertyDepsAnalysis {
+        PropertyDeps::analyze(&query)
+    }
+
+    fn reason(a: &PropertyDepsAnalysis) -> &str {
+        a.incomplete.as_deref().unwrap_or("")
+    }
+
+    #[test]
+    fn analyze_accepts_the_documented_shape() {
+        let a = analyze(serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "where": [
+                {"@id": "?x", "@type": "ex:Doc", "ex:title": "?title"},
+                ["optional", {"@id": "?x", "ex:summary": "?s"}],
+                ["union", {"@id": "?x", "ex:lang": "en"}, [{"@id": "?x", "ex:lang": "fr"}]],
+                ["filter", [">", ["strlen", "?title"], 3]],
+                ["filter", ["not-exists", {"@id": "?x", "ex:archived": true}]],
+                ["graph", "ex:g1", {"@id": "?x", "ex:note": "?n"}],
+                ["values", ["?x", [{"@id": "ex:doc1"}]]],
+                ["bind", "?len", ["strlen", "?title"]]
+            ],
+            "select": {"?x": ["@id", "@type", "ex:title", "ex:summary"]},
+            "orderBy": "?title"
+        }));
+        assert!(a.is_complete(), "unexpectedly incomplete: {}", reason(&a));
+        for iri in [
+            fluree_vocab::rdf::TYPE,
+            "http://example.org/title",
+            "http://example.org/summary",
+            "http://example.org/lang",
+            "http://example.org/archived",
+            "http://example.org/note",
+        ] {
+            assert!(a.deps.contains(iri), "missing {iri}");
+        }
+        assert_eq!(a.deps.len(), 6);
+    }
+
+    #[test]
+    fn analyze_accepts_a_reference_valued_property() {
+        // `{"@id": "?a"}` is a reference, not a second pattern.
+        let a = analyze(serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "where": [{"@id": "?x", "@type": "ex:Doc", "ex:author": {"@id": "?a"}}],
+            "select": {"?x": ["@id", "ex:title"]}
+        }));
+        assert!(a.is_complete(), "{}", reason(&a));
+        assert!(a.deps.contains("http://example.org/author"));
+    }
+
+    #[test]
+    fn analyze_flags_wildcard_select() {
+        let a = analyze(serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "where": [{"@id": "?x", "@type": "ex:Doc"}],
+            "select": {"?x": ["*"]}
+        }));
+        assert!(reason(&a).contains('*'), "{}", reason(&a));
+        // What it could see, it still tracks.
+        assert!(a.deps.contains(fluree_vocab::rdf::TYPE));
+
+        let a = analyze(serde_json::json!({
+            "where": [{"@id": "?x", "http://example.org/title": "?t"}],
+            "select": "*"
+        }));
+        assert!(reason(&a).contains('*'), "{}", reason(&a));
+    }
+
+    #[test]
+    fn analyze_flags_nested_projection_but_keeps_its_predicates() {
+        let a = analyze(serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "where": [{"@id": "?x", "@type": "ex:Doc"}],
+            "select": {"?x": ["@id", "ex:title", {"ex:author": ["ex:name"]}]}
+        }));
+        assert!(reason(&a).contains("nested projection"), "{}", reason(&a));
+        assert!(a.deps.contains("http://example.org/author"));
+        assert!(a.deps.contains("http://example.org/name"));
+    }
+
+    #[test]
+    fn analyze_flags_variable_predicate() {
+        let a = analyze(serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "where": [{"@id": "?x", "@type": "ex:Doc"}, {"@id": "?x", "?p": "?o"}],
+            "select": {"?x": ["@id", "ex:title"]}
+        }));
+        assert!(reason(&a).contains("?p"), "{}", reason(&a));
+
+        let a = analyze(serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "where": [{"@id": "?x"}],
+            "select": {"?x": ["@id", "ex:title"]}
+        }));
+        assert!(reason(&a).contains("every predicate"), "{}", reason(&a));
+    }
+
+    #[test]
+    fn analyze_flags_patterns_on_another_subject() {
+        let a = analyze(serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "where": [
+                {"@id": "?x", "@type": "ex:Doc", "ex:author": "?a"},
+                {"@id": "?a", "ex:name": "?n"}
+            ],
+            "select": {"?x": ["@id", "ex:title"]}
+        }));
+        assert!(reason(&a).contains("?a"), "{}", reason(&a));
+        assert!(a.deps.contains("http://example.org/name"));
+
+        let a = analyze(serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "where": [{"@id": "?x", "ex:author": {"@id": "?a", "ex:name": "?n"}}],
+            "select": {"?x": ["@id", "ex:title"]}
+        }));
+        assert!(reason(&a).contains("?a"), "{}", reason(&a));
+        assert!(a.deps.contains("http://example.org/name"));
+
+        let a = analyze(serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "where": [{"@id": "?x", "@type": "ex:Doc"}, {"ex:title": "?t"}],
+            "select": {"?x": ["@id", "ex:title"]}
+        }));
+        assert!(reason(&a).contains("anonymous"), "{}", reason(&a));
+
+        let a = analyze(serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "where": [
+                {"@id": "?x", "@type": "ex:Doc"},
+                ["filter", ["exists", {"@id": "?y", "ex:archived": true}]]
+            ],
+            "select": {"?x": ["@id", "ex:title"]}
+        }));
+        assert!(reason(&a).contains("?y"), "{}", reason(&a));
+    }
+
+    #[test]
+    fn analyze_flags_reverse_terms_and_path_aliases() {
+        let a = analyze(serde_json::json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "parent": {"@reverse": "ex:child"}
+            },
+            "where": [{"@id": "?x", "@type": "ex:Doc", "parent": "?p"}],
+            "select": {"?x": ["@id", "ex:title"]}
+        }));
+        assert!(reason(&a).contains("parent"), "{}", reason(&a));
+        assert!(a.deps.contains("http://example.org/child"));
+
+        let a = analyze(serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "where": [{"@id": "?x", "@type": "ex:Doc"}],
+            "select": {"?x": ["@id", "@reverse:ex:cites"]}
+        }));
+        assert!(reason(&a).contains("reverse"), "{}", reason(&a));
+        assert!(a.deps.contains("http://example.org/cites"));
+
+        let a = analyze(serde_json::json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "ancestors": {"@path": "ex:parent+"}
+            },
+            "where": [{"@id": "?x", "@type": "ex:Doc", "ancestors": "?p"}],
+            "select": {"?x": ["@id", "ex:title"]}
+        }));
+        assert!(reason(&a).contains("@path"), "{}", reason(&a));
+    }
+
+    #[test]
+    fn analyze_flags_result_shaping_and_expansion_options() {
+        let base = serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "where": [{"@id": "?x", "@type": "ex:Doc"}],
+            "select": {"?x": ["@id", "ex:title"]}
+        });
+        for (key, value) in [
+            ("depth", serde_json::json!(2)),
+            ("limit", serde_json::json!(10)),
+            ("offset", serde_json::json!(5)),
+            ("groupBy", serde_json::json!("?x")),
+            ("having", serde_json::json!([">", ["count", "?x"], 1])),
+        ] {
+            let mut q = base.clone();
+            q.as_object_mut().unwrap().insert(key.to_string(), value);
+            let a = analyze(q);
+            assert!(reason(&a).contains(key), "{key}: {}", reason(&a));
+        }
+
+        let mut q = base.clone();
+        let select = q.as_object_mut().unwrap().remove("select").unwrap();
+        q.as_object_mut()
+            .unwrap()
+            .insert("selectOne".into(), select);
+        assert!(reason(&analyze(q)).contains("selectOne"));
+
+        let mut q = base.clone();
+        q.as_object_mut()
+            .unwrap()
+            .insert("depth".into(), serde_json::json!(0));
+        assert!(analyze(q).is_complete(), "depth 0 expands nothing");
+    }
+
+    #[test]
+    fn analyze_flags_selects_that_name_no_document() {
+        let a = analyze(serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "where": [{"@id": "?x", "@type": "ex:Doc", "ex:title": "?t"}],
+            "select": ["?x", "?t"]
+        }));
+        assert!(reason(&a).contains("object-form"), "{}", reason(&a));
+
+        let a = analyze(serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "where": [{"@id": "?x", "@type": "ex:Doc"}],
+            "select": {"?x": ["@id"], "?y": ["@id"]}
+        }));
+        assert!(reason(&a).contains("exactly one"), "{}", reason(&a));
+
+        let a = analyze(serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": {"ex:doc1": ["@id", "ex:title"]}
+        }));
+        assert!(!a.is_complete());
+    }
+
+    #[test]
+    fn analyze_flags_subqueries_and_unknown_forms() {
+        let a = analyze(serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "where": [
+                {"@id": "?x", "@type": "ex:Doc"},
+                ["query", {"select": ["?x"], "where": {"@id": "?x", "ex:flag": true}}]
+            ],
+            "select": {"?x": ["@id", "ex:title"]}
+        }));
+        assert!(reason(&a).contains("subquery"), "{}", reason(&a));
+
+        let a = analyze(serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "where": [{"@id": "?x", "@type": "ex:Doc", "@context": {"ex": "http://other/"}}],
+            "select": {"?x": ["@id", "ex:title"]}
+        }));
+        assert!(reason(&a).contains("@context"), "{}", reason(&a));
+    }
+
+    #[test]
+    fn analyze_expands_keys_the_way_the_parser_does() {
+        // Term definitions and @vocab: bare keys must not survive as literal
+        // strings, or they can never encode and silently drop out of the set.
+        let a = analyze(serde_json::json!({
+            "@context": {
+                "@vocab": "http://example.org/",
+                "headline": "http://schema.org/headline"
+            },
+            "where": [{"@id": "?x", "@type": "Doc", "headline": "?h", "body": "?b"}],
+            "select": {"?x": ["@id", "headline", "body"]}
+        }));
+        assert!(a.is_complete(), "{}", reason(&a));
+        assert!(a.deps.contains("http://schema.org/headline"));
+        assert!(a.deps.contains("http://example.org/body"));
+        assert!(!a.deps.contains("headline"));
+        assert!(!a.deps.contains("body"));
+
+        // @base stands in for @vocab, as `parse_query` arranges.
+        let a = analyze(serde_json::json!({
+            "@context": {"@base": "http://example.org/"},
+            "where": [{"@id": "?x", "title": "?t"}],
+            "select": {"?x": ["@id", "title"]}
+        }));
+        assert!(a.is_complete(), "{}", reason(&a));
+        assert!(a.deps.contains("http://example.org/title"));
+
+        // Array-form contexts resolve too.
+        let a = analyze(serde_json::json!({
+            "@context": [{"ex": "http://example.org/"}, {"schema": "http://schema.org/"}],
+            "where": [{"@id": "?x", "ex:title": "?t", "schema:name": "?n"}],
+            "select": {"?x": ["@id", "ex:title"]}
+        }));
+        assert!(a.is_complete(), "{}", reason(&a));
+        assert!(a.deps.contains("http://example.org/title"));
+        assert!(a.deps.contains("http://schema.org/name"));
+    }
+
+    #[test]
+    fn analyze_honours_id_and_type_aliases() {
+        let a = analyze(serde_json::json!({
+            "@context": {"ex": "http://example.org/", "id": "@id", "type": "@type"},
+            "where": [{"id": "?x", "type": "ex:Doc", "ex:title": "?t"}],
+            "select": {"?x": ["id", "type", "ex:title"]}
+        }));
+        assert!(a.is_complete(), "{}", reason(&a));
+        assert!(a.deps.contains(fluree_vocab::rdf::TYPE));
+        assert_eq!(a.deps.len(), 2);
     }
 }

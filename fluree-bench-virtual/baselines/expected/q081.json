@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "query_id": "q081",
+  "result_hash": "c056eadad15f82c6e707f6dd2b4e15b6f79a52be0029d34c0ee2ace1f33ec3fd",
+  "rows": 1,
+  "head_rows": [
+    "{\"@type\":\"http://ns.fluree.dev/edw#Customer\"}"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KY0X3SHR4SYZAMCDDTF33GDT",
+    "commit": "be859fe97"
+  }
+}

@@ -4,6 +4,38 @@ use crate::format::FormatError;
 use thiserror::Error;
 
 // ============================================================================
+// Fan-out outcome tally
+// ============================================================================
+
+/// Per-target outcome counts for one fan-out materialize window.
+///
+/// The unit of materialize work is the TARGET, not the poll. A single job resolves to
+/// N target ledgers and each can independently commit, defer on novelty backpressure,
+/// or fail — so any counter measured in polls is measuring the wrong thing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TargetTally {
+    /// Targets that committed (or had nothing to do and are up to date).
+    pub ok: usize,
+    /// Targets deferred by novelty backpressure. Self-heals on the next poll.
+    pub deferred: usize,
+    /// Targets that errored.
+    pub failed: usize,
+}
+
+impl TargetTally {
+    /// Total targets attempted in the window.
+    pub fn total(&self) -> usize {
+        self.ok + self.deferred + self.failed
+    }
+
+    /// True when every target reached the same successful outcome — the only case in
+    /// which the shared watermark may advance.
+    pub fn is_complete(&self) -> bool {
+        self.deferred == 0 && self.failed == 0
+    }
+}
+
+// ============================================================================
 // Builder errors
 // ============================================================================
 
@@ -190,6 +222,20 @@ pub enum ApiError {
     #[error("Credential error: {0}")]
     Credential(#[from] fluree_db_credential::CredentialError),
 
+    /// Iceberg graph-source errors (requires `iceberg` feature).
+    ///
+    /// Preserves the typed discriminant from `fluree_db_iceberg` — notably
+    /// [`fluree_db_iceberg::IcebergError::MergeOnReadDeletes`], which the
+    /// fail-closed MoR guard raises for a correctly-configured table that merely
+    /// carries delete files (a 409 Conflict, not a 400 config error). Display is
+    /// the inner error verbatim (no prefix) so the guard's actionable message —
+    /// including the `merge-on-read` substring the CLI/solo classifiers match on
+    /// and the `FLUREE_ICEBERG_ALLOW_MOR_DELETES` override name — reaches the
+    /// caller unchanged.
+    #[cfg(feature = "iceberg")]
+    #[error("{0}")]
+    Iceberg(#[from] fluree_db_iceberg::IcebergError),
+
     /// Core/Storage errors
     #[error("Core error: {0}")]
     Core(#[from] fluree_db_core::Error),
@@ -201,6 +247,50 @@ pub enum ApiError {
     /// Configuration errors
     #[error("Invalid configuration: {0}")]
     Config(String),
+
+    /// Faults in a ledger's stored config graph.
+    ///
+    /// Distinct from [`Config`](Self::Config), which covers configuration the
+    /// caller supplies and is therefore a 400. The config graph is operator
+    /// data: no request can cause a fault in it and no change to a request can
+    /// clear one, so telling the caller their request was bad sends them
+    /// looking in the wrong place.
+    #[error("Ledger configuration error: {0}")]
+    LedgerConfig(String),
+
+    /// A materialize pass's subject accumulator outgrew its memory budget.
+    ///
+    /// A pre-OOM circuit breaker, not an allocator meter: the bytes are
+    /// ESTIMATED (string lengths + JSON value sizes + flat per-entry overhead)
+    /// as rows accumulate, and the pass aborts BEFORE any commit — no retract
+    /// has run, no target ledger is touched, the watermark is un-advanced, so
+    /// the failure leaves everything exactly as the last successful poll did.
+    /// The previous behavior was the kernel OOM-killing the whole server with
+    /// no log line (measured: 21.4 GiB resident on a 735k-row full re-read,
+    /// killed every 4-6 minutes, watermark never advancing).
+    ///
+    /// This failure is DETERMINISTIC: the same window fails identically on the
+    /// next poll. Levers, in order: an incremental window this large usually
+    /// means the poll interval is too long — shorten it so windows stay small;
+    /// a FULL read this large has no window to shrink — raise
+    /// `FLUREE_MATERIALIZE_MEMORY_BUDGET_MB` (default 1024; 0 disables the
+    /// gate) for a scheduled off-peak sync until streaming finalization lands.
+    #[error(
+        "materialize window for table '{table}' needs ~{estimated_bytes} B of accumulator \
+         memory ({distinct_subjects} distinct subjects) against a budget of {budget_bytes} B; \
+         nothing was committed. Shorten the poll interval (smaller windows) or raise \
+         FLUREE_MATERIALIZE_MEMORY_BUDGET_MB (0 disables)"
+    )]
+    MaterializeMemoryBudget {
+        /// Source table whose window overflowed the accumulator.
+        table: String,
+        /// Estimated resident bytes of the accumulator at abort.
+        estimated_bytes: usize,
+        /// The configured budget in bytes.
+        budget_bytes: usize,
+        /// Distinct (target, graph, subject) keys accumulated at abort.
+        distinct_subjects: usize,
+    },
 
     /// Unresolved `owl:imports` in the reasoning schema closure.
     ///
@@ -224,6 +314,10 @@ pub enum ApiError {
     #[error("Invalid branch operation: {0}")]
     InvalidBranch(String),
 
+    /// A ledger id that does not parse (the message names the rule broken).
+    #[error("{0}")]
+    InvalidLedgerId(#[from] fluree_db_core::LedgerIdParseError),
+
     /// Branch conflict (fast-forward not possible, rebase abort, etc.)
     #[error("Branch conflict: {0}")]
     BranchConflict(String),
@@ -232,13 +326,122 @@ pub enum ApiError {
     #[error("Not found: {0}")]
     NotFound(String),
 
+    /// A graph the addressed ledger does not have (404).
+    ///
+    /// Deliberately not [`ApiError::is_not_found`]: that condition means "no
+    /// such ledger" and sends a lookup on to graph sources, while here the
+    /// ledger exists and only the graph is missing.
+    #[error("Graph not found: {0}")]
+    GraphNotFound(String),
+
+    /// A commit reference (a CID, a hex prefix, a `t`) that names no commit of
+    /// the ledger it is resolved in (404).
+    ///
+    /// Deliberately not [`ApiError::is_not_found`], for the reason
+    /// [`ApiError::GraphNotFound`] is not: the ledger exists, and a time pin
+    /// that resolves to no commit must not read as a missing ledger.
+    #[error("{0}")]
+    CommitNotFound(String),
+
     /// Ledger already exists
     #[error("Ledger already exists: {0}")]
     LedgerExists(String),
 
+    /// Materialization deferred by novelty backpressure — NOT a failure.
+    ///
+    /// The target ledger's novelty is at its ceiling, and only the indexer can drain
+    /// it. Deliberately a distinct variant rather than an `Internal` string so callers
+    /// can treat it as "retry next poll" instead of logging a fault: the materialize
+    /// worker polls every 30-57 s, which is the correct backoff.
+    ///
+    /// Waiting in-process instead of deferring caused a production deadlock — the
+    /// worker holds what the indexer needs to publish, so the wait guaranteed the
+    /// condition could not clear. See `transact_chunks_with_backpressure`.
+    // NOT "(will retry)". Whether anything retries depends on the CALLER: the
+    // materialize worker re-polls every 30-57 s, but a one-shot HTTP
+    // /iceberg/materialize does not — so promising a retry misinformed an operator who
+    // invoked it by hand and reasonably read it as "in progress".
+    #[error(
+        "Materialization deferred: novelty at capacity, {remaining} items pending. Nothing was \
+         applied for the deferred target. The tracking worker retries automatically; a one-shot \
+         /iceberg/materialize call must be re-issued."
+    )]
+    NoveltyDeferred {
+        /// Items not applied in this window; they are re-derived on the next poll.
+        remaining: usize,
+    },
+
+    /// A fan-out window where the targets did not all reach the same outcome.
+    ///
+    /// One materialize job resolves to N target ledgers, each an independent commit
+    /// domain. Partial application is therefore the NORMAL case, not an exception, and
+    /// reporting it as a single scalar outcome loses the only number that matters:
+    /// how many targets actually progressed.
+    ///
+    /// This is still an `Err` because the shared watermark is held back whenever any
+    /// target is behind, so the window is NOT complete and a caller must re-poll. The
+    /// tally rides along so the caller can account for the targets that did commit.
+    ///
+    /// Concretely: a production poll with 21 of 22 targets committing surfaced as one
+    /// `NoveltyDeferred`, so the worker recorded zero commits and one deferral. Read off
+    /// the stats, a healthy window was indistinguishable from a total stall — and it was
+    /// diagnosed as one.
+    #[error(
+        "Materialization applied {} of {} targets ({} deferred, {} failed); the watermark is held \
+         back so the window is retried. Most serious outcome: {detail}",
+        tally.ok, tally.total(), tally.deferred, tally.failed
+    )]
+    MaterializePartial {
+        /// Per-target outcome counts for this window.
+        tally: TargetTally,
+        /// The most serious single outcome — a failure if any target failed, else a
+        /// deferral. Failure outranks deferral because a deferral self-heals on the
+        /// next poll and a failure usually needs attention.
+        detail: String,
+    },
+
     /// Internal errors (ledger_info, etc.)
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// Object storage denied a read of an external table's data (S3 403 /
+    /// `AccessDenied`), on the preview/browse path.
+    ///
+    /// Surfaced as HTTP 403 (not the generic 400/500) so the caller can tell a
+    /// permission problem from a bad query. Because S3 also returns
+    /// `AccessDenied` for a missing object without `s3:ListBucket`, this means
+    /// the credentials lack access **or** the object was moved/removed. The scan
+    /// path produces the equivalent [`fluree_db_query::QueryError::StorageAccessDenied`]
+    /// (wrapped here via [`ApiError::Query`]); both map to the same server code.
+    #[error(
+        "Storage access denied for s3://{bucket}/{key}{region_suffix}: {message}",
+        region_suffix = .region.as_deref().map(|r| format!(" (region {r})")).unwrap_or_default()
+    )]
+    StorageAccessDenied {
+        /// Bucket parsed from the object path.
+        bucket: String,
+        /// Object key parsed from the object path.
+        key: String,
+        /// Configured/resolved region, if known.
+        region: Option<String>,
+        /// The underlying storage error detail.
+        message: String,
+    },
+
+    /// The catalog authorized the table but vended no storage credentials while
+    /// the source requires them (`vended_credentials = true`).
+    ///
+    /// Fail-closed on the preview/browse path: refused rather than silently
+    /// downgrading to ambient (process-default) AWS credentials.
+    #[error(
+        "Catalog {catalog_uri} authorized the table but vended no storage credentials; \
+         either fix the catalog's credential vending or set vended_credentials=false on \
+         the source to explicitly use ambient AWS credentials"
+    )]
+    CatalogCredentialsNotVended {
+        /// The REST catalog URI that authorized the table.
+        catalog_uri: String,
+    },
 
     /// HTTP error with explicit status code
     ///
@@ -288,7 +491,7 @@ pub enum ApiError {
 
     /// Indexer crate errors
     #[error("Indexer error: {0}")]
-    Indexer(#[from] fluree_db_indexer::IndexerError),
+    Indexer(#[from] crate::wasm_compat::IndexerError),
 
     /// Builder validation errors (one or more problems with builder configuration)
     #[error("{0}")]
@@ -308,6 +511,20 @@ pub enum ApiError {
 }
 
 impl ApiError {
+    /// Per-target tally when this error came from a fan-out materialize window.
+    ///
+    /// Exists so a caller can credit the targets that DID commit without matching on the
+    /// variant. The absence of any such accessor is what made the previous behaviour
+    /// invisible: a partial window arrived as `NoveltyDeferred { remaining }`, which has
+    /// nowhere to put "21 targets succeeded", so the information was not so much lost as
+    /// unrepresentable.
+    pub fn target_tally(&self) -> Option<TargetTally> {
+        match self {
+            ApiError::MaterializePartial { tally, .. } => Some(*tally),
+            _ => None,
+        }
+    }
+
     /// Check if this error represents a "not found" condition.
     ///
     /// Matches both `ApiError::NotFound` and `ApiError::Ledger(LedgerError::NotFound)`.
@@ -321,6 +538,11 @@ impl ApiError {
     /// Create a configuration error
     pub fn config(msg: impl Into<String>) -> Self {
         ApiError::Config(msg.into())
+    }
+
+    /// Create an error describing a fault in the ledger's stored config graph.
+    pub fn ledger_config(msg: impl Into<String>) -> Self {
+        ApiError::LedgerConfig(msg.into())
     }
 
     /// Create a SPARQL error with diagnostics
@@ -358,6 +580,12 @@ impl ApiError {
     /// Create a query error
     pub fn query(msg: impl Into<String>) -> Self {
         ApiError::Internal(format!("Query error: {}", msg.into()))
+    }
+
+    /// Create an error for a query the caller got wrong: a 400, where
+    /// [`Self::query`] is a 500.
+    pub fn invalid_query(msg: impl Into<String>) -> Self {
+        ApiError::Query(fluree_db_query::QueryError::InvalidQuery(msg.into()))
     }
 
     /// Create a not-implemented error
@@ -399,16 +627,32 @@ impl ApiError {
             ApiError::Http { status, .. } => *status,
             #[cfg(feature = "credential")]
             ApiError::Credential(e) => e.status_code(),
+            // A correctly-configured Iceberg table that merely carries
+            // merge-on-read delete files is a conflict (unsupported state), not
+            // bad input — 409. Other Iceberg errors preserve the pre-typed-variant
+            // 400 (they previously flowed through `ApiError::config`).
+            #[cfg(feature = "iceberg")]
+            ApiError::Iceberg(e) => match e {
+                fluree_db_iceberg::IcebergError::MergeOnReadDeletes(_) => 409,
+                _ => 400,
+            },
             ApiError::InvalidBranch(_) => 400,
+            ApiError::InvalidLedgerId(_) => 400,
+            ApiError::NameService(fluree_db_nameservice::NameServiceError::InvalidId(_)) => 400,
             ApiError::BranchConflict(_) => 409,
-            ApiError::NotFound(_) => 404,
+            ApiError::NotFound(_) | ApiError::GraphNotFound(_) => 404,
+            ApiError::CommitNotFound(_) => 404,
             ApiError::Ledger(fluree_db_ledger::LedgerError::NotFound(_)) => 404,
             ApiError::LedgerExists(_) => 409,
             ApiError::ReindexConflict { .. } => 409,
-            ApiError::IndexTimeout(_) => 504,  // Gateway Timeout
+            ApiError::IndexTimeout(_) => 504, // Gateway Timeout
+            // 503 + retryable: novelty is at capacity and only the indexer can clear
+            // it. Not the caller's fault (no 4xx) and not a fault at all (no 500) —
+            // the correct client behaviour is to try again shortly.
+            ApiError::NoveltyDeferred { .. } => 503,
             ApiError::IndexingDisabled => 400, // Bad Request
             ApiError::Indexer(e) => {
-                use fluree_db_indexer::IndexerError;
+                use crate::wasm_compat::IndexerError;
                 match e {
                     IndexerError::LedgerNotFound(_) => 404,
                     IndexerError::NoCommits => 400,
@@ -418,6 +662,30 @@ impl ApiError {
             // Builder validation errors
             ApiError::Builder(_) => 400,
             ApiError::Query(fluree_db_query::QueryError::Cancelled { .. }) => 408,
+            // R3-B: memory-budget abort → 507 (Insufficient Storage), distinct from
+            // the 408 timeout so the caller can degrade on it specifically.
+            ApiError::Query(fluree_db_query::QueryError::MemoryBudgetExceeded { .. }) => 507,
+            // Storage-permission / fail-closed errors are 403 (Forbidden),
+            // whether raised directly (preview path) or wrapped from the query
+            // engine (scan path). These arms MUST precede the generic
+            // `ApiError::Query(_) => 400` below.
+            ApiError::StorageAccessDenied { .. }
+            | ApiError::CatalogCredentialsNotVended { .. }
+            | ApiError::Query(
+                fluree_db_query::QueryError::StorageAccessDenied { .. }
+                | fluree_db_query::QueryError::CatalogCredentialsNotVended { .. }
+                | fluree_db_query::QueryError::CatalogAccessDenied { .. },
+            ) => 403,
+            // The write was understood but refused by its policy. Other
+            // policy errors (invalid definitions, evaluation failures) are
+            // not authorization denials.
+            ApiError::Policy(fluree_db_policy::PolicyError::ModifyDenied { .. })
+            | ApiError::Transact(fluree_db_transact::TransactError::PolicyViolation(
+                fluree_db_policy::PolicyError::ModifyDenied { .. },
+            )) => 403,
+            // A malformed ledger config graph is the operator's to fix, and no
+            // change to the request can clear it.
+            ApiError::LedgerConfig(_) => 500,
             // Most errors are client errors (bad input)
             ApiError::Parse(_)
             | ApiError::Query(_)
@@ -437,6 +705,34 @@ impl ApiError {
                 | fluree_db_transact::TransactError::PublishLostRace { .. }
                 | fluree_db_transact::TransactError::NamespaceConflict(_),
             ) => 409,
+            // 413: the transaction's own delta meets or exceeds
+            // `reindex_max_bytes` (the commit check is `current + delta >=
+            // max`, so with drained novelty this still fails) — no amount of
+            // indexer draining can ever admit it. A 503 here would tell the
+            // client to retry a request that can never work; 413 says the
+            // payload itself is the problem. MUST precede the drainable
+            // novelty arm below.
+            ApiError::Transact(fluree_db_transact::TransactError::NoveltyWouldExceed {
+                delta_bytes,
+                max_bytes,
+                ..
+            }) if delta_bytes >= max_bytes => 413,
+            // 503 + retryable: novelty backpressure, the same class as
+            // `NoveltyDeferred` above. `NoveltyAtMax` (novelty already at
+            // `reindex_max_bytes`) and drainable `NoveltyWouldExceed` (this
+            // delta would cross it, but fits once novelty drains) are cleared
+            // by the indexer, not by changing the request — a 400 tells
+            // retrying clients the write is permanently invalid and to drop
+            // it.
+            ApiError::Transact(
+                fluree_db_transact::TransactError::NoveltyAtMax
+                | fluree_db_transact::TransactError::NoveltyWouldExceed { .. },
+            ) => 503,
+            // 422: well-formed, but the ledger has no room for its new
+            // datatypes. Permanent: datatype IDs are never released.
+            ApiError::Transact(fluree_db_transact::TransactError::DatatypeLimitExceeded {
+                ..
+            }) => 422,
             // Other transaction errors are usually validation failures
             ApiError::Transact(_) => 400,
             // Cross-ledger model dependency could not be resolved /
@@ -463,3 +759,155 @@ impl ApiError {
 
 /// Result type alias for API operations
 pub type Result<T> = std::result::Result<T, ApiError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_permission_errors_are_403() {
+        // Direct (preview path) and query-wrapped (scan path) both → 403, and
+        // the query-wrapped ones must NOT fall through to the generic
+        // `ApiError::Query(_) => 400`.
+        assert_eq!(
+            ApiError::StorageAccessDenied {
+                bucket: "b".into(),
+                key: "k".into(),
+                region: None,
+                message: "m".into(),
+            }
+            .status_code(),
+            403
+        );
+        assert_eq!(
+            ApiError::CatalogCredentialsNotVended {
+                catalog_uri: "https://c/v1".into(),
+            }
+            .status_code(),
+            403
+        );
+        assert_eq!(
+            ApiError::Query(fluree_db_query::QueryError::StorageAccessDenied {
+                bucket: "b".into(),
+                key: "k".into(),
+                region: Some("us-east-2".into()),
+                message: "m".into(),
+            })
+            .status_code(),
+            403
+        );
+        assert_eq!(
+            ApiError::Query(fluree_db_query::QueryError::CatalogCredentialsNotVended {
+                catalog_uri: "https://c/v1".into(),
+            })
+            .status_code(),
+            403
+        );
+    }
+
+    #[test]
+    fn generic_query_error_still_400() {
+        // Guard against the new 403 arms accidentally swallowing other query
+        // errors.
+        assert_eq!(
+            ApiError::Query(fluree_db_query::QueryError::InvalidQuery("bad".into())).status_code(),
+            400
+        );
+    }
+
+    #[test]
+    fn only_actual_policy_denials_are_forbidden() {
+        use fluree_db_policy::PolicyError;
+        use fluree_db_transact::TransactError;
+
+        let denied = || PolicyError::modify_denied("write refused");
+        assert_eq!(ApiError::Policy(denied()).status_code(), 403);
+        assert_eq!(
+            ApiError::Transact(TransactError::PolicyViolation(denied())).status_code(),
+            403
+        );
+        assert_eq!(
+            ApiError::Transact(TransactError::InvalidTerm("bad term".into())).status_code(),
+            400
+        );
+    }
+
+    #[test]
+    fn tally_totals_and_completeness() {
+        let all_good = TargetTally {
+            ok: 22,
+            deferred: 0,
+            failed: 0,
+        };
+        assert_eq!(all_good.total(), 22);
+        assert!(all_good.is_complete());
+
+        // One target behind is enough to hold the shared watermark back.
+        for behind in [
+            TargetTally {
+                ok: 21,
+                deferred: 1,
+                failed: 0,
+            },
+            TargetTally {
+                ok: 21,
+                deferred: 0,
+                failed: 1,
+            },
+        ] {
+            assert_eq!(behind.total(), 22);
+            assert!(
+                !behind.is_complete(),
+                "a target that did not commit must block watermark advance: {behind:?}"
+            );
+        }
+    }
+
+    /// The regression this variant exists for. Reproduces the exact production window:
+    /// 21 of 22 targets committed, one did not.
+    ///
+    /// This test CANNOT be written against the previous behaviour — that path returned
+    /// `NoveltyDeferred { remaining }` / `Internal(String)`, neither of which has a field
+    /// capable of holding "21 targets succeeded". The count was unrepresentable, so the
+    /// worker scored the window as zero commits and the deployment was diagnosed as
+    /// stalled while 21 ledgers were in fact being written every poll.
+    #[test]
+    fn a_partial_window_reports_the_targets_that_succeeded() {
+        let tally = TargetTally {
+            ok: 21,
+            deferred: 1,
+            failed: 0,
+        };
+        let e = ApiError::MaterializePartial {
+            tally,
+            detail: "novelty at capacity, 3088 items pending".into(),
+        };
+
+        assert_eq!(
+            e.target_tally().map(|t| t.ok),
+            Some(21),
+            "the 21 committed targets must be recoverable from the error itself"
+        );
+
+        // The operator-facing message must lead with the ratio, because "deferred" alone
+        // is what read as a total stall.
+        let msg = e.to_string();
+        assert!(
+            msg.contains("21 of 22"),
+            "message must state the ratio, got: {msg}"
+        );
+        assert!(msg.contains("1 deferred"), "got: {msg}");
+        assert!(
+            msg.contains("watermark is held back"),
+            "message must say the window will be retried, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn target_tally_is_none_for_unrelated_errors() {
+        assert!(ApiError::NoveltyDeferred { remaining: 5 }
+            .target_tally()
+            .is_none());
+        assert!(ApiError::Internal("boom".into()).target_tally().is_none());
+    }
+}

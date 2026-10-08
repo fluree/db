@@ -48,6 +48,21 @@ fn main() -> ExitCode {
             result_url,
             graph_data,
         ),
+        TestDescriptor::UpdateEval {
+            ref test_id,
+            ref request_url,
+            ref data_url,
+            ref graph_data,
+            ref result_data_url,
+            ref result_graph_data,
+        } => run_update_eval_test(
+            test_id,
+            request_url,
+            data_url.as_deref(),
+            graph_data,
+            result_data_url.as_deref(),
+            result_graph_data,
+        ),
     };
 
     // Write result as JSON to stdout
@@ -107,6 +122,32 @@ fn run_eval_test(
     result_url: &str,
     graph_data: &[(String, String)],
 ) -> SubprocessResult {
+    run_async(testsuite_sparql::query_handler::run_eval_test(
+        test_id, query_url, data_url, result_url, graph_data,
+    ))
+}
+
+fn run_update_eval_test(
+    test_id: &str,
+    request_url: &str,
+    data_url: Option<&str>,
+    graph_data: &[(String, String)],
+    result_data_url: Option<&str>,
+    result_graph_data: &[(String, String)],
+) -> SubprocessResult {
+    run_async(testsuite_sparql::query_handler::run_update_eval_test(
+        test_id,
+        request_url,
+        data_url,
+        graph_data,
+        result_data_url,
+        result_graph_data,
+    ))
+}
+
+/// Drive an async test body on a fresh current-thread runtime and convert
+/// its outcome to a `SubprocessResult`.
+fn run_async(fut: impl std::future::Future<Output = anyhow::Result<()>>) -> SubprocessResult {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -121,14 +162,7 @@ fn run_eval_test(
         }
     };
 
-    let outcome = rt.block_on(async {
-        testsuite_sparql::query_handler::run_eval_test(
-            test_id, query_url, data_url, result_url, graph_data,
-        )
-        .await
-    });
-
-    match outcome {
+    match rt.block_on(fut) {
         Ok(()) => SubprocessResult {
             passed: true,
             has_errors: None,

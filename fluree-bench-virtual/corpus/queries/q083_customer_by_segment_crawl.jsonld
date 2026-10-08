@@ -1,0 +1,14 @@
+# q083 customer_by_segment_crawl — browse-parity E1 (D7). A property-scoped
+#   "listing" crawl: a variable subject bound by a PROPERTY (edw:segment, object
+#   var) rather than a class, limit 10. At 733cb2c8e this DNF'd (>90s): the LIMIT
+#   row budget was not forwarded to the property-var crawl's full-source wildcard
+#   scan (it ran as the unbudgeted inner scan). E1 estimates that pruning-key-less
+#   wildcard as a full-source scan so reorder makes it the LIMIT-budgeted
+#   correlated OUTER, driven by the selective edw:segment scan — so it terminates.
+#   RowsOnly: the LIMIT truncates the unordered set.
+{
+  "@context": {"edw": "http://ns.fluree.dev/edw#"},
+  "select": {"?s": ["*"]},
+  "where": {"@id": "?s", "edw:segment": "?v"},
+  "limit": 10
+}

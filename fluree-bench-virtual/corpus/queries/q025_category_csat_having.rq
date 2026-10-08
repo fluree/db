@@ -1,0 +1,10 @@
+# q025 category_csat_having
+# Intent: Fact->dim rollup with HAVING (problem areas).
+# BI lineage (BI-14): "Which product categories have average CSAT below 3?"
+# Predicates verified against enterprise.ttl — FactSupportTicket: csatScore, product; DimProduct: category.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?cat (AVG(?csat) AS ?avg) (COUNT(?t) AS ?n)
+WHERE { ?t a edw:SupportTicket ; edw:csatScore ?csat ; edw:product ?p .
+        ?p edw:category ?cat . }
+GROUP BY ?cat
+HAVING (AVG(?csat) < 3)

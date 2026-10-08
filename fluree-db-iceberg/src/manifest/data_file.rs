@@ -15,7 +15,7 @@ use bytes::Bytes;
 use crate::error::{IcebergError, Result};
 
 /// File format for data files.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum FileFormat {
     /// Parquet format (default, supported)
     #[default]
@@ -72,14 +72,14 @@ impl ManifestEntryStatus {
 }
 
 /// Partition data for a data file.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PartitionData {
     /// Partition field values (field_id -> value bytes)
     pub values: HashMap<i32, Option<Vec<u8>>>,
 }
 
 /// A data file entry in a manifest.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DataFile {
     /// Path to the data file
     pub file_path: String,

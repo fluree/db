@@ -43,10 +43,18 @@ fluree iceberg map execution-log \
   --table-location s3://bucket/warehouse/logs/execution_log \
   --r2rml mappings/execution_log.ttl
 
+# Governed by a model ledger holding its policies and class hierarchy
+# (see "Access policy" below)
+fluree iceberg map execution-log \
+  --mode direct \
+  --table-location s3://bucket/warehouse/logs/execution_log \
+  --r2rml mappings/execution_log.ttl \
+  --model governance:main
+
 # AWS Glue Data Catalog (native SDK, ambient AWS credentials)
+# (each rr:tableName in the mapping is a Glue <database>.<table>)
 fluree iceberg map warehouse-orders \
   --mode glue \
-  --table sales.orders \
   --region us-east-1 \
   --r2rml mappings/orders.ttl
 
@@ -68,6 +76,10 @@ fluree iceberg map orders \
 ```
 
 Once mapped, graph sources appear in `fluree list`, can be inspected with `fluree info`, and removed with `fluree drop`. See [CLI iceberg reference](../cli/iceberg.md) for all options.
+
+#### Warehouse-root `--table-location` (multi-table, catalog-less)
+
+`--table-location` normally points at a single table's root directory. It may instead point at a **database / namespace root** — e.g. `s3://bucket/warehouse/dw` — for a catalog-less copy whose table directories carry random suffixes (a Snowflake-managed Iceberg database writes `fact_order.UIHGsQex/`, not `fact_order/`). With an `--r2rml` mapping, each `rr:tableName` (e.g. `DW.FACT_ORDER`) is resolved to its own directory under the root via a single S3 `LIST`, matching `<name>.<suffix>/` or bare `<name>/`, case-insensitively on the name (the namespace prefix stripped). Warehouse-root mode is **auto-detected** when the location's leaf directory does not name the requested table; a bare single-table location resolves exactly as before. (A table named identically to its own parent directory reads as single-table.) No catalog or OAuth flags are needed — direct mode reads with ambient IAM credentials.
 
 ### HTTP API
 
@@ -108,7 +120,7 @@ curl -X POST http://localhost:8090/v1/fluree/iceberg/map \
   }'
 ```
 
-R2RML can be omitted to auto-generate a direct mapping. AWS credentials for `direct` mode are read from the server's environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, or an attached instance role). See the [Graph Source Endpoints](../api/endpoints.md#graph-source-endpoints) section in the API reference for the complete request/response schema.
+R2RML can be omitted to auto-generate a direct mapping. An optional `"model": "governance:main"` names the model ledger that governs the source (see [Access policy](#access-policy)). AWS credentials for `direct` mode are read from the server's environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, or an attached instance role). See the [Graph Source Endpoints](../api/endpoints.md#graph-source-endpoints) section in the API reference for the complete request/response schema.
 
 ### Rust API
 
@@ -156,7 +168,7 @@ fluree.create_r2rml_graph_source(config).await?;
 
 Iceberg graph sources are persisted as an `IcebergGsConfig` JSON document in the nameservice record’s `config` field.
 
-Note the nesting: the graph source is “Iceberg” (this page), and `catalog.type` selects the **catalog mode** (`rest` vs `direct`) used to discover Iceberg metadata.
+Note the nesting: the graph source is “Iceberg” (this page), and `catalog.type` selects the **catalog mode** (`rest` vs `direct`) used to discover Iceberg metadata. Optional top-level fields not shown below: `mapping` (the stored R2RML address and media type), `delete` and `order_by` (materialization conventions), and `model` (the governing model ledger, see [Access policy](#access-policy)).
 
 **REST catalog config:**
 
@@ -178,6 +190,31 @@ Note the nesting: the graph source is “Iceberg” (this page), and `catalog.ty
 }
 ```
 
+`warehouse` is the name the catalog knows the warehouse (or catalog) by. It is
+sent to the catalog's `/v1/config` route, and the path prefix that route
+returns is used for every later request, as the Iceberg REST specification
+describes — so the name is enough even where the catalog's routes are laid out
+differently (for example `catalogs/<name>` on Databricks Unity Catalog, whose
+Iceberg endpoint is `https://<workspace>/api/2.1/unity-catalog/iceberg-rest`).
+A catalog with no `/v1/config` route is addressed with the warehouse name as
+the prefix.
+
+**Keeping the secret out of the stored config.** `auth_bearer` and
+`oauth2_client_secret` are stored with the graph source as given. To store only
+a name, give `auth_bearer_env` / `oauth2_client_secret_env`
+(`--auth-bearer-env` / `--oauth2-client-secret-env`): the variable is read from
+the environment of the process that reads the tables, each time a token is
+needed, and the stored config holds `{ "env_var": "<name>" }`. A local CLI
+may name any variable. A **server** accepts only names its operator has listed
+in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS` (comma-separated): the request also
+chooses the catalog and token URLs the secret is sent to, so an unlisted name
+would let a caller send the server's environment to a host of their choosing.
+An embedding application can use a secret reference resolved through its
+`SecretResolver` instead.
+
+For Databricks — what to enable in Unity Catalog, and the token it needs — see
+[Connecting to lakehouse platforms](lakehouse-platforms.md#databricks-through-the-iceberg-rest-endpoint).
+
 **Direct S3 config:**
 
 ```json
@@ -196,13 +233,101 @@ Note the nesting: the graph source is “Iceberg” (this page), and `catalog.ty
 }
 ```
 
+**Local filesystem (no catalog, no object store):**
+
+A Direct `table_location` may also be a **local path** — a `file://` URI or a
+bare absolute path — for Iceberg tables written to the local filesystem (e.g.
+with pyiceberg or Spark against a local warehouse). No catalog service, no
+object store, no AWS credential resolution: the table is read straight from
+disk. Ideal for local development and test datasets.
+
+> **Local tables are opt-in.** Reading the local filesystem is **disabled by
+> default**: a Direct `table_location` that is a `file://` URI or an absolute
+> path is refused unless the operator has named the directories that may be
+> read, via `FLUREE_ICEBERG_LOCAL_ROOTS` (or `iceberg_local_roots` in the config
+> file). See [Enabling local tables](#enabling-local-tables) below.
+
+```json
+{
+  "catalog": {
+    "type": "direct",
+    "table_location": "file:///data/warehouse/logs/execution_log"
+  },
+  "table": "",
+  "io": { "vended_credentials": false }
+}
+```
+
+### Enabling local tables
+
+`FLUREE_ICEBERG_LOCAL_ROOTS` is a colon-separated list of absolute directories,
+in the style of `PATH`:
+
+```bash
+export FLUREE_ICEBERG_LOCAL_ROOTS=/data/warehouse:/srv/lake
+fluree server run --storage-path .fluree/storage
+```
+
+or in `.fluree/config.toml`:
+
+```toml
+[server]
+iceberg_local_roots = "/data/warehouse:/srv/lake"
+```
+
+or in `.fluree/config.jsonld`:
+
+```json
+{
+  "@context": { "@vocab": "https://ns.flur.ee/config#" },
+  "server": {
+    "iceberg_local_roots": "/data/warehouse:/srv/lake"
+  }
+}
+```
+
+The allowlist does two jobs:
+
+1. **It enables local locations at all.** Unset, `table_location: "/data/wh/t"`
+   is refused when the graph source is created, with an error naming the switch.
+   Relative entries in the list are ignored, and a list that parses to nothing
+   is the same as unset.
+2. **It confines every path that is read.** Iceberg manifests reference data
+   files by absolute URI, and that metadata is only as trustworthy as whoever
+   supplied the table directory. Every resolved path — the table location,
+   metadata, manifests, and data files — must land under one of the roots, so a
+   reference such as `.../table/../../../etc/passwd` is refused rather than
+   followed. Containment is checked both textually and against the path's
+   canonical form, so a symlink out of a root does not escape it either.
+
+`FLUREE_ICEBERG_LOCAL_ROOTS=/` allows the whole filesystem. That is a deliberate
+choice for a single-tenant workstation, and a poor one for a shared deployment:
+any caller who can create a graph source can then point it at any directory the
+process can read.
+
+**Why it is off by default.** Fluree is embedded by services that forward
+caller-supplied `table_location` values from their own APIs. Before local
+support existed, this crate rejected everything that was not `s3://`, so those
+services inherited a scheme check they never had to write. Defaulting local
+access to on would have removed that protection silently on a version bump —
+so the capability ships closed, and an operator turns it on for the directories
+they intend to expose.
+
+**Copied and moved tables work with zero configuration.** Iceberg metadata
+references data files by absolute URI, so a table copied down from an object
+store (or moved on disk) carries its *original* location in every manifest.
+Fluree infers the relocation automatically: when the metadata's own `location`
+differs from the configured `table_location`, file references under the old
+root are read from the new one. Copy the table directory, point
+`table_location` at it, done — whether the manifests say `s3://bucket/...` or
+`file:///old/path/...`. (Only whole-directory copies are inferred; a table
+whose manifests reference files *outside* its own root is not remapped.)
+
 **Direct mode requirements:**
 
-- `catalog.table_location` must be an S3 URI (`s3://` or `s3a://`) pointing to the table root directory.
-- The table must contain a `metadata/` subdirectory with:
-  - `version-hint.text` — the current metadata filename (e.g., `00001-abc-def.metadata.json`), a full `s3://`/`gs://` path, or a bare integer version `N` (resolving to `vN.metadata.json`)
-  - The referenced `.metadata.json` file
-- Direct mode uses ambient AWS credentials (IAM roles, env vars, `~/.aws/credentials`). It does **not** support vended credentials.
+- `catalog.table_location` must be an S3 URI (`s3://` or `s3a://`), a `file://` URI, or an absolute local path, pointing to the table root directory. Local paths additionally require `FLUREE_ICEBERG_LOCAL_ROOTS` to name a directory containing them (see [Enabling local tables](#enabling-local-tables)).
+- The table must contain a `metadata/` subdirectory with the current `.metadata.json` file, and (for S3 locations) `version-hint.text` — the current metadata filename (e.g., `00001-abc-def.metadata.json`), a full `s3://`/`gs://` path, or a bare integer version `N` (resolving to `vN.metadata.json`)
+- Direct mode uses ambient AWS credentials (IAM roles, env vars, `~/.aws/credentials`) for S3 locations. It does **not** support vended credentials. Local locations use no credentials at all.
 
 **How Direct metadata resolution works:**
 
@@ -210,7 +335,7 @@ Note the nesting: the graph source is “Iceberg” (this page), and `catalog.ty
   - `"{table_location}/metadata/version-hint.text"` to get the current metadata filename
   - `"{table_location}/metadata/{filename}"` as the table’s current metadata
 - `version-hint.text` may contain a bare filename (e.g., `00001-abc.metadata.json`), a full absolute path (`s3://...` / `gs://...`), or a bare integer version `N` — the Iceberg Hadoop file-based catalog convention — which resolves to `vN.metadata.json`.
-- If `version-hint.text` is missing or empty, Direct mode fails with an error mentioning `version-hint.text`.
+- **Local tables don't need `version-hint.text`** (pyiceberg and most non-Hadoop writers never produce it): when the hint is absent, the `metadata/` directory is listed and the highest-versioned `*.metadata.json` is used. On S3, where listing is not performed, a missing or empty `version-hint.text` fails with an error mentioning `version-hint.text`.
 
 **Iceberg table setup must already exist:**
 
@@ -256,7 +381,9 @@ export AWS_SECRET_ACCESS_KEY=<gcs-hmac-secret>
 
 A signing region is required and must match the bucket location — SigV4 scopes the signature to a region, and GCS interop rejects a mismatched or unsigned region. Set it via `s3_region` in the config (recommended, and what the examples use) or via the ambient `AWS_REGION` in the server environment. `s3_endpoint` must be the interop host, and `s3_path_style` must be `true`. HMAC keys do not expire; in `rest` mode, credentials vended by the catalog for a GCS-backed table are used instead (and refreshed by the SDK).
 
-GCS-backed Iceberg tables are typically read via `direct` mode — point `table_location` at the table root. GCS-native conventions are handled automatically: `gs://` paths in metadata/manifests, a Hadoop-style integer `version-hint.text` (resolved to `vN.metadata.json`), and Snappy-compressed Parquet. As with any direct-mode table, the Iceberg layout (the `metadata/` directory and a current `version-hint.text`) must already exist in the bucket.
+GCS-backed Iceberg tables are typically read via `direct` mode — point `table_location` at the table root. GCS-native conventions are handled automatically: `gs://` paths in metadata/manifests, a Hadoop-style integer `version-hint.text` (resolved to `vN.metadata.json`), and Snappy/GZIP-compressed Parquet. As with any direct-mode table, the Iceberg layout (the `metadata/` directory and a current `version-hint.text`) must already exist in the bucket.
+
+**BigLake REST catalog (catalog auth, distinct from the storage HMAC above).** For tables discovered through Google's BigLake Iceberg REST catalog, the catalog `loadTable` call authenticates with a **Google OAuth token** — separate from the HMAC keys that read the `gs://` data files. A **static `auth_bearer`** (e.g. `gcloud auth print-access-token`) works for a one-shot map/query but **expires after ~1h and cannot renew**, so a long-running tracking worker starts returning 401s. For a workload running as a GCP service account (GKE **Workload Identity**), set **`auth_google_metadata: true`** instead: it mints and auto-refreshes tokens from the instance metadata server, so tracked jobs keep authenticating. (The metadata server is only reachable on GCE/GKE; locally, use a static `auth_bearer`.) The storage HMAC keys are unaffected — they don't expire.
 
 ## RDF Mapping (R2RML)
 
@@ -334,6 +461,262 @@ ORDER BY DESC(?date)
 LIMIT 100
 ```
 
+## Materialization (into a native ledger)
+
+Querying a graph source reads the Iceberg table on the fly. Native Fluree
+features — **BM25 full-text search, vector / RAG, and reasoning** — operate only
+on facts committed to a *native* ledger. To use those over an Iceberg table,
+**materialize** it: Fluree expands the R2RML mapping over the source rows and
+`upsert`s the resulting triples into a target native ledger, which you can then
+index and reason over like any other ledger.
+
+> Requires the `iceberg` feature. The endpoints are admin-protected (send the
+> admin Bearer token when one is configured).
+
+### One-shot materialize
+
+`POST {api_base_url}/iceberg/materialize` reads the source and writes it into the
+target ledger (created if it does not exist):
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/iceberg/materialize \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{ "source": "orders:main", "target": "orders-native:main" }'
+```
+
+```json
+{
+  "source": "orders:main",
+  "target": "orders-native:main",
+  "from_snapshot_id": null,
+  "to_snapshot_id": 5648190075564901028,
+  "incremental": false,
+  "committed": true,
+  "rows_read": 1200,
+  "subjects_upserted": 1200,
+  "subjects_retracted": 0
+}
+```
+
+The materialized snapshot id is persisted as a **watermark** — one per
+`(source, target, table)` — in a shared materialization-state ledger
+(`fluree_materialize_state:main`, created automatically), so re-running resumes
+**incrementally** — only the rows added since the last run are read. Keeping the
+watermark out of the target ledger means bookkeeping never mixes with your
+materialized data. You track nothing; just call it again. A run with no new data
+commits nothing and returns `committed: false`. Pass `"force_full": true` to
+ignore the watermark and re-read the whole table.
+
+Incremental reads apply when the source's snapshot window is append- or
+compaction-only; an `overwrite`/`delete` snapshot, or expired history, falls back
+to a full re-read automatically.
+
+### Tracking (keep the target fresh automatically)
+
+`POST {api_base_url}/iceberg/track` registers a `source → target` job with the
+in-process tracking worker, runs an immediate first sync, and then refreshes the
+target on a timer (default every 30s):
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/iceberg/track \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{ "source": "orders:main", "target": "orders-native:main" }'
+```
+
+- `POST {api_base_url}/iceberg/untrack` — stop tracking (leaves materialized data in place).
+- `GET {api_base_url}/iceberg/tracking` — list tracked jobs and worker stats.
+
+The worker runs on write nodes (not peers). Tracked jobs are **persisted** in the
+`fluree_materialize_state:main` state ledger, next to the watermarks, and restored
+when the worker starts — so a restart resumes tracking on its own, incrementally,
+with no need to re-issue `track`. `untrack` is equally durable: it clears the
+record, so a restart will not resurrect the job.
+
+### One ledger per partition (templated target)
+
+`target` may be a **template** with `{column}` placeholders resolved from each
+source row, so a single materialize/track job **fans out** into one native ledger
+per partition value — e.g. isolating each `(tenant, user)` into its own ledger:
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/iceberg/materialize \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{ "source": "orders:main", "target": "orders_{tenant_id}_{user_id}:main" }'
+```
+
+Each row is routed to the ledger its columns expand to (e.g. `orders_acme_u42:main`),
+creating that ledger on first sight; a row whose template columns are null is
+skipped. One scan of the source feeds every target, and the job keeps **one
+watermark per source table** (in the state ledger) regardless of how many ledgers
+it writes. A placeholder-free `target` is the ordinary single-ledger case,
+unchanged.
+
+This is the way to give each partition its **own** ledger for per-partition
+access isolation: Fluree's read policy is graph-blind, so separate access regimes
+are separate ledgers (isolated by the per-ledger read gate) rather than named
+graphs. Within each per-partition ledger, `rr:graphMap` named-graph routing still
+applies independently. Row- and column-level policy on the live source itself is
+covered under [Access policy](#access-policy).
+
+### Multiple sources into one target (additive)
+
+By default materialization is **additive**: it inserts and updates triples and
+never removes them. Several sources can safely materialize into the **same**
+target ledger — a shared knowledge graph, or a join table that only adds an edge
+to a parent entity. `rdf:type` is asserted additively (via an idempotent insert),
+so classes **union** across sources instead of the last writer clobbering the
+rest; the remaining predicates are upserted per predicate. For example, one
+source can type a subject `as:Article` while a second source adds `as:Announce`
+to the *same* subject IRI, and both classes remain queryable. (The "dedicated
+target" restriction under *Assumptions and limitations* applies only to
+latest-by-key mode, not to additive mode.)
+
+### Change data capture: updates and deletes (latest-by-key)
+
+For a change-data-capture source — an append-only log where each change is a new
+row and a delete is a **tombstone row** — configure two options so Fluree applies
+*latest-by-key* semantics that match a
+`ROW_NUMBER() OVER (PARTITION BY id ORDER BY <ts> DESC) = 1` view:
+
+- **`order_by`** — a column that orders a key's revisions (e.g. an event
+  timestamp or offset). Must be an **integer / date / timestamp** column. The
+  latest row per subject wins, and a whole-subject *replace* clears fields that
+  were dropped in the newer revision.
+- **`delete_column`** + **`delete_values`** — how a row is recognized as a
+  delete. `delete_values` lists the `delete_column` values that mean "deleted";
+  a `null` entry matches a NULL column (the Debezium null-payload convention).
+  When the latest row for a key is a tombstone, the **entire subject** (all its
+  triples) is retracted.
+
+Two ways to encode a delete:
+
+```bash
+# (a) value-match: an op column carries "d" on a delete (Debezium-style).
+curl -X POST http://localhost:8090/v1/fluree/iceberg/map \
+  -H 'Content-Type: application/json' \
+  -d '{ "name": "orders", "mode": "direct",
+        "table_location": "s3://my-bucket/warehouse/sales/orders",
+        "r2rml": "...", "r2rml_type": "text/turtle",
+        "order_by": "event_timestamp",
+        "delete_column": "_op", "delete_values": ["d", "delete"] }'
+
+# (b) null-payload: a delete row has the key set but content columns null;
+#     pick a column always set on a live row but null on a delete, and list null.
+curl -X POST http://localhost:8090/v1/fluree/iceberg/map \
+  -H 'Content-Type: application/json' \
+  -d '{ "name": "orders", "mode": "direct",
+        "table_location": "s3://my-bucket/warehouse/sales/orders",
+        "r2rml": "...", "r2rml_type": "text/turtle",
+        "order_by": "event_timestamp",
+        "delete_column": "status", "delete_values": [null] }'
+
+# (combine both: a "d" op value OR a null column both mean delete)
+#   "delete_column": "_op", "delete_values": ["d", null]
+```
+
+These live in the graph source's stored config (`IcebergGsConfig.delete` and
+`order_by`); set them once at `iceberg map` time. A delete removes the **whole
+entity**, not individual columns — a `null` in an ordinary column of a *live* row
+just clears that one predicate.
+
+### Assumptions and limitations
+
+Latest-by-key mode (i.e. when `order_by` and/or a delete convention is set)
+assumes the source matches the append-only, full-image CDC shape these features
+target. The materializer enforces what it can and documents the rest:
+
+- **One complete row per subject revision.** Each row is a full snapshot of its
+  subject. A source that assembles one subject across multiple rows (e.g. an
+  unpivoted join table) is not supported in latest-by-key mode — use additive
+  mode (omit `order_by`/`delete`) or a one-row-per-subject view.
+- **One triples map per logical table** (enforced — multiple would clobber under
+  whole-subject replace).
+- **`order_by` must be populated and value-orderable** (int/date/timestamp,
+  enforced). A row with a null ordering value sorts as oldest.
+- **The target ledger is dedicated to one source.** Whole-subject retraction owns
+  the subject; don't mix other sources or hand-written data about the same IRIs
+  into the same target. (With a templated target, each fanned-out per-partition
+  ledger is likewise dedicated to that source+partition.)
+- **Deletes must be expressed as tombstone rows.** A key that simply stops
+  appearing — with no tombstone — is not reconciled (a set-difference pass is a
+  possible future addition).
+- The target data is committed first; the watermark then advances in a **separate
+  commit to the state ledger**, never before the data — so an interrupted run
+  re-materializes the same window on the next pass (self-healing, because the data
+  writes are idempotent: whole-subject replace / idempotent insert+upsert).
+- **A window is applied as several transactions**, chunked to fit the target
+  ledger's novelty ceiling. An interrupted or failed pass can therefore leave a
+  target *partially applied* — some subjects re-asserted, others not yet — until
+  the next successful poll re-materializes the window (the watermark only
+  advances after the whole window commits).
+- **A full read is bounded and resumable.** When a source falls back to a full
+  read — first run, a watermark expired by the source's snapshot retention, or a
+  window containing an `overwrite`/`delete` — the pass reads a commit-ordered
+  prefix sized to the novelty ceiling (`FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS`,
+  derived from `reindex_max_bytes` by default) and records where it stopped: at a
+  retained snapshot when one names the prefix, otherwise as a commit-sequence
+  cursor (`urn:fluree:materialize#appliedSequence`), which survives snapshot
+  expiry. Each poll resumes above the cursor until the read completes, at which
+  point the snapshot watermark advances and the cursor is retired. Without the
+  bound, a full read too large to commit deferred on every poll and never made
+  progress.
+- **An incremental backlog is bounded too.** A window is only committed whole,
+  so a window whose flakes exceed the target's novelty ceiling is deferred on
+  every poll, writes no watermark, and grows by one poll each time — until the
+  stored snapshot falls out of the source's retention and the job degrades to a
+  full read of the whole table to recover a backlog that was a few snapshots
+  wide. So an unpinned incremental window over the same per-pass budget (sized
+  from each snapshot's `added-records` summary, so no manifest is read to
+  decide) stops at the last snapshot the budget covers, keeping that snapshot
+  whole, and advances the watermark to it. The next poll resumes from there.
+  A window with an `overwrite`/`delete` anywhere in it is not cut: it full-reads
+  the head regardless, and that read subsumes every prefix.
+- **A window's working memory is budgeted, not unbounded.** The pass retains one
+  node per distinct subject in the window; a window whose estimated accumulator
+  exceeds `FLUREE_MATERIALIZE_MEMORY_BUDGET_MB` (default 1024; `0` disables)
+  fails *before any commit* with a typed error naming the size and the levers —
+  instead of the process being OOM-killed. An incremental window that large
+  usually means the poll interval is too long; a *full* read that large needs a
+  raised budget until streaming finalization lands. This failure recurs every
+  poll until the budget or window changes.
+- **Merge-on-read tables fail closed on both materialize paths** (incremental
+  added-files scans and full reads), exactly as on the query path — see
+  [Limitations](#limitations) item 4 and `FLUREE_ICEBERG_ALLOW_MOR_DELETES`.
+  Materializing makes the guard *more* important, not less: a query returning
+  deleted rows is a transient wrong answer, but a materialized twin commits them
+  as state and advances the watermark past the window.
+- **Foreign-key (`rr:refObjectMap`) edges are not materialized.** The virtual
+  query path resolves them at query time; the materializer does not yet index
+  parent tables, so FK edges are absent from the twin (each pass logs a warning
+  with the dropped-edge count when the mapping carries them).
+- **`rr:graphMap` routing is materialize-only today.** The materializer places
+  rows into named graphs per the subject map's graph map; the virtual query path
+  does not yet read graph maps, so a graph-scoped query returns different
+  results against the source and its twin. Query-path parity is a tracked
+  follow-up. The [native twin](#materializing-a-native-twin) builder refuses a
+  mapping with a graph map rather than flattening it into the default graph.
+- **Compaction can silently turn incremental into a full re-read.** The
+  incremental window treats `replace` (compaction) snapshots as safe when the
+  writer preserves data sequence numbers (Spark's `rewrite_data_files` default).
+  A compaction that *reassigns* sequence numbers makes every rewritten file look
+  newly added — correctness is unaffected (the writes are idempotent), but the
+  cheap incremental poll silently becomes a full-table read. If a tracked
+  source shows periodic cost spikes, check the source's compaction settings.
+- **In a multi-node deployment the worker runs on every write node** (every
+  non-peer node with indexing enabled) with its own job set, so two nodes
+  tracking the same `(source, target)` will interleave their commits;
+  leader-gating is a tracked follow-up. Nodes running external-indexer mode
+  (`indexing_enabled = false`) do not run the worker at all — materialization
+  needs a local indexer draining novelty between chunks — and `POST
+  /iceberg/track` on such a node returns an error saying so.
+- **A templated target creates ledgers without bound** — one per distinct
+  partition value that appears in the source. Malformed or high-cardinality
+  partition columns create that many ledgers; the template columns are the
+  operator's responsibility to keep bounded and well-formed.
+
 ## Partition Pruning
 
 Iceberg's partition pruning optimizes queries:
@@ -355,18 +738,25 @@ If `orderDate` is a partition column, Iceberg only scans January 2024 partitions
 
 ## Combining with Fluree Data
 
-Join Iceberg data with Fluree ledgers:
+Join Iceberg data with Fluree ledgers by naming the graph source in
+`fromNamed` (SPARQL: `FROM NAMED`) and reading it inside a `graph` block. A
+graph source cannot share the default graph with a ledger; such a query is
+refused.
 
 ```json
 {
-  "from": ["customers:main", "warehouse-orders:main"],
+  "from": "customers:main",
+  "fromNamed": "warehouse-orders:main",
   "select": ["?customerName", "?orderTotal", "?orderDate"],
   "where": [
     { "@id": "?customer", "schema:name": "?customerName" },
     { "@id": "?customer", "ex:customerId": "?customerId" },
-    { "@id": "?order", "ex:customerId": "?customerId" },
-    { "@id": "?order", "ex:total": "?orderTotal" },
-    { "@id": "?order", "ex:orderDate": "?orderDate" }
+    ["graph", "warehouse-orders:main", {
+      "@id": "?order",
+      "ex:customerId": "?customerId",
+      "ex:total": "?orderTotal",
+      "ex:orderDate": "?orderDate"
+    }]
   ],
   "filter": "?orderDate >= '2024-01-01'",
   "orderBy": ["-?orderDate"]
@@ -377,11 +767,23 @@ Combines customer data from Fluree with order data from Iceberg.
 
 ## Time Travel
 
-Query historical Iceberg snapshots:
+A query against a virtual Iceberg source reads the table's **current**
+snapshot unless the alias carries a time specification, in which case every
+table of the source is read at the snapshot that specification selects, for the
+whole query. Two selectors apply to Iceberg sources:
+
+| Selector | Selects |
+| --- | --- |
+| `@snapshot:<id>` | The snapshot with exactly that Iceberg snapshot id (any retained snapshot, including one later rolled back) |
+| `@time:<timestamp>` | The snapshot that **was the table's current state** at that instant (RFC 3339): the latest snapshot-log entry at or before it, the same rule as Iceberg's own `TIMESTAMP AS OF`. A retained snapshot that was rolled back, or lives only on a branch, is not selected by time. |
+
+`@recorded:<timestamp>` is accepted as a synonym for `@time:`: an Iceberg
+snapshot carries one time, its commit time, and no separate event-time axis —
+the same rule as a ledger that never used caller-supplied event times.
 
 ```json
 {
-  "from": "warehouse-orders:main@snapshot:12345",
+  "from": "warehouse-orders:main@snapshot:5648190075564901028",
   "select": ["?orderId", "?total"],
   "where": [
     { "@id": "?order", "ex:orderId": "?orderId" },
@@ -390,15 +792,48 @@ Query historical Iceberg snapshots:
 }
 ```
 
-Or by timestamp:
-
 ```json
 {
-  "from": "warehouse-orders:main@timestamp:2024-01-01T00:00:00Z",
+  "from": "warehouse-orders:main@time:2024-01-01T00:00:00Z",
   "select": ["?orderId", "?total"],
   "where": [...]
 }
 ```
+
+The same selectors work in SPARQL `FROM <warehouse-orders:main@time:...>` and in
+the Rust API as `fluree.graph_at(alias, TimeSpec::AtSnapshot(id))` /
+`TimeSpec::AtTime(iso)`. Aggregates, including the manifest-backed `COUNT`
+shortcut, answer from the selected snapshot, so a count and a row scan in one
+query never disagree. Columns are resolved against the schema **as of that
+snapshot** (Iceberg reads Parquet by field id); the R2RML mapping applied is
+always the source's current mapping.
+
+A selection that no retained snapshot can satisfy is an **error**, never a
+fallback to the current or oldest snapshot:
+
+- `@snapshot:` with an id the table no longer has (expired by snapshot
+  retention, or never existed) → `snapshot <id> not found for table '...'`.
+- `@time:` before the oldest retained snapshot → `no snapshot of table '...' at
+  or before <requested>; the oldest retained snapshot is <time>`.
+- Either selector on a table that has never committed (no snapshots yet) →
+  the same errors, saying the table has no snapshots. Unpinned, such a table
+  simply reads as empty.
+
+`@t:` and `@commit:` name Fluree ledger states and are rejected on a graph
+source; `@snapshot:` is rejected on a native ledger. Only table sources with
+retained history can be pinned — Iceberg and [Delta](delta.md#time-travel): a
+SQL-backed R2RML source, a BM25 or vector index read their current state and
+reject any time specification. Naming one source at
+two different states in one query — two different pins, or one reference
+pinned and another not, across `from` and `fromNamed` — is also rejected,
+because a pin applies to every read of that source in the query.
+
+Retention matters: Iceberg's `expire_snapshots` removes old snapshots, and a
+table whose history has been expired cannot answer for it. For a durable
+point-in-time copy, [materialize a native twin](#materializing-a-native-twin);
+its completion stamp records the exact snapshot each table was read at, and
+`@snapshot:` with that id re-reads the same state from the source while it is
+retained.
 
 ## Aggregations
 
@@ -436,6 +871,21 @@ Iceberg optimizations:
   - Column pruning (only read order_id, order_date)
 ```
 
+### Same-subject stars over several triples maps
+
+A star of predicates on one subject is read in one scan when a single
+triples map provides every member. Where a second map over the same table
+and subject template provides only some of them and mints each the same way
+(the same column under the same predicate — the one-map-per-class idiom,
+where a `Customer` map and a `CustomerCountry` map both carry `ex:label`
+from `name`), the star stays one scan: that map adds no triple the fused
+scan misses, and an RDF graph holds a triple once. A map deriving a member
+differently (another column, a datatype, a reference) is a real second
+provider: the star is then read as one scan per member and joined on the
+subject, so every provider's rows come back. Two maps minting a pattern's
+triples alike are read once at the scan as well; when the pattern projects
+the type (`?s a ?t`), both are kept unless their class sets are equal.
+
 ### Best Practices
 
 1. **Partition by Common Filters:**
@@ -471,6 +921,8 @@ Iceberg optimizations:
 ## Schema Evolution
 
 Iceberg supports schema evolution via metadata updates. If a schema change renames/removes columns used by your R2RML mapping, update the mapping accordingly.
+
+A time-pinned read always uses the current mapping. Columns are matched by Iceberg field id, so a column renamed since the pinned snapshot still resolves under its new name, and a column added since reads as absent, as it was at that snapshot.
 
 ## Configuration Options
 
@@ -539,11 +991,146 @@ GROUP BY ?region ?category
 ORDER BY DESC(?total)
 ```
 
+## Materializing a Native Twin
+
+Querying a virtual Iceberg source pays catalog + S3 latency on every query. For a stable, low-latency copy, **materialize** it into a native ledger — a *twin* — with [`fluree materialize`](../cli/materialize.md):
+
+```bash
+fluree materialize warehouse-orders:main --output ledger --verify full
+```
+
+A twin is an ordinary, fully-indexed Fluree ledger holding a point-in-time snapshot of the virtual source, so it supports the full query surface (SPARQL / JSON-LD / Cypher), time travel, branching, policy, and `.flpack` export — with none of the per-query catalog/S3 round-trips.
+
+### The completion stamp and watermark
+
+The build writes a **completion stamp** into the twin's *final* commit (in the `https://ns.flur.ee/materialize#` namespace): `builderVersion`, `mappingHash` (a SHA-256 of the R2RML mapping — a mapping change invalidates the twin), the `watermark` (the per-table pinned Iceberg snapshot vector captured at build time, what a delta-sync reads), and a `sampleSeed`. The contract is: **a twin is valid iff a head-walk finds this stamp** — a build that dies mid-way leaves the head commit unstamped, so a partial twin is detectable. A **pin-all pre-pass** pins every table's current snapshot up front so the watermark reflects one narrow window rather than the whole build duration.
+
+### Verification modes
+
+Before a twin is announced, a memory-bounded parity gate re-checks it against the source:
+
+- **`quick`** (default) — per-class counts + a seeded 3-subjects-per-class sample against the build's *own* enumerator. A **shared oracle**: catches ingest/index corruption, but not enumerator-logic bugs (they appear identically on both sides).
+- **`full`** — a whole-twin triple diff (the twin streamed in a single linear pass over the binary index), external-sorted and diffed under a bounded working set.
+
+A failed gate drops the twin so nothing unverified stays announced. See the [`fluree materialize`](../cli/materialize.md) reference for the full flow, the machine-safety posture, and `--tmp-dir`.
+
+## Access policy
+
+Fluree's view policy applies to an Iceberg source the same way it applies to a
+native ledger, with one difference in what a policy can express. A request that
+carries policy inputs (`identity`, `policy-class`, an inline `policy`, or
+`default-allow`) is enforced inside the R2RML scan: subject classes come from
+the mapping (`rr:class`, plus any column-derived `rdf:type`), targets are
+matched on the row's IRIs, and a triples map whose required predicates are all
+hidden is skipped before its table is read. In the common case a decision is
+made once per `(triples map, predicate)`, so enforcement is cheaper than the
+per-flake filter a native scan pays.
+
+Supported, with native parity (the test suite checks each shape against a
+native twin of the same data):
+
+- `f:onProperty`, `f:onClass`, `f:onSubject`, and untargeted policies with a
+  static `f:allow`, including `f:required` gates and `default-allow`.
+- `f:onClass` / `f:onProperty` expansion through `rdfs:subClassOf` /
+  `rdfs:subPropertyOf`, when the source references a model ledger (below).
+- Every pattern shape the scan produces: fixed predicates, same-subject stars,
+  constant objects, class scans, projected `rdf:type`, wildcards (`?s ?p ?o`),
+  aggregates, and `GRAPH` blocks in a dataset query.
+
+Not supported: **`f:query`** policies. A virtual source has no graph to run the
+policy query against, so a targeted `f:query` evaluates as "no rows" and
+denies its targets — it never falls open. Relationship gates that join the
+requesting identity to the row (`fluree model access … --connected`) fall in
+this category. Write verbs do not apply; the source is read-only.
+
+### Where policies live: the model ledger
+
+A virtual source has no ledger of its own, so its stored policies, the
+identities' `f:policyClass` assignments, and the class hierarchy are held in a
+**model ledger** the source references at registration:
+
+```bash
+fluree create governance
+fluree model class define governance --class https://example.org/Person --subclass-of https://example.org/Agent
+fluree model access enable governance --profile read --class https://example.org/Agent
+fluree iceberg map orders --mode direct --table-location s3://… --r2rml orders.ttl \
+  --model governance:main
+```
+
+The reference (`model` in the HTTP body and stored config, `--model` on the
+CLI) makes the model ledger's default graph the source's `f:policySource` and
+`f:schemaSource`, resolved through the same cross-ledger mechanism a native
+ledger's config uses. Rule selection follows the cross-ledger contract: an
+explicit `policy-class` on the request (or token) selects rules; a bare
+`identity` is looked up in the model ledger for its `f:policyClass`; an
+anonymous request carrying `default-allow` applies the baseline
+`f:AccessPolicy` rules. A request with no policy inputs at all is governed by
+the model's own rules, as a native ledger's configured `f:policyDefaults`
+govern a bare read of it; a source registered without `--default-allow` is
+fail-closed, so such a request sees nothing. Inline `opts.policy` works with
+or without a model.
+
+The model is validated when the source is registered: it must be an existing
+native ledger (not a graph source), so a mistyped name fails at `map` time
+rather than as a 502 on every governed query. Registration also reports every
+policy in the model that uses `f:query` — in the CLI output, and as
+`model_warnings` in the HTTP response — since the source will deny their
+targets.
+
+### Sources without a model under authentication
+
+On a server with data auth enabled every request carries an identity, which is
+a policy input, so a source with **no** model and no matching policy resolves
+to nothing: `default-allow` is fail-closed when unset. To keep such a source
+readable without attaching a model, register it with `--default-allow true`
+(`default_allow` in the HTTP body and stored config). It plays the same role as
+a native ledger's `f:defaultAllow` config: it fills a request that left
+`default-allow` unset, and an explicit request value still wins.
+
+### Seeing what policy did
+
+With `"meta": {"policy": true}` (or the `fluree-meta` header) the tracked
+response's `policy_enforcement` carries `unevaluable_policies`: the ids of
+`f:query` policies the source could not evaluate and therefore denied. That is
+how to tell a fail-closed policy from an empty table. The server also logs a
+warning the first time each such policy is met, and a debug line for every
+triples map a scan skipped because its predicates were hidden.
+
 ## Limitations
 
 1. **Read-Only:** Iceberg graph sources are read-only (no writes via Fluree)
 2. **Complex Joins:** Large joins between Fluree and Iceberg may be slow
 3. **No Full-Text Search:** Use Fluree's BM25 for text search
+4. **Merge-on-read deletes are not yet applied (fail-closed):** Fluree reads the
+   live data files of a snapshot but does **not** apply Iceberg *merge-on-read*
+   position/equality delete files. To avoid silently returning deleted rows (or
+   over-counting `COUNT(*)`/row totals), a query over a snapshot that carries
+   delete files is **refused** with a `Merge-on-read deletes not applied` error.
+   Copy-on-write deletes (the Snowflake-managed v2 default today) rewrite data
+   files and are handled correctly — this only affects tables written with
+   merge-on-read semantics (e.g. Athena `DELETE`, Flink/CDC upserts, Snowflake v3
+   deletion vectors, or Snowflake v2 once `ENABLE_ICEBERG_MERGE_ON_READ` is on).
+   See the switch below to override.
+5. **No transitive traversal (fail-closed):** Property-path quantifiers (`p+`,
+   `p*`, `p?`, and quantified combinations like `^p+` or `(a|b)+`),
+   `shortestPath`, and subqueries need a native index to walk and cannot be
+   evaluated over an Iceberg source. A query using one is **refused** with HTTP
+   400 `err:db/InvalidQuery` naming the pattern, rather than returning the empty
+   result it would otherwise produce as a success. Fixed-length patterns (`p`,
+   `p/p`, …) and unquantified `a|b` / `^p` scan the tables normally. Bound the
+   traversal to a known depth (see [Graph Sources Overview → Query Patterns a
+   Graph Source Cannot
+   Evaluate](overview.md#query-patterns-a-graph-source-cannot-evaluate)) or
+   [materialize a native twin](#materializing-a-native-twin), which evaluates
+   all of them.
+
+### Environment switches
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `FLUREE_ICEBERG_ALLOW_MOR_DELETES` | off | When truthy (`1`/`true`/`yes`/`on`), **disables** the fail-closed merge-on-read guard: delete files are ignored and the read proceeds. **Results may include deleted rows and row counts may be over-counted.** A one-time warning is logged per table. |
+| `FLUREE_ICEBERG_PREDICATE_PUSHDOWN` | on | When falsy (`0`/`false`/`off`), disables row-group / row-level predicate pushdown during Parquet reads. |
+| `FLUREE_ICEBERG_INFO_COUNT_BUDGET_MS` | `10000` | Wall-clock budget for the virtual `/info` row-count fetch; `0` returns structure only. |
 
 ## Troubleshooting
 

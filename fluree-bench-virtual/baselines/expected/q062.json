@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "query_id": "q062",
+  "result_hash": "3f57d5907b4c6700154a20f63159446de0899f91b92976894811c12629bbc9f0",
+  "rows": 500,
+  "head_rows": [
+    "Store 1\u001f1440649",
+    "Store 10\u001f1509696",
+    "Store 100\u001f1489958",
+    "Store 101\u001f1502303",
+    "Store 102\u001f1450332",
+    "Store 103\u001f1478732",
+    "Store 104\u001f1454086",
+    "Store 105\u001f1422114",
+    "Store 106\u001f1488270",
+    "Store 107\u001f1516453",
+    "Store 108\u001f1597270",
+    "Store 109\u001f1497157",
+    "Store 11\u001f1438018",
+    "Store 110\u001f1521409",
+    "Store 111\u001f1552362",
+    "Store 112\u001f1404791",
+    "Store 113\u001f1430985",
+    "Store 114\u001f1506280",
+    "Store 115\u001f1603898",
+    "Store 116\u001f1585195"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KXR4D5S2VWQXKDPS98KBYZC9",
+    "commit": "ac562d8a4"
+  }
+}

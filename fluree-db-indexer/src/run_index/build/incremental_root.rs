@@ -24,13 +24,22 @@ pub struct IncrementalRootBuilder {
 }
 
 impl IncrementalRootBuilder {
-    /// Create a builder from an existing root (cloned).
-    pub fn from_old_root(root: IndexRoot) -> Self {
+    /// Create a builder from an existing root (cloned), re-stamped to `ledger_id`.
+    ///
+    /// The base root may carry a *different* ledger_id than the ledger being
+    /// indexed: `create_branch` copies the parent's root by CID, and pack
+    /// import/clone can restore a root under a new name. Every root this
+    /// builder publishes must name the ledger it indexes, or a cached
+    /// `LedgerState` for that ledger rejects it (`LedgerIdMismatch`) on refresh.
+    pub fn from_old_root(root: IndexRoot, ledger_id: &str) -> Self {
         // This flag is only valid for roots produced by the bulk import pipeline.
         // Incremental dictionary updates append new string IDs above the watermark,
         // which breaks lex-order preservation. Clear on first post-import write.
         let mut root = root;
         root.lex_sorted_string_ids = false;
+        if root.ledger_id != ledger_id {
+            root.ledger_id = ledger_id.to_string();
+        }
         Self {
             root,
             replaced_cids: Vec::new(),
@@ -196,7 +205,15 @@ impl IncrementalRootBuilder {
     }
 
     /// Update HLL sketch ref.
+    ///
+    /// **GC note**: Records the old sketch CID as replaced unless the new
+    /// root still references it.
     pub fn set_sketch_ref(&mut self, cid: Option<ContentId>) {
+        if let Some(old) = self.root.sketch_ref.take() {
+            if cid.as_ref() != Some(&old) {
+                self.replaced_cids.push(old);
+            }
+        }
         self.root.sketch_ref = cid;
     }
 
@@ -266,6 +283,17 @@ impl IncrementalRootBuilder {
             self.root.had_annotation_arena = true;
         }
         self.root.annotation_index = new_index;
+    }
+
+    /// Fold this pass's list-row observation into the sticky
+    /// `has_list_meta` state. Seeing a list row is conclusive (`Some(true)`)
+    /// regardless of the inherited state; seeing none only preserves what
+    /// the base root already knew — an untracked legacy root stays
+    /// untracked until a full rebuild observes every row.
+    pub fn note_list_meta(&mut self, saw_list_meta: bool) {
+        if saw_list_meta {
+            self.root.has_list_meta = Some(true);
+        }
     }
 
     /// Add to cumulative commit stats.
@@ -373,6 +401,7 @@ mod tests {
             has_annotations: false,
             annotation_index: None,
             had_annotation_arena: false,
+            has_list_meta: None,
             o_type_table: IndexRoot::build_o_type_table(&[], &[]),
             ns_split_mode: NsSplitMode::default(),
         }
@@ -400,7 +429,7 @@ mod tests {
 
         let mut root = minimal_root();
         root.annotation_index = Some(arena(fwd.clone(), rev.clone()));
-        let mut b = IncrementalRootBuilder::from_old_root(root);
+        let mut b = IncrementalRootBuilder::from_old_root(root, "test");
         // Same branches + same leaves (byte-identical re-seal).
         b.set_annotation_index(
             Some(arena(fwd.clone(), rev.clone())),
@@ -417,6 +446,41 @@ mod tests {
     }
 
     #[test]
+    fn set_sketch_ref_retires_the_superseded_sketch() {
+        let old = ContentId::new(ContentKind::StatsSketch, b"sketch-t1");
+        let new = ContentId::new(ContentKind::StatsSketch, b"sketch-t2");
+        let mut root = minimal_root();
+        root.sketch_ref = Some(old.clone());
+        let mut b = IncrementalRootBuilder::from_old_root(root, "test");
+        b.set_sketch_ref(Some(new.clone()));
+        let (root, garbage) = b.build();
+        assert_eq!(root.sketch_ref, Some(new));
+        assert_eq!(garbage, vec![old]);
+    }
+
+    #[test]
+    fn set_sketch_ref_keeps_an_unchanged_sketch_out_of_garbage() {
+        let same = ContentId::new(ContentKind::StatsSketch, b"sketch");
+        let mut root = minimal_root();
+        root.sketch_ref = Some(same.clone());
+        let mut b = IncrementalRootBuilder::from_old_root(root, "test");
+        b.set_sketch_ref(Some(same.clone()));
+        let (root, garbage) = b.build();
+        assert_eq!(root.sketch_ref, Some(same));
+        assert!(garbage.is_empty(), "live sketch must not be garbage");
+    }
+
+    #[test]
+    fn from_old_root_restamps_foreign_ledger_id() {
+        // A branch's base root is the parent's (copied by CID) and names the
+        // parent; the root we publish for the branch must name the branch.
+        let mut root = minimal_root();
+        root.ledger_id = "db:main".to_string();
+        let (root, _) = IncrementalRootBuilder::from_old_root(root, "db:dev").build();
+        assert_eq!(root.ledger_id, "db:dev");
+    }
+
+    #[test]
     fn set_annotation_index_retires_changed_arena_cids() {
         // Control: when the arena genuinely changes, the old now-unused
         // CIDs ARE retired to garbage, but CIDs the new arena still
@@ -427,7 +491,7 @@ mod tests {
 
         let mut root = minimal_root();
         root.annotation_index = Some(arena(old_fwd.clone(), rev.clone()));
-        let mut b = IncrementalRootBuilder::from_old_root(root);
+        let mut b = IncrementalRootBuilder::from_old_root(root, "test");
         let new_fwd = cid(b"fwd-new");
         b.set_annotation_index(
             Some(arena(new_fwd.clone(), rev.clone())),

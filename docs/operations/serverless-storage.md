@@ -4,6 +4,10 @@ This guide covers storage placement for cloud and serverless deployments, especi
 AWS Lambda-style architectures where commit writes, background indexing, and query
 execution may run in separate warm containers.
 
+For how serverless workers fit with query peers, transaction availability, and
+multi-cloud recovery, see
+[Scaling and resilience architecture](scaling-and-resilience.md).
+
 ## Short Recommendation
 
 Use **Standard S3 for commits**. Commits are the durable source of truth and should

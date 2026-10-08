@@ -41,7 +41,7 @@ tokio = { workspace = true, features = ["sync", "time"] }
 futures.workspace = true
 
 # HTTP client for REST catalog
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { workspace = true, features = ["form", "query"] }
 
 # Serialization
 serde = { workspace = true, features = ["derive"] }
@@ -93,11 +93,12 @@ hyper-rustls = { workspace = true, optional = true }
 # Optional: Arrow columnar reader (the single Iceberg decode path, gated by the
 # `aws` feature). `default-features = false` drops the unused csv/json readers
 # (compile-time only; LTO already strips them from the binary).
-arrow = { version = "54", default-features = false, optional = true }
+arrow = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 wiremock = "0.6"
+http.workspace = true
 
 [[example]]
 name = "read_rest_catalog"
@@ -105,6 +106,12 @@ required-features = ["aws"]
 
 [[example]]
 name = "read_local_iceberg"
+required-features = ["aws"]
+
+# smoke_minio uses the aws-gated S3IcebergStorage, so it must not be built under
+# default features (bare `cargo test -p fluree-db-iceberg` compiles examples).
+[[example]]
+name = "smoke_minio"
 required-features = ["aws"]
 
 [[example]]

@@ -77,7 +77,7 @@ Supported:
   - `defaults.indexing.reindexMinBytes` / `reindexMaxBytes` are applied as the default `IndexConfig` for writes
   - `defaults.indexing.indexingEnabled=false` suppresses background index triggers
   - `defaults.indexing.maxOldIndexes` sets the maximum number of old index versions to retain before GC (default: 5)
-  - `defaults.indexing.gcMinTimeMins` sets the minimum age in minutes before an index can be garbage collected (default: 30)
+  - `defaults.indexing.gcMinTimeMins` sets the minimum age in minutes before an index can be garbage collected (default: 15)
 
 ### addressIdentifiers (read routing)
 
@@ -85,14 +85,21 @@ The `addressIdentifiers` field maps identifier strings to storage backends, enab
 
 ```json
 {
-  "@id": "connection",
-  "@type": "Connection",
-  "indexStorage": {"@id": "indexS3"},
-  "commitStorage": {"@id": "commitS3"},
-  "addressIdentifiers": {
-    "commit-storage": {"@id": "commitS3"},
-    "index-storage": {"@id": "indexS3"}
-  }
+  "@context": {"@vocab": "https://ns.flur.ee/system#"},
+  "@graph": [
+    {"@id": "indexS3", "@type": "Storage", "s3Bucket": "my-index-bucket"},
+    {"@id": "commitS3", "@type": "Storage", "s3Bucket": "my-commit-bucket"},
+    {
+      "@id": "connection",
+      "@type": "Connection",
+      "indexStorage": {"@id": "indexS3"},
+      "commitStorage": {"@id": "commitS3"},
+      "addressIdentifiers": {
+        "commit-storage": {"@id": "commitS3"},
+        "index-storage": {"@id": "indexS3"}
+      }
+    }
+  ]
 }
 ```
 
@@ -118,32 +125,71 @@ Not yet supported (parsed/ignored or absent):
 { "@id": "mem", "@type": "Storage" }
 ```
 
+Supported:
+- `AES256Key` (supports `ConfigurationValue`) — encrypts the in-memory blobs;
+  mainly useful for testing an encrypted configuration without a filesystem
+- `AES256Keys` + `AES256CurrentKey` — a rotation key set; see
+  [Key Rotation](../security/encryption.md#key-rotation)
+
 ### File storage (requires `native`)
 
 Supported:
 - `filePath`
 - `AES256Key` (supports `ConfigurationValue`)
+- `AES256Keys` (list of `{keyId, AES256Key}` nodes) + `AES256CurrentKey` — a
+  rotation key set; mutually exclusive with `AES256Key`. See
+  [Key Rotation](../security/encryption.md#key-rotation)
+- `durability` — `"wal"` (default), `"sync"` or `"page-cache"`
 
 Notes:
-- Rust expects `AES256Key` to be **base64-encoded** and decode to exactly 32 bytes.
+- Rust expects `AES256Key` to be **base64-encoded** (standard or URL-safe) and decode to
+  exactly 32 bytes.
 - This encrypts the **index/commit blobs** written via the storage layer. The file-based
   nameservice remains plaintext, matching the existing builder behavior.
+- A key that is configured but does not resolve (an `envVar` that is unset or empty, with
+  no `defaultVal`) is a config error: the storage is never started unencrypted by accident.
+- Put the key on the `indexStorage` node. With a separate `commitStorage`, the
+  `indexStorage` key encrypts both; a `commitStorage` node with a different key is rejected.
 
 ```json
 {
   "@id": "fileStorage",
   "@type": "Storage",
   "filePath": "/var/lib/fluree",
-  "AES256Key": { "envVar": "FLUREE_ENCRYPTION_KEY" }
+  "AES256Key": { "envVar": "FLUREE_ENCRYPTION_KEY" },
+  "durability": "sync"
 }
 ```
+
+#### durability
+
+Filesystem syncing (FSYNC) is on by default. Leave this property unset for the
+default behavior, or use `"page-cache"` to turn syncing off in a storage config.
+
+| Value | Meaning |
+|---|---|
+| `wal` (default) | FSYNC on. Acknowledged commits survive process crashes and power loss. |
+| `sync` | FSYNC on, flushing each file individually. Acknowledged commits survive process crashes and power loss. |
+| `page-cache` | FSYNC off. Writes reach the OS page cache, but a power loss or kernel panic can lose acknowledged commits. |
+
+Writes remain atomic with every setting. An unrecognized value is rejected at
+config load.
+
+To turn FSYNC off without editing the config, set `FLUREE_STORAGE_FSYNC=0` before
+starting Fluree. Set `FLUREE_STORAGE_FSYNC=1` to turn it back on. This environment
+variable overrides the `durability` property. See
+[Storage durability](../operations/storage.md#durability).
 
 ### S3 storage (requires `aws`)
 
 Supported fields (parsed and **applied** by Rust):
 - `s3Bucket`
 - `s3Prefix`
+- `AES256Key` (supports `ConfigurationValue`; see the file storage notes — the
+  nameservice, whether DynamoDB or storage-backed, stays plaintext)
+- `AES256Keys` + `AES256CurrentKey` — a rotation key set, as for file storage
 - `s3Endpoint` (optional; recommended **only** for LocalStack/MinIO/custom endpoints)
+- `s3ForcePathStyle` (optional; `true` for MinIO-class endpoints without bucket-subdomain DNS)
 - `s3ReadTimeoutMs`, `s3WriteTimeoutMs`, `s3ListTimeoutMs`
   - Rust applies a single **operation timeout** of `max(read, write, list)`
 - `s3MaxRetries`, `s3RetryBaseDelayMs`, `s3RetryMaxDelayMs`
@@ -162,7 +208,7 @@ Supported fields (parsed and **applied** by Rust):
 }
 ```
 
-#### LocalStack / MinIO (custom endpoint)
+#### LocalStack (custom endpoint)
 
 ```json
 {
@@ -173,6 +219,26 @@ Supported fields (parsed and **applied** by Rust):
   "s3Prefix": "fluree/"
 }
 ```
+
+#### MinIO (custom endpoint + path-style)
+
+```json
+{
+  "@id": "s3",
+  "@type": "Storage",
+  "s3Bucket": "fluree",
+  "s3Endpoint": "http://minio:9000",
+  "s3ForcePathStyle": true
+}
+```
+
+`s3ForcePathStyle` addresses the bucket in the URL path
+(`http://minio:9000/fluree/key`) instead of as a virtual host
+(`http://fluree.minio:9000/key`). An endpoint override alone is not enough: the
+SDK still emits virtual-hosted URLs, and a plain MinIO — anything without
+wildcard DNS for bucket subdomains in front of it — rejects them. LocalStack
+resolves both forms. Leave it unset for real AWS. The builder equivalent is
+`FlureeBuilder::s3(bucket, endpoint).s3_force_path_style(true)`.
 
 #### S3 Express One Zone
 
@@ -196,7 +262,8 @@ endpoints; for Express buckets, use `FlureeBuilder::from_json_ld()` with a confi
 Guidance:
 - **Standard S3 in AWS**: omit `s3Endpoint` (let the SDK pick defaults)
 - **Express One Zone**: omit `s3Endpoint`
-- **LocalStack/MinIO/custom**: set `s3Endpoint`
+- **LocalStack/custom**: set `s3Endpoint`
+- **MinIO**: set `s3Endpoint` and `s3ForcePathStyle: true`
 
 For serverless index-storage tradeoffs, including Standard S3 vs S3 Express One
 Zone benchmark ranges, see
@@ -218,6 +285,12 @@ Internally, Rust routes:
 - `.../commit/...` and `.../txn/...` → commit storage
 - everything else → index storage
 
+**S3 only today.** The routing itself (`TieredStorage`) is backend-agnostic, but
+it is constructed only on the S3 path. A file-storage connection builds a single
+backend from `indexStorage` and ignores `commitStorage`, so on file storage the
+commit/index split is expressed by [`durability`](#durability) within one backend
+rather than by two storage nodes.
+
 ```json
 {
   "@context": {"@base": "https://ns.flur.ee/config/connection/", "@vocab": "https://ns.flur.ee/system#"},
@@ -236,37 +309,11 @@ Internally, Rust routes:
 }
 ```
 
-### IPFS storage (requires `ipfs`)
+### IPFS storage (not available here)
 
-Supported:
-- `ipfsApiUrl` (default `http://127.0.0.1:5001`): Kubo HTTP RPC API base URL
-- `ipfsPinOnPut` (default `true`): pin blocks after writing
-
-```json
-{
-  "@id": "ipfsStorage",
-  "@type": "Storage",
-  "ipfsApiUrl": "http://127.0.0.1:5001",
-  "ipfsPinOnPut": true
-}
-```
-
-With env var indirection:
-
-```json
-{
-  "@id": "ipfsStorage",
-  "@type": "Storage",
-  "ipfsApiUrl": { "envVar": "FLUREE_IPFS_API_URL", "defaultVal": "http://127.0.0.1:5001" },
-  "ipfsPinOnPut": true
-}
-```
-
-Notes:
-- Requires a running Kubo node at the specified URL
-- Fluree's CIDs (SHA-256 + private-use multicodec) are stored directly into IPFS
-- No encryption support (`AES256Key` is not applicable)
-- See [IPFS Storage Guide](../operations/ipfs-storage.md) for Kubo setup and operational details
+A connection config cannot select IPFS storage: a storage node with `ipfsApiUrl` is rejected
+with an error. IPFS storage is experimental and available only through the Rust API
+(`FlureeBuilder::build_ipfs`); see the [IPFS Storage Guide](../operations/ipfs-storage.md).
 
 ## Publisher (nameservice) node fields
 

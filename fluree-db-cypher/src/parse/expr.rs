@@ -118,6 +118,12 @@ fn parse_string_pred(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
             let span = left.span().union(right.span());
             Ok(Expr::Contains(Box::new(left), Box::new(right), span))
         }
+        TokenKind::RegexEq => {
+            s.advance();
+            let right = parse_null_pred(s)?;
+            let span = left.span().union(right.span());
+            Ok(Expr::RegexMatch(Box::new(left), Box::new(right), span))
+        }
         TokenKind::In => {
             s.advance();
             let right = parse_null_pred(s)?;
@@ -185,7 +191,16 @@ fn parse_unary(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
     let result = if s.eat(&TokenKind::Minus).is_some() {
         parse_unary(s).map(|e| {
             let span = start.union(e.span());
-            Expr::UnaryOp(UnaryOp::Neg, Box::new(e), span)
+            // Fold a negated numeric literal into a literal so `-1` is a
+            // plain constant wherever a literal is required (inline pattern
+            // properties, SET/CREATE values). `- -1` folds twice to `1`.
+            match e {
+                Expr::Lit(Literal::Integer(n, _)) if n.checked_neg().is_some() => {
+                    Expr::Lit(Literal::Integer(-n, span))
+                }
+                Expr::Lit(Literal::Float(f, _)) => Expr::Lit(Literal::Float(-f, span)),
+                other => Expr::UnaryOp(UnaryOp::Neg, Box::new(other), span),
+            }
         })
     } else {
         parse_power(s)
@@ -311,7 +326,7 @@ fn parse_primary(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
             let end = s.expect(&TokenKind::RBracket)?;
             Ok(Expr::List(items, start.union(end)))
         }
-        TokenKind::All => {
+        TokenKind::All if matches!(s.peek_at(1), TokenKind::LParen) => {
             // `all(var IN list WHERE pred)` — the only keyword-tokenized list
             // predicate (any/none/single are identifiers, handled in calls).
             s.advance();
@@ -324,7 +339,7 @@ fn parse_primary(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
             Ok(Expr::Map(map.entries, map.span))
         }
         TokenKind::Case => parse_case(s),
-        TokenKind::Exists => {
+        TokenKind::Exists if matches!(s.peek_at(1), TokenKind::LBrace) => {
             s.advance();
             s.expect(&TokenKind::LBrace)?;
             // Accept both the bare-pattern form `EXISTS { (a)-[:T]-(b) }` and the
@@ -340,7 +355,7 @@ fn parse_primary(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
             let end = s.expect(&TokenKind::RBrace)?;
             Ok(Expr::Exists(Box::new(pat), inner_where, start.union(end)))
         }
-        TokenKind::Count => {
+        TokenKind::Count if matches!(s.peek_at(1), TokenKind::LParen) => {
             // count(*) | count(DISTINCT x) | count(x)
             s.advance();
             s.expect(&TokenKind::LParen)?;
@@ -360,10 +375,24 @@ fn parse_primary(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
             }))
         }
         TokenKind::Ident(_) => parse_var_or_call(s),
-        other => Err(s.error(
-            DiagCode::UnexpectedToken,
-            format!("unexpected `{other}` in expression"),
-        )),
+        // A keyword token in operand position that no earlier arm claimed is a
+        // keyword used as a variable name (`RETURN … AS end … RETURN end`). The
+        // `count`/`exists`/`all` arms above already fell through here when not
+        // followed by their delimiter. Structural keywords never reach this
+        // point in a well-formed query — clause parsers consume them first — so
+        // treating a stray one as an (ultimately unbound) variable only shifts
+        // its diagnostic from parse-time to lowering, which is acceptable.
+        _ => {
+            if let Some(name) = s.peek_ident_text() {
+                s.advance();
+                Ok(Expr::Var(Variable { name, span: start }))
+            } else {
+                Err(s.error(
+                    DiagCode::UnexpectedToken,
+                    format!("unexpected `{}` in expression", s.peek_kind()),
+                ))
+            }
+        }
     }
 }
 

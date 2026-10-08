@@ -1,14 +1,5 @@
 //! Application state management
 //!
-//! # Thread Safety Note
-//!
-//! The HTTP server requires `Send + Sync` for state shared across handlers.
-//! This server currently only supports **file-based storage** for production use.
-//!
-//! Memory storage support would require either:
-//! - A single-threaded runtime with `LocalSet`
-//! - Or refactoring `MemoryNameService` to use `Arc<RwLock<...>>`
-//!
 //! # Storage Access Modes
 //!
 //! Peers can operate in two storage access modes:
@@ -22,7 +13,6 @@ use crate::telemetry::TelemetryConfig;
 use dashmap::DashMap;
 use fluree_db_api::{Fluree, FlureeBuilder, IndexConfig, NameServiceMode};
 use fluree_db_consensus::{CachingCommitter, SubmittingCommitter};
-use fluree_db_core::ledger_id::normalize_ledger_id;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -87,7 +77,7 @@ pub struct AppState {
     /// This gates optional DynamoDB nameservice checks on long-running query
     /// servers. It stores attempts, not successes, to prevent bursty failures
     /// from stampeding the nameservice.
-    query_refresh_last_checked: DashMap<String, Instant>,
+    query_refresh_last_checked: DashMap<fluree_db_api::LedgerId, Instant>,
 
     /// Serving posture memo, keyed by ledger id with value `(t, posture)`.
     ///
@@ -101,6 +91,16 @@ pub struct AppState {
     /// Handle for the background leaflet cache stats logger task.
     /// Aborted on drop so the `Arc<LeafletCache>` doesn't outlive the server.
     cache_stats_handle: Option<tokio::task::JoinHandle<()>>,
+
+    /// Handle to the R2RML/Iceberg materialization tracking worker for
+    /// registering `source → target` jobs. `None` on peer-mode nodes (which
+    /// forward writes) or when the worker failed to start.
+    #[cfg(feature = "iceberg")]
+    pub materialize_worker: Option<fluree_db_api::MaterializeWorkerHandle>,
+
+    /// Join handle for the materialization worker task; aborted on drop.
+    #[cfg(feature = "iceberg")]
+    materialize_worker_task: Option<tokio::task::JoinHandle<()>>,
 
     /// Registry of in-flight negotiated-upload import jobs (reference impl of
     /// the presigned `.flpack` upload flow). Empty/unused unless
@@ -200,7 +200,8 @@ impl AppState {
         config.validate().map_err(|e| {
             fluree_db_api::ApiError::internal(format!("Invalid configuration: {e}"))
         })?;
-        let (fluree, cache_stats_handle) = build_default_fluree(&config).await?;
+        // No external event bus to inject here — Fluree allocates its own.
+        let (fluree, cache_stats_handle) = build_default_fluree(&config, None).await?;
         Self::with_fluree(config, telemetry_config, fluree, cache_stats_handle).await
     }
 
@@ -270,6 +271,29 @@ impl AppState {
         #[cfg(feature = "aws")]
         let storage_vend_scope = resolve_storage_vend_scope(&config);
 
+        // Spawn the R2RML/Iceberg materialization tracking worker on write
+        // nodes that index locally. Peers forward writes elsewhere, so they
+        // don't run it. Nodes with `indexing_enabled = false` (external-indexer
+        // mode) don't either: the materializer's chunked commits rely on the
+        // LOCAL indexer draining novelty between chunks (see the txn-budget
+        // comment in `r2rml_materialize.rs`) — with `.without_indexing()`
+        // nothing drains, novelty only grows, and any sync bigger than the
+        // ceiling parks on backpressure until it fails. `POST /iceberg/track`
+        // on such a node returns the "worker is not running" error. (In Raft
+        // mode the worker currently runs on every qualifying node and writes
+        // directly via `Fluree::upsert`; gating it to the leader is a follow-up
+        // — single-node and peer deployments are correct today.)
+        #[cfg(feature = "iceberg")]
+        let (materialize_worker, materialize_worker_task) =
+            if config.server_role != ServerRole::Peer && config.indexing_enabled {
+                let worker = fluree_db_api::MaterializeTrackingWorker::new(Arc::clone(&fluree));
+                let handle = worker.handle();
+                let task = tokio::spawn(worker.run());
+                (Some(handle), Some(task))
+            } else {
+                (None, None)
+            };
+
         Ok(Self {
             fluree,
             config,
@@ -288,6 +312,10 @@ impl AppState {
             query_refresh_last_checked: DashMap::new(),
             serving_posture_cache: DashMap::new(),
             cache_stats_handle: Some(cache_stats_handle),
+            #[cfg(feature = "iceberg")]
+            materialize_worker,
+            #[cfg(feature = "iceberg")]
+            materialize_worker_task,
             import_jobs: Arc::new(crate::import_jobs::ImportJobs::default()),
             #[cfg(feature = "aws")]
             storage_vend_scope,
@@ -304,7 +332,10 @@ impl AppState {
             return false;
         }
 
-        let canonical = normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
+        // An id that does not parse names no ledger to refresh.
+        let Ok(canonical) = fluree_db_api::LedgerId::parse(ledger_id) else {
+            return false;
+        };
         let now = Instant::now();
         let ttl = Duration::from_millis(self.config.query_refresh_ttl_ms);
 
@@ -330,9 +361,10 @@ impl AppState {
             return;
         }
 
-        let canonical = normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
-        self.query_refresh_last_checked
-            .insert(canonical, Instant::now());
+        if let Ok(canonical) = fluree_db_api::LedgerId::parse(ledger_id) {
+            self.query_refresh_last_checked
+                .insert(canonical, Instant::now());
+        }
     }
 
     /// Get server uptime in seconds
@@ -354,6 +386,10 @@ impl Drop for AppState {
         if let Some(handle) = self.cache_stats_handle.take() {
             handle.abort();
         }
+        #[cfg(feature = "iceberg")]
+        if let Some(task) = self.materialize_worker_task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -363,22 +399,43 @@ impl Drop for AppState {
 //
 // Two paths:
 //
-// - [`build_default_fluree`] — backend-implied nameservice (file /
-//   S3 / proxy). The convenience path for single-node and peer
+// - [`build_default_fluree`] — backend-implied nameservice (memory /
+//   file / S3 / proxy). The convenience path for single-node and peer
 //   deployments.
 // - [`build_fluree_with_nameservice`] — explicit nameservice, for
 //   the Raft startup path where every node's reads must observe
 //   replicated state. Requires direct (non-proxy) storage.
 
+/// Who owns the background indexer's catch-up sweeps for this build.
+///
+/// A process can run more than one `BackgroundIndexerWorker` against the same
+/// nameservice, and catch-up must have exactly one owner: the workers hold
+/// independent `states` maps, so `trigger_if_idle` cannot see the other's
+/// claim and both would queue and build the same ledger concurrently.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CatchupSweeps {
+    /// The worker this build spawns is the only one, and sweeps.
+    Owned,
+    /// Another worker in this process already sweeps this nameservice, so the
+    /// worker this build spawns must not. It stays a fully functional indexer
+    /// for explicit requests — see
+    /// [`FlureeBuilder::without_indexer_catchup_sweeps`](fluree_db_api::FlureeBuilder::without_indexer_catchup_sweeps).
+    Delegated,
+}
+
 /// Build the default `Fluree` instance from server config — picks
 /// proxy or direct mode based on `config.is_proxy_storage_mode()`.
+///
+/// `event_bus` is threaded into `FlureeBuilder::with_event_bus` when
+/// provided; `None` lets Fluree allocate its own bus.
 pub async fn build_default_fluree(
     config: &ServerConfig,
+    event_bus: Option<Arc<fluree_db_nameservice::LedgerEventBus>>,
 ) -> Result<(Arc<Fluree>, tokio::task::JoinHandle<()>), fluree_db_api::ApiError> {
     if config.is_proxy_storage_mode() {
         build_proxy_fluree(config)
     } else {
-        build_direct_fluree(config, None).await
+        build_direct_fluree(config, None, event_bus, CatchupSweeps::Owned, None).await
     }
 }
 
@@ -389,10 +446,17 @@ pub async fn build_default_fluree(
 ///
 /// Raft mode requires direct storage; passing a proxy-mode config
 /// here errors at validation time below.
+///
+/// `event_bus` is the raft integration's `LedgerEventBus`; passing
+/// it here unifies the emitter (state-machine adapter) and the
+/// subscribers (events endpoint, Fluree's own cache reconciler)
+/// onto the same bus.
 #[cfg(feature = "raft")]
 pub async fn build_fluree_with_nameservice(
     config: &ServerConfig,
     nameservice: fluree_db_api::NameServiceMode,
+    event_bus: Option<Arc<fluree_db_nameservice::LedgerEventBus>>,
+    node_id: u64,
 ) -> Result<(Arc<Fluree>, tokio::task::JoinHandle<()>), fluree_db_api::ApiError> {
     if config.is_proxy_storage_mode() {
         return Err(fluree_db_api::ApiError::config(
@@ -400,17 +464,38 @@ pub async fn build_fluree_with_nameservice(
              use direct storage (file or S3) instead",
         ));
     }
-    build_direct_fluree(config, Some(nameservice)).await
+    // Raft delegates catch-up to the leader-scope worker that
+    // `Server::run` spawns inside `leader_tasks` — the one wired to the
+    // consensus event bus, started and stopped with leadership. Indexing under
+    // raft is leader-only because publishing an index result proposes to the
+    // state machine, so a follower must not initiate builds, and the leader
+    // must not sweep from two workers at once.
+    build_direct_fluree(
+        config,
+        Some(nameservice),
+        event_bus,
+        CatchupSweeps::Delegated,
+        Some(format!("node-{node_id}")),
+    )
+    .await
 }
 
-/// Build a direct-storage `Fluree` (file, S3, DynamoDB, etc.) from
+/// Build a direct-storage `Fluree` (memory, file, S3, DynamoDB, etc.) from
 /// config. When `nameservice` is `Some`, it replaces the
-/// backend-implied nameservice.
+/// backend-implied nameservice. When `event_bus` is `Some`, it
+/// replaces Fluree's default per-instance bus.
+/// `wal_owner` names this process's WAL when the storage root is
+/// shared with other processes (a Raft cluster's payload store).
 async fn build_direct_fluree(
     config: &ServerConfig,
     nameservice: Option<fluree_db_api::NameServiceMode>,
+    event_bus: Option<Arc<fluree_db_nameservice::LedgerEventBus>>,
+    catchup_sweeps: CatchupSweeps,
+    wal_owner: Option<String>,
 ) -> Result<(Arc<Fluree>, tokio::task::JoinHandle<()>), fluree_db_api::ApiError> {
-    let mut builder = if let Some(ref path) = config.connection_config {
+    let mut builder = if config.memory {
+        FlureeBuilder::memory()
+    } else if let Some(ref path) = config.connection_config {
         // Connection config: build from JSON-LD (supports S3,
         // DynamoDB, split storage, etc.)
         let json_str = std::fs::read_to_string(path).map_err(|e| {
@@ -439,17 +524,39 @@ async fn build_direct_fluree(
     };
 
     // Server-level overrides take precedence over connection config defaults.
+    if let Some(owner) = wal_owner {
+        // Voters share one payload root, so each node journals it under a
+        // log of its own; an owned log flushes every payload before its
+        // reference can be proposed.
+        builder = builder.with_storage_wal_owner(owner);
+    }
     if let Some(max_mb) = config.cache_max_mb {
         builder = builder.cache_max_mb(max_mb);
     }
     if let Some(max_mb) = config.disk_cache_max_mb {
         builder = builder.disk_cache_max_mb(max_mb);
     }
+    if let Some(bus) = event_bus {
+        builder = builder.with_event_bus(bus);
+    }
     if config.indexing_enabled {
         let max_bytes = config
             .reindex_max_bytes
             .unwrap_or_else(fluree_db_api::server_defaults::default_reindex_max_bytes);
-        builder = builder.with_indexing_thresholds(config.reindex_min_bytes, max_bytes);
+        builder = builder
+            .with_indexing_thresholds(config.reindex_min_bytes, max_bytes)
+            // GC retention only matters when this process runs the indexer.
+            .with_gc_settings(
+                config.gc_max_old_indexes,
+                config.gc_min_time_mins,
+                config.gc_hard_max_old_indexes,
+            )
+            .with_indexer_catchup_interval(std::time::Duration::from_secs(
+                config.indexer_catchup_interval_secs,
+            ));
+        if catchup_sweeps == CatchupSweeps::Delegated {
+            builder = builder.without_indexer_catchup_sweeps();
+        }
     } else {
         // Peer / external-indexer mode: skip spawning a background
         // indexer, but still set novelty thresholds so backpressure

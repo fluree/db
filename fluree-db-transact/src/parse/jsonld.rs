@@ -13,7 +13,9 @@
 
 use super::txn_meta::extract_txn_meta;
 use crate::error::{Result, TransactError};
-use crate::ir::{InlineValues, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType};
+use crate::ir::{
+    GraphSel, InlineValues, TemplateGraph, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType,
+};
 use crate::namespace::NamespaceRegistry;
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::FlakeValue;
@@ -27,42 +29,29 @@ use fluree_vocab::{
     rdf_names,
 };
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-/// Assigns per-transaction graph IDs for JSON-LD `@graph` selectors.
-///
-/// These IDs are scoped to the transaction envelope via `Txn.graph_delta`.
-/// They do not need to be globally stable across commits, as long as the commit
-/// carries the mapping used to encode flakes.
-struct GraphIdAssigner {
-    iri_to_id: HashMap<String, u16>,
-    next_id: u16, // 2+ reserved for user graphs
-}
+/// Named graphs a JSON-LD transaction writes to, interned so the templates
+/// of one graph share its IRI.
+struct WriteGraphs(HashMap<String, Arc<str>>);
 
-impl GraphIdAssigner {
+impl WriteGraphs {
     fn new() -> Self {
-        Self {
-            iri_to_id: HashMap::new(),
-            next_id: 2,
-        }
+        Self(HashMap::new())
     }
 
-    fn get_or_assign(&mut self, iri: &str) -> u16 {
-        if let Some(&id) = self.iri_to_id.get(iri) {
-            return id;
+    fn get_or_assign(&mut self, iri: &str) -> Arc<str> {
+        if let Some(iri) = self.0.get(iri) {
+            return Arc::clone(iri);
         }
-        let id = self.next_id;
-        self.next_id += 1;
-        self.iri_to_id.insert(iri.to_string(), id);
-        id
+        let interned: Arc<str> = Arc::from(iri);
+        self.0.insert(iri.to_string(), Arc::clone(&interned));
+        interned
     }
 
-    fn delta(&self) -> rustc_hash::FxHashMap<u16, String> {
-        self.iri_to_id
-            .iter()
-            .map(|(iri, &g_id)| (g_id, iri.clone()))
-            .collect()
+    fn iris(&self) -> BTreeSet<String> {
+        self.0.keys().cloned().collect()
     }
 }
 
@@ -117,6 +106,20 @@ pub fn parse_transaction(
     }
     let lpg_mode = opts.lpg_edge_lifecycle.unwrap_or(false);
 
+    // Requested SHACL validation mode ("warn" / "reject"), same JSON-over-
+    // programmatic precedence as the opts above. Whether the request is
+    // honored is decided later against the ledger config's override control
+    // (see TxnOpts::validation_mode); an unrecognized string is ignored.
+    if opts.validation_mode.is_none() {
+        opts.validation_mode = json
+            .as_object()
+            .and_then(|m| m.get("opts"))
+            .and_then(|v| v.as_object())
+            .and_then(|o| o.get("validationMode"))
+            .and_then(Value::as_str)
+            .and_then(fluree_db_core::ledger_config::ValidationMode::parse_opt);
+    }
+
     // M1: lower `@annotation` / `@edge` / `@reifies` into the seven-fact
     // `f:reifies*` system encoding before JSON-LD expansion, rejecting
     // user-authored `f:reifies*` IRIs and every deferred shape (literal-
@@ -163,10 +166,99 @@ pub fn parse_transaction(
     }
 }
 
+/// Parse a graph-sync transaction (see [`Txn::sync_graph`]).
+///
+/// The payload is an ordinary insert-shaped JSON-LD document describing the
+/// target graph's DESIRED full contents, parsed as [`parse_graph_insert`]
+/// does, with the sync directive stamped on the transaction. An explicitly
+/// empty document (`"@graph": []`) means "the graph's desired contents are
+/// empty"; the API layer gates that behind an explicit opt-in before it
+/// becomes a whole-graph clear.
+pub fn parse_sync_transaction(
+    json: &Value,
+    graph: &GraphSel,
+    opts: TxnOpts,
+    ns_registry: &mut NamespaceRegistry,
+) -> Result<Txn> {
+    let mut txn = parse_graph_insert(json, graph, opts, ns_registry)?;
+    txn.sync_graph = Some(graph.clone());
+    Ok(txn)
+}
+
+/// Parse an insert whose triples all land in `graph`, the default graph or
+/// one named graph, named by the caller rather than by the payload.
+///
+/// Parsing is exactly insert parsing (same context handling, annotation
+/// lowering, txn-meta extraction), after which every template is homed on
+/// `graph`. Differences from insert:
+/// - an explicitly empty document (`"@graph": []`) parses to an empty
+///   transaction instead of an error;
+/// - a payload that addresses named graphs itself (`@graph` with a graph
+///   `@id`) is rejected: the scope is exactly one graph.
+pub fn parse_graph_insert(
+    json: &Value,
+    graph: &GraphSel,
+    opts: TxnOpts,
+    ns_registry: &mut NamespaceRegistry,
+) -> Result<Txn> {
+    let explicitly_empty = json
+        .get("@graph")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty);
+    let mut txn = if explicitly_empty {
+        Txn::insert().with_opts(opts)
+    } else {
+        parse_transaction(json, TxnType::Insert, opts, ns_registry)?
+    };
+    if !txn.write_graphs.is_empty() {
+        return Err(TransactError::Parse(
+            "payload must not address named graphs; the target graph is given by the request"
+                .to_string(),
+        ));
+    }
+    // Parsed templates are already in the default graph.
+    let GraphSel::Graph(graph_iri) = graph else {
+        return Ok(txn);
+    };
+    let target: Arc<str> = Arc::from(graph_iri.as_str());
+    for t in &mut txn.insert_templates {
+        t.graph = TemplateGraph::Iri(Arc::clone(&target));
+    }
+    // Edge annotations were lowered against a payload with no graph identity,
+    // so their `f:reifies*` bundles carry no `f:reifiesGraph`. Re-homing the
+    // bundle into the target graph without one produces a bundle whose
+    // flake-level graph disagrees with the edge graph it encodes
+    // (`EdgeKey::from_reifies_facts` → `GraphMismatch`, refused at stage).
+    // Anchor every reifier to the target graph, exactly as the named-`@graph`
+    // lowering does for an annotated edge written inside a graph block.
+    let reifies_subject = fluree_db_core::Sid::new(
+        fluree_vocab::namespaces::FLUREE_DB,
+        fluree_vocab::db::REIFIES_SUBJECT,
+    );
+    let reifies_graph = fluree_db_core::Sid::new(
+        fluree_vocab::namespaces::FLUREE_DB,
+        fluree_vocab::db::REIFIES_GRAPH,
+    );
+    let anchors: Vec<TripleTemplate> = txn
+        .insert_templates
+        .iter()
+        .filter(|t| matches!(&t.predicate, TemplateTerm::Sid(p) if *p == reifies_subject))
+        .map(|t| {
+            let mut anchor = t.clone();
+            anchor.predicate = TemplateTerm::Sid(reifies_graph.clone());
+            anchor.object = TemplateTerm::Sid(ns_registry.sid_for_iri(graph_iri));
+            anchor
+        })
+        .collect();
+    txn.insert_templates.extend(anchors);
+    txn.write_graphs.insert(graph_iri.clone());
+    Ok(txn)
+}
+
 /// Parse an insert transaction
 fn parse_insert(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry) -> Result<Txn> {
     let mut vars = VarRegistry::new();
-    let mut graph_ids = GraphIdAssigner::new();
+    let mut write_graphs = WriteGraphs::new();
 
     // Parse and merge context
     let context = extract_context(json)?;
@@ -195,7 +287,7 @@ fn parse_insert(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
         ns_registry,
         false,
         strict,
-        &mut graph_ids,
+        &mut write_graphs,
         None,
         &empty_aliases,
     );
@@ -212,7 +304,7 @@ fn parse_insert(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
         .with_vars(vars)
         .with_opts(opts)
         .with_txn_meta(txn_meta);
-    txn.graph_delta = graph_ids.delta();
+    txn.write_graphs = write_graphs.iris();
     Ok(txn)
 }
 
@@ -224,7 +316,7 @@ fn parse_upsert(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
     // For now, upsert is handled the same as insert at parse time
     // The actual upsert logic (query existing, delete old) happens in stage
     let mut vars = VarRegistry::new();
-    let mut graph_ids = GraphIdAssigner::new();
+    let mut write_graphs = WriteGraphs::new();
 
     let context = extract_context(json)?;
 
@@ -251,7 +343,7 @@ fn parse_upsert(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
         ns_registry,
         false,
         strict,
-        &mut graph_ids,
+        &mut write_graphs,
         None,
         &empty_aliases,
     );
@@ -268,7 +360,7 @@ fn parse_upsert(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
         .with_vars(vars)
         .with_opts(opts)
         .with_txn_meta(txn_meta);
-    txn.graph_delta = graph_ids.delta();
+    txn.write_graphs = write_graphs.iris();
     Ok(txn)
 }
 
@@ -285,8 +377,18 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
         .as_object()
         .ok_or_else(|| TransactError::Parse("Update transaction must be an object".to_string()))?;
 
+    // An update with neither clause can never change data. Rejecting it here
+    // (mirroring the empty-insert/upsert guards) prevents a mistargeted body —
+    // e.g. a Cypher envelope posted as JSON-LD — from committing an empty
+    // transaction and reporting success.
+    if !obj.contains_key("insert") && !obj.contains_key("delete") {
+        return Err(TransactError::Parse(
+            "update transaction must contain an \"insert\" or \"delete\" clause".to_string(),
+        ));
+    }
+
     let mut vars = VarRegistry::new();
-    let mut graph_ids = GraphIdAssigner::new();
+    let mut write_graphs = WriteGraphs::new();
 
     // Parse context from the outer document
     let context = extract_context(json)?;
@@ -329,7 +431,7 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
         obj.get("graph"),
         &context,
         &from_named_aliases,
-        &mut graph_ids,
+        &mut write_graphs,
         strict,
     )?;
 
@@ -387,11 +489,27 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
             ns_registry,
             object_var_parsing,
             strict,
-            &mut graph_ids,
-            template_default_graph.as_ref().map(|(g_id, _)| *g_id),
+            &mut write_graphs,
+            template_default_graph
+                .as_ref()
+                .map(|(graph, _)| Arc::clone(graph)),
             &from_named_aliases,
         );
+        ctx.default_graph_is_template_default = template_default_graph.is_some();
         let templates = parse_update_templates_with_ctx(delete_val, &mut ctx)?;
+        // Blank nodes are not allowed in delete templates (mirrors SPARQL 1.1
+        // Update §19.8 note 8 on the JSON-LD surface): a blank node denotes a
+        // fresh node, so the retraction would skolemize a brand-new SID and
+        // silently match nothing. Stable `_:fdb-` ids already resolved to
+        // constant SIDs above, so they pass. Nested objects without `@id`
+        // also mint blank nodes and are rejected the same way.
+        if let Some(label) = first_blank_node_in_templates(&templates) {
+            return Err(TransactError::Parse(format!(
+                "blank node {label} is not allowed in delete: it denotes a fresh node and can \
+                 never match existing data. Use a variable bound by \"where\", a concrete @id, \
+                 or a Fluree stable _:fdb- id."
+            )));
+        }
         if templates.is_empty() {
             // An explicit empty delete (e.g. `"delete": []`) is a no-op.
             // Still reject structurally-empty deletes like `{ "@id": "ex:foo" }`.
@@ -418,10 +536,13 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
             ns_registry,
             object_var_parsing,
             strict,
-            &mut graph_ids,
-            template_default_graph.as_ref().map(|(g_id, _)| *g_id),
+            &mut write_graphs,
+            template_default_graph
+                .as_ref()
+                .map(|(graph, _)| Arc::clone(graph)),
             &from_named_aliases,
         );
+        ctx.default_graph_is_template_default = template_default_graph.is_some();
         let templates = parse_update_templates_with_ctx(insert_val, &mut ctx)?;
         if templates.is_empty() {
             return Err(TransactError::Parse(
@@ -441,7 +562,8 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
         .with_vars(vars)
         .with_opts(opts)
         .with_txn_meta(txn_meta);
-    txn.graph_delta = graph_ids.delta();
+    txn.write_graphs = write_graphs.iris();
+    txn.template_default_graph = template_default_graph.map(|(_, iri)| iri);
     txn.update_where_default_graph_iris = Some(where_default_graph_iris);
     txn.update_where_named_graphs = where_named_graphs;
 
@@ -457,9 +579,9 @@ fn parse_update_template_default_graph(
     graph_val: Option<&Value>,
     context: &ParsedContext,
     from_named_aliases: &HashMap<String, String>,
-    graph_ids: &mut GraphIdAssigner,
+    write_graphs: &mut WriteGraphs,
     strict: bool,
-) -> Result<Option<(u16, String)>> {
+) -> Result<Option<(Arc<str>, String)>> {
     let Some(v) = graph_val else {
         return Ok(None);
     };
@@ -477,7 +599,7 @@ fn parse_update_template_default_graph(
     }
 
     let resolved = resolve_graph_selector_value_for_update(v, from_named_aliases);
-    parse_update_default_graph(Some(&resolved), context, graph_ids, strict)
+    parse_update_default_graph(Some(&resolved), context, write_graphs, strict)
 }
 
 fn parse_update_where_default_graph_iris(
@@ -670,9 +792,9 @@ fn expand_update_graph_iri(v: &Value, context: &ParsedContext, strict: bool) -> 
 fn parse_update_default_graph(
     graph_val: Option<&Value>,
     context: &ParsedContext,
-    graph_ids: &mut GraphIdAssigner,
+    write_graphs: &mut WriteGraphs,
     strict: bool,
-) -> Result<Option<(u16, String)>> {
+) -> Result<Option<(Arc<str>, String)>> {
     let Some(v) = graph_val else {
         return Ok(None);
     };
@@ -725,8 +847,8 @@ fn parse_update_default_graph(
     }
     .ok_or_else(|| TransactError::Parse("graph must expand to an @id IRI".to_string()))?;
 
-    let g_id = graph_ids.get_or_assign(&iri);
-    Ok(Some((g_id, iri)))
+    let graph = write_graphs.get_or_assign(&iri);
+    Ok(Some((graph, iri)))
 }
 
 struct TemplateParseCtx<'a> {
@@ -735,8 +857,12 @@ struct TemplateParseCtx<'a> {
     ns_registry: &'a mut NamespaceRegistry,
     object_var_parsing: bool,
     strict_compact_iri: bool,
-    graph_ids: &'a mut GraphIdAssigner,
-    default_graph_id: Option<u16>,
+    write_graphs: &'a mut WriteGraphs,
+    default_graph: Option<Arc<str>>,
+    /// Whether `default_graph` is the update's top-level `graph` (the
+    /// template default, [`Txn::template_default_graph`]) rather than the
+    /// graph of an enclosing `["graph", <iri>, …]` wrapper.
+    default_graph_is_template_default: bool,
     from_named_aliases: &'a HashMap<String, String>,
     blank_counter: usize,
 }
@@ -749,8 +875,8 @@ impl<'a> TemplateParseCtx<'a> {
         ns_registry: &'a mut NamespaceRegistry,
         object_var_parsing: bool,
         strict_compact_iri: bool,
-        graph_ids: &'a mut GraphIdAssigner,
-        default_graph_id: Option<u16>,
+        write_graphs: &'a mut WriteGraphs,
+        default_graph: Option<Arc<str>>,
         from_named_aliases: &'a HashMap<String, String>,
     ) -> Self {
         Self {
@@ -759,8 +885,9 @@ impl<'a> TemplateParseCtx<'a> {
             ns_registry,
             object_var_parsing,
             strict_compact_iri,
-            graph_ids,
-            default_graph_id,
+            write_graphs,
+            default_graph,
+            default_graph_is_template_default: false,
             from_named_aliases,
             blank_counter: 0,
         }
@@ -806,6 +933,22 @@ impl<'a> TemplateParseCtx<'a> {
     }
 }
 
+/// First blank-node label appearing in any template term, if one exists.
+///
+/// Used to reject blank nodes in delete templates (they can never match
+/// stored data). Stable `_:fdb-` ids never appear here — the term parsers
+/// resolve them to constant `TemplateTerm::Sid`s.
+fn first_blank_node_in_templates(templates: &[TripleTemplate]) -> Option<&str> {
+    templates.iter().find_map(|t| {
+        [&t.subject, &t.predicate, &t.object]
+            .into_iter()
+            .find_map(|term| match term {
+                TemplateTerm::BlankNode(label) => Some(label.as_str()),
+                _ => None,
+            })
+    })
+}
+
 fn parse_update_templates_with_ctx(
     val: &Value,
     ctx: &mut TemplateParseCtx<'_>,
@@ -823,17 +966,20 @@ fn parse_update_templates_with_ctx(
                     let graph = parse_update_default_graph(
                         Some(&resolved_graph),
                         ctx.context,
-                        ctx.graph_ids,
+                        ctx.write_graphs,
                         ctx.strict_compact_iri,
                     )?
                     .ok_or_else(|| {
                         TransactError::Parse("graph wrapper requires a graph IRI".to_string())
                     })?;
                     let expanded = ctx.expand_document(&arr[2])?;
-                    let prev_default = ctx.default_graph_id;
-                    ctx.default_graph_id = Some(graph.0);
+                    let prev_default = ctx.default_graph.replace(graph.0);
+                    // The wrapper names its graph: not the template default.
+                    let prev_is_template_default =
+                        std::mem::replace(&mut ctx.default_graph_is_template_default, false);
                     let templates = parse_expanded_triples_with_ctx(&expanded, ctx)?;
-                    ctx.default_graph_id = prev_default;
+                    ctx.default_graph = prev_default;
+                    ctx.default_graph_is_template_default = prev_is_template_default;
                     out.extend(templates);
                     continue;
                 }
@@ -1227,7 +1373,7 @@ fn parse_expanded_object_with_ctx(
     //
     // This is distinct from *envelope form* (top-level `@graph: [...]`) used
     // for txn-meta extraction.
-    let graph_id = obj
+    let node_graph = obj
         .get("@graph")
         .and_then(|v| match v {
             Value::String(s) => Some(s.as_str()),
@@ -1239,12 +1385,26 @@ fn parse_expanded_object_with_ctx(
             }),
             _ => None,
         })
-        .map(|raw| -> Result<u16> {
+        .map(|raw| -> Result<Arc<str>> {
             let resolved = resolve_graph_selector_str_for_templates(raw, ctx)?;
-            Ok(ctx.graph_ids.get_or_assign(&resolved))
+            Ok(ctx.write_graphs.get_or_assign(&resolved))
         })
         .transpose()?;
-    let graph_id = graph_id.or(ctx.default_graph_id);
+    // A node with no `@graph` of its own takes the default: the update's
+    // template default (top-level `graph`), an enclosing wrapper's graph, or
+    // the graph of the node it is nested in.
+    let graph_from_template_default = node_graph.is_none()
+        && ctx.default_graph.is_some()
+        && ctx.default_graph_is_template_default;
+    let own_graph = node_graph.clone();
+    let node_graph = node_graph.or_else(|| ctx.default_graph.clone());
+    let place = |t: TripleTemplate| match &node_graph {
+        Some(graph) if graph_from_template_default => {
+            t.in_template_default_graph(Arc::clone(graph))
+        }
+        Some(graph) => t.in_graph(Arc::clone(graph)),
+        None => t,
+    };
 
     // Get subject from @id (already expanded IRI or variable)
     let subject = if let Some(id) = obj.get("@id") {
@@ -1256,7 +1416,32 @@ fn parse_expanded_object_with_ctx(
         TemplateTerm::BlankNode(format!("_:b{n}"))
     };
 
-    // Parse each predicate-object pair
+    // Nodes nested in this one belong to its graph, as an embedded node object
+    // does in JSON-LD.
+    let outer = own_graph.map(|graph| {
+        (
+            ctx.default_graph.replace(graph),
+            std::mem::replace(&mut ctx.default_graph_is_template_default, false),
+        )
+    });
+    let parsed = parse_node_properties(obj, &subject, &place, ctx, &mut templates);
+    if let Some((default_graph, is_template_default)) = outer {
+        ctx.default_graph = default_graph;
+        ctx.default_graph_is_template_default = is_template_default;
+    }
+    parsed?;
+
+    Ok((subject, templates))
+}
+
+/// The triples for each predicate-object pair of a node object.
+fn parse_node_properties(
+    obj: &serde_json::Map<String, Value>,
+    subject: &TemplateTerm,
+    place: &dyn Fn(TripleTemplate) -> TripleTemplate,
+    ctx: &mut TemplateParseCtx<'_>,
+    templates: &mut Vec<TripleTemplate>,
+) -> Result<()> {
     for (key, value) in obj {
         // Skip JSON-LD keywords except @type which becomes rdf:type
         if key == "@id" || key == "@context" || key == "@graph" {
@@ -1281,10 +1466,11 @@ fn parse_expanded_object_with_ctx(
                     } else {
                         TemplateTerm::Sid(ctx.ns_registry.sid_for_iri(type_iri))
                     };
-                    let mut t = TripleTemplate::new(subject.clone(), predicate.clone(), object);
-                    if let Some(g_id) = graph_id {
-                        t = t.with_graph_id(g_id);
-                    }
+                    let t = place(TripleTemplate::new(
+                        subject.clone(),
+                        predicate.clone(),
+                        object,
+                    ));
                     templates.push(t);
                 } else {
                     return Err(TransactError::Parse(format!(
@@ -1309,14 +1495,14 @@ fn parse_expanded_object_with_ctx(
             TemplateTerm::Sid(ctx.ns_registry.sid_for_iri(key))
         };
 
-        let parsed_values = parse_expanded_objects_with_ctx(value, ctx, &mut templates)?;
+        let parsed_values = parse_expanded_objects_with_ctx(value, ctx, templates)?;
 
         for parsed_value in parsed_values {
-            let mut template =
-                TripleTemplate::new(subject.clone(), predicate.clone(), parsed_value.term);
-            if let Some(g_id) = graph_id {
-                template = template.with_graph_id(g_id);
-            }
+            let mut template = place(TripleTemplate::new(
+                subject.clone(),
+                predicate.clone(),
+                parsed_value.term,
+            ));
             if let Some(dtc) = parsed_value.dtc {
                 template = template.with_dtc(dtc);
             }
@@ -1326,8 +1512,7 @@ fn parse_expanded_object_with_ctx(
             templates.push(template);
         }
     }
-
-    Ok((subject, templates))
+    Ok(())
 }
 
 fn resolve_graph_selector_str_for_templates(
@@ -1378,7 +1563,7 @@ fn parse_expanded_id(
     ns_registry: &mut NamespaceRegistry,
 ) -> Result<TemplateTerm> {
     let context = ParsedContext::new();
-    let mut graph_ids = GraphIdAssigner::new();
+    let mut write_graphs = WriteGraphs::new();
     let empty_aliases: HashMap<String, String> = HashMap::new();
     let mut ctx = TemplateParseCtx::new(
         &context,
@@ -1386,7 +1571,7 @@ fn parse_expanded_id(
         ns_registry,
         true,
         true,
-        &mut graph_ids,
+        &mut write_graphs,
         None,
         &empty_aliases,
     );
@@ -1588,8 +1773,8 @@ fn parse_expanded_value(
     ns_registry: &mut NamespaceRegistry,
     templates: &mut Vec<TripleTemplate>,
     object_var_parsing: bool,
-    graph_ids: &mut GraphIdAssigner,
-    default_graph_id: Option<u16>,
+    write_graphs: &mut WriteGraphs,
+    default_graph: Option<Arc<str>>,
     from_named_aliases: &HashMap<String, String>,
     blank_counter: &mut usize,
 ) -> Result<ParsedValue> {
@@ -1599,14 +1784,28 @@ fn parse_expanded_value(
         ns_registry,
         object_var_parsing,
         true,
-        graph_ids,
-        default_graph_id,
+        write_graphs,
+        default_graph,
         from_named_aliases,
     );
     ctx.blank_counter = *blank_counter;
     let out = parse_expanded_value_with_ctx(value, &mut ctx, templates);
     *blank_counter = ctx.blank_counter;
     out
+}
+
+/// Refuse a language tag that is not a `LANGTAG` (optionally with an RDF 1.2
+/// base direction). Turtle and N-Triples have no escape for a tag, so an
+/// invalid one would end the literal in every text serialization of it.
+pub(crate) fn check_lang_tag(lang: &str) -> Result<()> {
+    if fluree_graph_ir::syntax::is_lang_tag(lang) {
+        Ok(())
+    } else {
+        Err(TransactError::Parse(format!(
+            "invalid language tag {lang:?}: a language tag starts with a letter and \
+             continues as `-`-separated alphanumeric subtags (for example \"en\" or \"en-GB\")"
+        )))
+    }
 }
 
 /// Parse a literal value with optional @type or @language, returning full metadata
@@ -1627,13 +1826,16 @@ fn parse_literal_value_with_meta(
 
             // Handle @json specially
             if type_iri == "@json" || expanded_type == rdf::JSON {
-                // If @value is already a string, use it directly (avoid double-serialization)
-                // Only serialize if it's an object, array, or other non-string JSON value
+                // Canonicalizing here gives one term per value, regardless
+                // of how the writer serialized it (#1781). A string `@value`
+                // holds an already serialized document, so it is
+                // canonicalized in place when it parses and stored as written
+                // when it does not.
                 let json_string = match val {
-                    Value::String(s) => s.clone(),
-                    _ => serde_json::to_string(val).map_err(|e| {
-                        TransactError::Parse(format!("Failed to serialize @json value: {e}"))
-                    })?,
+                    Value::String(s) => {
+                        fluree_graph_ir::canonicalize_json(s).unwrap_or_else(|_| s.clone())
+                    }
+                    _ => fluree_graph_ir::canonicalize_json_value(val),
                 };
                 let datatype_sid = ns_registry.sid_for_iri(rdf::JSON);
                 return Ok(
@@ -1669,6 +1871,7 @@ fn parse_literal_value_with_meta(
             // Check for @language
             if let Some(lang_val) = obj.get("@language") {
                 if let Some(lang) = lang_val.as_str() {
+                    check_lang_tag(lang)?;
                     return Ok(ParsedValue::new(TemplateTerm::Value(FlakeValue::String(
                         s.clone(),
                     )))
@@ -1770,8 +1973,8 @@ fn convert_typed_value_with_meta(
 /// @list objects and uses `parse_list_values` instead to get all elements with indices.
 ///
 /// This function only handles the fallback case and returns the first element.
-/// Empty lists produce an error here since we can't return "no value" - the proper
-/// empty list handling happens in `parse_expanded_objects` via `parse_list_values`.
+/// An empty @list denotes the IRI rdf:nil and returns that single term, in
+/// both this fallback and the `parse_list_values` path (issue #1694 twin).
 #[allow(clippy::too_many_arguments)]
 fn parse_list_value_with_ctx(
     list_val: &Value,
@@ -1788,15 +1991,13 @@ fn parse_list_value_with_ctx(
         }
     };
 
-    // Empty list: we can't return "no value" from this function.
-    // The proper path for empty lists is through parse_expanded_objects which
-    // uses parse_list_values and filters empty results. If we get here with an
-    // empty list, it's an edge case where @list wasn't detected at the array level.
+    // An empty @list denotes the IRI rdf:nil (JSON-LD 1.1 § List to RDF
+    // Conversion) — same as `parse_list_values_with_ctx`. This position used
+    // to error ("Empty @list in unexpected position").
     if items.is_empty() {
-        return Err(TransactError::Parse(
-            "Empty @list in unexpected position (should be handled by parse_expanded_objects)"
-                .to_string(),
-        ));
+        return Ok(ParsedValue::new(TemplateTerm::Sid(
+            ctx.ns_registry.sid_for_iri(rdf::NIL),
+        )));
     }
 
     // Parse the first element with index 0
@@ -1823,9 +2024,14 @@ fn parse_list_values_with_ctx(
         }
     };
 
-    // Empty list produces zero triples
+    // An empty @list denotes the IRI rdf:nil (JSON-LD 1.1 § List to RDF
+    // Conversion): store the one triple, as an ordinary IRI object with no
+    // list index — the twin of the Turtle `()` fix (issue #1694). It used
+    // to produce zero templates, silently losing the statement.
     if items.is_empty() {
-        return Ok(Vec::new());
+        return Ok(vec![ParsedValue::new(TemplateTerm::Sid(
+            ctx.ns_registry.sid_for_iri(rdf::NIL),
+        ))]);
     }
 
     // Parse each item with its index
@@ -1848,8 +2054,8 @@ fn parse_list_values(
     ns_registry: &mut NamespaceRegistry,
     object_var_parsing: bool,
     templates: &mut Vec<TripleTemplate>,
-    graph_ids: &mut GraphIdAssigner,
-    default_graph_id: Option<u16>,
+    write_graphs: &mut WriteGraphs,
+    default_graph: Option<Arc<str>>,
     from_named_aliases: &HashMap<String, String>,
     blank_counter: &mut usize,
 ) -> Result<Vec<ParsedValue>> {
@@ -1859,8 +2065,8 @@ fn parse_list_values(
         ns_registry,
         object_var_parsing,
         true,
-        graph_ids,
-        default_graph_id,
+        write_graphs,
+        default_graph,
         from_named_aliases,
     );
     ctx.blank_counter = *blank_counter;
@@ -2043,6 +2249,44 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_update_without_insert_or_delete_rejected() {
+        let mut ns_registry = test_registry();
+
+        // A Cypher envelope mistakenly posted as a JSON-LD update: no
+        // insert/delete clause means the transaction could never change data.
+        let cypher_envelope = json!({
+            "cypher": "MERGE (n:Person {name: 'Alice'})",
+            "params": {}
+        });
+        let err = parse_update(&cypher_envelope, TxnOpts::default(), &mut ns_registry).unwrap_err();
+        assert!(
+            err.to_string().contains("\"insert\" or \"delete\""),
+            "unexpected error: {err}"
+        );
+
+        // where-only updates are equally inert and rejected.
+        let where_only = json!({
+            "@context": {"ex": "http://example.org/"},
+            "where": { "@id": "?s", "ex:name": "?name" }
+        });
+        let err = parse_update(&where_only, TxnOpts::default(), &mut ns_registry).unwrap_err();
+        assert!(
+            err.to_string().contains("\"insert\" or \"delete\""),
+            "unexpected error: {err}"
+        );
+
+        // An explicit empty delete keeps its documented no-op semantics.
+        let explicit_empty_delete = json!({
+            "@context": {"ex": "http://example.org/"},
+            "delete": []
+        });
+        let txn =
+            parse_update(&explicit_empty_delete, TxnOpts::default(), &mut ns_registry).unwrap();
+        assert!(txn.delete_templates.is_empty());
+        assert!(txn.insert_templates.is_empty());
+    }
+
+    #[test]
     fn test_parse_update_from_named_sets_where_named_graphs() {
         let mut ns_registry = test_registry();
         let json = json!({
@@ -2108,14 +2352,14 @@ mod tests {
 
         let txn = parse_update(&json, TxnOpts::default(), &mut ns_registry).unwrap();
         assert!(
-            txn.graph_delta
-                .values()
-                .any(|iri| iri == "http://example.org/g2"),
-            "expected graph_delta to contain resolved graph IRI for alias g2"
+            txn.write_graphs.contains("http://example.org/g2"),
+            "expected write_graphs to contain resolved graph IRI for alias g2"
         );
         assert!(
-            txn.insert_templates.iter().any(|t| t.graph_id.is_some()),
-            "expected insert templates to be tagged with a graph_id"
+            txn.insert_templates
+                .iter()
+                .any(|t| t.graph == TemplateGraph::Iri("http://example.org/g2".into())),
+            "expected insert templates to target the resolved graph IRI"
         );
     }
 
@@ -2220,7 +2464,7 @@ mod tests {
         let mut ns_registry = test_registry();
         let mut templates: Vec<TripleTemplate> = Vec::new();
         let ctx = ParsedContext::new();
-        let mut graph_ids = GraphIdAssigner::new();
+        let mut write_graphs = WriteGraphs::new();
         let mut blank_counter: usize = 0;
 
         // @value with @type - should preserve datatype
@@ -2232,7 +2476,7 @@ mod tests {
             &mut ns_registry,
             &mut templates,
             true,
-            &mut graph_ids,
+            &mut write_graphs,
             None,
             &HashMap::new(),
             &mut blank_counter,
@@ -2252,7 +2496,7 @@ mod tests {
         let mut ns_registry = test_registry();
         let mut templates: Vec<TripleTemplate> = Vec::new();
         let ctx = ParsedContext::new();
-        let mut graph_ids = GraphIdAssigner::new();
+        let mut write_graphs = WriteGraphs::new();
         let mut blank_counter: usize = 0;
 
         let val = json!({"@value": "before", "@type": "xsd:string"});
@@ -2263,7 +2507,7 @@ mod tests {
             &mut ns_registry,
             &mut templates,
             true,
-            &mut graph_ids,
+            &mut write_graphs,
             None,
             &HashMap::new(),
             &mut blank_counter,
@@ -2279,13 +2523,44 @@ mod tests {
         assert_eq!(dtc.datatype().name.as_ref(), "string");
     }
 
+    /// An `@language` that is not a `LANGTAG` is refused at ingest: no text
+    /// serialization could write it without it ending the literal.
+    #[test]
+    fn test_parse_invalid_language_tag_is_rejected() {
+        let mut vars = VarRegistry::new();
+        let mut ns_registry = test_registry();
+        let mut templates: Vec<TripleTemplate> = Vec::new();
+        let ctx = ParsedContext::new();
+        let mut write_graphs = WriteGraphs::new();
+        let mut blank_counter: usize = 0;
+        let mut parse = |lang: &str| {
+            parse_expanded_value(
+                &json!({"@value": "hi", "@language": lang}),
+                &ctx,
+                &mut vars,
+                &mut ns_registry,
+                &mut templates,
+                true,
+                &mut write_graphs,
+                None,
+                &HashMap::new(),
+                &mut blank_counter,
+            )
+        };
+        let err = parse("en . <urn:injected> <urn:p> \"pwned\" . #")
+            .err()
+            .expect("invalid tag must be refused");
+        assert!(err.to_string().contains("invalid language tag"), "{err}");
+        assert!(parse("en--ltr").is_ok());
+    }
+
     #[test]
     fn test_parse_language_tagged_string() {
         let mut vars = VarRegistry::new();
         let mut ns_registry = test_registry();
         let mut templates: Vec<TripleTemplate> = Vec::new();
         let ctx = ParsedContext::new();
-        let mut graph_ids = GraphIdAssigner::new();
+        let mut write_graphs = WriteGraphs::new();
         let mut blank_counter: usize = 0;
 
         // @value with @language
@@ -2297,7 +2572,7 @@ mod tests {
             &mut ns_registry,
             &mut templates,
             true,
-            &mut graph_ids,
+            &mut write_graphs,
             None,
             &HashMap::new(),
             &mut blank_counter,
@@ -2325,7 +2600,7 @@ mod tests {
         // Parse a @list with three string items
         let list_val = json!(["a", "b", "c"]);
         let mut templates = Vec::new();
-        let mut graph_ids = GraphIdAssigner::new();
+        let mut write_graphs = WriteGraphs::new();
         let mut blank_counter = 0usize;
         let results = parse_list_values(
             &list_val,
@@ -2334,7 +2609,7 @@ mod tests {
             &mut ns_registry,
             true,
             &mut templates,
-            &mut graph_ids,
+            &mut write_graphs,
             None,
             &HashMap::new(),
             &mut blank_counter,
@@ -2369,10 +2644,12 @@ mod tests {
         let mut ns_registry = test_registry();
         let ctx = ParsedContext::new();
 
-        // Empty @list produces zero ParsedValues
+        // An empty @list denotes rdf:nil: ONE ParsedValue, an ordinary IRI
+        // object with no list index (issue #1694 twin — it used to produce
+        // zero values, silently losing the statement).
         let list_val = json!([]);
         let mut templates = Vec::new();
-        let mut graph_ids = GraphIdAssigner::new();
+        let mut write_graphs = WriteGraphs::new();
         let mut blank_counter = 0usize;
         let results = parse_list_values(
             &list_val,
@@ -2381,13 +2658,55 @@ mod tests {
             &mut ns_registry,
             true,
             &mut templates,
-            &mut graph_ids,
+            &mut write_graphs,
             None,
             &HashMap::new(),
             &mut blank_counter,
         )
         .unwrap();
-        assert!(results.is_empty());
+        assert_eq!(results.len(), 1);
+        assert!(results[0].list_index.is_none());
+        let nil_sid = ns_registry.sid_for_iri(rdf::NIL);
+        assert!(
+            matches!(&results[0].term, TemplateTerm::Sid(sid) if *sid == nil_sid),
+            "empty @list must parse to the rdf:nil IRI"
+        );
+        assert!(templates.is_empty(), "no side-emitted templates");
+    }
+
+    /// The singular fallback (`parse_expanded_value` reaching a `@list`
+    /// object outside the array position) must agree with the plural path:
+    /// an empty `@list` is the single term rdf:nil. It used to error with
+    /// "Empty @list in unexpected position".
+    #[test]
+    fn test_parse_empty_list_single_value_position() {
+        let mut vars = VarRegistry::new();
+        let mut ns_registry = test_registry();
+        let mut templates: Vec<TripleTemplate> = Vec::new();
+        let ctx = ParsedContext::new();
+        let mut write_graphs = WriteGraphs::new();
+        let mut blank_counter: usize = 0;
+
+        let val = json!({"@list": []});
+        let result = parse_expanded_value(
+            &val,
+            &ctx,
+            &mut vars,
+            &mut ns_registry,
+            &mut templates,
+            true,
+            &mut write_graphs,
+            None,
+            &HashMap::new(),
+            &mut blank_counter,
+        )
+        .unwrap();
+        assert!(result.list_index.is_none());
+        let nil_sid = ns_registry.sid_for_iri(rdf::NIL);
+        assert!(
+            matches!(&result.term, TemplateTerm::Sid(sid) if *sid == nil_sid),
+            "empty @list must parse to the rdf:nil IRI"
+        );
     }
 
     #[test]
@@ -2406,7 +2725,7 @@ mod tests {
         }]);
 
         let mut vars = VarRegistry::new();
-        let mut graph_ids = GraphIdAssigner::new();
+        let mut write_graphs = WriteGraphs::new();
         let empty_aliases = HashMap::new();
         let mut parse_ctx = TemplateParseCtx::new(
             &ctx,
@@ -2414,7 +2733,7 @@ mod tests {
             &mut ns_registry,
             true,
             true,
-            &mut graph_ids,
+            &mut write_graphs,
             None,
             &empty_aliases,
         );
@@ -2450,7 +2769,7 @@ mod tests {
         let mut ns_registry = test_registry();
         let ctx = ParsedContext::new();
         let mut vars = VarRegistry::new();
-        let mut graph_ids = GraphIdAssigner::new();
+        let mut write_graphs = WriteGraphs::new();
 
         let expanded = json!([{
             "@id": "http://example.org/thing/1",
@@ -2467,7 +2786,7 @@ mod tests {
             &mut ns_registry,
             false,
             true,
-            &mut graph_ids,
+            &mut write_graphs,
             None,
             &empty_aliases,
         );
@@ -2513,7 +2832,7 @@ mod tests {
         let mut ns_registry = test_registry();
         let ctx = ParsedContext::new();
         let mut vars = VarRegistry::new();
-        let mut graph_ids = GraphIdAssigner::new();
+        let mut write_graphs = WriteGraphs::new();
 
         let expanded = json!([{
             "@id": "http://example.org/root",
@@ -2533,7 +2852,7 @@ mod tests {
             &mut ns_registry,
             false,
             true,
-            &mut graph_ids,
+            &mut write_graphs,
             None,
             &empty_aliases,
         );
@@ -2564,7 +2883,7 @@ mod tests {
         let mut ns_registry = test_registry();
         let ctx = ParsedContext::new();
         let mut vars = VarRegistry::new();
-        let mut graph_ids = GraphIdAssigner::new();
+        let mut write_graphs = WriteGraphs::new();
 
         let expanded = json!([{
             "@id": "http://example.org/parent",
@@ -2585,7 +2904,7 @@ mod tests {
             &mut ns_registry,
             false,
             true,
-            &mut graph_ids,
+            &mut write_graphs,
             None,
             &empty_aliases,
         );

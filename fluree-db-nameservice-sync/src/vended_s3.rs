@@ -40,6 +40,10 @@ pub struct VendedS3Grant {
     pub region: String,
     #[serde(default)]
     pub endpoint: Option<String>,
+    /// Path-style addressing for `endpoint`. Defaults to unset so a grant
+    /// from a server predating the field still parses.
+    #[serde(default)]
+    pub force_path_style: Option<bool>,
     /// Root key prefix to configure on the S3 reader so address→key mapping
     /// matches the origin.
     #[serde(default)]
@@ -198,6 +202,9 @@ pub async fn build_vended_s3_storage(
         bucket: grant.bucket.clone(),
         prefix: grant.key_prefix.clone(),
         endpoint: grant.endpoint.clone(),
+        // Travels with `endpoint`: an override without it addresses
+        // virtual-hosted, which a plain MinIO rejects.
+        force_path_style: grant.force_path_style,
         ..Default::default()
     };
     let region = aws_config::Region::new(grant.region.clone());
@@ -234,6 +241,7 @@ mod tests {
             bucket: "b".into(),
             region: "us-east-1".into(),
             endpoint: None,
+            force_path_style: None,
             key_prefix: Some("ledgers".into()),
             scoped_prefix: Some("ledgers/inv".into()),
         }

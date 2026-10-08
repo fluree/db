@@ -28,6 +28,11 @@ pub mod mf {
         "http://www.w3.org/2001/sw/DataAccess/tests/test-manifest#PositiveUpdateSyntaxTest11";
     pub const NEGATIVE_UPDATE_SYNTAX_TEST_11: &str =
         "http://www.w3.org/2001/sw/DataAccess/tests/test-manifest#NegativeUpdateSyntaxTest11";
+    // SPARQL 1.2 manifests use the un-versioned update syntax test types.
+    pub const POSITIVE_UPDATE_SYNTAX_TEST: &str =
+        "http://www.w3.org/2001/sw/DataAccess/tests/test-manifest#PositiveUpdateSyntaxTest";
+    pub const NEGATIVE_UPDATE_SYNTAX_TEST: &str =
+        "http://www.w3.org/2001/sw/DataAccess/tests/test-manifest#NegativeUpdateSyntaxTest";
     pub const UPDATE_EVALUATION_TEST: &str =
         "http://www.w3.org/2001/sw/DataAccess/tests/test-manifest#UpdateEvaluationTest";
     pub const CSV_RESULT_FORMAT_TEST: &str =
@@ -77,6 +82,21 @@ pub mod rdft {
     pub const APPROVAL: &str = "http://www.w3.org/2001/sw/DataAccess/tests/test-dawg#approval";
     pub const REJECTED: &str = "http://www.w3.org/2001/sw/DataAccess/tests/test-dawg#Rejected";
     pub const APPROVED: &str = "http://www.w3.org/2001/sw/DataAccess/tests/test-dawg#Approved";
+
+    // RDF syntax test types (`http://www.w3.org/ns/rdftest#`), used by the
+    // RDF 1.1 / 1.2 Turtle and N-Triples manifests.
+    pub const NS: &str = "http://www.w3.org/ns/rdftest#";
+    pub const TEST_TURTLE_POSITIVE_SYNTAX: &str =
+        "http://www.w3.org/ns/rdftest#TestTurtlePositiveSyntax";
+    pub const TEST_TURTLE_NEGATIVE_SYNTAX: &str =
+        "http://www.w3.org/ns/rdftest#TestTurtleNegativeSyntax";
+    pub const TEST_TURTLE_EVAL: &str = "http://www.w3.org/ns/rdftest#TestTurtleEval";
+    pub const TEST_TURTLE_NEGATIVE_EVAL: &str =
+        "http://www.w3.org/ns/rdftest#TestTurtleNegativeEval";
+    pub const TEST_NTRIPLES_POSITIVE_SYNTAX: &str =
+        "http://www.w3.org/ns/rdftest#TestNTriplesPositiveSyntax";
+    pub const TEST_NTRIPLES_NEGATIVE_SYNTAX: &str =
+        "http://www.w3.org/ns/rdftest#TestNTriplesNegativeSyntax";
 }
 
 /// Standard RDF vocabulary

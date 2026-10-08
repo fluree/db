@@ -1,0 +1,20 @@
+# q051 stores_above_avg_orders
+# Intent: Nested subquery (per-store count vs the average); H8 non-lowered.
+# BI lineage (BI-24): "Which stores handle more orders than the store average?"
+# Predicates verified against enterprise.ttl — FactOrder: store; DimStore: name.
+# PR-0/0a: a subquery inside a GRAPH-over-R2RML scope now ERRORS loudly on
+#   virtual targets (was silently 0 rows — F2); native still returns rows.
+#   Manifest: expected_status = {native: ok, virtual: error}.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?sn ?cnt
+WHERE {
+  { SELECT ?s (COUNT(?o) AS ?cnt)
+    WHERE { ?o a edw:Order ; edw:store ?s . }
+    GROUP BY ?s }
+  { SELECT (AVG(?c2) AS ?avg)
+    WHERE { SELECT ?s2 (COUNT(?o2) AS ?c2)
+            WHERE { ?o2 a edw:Order ; edw:store ?s2 . }
+            GROUP BY ?s2 } }
+  ?s edw:name ?sn .
+  FILTER(?cnt > ?avg)
+}

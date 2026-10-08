@@ -17,13 +17,15 @@ pub struct LoweringContext<'a, E: IriEncoder> {
     /// Counter for `?#__cy_<n>` synthetic vars.
     next_synth: u32,
     /// Optional default-vocabulary prefix used to resolve bare
-    /// identifiers (e.g. `Person`) into IRIs. Without this, only
-    /// fully-qualified IRIs work — and Cypher doesn't have a syntax
-    /// for those, so a default is essentially required in practice.
+    /// identifiers (e.g. `Person`) into IRIs — the RDF-compat mode,
+    /// sourced from the ledger context's `@vocab`.
     ///
-    /// Default in v1: `http://example.org/`. Real wiring will pull
-    /// this from the ledger config / request envelope.
-    pub vocab: String,
+    /// `None` (the default) means Cypher identifiers are plain names
+    /// with no IRI at all: they live under namespace code 0 (the empty
+    /// prefix), so `Person` is just `Person`. This is the native LPG
+    /// mode — a Cypher user never sees or enters a namespace unless
+    /// they opt into RDF interop by configuring `@vocab`.
+    pub vocab: Option<String>,
     /// Per-variable IRI overrides for labels/types/properties, set
     /// either via request envelope or test fixture. Bare identifier →
     /// IRI string.
@@ -34,6 +36,37 @@ pub struct LoweringContext<'a, E: IriEncoder> {
     /// query variable, and property access on it lowers to eval-time member
     /// access rather than an outer-pattern join.
     scopes: Vec<HashMap<String, VarId>>,
+    /// Variables used on the relationship *annotation* surface somewhere in
+    /// the statement (`e.prop`, `properties(e)`, …). A bound relationship
+    /// variable outside this set can bind a synthesized relationship value
+    /// from the plain base triple instead of requiring a reifier bundle.
+    scope_uses: super::annotation_use::ScopeUses,
+    /// Path variables bound by a bounded fixed-chain expansion, mapped to the
+    /// identity-carrying relationship list bound alongside them (see
+    /// `Self::register_path_rel_list`).
+    path_rel_lists: std::collections::HashMap<VarId, VarId>,
+    /// Allow a bare `MATCH (n)` (no label, property, or relationship) to
+    /// lower to a whole-graph distinct-subject scan. Off by default — a full
+    /// scan is rarely what a production query intends; benchmarks and ad-hoc
+    /// exploration opt in (server flag `FLUREE_CYPHER_ALLOW_FULL_SCAN`).
+    pub allow_full_scan: bool,
+    /// Whether any reified edge can exist in the queried view. When the
+    /// caller proves it cannot (index stats + overlay both show no
+    /// `f:reifies*` facts), value-only bound relationship variables skip
+    /// the per-hop OPTIONAL annotation probe entirely. Defaults to `true`
+    /// (conservative): reified parallel edges must never be silently
+    /// dropped.
+    pub reified_edges_possible: bool,
+    /// Whether chains of anonymous untyped hops (`-->()-->()-->(n)`) may
+    /// lower to a single exact-depth wildcard path (frontier BFS with
+    /// per-level dedup) instead of per-hop triple joins. Join chains produce
+    /// one row per *walk*; the path operator one row per *endpoint* — the
+    /// two agree only when the statement's output is `DISTINCT`, aggregates
+    /// nothing, and never references the interior nodes. The statement
+    /// lowering sets this after checking those conditions
+    /// ([`super::stmt`]); default off (write-path MATCH lowering and CALL
+    /// bodies never enable it).
+    pub(super) fuse_reachability_chains: bool,
 }
 
 impl<'a, E: IriEncoder> LoweringContext<'a, E> {
@@ -42,10 +75,70 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
             encoder,
             vars,
             next_synth: 0,
-            vocab: "http://example.org/".to_string(),
+            vocab: None,
             overrides: HashMap::new(),
             scopes: Vec::new(),
+            scope_uses: Default::default(),
+            path_rel_lists: std::collections::HashMap::new(),
+            allow_full_scan: false,
+            reified_edges_possible: true,
+            fuse_reachability_chains: false,
         }
+    }
+
+    /// Opt in to whole-graph scans for bare `MATCH (n)` patterns.
+    pub fn with_allow_full_scan(mut self, allow: bool) -> Self {
+        self.allow_full_scan = allow;
+        self
+    }
+
+    /// Tell the lowering whether the queried view can contain reified
+    /// edges (see the field docs; `false` is a caller-proved guarantee).
+    pub fn with_reified_edges_possible(mut self, possible: bool) -> Self {
+        self.reified_edges_possible = possible;
+        self
+    }
+
+    /// Install the variable-use sets for the `Query` scope about to be
+    /// lowered, returning the previous ones for the caller to restore. Paired
+    /// save/restore (not a reset) because UNION branches and `CALL` bodies
+    /// nest: see [`super::annotation_use`] for why the sets are per-scope.
+    pub(super) fn swap_scope_uses(
+        &mut self,
+        uses: super::annotation_use::ScopeUses,
+    ) -> super::annotation_use::ScopeUses {
+        std::mem::replace(&mut self.scope_uses, uses)
+    }
+
+    /// Whether `name` is used on the relationship annotation surface in the
+    /// `Query` scope being lowered.
+    pub(super) fn is_annotation_dependent(&self, name: &str) -> bool {
+        self.scope_uses.annotation.contains(name)
+    }
+
+    /// Record that the path variable `path` was bound by a bounded fixed-chain
+    /// expansion which also bound `rel_list` to the chain's relationship list.
+    ///
+    /// `Binding::Path.edges` is `(start, predicate, end)` with no reifier slot,
+    /// so `relationships(p)` computed from the path value alone cannot carry
+    /// per-hop edge identity. The fixed chain binds a list that can, and
+    /// `lower/expr.rs` resolves `relationships(p)` to it. The path value still
+    /// serves `nodes(p)`, `length(p)` and `RETURN p`.
+    pub(super) fn register_path_rel_list(&mut self, path: VarId, rel_list: VarId) {
+        self.path_rel_lists.insert(path, rel_list);
+    }
+
+    /// The identity-carrying relationship list bound alongside `path`, if it
+    /// came from a bounded fixed-chain expansion.
+    pub(super) fn path_rel_list(&self, path: VarId) -> Option<VarId> {
+        self.path_rel_lists.get(&path).copied()
+    }
+
+    /// Whether the *elements* of the list bound to `name` have their
+    /// properties read in the `Query` scope being lowered — `all(x IN name
+    /// WHERE x.p)`, `[x IN tail(name) | x.p]`, `UNWIND name AS x … x.p`.
+    pub(super) fn reads_element_properties(&self, name: &str) -> bool {
+        self.scope_uses.element_property.contains(name)
     }
 
     /// Push a new loop-local scope. Pair with [`Self::exit_scope`].
@@ -76,7 +169,12 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
     }
 
     pub fn with_vocab(mut self, vocab: impl Into<String>) -> Self {
-        self.vocab = vocab.into();
+        self.vocab = Some(vocab.into());
+        self
+    }
+
+    pub fn with_vocab_opt(mut self, vocab: Option<String>) -> Self {
+        self.vocab = vocab;
         self
     }
 
@@ -105,8 +203,9 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
         self.vars.get_or_insert(name)
     }
 
-    /// Resolve a bare Cypher identifier (label, type, property key) to
-    /// an IRI. Order: per-request override → vocab + bare identifier.
+    /// Resolve a bare Cypher identifier (label, type, property key).
+    /// Order: per-request override → `@vocab` + bare identifier (RDF
+    /// compat) → the bare name itself (namespace 0, no IRI).
     pub fn resolve_iri(&self, name: &str) -> String {
         if name == "*" {
             return name.to_string();
@@ -114,8 +213,12 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
         if let Some(iri) = self.overrides.get(name) {
             return iri.clone();
         }
-        // No prefixing rules in Cypher; concatenate vocab + name.
-        format!("{}{}", self.vocab, name)
+        match &self.vocab {
+            // RDF compat: concatenate vocab + name (no prefixing rules
+            // in Cypher).
+            Some(vocab) => format!("{vocab}{name}"),
+            None => name.to_string(),
+        }
     }
 
     /// Resolve and reject reserved-system predicates.
@@ -130,5 +233,41 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
     /// rdf:type IRI.
     pub fn rdf_type_iri(&self) -> &'static str {
         rdf::TYPE
+    }
+
+    /// Lower a resolved IRI to a pattern `Ref` through the shared
+    /// [`IriEncoder::encode_ref`] rule, with one Cypher-specific addition:
+    /// with no @vocab, a bare Cypher name (no scheme — identifiers can't
+    /// contain `:`) lives under namespace 0 (empty prefix), which
+    /// `encode_iri_strict` rejects by design, so it is constructed directly.
+    /// Scheme-ful strings (system IRIs like rdf:type, backticked IRIs) keep
+    /// the shared behavior: unregistered namespaces stay `Ref::Iri`.
+    pub fn iri_ref(&self, iri: String) -> fluree_db_query::ir::Ref {
+        match self.encoder.encode_ref(&iri) {
+            fluree_db_query::ir::Ref::Iri(_) if self.is_bare_name(&iri) => {
+                fluree_db_query::ir::Ref::Sid(fluree_db_core::Sid::new(
+                    fluree_vocab::namespaces::EMPTY,
+                    iri,
+                ))
+            }
+            r => r,
+        }
+    }
+
+    /// Object-position counterpart of [`Self::iri_ref`].
+    pub fn iri_term(&self, iri: String) -> fluree_db_query::ir::Term {
+        match self.encoder.encode_term(&iri) {
+            fluree_db_query::ir::Term::Iri(_) if self.is_bare_name(&iri) => {
+                fluree_db_query::ir::Term::Sid(fluree_db_core::Sid::new(
+                    fluree_vocab::namespaces::EMPTY,
+                    iri,
+                ))
+            }
+            t => t,
+        }
+    }
+
+    fn is_bare_name(&self, iri: &str) -> bool {
+        self.vocab.is_none() && !iri.contains(':')
     }
 }

@@ -56,9 +56,22 @@ pub fn kebab_case(ident: &str) -> String {
 /// `DIM_GEOGRAPHY` → `GEOGRAPHY`, `FACT_ORDER_LINE` → `ORDER_LINE`, and any stem
 /// without a recognized marker is returned unchanged.
 pub fn strip_table_marker(stem: &str) -> &str {
-    stem.strip_prefix("DIM_")
-        .or_else(|| stem.strip_prefix("FACT_"))
+    strip_prefix_ignore_case(stem, "DIM_")
+        .or_else(|| strip_prefix_ignore_case(stem, "FACT_"))
         .unwrap_or(stem)
+}
+
+/// `strip_prefix`, ignoring ASCII case: catalogs differ in how they fold names.
+pub fn strip_prefix_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &s[prefix.len()..])
+}
+
+/// `strip_suffix`, ignoring ASCII case.
+pub fn strip_suffix_ignore_case<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
+    let at = s.len().checked_sub(suffix.len())?;
+    s.get(at..)?.eq_ignore_ascii_case(suffix).then(|| &s[..at])
 }
 
 /// The TriplesMap node local name for a table stem (`DIM_DATE` → `DimDate`).
@@ -83,7 +96,7 @@ pub fn class_slug(stem: &str) -> String {
 /// A bare `KEY` / `ID` (nothing left after stripping) is returned unchanged.
 pub fn strip_key_suffix(column: &str) -> &str {
     for suffix in ["_KEY", "_ID"] {
-        if let Some(stem) = column.strip_suffix(suffix) {
+        if let Some(stem) = strip_suffix_ignore_case(column, suffix) {
             if !stem.is_empty() {
                 return stem;
             }

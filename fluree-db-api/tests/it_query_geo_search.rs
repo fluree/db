@@ -2,27 +2,29 @@
 //!
 //! These tests use the unified Triple + Bind(geof:distance) + Filter pattern
 //! that works identically in both JSON-LD and SPARQL. The `geo_rewrite` pass in
-//! `prepare_execution` rewrites this pattern into `Pattern::GeoSearch` for
-//! index-accelerated proximity queries.
+//! `prepare_execution` rewrites this pattern into `Pattern::GeoSearch` when a
+//! binary index covers the query's `t`, so each test indexes a file-backed
+//! ledger and checks the index is loaded before it queries.
 //!
 //! Tests cover:
-//! - Time-travel: different `to_t` values produce different results
-//! - Overlay novelty: uncommitted changes affect search results
-//! - Overlay + time-travel interaction: overlay respects `to_t` bounds
-//! - Deduplication: multiple points per subject returns min distance
-//!
-//! These tests require the binary index to be built, so they use the native feature.
+//! - Time-travel: a query as of the index's base `t` and one at head, with
+//!   novelty past it
+//! - Retraction: a location retracted in novelty over the index
+//! - One row per matching point, as the patterns evaluated as written give
+//! - Distances, ORDER BY + LIMIT, and SPARQL
+//! - Datasets spanning two ledgers, which run without a binary index
 
 #![cfg(feature = "native")]
 
 use crate::support;
 use crate::support::{start_background_indexer_local, trigger_index_and_wait_outcome};
 use fluree_db_api::{
-    policy_builder, FlureeBuilder, GovernanceOptions, IndexConfig, LedgerState, Novelty,
+    policy_builder, Fluree, FlureeBuilder, GovernanceOptions, GraphDb, IndexConfig, LedgerState,
 };
-use fluree_db_core::LedgerSnapshot;
+use fluree_db_indexer::IndexerHandle;
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::{json, Value as JsonValue};
+use tokio::task::LocalSet;
 
 fn geo_search_context() -> JsonValue {
     json!({
@@ -32,15 +34,48 @@ fn geo_search_context() -> JsonValue {
     })
 }
 
+const PARIS: (f64, f64) = (2.3522, 48.8566);
+
+/// A file-backed connection that indexes on request; an in-memory one with
+/// no indexing mode never loads the index it builds, so its queries never
+/// reach `GeoSearch`. Run the test body inside `local.run_until`.
+fn indexed_fluree(tmp: &tempfile::TempDir) -> (Fluree, LocalSet, IndexerHandle) {
+    let mut fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+    (fluree, local, handle)
+}
+
+/// Index `alias` through its head and reload it, with the index loaded.
+async fn index_and_load(fluree: &Fluree, handle: &IndexerHandle, alias: &str) -> LedgerState {
+    let t = fluree.ledger(alias).await.expect("ledger").t();
+    trigger_index_and_wait_outcome(handle, alias, t).await;
+    let loaded = fluree.ledger(alias).await.expect("load ledger");
+    assert!(
+        loaded.snapshot.range_provider.is_some(),
+        "the index is loaded"
+    );
+    loaded
+}
+
 /// Helper to insert a city and return the resulting ledger state.
 async fn insert_city(
-    fluree: &support::MemoryFluree,
-    ledger: support::MemoryLedger,
+    fluree: &Fluree,
+    ledger: LedgerState,
     id: &str,
     name: &str,
     lng: f64,
     lat: f64,
-) -> support::MemoryLedger {
+) -> LedgerState {
     let tx = json!({
         "@context": geo_search_context(),
         "@id": id,
@@ -59,251 +94,141 @@ async fn insert_city(
         .ledger
 }
 
-/// Helper to retract a city's location using update.
+/// Retract a city's location, naming it by its WKT value.
 async fn retract_location(
-    fluree: &support::MemoryFluree,
-    ledger: support::MemoryLedger,
+    fluree: &Fluree,
+    ledger: LedgerState,
     id: &str,
     lng: f64,
     lat: f64,
-) -> support::MemoryLedger {
+) -> LedgerState {
+    let point = json!({
+        "@value": format!("POINT({lng} {lat})"),
+        "@type": "geo:wktLiteral"
+    });
     let tx = json!({
         "@context": geo_search_context(),
-        "where": {
-            "@id": id,
-            "ex:location": {
-                "@value": format!("POINT({} {})", lng, lat),
-                "@type": "geo:wktLiteral"
-            }
-        },
-        "delete": {
-            "@id": id,
-            "ex:location": {
-                "@value": format!("POINT({} {})", lng, lat),
-                "@type": "geo:wktLiteral"
-            }
-        }
+        "where": { "@id": id, "ex:location": point },
+        "delete": { "@id": id, "ex:location": point }
     });
-
-    fluree.update(ledger, &tx).await.expect("retract").ledger
+    let result = fluree.update(ledger, &tx).await.expect("retract");
+    assert_eq!(result.receipt.retract_count, 1, "the location is retracted");
+    result.ledger
 }
 
-/// Helper to run a geo proximity query and return city names.
-///
-/// Uses Triple + Bind(geof:distance) + Filter pattern which `geo_rewrite`
-/// rewrites into Pattern::GeoSearch for index acceleration.
-async fn query_nearby(
-    fluree: &support::MemoryFluree,
-    ledger: &support::MemoryLedger,
-    center_lng: f64,
-    center_lat: f64,
-    radius_meters: f64,
-) -> Vec<String> {
-    let bind_expr = format!("(geof:distance ?loc \"POINT({center_lng} {center_lat})\")");
-    let filter_expr = format!("(<= ?dist {radius_meters})");
-
-    let query = json!({
-        "@context": geo_search_context(),
-        "select": ["?name"],
-        "where": [
-            { "@id": "?place", "ex:location": "?loc" },
-            ["bind", "?dist", bind_expr],
-            ["filter", filter_expr],
-            { "@id": "?place", "ex:name": "?name" }
-        ]
-    });
-
-    let result = support::query_jsonld(fluree, ledger, &query).await;
-    match result {
-        Ok(r) => {
-            let json_rows = r.to_jsonld(&ledger.snapshot).expect("jsonld");
-            json_rows
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|row| row.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default()
-        }
-        Err(e) => {
-            eprintln!("Query error (expected if binary index not available): {e}");
-            vec![]
-        }
-    }
-}
-
-/// Helper to run a geo proximity query with distance output.
-///
-/// Uses Triple + Bind(geof:distance) + Filter pattern, ordered by distance.
-async fn query_nearby_with_distance(
-    fluree: &support::MemoryFluree,
-    ledger: &support::MemoryLedger,
-    center_lng: f64,
-    center_lat: f64,
+/// The places within `radius_meters` of `center` with their distances,
+/// nearest first. The Triple + Bind(geof:distance) + Filter shape is what
+/// `geo_rewrite` turns into `Pattern::GeoSearch`.
+async fn nearby(
+    fluree: &Fluree,
+    db: &GraphDb,
+    (center_lng, center_lat): (f64, f64),
     radius_meters: f64,
 ) -> Vec<(String, f64)> {
-    let bind_expr = format!("(geof:distance ?loc \"POINT({center_lng} {center_lat})\")");
-    let filter_expr = format!("(<= ?dist {radius_meters})");
-
     let query = json!({
         "@context": geo_search_context(),
         "select": ["?name", "?dist"],
         "where": [
             { "@id": "?place", "ex:location": "?loc" },
-            ["bind", "?dist", bind_expr],
-            ["filter", filter_expr],
+            ["bind", "?dist", format!("(geof:distance ?loc \"POINT({center_lng} {center_lat})\")")],
+            ["filter", format!("(<= ?dist {radius_meters})")],
             { "@id": "?place", "ex:name": "?name" }
         ],
         "orderBy": "?dist"
     });
+    let rows = fluree
+        .query(db, &query)
+        .await
+        .expect("geo query")
+        .to_jsonld(&db.snapshot)
+        .expect("jsonld");
+    rows.as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| {
+            (
+                row[0].as_str().expect("name").to_string(),
+                row[1].as_f64().expect("distance"),
+            )
+        })
+        .collect()
+}
 
-    let result = support::query_jsonld(fluree, ledger, &query).await;
-    match result {
-        Ok(r) => {
-            let json_rows = r.to_jsonld(&ledger.snapshot).expect("jsonld");
-            json_rows
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|row| {
-                            let arr = row.as_array()?;
-                            let name = arr.first()?.as_str()?.to_string();
-                            let dist = arr.get(1)?.as_f64()?;
-                            Some((name, dist))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        }
-        Err(e) => {
-            eprintln!("Query error: {e}");
-            vec![]
-        }
-    }
+fn names(rows: &[(String, f64)]) -> Vec<&str> {
+    rows.iter().map(|(name, _)| name.as_str()).collect()
 }
 
 // =============================================================================
-// Time-travel tests
+// Time-travel and novelty tests
 // =============================================================================
 
+/// GeoSearch reads the index as of the query's `t` and overlays the novelty
+/// past the index's base: a city inserted after the index is found at head
+/// and not as of the base.
 #[tokio::test]
 async fn geo_search_time_travel_different_results_at_different_t() {
-    // Test that querying at different t values returns different results.
-    //
-    // Scenario:
-    // - t=1: Insert Paris
-    // - t=2: Insert London (within 500km of Paris)
-    // - Query at t=1 should only find Paris
-    // - Query at t=2 should find both Paris and London
-
-    let fluree = FlureeBuilder::memory().build_memory();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (fluree, local, handle) = indexed_fluree(&tmp);
     let alias = "it/geo-search-time-travel:main";
-
-    let (local, handle) = start_background_indexer_local(
-        fluree.backend().clone(),
-        fluree
-            .nameservice_mode()
-            .publisher_arc()
-            .expect("test setup requires ReadWrite nameservice mode"),
-        fluree_db_indexer::IndexerConfig::small(),
-    );
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(alias);
-            let ledger = LedgerState::new(db0, Novelty::new(0));
+            let ledger = fluree.create_ledger(alias).await.expect("create");
+            insert_city(&fluree, ledger, "ex:paris", "Paris", 2.3522, 48.8566).await;
+            let indexed = index_and_load(&fluree, &handle, alias).await;
+            let base_t = indexed.t();
 
-            // t=1: Insert Paris (lat=48.8566, lng=2.3522)
-            let ledger = insert_city(&fluree, ledger, "ex:paris", "Paris", 2.3522, 48.8566).await;
-            let _t1 = ledger.snapshot.t;
+            // London (~343km from Paris) only in novelty.
+            insert_city(&fluree, indexed, "ex:london", "London", -0.1278, 51.5074).await;
 
-            // t=2: Insert London (lat=51.5074, lng=-0.1278) - ~343km from Paris
-            let ledger =
-                insert_city(&fluree, ledger, "ex:london", "London", -0.1278, 51.5074).await;
-            let t2 = ledger.snapshot.t;
-
-            // Trigger indexing to build binary index
-            let completion = handle.trigger(alias, t2).await;
-            match completion.wait().await {
-                fluree_db_api::IndexOutcome::Completed { .. } => {}
-                fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
-                fluree_db_api::IndexOutcome::Cancelled => panic!("indexing cancelled"),
-            }
-
-            // Load the indexed ledger
-            let loaded = fluree.ledger(alias).await.expect("load ledger");
-
-            // Query at t=2 (current) - should find both cities within 500km of Paris
-            let results_t2 = query_nearby(&fluree, &loaded, 2.3522, 48.8566, 500_000.0).await;
-
-            // Note: This test verifies the query infrastructure works.
-            // The actual time-travel filtering happens via cursor.set_to_t()
-            // which is wired in GeoSearchOperator.
-            println!("Results at t={t2}: {results_t2:?}");
-
-            // If binary index is available and working, we should get results
+            let head = fluree.db(alias).await.expect("db");
+            assert_eq!(
+                names(&nearby(&fluree, &head, PARIS, 500_000.0).await),
+                ["Paris", "London"]
+            );
+            let at_base = fluree.db(alias).await.expect("db").as_of(base_t);
+            assert_eq!(
+                names(&nearby(&fluree, &at_base, PARIS, 500_000.0).await),
+                ["Paris"]
+            );
         })
         .await;
 }
 
+/// A location retracted after the index was built is gone from the results,
+/// though the index still holds it.
 #[tokio::test]
 async fn geo_search_retraction_removes_point_from_results() {
-    // Test that retracting a location removes it from search results.
-    //
-    // Scenario:
-    // - t=1: Insert Paris
-    // - t=2: Insert London
-    // - t=3: Retract London's location
-    // - Query at t=3 should only find Paris
-
-    let fluree = FlureeBuilder::memory().build_memory();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (fluree, local, handle) = indexed_fluree(&tmp);
     let alias = "it/geo-search-retraction:main";
-
-    let (local, handle) = start_background_indexer_local(
-        fluree.backend().clone(),
-        fluree
-            .nameservice_mode()
-            .publisher_arc()
-            .expect("test setup requires ReadWrite nameservice mode"),
-        fluree_db_indexer::IndexerConfig::small(),
-    );
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(alias);
-            let ledger = LedgerState::new(db0, Novelty::new(0));
-
-            // t=1: Insert Paris
+            let ledger = fluree.create_ledger(alias).await.expect("create");
             let ledger = insert_city(&fluree, ledger, "ex:paris", "Paris", 2.3522, 48.8566).await;
+            insert_city(&fluree, ledger, "ex:london", "London", -0.1278, 51.5074).await;
+            let indexed = index_and_load(&fluree, &handle, alias).await;
+            let before = GraphDb::from_ledger_state(&indexed);
+            assert_eq!(
+                names(&nearby(&fluree, &before, PARIS, 500_000.0).await),
+                ["Paris", "London"]
+            );
 
-            // t=2: Insert London
-            let ledger =
-                insert_city(&fluree, ledger, "ex:london", "London", -0.1278, 51.5074).await;
-            let _t2 = ledger.snapshot.t;
+            let ledger = retract_location(&fluree, indexed, "ex:london", -0.1278, 51.5074).await;
+            let after = GraphDb::from_ledger_state(&ledger);
+            assert_eq!(
+                names(&nearby(&fluree, &after, PARIS, 500_000.0).await),
+                ["Paris"]
+            );
 
-            // t=3: Retract London's location
-            let ledger = retract_location(&fluree, ledger, "ex:london", -0.1278, 51.5074).await;
-            let t3 = ledger.snapshot.t;
-
-            // Trigger indexing
-            let completion = handle.trigger(alias, t3).await;
-            match completion.wait().await {
-                fluree_db_api::IndexOutcome::Completed { .. } => {}
-                fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
-                fluree_db_api::IndexOutcome::Cancelled => panic!("indexing cancelled"),
-            }
-
-            // Load the indexed ledger
-            let loaded = fluree.ledger(alias).await.expect("load ledger");
-
-            // Query - should only find Paris (London's location was retracted)
-            let results = query_nearby(&fluree, &loaded, 2.3522, 48.8566, 500_000.0).await;
-            println!("Results after retraction: {results:?}");
-
-            // If working correctly:
-            // - Paris should be in results
-            // - London should NOT be in results (location retracted)
+            // And once the retraction is indexed too.
+            let reindexed = index_and_load(&fluree, &handle, alias).await;
+            let reindexed = GraphDb::from_ledger_state(&reindexed);
+            assert_eq!(
+                names(&nearby(&fluree, &reindexed, PARIS, 500_000.0).await),
+                ["Paris"]
+            );
         })
         .await;
 }
@@ -312,18 +237,17 @@ async fn geo_search_retraction_removes_point_from_results() {
 // Deduplication tests
 // =============================================================================
 
+/// A subject with several points within the radius matches once per point,
+/// each with that point's own distance and the point bound — exactly what the
+/// triple + bind + filter evaluated as written gives, before the ledger is
+/// indexed. The rewrite into GeoSearch must not change the answer.
 #[tokio::test]
-async fn geo_search_dedup_returns_min_distance_per_subject() {
-    // Test that when a subject has multiple GeoPoint values for the same predicate,
-    // deduplication returns only one result per subject with the minimum distance.
-    //
-    // Scenario:
-    // - Insert a city with two locations (e.g., city center and airport)
-    // - Query should return the city once with the closer location's distance
-
-    let fluree = FlureeBuilder::memory().build_memory();
-    let alias = "it/geo-search-dedup:main";
-
+async fn geo_search_matches_once_per_point_like_the_patterns_it_replaces() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let mut fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+    let alias = "it/geo-search-points:main";
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
         fluree
@@ -332,65 +256,76 @@ async fn geo_search_dedup_returns_min_distance_per_subject() {
             .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(alias);
-            let ledger = LedgerState::new(db0, Novelty::new(0));
-
-            // Insert Paris with two locations: city center and a point 100km away
-            // City center: (2.3522, 48.8566)
-            // Far point: (2.3522, 49.7566) - ~100km north
+            let ledger = fluree.create_ledger(alias).await.expect("create");
+            // Paris with two points ~100km apart, and Rome, out of range.
             let tx = json!({
                 "@context": geo_search_context(),
-                "@id": "ex:paris",
-                "@type": "ex:City",
-                "ex:name": "Paris",
-                "ex:location": [
-                    {
-                        "@value": "POINT(2.3522 48.8566)",
-                        "@type": "geo:wktLiteral"
-                    },
-                    {
-                        "@value": "POINT(2.3522 49.7566)",
-                        "@type": "geo:wktLiteral"
-                    }
+                "@graph": [
+                    {"@id": "ex:paris", "ex:name": "Paris", "ex:location": [
+                        {"@value": "POINT(2.3522 48.8566)", "@type": "geo:wktLiteral"},
+                        {"@value": "POINT(2.3522 49.7566)", "@type": "geo:wktLiteral"}
+                    ]},
+                    {"@id": "ex:rome", "ex:name": "Rome",
+                     "ex:location": {"@value": "POINT(12.4964 41.9028)", "@type": "geo:wktLiteral"}}
                 ]
             });
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 1_000_000,
+            };
+            let ledger = fluree
+                .insert_with_opts(
+                    ledger,
+                    &tx,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert")
+                .ledger;
+            let query = json!({
+                "@context": geo_search_context(),
+                "select": ["?name", "?loc", "?dist"],
+                "where": [
+                    { "@id": "?place", "ex:location": "?loc" },
+                    ["bind", "?dist", "(geof:distance ?loc \"POINT(2.3522 48.8566)\")"],
+                    ["filter", "(<= ?dist 200000)"],
+                    { "@id": "?place", "ex:name": "?name" }
+                ],
+                "orderBy": "?dist"
+            });
+            let rows = |ledger: LedgerState| {
+                let (fluree, query) = (&fluree, &query);
+                async move {
+                    support::query_jsonld(fluree, &ledger, query)
+                        .await
+                        .expect("query")
+                        .to_jsonld(&ledger.snapshot)
+                        .expect("format")
+                }
+            };
 
-            let ledger = fluree.insert(ledger, &tx).await.expect("insert").ledger;
-            let t = ledger.snapshot.t;
+            let as_written = rows(ledger.clone()).await;
+            let found = as_written.as_array().expect("rows");
+            assert_eq!(found.len(), 2, "one row per point: {as_written}");
+            assert!(found
+                .iter()
+                .all(|row| row[0] == "Paris" && row[1].is_object()));
+            assert!(found[0][2].as_f64().unwrap() < 1.0);
+            assert!(found[1][2].as_f64().unwrap() > 90_000.0);
 
-            // Trigger indexing
-            let completion = handle.trigger(alias, t).await;
-            match completion.wait().await {
-                fluree_db_api::IndexOutcome::Completed { .. } => {}
-                fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
-                fluree_db_api::IndexOutcome::Cancelled => panic!("indexing cancelled"),
-            }
-
-            // Load the indexed ledger
-            let loaded = fluree.ledger(alias).await.expect("load ledger");
-
-            // Query from Paris city center with large radius to find both points
-            let results =
-                query_nearby_with_distance(&fluree, &loaded, 2.3522, 48.8566, 200_000.0).await;
-            println!("Results with distance: {results:?}");
-
-            // Deduplication should return Paris once with the minimum distance (0m for city center)
-            // Not twice (once for each location)
-            let paris_count = results.iter().filter(|(name, _)| name == "Paris").count();
+            trigger_index_and_wait_outcome(&handle, alias, ledger.t()).await;
+            let indexed = fluree.ledger(alias).await.expect("load ledger");
             assert!(
-                paris_count <= 1,
-                "Expected at most 1 result for Paris (dedup), got {paris_count}"
+                indexed.snapshot.range_provider.is_some(),
+                "the index is loaded"
             );
-
-            if let Some((_, dist)) = results.iter().find(|(name, _)| name == "Paris") {
-                assert!(
-                    *dist < 1000.0, // Should be ~0m for city center, not ~100km for far point
-                    "Expected min distance (~0m), got {dist}m"
-                );
-            }
+            assert_eq!(rows(indexed).await, as_written);
         })
         .await;
 }
@@ -401,76 +336,36 @@ async fn geo_search_dedup_returns_min_distance_per_subject() {
 
 #[tokio::test]
 async fn geo_search_returns_correct_distances() {
-    // Test that geof:distance returns accurate haversine distances.
-    //
-    // Known distances:
-    // - Paris to London: ~343km
-    // - Paris to Berlin: ~878km
-
-    let fluree = FlureeBuilder::memory().build_memory();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (fluree, local, handle) = indexed_fluree(&tmp);
     let alias = "it/geo-search-distance:main";
-
-    let (local, handle) = start_background_indexer_local(
-        fluree.backend().clone(),
-        fluree
-            .nameservice_mode()
-            .publisher_arc()
-            .expect("test setup requires ReadWrite nameservice mode"),
-        fluree_db_indexer::IndexerConfig::small(),
-    );
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(alias);
-            let ledger = LedgerState::new(db0, Novelty::new(0));
-
-            // Insert cities
+            let ledger = fluree.create_ledger(alias).await.expect("create");
             let ledger = insert_city(&fluree, ledger, "ex:paris", "Paris", 2.3522, 48.8566).await;
             let ledger =
                 insert_city(&fluree, ledger, "ex:london", "London", -0.1278, 51.5074).await;
-            let ledger =
-                insert_city(&fluree, ledger, "ex:berlin", "Berlin", 13.4050, 52.5200).await;
-            let t = ledger.snapshot.t;
+            insert_city(&fluree, ledger, "ex:berlin", "Berlin", 13.4050, 52.5200).await;
+            let indexed = index_and_load(&fluree, &handle, alias).await;
 
-            // Trigger indexing
-            let completion = handle.trigger(alias, t).await;
-            match completion.wait().await {
-                fluree_db_api::IndexOutcome::Completed { .. } => {}
-                fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
-                fluree_db_api::IndexOutcome::Cancelled => panic!("indexing cancelled"),
-            }
-
-            // Load the indexed ledger
-            let loaded = fluree.ledger(alias).await.expect("load ledger");
-
-            // Query from Paris with 1000km radius (should find Paris, London, and Berlin)
-            let results =
-                query_nearby_with_distance(&fluree, &loaded, 2.3522, 48.8566, 1_000_000.0).await;
-            println!("Distance results: {results:?}");
-
-            // Verify distances are approximately correct
-            for (name, dist) in &results {
-                match name.as_str() {
-                    "Paris" => {
-                        assert!(*dist < 1000.0, "Paris distance should be ~0m, got {dist}m");
-                    }
-                    "London" => {
-                        // Paris-London: ~343km
-                        assert!(
-                            (330_000.0..360_000.0).contains(dist),
-                            "London distance should be ~343km, got {dist}m"
-                        );
-                    }
-                    "Berlin" => {
-                        // Paris-Berlin: ~878km
-                        assert!(
-                            (860_000.0..900_000.0).contains(dist),
-                            "Berlin distance should be ~878km, got {dist}m"
-                        );
-                    }
-                    _ => {}
-                }
-            }
+            let rows = nearby(
+                &fluree,
+                &GraphDb::from_ledger_state(&indexed),
+                PARIS,
+                1_000_000.0,
+            )
+            .await;
+            assert_eq!(names(&rows), ["Paris", "London", "Berlin"]);
+            assert!(rows[0].1 < 1.0, "Paris is ~0m away: {rows:?}");
+            assert!(
+                (330_000.0..360_000.0).contains(&rows[1].1),
+                "London is ~343km away: {rows:?}"
+            );
+            assert!(
+                (860_000.0..900_000.0).contains(&rows[2].1),
+                "Berlin is ~878km away: {rows:?}"
+            );
         })
         .await;
 }
@@ -481,90 +376,47 @@ async fn geo_search_returns_correct_distances() {
 
 #[tokio::test]
 async fn geo_search_respects_limit_returns_nearest() {
-    // Test that query-level limit + orderBy returns only the N nearest results.
-
-    let fluree = FlureeBuilder::memory().build_memory();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (fluree, local, handle) = indexed_fluree(&tmp);
     let alias = "it/geo-search-limit:main";
-
-    let (local, handle) = start_background_indexer_local(
-        fluree.backend().clone(),
-        fluree
-            .nameservice_mode()
-            .publisher_arc()
-            .expect("test setup requires ReadWrite nameservice mode"),
-        fluree_db_indexer::IndexerConfig::small(),
-    );
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(alias);
-            let ledger = LedgerState::new(db0, Novelty::new(0));
-
-            // Insert cities at increasing distances from Paris
-            let ledger = insert_city(&fluree, ledger, "ex:paris", "Paris", 2.3522, 48.8566).await;
+            let ledger = fluree.create_ledger(alias).await.expect("create");
+            // Inserted farthest first, so insertion order cannot pass for
+            // nearest-first.
+            let ledger = insert_city(&fluree, ledger, "ex:tokyo", "Tokyo", 139.6917, 35.6895).await;
             let ledger =
-                insert_city(&fluree, ledger, "ex:london", "London", -0.1278, 51.5074).await; // ~343km
+                insert_city(&fluree, ledger, "ex:berlin", "Berlin", 13.4050, 52.5200).await;
             let ledger =
-                insert_city(&fluree, ledger, "ex:berlin", "Berlin", 13.4050, 52.5200).await; // ~878km
-            let ledger = insert_city(&fluree, ledger, "ex:tokyo", "Tokyo", 139.6917, 35.6895).await; // ~9700km
-            let t = ledger.snapshot.t;
+                insert_city(&fluree, ledger, "ex:london", "London", -0.1278, 51.5074).await;
+            insert_city(&fluree, ledger, "ex:paris", "Paris", 2.3522, 48.8566).await;
+            let indexed = index_and_load(&fluree, &handle, alias).await;
 
-            // Trigger indexing
-            let completion = handle.trigger(alias, t).await;
-            match completion.wait().await {
-                fluree_db_api::IndexOutcome::Completed { .. } => {}
-                fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
-                fluree_db_api::IndexOutcome::Cancelled => panic!("indexing cancelled"),
-            }
-
-            // Load the indexed ledger
-            let loaded = fluree.ledger(alias).await.expect("load ledger");
-
-            // Query with limit=2, ordered by distance, should return Paris and London (nearest 2)
-            let bind_expr = "(geof:distance ?loc \"POINT(2.3522 48.8566)\")";
             let query = json!({
                 "@context": geo_search_context(),
                 "select": ["?name", "?dist"],
                 "where": [
                     { "@id": "?place", "ex:location": "?loc" },
-                    ["bind", "?dist", bind_expr],
+                    ["bind", "?dist", "(geof:distance ?loc \"POINT(2.3522 48.8566)\")"],
                     ["filter", "(<= ?dist 20000000)"],
                     { "@id": "?place", "ex:name": "?name" }
                 ],
                 "orderBy": "?dist",
                 "limit": 2
             });
-
-            let result = support::query_jsonld(&fluree, &loaded, &query).await;
-            match result {
-                Ok(r) => {
-                    let json_rows = r.to_jsonld(&loaded.snapshot).expect("jsonld");
-                    let names: Vec<&str> = json_rows
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| {
-                                    v.as_array()
-                                        .and_then(|a| a.first())
-                                        .and_then(|v| v.as_str())
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-
-                    println!("Limited results: {names:?}");
-                    assert!(
-                        names.len() <= 2,
-                        "Expected at most 2 results with limit=2, got {}",
-                        names.len()
-                    );
-                    // Paris should always be included (distance 0)
-                    // London should be second (distance ~343km)
-                }
-                Err(e) => {
-                    eprintln!("Query error: {e}");
-                }
-            }
+            let rows = support::query_jsonld(&fluree, &indexed, &query)
+                .await
+                .expect("geo query")
+                .to_jsonld(&indexed.snapshot)
+                .expect("jsonld");
+            let found: Vec<&str> = rows
+                .as_array()
+                .expect("rows")
+                .iter()
+                .map(|row| row[0].as_str().expect("name"))
+                .collect();
+            assert_eq!(found, ["Paris", "London"]);
         })
         .await;
 }
@@ -573,40 +425,23 @@ async fn geo_search_respects_limit_returns_nearest() {
 // Named Graph Tests
 // =============================================================================
 
-/// Test that geo queries respect named graph boundaries.
-///
-/// This verifies that when querying a named graph, only locations within that
-/// graph are returned - not locations from the default graph or other named graphs.
-///
-/// This test uses TWO named graphs (Germany and Italy) plus a default graph to ensure
-/// that the g_id routing correctly distinguishes between different named graphs,
-/// not just between "named" and "default".
+/// Geo search stays within the graph it reads: the default graph's cities
+/// and each named graph's, though every one is within reach of the others.
+/// Two named graphs, so graph routing must tell them apart, not only named
+/// from default.
 #[tokio::test]
-#[ignore = "named graph geo boundary test needs graph-scoped binary index routing"]
 async fn geo_search_respects_named_graph_boundaries() {
-    let fluree = FlureeBuilder::memory().build_memory();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (fluree, local, handle) = indexed_fluree(&tmp);
     let alias = "it/geo-named-graph:main";
-
-    let (local, handle) = start_background_indexer_local(
-        fluree.backend().clone(),
-        fluree
-            .nameservice_mode()
-            .publisher_arc()
-            .expect("test setup requires ReadWrite nameservice mode"),
-        fluree_db_indexer::IndexerConfig::small(),
-    );
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(alias);
-            let ledger = LedgerState::new(db0, Novelty::new(0));
-
-            // Insert cities in default graph (France)
+            let ledger = fluree.create_ledger(alias).await.expect("create");
+            // Default graph: France.
             let ledger = insert_city(&fluree, ledger, "ex:paris", "Paris", 2.3522, 48.8566).await;
             let ledger = insert_city(&fluree, ledger, "ex:lyon", "Lyon", 4.8357, 45.7640).await;
-
-            // Insert cities in named graph: Germany (TriG format via staged builder)
-            let germany_trig = r#"
+            let trig = r#"
                 @prefix ex: <http://example.org/> .
                 @prefix geo: <http://www.opengis.net/ont/geosparql#> .
 
@@ -618,21 +453,6 @@ async fn geo_search_respects_named_graph_boundaries() {
                         ex:name "Munich" ;
                         ex:location "POINT(11.5820 48.1351)"^^geo:wktLiteral .
                 }
-            "#;
-
-            let ledger = fluree
-                .stage_owned(ledger)
-                .upsert_turtle(germany_trig)
-                .execute()
-                .await
-                .expect("insert germany graph")
-                .ledger;
-
-            // Insert cities in named graph: Italy (TriG format via staged builder)
-            let italy_trig = r#"
-                @prefix ex: <http://example.org/> .
-                @prefix geo: <http://www.opengis.net/ont/geosparql#> .
-
                 GRAPH <http://example.org/graphs/italy> {
                     ex:rome a ex:City ;
                         ex:name "Rome" ;
@@ -642,71 +462,70 @@ async fn geo_search_respects_named_graph_boundaries() {
                         ex:location "POINT(9.1900 45.4642)"^^geo:wktLiteral .
                 }
             "#;
-
-            let ledger = fluree
+            fluree
                 .stage_owned(ledger)
-                .upsert_turtle(italy_trig)
+                .upsert_turtle(trig)
                 .execute()
                 .await
-                .expect("insert italy graph")
-                .ledger;
-            let t = ledger.snapshot.t;
+                .expect("named graphs");
+            let indexed = index_and_load(&fluree, &handle, alias).await;
 
-            // Trigger indexing
-            let completion = handle.trigger(alias, t).await;
-            match completion.wait().await {
-                fluree_db_api::IndexOutcome::Completed { .. } => {}
-                fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
-                fluree_db_api::IndexOutcome::Cancelled => panic!("indexing cancelled"),
-            }
-
-            // Load the indexed ledger
-            let loaded = fluree.ledger(alias).await.expect("load ledger");
-
-            // Query default graph from Paris - should find Paris and Lyon only
-            let default_query = json!({
-                "@context": geo_search_context(),
-                "from": alias,
-                "select": ["?name"],
-                "where": [
-                    { "@id": "?place", "ex:location": "?loc" },
-                    ["bind", "?dist", "(geof:distance ?loc \"POINT(2.3522 48.8566)\")"],
-                    ["filter", "(<= ?dist 2000000)"],
-                    { "@id": "?place", "ex:name": "?name" }
-                ]
-            });
-
-            let result = support::query_jsonld(&fluree, &loaded, &default_query).await;
-            match result {
-                Ok(r) => {
-                    let json_rows = r.to_jsonld(&loaded.snapshot).expect("jsonld");
-                    let names: Vec<&str> = json_rows
-                        .as_array()
-                        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-                        .unwrap_or_default();
-
-                    println!("Default graph results: {names:?}");
-                    assert!(
-                        names.contains(&"Paris"),
-                        "Paris should be in default graph results"
+            // Every city is within 1,500 km of Paris, and of Munich.
+            let names_in = |graph: Option<&'static str>, center: &'static str| {
+                let (fluree, indexed) = (&fluree, &indexed);
+                async move {
+                    let shape = format!(
+                        r#"?place <http://example.org/location> ?loc ;
+                                  <http://example.org/name> ?name .
+                           BIND(geof:distance(?loc, "{center}"^^geo:wktLiteral) AS ?dist)
+                           FILTER(?dist <= 1500000)"#
                     );
-                    assert!(
-                        names.contains(&"Lyon"),
-                        "Lyon should be in default graph results"
+                    let pattern = match graph {
+                        Some(iri) => format!("GRAPH <{iri}> {{ {shape} }}"),
+                        None => shape,
+                    };
+                    let sparql = format!(
+                        "PREFIX geo: <http://www.opengis.net/ont/geosparql#>
+                         PREFIX geof: <http://www.opengis.net/def/function/geosparql/>
+                         SELECT ?name WHERE {{ {pattern} }} ORDER BY ?name"
                     );
-                    assert!(
-                        !names.contains(&"Berlin"),
-                        "Berlin should NOT be in default graph results"
-                    );
-                    assert!(
-                        !names.contains(&"Rome"),
-                        "Rome should NOT be in default graph results"
-                    );
+                    let rows = support::query_sparql(fluree, indexed, &sparql)
+                        .await
+                        .expect("geo query")
+                        .to_jsonld(&indexed.snapshot)
+                        .expect("jsonld");
+                    rows.as_array()
+                        .expect("rows")
+                        .iter()
+                        .map(|row| {
+                            row.as_str()
+                                .or_else(|| row[0].as_str())
+                                .unwrap_or_else(|| panic!("a name: {row}"))
+                                .to_string()
+                        })
+                        .collect::<Vec<_>>()
                 }
-                Err(e) => {
-                    eprintln!("Default graph query error (expected if binary index issue): {e}");
-                }
-            }
+            };
+            assert_eq!(
+                names_in(None, "POINT(2.3522 48.8566)").await,
+                ["Lyon", "Paris"]
+            );
+            assert_eq!(
+                names_in(
+                    Some("http://example.org/graphs/germany"),
+                    "POINT(11.5820 48.1351)"
+                )
+                .await,
+                ["Berlin", "Munich"]
+            );
+            assert_eq!(
+                names_in(
+                    Some("http://example.org/graphs/italy"),
+                    "POINT(11.5820 48.1351)"
+                )
+                .await,
+                ["Milan", "Rome"]
+            );
         })
         .await;
 }
@@ -715,59 +534,29 @@ async fn geo_search_respects_named_graph_boundaries() {
 // SPARQL geof:distance rewrite tests
 // =============================================================================
 
-/// Test that SPARQL geof:distance queries are rewritten to use GeoSearch acceleration.
-///
-/// This test verifies that the geo_rewrite pass correctly transforms:
+/// The same shape in SPARQL:
 /// ```sparql
 /// ?place ex:location ?loc .
 /// BIND(geof:distance(?loc, "POINT(...)"^^geo:wktLiteral) AS ?dist)
 /// FILTER(?dist < 500000)
 /// ```
-/// into a Pattern::GeoSearch that uses the accelerated GeoPoint index.
 #[tokio::test]
 async fn sparql_geof_distance_uses_geo_index() {
-    let fluree = FlureeBuilder::memory().build_memory();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (fluree, local, handle) = indexed_fluree(&tmp);
     let alias = "it/geo-search-sparql:main";
-
-    let (local, handle) = start_background_indexer_local(
-        fluree.backend().clone(),
-        fluree
-            .nameservice_mode()
-            .publisher_arc()
-            .expect("test setup requires ReadWrite nameservice mode"),
-        fluree_db_indexer::IndexerConfig::small(),
-    );
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(alias);
-            let ledger = LedgerState::new(db0, Novelty::new(0));
-
-            // Insert cities
+            let ledger = fluree.create_ledger(alias).await.expect("create");
             let ledger = insert_city(&fluree, ledger, "ex:paris", "Paris", 2.3522, 48.8566).await;
             let ledger =
                 insert_city(&fluree, ledger, "ex:london", "London", -0.1278, 51.5074).await;
             let ledger =
                 insert_city(&fluree, ledger, "ex:berlin", "Berlin", 13.4050, 52.5200).await;
-            let ledger = insert_city(&fluree, ledger, "ex:tokyo", "Tokyo", 139.6917, 35.6895).await;
-            let t = ledger.snapshot.t;
+            insert_city(&fluree, ledger, "ex:tokyo", "Tokyo", 139.6917, 35.6895).await;
+            let indexed = index_and_load(&fluree, &handle, alias).await;
 
-            // Trigger indexing
-            let completion = handle.trigger(alias, t).await;
-            match completion.wait().await {
-                fluree_db_api::IndexOutcome::Completed { .. } => {}
-                fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
-                fluree_db_api::IndexOutcome::Cancelled => panic!("indexing cancelled"),
-            }
-
-            // Load the indexed ledger
-            let loaded = fluree.ledger(alias).await.expect("load ledger");
-
-            // Query using SPARQL with geof:distance
-            // This pattern should be rewritten to GeoSearch:
-            // - Triple(?place, ex:location, ?loc)
-            // - BIND(geof:distance(?loc, POINT) AS ?dist)
-            // - FILTER(?dist < 500000)
             let sparql = r#"
                 PREFIX ex: <http://example.org/>
                 PREFIX geo: <http://www.opengis.net/ont/geosparql#>
@@ -783,75 +572,103 @@ async fn sparql_geof_distance_uses_geo_index() {
                 }
                 ORDER BY ?dist
             "#;
+            let rows = support::query_sparql(&fluree, &indexed, sparql)
+                .await
+                .expect("SPARQL geo query")
+                .to_jsonld(&indexed.snapshot)
+                .expect("jsonld");
+            let rows: Vec<(String, f64)> = rows
+                .as_array()
+                .expect("rows")
+                .iter()
+                .map(|row| {
+                    (
+                        row[0].as_str().expect("name").to_string(),
+                        row[1].as_f64().expect("distance"),
+                    )
+                })
+                .collect();
+            assert_eq!(names(&rows), ["Paris", "London"]);
+            assert!(rows[0].1 < 1.0, "Paris is ~0m away: {rows:?}");
+            assert!(
+                (330_000.0..360_000.0).contains(&rows[1].1),
+                "London is ~343km away: {rows:?}"
+            );
+        })
+        .await;
+}
 
-            let result = support::query_sparql(&fluree, &loaded, sparql).await;
-            match result {
-                Ok(r) => {
-                    let json_rows = r.to_jsonld(&loaded.snapshot).expect("jsonld");
-                    println!("SPARQL geof:distance results: {json_rows:?}");
+// =============================================================================
+// Multi-ledger datasets
+// =============================================================================
 
-                    // Parse results
-                    let results: Vec<(String, f64)> = json_rows
+/// A dataset spanning two ledgers runs without a binary index, so the shape
+/// is left as written rather than rewritten into a `GeoSearch` that cannot
+/// run, whether the second ledger joins the default graph or is named.
+#[tokio::test]
+async fn geof_distance_across_two_indexed_ledgers() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (fluree, local, handle) = indexed_fluree(&tmp);
+    let (a, b) = ("it/geo-multi-a:main", "it/geo-multi-b:main");
+
+    local
+        .run_until(async move {
+            let ledger = fluree.create_ledger(a).await.expect("create a");
+            let ledger = insert_city(&fluree, ledger, "ex:paris", "Paris", 2.3522, 48.8566).await;
+            insert_city(&fluree, ledger, "ex:lille", "Lille", 3.0573, 50.6292).await;
+            index_and_load(&fluree, &handle, a).await;
+            let ledger = fluree.create_ledger(b).await.expect("create b");
+            insert_city(&fluree, ledger, "ex:brussels", "Brussels", 4.3517, 50.8503).await;
+            index_and_load(&fluree, &handle, b).await;
+
+            let run = |sparql: String| {
+                let fluree = &fluree;
+                async move {
+                    let rows = fluree
+                        .query_from()
+                        .sparql(&sparql)
+                        .format(fluree_db_api::FormatterConfig::jsonld())
+                        .execute_formatted()
+                        .await
+                        .unwrap_or_else(|e| panic!("{e}: {sparql}"));
+                    let mut found: Vec<String> = rows
                         .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|row| {
-                                    let arr = row.as_array()?;
-                                    let name = arr.first()?.as_str()?.to_string();
-                                    let dist = arr.get(1)?.as_f64()?;
-                                    Some((name, dist))
-                                })
-                                .collect()
+                        .expect("rows")
+                        .iter()
+                        .map(|row| {
+                            row.as_str()
+                                .or_else(|| row[0].as_str())
+                                .unwrap_or_else(|| panic!("a name: {row}"))
+                                .to_string()
                         })
-                        .unwrap_or_default();
-
-                    println!("Parsed SPARQL results: {results:?}");
-
-                    // Should find Paris (distance ~0) and London (~343km)
-                    // Should NOT find Berlin (~878km) or Tokyo (~9700km)
-                    let names: Vec<&str> = results.iter().map(|(n, _)| n.as_str()).collect();
-
-                    assert!(
-                        names.contains(&"Paris"),
-                        "Paris should be within 500km of itself"
-                    );
-                    assert!(
-                        names.contains(&"London"),
-                        "London should be within 500km of Paris (~343km)"
-                    );
-                    assert!(
-                        !names.contains(&"Berlin"),
-                        "Berlin should NOT be within 500km of Paris (~878km)"
-                    );
-                    assert!(
-                        !names.contains(&"Tokyo"),
-                        "Tokyo should NOT be within 500km of Paris (~9700km)"
-                    );
-
-                    // Verify distances are reasonable
-                    for (name, dist) in &results {
-                        match name.as_str() {
-                            "Paris" => {
-                                assert!(
-                                    *dist < 1000.0,
-                                    "Paris distance should be ~0m, got {dist}m"
-                                );
-                            }
-                            "London" => {
-                                assert!(
-                                    (330_000.0..360_000.0).contains(dist),
-                                    "London distance should be ~343km, got {dist}m"
-                                );
-                            }
-                            _ => {}
-                        }
-                    }
+                        .collect();
+                    found.sort();
+                    found
                 }
-                Err(e) => {
-                    // This is expected if SPARQL geof:distance lowering or rewrite isn't wired
-                    eprintln!("SPARQL geof:distance query error: {e}");
-                }
+            };
+            let shape = r#"?place <http://example.org/location> ?loc ;
+                               <http://example.org/name> ?name .
+                        BIND(geof:distance(?loc, "POINT(2.3522 48.8566)"^^geo:wktLiteral) AS ?dist)
+                        FILTER(?dist < 300000)"#;
+            let prefixes = r"PREFIX geo: <http://www.opengis.net/ont/geosparql#>
+                PREFIX geof: <http://www.opengis.net/def/function/geosparql/>";
+
+            for (first, second) in [(a, b), (b, a)] {
+                assert_eq!(
+                    run(format!(
+                        "{prefixes} SELECT ?name FROM <{first}> FROM <{second}> WHERE {{ {shape} }}"
+                    ))
+                    .await,
+                    ["Brussels", "Lille", "Paris"]
+                );
             }
+            assert_eq!(
+                run(format!(
+                    "{prefixes} SELECT ?name FROM <{a}> FROM NAMED <{b}> WHERE {{ GRAPH <{b}> {{ {shape} }} }}"
+                ))
+                .await,
+                ["Brussels"]
+            );
         })
         .await;
 }
@@ -948,7 +765,7 @@ async fn geo_search_enforces_view_policy_on_location_flake() {
             }]);
             let opts = GovernanceOptions {
                 policy: Some(policy),
-                default_allow: false,
+                default_allow: Some(false),
                 ..Default::default()
             };
             let policy_ctx = policy_builder::build_policy_context_from_opts(
@@ -977,6 +794,67 @@ async fn geo_search_enforces_view_policy_on_location_flake() {
                 !rendered.contains("london"),
                 "London (hidden location) must not leak through geo search; got {jsonld:#?}"
             );
+        })
+        .await;
+}
+
+// =============================================================================
+// WKT constants
+// =============================================================================
+
+/// A `geo:wktLiteral` POINT is stored as a GeoPoint, and a POINT constant in
+/// a query lowers to the same value, so it matches: as a triple object, in
+/// VALUES, compared in a FILTER, and as a JSON-LD value object. Checked with
+/// the point in novelty and again from the index.
+#[tokio::test]
+async fn a_wkt_point_constant_matches_the_stored_point() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (fluree, local, handle) = indexed_fluree(&tmp);
+    let alias = "it/geo-wkt-constant:main";
+
+    local
+        .run_until(async move {
+            let ledger = fluree.create_ledger(alias).await.expect("create");
+            let ledger =
+                insert_city(&fluree, ledger, "ex:london", "London", -0.1278, 51.5074).await;
+            let sparql = [
+                r#"SELECT ?s WHERE { ?s ex:location "POINT(-0.1278 51.5074)"^^geo:wktLiteral }"#,
+                r#"SELECT ?s WHERE { VALUES ?l { "POINT(-0.1278 51.5074)"^^geo:wktLiteral } ?s ex:location ?l }"#,
+                r#"SELECT ?s WHERE { ?s ex:location ?l FILTER(?l = "POINT(-0.1278 51.5074)"^^geo:wktLiteral) }"#,
+            ];
+            let jsonld = json!({
+                "@context": geo_search_context(),
+                "select": ["?s"],
+                "where": {
+                    "@id": "?s",
+                    "ex:location": {"@value": "POINT(-0.1278 51.5074)", "@type": "geo:wktLiteral"}
+                }
+            });
+            let check = |ledger: LedgerState| {
+                let (fluree, jsonld) = (&fluree, &jsonld);
+                async move {
+                    for query in sparql {
+                        let query = format!(
+                            "PREFIX ex: <http://example.org/> \
+                             PREFIX geo: <http://www.opengis.net/ont/geosparql#> {query}"
+                        );
+                        let rows = support::query_sparql(fluree, &ledger, &query)
+                            .await
+                            .expect("query")
+                            .to_jsonld(&ledger.snapshot)
+                            .expect("jsonld");
+                        assert_eq!(rows, json!([["ex:london"]]), "{query}");
+                    }
+                    let rows = support::query_jsonld(fluree, &ledger, jsonld)
+                        .await
+                        .expect("query")
+                        .to_jsonld(&ledger.snapshot)
+                        .expect("jsonld");
+                    assert_eq!(rows, json!([["ex:london"]]), "JSON-LD value object");
+                }
+            };
+            check(ledger).await;
+            check(index_and_load(&fluree, &handle, alias).await).await;
         })
         .await;
 }

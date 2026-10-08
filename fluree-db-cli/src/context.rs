@@ -3,7 +3,7 @@ use crate::error::{CliError, CliResult};
 use crate::remote_client::{RefreshConfig, RemoteLedgerClient};
 use colored::Colorize;
 use fluree_db_api::server_defaults::FlureeDir;
-use fluree_db_api::{Fluree, FlureeBuilder};
+use fluree_db_api::{Fluree, FlureeBuilder, LedgerId};
 use fluree_db_nameservice::RemoteName;
 use fluree_db_nameservice_sync::{
     RemoteAuth, RemoteAuthType, RemoteConfig, RemoteEndpoint, SyncConfigStore,
@@ -119,10 +119,10 @@ pub async fn resolve_query_target(
         return Ok(QueryTarget::Ledger(mode));
     }
 
-    let fluree = build_fluree(dirs)?;
+    let fluree = build_fluree(dirs).await?;
 
     // Check if local ledger exists (local wins)
-    let ledger_id = to_ledger_id(ledger_part);
+    let ledger_id = to_ledger_id(ledger_part)?;
     if fluree.ledger_exists(&ledger_id).await.unwrap_or(false) {
         return Ok(QueryTarget::Ledger(LedgerMode::Local {
             fluree: Box::new(fluree),
@@ -145,7 +145,7 @@ pub async fn resolve_query_target(
         Ok(Some(record)) if !record.retracted => {
             return Ok(QueryTarget::GraphSource {
                 fluree: Box::new(fluree),
-                alias: ledger_id,
+                alias: ledger_id.to_string(),
             });
         }
         // Absent or retracted — not a queryable graph source; fall through.
@@ -159,27 +159,12 @@ pub async fn resolve_query_target(
         }
     }
 
-    // Check tracked config
+    // Check tracked config. Entries are canonical ids (configs written
+    // before track-time normalization read back as `name:main`), so one
+    // lookup covers every spelling.
     let store = TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
-    if let Some(tracked) = store.get_tracked(ledger_part) {
+    if let Some(tracked) = store.get_tracked(&ledger_id) {
         return build_tracked_target(&store, &tracked, ledger_part).await;
-    }
-
-    // Also try the normalized ledger_id (user might have typed "mydb" but tracked as "mydb:main")
-    if ledger_part != ledger_id {
-        if let Some(tracked) = store.get_tracked(&ledger_id) {
-            return build_tracked_target(&store, &tracked, &ledger_id).await;
-        }
-    }
-
-    // Also try the base name without branch suffix (user typed "mydb:main" but tracked as "mydb").
-    // This handles configs created before track-time normalization was added.
-    if let Some(base) = ledger_part.split(':').next() {
-        if base != ledger_part && base != ledger_id {
-            if let Some(tracked) = store.get_tracked(base) {
-                return build_tracked_target(&store, &tracked, ledger_part).await;
-            }
-        }
     }
 
     // Not found locally or tracked
@@ -335,7 +320,7 @@ async fn build_tracked_mode(
     let client = build_client_from_auth(&base_url, &auth);
     Ok(LedgerMode::Tracked {
         client: Box::new(client),
-        remote_alias: tracked.remote_alias.clone(),
+        remote_alias: tracked.remote_alias.to_string(),
         local_alias: local_alias.to_string(),
         remote_name: tracked.remote.clone(),
     })
@@ -369,12 +354,12 @@ async fn build_peer_target(
     let client = build_client_from_auth(&base_url, &auth);
 
     // Persistent, per-remote artifact cache. Everything cached is
-    // content-addressed and immutable, so entries never invalidate; the
-    // nameservice head lookup (verify_freshness_on_cache_hit) is the only
-    // per-query remote state.
+    // content-addressed and immutable, so entries never invalidate. The
+    // ledger head is the only per-query remote state: each CLI invocation
+    // builds a fresh in-process Fluree, so the first load always resolves
+    // the head through the proxy nameservice.
     let cache_config = LedgerManagerConfig {
         cache_dir: peer_cache_dir(&tracked.remote),
-        verify_freshness_on_cache_hit: true,
         ..Default::default()
     };
 
@@ -430,7 +415,7 @@ async fn build_peer_target(
     Ok(QueryTarget::Peer {
         fluree: Box::new(fluree),
         client: Box::new(client),
-        remote_alias: tracked.remote_alias.clone(),
+        remote_alias: tracked.remote_alias.to_string(),
         local_alias: local_alias.to_string(),
         remote_name: tracked.remote.clone(),
     })
@@ -476,11 +461,9 @@ pub async fn build_remote_mode(
     };
 
     let client = build_client_from_auth(&base_url, &remote.auth);
-    // Canonicalize the remote alias so the URL path carries the full
-    // `name:branch` form. The server's `can_read` check is a literal string
-    // match against the path, so a token scoped to `mydb:main` would 404 if
-    // we sent `mydb` here.
-    let remote_alias = to_ledger_id(ledger_alias);
+    // Send the canonical `name:branch` form so the URL names the same ledger
+    // however the user spelled it.
+    let remote_alias = to_ledger_id(ledger_alias)?.to_string();
     Ok(LedgerMode::Tracked {
         client: Box::new(client),
         remote_alias,
@@ -556,7 +539,7 @@ pub fn resolve_ledger(explicit: Option<&str>, dirs: &FlureeDir) -> CliResult<Str
 ///
 /// Honors `[server].storage_path` and `[server.indexing]` thresholds
 /// from the config file if set, otherwise falls back to defaults.
-pub fn build_fluree(dirs: &FlureeDir) -> CliResult<Fluree> {
+pub async fn build_fluree(dirs: &FlureeDir) -> CliResult<Fluree> {
     let storage = config::resolve_storage_path(dirs);
     let storage_str = storage.to_string_lossy().to_string();
     let mut builder = FlureeBuilder::file(storage_str).without_ledger_caching();
@@ -579,7 +562,8 @@ pub fn build_fluree(dirs: &FlureeDir) -> CliResult<Fluree> {
         .with_novelty_thresholds(min_bytes, max_bytes);
 
     builder
-        .build()
+        .build_async()
+        .await
         .map_err(|e| CliError::Config(format!("failed to initialize Fluree: {e}")))
 }
 
@@ -604,9 +588,10 @@ pub fn build_memory_fluree() -> Fluree {
 /// Normalize a ledger identifier to include a branch suffix if missing.
 ///
 /// The nameservice uses canonical ledger IDs like `mydb:main`.
-/// When users provide just `mydb`, we append `:main`.
-pub fn to_ledger_id(ledger_id: &str) -> String {
-    fluree_db_core::normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string())
+/// When users provide just `mydb`, we append `:main`. An argument that is
+/// not a ledger id is an error here rather than a lookup that silently misses.
+pub fn to_ledger_id(ledger_id: &str) -> CliResult<LedgerId> {
+    LedgerId::parse(ledger_id).map_err(|e| CliError::Input(e.to_string()))
 }
 
 /// Persist any refreshed tokens back to config.toml after a remote operation.
@@ -815,7 +800,7 @@ mod tests {
     /// `fluree iceberg map` (which needs a live catalog) so the resolution
     /// branch can be tested in isolation.
     async fn register_graph_source(dirs: &FlureeDir, name: &str) {
-        let fluree = build_fluree(dirs).unwrap();
+        let fluree = build_fluree(dirs).await.unwrap();
         fluree
             .publisher()
             .unwrap()
@@ -902,9 +887,9 @@ mod tests {
             .unwrap();
         store
             .add_tracked(TrackedLedgerConfig {
-                local_alias: "inv:main".to_string(),
+                local_alias: fluree_db_api::LedgerId::parse("inv:main").unwrap(),
                 remote: "origin".to_string(),
-                remote_alias: "inventory:main".to_string(),
+                remote_alias: fluree_db_api::LedgerId::parse("inventory:main").unwrap(),
                 mode,
             })
             .unwrap();

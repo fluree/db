@@ -94,6 +94,13 @@ impl R2RML {
     /// rr:graph - Shortcut for constant-valued graph map
     pub const GRAPH: &'static str = "http://www.w3.org/ns/r2rml#graph";
 
+    /// `rr:defaultGraph` — the IRI a graph map produces to place a triple in the
+    /// default graph. Recognised wherever a graph IRI is resolved (the extractor
+    /// for constants, the materializer for per-row values), because parsed as an
+    /// ordinary IRI it would mint a named graph literally called
+    /// `http://www.w3.org/ns/r2rml#defaultGraph`.
+    pub const DEFAULT_GRAPH: &'static str = "http://www.w3.org/ns/r2rml#defaultGraph";
+
     // ==========================================================================
     // Properties - Predicate-Object Map
     // ==========================================================================

@@ -34,11 +34,37 @@ mod tests;
 
 pub use diagnostic::{DiagCode, Diagnostic, Severity};
 pub use input::{
-    EmitColumn, EmitColumnStats, EmitTableSchema, TableKey, TableOverride, TypedBound,
+    DeclaredForeignKey, EmitColumn, EmitColumnStats, EmitTableSchema, TableKey, TableOverride,
+    TypedBound,
 };
 pub use ir::{ColumnMapping, ForeignKey, PrefixDecl, StructuredR2rmlMapping, TableMapping};
 
 use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+/// How the emitter chooses a table's subject key when no *verified* key exists.
+///
+/// The strategy governs ONLY the non-override tail (the `<STEM>_KEY`/`_ID` name
+/// fallback and the keyless case); an explicit per-table `primary_key` override
+/// and an Iceberg `identifier_field_ids` hint are validated strictly under both
+/// strategies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum SubjectStrategy {
+    /// Always emit a subject (the DEFAULT). When the name fallback finds a
+    /// `<STEM>_KEY`/`_ID` column that is not *provably* non-null, use it anyway
+    /// (a `SubjectKeyUnverified` warning, kept join-compatible as an FK parent);
+    /// when there is no key-like column at all, synthesize a deterministic
+    /// composite subject over the row's columns (`SubjectKeySynthesized`). This
+    /// guarantees every selected table produces a saveable mapping.
+    #[default]
+    Auto,
+    /// Strict (the pre-change behavior): emit a subject only from an explicit
+    /// override, an `identifier_field_ids` hint, or a proven-non-null
+    /// `<STEM>_KEY`/`_ID` column; otherwise emit `NoSafeSubjectKey` and no subject.
+    Identifier,
+}
 
 /// Emitter configuration. Every field is a pure knob — identical options plus
 /// identical inputs yield byte-identical output.
@@ -65,6 +91,12 @@ pub struct EmitOptions {
     /// — an empty map is a strict no-op, leaving every stem-derived default and
     /// the byte-for-byte output unchanged.
     pub per_table_overrides: HashMap<TableKey, TableOverride>,
+    /// The global subject-key strategy. Defaults to [`SubjectStrategy::Auto`]
+    /// (always emit a saveable subject); a per-table override may force
+    /// [`SubjectStrategy::Identifier`] (strict) or `Auto` for a single table.
+    pub subject_strategy: SubjectStrategy,
+    /// What a table's declared key is, for the diagnostics that mention it.
+    pub declared_key_source: String,
 }
 
 impl EmitOptions {
@@ -87,6 +119,8 @@ impl Default for EmitOptions {
             emit_fk_joins: true,
             keep_fk_keys_as_literals: true,
             per_table_overrides: HashMap::new(),
+            subject_strategy: SubjectStrategy::Auto,
+            declared_key_source: "Iceberg identifier_field_ids".to_string(),
         }
     }
 }

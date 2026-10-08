@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod branch;
 pub mod error;
 pub mod file_sync;
@@ -11,11 +12,14 @@ pub mod turtle_io;
 pub mod types;
 pub mod vocab;
 
+pub use audit::{
+    audit_memories, AuditOptions, AuditReport, AuditScope, MemoryAuditEntry, DEFAULT_BASE_REF,
+};
 pub use branch::{detect_git_branch, detect_git_branch_from};
 pub use error::{MemoryError, Result};
 pub use format::{
-    format_context, format_context_paged, format_json, format_recall_json, format_recall_text,
-    format_related_memories, format_status_text, format_text,
+    format_audit_markdown, format_context, format_context_paged, format_json, format_recall_json,
+    format_recall_text, format_related_memories, format_status_text, format_text,
 };
 pub use id::generate_memory_id;
 pub use recall::RecallEngine;

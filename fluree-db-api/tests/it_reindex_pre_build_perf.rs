@@ -87,6 +87,14 @@ impl<C: ContentStore> CountingContentStore<C> {
 
 #[async_trait]
 impl<C: ContentStore + Send + Sync> ContentStore for CountingContentStore<C> {
+    fn permits_plaintext_cache(&self) -> bool {
+        self.inner.permits_plaintext_cache()
+    }
+
+    fn is_remote(&self) -> bool {
+        self.inner.is_remote()
+    }
+
     async fn has(&self, id: &ContentId) -> StorageResult<bool> {
         self.inner.has(id).await
     }
@@ -327,7 +335,12 @@ async fn orchestrator_first_reindex_no_config_completes_quickly() {
     let started = Instant::now();
     let outcome = local
         .run_until(async move {
-            let completion = handle.trigger(ledger_id, N as i64).await;
+            let completion = handle
+                .trigger(
+                    &fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
+                    N as i64,
+                )
+                .await;
             completion.wait().await
         })
         .await;

@@ -60,6 +60,14 @@ impl<'a> Graph<'a> {
     /// Materialize the snapshot, producing a [`GraphSnapshot`] that can be queried
     /// multiple times without re-loading.
     ///
+    /// The snapshot carries the ledger's configured policy defaults, so a bare
+    /// read of a governed ledger is filtered here exactly as it is through
+    /// [`Graph::query`]. An unconfigured ledger comes back untouched.
+    ///
+    /// A query's own `opts` cannot be applied here: the snapshot is materialized
+    /// before any query is attached, and the same snapshot serves many queries.
+    /// Those still reach only [`Graph::query`] and `query_from`.
+    ///
     /// # Example
     ///
     /// ```ignore
@@ -72,6 +80,7 @@ impl<'a> Graph<'a> {
             .fluree
             .load_graph_db_at(&self.ledger_id, self.time_spec.clone())
             .await?;
+        let view = self.fluree.wrap_policy_defaults(view).await?;
         Ok(GraphSnapshot::new(self.fluree, view))
     }
 
@@ -136,16 +145,21 @@ impl<'a> Graph<'a> {
 
     /// Fetch and decode a single commit by hex-digest prefix.
     ///
-    /// Accepts abbreviated commit hashes (minimum 6 chars) as shown by
-    /// `fluree log`, or full CID strings. If the string parses as a valid CID,
-    /// it's used directly; otherwise it's treated as a hex prefix.
+    /// Accepts a hex digest prefix (minimum 6 characters) as printed by
+    /// `fluree log`, or a full CID string. If the string parses as a valid CID
+    /// it is used directly; otherwise it is treated as a hex prefix.
+    ///
+    /// Hex, not base32: the indexed commit subject is minted from
+    /// `ContentId::digest_hex()`, so the prefix scan is keyed on hex. An
+    /// abbreviated CID cannot be resolved — the first twelve characters of
+    /// every commit CID are a constant header — and is rejected saying so.
     ///
     /// # Example
     ///
     /// ```ignore
     /// let detail = fluree
     ///     .graph("mydb:main")
-    ///     .commit_prefix("bagaybq")
+    ///     .commit_prefix("ddca65d84c08")
     ///     .execute()
     ///     .await?;
     /// ```

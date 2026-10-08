@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "query_id": "q035",
+  "result_hash": "240053517cd4bbf741f94748abf83ceff4750dc57919be8d36120159c19a3d8b",
+  "rows": 14,
+  "head_rows": [
+    "<http://data.fluree.dev/edw/employee/1318>\u001f<http://data.fluree.dev/edw/employee/310>",
+    "<http://data.fluree.dev/edw/employee/1544>\u001f<http://data.fluree.dev/edw/employee/310>",
+    "<http://data.fluree.dev/edw/employee/1764>\u001f<http://data.fluree.dev/edw/employee/310>",
+    "<http://data.fluree.dev/edw/employee/1823>\u001f<http://data.fluree.dev/edw/employee/310>",
+    "<http://data.fluree.dev/edw/employee/2012>\u001f<http://data.fluree.dev/edw/employee/310>",
+    "<http://data.fluree.dev/edw/employee/2027>\u001f<http://data.fluree.dev/edw/employee/310>",
+    "<http://data.fluree.dev/edw/employee/2871>\u001f<http://data.fluree.dev/edw/employee/310>",
+    "<http://data.fluree.dev/edw/employee/3235>\u001f<http://data.fluree.dev/edw/employee/310>",
+    "<http://data.fluree.dev/edw/employee/3482>\u001f<http://data.fluree.dev/edw/employee/310>",
+    "<http://data.fluree.dev/edw/employee/4609>\u001f<http://data.fluree.dev/edw/employee/310>",
+    "<http://data.fluree.dev/edw/employee/4639>\u001f<http://data.fluree.dev/edw/employee/310>",
+    "<http://data.fluree.dev/edw/employee/4847>\u001f<http://data.fluree.dev/edw/employee/310>",
+    "<http://data.fluree.dev/edw/employee/4926>\u001f<http://data.fluree.dev/edw/employee/310>",
+    "<http://data.fluree.dev/edw/employee/982>\u001f<http://data.fluree.dev/edw/employee/310>"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

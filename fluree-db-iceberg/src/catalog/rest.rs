@@ -43,6 +43,83 @@ pub struct RestCatalogClient {
     pub(crate) config: RestCatalogConfig,
     auth: Arc<dyn SendCatalogAuth>,
     http_client: reqwest::Client,
+    /// Process-wide cap on concurrent catalog requests (a shared `Arc`, so every
+    /// client built via `new` bounds one global pool). Injectable for tests.
+    catalog_semaphore: Arc<tokio::sync::Semaphore>,
+}
+
+/// Default cap on concurrent catalog REST requests, process-wide.
+const DEFAULT_CATALOG_CONCURRENCY: usize = 8;
+/// Default max 429/503 retries before the error is surfaced.
+const DEFAULT_CATALOG_MAX_RETRIES: u32 = 4;
+/// Base backoff (doubles per attempt, jittered, capped at [`CATALOG_BACKOFF_CAP_MS`]).
+const CATALOG_BACKOFF_BASE_MS: u64 = 250;
+const CATALOG_BACKOFF_CAP_MS: u64 = 8_000;
+
+/// The process-wide catalog-request semaphore, sized from
+/// `FLUREE_ICEBERG_CATALOG_CONCURRENCY` (default 8) at first use. Returns a clone
+/// of the shared `Arc` so all clients bound one pool.
+fn global_catalog_semaphore() -> Arc<tokio::sync::Semaphore> {
+    static SEM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    SEM.get_or_init(|| {
+        let permits = std::env::var("FLUREE_ICEBERG_CATALOG_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_CATALOG_CONCURRENCY);
+        Arc::new(tokio::sync::Semaphore::new(permits))
+    })
+    .clone()
+}
+
+fn max_catalog_retries() -> u32 {
+    std::env::var("FLUREE_ICEBERG_CATALOG_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_CATALOG_MAX_RETRIES)
+}
+
+fn catalog_backoff_base_ms() -> u64 {
+    std::env::var("FLUREE_ICEBERG_CATALOG_BACKOFF_BASE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(CATALOG_BACKOFF_BASE_MS)
+}
+
+/// A `Retry-After` delta-seconds header as a (capped) `Duration`, if present and
+/// parseable. HTTP-date form is not honored (delta-seconds is what Horizon sends).
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let secs = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_secs(secs.min(30)))
+}
+
+/// Exponential backoff with full jitter for a 0-based `attempt`.
+fn backoff_delay(attempt: u32) -> Duration {
+    let exp = catalog_backoff_base_ms()
+        .saturating_mul(1u64 << attempt.min(5))
+        .min(CATALOG_BACKOFF_CAP_MS);
+    Duration::from_millis(jitter_ms(exp))
+}
+
+/// Uniform pseudo-random in `[0, cap]` from the clock's sub-second bits — full
+/// jitter without pulling in a RNG dependency.
+fn jitter_ms(cap_ms: u64) -> u64 {
+    if cap_ms == 0 {
+        return 0;
+    }
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    n % (cap_ms + 1)
 }
 
 impl std::fmt::Debug for RestCatalogClient {
@@ -71,6 +148,7 @@ impl RestCatalogClient {
             config,
             auth,
             http_client,
+            catalog_semaphore: global_catalog_semaphore(),
         })
     }
 
@@ -95,78 +173,157 @@ impl RestCatalogClient {
         Box::pin(async move {
             let url = format!("{}{}", self.config.uri, path);
 
-            let mut request = self
-                .http_client
-                .get(&url)
-                .header("Accept", "application/json");
+            // Bound concurrent catalog requests process-wide so a fan-out — the
+            // slice-1 prefetch, a wildcard crawl, or a raised scan concurrency —
+            // can't storm Horizon. The permit is held across the 429/503 backoff
+            // below (a throttled request keeps its slot while it waits — that IS
+            // the rate limiting), but released before the 401 recursion so a small
+            // cap can't self-deadlock.
+            let permit = self.catalog_semaphore.acquire().await;
 
-            // Add auth header if available
-            if let Some(auth_header) = self.auth.authorization_header().await? {
-                request = request.header("Authorization", auth_header);
+            let mut attempt: u32 = 0;
+            loop {
+                let mut request = self
+                    .http_client
+                    .get(&url)
+                    .header("Accept", "application/json");
+
+                // Add auth header if available
+                if let Some(auth_header) = self.auth.authorization_header().await? {
+                    request = request.header("Authorization", auth_header);
+                }
+
+                // Add custom headers
+                for (name, value) in headers {
+                    request = request.header(*name, *value);
+                }
+
+                let response = request.send().await?;
+                let status = response.status();
+
+                if status == reqwest::StatusCode::UNAUTHORIZED && !is_retry {
+                    // Refresh the token and retry once. Release the permit first —
+                    // the recursive call re-acquires it, and holding it across the
+                    // recursion would deadlock a single-permit semaphore.
+                    tracing::debug!("Got 401, refreshing auth token and retrying");
+                    drop(permit);
+                    self.auth.refresh().await?;
+                    return self.request_with_retry(path, headers, true).await;
+                }
+
+                // 429 Too Many Requests / 503 Service Unavailable: honor a
+                // `Retry-After` header when present, else exponential backoff with
+                // full jitter; bounded attempts, then surface the error.
+                if (status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status == reqwest::StatusCode::SERVICE_UNAVAILABLE)
+                    && attempt < max_catalog_retries()
+                {
+                    let delay = retry_after(&response).unwrap_or_else(|| backoff_delay(attempt));
+                    tracing::debug!(
+                        status = %status,
+                        attempt,
+                        delay_ms = delay.as_millis() as u64,
+                        "catalog throttled; backing off"
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+
+                if status == reqwest::StatusCode::NOT_FOUND {
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(IcebergError::TableNotFound(format!(
+                        "Resource not found at {path}: {body}"
+                    )));
+                }
+
+                if !status.is_success() {
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(IcebergError::Catalog(format!(
+                        "Catalog request failed ({status}): {body}"
+                    )));
+                }
+
+                return response
+                    .json()
+                    .await
+                    .map_err(|e| IcebergError::Catalog(format!("Failed to parse response: {e}")));
             }
-
-            // Add custom headers
-            for (name, value) in headers {
-                request = request.header(*name, *value);
-            }
-
-            let response = request.send().await?;
-            let status = response.status();
-
-            if status == reqwest::StatusCode::UNAUTHORIZED && !is_retry {
-                // Try refresh and retry once
-                tracing::debug!("Got 401, refreshing auth token and retrying");
-                self.auth.refresh().await?;
-                return self.request_with_retry(path, headers, true).await;
-            }
-
-            if status == reqwest::StatusCode::NOT_FOUND {
-                let body = response.text().await.unwrap_or_default();
-                return Err(IcebergError::TableNotFound(format!(
-                    "Resource not found at {path}: {body}"
-                )));
-            }
-
-            if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
-                return Err(IcebergError::Catalog(format!(
-                    "Catalog request failed ({status}): {body}"
-                )));
-            }
-
-            response
-                .json()
-                .await
-                .map_err(|e| IcebergError::Catalog(format!("Failed to parse response: {e}")))
         })
     }
 
     /// Build REST API path for a table.
-    fn table_path(&self, table_id: &TableIdentifier) -> String {
+    async fn table_path(&self, table_id: &TableIdentifier) -> Result<String> {
         let encoded_ns = encode_namespace_for_rest(&table_id.namespace);
-        let base = self.api_prefix();
-        format!(
+        let base = self.api_prefix().await?;
+        Ok(format!(
             "{}/namespaces/{}/tables/{}",
             base, encoded_ns, table_id.table
-        )
+        ))
     }
 
-    /// Get the API prefix, optionally including the warehouse.
-    ///
-    /// Standard Iceberg REST: `/v1/namespaces/...`
-    /// Polaris with warehouse: `/v1/{warehouse}/namespaces/...`
-    fn api_prefix(&self) -> String {
-        match &self.config.warehouse {
-            Some(warehouse) => format!("/v1/{warehouse}"),
+    /// The path every catalog route sits under: `/v1`, then the prefix the
+    /// catalog's `/v1/config` names for this warehouse. That prefix is the
+    /// catalog's to choose — often the warehouse name, but not always
+    /// (`catalogs/<name>` on Unity Catalog) — and may span several segments.
+    async fn api_prefix(&self) -> Result<String> {
+        let key = (self.config.uri.clone(), self.config.warehouse.clone());
+        if let Some(prefix) = lock_prefixes().get(&key) {
+            return Ok(prefix.clone());
+        }
+        let under_v1 = |prefix: Option<String>| match prefix {
+            Some(prefix) => format!("/v1/{}", prefix.trim_matches('/')),
             None => "/v1".to_string(),
+        };
+        match self.configured_prefix().await {
+            Ok(named) => {
+                let prefix = under_v1(named);
+                lock_prefixes().insert(key, prefix.clone());
+                Ok(prefix)
+            }
+            // A catalog without that route is read the way it was before this
+            // lookup existed: the warehouse name is the prefix. Not cached, so
+            // a transient 404 (a gateway mid-deploy) does not pin it.
+            Err(IcebergError::TableNotFound(_)) => Ok(under_v1(self.config.warehouse.clone())),
+            Err(e) => Err(e),
         }
     }
+
+    /// `overrides.prefix`, else `defaults.prefix`, from `/v1/config`.
+    async fn configured_prefix(&self) -> Result<Option<String>> {
+        let path = match &self.config.warehouse {
+            Some(warehouse) => format!("/v1/config?warehouse={}", urlencoding::encode(warehouse)),
+            None => "/v1/config".to_string(),
+        };
+        let config = self.get(&path, &[]).await?;
+        let named = |section: &str| {
+            config
+                .get(section)
+                .and_then(|s| s.get("prefix"))
+                .and_then(|p| p.as_str())
+                .filter(|p| !p.trim_matches('/').is_empty())
+                .map(str::to_string)
+        };
+        Ok(named("overrides").or_else(|| named("defaults")))
+    }
+}
+
+/// Route prefix by (catalog URI, warehouse).
+type Prefixes = HashMap<(String, Option<String>), String>;
+
+/// A catalog's prefix does not change, and clients are built per request.
+fn lock_prefixes() -> std::sync::MutexGuard<'static, Prefixes> {
+    static PREFIXES: std::sync::OnceLock<std::sync::Mutex<Prefixes>> = std::sync::OnceLock::new();
+    PREFIXES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[async_trait(?Send)]
 impl CatalogClient for RestCatalogClient {
     async fn list_namespaces(&self) -> Result<Vec<String>> {
-        let path = format!("{}/namespaces", self.api_prefix());
+        let path = format!("{}/namespaces", self.api_prefix().await?);
         let response = self.get(&path, &[]).await?;
 
         let namespaces = response
@@ -191,7 +348,11 @@ impl CatalogClient for RestCatalogClient {
 
     async fn list_tables(&self, namespace: &str) -> Result<Vec<String>> {
         let encoded_ns = encode_namespace_for_rest(namespace);
-        let path = format!("{}/namespaces/{}/tables", self.api_prefix(), encoded_ns);
+        let path = format!(
+            "{}/namespaces/{}/tables",
+            self.api_prefix().await?,
+            encoded_ns
+        );
         let response = self.get(&path, &[]).await?;
 
         let identifiers = response
@@ -223,7 +384,7 @@ impl CatalogClient for RestCatalogClient {
         table_id: &TableIdentifier,
         request_credentials: bool,
     ) -> Result<LoadTableResponse> {
-        let path = self.table_path(table_id);
+        let path = self.table_path(table_id).await?;
 
         let headers = if request_credentials {
             vec![("X-Iceberg-Access-Delegation", "vended-credentials")]
@@ -240,7 +401,7 @@ impl CatalogClient for RestCatalogClient {
 #[async_trait]
 impl super::SendCatalogClient for RestCatalogClient {
     async fn list_namespaces(&self) -> Result<Vec<String>> {
-        let path = format!("{}/namespaces", self.api_prefix());
+        let path = format!("{}/namespaces", self.api_prefix().await?);
         let response = self.get(&path, &[]).await?;
 
         let namespaces = response
@@ -264,7 +425,11 @@ impl super::SendCatalogClient for RestCatalogClient {
 
     async fn list_tables(&self, namespace: &str) -> Result<Vec<String>> {
         let encoded_ns = encode_namespace_for_rest(namespace);
-        let path = format!("{}/namespaces/{}/tables", self.api_prefix(), encoded_ns);
+        let path = format!(
+            "{}/namespaces/{}/tables",
+            self.api_prefix().await?,
+            encoded_ns
+        );
         let response = self.get(&path, &[]).await?;
 
         let identifiers = response
@@ -296,7 +461,7 @@ impl super::SendCatalogClient for RestCatalogClient {
         table_id: &TableIdentifier,
         request_credentials: bool,
     ) -> Result<LoadTableResponse> {
-        let path = self.table_path(table_id);
+        let path = self.table_path(table_id).await?;
 
         let headers = if request_credentials {
             vec![("X-Iceberg-Access-Delegation", "vended-credentials")]
@@ -357,36 +522,325 @@ fn parse_load_table_response(response: &serde_json::Value) -> Result<LoadTableRe
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_table_path_single_namespace() {
-        let client = RestCatalogClient {
+    // ---- PR-8 slice 3: 429 backoff + catalog-request semaphore ----
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    /// A test client pointed at a wiremock server. Uses a PLAIN reqwest client so
+    /// the loopback mock is reachable (the production `new` hardens against
+    /// loopback for SSRF), and injects `sem` as the catalog semaphore.
+    fn wiremock_client(uri: &str, sem: Arc<tokio::sync::Semaphore>) -> RestCatalogClient {
+        RestCatalogClient {
             config: RestCatalogConfig {
-                uri: "https://polaris.example.com".to_string(),
+                uri: uri.to_string(),
                 ..Default::default()
             },
-            auth: Arc::new(crate::auth::BearerTokenAuth::new("test".to_string())),
+            auth: Arc::new(crate::auth::NoAuth),
             http_client: reqwest::Client::new(),
-        };
+            catalog_semaphore: sem,
+        }
+    }
 
-        let table_id = TableIdentifier::new("openflights", "airlines");
-        let path = client.table_path(&table_id);
-        assert_eq!(path, "/v1/namespaces/openflights/tables/airlines");
+    // ---- the route prefix comes from /v1/config ----
+
+    use wiremock::matchers::{path, query_param};
+
+    fn warehouse_client(uri: &str, warehouse: Option<&str>) -> RestCatalogClient {
+        let mut client = wiremock_client(uri, Arc::new(tokio::sync::Semaphore::new(4)));
+        client.config.warehouse = warehouse.map(str::to_string);
+        client
+    }
+
+    async fn serve_config(server: &MockServer, body: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    /// Serves one table at `route` only, so a load succeeds only by that route.
+    async fn serve_table(server: &MockServer, route: &str) {
+        Mock::given(method("GET"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"metadata-location": "s3://bucket/t/metadata/v1.json"}),
+            ))
+            .mount(server)
+            .await;
+    }
+
+    async fn loads(client: &RestCatalogClient, namespace: &str) -> Result<LoadTableResponse> {
+        let table = TableIdentifier::new(namespace, "events");
+        super::super::SendCatalogClient::load_table(client, &table, false).await
+    }
+
+    #[tokio::test]
+    async fn a_prefix_the_catalog_names_is_used_whole() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .and(query_param("warehouse", "lake&x=y"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "defaults": {"prefix": "ignored"},
+                "overrides": {"prefix": "catalogs/lake"},
+            })))
+            .mount(&server)
+            .await;
+        serve_table(
+            &server,
+            "/v1/catalogs/lake/namespaces/db%1Fschema/tables/events",
+        )
+        .await;
+
+        let client = warehouse_client(&server.uri(), Some("lake&x=y"));
+        loads(&client, "db.schema").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_default_prefix_is_used_when_nothing_overrides_it() {
+        let server = MockServer::start().await;
+        serve_config(
+            &server,
+            serde_json::json!({"defaults": {"prefix": "main"}, "overrides": {}}),
+        )
+        .await;
+        serve_table(&server, "/v1/main/namespaces/db/tables/events").await;
+
+        loads(&warehouse_client(&server.uri(), None), "db")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_catalog_naming_no_prefix_is_read_without_one() {
+        let server = MockServer::start().await;
+        serve_config(
+            &server,
+            serde_json::json!({"defaults": {}, "overrides": {}}),
+        )
+        .await;
+        serve_table(&server, "/v1/namespaces/db/tables/events").await;
+
+        // The warehouse was the prefix before; it no longer is unless the catalog says so.
+        loads(&warehouse_client(&server.uri(), Some("lake")), "db")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_catalog_without_a_config_route_keeps_the_warehouse_as_its_prefix() {
+        let server = MockServer::start().await;
+        serve_table(&server, "/v1/lake/namespaces/db/tables/events").await;
+
+        loads(&warehouse_client(&server.uri(), Some("lake")), "db")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_config_route_that_fails_is_not_read_as_no_prefix() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("no"))
+            .mount(&server)
+            .await;
+        serve_table(&server, "/v1/namespaces/db/tables/events").await;
+        serve_table(&server, "/v1/lake/namespaces/db/tables/events").await;
+
+        let err = loads(&warehouse_client(&server.uri(), Some("lake")), "db")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, IcebergError::Catalog(m) if m.contains("403")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_catalog_is_asked_for_its_prefix_once() {
+        let server = MockServer::start().await;
+        serve_config(&server, serde_json::json!({"overrides": {"prefix": "p"}})).await;
+        serve_table(&server, "/v1/p/namespaces/db/tables/events").await;
+
+        for _ in 0..2 {
+            loads(&warehouse_client(&server.uri(), None), "db")
+                .await
+                .unwrap();
+        }
+        let asked = server.received_requests().await.unwrap();
+        let configs = asked
+            .iter()
+            .filter(|r| r.url.path() == "/v1/config")
+            .count();
+        assert_eq!(configs, 1, "two clients, one catalog");
+    }
+
+    #[tokio::test]
+    async fn a_missing_config_route_is_asked_again_not_cached() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(404))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        serve_config(&server, serde_json::json!({"overrides": {"prefix": "p"}})).await;
+        serve_table(&server, "/v1/lake/namespaces/db/tables/events").await;
+        serve_table(&server, "/v1/p/namespaces/db/tables/events").await;
+
+        // The first client falls back to the warehouse; the next one asks
+        // again and gets the prefix the catalog names.
+        for _ in 0..2 {
+            loads(&warehouse_client(&server.uri(), Some("lake")), "db")
+                .await
+                .unwrap();
+        }
+        let tables: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .filter(|p| p.ends_with("/tables/events"))
+            .collect();
+        assert_eq!(
+            tables,
+            [
+                "/v1/lake/namespaces/db/tables/events",
+                "/v1/p/namespaces/db/tables/events"
+            ]
+        );
     }
 
     #[test]
-    fn test_table_path_multi_level_namespace() {
-        let client = RestCatalogClient {
-            config: RestCatalogConfig {
-                uri: "https://polaris.example.com".to_string(),
-                ..Default::default()
-            },
-            auth: Arc::new(crate::auth::BearerTokenAuth::new("test".to_string())),
-            http_client: reqwest::Client::new(),
+    fn retry_after_parses_delta_seconds_and_backoff_is_bounded() {
+        let resp: reqwest::Response = http::Response::builder()
+            .header("Retry-After", "3")
+            .body("")
+            .map(reqwest::Response::from)
+            .unwrap();
+        assert_eq!(retry_after(&resp), Some(Duration::from_secs(3)));
+
+        let no_header: reqwest::Response = http::Response::builder()
+            .body("")
+            .map(reqwest::Response::from)
+            .unwrap();
+        assert_eq!(retry_after(&no_header), None);
+
+        // Backoff never exceeds the cap, at any attempt.
+        for attempt in 0..12 {
+            assert!(backoff_delay(attempt) <= Duration::from_millis(CATALOG_BACKOFF_CAP_MS));
+        }
+    }
+
+    /// Responds 429 (Retry-After: 0) for the first `fail_times` requests, then 200.
+    struct FlakyResponder {
+        calls: Arc<AtomicUsize>,
+        fail_times: usize,
+    }
+    impl Respond for FlakyResponder {
+        fn respond(&self, _: &Request) -> ResponseTemplate {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_times {
+                ResponseTemplate::new(429).insert_header("Retry-After", "0")
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true}))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_on_429_then_succeeds() {
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("GET"))
+            .respond_with(FlakyResponder {
+                calls: Arc::clone(&calls),
+                fail_times: 2,
+            })
+            .mount(&server)
+            .await;
+
+        let client = wiremock_client(&server.uri(), Arc::new(tokio::sync::Semaphore::new(4)));
+        let out = client.get("/v1/namespaces", &[]).await;
+        assert!(
+            out.is_ok(),
+            "should succeed after retrying past the 429s: {out:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "two 429s + one 200");
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_max_retries_and_surfaces_the_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+            .mount(&server)
+            .await;
+
+        let client = wiremock_client(&server.uri(), Arc::new(tokio::sync::Semaphore::new(4)));
+        let err = client.get("/v1/namespaces", &[]).await.unwrap_err();
+        match err {
+            IcebergError::Catalog(msg) => assert!(
+                msg.contains("429"),
+                "terminal error names the status: {msg}"
+            ),
+            other => panic!("expected a Catalog error after giving up, got {other:?}"),
+        }
+        // 1 initial attempt + DEFAULT_CATALOG_MAX_RETRIES retries.
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1 + DEFAULT_CATALOG_MAX_RETRIES as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn semaphore_bounds_concurrent_catalog_requests() {
+        // Each response is delayed, so with a 2-permit semaphore, 6 requests run in
+        // 3 waves ≈ 3×delay; an unbounded (6-permit) client finishes in ≈1×delay.
+        let delay = Duration::from_millis(120);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(delay)
+                    .set_body_json(serde_json::json!({})),
+            )
+            .mount(&server)
+            .await;
+
+        let fire = |permits: usize| {
+            let uri = server.uri();
+            async move {
+                let client = Arc::new(wiremock_client(
+                    &uri,
+                    Arc::new(tokio::sync::Semaphore::new(permits)),
+                ));
+                let start = Instant::now();
+                let futs = (0..6).map(|_| {
+                    let c = Arc::clone(&client);
+                    async move { c.get("/v1/namespaces", &[]).await }
+                });
+                let results = futures::future::join_all(futs).await;
+                assert!(results.iter().all(std::result::Result::is_ok));
+                start.elapsed()
+            }
         };
 
-        let table_id = TableIdentifier::new("db.schema", "events");
-        let path = client.table_path(&table_id);
-        // Multi-level namespace should use unit separator encoding
-        assert_eq!(path, "/v1/namespaces/db%1Fschema/tables/events");
+        let bounded = fire(2).await;
+        let unbounded = fire(6).await;
+        assert!(
+            bounded >= delay * 2,
+            "2-permit semaphore should serialize 6 requests into ≥3 waves (got {bounded:?})"
+        );
+        assert!(
+            unbounded < bounded,
+            "6-permit (unbounded here) should be faster than 2-permit (bounded {bounded:?} vs unbounded {unbounded:?})"
+        );
     }
 }

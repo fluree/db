@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "query_id": "q049",
+  "result_hash": "76d6ce1b6f48bb5512b9b710d4d16cbea62d107931a6ad56552484bd622fdbf3",
+  "rows": 5000,
+  "head_rows": [
+    "{\"@id\":\"http://data.fluree.dev/edw/customer/1\",\"edw:inRegion\":[\"Region-3\"]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/customer/10\",\"edw:inRegion\":[\"Region-8\"]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/customer/100\",\"edw:inRegion\":[\"Region-8\"]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/customer/1000\",\"edw:inRegion\":[\"Region-6\"]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/customer/10000\",\"edw:inRegion\":[\"Region-5\"]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/customer/100000\",\"edw:inRegion\":[\"Region-6\"]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/customer/100001\",\"edw:inRegion\":[\"Region-7\"]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/customer/100002\",\"edw:inRegion\":[\"Region-6\"]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/customer/100003\",\"edw:inRegion\":[\"Region-2\"]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/customer/100004\",\"edw:inRegion\":[\"Region-9\"]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/customer/100005\",\"edw:inRegion\":[\"Region-2\"]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/customer/100006\",\"edw:inRegion\":[\"Region-4\"]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/customer/100007\",\"edw:inRegion\":[\"Region-5\"]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/customer/100008\",\"edw:inRegion\":[\"Region-6\"]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/customer/100009\",\"edw:inRegion\":[\"Region-2\"]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/customer/10001\",\"edw:inRegion\":[\"Region-5\"]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/customer/100010\",\"edw:inRegion\":[\"Region-5\"]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/customer/100011\",\"edw:inRegion\":[\"Region-4\"]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/customer/100012\",\"edw:inRegion\":[\"Region-2\"]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/customer/100013\",\"edw:inRegion\":[\"Region-9\"]}"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

@@ -8,5 +8,6 @@ pub mod column_loader;
 pub mod column_types;
 pub mod leaf_access;
 pub mod leaflet_cache;
+pub mod need_fetch;
 pub mod replay;
 pub mod types;

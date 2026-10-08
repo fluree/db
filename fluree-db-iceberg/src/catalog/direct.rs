@@ -55,18 +55,32 @@ impl<S: IcebergStorage> DirectCatalogClient<S> {
         }
     }
 
-    /// Resolve the current metadata location via `version-hint.text`.
+    /// Resolve the current metadata location via `version-hint.text`, falling
+    /// back to listing the metadata directory when the hint is absent.
     ///
-    /// Returns the full S3 path to the current metadata JSON file.
-    /// The hint file should contain the metadata filename
-    /// (e.g., `00001-abc-def.metadata.json`) or a full path.
+    /// Returns the full path to the current metadata JSON file. The hint file,
+    /// when present, contains the metadata filename
+    /// (e.g., `00001-abc-def.metadata.json`) or a full path. Without one
+    /// (pyiceberg and most non-Hadoop writers never write it), the highest-
+    /// versioned `*.metadata.json` in `metadata/` is used — only on storage
+    /// backends that support listing (local filesystem); S3 keeps the original
+    /// hint error. SYNC: mirror any change in
+    /// `SendDirectCatalogClient::resolve_metadata_location` below.
     async fn resolve_metadata_location(&self) -> Result<String> {
         let hint_path = format!("{}/metadata/version-hint.text", self.table_location);
-        let hint_bytes = self.storage.read(&hint_path).await.map_err(|e| {
-            IcebergError::Metadata(format!(
-                "Failed to read version-hint.text at {hint_path}: {e}"
-            ))
-        })?;
+        let hint_bytes = match self.storage.read(&hint_path).await {
+            Ok(bytes) => bytes,
+            Err(hint_err) => {
+                return fallback_metadata_location(
+                    self.storage
+                        .list_files(&format!("{}/metadata", self.table_location)),
+                    &self.table_location,
+                    &hint_path,
+                    &hint_err,
+                )
+                .await;
+            }
+        };
 
         let hint = std::str::from_utf8(&hint_bytes)
             .map_err(|e| IcebergError::Metadata(format!("Invalid version-hint.text: {e}")))?
@@ -152,16 +166,26 @@ impl<S: SendIcebergStorage> SendDirectCatalogClient<S> {
         }
     }
 
-    /// Resolve the current metadata location via `version-hint.text`.
+    /// Resolve the current metadata location via `version-hint.text`, falling
+    /// back to a metadata-directory listing when the hint is absent.
     ///
-    /// See [`DirectCatalogClient`] for format details.
+    /// See [`DirectCatalogClient::resolve_metadata_location`] (SYNC — keep the
+    /// two in step) and [`DirectCatalogClient`] for format details.
     async fn resolve_metadata_location(&self) -> Result<String> {
         let hint_path = format!("{}/metadata/version-hint.text", self.table_location);
-        let hint_bytes = self.storage.read(&hint_path).await.map_err(|e| {
-            IcebergError::Metadata(format!(
-                "Failed to read version-hint.text at {hint_path}: {e}"
-            ))
-        })?;
+        let hint_bytes = match self.storage.read(&hint_path).await {
+            Ok(bytes) => bytes,
+            Err(hint_err) => {
+                return fallback_metadata_location(
+                    self.storage
+                        .list_files(&format!("{}/metadata", self.table_location)),
+                    &self.table_location,
+                    &hint_path,
+                    &hint_err,
+                )
+                .await;
+            }
+        };
 
         let hint = std::str::from_utf8(&hint_bytes)
             .map_err(|e| IcebergError::Metadata(format!("Invalid version-hint.text: {e}")))?
@@ -241,10 +265,231 @@ fn resolve_hint_to_metadata_path(hint: &str, table_location: &str) -> String {
     }
 }
 
+/// Shared hint-absent fallback: resolve the current metadata file by listing
+/// the `metadata/` directory. Takes the not-yet-awaited listing future so one
+/// helper serves both the Send and non-Send clients. A storage backend without
+/// listing support (S3) surfaces the ORIGINAL version-hint error, so S3
+/// Direct-mode behavior is unchanged.
+async fn fallback_metadata_location(
+    list: impl std::future::Future<Output = Result<Vec<String>>>,
+    table_location: &str,
+    hint_path: &str,
+    hint_err: &IcebergError,
+) -> Result<String> {
+    match list.await {
+        Ok(files) => pick_latest_metadata_file(&files)
+            .map(|name| format!("{table_location}/metadata/{name}"))
+            .ok_or_else(|| {
+                IcebergError::Metadata(format!(
+                    "No version-hint.text and no *.metadata.json files under \
+                     {table_location}/metadata"
+                ))
+            }),
+        Err(_) => Err(IcebergError::Metadata(format!(
+            "Failed to read version-hint.text at {hint_path}: {hint_err}"
+        ))),
+    }
+}
+
+/// Pick the CURRENT metadata file from a `metadata/` directory listing — the
+/// fallback discovery when `version-hint.text` is absent. `version-hint.text`
+/// is a Hadoop-catalog convention; pyiceberg and most non-Hadoop writers never
+/// produce it, so a locally-written table has only the metadata files
+/// themselves. Filenames carry a monotonically increasing version in one of
+/// two conventions: `v{N}.metadata.json` (Hadoop) or
+/// `{NNNNN}-{uuid}.metadata.json` (pyiceberg / REST-commit style). The highest
+/// parsed version wins; a tie breaks lexicographically so the choice is
+/// deterministic.
+fn pick_latest_metadata_file(files: &[String]) -> Option<&str> {
+    files
+        .iter()
+        .filter(|f| f.ends_with(".metadata.json"))
+        .map(|f| {
+            let stem = f.strip_prefix('v').unwrap_or(f);
+            let digits: String = stem.chars().take_while(char::is_ascii_digit).collect();
+            (digits.parse::<u64>().unwrap_or(0), f.as_str())
+        })
+        .max()
+        .map(|(_, f)| f)
+}
+
+// ---------------------------------------------------------------------------
+// Warehouse-root resolution (catalog-less multi-table Direct mode)
+// ---------------------------------------------------------------------------
+
+/// The table-name part of a warehouse child directory: the segment before the
+/// first `.` (a Snowflake-style random suffix, e.g. `fact_order.UIHGsQex`), with
+/// any trailing `/` trimmed. A bare `fact_order/` yields `fact_order`.
+pub fn warehouse_dir_name(dir: &str) -> &str {
+    dir.trim_end_matches('/').split('.').next().unwrap_or("")
+}
+
+/// Resolve a table name to its directory under a warehouse root, given the root's
+/// immediate child directory names. A catalog-less warehouse (e.g. a bucket copy
+/// of a Snowflake-managed Iceberg database) stores each table in
+/// `<name>.<random-suffix>/` or a bare `<name>/`. Matches the requested table
+/// (namespace already stripped) to exactly one such directory, case-INSENSITIVE
+/// on the name part. Ambiguity (two dirs matching one name) or a miss is a
+/// fail-loud [`IcebergError::Catalog`] naming what WAS found.
+pub fn match_warehouse_table_dir(table_name: &str, dir_names: &[String]) -> Result<String> {
+    let want = table_name.trim();
+    let matches: Vec<&String> = dir_names
+        .iter()
+        .filter(|d| warehouse_dir_name(d).eq_ignore_ascii_case(want))
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok((*one).trim_end_matches('/').to_string()),
+        [] => Err(IcebergError::Catalog(format!(
+            "no directory under the warehouse root matches table '{table_name}' \
+             (matched on the name before '.', case-insensitive). Found {} directories: [{}]",
+            dir_names.len(),
+            dir_names.join(", ")
+        ))),
+        many => Err(IcebergError::Catalog(format!(
+            "table '{table_name}' is AMBIGUOUS under the warehouse root — {} directories match: [{}]",
+            many.len(),
+            many.iter().map(|d| d.as_str()).collect::<Vec<_>>().join(", ")
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod warehouse_tests {
+    use super::*;
+
+    fn dirs(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn matches_snowflake_suffixed_dir_case_insensitively() {
+        let d = dirs(&[
+            "fact_order.UIHGsQex/",
+            "dim_customer.AbCdEf/",
+            "dim_date.ZzZz/",
+        ]);
+        // rr:tableName `DW.FACT_ORDER` arrives here namespace-stripped + upper.
+        assert_eq!(
+            match_warehouse_table_dir("FACT_ORDER", &d).unwrap(),
+            "fact_order.UIHGsQex"
+        );
+        assert_eq!(
+            match_warehouse_table_dir("dim_customer", &d).unwrap(),
+            "dim_customer.AbCdEf"
+        );
+    }
+
+    #[test]
+    fn matches_bare_dir_without_suffix() {
+        let d = dirs(&["fact_order/", "dim_customer/"]);
+        assert_eq!(
+            match_warehouse_table_dir("Fact_Order", &d).unwrap(),
+            "fact_order"
+        );
+    }
+
+    #[test]
+    fn miss_lists_what_was_found() {
+        let d = dirs(&["fact_order.X/", "dim_customer.Y/"]);
+        let err = match_warehouse_table_dir("dim_geography", &d)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("dim_geography"),
+            "names the missing table: {err}"
+        );
+        assert!(
+            err.contains("fact_order.X") && err.contains("dim_customer.Y"),
+            "lists candidates: {err}"
+        );
+    }
+
+    #[test]
+    fn ambiguity_is_a_loud_error_naming_candidates() {
+        // Two dirs whose name part collides (a bare + a suffixed copy) — refuse.
+        let d = dirs(&["fact_order/", "fact_order.NEWSUFFIX/"]);
+        let err = match_warehouse_table_dir("fact_order", &d)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("AMBIGUOUS"), "flags ambiguity: {err}");
+        assert!(
+            err.contains("fact_order.NEWSUFFIX"),
+            "lists both candidates: {err}"
+        );
+    }
+
+    #[test]
+    fn warehouse_dir_name_strips_suffix_and_slash() {
+        assert_eq!(warehouse_dir_name("fact_order.UIHGsQex/"), "fact_order");
+        assert_eq!(warehouse_dir_name("dim_customer/"), "dim_customer");
+        assert_eq!(warehouse_dir_name("plain"), "plain");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::io::MemoryStorage;
+
+    #[test]
+    fn pick_latest_handles_both_naming_conventions() {
+        // Hadoop convention: v{N}.metadata.json.
+        let hadoop = vec![
+            "v1.metadata.json".to_string(),
+            "v10.metadata.json".to_string(),
+            "v2.metadata.json".to_string(),
+        ];
+        assert_eq!(
+            pick_latest_metadata_file(&hadoop),
+            Some("v10.metadata.json")
+        );
+
+        // pyiceberg / REST-commit convention: {NNNNN}-{uuid}.metadata.json.
+        let py = vec![
+            "00001-aaaa.metadata.json".to_string(),
+            "00010-bbbb.metadata.json".to_string(),
+            "00002-cccc.metadata.json".to_string(),
+            "not-metadata.txt".to_string(),
+        ];
+        assert_eq!(
+            pick_latest_metadata_file(&py),
+            Some("00010-bbbb.metadata.json")
+        );
+
+        assert_eq!(pick_latest_metadata_file(&["a.txt".to_string()]), None);
+        assert_eq!(pick_latest_metadata_file(&[]), None);
+    }
+
+    #[tokio::test]
+    async fn missing_version_hint_falls_back_to_metadata_listing() {
+        // No version-hint.text — only metadata files. The client must resolve
+        // to the highest-versioned one via listing (pyiceberg-written tables).
+        let mut storage = MemoryStorage::new();
+        storage.add_file("file:///wh/t/metadata/00001-aaaa.metadata.json", "{}");
+        storage.add_file("file:///wh/t/metadata/00003-bbbb.metadata.json", "{}");
+        let client = DirectCatalogClient::new("file:///wh/t".to_string(), Arc::new(storage));
+        let resp = client
+            .load_table(&TableIdentifier::new("ns", "t"), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.metadata_location,
+            "file:///wh/t/metadata/00003-bbbb.metadata.json"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_hint_and_no_listing_keeps_the_hint_error() {
+        // Empty storage: hint read fails AND the listing finds nothing —
+        // the error must be the no-metadata-found one, not a panic.
+        let storage = MemoryStorage::new();
+        let client = DirectCatalogClient::new("s3://bucket/t".to_string(), Arc::new(storage));
+        let err = client
+            .load_table(&TableIdentifier::new("ns", "t"), false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("metadata"), "got: {err}");
+    }
 
     #[tokio::test]
     async fn test_direct_catalog_resolves_version_hint() {

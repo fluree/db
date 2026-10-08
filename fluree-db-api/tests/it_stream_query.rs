@@ -192,6 +192,45 @@ async fn dataset_select_streams_via_from() {
     assert_eq!(records.iter().filter(|r| r["type"] == "row").count(), 3);
 }
 
+/// Streamed rows are the `bindings` entries `/query` returns — the documented
+/// contract — so their IRIs are absolute even when the query declares a prefix
+/// for them: a row carries no prefix map to expand a compact IRI against.
+#[tokio::test]
+async fn streamed_rows_match_buffered_sparql_json_iris() {
+    let (fluree, ledger) = seed_three().await;
+    let sparql = "PREFIX a: <http://a.co/> SELECT ?s WHERE { ?s a:name \"Xavier\" }";
+
+    let buffered = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("buffered query")
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let expected = &buffered["results"]["bindings"][0];
+    assert_eq!(
+        expected["s"],
+        json!({"type": "uri", "value": "http://a.co/x"})
+    );
+
+    let records = collect_records(
+        &fluree,
+        ledger,
+        OwnedStreamQuery::Sparql(sparql.to_string()),
+    )
+    .await;
+    let row = records.iter().find(|r| r["type"] == "row").expect("a row");
+    assert_eq!(&row["row"], expected, "single-ledger stream row");
+
+    let from_query = json!({
+        "@context": { "a": "http://a.co/" },
+        "from": "stream/sel:main",
+        "select": ["?s"],
+        "where": { "@id": "?s", "a:name": "Xavier" }
+    });
+    let records = collect_dataset_records(&fluree, from_query).await;
+    let row = records.iter().find(|r| r["type"] == "row").expect("a row");
+    assert_eq!(&row["row"], expected, "dataset stream row");
+}
+
 #[tokio::test]
 async fn multi_ledger_dataset_streams_union() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -235,6 +274,35 @@ async fn ask_query_is_rejected_before_streaming() {
         Err(e) => assert!(
             e.to_string().to_lowercase().contains("ask"),
             "error should mention ASK, got: {e}"
+        ),
+    }
+}
+
+/// N5 lock: the streaming query path rejects a SPARQL `FROM`/`FROM NAMED`
+/// dataset clause (it does not build datasets), whereas the buffered `query`
+/// path supports a within-ledger `FROM`. This is a deliberate surface
+/// asymmetry, and it exercises the very same `validate_sparql_for_view` guard
+/// the R2RML query path uses to reject `FROM` — so it locks both.
+#[tokio::test]
+async fn sparql_from_clause_is_rejected_before_streaming() {
+    let (fluree, ledger) = seed_three().await;
+    let graph = support::graphdb_from_ledger(&ledger);
+
+    let result = fluree
+        .plan_stream_query(
+            &graph,
+            &OwnedStreamQuery::Sparql(
+                "PREFIX a: <http://a.co/> SELECT ?name FROM <urn:g1> { ?s a:name ?name }"
+                    .to_string(),
+            ),
+        )
+        .await;
+
+    match result {
+        Ok(_) => panic!("a SPARQL FROM clause must be rejected on the streaming endpoint"),
+        Err(e) => assert!(
+            e.to_string().contains("FROM"),
+            "error should mention the unsupported FROM clause, got: {e}"
         ),
     }
 }

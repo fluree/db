@@ -1,0 +1,10 @@
+# q049 construct_customer_region
+# Intent: CONSTRUCT over a dims-only join.
+# BI lineage (BI-22): "Emit current-customer -> region edges."
+# Predicates verified against enterprise.ttl — DimCustomer: isCurrent, geography; DimGeography: region.
+# Determinism: unordered LIMIT truncates a larger set (any k rows are valid) -> hash_gate=rows_only; gated on row count + invariants, not an exact hash.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+CONSTRUCT { ?c edw:inRegion ?region . }
+WHERE { ?c a edw:Customer ; edw:isCurrent true ; edw:geography ?g .
+        ?g edw:region ?region . }
+LIMIT 5000

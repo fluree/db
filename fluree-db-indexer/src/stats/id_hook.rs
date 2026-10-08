@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::hll::HllSketch256;
 use fluree_db_core::value_id::ValueTypeTag;
-use fluree_db_core::{GraphId, GraphPropertyStatEntry, GraphStatsEntry};
+use fluree_db_core::{GraphId, GraphPropertyStatEntry, GraphStatsEntry, PropertyStatEntry};
 
 use super::hashing::subject_hash;
 
@@ -34,6 +34,14 @@ pub struct IdPropertyHll {
     pub last_modified_t: i64,
     /// Per-datatype flake count deltas: ValueTypeTag(u8) -> signed count
     pub datatypes: HashMap<u8, i64>,
+    /// 256-bit set of every datatype tag this entry has *seen* — every record
+    /// fed through the hook (asserts and retracts alike) plus any prior
+    /// historical tags seeded by the incremental path. Unlike `datatypes`,
+    /// bits are never cleared, which is what makes the finalized
+    /// `historical_datatypes` monotone across publishes. A retract's tag is
+    /// deliberately included: extra tags can only *decline* an optimization,
+    /// never license one.
+    historical_tag_bits: [u64; 4],
 }
 
 impl IdPropertyHll {
@@ -44,6 +52,7 @@ impl IdPropertyHll {
             subjects_hll: HllSketch256::new(),
             last_modified_t: 0,
             datatypes: HashMap::new(),
+            historical_tag_bits: [0; 4],
         }
     }
 
@@ -61,6 +70,7 @@ impl IdPropertyHll {
             subjects_hll,
             last_modified_t,
             datatypes,
+            historical_tag_bits: [0; 4],
         }
     }
 
@@ -68,12 +78,52 @@ impl IdPropertyHll {
     /// HLL: register-wise max. Counts: additive. last_modified_t: max.
     pub fn merge_from(&mut self, other: &IdPropertyHll) {
         self.count += other.count;
-        self.values_hll.merge_inplace(&other.values_hll);
-        self.subjects_hll.merge_inplace(&other.subjects_hll);
+        self.values_hll.merge(&other.values_hll);
+        self.subjects_hll.merge(&other.subjects_hll);
         self.last_modified_t = self.last_modified_t.max(other.last_modified_t);
         for (&dt, &delta) in &other.datatypes {
             *self.datatypes.entry(dt).or_insert(0) += delta;
         }
+        for (word, other_word) in self
+            .historical_tag_bits
+            .iter_mut()
+            .zip(other.historical_tag_bits.iter())
+        {
+            *word |= other_word;
+        }
+    }
+
+    #[inline]
+    fn note_historical_tag(&mut self, tag: u8) {
+        self.historical_tag_bits[(tag >> 6) as usize] |= 1u64 << (tag & 63);
+    }
+
+    /// Union prior historical tags into this entry (incremental seeding).
+    pub fn seed_historical_tags(&mut self, tags: impl IntoIterator<Item = u8>) {
+        for tag in tags {
+            self.note_historical_tag(tag);
+        }
+    }
+
+    /// The finalized historical tag set: every bit noted or seeded, unioned
+    /// with every key in the seeded `datatypes` count map (belt and braces —
+    /// a seeded count tag belongs to the covered range by construction, and
+    /// an extra tag is only ever conservative). Sorted.
+    pub fn historical_datatypes(&self) -> Vec<u8> {
+        let mut bits = self.historical_tag_bits;
+        for &dt in self.datatypes.keys() {
+            bits[(dt >> 6) as usize] |= 1u64 << (dt & 63);
+        }
+        let mut tags = Vec::new();
+        for (word_idx, word) in bits.iter().enumerate() {
+            let mut w = *word;
+            while w != 0 {
+                let bit = w.trailing_zeros();
+                tags.push((word_idx as u32 * 64 + bit) as u8);
+                w &= w - 1;
+            }
+        }
+        tags
     }
 }
 
@@ -345,10 +395,38 @@ impl IdStatsHook {
 
     /// Process a single record with resolved IDs.
     ///
-    /// Called per-op after the resolver maps Sids to numeric IDs.
+    /// Called per-op after the resolver maps Sids to numeric IDs. The signed
+    /// count delta is derived from the op alone (assert +1, retract -1),
+    /// which is correct when counts accumulate from scratch over an ordered
+    /// event replay (rebuild/import). For base-seeded counts use
+    /// [`Self::on_record_with_base_presence`].
     pub fn on_record(&mut self, rec: &StatsRecord) {
-        self.flake_count += 1;
         let delta: i64 = if rec.op { 1 } else { -1 };
+        self.apply_record(rec, delta);
+    }
+
+    /// Process a single record whose fact identity's presence in the base
+    /// index is known, deriving the signed count delta from the materialized
+    /// state transition instead of the raw op: an assert creates a row only
+    /// when the fact is base-absent, and a retract removes one only when it
+    /// is base-present; otherwise the record changes no rows and counts by 0.
+    /// Monotone accumulators (HLL sketches, touched-property sets,
+    /// `last_modified_t`) still observe every record.
+    ///
+    /// Use for base-seeded counts (the incremental path); commit event logs
+    /// legitimately contain re-asserts of present facts, and deriving ±1
+    /// from the op double-counts them against the seed.
+    pub fn on_record_with_base_presence(&mut self, rec: &StatsRecord, base_present: bool) {
+        let delta: i64 = match (rec.op, base_present) {
+            (true, false) => 1,
+            (false, true) => -1,
+            (true, true) | (false, false) => 0,
+        };
+        self.apply_record(rec, delta);
+    }
+
+    fn apply_record(&mut self, rec: &StatsRecord, delta: i64) {
+        self.flake_count += 1;
 
         // Track per-graph flake count
         *self.graph_flakes.entry(rec.g_id).or_insert(0) += delta;
@@ -376,6 +454,8 @@ impl IdStatsHook {
 
         // Track datatype usage
         *hll.datatypes.entry(rec.dt.as_u8()).or_insert(0) += delta;
+        // Historical tag set: every record's tag, regardless of op or delta.
+        hll.note_historical_tag(rec.dt.as_u8());
 
         // Track class membership and class→property attribution (graph-scoped).
         if let Some(rdf_type_pid) = self.rdf_type_p_id {
@@ -449,6 +529,29 @@ impl IdStatsHook {
                     .or_insert(0) += delta;
             }
         }
+    }
+
+    /// Discount duplicate statements collapsed by the import SPOT merge.
+    ///
+    /// Import worker hooks are fed per chunk, upstream of the cross-chunk
+    /// merge, so a statement duplicated across chunks was counted once per
+    /// copy; the merge reports the collapsed copies here. Only the exact
+    /// counters move — HLL sketches, `last_modified_t`, and historical
+    /// datatype tags are duplicate-insensitive and stay untouched. Worker
+    /// hooks never track class detail (rdf:type p_id unset), so class maps
+    /// need no correction; the set-view class stats come from the
+    /// `SpotClassStatsCollector` on the already-deduplicated merge output.
+    pub fn discount_import_duplicates(&mut self, g_id: GraphId, p_id: u32, o_type: u16, n: u64) {
+        let delta = n as i64;
+        self.flake_count = self.flake_count.saturating_sub(n as usize);
+        *self.graph_flakes.entry(g_id).or_insert(0) -= delta;
+        let hll = self
+            .properties
+            .entry(GraphPropertyKey { g_id, p_id })
+            .or_insert_with(IdPropertyHll::new);
+        hll.count -= delta;
+        let dt = otype_to_value_type_tag(fluree_db_core::o_type::OType::from_u16(o_type));
+        *hll.datatypes.entry(dt.as_u8()).or_insert(0) -= delta;
     }
 
     /// Merge another hook into this one (for cross-commit accumulation).
@@ -631,6 +734,8 @@ impl IdStatsHook {
                     ndv_values: hll.values_hll.estimate(),
                     ndv_subjects: hll.subjects_hll.estimate(),
                     last_modified_t: hll.last_modified_t,
+                    observed_datatypes: PropertyStatEntry::tags_of(&datatypes),
+                    historical_datatypes: hll.historical_datatypes(),
                     datatypes,
                 });
             }
@@ -749,6 +854,8 @@ impl IdStatsHook {
                     ndv_values: hll.values_hll.estimate(),
                     ndv_subjects: hll.subjects_hll.estimate(),
                     last_modified_t: hll.last_modified_t,
+                    observed_datatypes: PropertyStatEntry::tags_of(&datatypes),
+                    historical_datatypes: hll.historical_datatypes(),
                     datatypes,
                 }
             })
@@ -858,5 +965,143 @@ mod tests {
         let key = GraphPropertyKey { g_id: 0, p_id: 1 };
         assert_eq!(props[&key].count, 5);
         assert_eq!(props[&key].last_modified_t, 3);
+    }
+
+    /// The indexer's own guard on the sketch it persists.
+    ///
+    /// `merge_from` is register-wise max, so merging a disjoint sketch
+    /// can only raise the estimate, and the merged estimate must be
+    /// near the true union cardinality. The kernel tests this too, but
+    /// the indexer had no test that would redden if the kernel's merge
+    /// regressed under it -- flipping that max to a min left all of the
+    /// indexer's tests green.
+    #[test]
+    fn merge_from_unions_the_sketches() {
+        // Fed the way the refresh path feeds it: `subject_hash`, not a
+        // raw counter. The sketch takes an already-mixed 64-bit hash,
+        // and a value with structure left in it (`i * odd`) inflates
+        // the estimate by most of a factor of two.
+        let mut a = IdPropertyHll::new();
+        let mut b = IdPropertyHll::new();
+        for i in 0..5_000u64 {
+            a.subjects_hll.insert_hash(subject_hash(i));
+        }
+        for i in 5_000..10_000u64 {
+            b.subjects_hll.insert_hash(subject_hash(i));
+        }
+        let (only_a, only_b) = (a.subjects_hll.estimate(), b.subjects_hll.estimate());
+
+        a.merge_from(&b);
+        let merged = a.subjects_hll.estimate();
+
+        assert!(
+            merged >= only_a && merged >= only_b,
+            "merge must not lower the estimate: {only_a} + {only_b} -> {merged}"
+        );
+        // 256 registers is about 6.5% relative error; allow three sigma.
+        let err = (merged as f64 - 10_000.0).abs() / 10_000.0;
+        assert!(err < 0.20, "merged estimate {merged} is not near 10,000");
+    }
+
+    fn record(op: bool, t: i64) -> StatsRecord {
+        StatsRecord {
+            g_id: 0,
+            p_id: 1,
+            s_id: 10,
+            dt: fluree_db_core::value_id::ValueTypeTag::INTEGER,
+            o_hash: 42,
+            o_kind: 0,
+            o_key: 7,
+            t,
+            op,
+            lang_id: 0,
+        }
+    }
+
+    fn seeded_hook(count: i64) -> IdStatsHook {
+        let mut prior = HashMap::new();
+        let mut hll = IdPropertyHll::new();
+        hll.count = count;
+        prior.insert(GraphPropertyKey { g_id: 0, p_id: 1 }, hll);
+        IdStatsHook::with_prior_properties(prior)
+    }
+
+    fn property_count(hook: &IdStatsHook) -> i64 {
+        hook.properties()[&GraphPropertyKey { g_id: 0, p_id: 1 }].count
+    }
+
+    /// Base-seeded counts change only on real state transitions: assert of an
+    /// absent fact (+1) and retract of a present fact (-1).
+    #[test]
+    fn base_presence_delta_counts_transitions_only() {
+        let mut hook = seeded_hook(5);
+        hook.on_record_with_base_presence(&record(true, 1), false); // created
+        assert_eq!(property_count(&hook), 6);
+        hook.on_record_with_base_presence(&record(false, 2), true); // removed
+        assert_eq!(property_count(&hook), 5);
+    }
+
+    /// A re-assert of a base-present fact and a retract of a base-absent
+    /// fact are no-ops for counts; commit event logs legitimately contain
+    /// both (facts are re-asserted across commits, and a window's
+    /// assert+retract of a new fact dedups to a lone retract).
+    #[test]
+    fn base_presence_delta_ignores_noop_events() {
+        let mut hook = seeded_hook(5);
+        hook.on_record_with_base_presence(&record(true, 1), true); // re-assert
+        assert_eq!(property_count(&hook), 5);
+        hook.on_record_with_base_presence(&record(false, 2), false); // retract of absent
+        assert_eq!(property_count(&hook), 5);
+    }
+
+    /// Zero-delta records still feed the monotone accumulators: NDV sketches
+    /// and last-modified tracking observe every record.
+    #[test]
+    fn noop_events_still_feed_monotone_accumulators() {
+        let mut hook = seeded_hook(5);
+        hook.on_record_with_base_presence(&record(true, 9), true);
+        let hll = &hook.properties()[&GraphPropertyKey { g_id: 0, p_id: 1 }];
+        assert_eq!(hll.last_modified_t, 9);
+        assert!(hll.values_hll.estimate() > 0, "value sketch observed");
+    }
+
+    /// Import-merge duplicate discounts move exactly the exact counters —
+    /// graph flakes, property count, per-datatype count — and leave the
+    /// monotone accumulators (HLL, last_modified_t, historical tags) alone.
+    #[test]
+    fn discount_import_duplicates_moves_exact_counters_only() {
+        use fluree_db_core::o_type::OType;
+
+        let mut hook = IdStatsHook::new();
+        // Two copies of the same fact counted by per-chunk worker hooks.
+        hook.on_record(&record(true, 1));
+        hook.on_record(&record(true, 1));
+        let hll_before = hook.properties()[&GraphPropertyKey { g_id: 0, p_id: 1 }]
+            .values_hll
+            .estimate();
+
+        // The merge collapsed one copy. record() uses ValueTypeTag::INTEGER,
+        // which OType::XSD_INTEGER maps back to.
+        hook.discount_import_duplicates(0, 1, OType::XSD_INTEGER.as_u16(), 1);
+
+        assert_eq!(property_count(&hook), 1);
+        assert_eq!(hook.graph_flakes_mut()[&0], 1);
+        let hll = &hook.properties()[&GraphPropertyKey { g_id: 0, p_id: 1 }];
+        assert_eq!(
+            hll.datatypes[&fluree_db_core::value_id::ValueTypeTag::INTEGER.as_u8()],
+            1
+        );
+        assert_eq!(hll.values_hll.estimate(), hll_before, "HLL untouched");
+        assert_eq!(hll.last_modified_t, 1);
+    }
+
+    /// The op-derived path is unchanged: ±1 regardless of any base.
+    #[test]
+    fn event_delta_path_counts_every_op() {
+        let mut hook = seeded_hook(0);
+        hook.on_record(&record(true, 1));
+        hook.on_record(&record(true, 2));
+        hook.on_record(&record(false, 3));
+        assert_eq!(property_count(&hook), 1);
     }
 }

@@ -130,8 +130,12 @@ pub fn aggregate_column_stats(data_files: &[DataFile], schema: &Schema) -> Table
     let mut had_column_bounds = false;
 
     for df in data_files {
-        row_count += df.record_count;
-        total_bytes += df.file_size_in_bytes;
+        // Saturate rather than wrap (or overflow-panic in debug builds) on a
+        // corrupt manifest; these table-level totals are advisory. Correctness
+        // consumers (the COUNT(*) manifest shortcut) re-derive the row count
+        // with per-file checked arithmetic and decline on any corruption.
+        row_count = row_count.saturating_add(df.record_count);
+        total_bytes = total_bytes.saturating_add(df.file_size_in_bytes);
 
         for field in &scalar_fields {
             let fid = field.id;
@@ -379,6 +383,39 @@ pub async fn send_read_snapshot_data_files<S: crate::io::SendIcebergStorage + ?S
     }
 
     Ok((data_files, manifests_read, has_delete_manifests))
+}
+
+/// Whether a snapshot carries any **delete manifests** (merge-on-read
+/// position/equality deletes) — reading the **manifest list only**, never a data
+/// or delete manifest.
+///
+/// This is the same detection [`send_read_snapshot_data_files`] performs (parse
+/// the manifest list WITH deletes, then check `is_deletes()`), isolated so a
+/// caller that needs only the flag — e.g. stamping a scan-file cache entry so a
+/// later cache hit can re-refuse a delete-bearing selection — pays a single
+/// manifest-list read instead of reading every data manifest.
+///
+/// Send-safe variant for server-side use.
+#[cfg(feature = "aws")]
+pub async fn send_snapshot_has_delete_manifests<S: crate::io::SendIcebergStorage + ?Sized>(
+    storage: &S,
+    snapshot: &Snapshot,
+) -> Result<bool> {
+    let manifest_list_path = snapshot.manifest_list.as_ref().ok_or_else(|| {
+        crate::error::IcebergError::Manifest(
+            "Snapshot has no manifest list (v1 format not supported)".to_string(),
+        )
+    })?;
+    let manifest_list_data = storage.read(manifest_list_path).await?;
+    // Parse WITH deletes so a `content=1` delete manifest is visible; the default
+    // `parse_manifest_list` filters them out.
+    let manifest_entries = parse_manifest_list_with_deletes(&manifest_list_data, true)?;
+    for me in &manifest_entries {
+        if me.is_deletes() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -950,5 +987,38 @@ mod tests {
             !reads.iter().any(|p| p == delete_manifest),
             "the delete manifest must never be fetched: {reads:?}"
         );
+    }
+
+    /// The stats/COUNT path: once `read_snapshot_data_files` reports delete
+    /// manifests, the fail-closed guard must refuse (default) rather than let the
+    /// over-counting `row_count` sum be returned — and proceed under the
+    /// override. This mirrors exactly what the metadata-preview consumer
+    /// (`iceberg_catalog.rs`) does with the returned flag (F-AUD-1).
+    #[tokio::test]
+    async fn stats_path_refuses_delete_manifests_unless_overridden() {
+        use crate::mor_guard::ensure_no_delete_manifests;
+
+        let list_path = "s3://b/t/metadata/snap.avro";
+        let data_manifest = "s3://b/t/metadata/m-data.avro";
+        let delete_manifest = "s3://b/t/metadata/m-del.avro";
+
+        let mut mem = crate::io::MemoryStorage::new();
+        mem.add_file(
+            list_path,
+            build_manifest_list_with_delete(data_manifest, delete_manifest),
+        );
+        mem.add_file(data_manifest, build_manifest("s3://b/t/data/f1.parquet"));
+        let snapshot = snapshot_with_list(list_path);
+
+        let (_data_files, _read, has_deletes) =
+            read_snapshot_data_files(&mem, &snapshot).await.unwrap();
+        assert!(has_deletes);
+
+        // Guard active (default): refuse.
+        let err =
+            ensure_no_delete_manifests(usize::from(has_deletes), "dw.fact", false).unwrap_err();
+        assert!(matches!(err, crate::IcebergError::MergeOnReadDeletes(_)));
+        // Operator opted out: proceed (upper-bound counts, with a logged warning).
+        assert!(ensure_no_delete_manifests(usize::from(has_deletes), "dw.fact", true).is_ok());
     }
 }

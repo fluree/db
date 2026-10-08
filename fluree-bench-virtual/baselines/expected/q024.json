@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "query_id": "q024",
+  "result_hash": "e5a7b2ee0fb17256d0ce914cf50708b786a95590396ece62f0a11b0bb96c116c",
+  "rows": 44142,
+  "head_rows": [
+    "<http://data.fluree.dev/edw/customer/100002>",
+    "<http://data.fluree.dev/edw/customer/100007>",
+    "<http://data.fluree.dev/edw/customer/100008>",
+    "<http://data.fluree.dev/edw/customer/100010>",
+    "<http://data.fluree.dev/edw/customer/10001>",
+    "<http://data.fluree.dev/edw/customer/100024>",
+    "<http://data.fluree.dev/edw/customer/100025>",
+    "<http://data.fluree.dev/edw/customer/100038>",
+    "<http://data.fluree.dev/edw/customer/100052>",
+    "<http://data.fluree.dev/edw/customer/100057>",
+    "<http://data.fluree.dev/edw/customer/100064>",
+    "<http://data.fluree.dev/edw/customer/100069>",
+    "<http://data.fluree.dev/edw/customer/100074>",
+    "<http://data.fluree.dev/edw/customer/100075>",
+    "<http://data.fluree.dev/edw/customer/100076>",
+    "<http://data.fluree.dev/edw/customer/100077>",
+    "<http://data.fluree.dev/edw/customer/100078>",
+    "<http://data.fluree.dev/edw/customer/100080>",
+    "<http://data.fluree.dev/edw/customer/100093>",
+    "<http://data.fluree.dev/edw/customer/100108>"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}
