@@ -164,10 +164,10 @@ fn the_sink_hears_one_statement_per_block() {
     }
     impl GraphSink for Counting {
         fn on_base(&mut self, b: &str) {
-            self.inner().on_base(b)
+            self.inner().on_base(b);
         }
         fn on_prefix(&mut self, p: &str, n: &str) {
-            self.inner().on_prefix(p, n)
+            self.inner().on_prefix(p, n);
         }
         fn term_iri(&mut self, i: &str) -> fluree_graph_ir::TermId {
             self.inner().term_iri(i)
@@ -212,7 +212,7 @@ fn the_sink_hears_one_statement_per_block() {
         }
         fn end_statement(&mut self) {
             self.ends += 1;
-            self.inner().end_statement()
+            self.inner().end_statement();
         }
     }
     let mut sink = Counting::default();
@@ -223,4 +223,20 @@ fn the_sink_hears_one_statement_per_block() {
     .unwrap();
     // The prefix directive, the block, and the triple.
     assert_eq!(sink.ends, 3);
+}
+
+#[test]
+fn an_annotation_block_is_never_empty() {
+    // `annotationBlock ::= '{|' predicateObjectList '|}'`, in Turtle and TriG.
+    let mut sink = GraphCollectorSink::with_named_graphs();
+    let turtle = format!("{PREFIXES}ex:s ex:p ex:o {{|  |}} .");
+    assert!(fluree_graph_turtle::parse(&turtle, &mut sink).is_err());
+    let mut sink = GraphCollectorSink::with_named_graphs();
+    assert!(parse_trig(
+        &format!("{PREFIXES}ex:g {{ ex:s ex:p ex:o {{| |}} }}"),
+        &mut sink
+    )
+    .is_err());
+    // One pair is enough.
+    dataset("ex:g { ex:s ex:p ex:o {| ex:q ex:r |} }");
 }
