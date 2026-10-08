@@ -123,58 +123,52 @@ impl VendedCredentials {
     ///
     /// Honors the standardized top-level `storage-credentials` array
     /// (apache/iceberg #10722): per spec a client MUST check `storage-credentials`
-    /// **before** the legacy top-level `config` map. Among entries whose `prefix`
-    /// matches `metadata_location`, the **longest** prefix that yields usable
-    /// static creds wins — a remote-signing-only entry carries no `s3.*` keys, so
-    /// [`Self::from_config_map`] returns `None` and it is skipped. Falls back to
-    /// the flat top-level `config` map when no usable storage-credential is found
-    /// (the shape AWS Lake Formation and older catalogs still emit).
+    /// **before** the legacy top-level `config` map. Among the entries whose
+    /// `prefix` matches `metadata_location` (an empty prefix matches everything),
+    /// the **longest** prefix is the catalog's decision for this table, and it is
+    /// final:
+    ///
+    /// - its static `s3.*` keys are the credentials;
+    /// - if it has none — e.g. a remote-signing entry, which this reader does not
+    ///   implement — the result is `None`, and the source's `vended_credentials`
+    ///   policy refuses the read (§2 fail-closed) rather than falling back to a
+    ///   shorter entry or the legacy `config`, credentials the catalog did not
+    ///   scope to this table.
+    ///
+    /// Only when no entry matches does the flat top-level `config` map apply (the
+    /// shape AWS Lake Formation and older catalogs still emit). Ties between equal
+    /// prefixes go to the later entry. Entries without a `config` object are
+    /// malformed and ignored.
+    ///
+    /// The prefix is matched against `metadata_location` because one credential
+    /// set serves the whole table; a table whose data files sit outside its
+    /// metadata prefix is matched on the metadata.
     pub fn from_load_table_response(
         response: &serde_json::Value,
         metadata_location: &str,
     ) -> Result<Option<Self>> {
-        if let Some(entries) = response
+        let best_entry = response
             .get("storage-credentials")
             .and_then(|v| v.as_array())
-        {
-            let mut best: Option<(usize, Self)> = None;
-            for entry in entries {
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
                 let prefix = entry.get("prefix").and_then(|p| p.as_str()).unwrap_or("");
-                // An empty/absent prefix applies to everything; a present prefix
-                // must be a prefix of this table's metadata_location.
-                if !prefix.is_empty() && !metadata_location.starts_with(prefix) {
-                    continue;
-                }
-                let Some(cfg_obj) = entry.get("config").and_then(|c| c.as_object()) else {
-                    continue;
-                };
-                let cfg: HashMap<String, serde_json::Value> = cfg_obj
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                // Skip entries with no usable static creds (e.g. remote-signing).
-                if let Some(creds) = Self::from_config_map(&cfg)? {
-                    let len = prefix.len();
-                    let better = match &best {
-                        None => true,
-                        Some((best_len, _)) => len >= *best_len,
-                    };
-                    if better {
-                        best = Some((len, creds));
-                    }
-                }
-            }
-            if let Some((_, creds)) = best {
-                return Ok(Some(creds));
-            }
-        }
+                let config = entry.get("config").and_then(|c| c.as_object())?;
+                (prefix.is_empty() || metadata_location.starts_with(prefix))
+                    .then_some((prefix.len(), config))
+            })
+            .max_by_key(|(prefix_len, _)| *prefix_len);
 
-        // Fall back to the legacy flat top-level `config` map.
-        let config: HashMap<String, serde_json::Value> = response
-            .get("config")
-            .and_then(|v| v.as_object())
-            .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default();
+        let config = match best_entry {
+            Some((_, entry_config)) => entry_config,
+            None => match response.get("config").and_then(|v| v.as_object()) {
+                Some(legacy) => legacy,
+                None => return Ok(None),
+            },
+        };
+        let config: HashMap<String, serde_json::Value> =
+            config.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         Self::from_config_map(&config)
     }
 
@@ -625,17 +619,32 @@ mod tests {
     }
 
     #[test]
-    fn longest_prefix_without_usable_keys_is_skipped() {
-        // The longest-prefix entry is remote-signing-only (no static s3.* keys);
-        // the shorter entry that actually carries keys must be chosen.
+    fn longest_prefix_without_static_keys_yields_no_credentials() {
+        // The longest matching prefix is remote-signing-only (no static s3.* keys).
+        // It decides this table: no credentials, NOT the shorter entry's keys.
         let resp = serde_json::json!({
             "metadata-location": ML,
             "storage-credentials": [
-                { "prefix": "s3://bucket/db", "config": creds_config("AKIA_USABLE") },
+                { "prefix": "s3://bucket/db", "config": creds_config("AKIA_SHORTER") },
                 { "prefix": "s3://bucket/db/tbl", "config": { "s3.remote-signing-enabled": "true" } }
             ],
         });
-        assert_eq!(load_creds(&resp).unwrap().access_key_id, "AKIA_USABLE");
+        assert!(load_creds(&resp).is_none());
+    }
+
+    #[test]
+    fn matching_remote_signing_entry_does_not_fall_back_to_legacy_config() {
+        // fluree/db#1451 review: a prefix-matching remote-signing entry plus static
+        // keys in the legacy `config` must not read with the legacy keys — the
+        // catalog asked for remote signing on this prefix.
+        let resp = serde_json::json!({
+            "metadata-location": ML,
+            "config": creds_config("AKIA_LEGACY"),
+            "storage-credentials": [
+                { "prefix": "s3://bucket/db/tbl", "config": { "s3.remote-signing-enabled": "true" } }
+            ],
+        });
+        assert!(load_creds(&resp).is_none());
     }
 
     #[test]
