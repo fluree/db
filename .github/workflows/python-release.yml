@@ -6,28 +6,16 @@ name: Python release
 # the workspace version, so `v4.3.0` publishes `fluree` 4.3.0. A pre-release
 # tag (`v4.3.0-rc.1`) publishes a PyPI pre-release (4.3.0rc1).
 #
-# A Python-only release, between engine releases, is a hand run on `main`
-# that names its version (`4.2.4a1`, say): the wheels carry that version
-# instead of the workspace's. A hand run that names none builds and tests the
-# wheels without publishing.
-#
 # Publishing uses PyPI trusted publishing: PyPI trusts this workflow, run in
 # the `pypi` environment, so no token is stored. That environment admits only
-# `v*` tags and `main`. Only a tag push or a hand run on `main` that names a
-# version publishes, and only when the wheels carry the version it names.
+# `v*` tags, only a tag push publishes, and only when the tag names the
+# version the wheels carry. Run it by hand (workflow_dispatch) to build and
+# test the wheels without publishing.
 on:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+*'
   workflow_dispatch:
-    inputs:
-      version:
-        description: >-
-          Publish a Python-only release of this version (PEP 440, such as
-          4.2.4a1); runs on main only. Leave empty to build and test without
-          publishing.
-        required: false
-        default: ''
 
 permissions:
   contents: read
@@ -71,27 +59,6 @@ jobs:
       # build in the manylinux_2_28 image so they install on glibc 2.28+
       # (RHEL 8, Debian 11, Ubuntu 20.04 and later); maturin refuses a wheel
       # that needs a newer glibc than its tag claims.
-      #
-      # A Python-only release sets its version in pyproject.toml, which maturin
-      # prefers to Cargo.toml's, so Cargo.lock (and --locked) is untouched.
-      - name: Set the version of a Python-only release
-        if: github.event_name == 'workflow_dispatch' && inputs.version != ''
-        shell: bash
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          py="${{ steps.py314.outputs.python-path }}"
-          "$py" -m pip install --quiet packaging
-          "$py" - <<'EOF'
-          import os, pathlib
-          from packaging.version import Version
-          version = str(Version(os.environ["VERSION"]))  # refuses a version PEP 440 does not allow
-          path = pathlib.Path("fluree-db-python/pyproject.toml")
-          text = path.read_text()
-          assert 'dynamic = ["version"]' in text, "pyproject.toml no longer takes its version from Cargo.toml"
-          path.write_text(text.replace('dynamic = ["version"]', f'version = "{version}"'))
-          EOF
-
       - name: Build the wheel
         uses: PyO3/maturin-action@v1
         with:
@@ -103,15 +70,13 @@ jobs:
 
       # PyPI never takes a version twice, so a tag on the wrong commit must
       # not publish whatever version that commit carries.
-      - name: The release names the version being built
-        if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.version != '')
+      - name: The tag names the version being built
+        if: github.ref_type == 'tag'
         shell: bash
-        env:
-          EXPECTED: ${{ inputs.version || github.ref_name }}
         run: |
           py="${{ steps.py314.outputs.python-path }}"
           "$py" -m pip install --quiet packaging
-          "$py" -c 'import glob, os, sys; from packaging.version import Version as V; named = V(os.environ["EXPECTED"].removeprefix("v")); built = {V(os.path.basename(w).split("-")[1]) for w in glob.glob("dist/*.whl")}; sys.exit(0 if built == {named} else f"the release names {named}, but the wheels carry {sorted(map(str, built))}")'
+          "$py" -c 'import glob, os, sys; from packaging.version import Version as V; tag = V(os.environ["GITHUB_REF_NAME"].removeprefix("v")); built = {V(os.path.basename(w).split("-")[1]) for w in glob.glob("dist/*.whl")}; sys.exit(0 if built == {tag} else f"tag {tag} does not match the wheel version {sorted(map(str, built))}")'
 
       - name: Test the wheel on Python 3.10 and 3.14
         shell: bash
@@ -134,9 +99,7 @@ jobs:
   publish:
     name: publish to PyPI
     needs: wheels
-    if: >-
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
-      || (github.event_name == 'workflow_dispatch' && inputs.version != '' && github.ref == 'refs/heads/main')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     environment:
       name: pypi

@@ -15,8 +15,7 @@ pip install fluree                # or "fluree[pandas]", "fluree[polars]"
 
 Wheels are published for Linux (x86-64 and arm64, glibc 2.28 or later), macOS
 on Apple silicon, and Windows (x86-64), for CPython 3.10 and later. The
-package version is the version of the engine inside it; a pre-release such as
-`4.2.4a1` carries an engine newer than the last release.
+package version is the version of the engine inside it.
 
 ## Quick start
 

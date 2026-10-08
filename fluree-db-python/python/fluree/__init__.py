@@ -63,7 +63,7 @@ from fluree.errors import (
     UniqueConstraintError,
 )
 
-# The package's version: the engine's, or a Python-only release's own.
+# The installed package's version, which is the engine's.
 __version__ = _version("fluree")
 
 __all__ = [
