@@ -1829,12 +1829,18 @@ impl<'a, 'input, S: GraphSink, L: TokenStream> Parser<'a, 'input, S, L> {
                             r
                         }
                     };
-                    if !matches!(self.current().kind, TokenKind::AnnotationClose) {
-                        self.annotation_depth += 1;
-                        let body = self.parse_predicate_object_list(reifier);
-                        self.annotation_depth -= 1;
-                        body?;
+                    // `annotationBlock ::= '{|' predicateObjectList '|}'`.
+                    if self.check(&TokenKind::AnnotationClose) {
+                        return Err(TurtleError::parse(
+                            self.current().start as usize,
+                            "an annotation block '{| … |}' needs at least one predicate \
+                             and object",
+                        ));
                     }
+                    self.annotation_depth += 1;
+                    let body = self.parse_predicate_object_list(reifier);
+                    self.annotation_depth -= 1;
+                    body?;
                     self.expect(&TokenKind::AnnotationClose)?;
                 }
                 _ => break,
