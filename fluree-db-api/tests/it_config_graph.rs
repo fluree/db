@@ -1752,31 +1752,41 @@ async fn transaction_is_guarded_on_its_result() {
     assert!(message.contains("f:shaclEnabled"), "{message}");
 }
 
-/// The repair recipe exactly as `docs/ledger-config/writing-config.md` gives
-/// it, for the ledger whose config graph is `config_graph`.
+/// A repair recipe exactly as `docs/ledger-config/writing-config.md` gives
+/// it, for `ledger_id`: the first (`which` 0) starts from the config subject
+/// in the config graph, the second from the recommended subject when the
+/// config graph holds none.
 #[cfg(feature = "shacl")]
-fn docs_repair_recipe(config_graph: &str) -> String {
+fn docs_repair_recipe(ledger_id: &str, which: usize) -> String {
     let doc = include_str!("../../docs/ledger-config/writing-config.md");
     let section = doc
         .split_once("## Repairing a config split across graphs")
         .expect("the repair section")
         .1;
     let recipe = section
-        .split_once("```sparql")
-        .and_then(|(_, rest)| rest.split_once("```"))
+        .split("```sparql")
+        .nth(which + 1)
+        .and_then(|rest| rest.split_once("```"))
         .expect("the recipe")
         .0;
-    recipe.replace("urn:fluree:mydb:main#config", config_graph)
+    recipe
+        .replace("urn:fluree:mydb:main#config", &config_graph_iri(ledger_id))
+        .replace(
+            "urn:fluree:mydb:main:config:ledger",
+            &format!("urn:fluree:{ledger_id}:config:ledger"),
+        )
 }
 
 /// The repair recipe (`docs/ledger-config/writing-config.md`, run as the docs
 /// give it) restores each config the pre-fix JSON-LD parser could split
 /// across graphs: a setting group's fields in the default graph; the config
 /// subject's own group link and group there; a per-graph override's target
-/// and groups there; and a group partly in the config graph. Before the
-/// repair each reads without its SHACL setting (the forbidden record
-/// commits) and ledger info reports `stranded-fields`; after it, nothing is
-/// stranded and SHACL enforces again.
+/// and groups there; a group partly in the config graph; and (with the second
+/// recipe) a whole config on the recommended subject in the default graph,
+/// untyped, with no config subject in the config graph. Before the repair
+/// each reads without its SHACL setting (the forbidden record commits) and
+/// ledger info reports `stranded-fields`; after it, nothing is stranded and
+/// SHACL enforces again.
 #[cfg(feature = "shacl")]
 #[tokio::test]
 async fn repair_recipe_restores_a_split_config() {
@@ -1787,6 +1797,15 @@ async fn repair_recipe_restores_a_split_config() {
         "sh:property": [{"sh:path": {"@id": "ex:name"}, "sh:minCount": 1}]
     });
     let cases: Vec<(&str, Option<&str>, Vec<serde_json::Value>)> = vec![
+        (
+            "the whole config on the recommended subject in the default graph",
+            None,
+            vec![
+                json!({"@id": "urn:fluree:{ledger}:config:ledger",
+                       "f:shaclDefaults": {"@id": "urn:config:shacl"}}),
+                json!({"@id": "urn:config:shacl", "f:shaclEnabled": true}),
+            ],
+        ),
         (
             "a group's fields in the default graph",
             None,
@@ -1833,7 +1852,6 @@ async fn repair_recipe_restores_a_split_config() {
     for (i, (what, data_graph, config)) in cases.into_iter().enumerate() {
         let fluree = FlureeBuilder::memory().build_memory();
         let ledger_id = format!("it/config-repair-recipe-{i}:main");
-        let cfg = config_graph_iri(&ledger_id);
         let forbidden = |id: &str| {
             let mut doc =
                 json!({"@context": {"ex": "http://example.org/"}, "@id": id, "@type": "ex:Person"});
@@ -1843,7 +1861,11 @@ async fn repair_recipe_restores_a_split_config() {
             doc
         };
         let mut seed = vec![shape.clone()];
-        seed.extend(config);
+        seed.extend(config.into_iter().map(|node| {
+            let node = node.to_string().replace("{ledger}", &ledger_id);
+            serde_json::from_str::<serde_json::Value>(&node).unwrap()
+        }));
+        let recipe = docs_repair_recipe(&ledger_id, usize::from(i == 0));
         // The state as the pre-fix parser (and writes before the config guard)
         // left it, seeded unchecked, as that history reaches a ledger.
         let ledger = commit_unchecked(
@@ -1871,7 +1893,7 @@ async fn repair_recipe_restores_a_split_config() {
             .unwrap_or_else(|e| panic!("{what}: the split setting is not in effect: {e}"))
             .ledger;
 
-        let ledger = sparql_update(&fluree, ledger, &docs_repair_recipe(&cfg))
+        let ledger = sparql_update(&fluree, ledger, &recipe)
             .await
             .unwrap_or_else(|e| panic!("{what}: the repair recipe commits: {e}"))
             .ledger;
@@ -1979,6 +2001,69 @@ async fn config_guard_refuses_fields_of_the_config_subject_outside_the_config_gr
         .expect_err("typing it in the config graph would leave its group link outside");
     let message = config_guard_refusal(err);
     assert!(message.contains("already has fields"), "{message}");
+}
+
+/// The conventional config subject (`urn:fluree:<ledger>:config:ledger`) is
+/// the config subject by its IRI, before the config graph holds it: on a
+/// ledger with no config, its fields written without the config graph would
+/// never be read, so the write is refused (JSON-LD with no `@graph`, SPARQL
+/// `INSERT DATA` with no `GRAPH`), naming the config graph. Written past the
+/// guard (data from an earlier release), ledger info reports them.
+#[tokio::test]
+async fn config_guard_refuses_the_conventional_config_subject_outside_the_config_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (i, form) in ["jsonld", "sparql"].into_iter().enumerate() {
+        let name = format!("it/config-guard-conventional-{i}");
+        fluree.create_ledger(&name).await.unwrap();
+        let ledger_id = format!("{name}:main");
+        let cfg = config_graph_iri(&ledger_id);
+        let root = format!("urn:fluree:{ledger_id}:config:ledger");
+        let result = if form == "jsonld" {
+            fluree
+                .graph(&ledger_id)
+                .transact()
+                .insert(&json!({
+                    "@context": {"f": "https://ns.flur.ee/db#"},
+                    "@id": root,
+                    "f:shaclDefaults": {"@id": "urn:x:shacl", "f:shaclEnabled": true}
+                }))
+                .commit()
+                .await
+        } else {
+            fluree
+                .graph(&ledger_id)
+                .transact()
+                .sparql_update(&format!(
+                    "PREFIX f: <https://ns.flur.ee/db#>
+                     INSERT DATA {{ <{root}> f:shaclDefaults <urn:x:shacl> .
+                                    <urn:x:shacl> f:shaclEnabled true . }}"
+                ))
+                .commit()
+                .await
+        };
+        let message = config_guard_refusal(result.expect_err(form));
+        assert!(
+            message.contains("config subject") && message.contains(&root) && message.contains(&cfg),
+            "{form}: {message}"
+        );
+    }
+
+    let ledger_id = "it/config-diagnostics-conventional:main";
+    let root = format!("urn:fluree:{ledger_id}:config:ledger");
+    commit_unchecked(
+        &fluree,
+        genesis_ledger(&fluree, ledger_id),
+        &json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "@id": root,
+            "f:shaclDefaults": {"@id": "urn:x:shacl", "f:shaclEnabled": true}
+        }),
+    )
+    .await;
+    assert_eq!(
+        config_diagnostic_codes(&fluree, ledger_id).await,
+        ["stranded-fields"]
+    );
 }
 
 /// Ledger info reports every config node with config fields outside the

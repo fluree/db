@@ -107,6 +107,14 @@ pub(crate) const MULTI_VALUED: &[&str] = &[
 /// config graph: the ledger's config subject, and a per-graph override.
 pub(crate) const CONFIG_CLASSES: &[&str] = &[config_iris::LEDGER_CONFIG, config_iris::GRAPH_CONFIG];
 
+/// The documented IRI of a ledger's config subject,
+/// `urn:fluree:<ledger_id>:config:ledger`. It names the config subject
+/// whether or not the config graph holds it yet, so its config fields
+/// anywhere but the config graph are a config written to the wrong graph.
+pub(crate) fn conventional_config_subject(ledger_id: &str) -> String {
+    format!("urn:fluree:{ledger_id}:config:ledger")
+}
+
 /// Whether `p` is a predicate the config reader reads: a group pointer or
 /// source edge ([`CONFIG_EDGES`]), a single-valued setting
 /// ([`SINGLE_VALUED`]) or a multi-valued one ([`MULTI_VALUED`]). Only these
@@ -396,10 +404,11 @@ mod tests {
         );
     }
 
-    /// The repair recipe in `docs/ledger-config/writing-config.md` follows
-    /// every config edge: its `VALUES ?edge` list is the config edges, and
-    /// its path is the config edges plus the RDF list a `f:reasoningModes`
-    /// value may be. A config edge added here fails until the recipe has it.
+    /// The repair recipes in `docs/ledger-config/writing-config.md` follow
+    /// every config edge: the first one's `VALUES ?edge` list is the config
+    /// edges, and each one's path is the config edges plus the RDF list a
+    /// `f:reasoningModes` value may be. A config edge added here fails until
+    /// the recipes have it.
     #[test]
     fn the_repair_recipe_follows_every_config_edge() {
         use std::collections::BTreeSet;
@@ -408,11 +417,17 @@ mod tests {
             .split_once("## Repairing a config split across graphs")
             .expect("the repair section")
             .1;
-        let recipe = section
-            .split_once("```sparql")
-            .and_then(|(_, rest)| rest.split_once("```"))
-            .expect("the recipe")
-            .0;
+        let section = section.split_once("\n## ").map_or(section, |(s, _)| s);
+        let recipes: Vec<&str> = section
+            .split("```sparql")
+            .skip(1)
+            .map(|rest| rest.split_once("```").expect("the recipe").0)
+            .collect();
+        assert_eq!(
+            recipes.len(),
+            2,
+            "two recipes: from the config subject, and without one"
+        );
         let expand = |term: &str| -> String {
             if let Some(local) = term.strip_prefix("f:") {
                 format!("{}{local}", fluree_vocab::fluree::DB)
@@ -422,7 +437,7 @@ mod tests {
                 panic!("unexpected term {term:?} in the repair recipe")
             }
         };
-        let values: BTreeSet<String> = recipe
+        let values: BTreeSet<String> = recipes[0]
             .split_once("VALUES ?edge {")
             .and_then(|(_, rest)| rest.split_once('}'))
             .expect("the VALUES ?edge list")
@@ -430,22 +445,24 @@ mod tests {
             .split_whitespace()
             .map(expand)
             .collect();
-        let path: BTreeSet<String> = recipe
-            .split_once("?root (")
-            .and_then(|(_, rest)| rest.split_once(")*"))
-            .expect("the path")
-            .0
-            .split('|')
-            .map(|term| expand(term.trim()))
-            .collect();
         let edges: BTreeSet<String> = CONFIG_EDGES.iter().map(ToString::to_string).collect();
         assert_eq!(values, edges, "VALUES ?edge is the config edges");
         let mut path_terms = edges;
         path_terms.insert(config_iris::REASONING_MODES.to_string());
         path_terms.insert(fluree_vocab::rdf::REST.to_string());
-        assert_eq!(
-            path, path_terms,
-            "the path is the config edges and f:reasoningModes lists"
-        );
+        for recipe in recipes {
+            let path: BTreeSet<String> = recipe
+                .split_once("?root (")
+                .and_then(|(_, rest)| rest.split_once(")*"))
+                .expect("the path")
+                .0
+                .split('|')
+                .map(|term| expand(term.trim()))
+                .collect();
+            assert_eq!(
+                path, path_terms,
+                "the path is the config edges and f:reasoningModes lists"
+            );
+        }
     }
 }

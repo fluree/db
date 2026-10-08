@@ -423,6 +423,30 @@ pub async fn diagnose(
         }
     }
 
+    // The conventional config subject (`urn:fluree:<ledger>:config:ledger`)
+    // with config fields outside the config graph while the config graph does
+    // not hold it: a whole config written to the wrong graph. Transactions
+    // refuse that write; data written before may hold it.
+    let conventional = crate::config_vocab::conventional_config_subject(&snapshot.ledger_id);
+    if let Some(subject) = snapshot.encode_iri(&conventional) {
+        if !config_sids.contains(&subject) {
+            let stranded = graphs_with_config_fields(snapshot, overlay, to_t, &subject).await?;
+            if !stranded.is_empty() {
+                out.push(ConfigDiagnostic {
+                    code: ConfigDiagnosticCode::StrandedFields,
+                    message: format!(
+                        "the config subject {conventional} has config fields in {}, and the \
+                         config graph does not type it f:LedgerConfig, so none of them is read; \
+                         write the config into the config graph (see the repair recipe in \
+                         docs/ledger-config/writing-config.md)",
+                        stranded.join(", ")
+                    ),
+                    subjects: vec![conventional],
+                });
+            }
+        }
+    }
+
     if let Some(config) = resolve_ledger_config(snapshot, overlay, to_t).await? {
         let mut by_target: std::collections::BTreeMap<&str, usize> =
             std::collections::BTreeMap::new();

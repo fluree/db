@@ -226,7 +226,7 @@ A transaction that writes ledger config is checked before it commits, and refuse
 | Refused | Why | Write it instead |
 |---|---|---|
 | A setting group linked from the config graph whose fields are written to another graph, in the same transaction or a later one; or a link to a group whose fields already sit in another graph | The reader reads groups only from the config graph, so the group reads as empty | Put the group's fields in the config graph too (in JSON-LD, nest the group under the config node, or give it `"@graph": "config"`); to link fields that sit elsewhere, move them in the same transaction ([Repairing a config split across graphs](#repairing-a-config-split-across-graphs)) |
-| An `f:LedgerConfig` or `f:GraphConfig` written outside the config graph | Config is read only from the config graph, so the write has no effect | Write it to `urn:fluree:{ledger_id}#config` (or `"@graph": "config"`) |
+| An `f:LedgerConfig` or `f:GraphConfig` written outside the config graph, or config fields (a setting-group link such as `f:shaclDefaults`, say) written outside it on the [recommended config subject](#recommended-subject-iri) `urn:fluree:{ledger_id}:config:ledger`, whether or not the config graph holds that subject yet | Config is read only from the config graph, so the write has no effect | Write it to `urn:fluree:{ledger_id}#config` (or `"@graph": "config"`), with the subject typed `f:LedgerConfig` there |
 | A second value for a single-valued setting (`f:shaclEnabled`, `f:defaultAllow`, a group pointer such as `f:shaclDefaults`, ...), or a second `f:LedgerConfig` subject | The reader would pick one of them | Upsert, or delete the old value in the same transaction; add settings to the existing config subject |
 | An unrecognized `f:reasoningModes` value | Query-time reasoning would skip it silently | Use a supported mode name |
 
@@ -271,6 +271,25 @@ WHERE {
 ```
 
 Upserting the corrected config also restores the settings, but leaves the stray fields behind in the default graph.
+
+If the config graph holds no config subject at all (the whole config was written to the default graph on the [recommended subject](#recommended-subject-iri), which ledger info reports as `stranded-fields` on that subject), start from that subject instead, and type it `f:LedgerConfig` in the config graph as its fields move:
+
+```sparql
+PREFIX f: <https://ns.flur.ee/db#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+
+DELETE { ?n ?p ?o }
+INSERT { GRAPH <urn:fluree:mydb:main#config> { ?root a f:LedgerConfig . ?n ?p ?o } }
+WHERE {
+  VALUES ?root { <urn:fluree:mydb:main:config:ledger> }
+  ?root (f:policyDefaults|f:shaclDefaults|f:reasoningDefaults|f:datalogDefaults|
+         f:transactDefaults|f:fullTextDefaults|f:servingDefaults|f:queryDefaults|
+         f:graphOverrides|f:overrideControl|f:shapesSource|f:policySource|f:schemaSource|
+         f:rulesSource|f:constraintsSource|f:graphSource|f:trustPolicy|f:rollbackGuard|
+         f:ontologyImportMap|f:graphRef|f:property|f:reasoningModes|rdf:rest)* ?n .
+  ?n ?p ?o .
+}
+```
 
 ## Config mutation governance
 

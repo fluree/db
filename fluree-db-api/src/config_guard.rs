@@ -10,7 +10,8 @@
 //!
 //! The checks: R1, a config group split across graphs (in one transaction or
 //! across two); R2, an `f:LedgerConfig`/`f:GraphConfig` typed outside the
-//! config graph; R3, a second value for a single-valued setting or a second
+//! config graph, or config fields on the conventional config subject
+//! (`urn:fluree:<ledger>:config:ledger`) written there; R3, a second value for a single-valued setting or a second
 //! `f:LedgerConfig` subject; and unrecognized `f:reasoningModes` values.
 //!
 //! The guard reads only the staged flakes and the pre-transaction config
@@ -23,7 +24,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::config_vocab::{is_config_field, CONFIG_CLASSES, CONFIG_EDGES, SINGLE_VALUED};
+use crate::config_vocab::{
+    conventional_config_subject, is_config_field, CONFIG_CLASSES, CONFIG_EDGES, SINGLE_VALUED,
+};
 use fluree_db_core::graph_registry::{config_graph_iri, CONFIG_GRAPH_ID};
 use fluree_db_core::{
     range_with_overlay, Flake, FlakeValue, GraphId, IndexType, RangeMatch, RangeOptions, RangeTest,
@@ -149,7 +152,8 @@ fn split_group_for_branch_op(
 ///   `f:GraphConfig` there) that gets config fields ([`is_config_field`]) in
 ///   another graph, in this transaction or across two;
 /// - an `f:LedgerConfig` or `f:GraphConfig` typed outside the config graph,
-///   which has no effect;
+///   or a config field written there on the conventional config subject
+///   (`urn:fluree:<ledger>:config:ledger`), which has no effect;
 /// - a second value for a single-valued config setting, or a second
 ///   `f:LedgerConfig` subject, counting what the config graph already holds;
 /// - an unrecognized `f:reasoningModes` value.
@@ -201,6 +205,9 @@ pub(crate) async fn validate_staged_config(
     }
     if writes_config || writes_fields_elsewhere {
         refuse_groups_split_across_transactions(view, &names, scope).await?;
+    }
+    if authoring && writes_fields_elsewhere {
+        refuse_config_subject_fields_outside_config_graph(view, &names)?;
     }
     if asserts_modes {
         validate_reasoning_modes(view, &modes_p)?;
@@ -267,6 +274,48 @@ fn refuse_config_typed_outside_config_graph(
         }
     }
     Ok(())
+}
+
+/// Config fields written outside the config graph on the conventional config
+/// subject, `urn:fluree:<ledger>:config:ledger`. Its IRI names it the config
+/// subject whether or not the config graph holds it yet, so the fields are a
+/// config written to the wrong graph, which the reader never sees. Needs no
+/// read: when the config graph already holds the subject,
+/// [`refuse_groups_split_across_transactions`] has refused the write first.
+fn refuse_config_subject_fields_outside_config_graph(
+    view: &StagedLedger,
+    names: &Names<'_>,
+) -> Result<(), GuardError> {
+    let subject = conventional_config_subject(&view.base().snapshot.ledger_id);
+    let Some(subject) = names.ns.lookup_sid_for_iri(&subject) else {
+        return Ok(());
+    };
+    let mut stray: BTreeMap<GraphId, BTreeSet<&Sid>> = BTreeMap::new();
+    for (g_id, flake) in view.staged_flakes_by_graph() {
+        if flake.op
+            && flake.s == subject
+            && is_config_field(&flake.p)
+            && !crate::export::is_system_graph(g_id)
+        {
+            stray.entry(g_id).or_default().insert(&flake.p);
+        }
+    }
+    match stray.into_iter().next() {
+        None => Ok(()),
+        Some((g_id, fields)) => Err(GuardError::Refused(format!(
+            "the config subject {} would get its fields {} in {}; config is read only from the \
+             config graph <{}>, from a subject typed f:LedgerConfig there, so write it into \
+             that graph",
+            names.term(&subject),
+            fields
+                .into_iter()
+                .map(|p| names.term(p))
+                .collect::<Vec<_>>()
+                .join(", "),
+            names.graph(g_id),
+            names.config_graph,
+        ))),
+    }
 }
 
 /// A config node this transaction links in the config graph (a config edge
