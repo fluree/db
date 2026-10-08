@@ -320,6 +320,12 @@ async fn glue_catalog_mode_reads_tables_resolved_through_glue() {
     let fixture = load_fixture();
     seed(&endpoint, &fixture).await;
     point_aws_sdk_at(&endpoint);
+    // Fluree's Iceberg disk caches (catalog pointers, metadata, Parquet) live under
+    // the temp dir and outlive the process. Without a fresh one, a re-run (or a
+    // nextest retry) answers from the previous run's cache and never asks Glue,
+    // which is how a stale-pointer bug passed the count checks once.
+    let caches = tempfile::tempdir().expect("cache dir");
+    std::env::set_var("TMPDIR", caches.path());
     let db = fixture.database.as_str();
     let fluree = FlureeBuilder::memory().build_memory();
     let ty = |class: &str| serde_json::json!({"@id": "?s", "@type": class});
