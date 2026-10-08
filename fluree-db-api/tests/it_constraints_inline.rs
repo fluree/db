@@ -232,6 +232,108 @@ async fn inline_unique_property_enforced_in_second_named_graph_sparql() {
     );
 }
 
+/// Inline uniqueness constraints from the programmatic options apply to a
+/// Turtle insert whether or not the document has a `GRAPH` block (plain
+/// Turtle and TriG take different parse paths), and are refused in a
+/// policy-scoped Turtle request as on the other surfaces.
+#[tokio::test]
+async fn inline_unique_property_applies_to_turtle_with_and_without_graph_blocks() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let email = "http://example.org/ns/email";
+    let unique = || TxnOpts {
+        unique_properties: Some(vec![email.to_string()]),
+        ..TxnOpts::default()
+    };
+    let seed = json!({"@context": {"ex": "http://example.org/ns/"}, "@id": "ex:alice", "ex:email": "alice@example.org"});
+    for (i, (what, turtle)) in [
+        (
+            "plain Turtle",
+            "@prefix ex: <http://example.org/ns/> . ex:bob ex:email \"alice@example.org\" .",
+        ),
+        (
+            "TriG",
+            "@prefix ex: <http://example.org/ns/> .
+             GRAPH ex:other { ex:carol ex:p 1 }
+             ex:bob ex:email \"alice@example.org\" .",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ledger_id = format!("test/inline-constraints/turtle-{i}:main");
+        let t = fluree
+            .insert(genesis_ledger(&fluree, &ledger_id), &seed)
+            .await
+            .expect("seed")
+            .ledger
+            .t();
+        let err = fluree
+            .graph(&ledger_id)
+            .transact()
+            .insert_turtle(turtle)
+            .txn_opts(unique())
+            .commit()
+            .await
+            .expect_err(what);
+        assert!(
+            matches!(
+                err,
+                fluree_db_api::ApiError::Transact(
+                    fluree_db_transact::TransactError::UniqueConstraintViolation { .. }
+                )
+            ),
+            "{what}: {err:?}"
+        );
+        assert_eq!(
+            fluree.ledger(&ledger_id).await.unwrap().t(),
+            t,
+            "{what}: nothing committed"
+        );
+    }
+
+    // Under a request policy the inline constraints are refused, as on the
+    // other surfaces.
+    let ledger_id = "test/inline-constraints/turtle-policy:main";
+    let ledger = fluree
+        .insert(genesis_ledger(&fluree, ledger_id), &seed)
+        .await
+        .expect("seed")
+        .ledger;
+    let policy = fluree_db_api::build_policy_context(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &fluree_db_api::GovernanceOptions {
+            policy: Some(json!([{
+                "@id": "http://example.org/ns/allowAll",
+                "https://ns.flur.ee/db#action": [
+                    {"@id": "https://ns.flur.ee/db#view"},
+                    {"@id": "https://ns.flur.ee/db#modify"}
+                ],
+                "https://ns.flur.ee/db#allow": true
+            }])),
+            default_allow: Some(true),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("policy context");
+    drop(ledger);
+    let err = fluree
+        .graph(ledger_id)
+        .transact()
+        .insert_turtle(
+            "@prefix ex: <http://example.org/ns/> . ex:bob ex:email \"bob@example.org\" .",
+        )
+        .txn_opts(unique())
+        .policy(policy)
+        .commit()
+        .await
+        .expect_err("inline uniqueness in a policy-scoped Turtle request");
+    assert_unique_properties_refused(&err, "plain Turtle under a request policy");
+}
+
 #[tokio::test]
 async fn inline_unique_property_enforced_in_second_named_graph_jsonld() {
     let fluree = FlureeBuilder::memory().build_memory();

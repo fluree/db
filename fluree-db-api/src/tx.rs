@@ -4101,8 +4101,10 @@ impl crate::Fluree {
         // guard, under one config read. Plain Turtle has no named-graph
         // metadata (that's TriG), so there is no graph delta: every flake
         // `FlakeSink` produces is in the default graph. Turtle carries no
-        // request surface (inline shapes, validation mode, JSON-LD context),
-        // so it runs the configured posture and violations name full IRIs.
+        // request surface in its text (inline shapes, validation mode,
+        // JSON-LD context), so it runs the configured posture, plus the
+        // caller's inline uniqueness constraints as TriG does, and violations
+        // name full IRIs.
         let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self)
             .with_data_state(view.base().clone());
         check_staged_write(
@@ -4110,7 +4112,9 @@ impl crate::Fluree {
             &mut ns_registry,
             &rustc_hash::FxHashMap::default(),
             WriteChecks {
+                unique_properties: txn_opts.unique_properties.as_deref(),
                 tracker,
+                policy,
                 request,
                 ..WriteChecks::new(crate::config_guard::GuardScope::Authoring)
             },
