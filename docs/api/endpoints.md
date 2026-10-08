@@ -2625,7 +2625,7 @@ POST /merge
 - `200 OK` - Merge completed successfully
 - `400 Bad Request` - Source has no branch point (e.g., main), self-merge, unknown strategy, or unsupported merge strategy
 - `404 Not Found` - Ledger or branch does not exist
-- `409 Conflict` - Merge aborted due to conflicts when using the `abort` strategy, the target HEAD changed during commit publishing, or the merge is refused by the target's config checks (a config group the merge would split, a second value for a single-valued setting, or a write to the source branch's own config or txn-meta graph)
+- `409 Conflict` - Merge aborted due to conflicts when using the `abort` strategy, the target HEAD changed during commit publishing, or the merge is refused by the target's config checks (a config group the merge would split, a second value for a single-valued setting, a write to the source branch's own config or txn-meta graph, or a change to the target's own config or txn-meta graph from the source branch)
 - `500 Internal Server Error` - Server error
 
 **Examples:**

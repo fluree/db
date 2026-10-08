@@ -991,7 +991,7 @@ These rules are not negotiable; the CLI and other clients depend on them:
    `include_validation=false` it is the strategy signal alone and
    `validation` is absent. A fast-forward preview carries `validation`
    only when the target's config enables SHACL or uniqueness, or the
-   commits it adopts carry config settings (`f:` predicates), as only
+   commits it adopts carry config settings (a field the config reader reads, a type in the `f:` vocabulary, or a write to a config or txn-meta graph of this ledger), as only
    then does the merge check them. Under
    `strategy=abort` with conflicts the merge never reaches validation, so
    `validation` is absent there too. This rule is what makes
