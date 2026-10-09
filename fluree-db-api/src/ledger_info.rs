@@ -1848,8 +1848,13 @@ async fn build_iceberg_virtual_info(
                 meta.catalog_uri = Some(cfg.catalog.catalog_label().to_string());
             }
         }
+        // A mapped source's own `table` may be the placeholder a mapping-defined
+        // source records; its tables are the mapping's, so never list (or ask the
+        // catalog about) the placeholder.
         let id = cfg.table.identifier();
-        if !id.is_empty() && !tables.contains(&id) {
+        let placeholder =
+            cfg.mapping.is_some() && id == fluree_db_iceberg::config::MAPPING_DEFINED_TABLE;
+        if !id.is_empty() && !placeholder && !tables.contains(&id) {
             tables.push(id);
         }
     }

@@ -681,6 +681,12 @@ impl IoConfig {
     }
 }
 
+/// The table identifier a catalog-mode source (rest, glue, s3tables) records
+/// when ALL its tables come from its R2RML mapping (each `rr:tableName` names
+/// one). It satisfies the `namespace.table` shape the config requires and is
+/// never loaded; anything that lists a mapped source's tables skips it.
+pub const MAPPING_DEFINED_TABLE: &str = "default.default";
+
 /// The region a native-AWS catalog's API (Glue `GetTable`, S3 Tables
 /// `GetTableMetadataLocation`) is called in: the mode's own `region`, else
 /// `io.s3_region` (the same region the data reads use), else `None`, which

@@ -1003,7 +1003,7 @@ impl IcebergCreateConfig {
             Some(table) => table,
             // A mapping-defined source has no table of its own; the placeholder
             // only satisfies the identifier shape and is never loaded.
-            None if has_mapping => "default.default",
+            None if has_mapping => fluree_db_iceberg::config::MAPPING_DEFINED_TABLE,
             None => return Err(CatalogModeError::MissingTable { mode }),
         };
         Ok(Self::from_connection(name, connection, table))
@@ -2075,7 +2075,10 @@ mod tests {
         // A mapping-defined source has no table of its own (each rr:tableName is
         // one), for glue and s3tables exactly as for rest.
         let mapped = IcebergCreateConfig::from_mode("gs", glue(), None, true).unwrap();
-        assert_eq!(mapped.table_identifier, "default.default");
+        assert_eq!(
+            mapped.table_identifier,
+            fluree_db_iceberg::config::MAPPING_DEFINED_TABLE
+        );
         let named =
             IcebergCreateConfig::from_mode("gs", glue(), Some("sales.orders"), true).unwrap();
         assert_eq!(named.table_identifier, "sales.orders");
