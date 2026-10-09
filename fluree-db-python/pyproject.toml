@@ -38,10 +38,12 @@ dev = ["maturin>=1.9,<2", "pytest>=8", "mypy>=1.10", "pandas-stubs", "pandas", "
 [tool.maturin]
 python-source = "python"
 module-name = "fluree._fluree"
-# abi3-py310: one wheel per platform for every CPython >= 3.10. Set here, not
-# as a crate feature, so workspace `--all-features` builds do not demand a 3.10+
-# interpreter; plain cargo builds use whichever Python is installed.
-features = ["pyo3/extension-module", "pyo3/abi3-py310"]
+# `extension` is the module itself: without it the crate is empty, so a plain
+# workspace build (the CLI release's among them) skips it. abi3-py310: one wheel
+# per platform for every CPython >= 3.10. Set here, not as a crate feature, so
+# workspace `--all-features` builds do not demand a 3.10+ interpreter; plain
+# cargo builds use whichever Python is installed.
+features = ["extension", "pyo3/extension-module", "pyo3/abi3-py310"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
