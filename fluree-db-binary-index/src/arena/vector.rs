@@ -115,31 +115,14 @@ impl VectorArena {
 
     /// Insert an f32 vector, returning its handle.
     ///
-    /// Non-finite values (NaN, ±Inf) are rejected. The coercion layer
-    /// should have already validated this, but we check here as a safety net.
+    /// Refuses what [`fluree_db_core::vector::check_vector`] refuses: an
+    /// empty vector, more than `u16::MAX` elements, a length other than the
+    /// arena's, or a non-finite element. The write paths check the same rule
+    /// before they commit.
     pub fn insert_f32(&mut self, vec: &[f32]) -> Result<u32, String> {
-        if vec.is_empty() {
-            return Err("vector must not be empty".into());
-        }
-        // Reject non-finite elements
-        if let Some(pos) = vec.iter().position(|v| !v.is_finite()) {
-            return Err(format!(
-                "vector element [{}] is not finite: {}",
-                pos, vec[pos]
-            ));
-        }
-        if self.dims == 0 {
-            if vec.len() > u16::MAX as usize {
-                return Err(format!("vector dims {} exceeds u16::MAX", vec.len()));
-            }
-            self.dims = vec.len() as u16;
-        } else if vec.len() != self.dims as usize {
-            return Err(format!(
-                "vector dims mismatch: expected {}, got {}",
-                self.dims,
-                vec.len()
-            ));
-        }
+        let dims = (self.dims != 0).then_some(self.dims);
+        self.dims = fluree_db_core::vector::check_vector(dims, vec.iter().copied())
+            .map_err(|e| e.to_string())?;
 
         // Check unit norm
         if self.all_unit_norm {
