@@ -32,6 +32,10 @@ aws-testcontainers = [
   "dep:aws-sdk-s3",
   "dep:aws-sdk-dynamodb",
 ]
+# Opt-in moto-backed AWS Glue / S3 Tables catalog test (it_iceberg_glue_moto): the
+# test seeds a moto server (S3, Glue, S3 Tables) from a committed fixture through
+# the AWS SDK. CI's --all-features run enables it, beside the job's `moto` service.
+glue-moto = ["iceberg", "dep:aws-sdk-s3", "dep:aws-sdk-glue", "dep:aws-sdk-s3tables"]
 # DID/JWS/VerifiableCredential support for signed queries/transactions
 # Pulls in ed25519-dalek, bs58, etc. Default off to reduce compile times.
 credential = ["dep:fluree-db-credential"]
@@ -120,6 +124,8 @@ percent-encoding = "2"
 testcontainers = { version = "0.23", optional = true }
 aws-config = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
+aws-sdk-glue = { workspace = true, optional = true }
+aws-sdk-s3tables = { workspace = true, optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true }
 aws-sdk-sts = { workspace = true, optional = true }
 
@@ -531,6 +537,16 @@ path = "tests/it_iceberg_provisional_live.rs"
 required-features = ["iceberg"]
 
 [[test]]
+name = "it_glue_live"
+path = "tests/it_glue_live.rs"
+required-features = ["iceberg"]
+
+[[test]]
+name = "it_iceberg_glue_moto"
+path = "tests/it_iceberg_glue_moto.rs"
+required-features = ["glue-moto"]
+
+[[test]]
 name = "it_iceberg_direct"
 path = "tests/it_iceberg_direct.rs"
 required-features = ["iceberg", "aws-testcontainers"]
@@ -567,6 +583,10 @@ path = "tests/it_select_star_deep_crawl_stack.rs"
 [[example]]
 name = "sql_pushdown_lane_probe"
 required-features = ["sql", "native"]
+
+[[example]]
+name = "glue_onboarding"
+required-features = ["iceberg"]
 
 [[bench]]
 name = "vector_query"

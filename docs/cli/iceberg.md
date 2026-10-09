@@ -33,7 +33,7 @@ fluree iceberg map <NAME> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--mode <MODE>` | Catalog mode: `rest` (default) or `direct` |
+| `--mode <MODE>` | Catalog mode, case-insensitive: `rest` (default), `direct`, `glue` (AWS Glue Data Catalog), or `s3tables` (AWS S3 Tables) |
 
 **REST catalog mode options:**
 
@@ -50,6 +50,15 @@ fluree iceberg map <NAME> [OPTIONS]
 |--------|-------------|
 | `--table-location <URI>` | S3 table location (required for direct mode, e.g., `s3://bucket/warehouse/ns/table`) |
 
+**AWS Glue / S3 Tables mode options** (native AWS SDK; reads S3 with the ambient AWS credential chain — no vended credentials):
+
+| Option | Description |
+|--------|-------------|
+| `--table <ID>` | Table identifier `namespace.table`; required unless `--r2rml` is given, whose `rr:tableName` entries then name the tables. For `glue`, `namespace` is the Glue database. |
+| `--region <REGION>` | AWS region of the Glue / S3 Tables API. Glue falls back to `--s3-region`, then the AWS SDK's region chain; S3 Tables defaults to the table bucket ARN's region and refuses a `--region` that contradicts it. S3 data reads use `--s3-region` when given, else this region. Must be an AWS region code (e.g. `us-east-1`). |
+| `--catalog-id <ID>` | Glue catalog id for cross-account access (`glue` mode; defaults to the caller's account) |
+| `--table-bucket-arn <ARN>` | S3 Tables table-bucket ARN, `arn:aws:s3tables:<region>:<account>:bucket/<name>` (required for `s3tables` mode; any AWS partition) |
+
 **R2RML mapping:**
 
 | Option | Description |
@@ -58,6 +67,8 @@ fluree iceberg map <NAME> [OPTIONS]
 | `--r2rml-type <TYPE>` | Mapping media type (e.g., `text/turtle`); inferred from extension if omitted |
 
 **Authentication:**
+
+These options, and `--warehouse`, configure a REST catalog: any other `--mode` refuses them rather than ignore them.
 
 | Option | Description |
 |--------|-------------|
@@ -72,7 +83,7 @@ fluree iceberg map <NAME> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--s3-region <REGION>` | S3 region override |
+| `--s3-region <REGION>` | S3 region override, in every mode (for `glue` / `s3tables`, defaults to the catalog's region) |
 | `--s3-endpoint <URL>` | S3 endpoint override (e.g. MinIO, LocalStack, or `https://storage.googleapis.com` for Google Cloud Storage) |
 | `--s3-path-style` | Use path-style S3 URLs |
 
@@ -91,10 +102,14 @@ Maps an Apache Iceberg table as a graph source that can be queried using SPARQL 
 
 An R2RML mapping (`--r2rml`) is required to define how Iceberg table rows are transformed into RDF triples.
 
-Two catalog modes are supported:
+Four catalog modes are supported:
 
 - **REST mode** (default): Connects to an Iceberg REST catalog (e.g., Apache Polaris) to discover table metadata. Supports vended credentials and warehouse selection.
 - **Direct S3 mode**: Reads table metadata directly from S3 by resolving `version-hint.text` in the table's `metadata/` directory. No catalog server required. Also reads **Google Cloud Storage** (`--s3-endpoint https://storage.googleapis.com`); GCS reads are signed with AWS SigV4 using GCS HMAC interop keys (the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) — see the [Iceberg guide](../graph-sources/iceberg.md#google-cloud-storage-gcs).
+- **AWS Glue mode** (`--mode glue`): Looks the table up in the AWS Glue Data Catalog (Glue `GetTable`) and reads the metadata file its `metadata_location` parameter names. The Glue database is the namespace; `--catalog-id` reads another account's catalog.
+- **AWS S3 Tables mode** (`--mode s3tables`): Resolves the table's metadata file in an S3 Tables table bucket (`--table-bucket-arn`) with `GetTableMetadataLocation`.
+
+Glue and S3 Tables use the ambient AWS credential chain (environment, shared config / `AWS_PROFILE` / SSO, container or instance role) for the catalog call and the S3 reads; vended credentials are not supported, and the CLI turns them off for these modes. `map` tests the connection for REST catalogs only: for Glue and S3 Tables it reports `Connection: not tested`, and catalog errors surface at query time. See [Catalog Modes](../graph-sources/iceberg.md#catalog-modes) and [AWS Credentials](../graph-sources/iceberg.md#aws-credentials).
 
 ### Examples
 
@@ -130,6 +145,14 @@ fluree iceberg map orders \
   --s3-endpoint https://storage.googleapis.com \
   --s3-region europe-west1 \
   --s3-path-style
+
+# AWS Glue Data Catalog (ambient AWS credentials; the Glue database is the namespace).
+# Add --catalog-id 123456789012 to read another account's catalog.
+fluree iceberg map glue-orders \
+  --mode glue \
+  --region us-east-1 \
+  --table sales.orders \
+  --r2rml mappings/orders.ttl
 
 # OAuth2 authentication
 fluree iceberg map orders \

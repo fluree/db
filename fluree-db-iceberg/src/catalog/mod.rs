@@ -15,10 +15,33 @@ pub use table_identifier::{encode_namespace_for_rest, parse_table_identifier, Ta
 #[cfg(feature = "aws")]
 pub use direct::SendDirectCatalogClient;
 
+#[cfg(feature = "aws")]
+mod aws_sdk;
+#[cfg(feature = "aws")]
+pub use aws_sdk::{GlueSdkCatalogClient, S3TablesSdkCatalogClient};
+
 use crate::credential::VendedCredentials;
 use crate::error::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
+
+/// Name the table a catalog refused access to. A denial is raised where only
+/// the request is known (a REST path, an SDK operation), so each `load_table`
+/// relabels it with the table it was loading; any other error passes through.
+pub(crate) fn name_denied_table(
+    err: crate::IcebergError,
+    table_id: &TableIdentifier,
+) -> crate::IcebergError {
+    match err {
+        crate::IcebergError::CatalogAccessDenied { message, .. } => {
+            crate::IcebergError::CatalogAccessDenied {
+                table: format!("{}.{}", table_id.namespace, table_id.table),
+                message,
+            }
+        }
+        other => other,
+    }
+}
 
 /// Response from loading a table, including optional vended credentials.
 #[derive(Debug)]

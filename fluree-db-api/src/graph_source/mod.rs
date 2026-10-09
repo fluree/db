@@ -258,7 +258,10 @@ pub use config::Bm25CreateConfig;
 pub use config::VectorCreateConfig;
 
 #[cfg(feature = "iceberg")]
-pub use config::{CatalogMode, IcebergConnectionConfig, IcebergCreateConfig, RestCatalogMode};
+pub use config::{
+    CatalogMode, CatalogModeArgs, CatalogModeError, IcebergConnectionConfig, IcebergCreateConfig,
+    RestCatalogMode,
+};
 
 #[cfg(feature = "iceberg")]
 pub use iceberg_catalog::{
@@ -278,7 +281,7 @@ pub use iceberg_sample::{sample_column_values, sample_iceberg_rows};
 #[cfg(feature = "iceberg")]
 pub(crate) use iceberg_catalog::table_schema_from_metadata;
 #[cfg(feature = "iceberg")]
-pub(crate) use r2rml::{mapping_source_of, rest_client_cache_key};
+pub(crate) use r2rml::{catalog_table_metadata, mapping_source_of, shared_catalog_client};
 
 #[cfg(feature = "iceberg")]
 pub use iceberg_generate::{

@@ -327,7 +327,7 @@ async fn run_iceberg_map_remote(
             if connection {
                 "verified"
             } else {
-                "not tested (direct mode or catalog unreachable)"
+                "not tested (tested for REST catalogs only, or catalog unreachable)"
             }
         );
     }
@@ -392,6 +392,15 @@ fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
     }
     if let Some(ref v) = args.table_location {
         obj.insert("table_location".into(), v.clone().into());
+    }
+    if let Some(ref v) = args.region {
+        obj.insert("region".into(), v.clone().into());
+    }
+    if let Some(ref v) = args.catalog_id {
+        obj.insert("catalog_id".into(), v.clone().into());
+    }
+    if let Some(ref v) = args.table_bucket_arn {
+        obj.insert("table_bucket_arn".into(), v.clone().into());
     }
     if let Some(ref v) = args.r2rml {
         // Read file content and send it (not the path)
@@ -651,7 +660,7 @@ async fn run_iceberg_map_local(args: IcebergMapArgs, dirs: &FlureeDir) -> CliRes
             if result.connection_tested {
                 "verified"
             } else {
-                "not tested (direct mode or catalog unreachable)"
+                "not tested (tested for REST catalogs only, or catalog unreachable)"
             }
         );
     }
@@ -687,39 +696,41 @@ pub(crate) fn secret_value(
 
 #[cfg(feature = "iceberg")]
 fn build_iceberg_config(args: &IcebergMapArgs) -> CliResult<fluree_db_api::IcebergCreateConfig> {
-    let mode = args.mode.to_lowercase();
-    let mut config = match mode.as_str() {
-        "rest" => {
-            let catalog_uri = args
-                .catalog_uri
-                .as_ref()
-                .ok_or_else(|| CliError::Usage("--catalog-uri is required for rest mode".into()))?;
-            let table = args.table.as_deref().unwrap_or_default();
-            if table.is_empty() && args.r2rml.is_none() {
-                return Err(CliError::Usage(
-                    "--table is required for rest mode (or use --r2rml to define tables via mapping)"
-                        .into(),
-                ));
-            }
-            let table = if table.is_empty() {
-                "default.default"
-            } else {
-                table
-            };
-            fluree_db_api::IcebergCreateConfig::new(&args.name, catalog_uri, table)
-        }
-        "direct" => {
-            let location = args.table_location.as_ref().ok_or_else(|| {
-                CliError::Usage("--table-location is required for direct mode".into())
-            })?;
-            fluree_db_api::IcebergCreateConfig::new_direct(&args.name, location)
-        }
-        other => {
-            return Err(CliError::Usage(format!(
-                "unknown catalog mode '{other}'. Use 'rest' or 'direct'."
-            )));
-        }
+    // One mode dispatch for every surface (the server parses its JSON the same
+    // way); errors name this surface's flags.
+    let rest_only: Vec<&'static str> = [
+        ("auth_bearer", args.auth_bearer.is_some()),
+        ("auth_bearer_env", args.auth_bearer_env.is_some()),
+        ("oauth2_token_url", args.oauth2_token_url.is_some()),
+        ("oauth2_client_id", args.oauth2_client_id.is_some()),
+        ("oauth2_client_secret", args.oauth2_client_secret.is_some()),
+        (
+            "oauth2_client_secret_env",
+            args.oauth2_client_secret_env.is_some(),
+        ),
+        ("oauth2_scope", args.oauth2_scope.is_some()),
+        ("oauth2_audience", args.oauth2_audience.is_some()),
+        ("warehouse", args.warehouse.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, given)| given.then_some(name))
+    .collect();
+    let mode_args = fluree_db_api::CatalogModeArgs {
+        mode: &args.mode,
+        catalog_uri: args.catalog_uri.as_deref(),
+        table_location: args.table_location.as_deref(),
+        region: args.region.as_deref(),
+        catalog_id: args.catalog_id.as_deref(),
+        table_bucket_arn: args.table_bucket_arn.as_deref(),
+        rest_only: &rest_only,
     };
+    let mut config = fluree_db_api::IcebergCreateConfig::from_mode(
+        &args.name,
+        mode_args,
+        args.table.as_deref(),
+        args.r2rml.is_some(),
+    )
+    .map_err(|e| CliError::Usage(e.message(|field| format!("--{}", field.replace('_', "-")))))?;
 
     if let Some(ref branch) = args.branch {
         config = config.with_branch(branch);
@@ -804,6 +815,9 @@ mod tests {
             catalog_uri: Some("https://catalog.example.com".to_string()),
             table: Some("ns.tbl".to_string()),
             table_location: None,
+            region: None,
+            catalog_id: None,
+            table_bucket_arn: None,
             r2rml: None,
             r2rml_type: None,
             branch: None,
@@ -956,6 +970,52 @@ mod tests {
         let gs = config.to_iceberg_gs_config();
         let v = serde_json::to_value(&gs).unwrap();
         assert_eq!(v["catalog"]["auth"]["type"], "none");
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn rest_only_flags_are_refused_by_other_modes() {
+        use clap::Parser;
+        let glue = |extra: &[&str]| {
+            let mut argv = vec![
+                "fluree",
+                "iceberg",
+                "map",
+                "gs",
+                "--mode",
+                "glue",
+                "--region",
+                "us-east-1",
+                "--r2rml",
+                "mapping.ttl",
+            ];
+            argv.extend_from_slice(extra);
+            match crate::cli::Cli::try_parse_from(argv).unwrap().command {
+                crate::cli::Commands::Iceberg {
+                    action: crate::cli::IcebergAction::Map(args),
+                } => build_iceberg_config(&args),
+                _ => unreachable!(),
+            }
+        };
+        assert!(glue(&[]).is_ok());
+
+        for flag in [
+            "--auth-bearer",
+            "--auth-bearer-env",
+            "--oauth2-token-url",
+            "--oauth2-client-id",
+            "--oauth2-client-secret",
+            "--oauth2-client-secret-env",
+            "--oauth2-scope",
+            "--oauth2-audience",
+            "--warehouse",
+        ] {
+            let err = glue(&[flag, "x"]).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("{flag} applies to rest mode only")),
+                "{flag}: {err}"
+            );
+        }
     }
 
     #[test]

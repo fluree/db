@@ -72,6 +72,19 @@ pub enum IcebergError {
         catalog_uri: String,
     },
 
+    /// The catalog refused this principal access to a table or listing (an AWS
+    /// `AccessDeniedException` / 403), in the catalog's own words. Lifted to
+    /// `QueryError::CatalogAccessDenied` (`err:catalog/AccessDenied`, HTTP 403) on
+    /// the query path, so a missing IAM grant reads as one rather than as an
+    /// internal error.
+    #[error("Catalog denied access to {table}: {message}")]
+    CatalogAccessDenied {
+        /// The table (or catalog object) as the catalog names it.
+        table: String,
+        /// The catalog's refusal, with its full error chain.
+        message: String,
+    },
+
     /// Snapshot not found
     #[error("Snapshot not found: {0}")]
     SnapshotNotFound(String),
