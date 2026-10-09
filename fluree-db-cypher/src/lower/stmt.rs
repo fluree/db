@@ -605,7 +605,11 @@ impl ProjectionState {
                 self.saw_star = true;
                 return Ok(());
             }
-            if item.alias.is_none() {
+            // `x AS x` is `x`. As a `Bind` it would rebind a variable that is
+            // already bound, which keeps the row only when the two bindings
+            // compare equal, and an encoded binding from an index does not
+            // equal its decoded value.
+            if item.alias.as_ref().is_none_or(|alias| alias.name == v.name) {
                 let id = ctx.intern_var(&v.name);
                 self.vars.push(id);
                 self.group_keys.push(id);
