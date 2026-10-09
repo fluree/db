@@ -16,7 +16,7 @@ use fluree_db_core::Tracker;
 use crate::format::branch::BranchManifest;
 use crate::format::run_record::RunSortOrder;
 use crate::format::run_record_v2::cmp_v2_for_order;
-use crate::format::run_record_v2::{read_ordered_key_v2, RunRecordV2};
+use crate::format::run_record_v2::{read_ordered_key_v2, RunRecordV2, ORDERED_KEY_V2_SIZE};
 use crate::read::types::cmp_overlay_vs_record;
 use crate::read::types::{cmp_row_vs_overlay, OverlayOp};
 
@@ -76,6 +76,9 @@ pub struct BinaryCursor {
     /// once past the range, instead of walking every directory entry.
     range_min: Option<RunRecordV2>,
     range_max: Option<RunRecordV2>,
+    /// Sorted lead keys a batched probe wants; leaflets whose directory key
+    /// range holds none of them are skipped. See [`Self::set_wanted_keys`].
+    wanted_keys: Option<Arc<[u64]>>,
 }
 
 /// State for a leaf that's been opened via `LeafHandle`.
@@ -117,6 +120,7 @@ impl BinaryCursor {
             tracker: None,
             range_min: Some(*min_key),
             range_max: Some(*max_key),
+            wanted_keys: None,
         }
     }
 
@@ -148,7 +152,42 @@ impl BinaryCursor {
             tracker: None,
             range_min: None,
             range_max: None,
+            wanted_keys: None,
         }
+    }
+
+    /// Restrict a batched probe to leaflets that can hold one of `keys`
+    /// (sorted, deduplicated): `s_id` for SPOT and single-predicate PSOT
+    /// leaflets, `o_key` for single-`o_type` OPST leaflets. Other leaflets
+    /// pass through. A gap between wanted keys then costs a directory-key
+    /// compare per leaflet instead of a decode or cache probe, which keeps
+    /// gap-tolerant chunking cheap however fine the leaflets are.
+    pub fn set_wanted_keys(&mut self, keys: Arc<[u64]>) {
+        debug_assert!(keys.windows(2).all(|w| w[0] < w[1]));
+        self.wanted_keys = Some(keys);
+    }
+
+    /// Whether a leaflet's directory key range can hold a wanted key.
+    fn leaflet_may_hold_wanted(
+        &self,
+        first_key: &[u8; ORDERED_KEY_V2_SIZE],
+        last_key: &[u8; ORDERED_KEY_V2_SIZE],
+    ) -> bool {
+        let Some(keys) = &self.wanted_keys else {
+            return true;
+        };
+        let first = read_ordered_key_v2(self.order, first_key);
+        let last = read_ordered_key_v2(self.order, last_key);
+        let (lo, hi) = match self.order {
+            RunSortOrder::Spot => (first.s_id.as_u64(), last.s_id.as_u64()),
+            RunSortOrder::Psot if first.p_id == last.p_id => {
+                (first.s_id.as_u64(), last.s_id.as_u64())
+            }
+            RunSortOrder::Opst if first.o_type == last.o_type => (first.o_key, last.o_key),
+            _ => return true,
+        };
+        let i = keys.partition_point(|&k| k < lo);
+        i < keys.len() && keys[i] <= hi
     }
 
     /// Attach a fuel tracker. Charges one index touch
@@ -424,6 +463,12 @@ impl BinaryCursor {
                             &entry.first_key,
                             &entry.last_key,
                         )
+                    {
+                        continue;
+                    }
+                    if !has_ov
+                        && !needs_history_replay
+                        && !self.leaflet_may_hold_wanted(&entry.first_key, &entry.last_key)
                     {
                         continue;
                     }
@@ -1266,5 +1311,74 @@ mod tests {
         };
         let (start, end) = leading_bound_range(&filter, &batch, RunSortOrder::Psot);
         assert_eq!(start, end, "const mismatch yields an empty range");
+    }
+
+    /// A batched probe's wanted keys skip every leaflet in the cursor's range
+    /// that holds none of them, without losing a wanted row.
+    #[test]
+    fn wanted_keys_skip_leaflets_without_a_wanted_subject() {
+        use crate::format::branch::{BranchManifest, LeafEntry};
+        use crate::format::leaf::LeafWriter;
+        use crate::read::binary_index_store::tests::{empty_store, temp_cache_dir};
+        use crate::read::column_types::{BinaryFilter, ColumnProjection};
+        use fluree_db_core::content_kind::ContentKind;
+        use fluree_db_core::{ContentStore, MemoryContentStore};
+
+        let mut writer = LeafWriter::new(RunSortOrder::Spot, 4, 100_000, 1);
+        writer.set_skip_history(true);
+        for s in 1..=200u64 {
+            let mut rec = make_key(s, 1);
+            rec.o_key = s;
+            writer.push_record(rec).unwrap();
+        }
+        let leaf = writer.finish().unwrap().remove(0);
+        let mem = MemoryContentStore::new();
+        let cid = crate::read::binary_index_store::run_sync_on_runtime({
+            let mem = mem.clone();
+            let bytes = leaf.leaf_bytes.clone();
+            async move {
+                mem.put(ContentKind::IndexLeaf, &bytes)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))
+            }
+        })
+        .unwrap();
+        let cs: Arc<dyn ContentStore> = Arc::new(mem);
+        let store = Arc::new(empty_store(cs, temp_cache_dir()));
+        let branch = Arc::new(BranchManifest {
+            leaves: vec![LeafEntry {
+                first_key: leaf.first_key,
+                last_key: leaf.last_key,
+                row_count: leaf.total_rows,
+                leaf_cid: cid,
+                sidecar_cid: None,
+            }],
+        });
+        let scan = |wanted: Option<&[u64]>| {
+            let mut cursor = BinaryCursor::new(
+                Arc::clone(&store),
+                RunSortOrder::Spot,
+                Arc::clone(&branch),
+                &make_key(1, 0),
+                &make_key(200, u32::MAX),
+                BinaryFilter::default(),
+                ColumnProjection::all(),
+            );
+            if let Some(keys) = wanted {
+                cursor.set_wanted_keys(Arc::from(keys));
+            }
+            let mut batches = 0;
+            let mut s_ids = Vec::new();
+            while let Some(batch) = cursor.next_batch().unwrap() {
+                batches += 1;
+                s_ids.extend((0..batch.row_count).map(|i| batch.s_id.get(i)));
+            }
+            (batches, s_ids)
+        };
+
+        assert_eq!(scan(None).0, 50);
+        let (batches, s_ids) = scan(Some(&[10, 150]));
+        assert_eq!(batches, 2, "only the two leaflets holding a wanted subject");
+        assert_eq!(s_ids, vec![9, 10, 11, 12, 149, 150, 151, 152]);
     }
 }

@@ -222,6 +222,7 @@ fn keyset_overlay_supported(node: &KeySetNode) -> bool {
 }
 
 /// A subject-keyed `(s_id, count)` group stream — metadata or overlay lane.
+#[allow(clippy::large_enum_variant)] // one per query
 enum SubjectGroups<'a> {
     /// Genuinely empty (predicate absent from the base index, no overlay).
     Empty,

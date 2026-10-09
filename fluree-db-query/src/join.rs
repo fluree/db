@@ -113,7 +113,7 @@ impl GroupedCountDrain {
 pub(crate) struct LeafScan {
     pub(crate) leaf_bytes: fluree_db_binary_index::SharedLeafBytes,
     pub(crate) header: fluree_db_binary_index::format::leaf::LeafHeaderV3,
-    pub(crate) dir: fluree_db_binary_index::format::leaf::DecodedLeafDirV3,
+    pub(crate) dir: Arc<fluree_db_binary_index::format::leaf::DecodedLeafDirV3>,
     pub(crate) leaf_id: u128,
     /// Sidecar bytes for time-travel replay. `None` at `max_t` (the base
     /// leaflet alone is authoritative); always fetched when `need_replay`
@@ -273,9 +273,15 @@ pub(crate) fn prepare_leaf_for_scan(
     };
     let header = decode_leaf_header_v3(&leaf_bytes)
         .map_err(|e| QueryError::Internal(format!("read leaf header: {e}")))?;
-    let dir = decode_leaf_dir_v3_with_base(&leaf_bytes, &header)
-        .map_err(|e| QueryError::Internal(format!("decode leaf dir: {e}")))?;
     let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_entry.leaf_cid.to_bytes().as_ref());
+    // Shared with every other reader of this leaf; a directory decode is
+    // O(leaflets) and this runs once per leaf per probe.
+    let decode = || decode_leaf_dir_v3_with_base(&leaf_bytes, &header).map(Arc::new);
+    let dir = match store.leaflet_cache() {
+        Some(cache) => cache.try_get_or_load_leaf_dir(leaf_id, decode),
+        None => decode(),
+    }
+    .map_err(|e| QueryError::Internal(format!("decode leaf dir: {e}")))?;
 
     Ok(LeafScan {
         leaf_bytes,
