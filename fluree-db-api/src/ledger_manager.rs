@@ -671,7 +671,6 @@ impl LedgerHandle {
         &self,
         index_id: &ContentId,
         cs: Arc<dyn ContentStore>,
-        cache_dir: &std::path::Path,
         leaflet_cache: Option<Arc<LeafletCache>>,
     ) -> Result<()> {
         use tracing::Instrument as _;
@@ -680,7 +679,7 @@ impl LedgerHandle {
             ledger_id = %self.id(),
             index_t = tracing::field::Empty,
         );
-        self.apply_index_v2_inner(index_id, cs, cache_dir, leaflet_cache)
+        self.apply_index_v2_inner(index_id, cs, leaflet_cache)
             .instrument(span)
             .await
     }
@@ -689,7 +688,6 @@ impl LedgerHandle {
         &self,
         index_id: &ContentId,
         cs: Arc<dyn ContentStore>,
-        cache_dir: &std::path::Path,
         leaflet_cache: Option<Arc<LeafletCache>>,
     ) -> Result<()> {
         use tracing::Instrument as _;
@@ -709,7 +707,6 @@ impl LedgerHandle {
         let mut store = BinaryIndexStore::load_from_root_v6_reusing(
             Arc::clone(&cs),
             &root,
-            cache_dir,
             leaflet_cache,
             prev_store.as_deref(),
         )
@@ -1149,7 +1146,6 @@ pub(crate) async fn load_and_attach_binary_store(
     backend: &StorageBackend,
     nameservice: &dyn fluree_db_nameservice::NameServiceLookup,
     state: &mut LedgerState,
-    cache_dir: &std::path::Path,
     leaflet_cache: Option<Arc<LeafletCache>>,
     prev: Option<&BinaryIndexStore>,
 ) -> std::result::Result<Option<Arc<BinaryIndexStore>>, ApiError> {
@@ -1192,15 +1188,10 @@ pub(crate) async fn load_and_attach_binary_store(
         "binary index root loaded"
     );
 
-    let mut store = BinaryIndexStore::load_from_root_v6_reusing(
-        Arc::clone(&cs),
-        &root,
-        cache_dir,
-        leaflet_cache,
-        prev,
-    )
-    .await
-    .map_err(|e| ApiError::internal(format!("failed to load binary index: {e}")))?;
+    let mut store =
+        BinaryIndexStore::load_from_root_v6_reusing(Arc::clone(&cs), &root, leaflet_cache, prev)
+            .await
+            .map_err(|e| ApiError::internal(format!("failed to load binary index: {e}")))?;
 
     {
         let snap = Arc::make_mut(&mut state.snapshot);
@@ -1348,7 +1339,7 @@ impl LedgerManager {
     ) -> Self {
         Self {
             entries: Arc::new(RwLock::new(HashMap::new())),
-            backend,
+            backend: crate::with_artifact_cache(backend, Some(&config)),
             nameservice_mode: nameservice,
             config,
             shutdown: AtomicBool::new(false),
@@ -1662,7 +1653,6 @@ impl LedgerManager {
                     &self.backend,
                     self.nameservice_mode.reader(),
                     &mut state,
-                    &self.config.cache_dir,
                     self.config.leaflet_cache.clone(),
                     None,
                 )
@@ -1942,7 +1932,6 @@ impl LedgerManager {
                             &self.backend,
                             self.nameservice_mode.reader(),
                             &mut new_state,
-                            &self.config.cache_dir,
                             self.config.leaflet_cache.clone(),
                             prev_store.as_deref(),
                         )
@@ -2412,12 +2401,7 @@ impl LedgerManager {
                 );
                 let cs = cs_for_record().await?;
                 handle
-                    .apply_index_v2(
-                        &index_head_id,
-                        cs,
-                        &self.config.cache_dir,
-                        self.config.leaflet_cache.clone(),
-                    )
+                    .apply_index_v2(&index_head_id, cs, self.config.leaflet_cache.clone())
                     .await?;
                 Ok(NotifyResult::IndexUpdated)
             }
@@ -2557,7 +2541,6 @@ impl LedgerManager {
                         .apply_index_v2(
                             &index_head_id,
                             Arc::clone(&cs),
-                            &self.config.cache_dir,
                             self.config.leaflet_cache.clone(),
                         )
                         .await?;
@@ -2611,6 +2594,29 @@ mod tests {
         let t2 = monotonic_secs();
         // Should be monotonically non-decreasing
         assert!(t2 >= t1);
+    }
+
+    /// A manager built directly over remote storage reads through the disk
+    /// cache in its configured directory.
+    #[tokio::test]
+    #[cfg(feature = "native")]
+    async fn a_manager_caches_remote_reads_in_its_configured_dir() {
+        use fluree_db_core::{ContentKind, ContentStore, MemoryStorage};
+        let dir = tempfile::tempdir().unwrap();
+        let manager = LedgerManager::new(
+            StorageBackend::Managed(Arc::new(MemoryStorage::new().simulating_remote())),
+            crate::NameServiceMode::ReadWrite(Arc::new(
+                fluree_db_nameservice::memory::MemoryNameService::new(),
+            )),
+            LedgerManagerConfig {
+                cache_dir: dir.path().to_path_buf(),
+                ..LedgerManagerConfig::default()
+            },
+        );
+        let store = manager.backend.content_store("db:main");
+        let id = store.put(ContentKind::IndexLeaf, b"leaf").await.unwrap();
+        store.get(&id).await.unwrap();
+        assert!(dir.path().join(id.to_string()).exists());
     }
 
     #[test]

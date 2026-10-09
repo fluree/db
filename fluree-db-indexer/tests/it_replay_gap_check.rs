@@ -97,7 +97,8 @@ fn apply_window(
 /// and report whether subject `s_id` is present.
 fn present_at(leaf_bytes: &[u8], sidecar_bytes: &[u8], t_target: i64, s_id: u64) -> bool {
     let sidecar = (!sidecar_bytes.is_empty()).then(|| sidecar_bytes.to_vec());
-    let handle = FullBlobLeafHandle::new(leaf_bytes.to_vec(), sidecar, 0).expect("leaf handle");
+    let handle = FullBlobLeafHandle::new(leaf_bytes.to_vec(), sidecar.map(Into::into), 0)
+        .expect("leaf handle");
     assert_eq!(handle.dir().entries.len(), 1, "single leaflet expected");
     let batch = handle
         .load_columns(0, &ColumnProjection::all(), RunSortOrder::Spot)

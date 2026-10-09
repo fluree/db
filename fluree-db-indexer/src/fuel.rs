@@ -67,8 +67,8 @@ pub fn charge_extra_leaflets(tracker: &Tracker, re_encoded_leaflet_count: u32) -
 /// A [`ContentStore`] wrapper that charges fuel for every successful CAS
 /// write the indexer makes through it.
 ///
-/// Delegates all read paths (`has`, `get`, `get_range`, `release`,
-/// `resolve_local_path`) and the `put` / `put_with_id` writes to the inner
+/// Delegates all read paths (`has`, `get`, `get_local`, `get_range`,
+/// `release`) and the `put` / `put_with_id` writes to the inner
 /// store. After each successful write the wrapper charges
 /// [`INDEX_CAS_WRITE_MICRO_FUEL`] against the tracker — once per CAS call,
 /// regardless of `ContentKind`.
@@ -127,7 +127,7 @@ impl ContentStore for MeteredContentStore {
         self.inner.sync().await
     }
 
-    async fn get(&self, id: &ContentId) -> StorageResult<Vec<u8>> {
+    async fn get(&self, id: &ContentId) -> StorageResult<fluree_db_core::ContentBytes> {
         self.inner.get(id).await
     }
 
@@ -145,20 +145,20 @@ impl ContentStore for MeteredContentStore {
         Ok(())
     }
 
-    fn resolve_local_path(&self, id: &ContentId) -> Option<std::path::PathBuf> {
-        self.inner.resolve_local_path(id)
+    fn get_local(&self, id: &ContentId) -> StorageResult<Option<fluree_db_core::ContentBytes>> {
+        self.inner.get_local(id)
     }
 
-    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
-        self.inner.resolve_cached_bytes(id)
+    fn supports_ranged_reads(&self) -> bool {
+        self.inner.supports_ranged_reads()
     }
 
-    fn permits_plaintext_cache(&self) -> bool {
-        self.inner.permits_plaintext_cache()
+    fn keep_local(&self, id: &ContentId, bytes: &[u8]) {
+        self.inner.keep_local(id, bytes);
     }
 
-    fn is_remote(&self) -> bool {
-        self.inner.is_remote()
+    async fn prefetch(&self, id: &ContentId) -> StorageResult<()> {
+        self.inner.prefetch(id).await
     }
 
     async fn release(&self, id: &ContentId) -> StorageResult<()> {
@@ -218,6 +218,64 @@ mod tests {
         let t = Tracker::disabled();
         charge_index_write(&t, 100).unwrap();
         assert!(t.tally().is_none());
+    }
+
+    /// Records which hints reach it.
+    #[derive(Debug, Default)]
+    struct HintRecorder {
+        kept: std::sync::Mutex<Vec<ContentId>>,
+        prefetched: std::sync::Mutex<Vec<ContentId>>,
+    }
+
+    #[async_trait]
+    impl ContentStore for HintRecorder {
+        async fn has(&self, _id: &ContentId) -> StorageResult<bool> {
+            Ok(true)
+        }
+        async fn get(&self, _id: &ContentId) -> StorageResult<fluree_db_core::ContentBytes> {
+            Ok(b"held".to_vec().into())
+        }
+        fn get_local(
+            &self,
+            _id: &ContentId,
+        ) -> StorageResult<Option<fluree_db_core::ContentBytes>> {
+            Ok(Some(b"held".to_vec().into()))
+        }
+        async fn put(&self, _kind: ContentKind, _bytes: &[u8]) -> StorageResult<ContentId> {
+            unimplemented!()
+        }
+        async fn put_with_id(&self, _id: &ContentId, _bytes: &[u8]) -> StorageResult<()> {
+            unimplemented!()
+        }
+        async fn release(&self, _id: &ContentId) -> StorageResult<()> {
+            unimplemented!()
+        }
+        fn supports_ranged_reads(&self) -> bool {
+            true
+        }
+        fn keep_local(&self, id: &ContentId, _bytes: &[u8]) {
+            self.kept.lock().unwrap().push(id.clone());
+        }
+        async fn prefetch(&self, id: &ContentId) -> StorageResult<()> {
+            self.prefetched.lock().unwrap().push(id.clone());
+            Ok(())
+        }
+    }
+
+    /// Metering wraps the indexer's store, so it must pass every hint on:
+    /// a dropped one would silently cost the build its warming and seeding.
+    #[tokio::test]
+    async fn metered_store_forwards_every_hint() {
+        let recorder = Arc::new(HintRecorder::default());
+        let metered = MeteredContentStore::new(recorder.clone(), enabled_tracker());
+        let id = ContentId::new(ContentKind::IndexLeaf, b"leaf");
+
+        assert!(metered.supports_ranged_reads());
+        assert!(metered.get_local(&id).unwrap().is_some());
+        metered.keep_local(&id, b"bytes");
+        metered.prefetch(&id).await.unwrap();
+        assert_eq!(*recorder.kept.lock().unwrap(), vec![id.clone()]);
+        assert_eq!(*recorder.prefetched.lock().unwrap(), vec![id]);
     }
 
     #[tokio::test]

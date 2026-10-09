@@ -88,7 +88,7 @@ fn rebuild_psot_first_fact_of_predicate_loses_replay_history() {
         .as_ref()
         .map(|p| std::fs::read(p).unwrap());
 
-    let handle = FullBlobLeafHandle::new(leaf_bytes, sidecar_bytes, 0).unwrap();
+    let handle = FullBlobLeafHandle::new(leaf_bytes, sidecar_bytes.map(Into::into), 0).unwrap();
     let n = handle.dir().entries.len();
     eprintln!("leaflets: {n}");
     for i in 0..n {

@@ -64,11 +64,16 @@ pub struct FetchOutcome {
     pub failures: Vec<(Want, String)>,
 }
 
+/// Whether `cid` is in the store's residency tier right now.
+pub fn is_resident(cs: &dyn ContentStore, cid: &fluree_db_core::ContentId) -> bool {
+    matches!(cs.get_local(cid), Ok(Some(_)))
+}
+
 /// Fetch `wants` into the store's resident tier, `width` at a time.
 ///
 /// Uses [`ContentStore::get`] as the fetch-and-pin primitive (the residency
 /// contract: bytes returned by `get` become resident) and verifies each want
-/// via [`ContentStore::resolve_cached_bytes`] afterwards. Failures are
+/// via [`ContentStore::get_local`] afterwards. Failures are
 /// collected, not short-circuited — a partially fetched round can still be
 /// progress.
 pub async fn fetch_wants(cs: &dyn ContentStore, wants: Vec<Want>, width: usize) -> FetchOutcome {
@@ -85,7 +90,7 @@ pub async fn fetch_wants(cs: &dyn ContentStore, wants: Vec<Want>, width: usize) 
             async move {
                 match cs.get(&want.cid).await {
                     Ok(_bytes) => {
-                        if cs.resolve_cached_bytes(&want.cid).is_some() {
+                        if is_resident(cs, &want.cid) {
                             newly_resident.fetch_add(1, Ordering::Relaxed);
                         } else {
                             failures.lock().push((
@@ -210,7 +215,7 @@ impl RetryBudget {
         let blocking = wants[0].cid.clone();
         let outcome = fetch_wants(cs, wants, width).await;
         self.fetched_total += outcome.newly_resident;
-        if cs.resolve_cached_bytes(&blocking).is_none() {
+        if !is_resident(cs, &blocking) {
             let detail = outcome
                 .failures
                 .first()
@@ -271,24 +276,19 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl ContentStore for MissInjectingStore {
-        fn permits_plaintext_cache(&self) -> bool {
-            self.inner.permits_plaintext_cache()
-        }
-
-        fn is_remote(&self) -> bool {
-            self.inner.is_remote()
-        }
-
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             self.inner.has(id).await
         }
 
-        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+        async fn get(
+            &self,
+            id: &ContentId,
+        ) -> fluree_db_core::Result<fluree_db_core::ContentBytes> {
             let bytes = self.inner.get(id).await?;
             // Fetch-pins contract: fetched bytes become resident.
             self.resident
                 .write()
-                .insert(id.clone(), Arc::from(bytes.clone().into_boxed_slice()));
+                .insert(id.clone(), Arc::from(&bytes[..]));
             Ok(bytes)
         }
 
@@ -304,8 +304,16 @@ pub(crate) mod tests {
             self.inner.release(id).await
         }
 
-        fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
-            self.resident.read().get(id).cloned()
+        fn get_local(
+            &self,
+            id: &ContentId,
+        ) -> fluree_db_core::Result<Option<fluree_db_core::ContentBytes>> {
+            Ok(self
+                .resident
+                .read()
+                .get(id)
+                .cloned()
+                .map(fluree_db_core::ContentBytes::Shared))
         }
 
         fn miss_register(&self) -> Option<&MissRegister> {
@@ -359,7 +367,7 @@ pub(crate) mod tests {
             .expect("resident after fetch");
         assert_eq!(&bytes[..], &payload[..]);
         let again = resident_or_need_fetch(store.as_ref(), &cid, FetchKind::IndexLeaf).unwrap();
-        assert!(Arc::ptr_eq(&bytes, &again), "hits clone the Arc");
+        assert!(bytes.ptr_eq(&again), "hits clone the Arc");
 
         // Register drained: a real error now reports no-retry.
         let no_retry = run_sync_on_runtime({
@@ -407,7 +415,7 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(retried, (true, cids.len()), "one round pinned every want");
         for cid in &cids {
-            assert!(store.resolve_cached_bytes(cid).is_some());
+            assert!(is_resident(store.as_ref(), cid));
         }
     }
 
@@ -423,18 +431,13 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl ContentStore for NonPinningStore {
-        fn permits_plaintext_cache(&self) -> bool {
-            self.inner.permits_plaintext_cache()
-        }
-
-        fn is_remote(&self) -> bool {
-            self.inner.is_remote()
-        }
-
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             self.inner.has(id).await
         }
-        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+        async fn get(
+            &self,
+            id: &ContentId,
+        ) -> fluree_db_core::Result<fluree_db_core::ContentBytes> {
             self.inner.get(id).await
         }
         async fn put(&self, kind: ContentKind, bytes: &[u8]) -> fluree_db_core::Result<ContentId> {

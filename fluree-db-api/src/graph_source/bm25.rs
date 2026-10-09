@@ -10,7 +10,7 @@ use crate::graph_source::result::{
 };
 use crate::Result;
 use fluree_db_core::{
-    ledger_id::split_ledger_id, ContentId, ContentStore, OverlayProvider, Storage,
+    ledger_id::split_ledger_id, ContentBytes, ContentId, ContentStore, OverlayProvider, Storage,
 };
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{GraphSourceRecord, GraphSourceType};
@@ -767,7 +767,7 @@ impl crate::Fluree {
             }
 
             // Fetch all misses with bounded concurrency
-            let fetched: Vec<(LeafletRef, Vec<u8>)> = stream::iter(misses)
+            let fetched: Vec<(LeafletRef, ContentBytes)> = stream::iter(misses)
                 .map(|lr| {
                     let cs = cs.clone();
                     async move {
@@ -780,9 +780,9 @@ impl crate::Fluree {
                 .try_collect()
                 .await?;
 
-            // Cache + deserialize fetched leaflets (zero-copy Vec → Arc)
+            // Cache + deserialize fetched leaflets
             for (lr, raw) in fetched {
-                let bytes: Arc<[u8]> = raw.into_boxed_slice().into();
+                let bytes = raw.into_shared();
                 let key = LeafletCache::cid_cache_key(&lr.cid_bytes);
                 cache.insert_bm25_leaflet(key, Arc::clone(&bytes));
                 let (first_idx, lists) = deserialize_posting_leaflet(&bytes)?;
@@ -900,7 +900,7 @@ impl crate::Fluree {
         }
 
         // Fetch all misses with bounded concurrency
-        let fetched: Vec<(LeafletRef, Vec<u8>)> = stream::iter(misses)
+        let fetched: Vec<(LeafletRef, ContentBytes)> = stream::iter(misses)
             .map(|lr| {
                 let cs = cs.clone();
                 async move {
@@ -913,9 +913,9 @@ impl crate::Fluree {
             .try_collect()
             .await?;
 
-        // Cache + deserialize fetched leaflets (zero-copy Vec → Arc)
+        // Cache + deserialize fetched leaflets
         for (lr, raw) in fetched {
-            let bytes: Arc<[u8]> = raw.into_boxed_slice().into();
+            let bytes = raw.into_shared();
             let key = LeafletCache::cid_cache_key(&lr.cid_bytes);
             cache.insert_bm25_leaflet(key, Arc::clone(&bytes));
             let (first_idx, lists) = deserialize_posting_leaflet(&bytes)?;

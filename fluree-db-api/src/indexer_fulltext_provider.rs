@@ -32,7 +32,6 @@ pub(crate) struct ApiFulltextConfigProvider {
     pub(crate) backend: StorageBackend,
     pub(crate) nameservice: Arc<dyn NameServiceLookup>,
     pub(crate) leaflet_cache: Arc<fluree_db_binary_index::LeafletCache>,
-    pub(crate) cache_dir: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for ApiFulltextConfigProvider {
@@ -151,7 +150,6 @@ impl ApiFulltextConfigProvider {
             &self.backend,
             self.nameservice.as_ref(),
             &mut state,
-            &self.cache_dir,
             Some(Arc::clone(&self.leaflet_cache)),
             None,
         )

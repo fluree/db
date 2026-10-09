@@ -494,7 +494,6 @@ async fn drop_branch_releases_dictionary_blobs_only_the_branch_referenced() {
                 ledger_id: fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
                 index_head_id: head,
             }],
-            None,
         )
         .await
         .unwrap()

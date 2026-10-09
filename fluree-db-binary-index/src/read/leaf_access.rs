@@ -2,8 +2,9 @@
 //!
 //! Provides a [`LeafHandle`] trait that abstracts over two access strategies:
 //!
-//! - **[`FullBlobLeafHandle`]**: holds the entire leaf blob in memory. Used for
-//!   local filesystem access (OS page cache is optimal) and locally cached leaves.
+//! - **[`FullBlobLeafHandle`]**: holds the whole leaf blob — mapped, shared
+//!   from the store, or read. Used for every leaf the store has locally, and
+//!   for remote leaves promoted to a whole-blob fetch.
 //!
 //! - **[`RangeReadLeafHandle`]**: holds only the decoded header + directory.
 //!   Fetches individual column blocks on demand via byte-range reads. Used for
@@ -13,13 +14,11 @@
 //! Both handles produce identical [`ColumnBatch`] output — the choice of handle
 //! is invisible to the cursor and cache layers.
 
-#[cfg(target_arch = "wasm32")]
-use crate::wasm_compat::memmap2;
 use std::io;
 use std::ops::Range;
 use std::sync::Arc;
 
-use fluree_db_core::ContentId;
+use fluree_db_core::{ContentBytes, ContentId};
 
 use crate::format::column_block::{ColumnBlockRef, ColumnId};
 use crate::format::history_sidecar::{decode_history_segment, HistEntryV2, HistorySegmentRef};
@@ -74,31 +73,49 @@ pub trait LeafHandle: Send + Sync {
 // FullBlobLeafHandle
 // ============================================================================
 
-/// Leaf handle backed by the full leaf blob in memory.
+/// Leaf handle over the whole leaf blob.
 ///
-/// This is the fast path for local filesystem access and for leaves
-/// already cached locally. Column loading delegates to the existing
-/// `load_leaflet_columns()` function.
+/// The bytes are whatever the store handed out: a mapping of a local file
+/// (only the pages a scan touches fault in), bytes a store holds in memory
+/// (shared, not copied), or a buffer read or fetched for this leaf. Column
+/// loading delegates to `load_leaflet_columns()`.
 pub struct FullBlobLeafHandle {
-    bytes: Vec<u8>,
-    dir: DecodedLeafDirV3,
-    sidecar: Option<Vec<u8>>,
+    bytes: ContentBytes,
+    /// Shared from the [`LeafletCache`](super::leaflet_cache::LeafletCache)
+    /// when the opener has one, so a leaf's directory is decoded once per
+    /// leaf CID rather than per open.
+    dir: Arc<DecodedLeafDirV3>,
+    sidecar: Option<ContentBytes>,
     leaf_id: u128,
 }
 
 impl FullBlobLeafHandle {
-    /// Create from raw leaf bytes and optional sidecar bytes.
-    ///
-    /// Parses the header and directory from the leaf bytes.
-    pub fn new(bytes: Vec<u8>, sidecar: Option<Vec<u8>>, leaf_id: u128) -> io::Result<Self> {
+    /// Create from leaf bytes and optional sidecar bytes, decoding the
+    /// header and directory from the leaf bytes.
+    pub fn new(
+        bytes: impl Into<ContentBytes>,
+        sidecar: Option<ContentBytes>,
+        leaf_id: u128,
+    ) -> io::Result<Self> {
+        let bytes = bytes.into();
         let header = decode_leaf_header_v3(&bytes)?;
-        let dir = decode_leaf_dir_v3_with_base(&bytes, &header)?;
-        Ok(Self {
+        let dir = Arc::new(decode_leaf_dir_v3_with_base(&bytes, &header)?);
+        Ok(Self::with_dir(bytes, dir, sidecar, leaf_id))
+    }
+
+    /// Create with a directory already decoded.
+    pub fn with_dir(
+        bytes: ContentBytes,
+        dir: Arc<DecodedLeafDirV3>,
+        sidecar: Option<ContentBytes>,
+        leaf_id: u128,
+    ) -> Self {
+        Self {
             bytes,
             dir,
             sidecar,
             leaf_id,
-        })
+        }
     }
 }
 
@@ -115,192 +132,6 @@ impl LeafHandle for FullBlobLeafHandle {
     ) -> io::Result<ColumnBatch> {
         let entry = &self.dir.entries[leaflet_idx];
         load_leaflet_columns(&self.bytes, entry, self.dir.payload_base, projection, order)
-    }
-
-    fn load_sidecar_segment(&self, leaflet_idx: usize) -> io::Result<Vec<HistEntryV2>> {
-        let entry = &self.dir.entries[leaflet_idx];
-        if entry.history_len == 0 {
-            return Ok(Vec::new());
-        }
-        let sc_bytes = self.sidecar.as_deref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "sidecar bytes required for history replay but not available",
-            )
-        })?;
-        let seg = HistorySegmentRef {
-            offset: entry.history_offset,
-            len: entry.history_len,
-            min_t: entry.history_min_t,
-            max_t: entry.history_max_t,
-        };
-        decode_history_segment(sc_bytes, &seg)
-    }
-
-    fn sidecar_bytes(&self) -> Option<&[u8]> {
-        self.sidecar.as_deref()
-    }
-
-    fn leaf_id(&self) -> u128 {
-        self.leaf_id
-    }
-}
-
-// ============================================================================
-// SharedBlobLeafHandle (resident bytes)
-// ============================================================================
-
-/// Leaf handle over shared, already-resident bytes.
-///
-/// Whole leaf blobs the content store already holds in memory
-/// (`resolve_cached_bytes`) arrive as `Arc<[u8]>`: in-memory storage on
-/// native, the residency tier on wasm32. This handle is
-/// [`FullBlobLeafHandle`] with shared instead of owned backing, so opening a
-/// resident leaf clones two `Arc`s — no byte copy.
-pub struct SharedBlobLeafHandle {
-    bytes: Arc<[u8]>,
-    dir: Arc<DecodedLeafDirV3>,
-    sidecar: Option<Arc<[u8]>>,
-    leaf_id: u128,
-}
-
-impl SharedBlobLeafHandle {
-    /// Create from resident leaf bytes and optional resident sidecar bytes.
-    ///
-    /// Parses the header and directory from the leaf bytes.
-    pub fn new(bytes: Arc<[u8]>, sidecar: Option<Arc<[u8]>>, leaf_id: u128) -> io::Result<Self> {
-        let header = decode_leaf_header_v3(&bytes)?;
-        let dir = Arc::new(decode_leaf_dir_v3_with_base(&bytes, &header)?);
-        Ok(Self::with_dir(bytes, dir, sidecar, leaf_id))
-    }
-
-    /// Create with a directory already decoded, shared from the
-    /// [`LeafletCache`](super::leaflet_cache::LeafletCache).
-    pub fn with_dir(
-        bytes: Arc<[u8]>,
-        dir: Arc<DecodedLeafDirV3>,
-        sidecar: Option<Arc<[u8]>>,
-        leaf_id: u128,
-    ) -> Self {
-        Self {
-            bytes,
-            dir,
-            sidecar,
-            leaf_id,
-        }
-    }
-}
-
-impl LeafHandle for SharedBlobLeafHandle {
-    fn dir(&self) -> &DecodedLeafDirV3 {
-        &self.dir
-    }
-
-    fn load_columns(
-        &self,
-        leaflet_idx: usize,
-        projection: &ColumnProjection,
-        order: RunSortOrder,
-    ) -> io::Result<ColumnBatch> {
-        let entry = &self.dir.entries[leaflet_idx];
-        load_leaflet_columns(&self.bytes, entry, self.dir.payload_base, projection, order)
-    }
-
-    fn load_sidecar_segment(&self, leaflet_idx: usize) -> io::Result<Vec<HistEntryV2>> {
-        let entry = &self.dir.entries[leaflet_idx];
-        if entry.history_len == 0 {
-            return Ok(Vec::new());
-        }
-        let sc_bytes = self.sidecar.as_deref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "sidecar bytes required for history replay but not available",
-            )
-        })?;
-        let seg = HistorySegmentRef {
-            offset: entry.history_offset,
-            len: entry.history_len,
-            min_t: entry.history_min_t,
-            max_t: entry.history_max_t,
-        };
-        decode_history_segment(sc_bytes, &seg)
-    }
-
-    fn sidecar_bytes(&self) -> Option<&[u8]> {
-        self.sidecar.as_deref()
-    }
-
-    fn leaf_id(&self) -> u128 {
-        self.leaf_id
-    }
-}
-
-// ============================================================================
-// MmapLeafHandle
-// ============================================================================
-
-/// Leaf handle backed by an mmap of the local leaf file, with the decoded
-/// directory shared from the [`LeafletCache`](super::leaflet_cache::LeafletCache).
-///
-/// The local read fast path used to `std::fs::read` the entire leaf blob into a
-/// fresh heap buffer on every open and re-decode the directory each time. For a
-/// leaf that grows across incremental builds, that whole-blob copy + full
-/// directory decode is re-paid per point read. This handle instead:
-/// - maps the (immutable, content-addressed) leaf file, so the raw bytes stay in
-///   OS page cache and only the pages actually touched (header, directory, and
-///   the one scanned leaflet's columns) fault in — no whole-blob copy; and
-/// - takes the decoded directory as an `Arc` from the shared cache, so the
-///   directory is parsed once per leaf CID, not per open.
-///
-/// Column data itself is still materialized once, per leaflet, via the V3Batch
-/// cache — this handle only supplies the bytes for a cold decode. Raw leaf bytes
-/// are never copied into the cache budget.
-pub struct MmapLeafHandle {
-    /// Shared mapping: leaf files are immutable CAS artifacts, so one
-    /// mapping is created per leaf and shared across concurrent handles
-    /// (see `LeafletCache::try_get_or_load_leaf_mmap`). `Mmap` does not
-    /// keep the file descriptor alive — sharing costs address space only.
-    mmap: Arc<memmap2::Mmap>,
-    dir: Arc<DecodedLeafDirV3>,
-    sidecar: Option<Vec<u8>>,
-    leaf_id: u128,
-}
-
-impl MmapLeafHandle {
-    pub fn new(
-        mmap: Arc<memmap2::Mmap>,
-        dir: Arc<DecodedLeafDirV3>,
-        sidecar: Option<Vec<u8>>,
-        leaf_id: u128,
-    ) -> Self {
-        Self {
-            mmap,
-            dir,
-            sidecar,
-            leaf_id,
-        }
-    }
-}
-
-impl LeafHandle for MmapLeafHandle {
-    fn dir(&self) -> &DecodedLeafDirV3 {
-        &self.dir
-    }
-
-    fn load_columns(
-        &self,
-        leaflet_idx: usize,
-        projection: &ColumnProjection,
-        order: RunSortOrder,
-    ) -> io::Result<ColumnBatch> {
-        let entry = &self.dir.entries[leaflet_idx];
-        load_leaflet_columns(
-            &self.mmap[..],
-            entry,
-            self.dir.payload_base,
-            projection,
-            order,
-        )
     }
 
     fn load_sidecar_segment(&self, leaflet_idx: usize) -> io::Result<Vec<HistEntryV2>> {
@@ -1103,15 +934,19 @@ mod tests {
         let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
 
         // FullBlobLeafHandle path.
-        let mut full_handle =
-            FullBlobLeafHandle::new(leaf_bytes.clone(), Some(sidecar_bytes.clone()), leaf_id)
-                .unwrap();
+        let mut full_handle = FullBlobLeafHandle::new(
+            leaf_bytes.clone(),
+            Some(sidecar_bytes.clone().into()),
+            leaf_id,
+        )
+        .unwrap();
         // Patch history fields.
         let seg = &seg_refs[0];
-        full_handle.dir.entries[0].history_offset = seg.offset;
-        full_handle.dir.entries[0].history_len = seg.len;
-        full_handle.dir.entries[0].history_min_t = seg.min_t;
-        full_handle.dir.entries[0].history_max_t = seg.max_t;
+        let dir = Arc::make_mut(&mut full_handle.dir);
+        dir.entries[0].history_offset = seg.offset;
+        dir.entries[0].history_len = seg.len;
+        dir.entries[0].history_min_t = seg.min_t;
+        dir.entries[0].history_max_t = seg.max_t;
         let full_entries = full_handle.load_sidecar_segment(0).unwrap();
 
         // RangeReadLeafHandle path.

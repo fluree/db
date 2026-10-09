@@ -93,13 +93,18 @@ impl StorageRead for MemoryStorage {
     }
 
     /// The stored bytes themselves, shared. A [`Self::simulating_remote`]
-    /// view holds nothing resident: a remote store's bytes are not in this
+    /// view holds nothing locally: a remote store's bytes are not in this
     /// process.
-    fn resolve_local_bytes(&self, address: &str) -> Option<Arc<[u8]>> {
+    fn get_local(&self, address: &str) -> Result<Option<super::ContentBytes>> {
         if self.remote {
-            return None;
+            return Ok(None);
         }
-        self.data.read().get(address).cloned()
+        Ok(self
+            .data
+            .read()
+            .get(address)
+            .cloned()
+            .map(super::ContentBytes::Shared))
     }
 
     fn encryption_admin(&self) -> Option<std::sync::Arc<dyn crate::EncryptionAdmin>> {
@@ -236,7 +241,7 @@ impl StorageCas for MemoryStorage {
 /// This is the CID-first counterpart to [`MemoryStorage`].
 #[derive(Debug, Clone)]
 pub struct MemoryContentStore {
-    data: Arc<RwLock<HashMap<ContentId, Vec<u8>>>>,
+    data: Arc<RwLock<HashMap<ContentId, Arc<[u8]>>>>,
 }
 
 impl Default for MemoryContentStore {
@@ -256,31 +261,27 @@ impl MemoryContentStore {
 
 #[async_trait]
 impl ContentStore for MemoryContentStore {
-    /// Reads return exactly the bytes at rest.
-    fn permits_plaintext_cache(&self) -> bool {
-        true
-    }
-
-    /// Reads are served from memory.
-    fn is_remote(&self) -> bool {
-        false
-    }
-
     async fn has(&self, id: &ContentId) -> Result<bool> {
         Ok(self.data.read().contains_key(id))
     }
 
-    async fn get(&self, id: &ContentId) -> Result<Vec<u8>> {
-        self.data
+    async fn get(&self, id: &ContentId) -> Result<super::ContentBytes> {
+        self.get_local(id)?
+            .ok_or_else(|| crate::error::Error::not_found(id.to_string()))
+    }
+
+    fn get_local(&self, id: &ContentId) -> Result<Option<super::ContentBytes>> {
+        Ok(self
+            .data
             .read()
             .get(id)
             .cloned()
-            .ok_or_else(|| crate::error::Error::not_found(id.to_string()))
+            .map(super::ContentBytes::Shared))
     }
 
     async fn put(&self, kind: ContentKind, bytes: &[u8]) -> Result<ContentId> {
         let id = ContentId::new(kind, bytes);
-        self.data.write().insert(id.clone(), bytes.to_vec());
+        self.data.write().insert(id.clone(), Arc::from(bytes));
         Ok(id)
     }
 
@@ -290,7 +291,7 @@ impl ContentStore for MemoryContentStore {
                 "CID verification failed: provided CID {id} does not match bytes"
             )));
         }
-        self.data.write().insert(id.clone(), bytes.to_vec());
+        self.data.write().insert(id.clone(), Arc::from(bytes));
         Ok(())
     }
 
@@ -310,6 +311,10 @@ impl ContentStore for MemoryContentStore {
             return Ok(Vec::new());
         }
         Ok(full[start..end].to_vec())
+    }
+
+    fn supports_ranged_reads(&self) -> bool {
+        true
     }
 }
 
@@ -331,22 +336,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_local_bytes_shares_the_stored_bytes() {
+    fn get_local_shares_the_stored_bytes() {
         let storage = MemoryStorage::new();
         storage.insert("test/path", b"hello world".to_vec());
 
-        let first = storage.resolve_local_bytes("test/path").expect("resident");
-        let second = storage.resolve_local_bytes("test/path").expect("resident");
-        assert_eq!(&first[..], b"hello world");
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "each lookup shares one allocation"
-        );
-        assert!(storage.resolve_local_bytes("nonexistent").is_none());
+        let first = storage.get_local("test/path").unwrap().expect("local");
+        let second = storage.get_local("test/path").unwrap().expect("local");
+        assert_eq!(first, b"hello world");
+        assert!(first.ptr_eq(&second), "each lookup shares one allocation");
+        assert!(storage.get_local("nonexistent").unwrap().is_none());
         assert!(
             storage
                 .simulating_remote()
-                .resolve_local_bytes("test/path")
+                .get_local("test/path")
+                .unwrap()
                 .is_none(),
             "a remote store's bytes are not in this process"
         );

@@ -100,7 +100,7 @@ async fn upload_incremental_reverse_tree_core(
             .get(cid)
             .await
             .map_err(|e| IndexerError::StorageRead(format!("fetch reverse leaf: {e}")))?;
-        prefetched.insert(idx, bytes);
+        prefetched.insert(idx, bytes.into_vec());
     }
 
     // 4. CPU-bound CoW update in spawn_blocking.

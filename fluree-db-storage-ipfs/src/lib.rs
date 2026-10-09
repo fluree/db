@@ -148,15 +148,6 @@ impl IpfsStorage {
 
 #[async_trait]
 impl ContentStore for IpfsStorage {
-    /// Reads return exactly the bytes at rest.
-    fn permits_plaintext_cache(&self) -> bool {
-        true
-    }
-
-    fn is_remote(&self) -> bool {
-        true
-    }
-
     async fn has(&self, id: &ContentId) -> fluree_db_core::error::Result<bool> {
         let cid_str = id.to_string();
         match self.kubo.block_stat(&cid_str).await {
@@ -166,11 +157,15 @@ impl ContentStore for IpfsStorage {
         }
     }
 
-    async fn get(&self, id: &ContentId) -> fluree_db_core::error::Result<Vec<u8>> {
+    async fn get(
+        &self,
+        id: &ContentId,
+    ) -> fluree_db_core::error::Result<fluree_db_core::ContentBytes> {
         let cid_str = id.to_string();
         self.kubo
             .block_get(&cid_str)
             .await
+            .map(Into::into)
             .map_err(fluree_db_core::error::Error::from)
     }
 

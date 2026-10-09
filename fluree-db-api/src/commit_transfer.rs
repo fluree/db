@@ -1716,7 +1716,7 @@ impl Fluree {
             }
             oldest_t = Some(t);
 
-            commits.push(Base64Bytes(raw_bytes));
+            commits.push(Base64Bytes(raw_bytes.into_vec()));
 
             // Collect referenced txn blob via ContentStore. A missing blob is
             // a provenance gap, not a chain break: report it and keep going.
@@ -1725,7 +1725,7 @@ impl Fluree {
                 if let std::collections::hash_map::Entry::Vacant(e) = blobs.entry(txn_key.clone()) {
                     match content_store.get(txn_cid).await {
                         Ok(txn_bytes) => {
-                            e.insert(Base64Bytes(txn_bytes));
+                            e.insert(Base64Bytes(txn_bytes.into_vec()));
                         }
                         Err(fluree_db_core::Error::NotFound(_)) => {
                             tracing::warn!(
@@ -1796,7 +1796,7 @@ async fn read_export_commits(
             if let std::collections::hash_map::Entry::Vacant(entry) = blobs.entry(key.clone()) {
                 match store.get(txn_cid).await {
                     Ok(txn_bytes) => {
-                        entry.insert(Base64Bytes(txn_bytes));
+                        entry.insert(Base64Bytes(txn_bytes.into_vec()));
                     }
                     Err(fluree_db_core::Error::NotFound(_)) => {
                         tracing::warn!(
@@ -1814,7 +1814,7 @@ async fn read_export_commits(
                 }
             }
         }
-        out.push((envelope.t, Base64Bytes(bytes)));
+        out.push((envelope.t, Base64Bytes(bytes.into_vec())));
     }
     Ok(out)
 }

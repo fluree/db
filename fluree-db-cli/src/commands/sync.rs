@@ -717,7 +717,8 @@ async fn read_push_commits(
         let bytes = store
             .get(cid)
             .await
-            .map_err(|e| CliError::Config(format!("failed to read local commit {cid}: {e}")))?;
+            .map_err(|e| CliError::Config(format!("failed to read local commit {cid}: {e}")))?
+            .into_vec();
         let commit = fluree_db_core::commit::codec::read_commit(&bytes)
             .map_err(|e| CliError::Config(format!("failed to decode local commit {cid}: {e}")))?;
         commits.push(fluree_db_api::Base64Bytes(bytes));
@@ -727,7 +728,7 @@ async fn read_push_commits(
             if let std::collections::hash_map::Entry::Vacant(e) = blobs.entry(txn_key.clone()) {
                 match store.get(txn_cid).await {
                     Ok(txn_bytes) => {
-                        e.insert(fluree_db_api::Base64Bytes(txn_bytes));
+                        e.insert(fluree_db_api::Base64Bytes(txn_bytes.into_vec()));
                     }
                     Err(fluree_db_core::Error::NotFound(_)) => {
                         eprintln!(
@@ -1604,9 +1605,13 @@ pub async fn run_clone_origin(
             }
             let commit_bytes = if content_store.has(&cid).await.unwrap_or(false) {
                 // Already have this commit — read local bytes for chain traversal.
-                content_store.get(&cid).await.map_err(|e| {
-                    CliError::Config(format!("clone failed (read local commit): {e}"))
-                })?
+                content_store
+                    .get(&cid)
+                    .await
+                    .map_err(|e| {
+                        CliError::Config(format!("clone failed (read local commit): {e}"))
+                    })?
+                    .into_vec()
             } else {
                 // Fetch commit blob from origin.
                 let bytes = fetcher

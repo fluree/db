@@ -72,7 +72,11 @@ The `ContentStore` trait is the primary interface for accessing immutable, conte
 #[async_trait]
 pub trait ContentStore: Debug + Send + Sync {
     /// Retrieve bytes by content ID
-    async fn get(&self, id: &ContentId) -> Result<Vec<u8>>;
+    async fn get(&self, id: &ContentId) -> Result<ContentBytes>;
+
+    /// The bytes when this machine already has them, without fetching.
+    /// Sync readers try this before bridging to `get`.
+    fn get_local(&self, id: &ContentId) -> Result<Option<ContentBytes>> { Ok(None) }
 
     /// Store bytes, returning the computed ContentId
     async fn put(&self, kind: ContentKind, bytes: &[u8]) -> Result<ContentId>;
@@ -80,11 +84,33 @@ pub trait ContentStore: Debug + Send + Sync {
     /// Check whether an object exists
     async fn has(&self, id: &ContentId) -> Result<bool>;
 
-    /// Whether bytes returned by `get` may be persisted unencrypted outside
-    /// this store (the binary-index disk cache). Required: see below.
-    fn permits_plaintext_cache(&self) -> bool;
+    /// Whether `get_range` reads only the requested bytes. When it does not,
+    /// readers fetch an object whole once instead of range-reading it.
+    fn supports_ranged_reads(&self) -> bool { false }
+
+    /// Hints, ignored by a store with no local tier: warm it with `id`
+    /// ahead of sync reads, or keep bytes just written for reads to come.
+    async fn prefetch(&self, id: &ContentId) -> Result<()> { Ok(()) }
+    fn keep_local(&self, id: &ContentId, bytes: &[u8]) {}
 }
 ```
+
+Readers never ask a `ContentStore` whether it is remote. The disk artifact
+cache is a store wrapper, `CachedContentStore`, that serves reads from the
+inner store's local tier, then its cache directory, then a coalesced fetch
+that writes the directory; it never copies what the inner store serves
+locally. `StorageBackend::with_disk_cache` applies it where the store stack is
+assembled, from the storage's own answers (below): a remote plaintext storage
+gets the cache, a remote storage that decrypts on read gets coalesced fetches
+and nothing on disk, and a local one is left alone. Every `Fluree` and
+`LedgerManager` constructor applies it. Cache entries are keyed by CID and
+shared, but a fetch is coalesced only among one backend's readers of one
+namespace: a waiter takes the leader's outcome without running its own read,
+so a child branch's miss must not fail its parent's concurrent read, and a
+reader with a different key must not receive another's plaintext. A release
+reaches the inner store first and evicts the cache entry after. Ledger verification reads through
+`StorageBackend::without_disk_cache`, since a cached copy would hide an object
+the storage has lost.
 
 **Design notes:**
 - `ContentId` is a CIDv1 value encoding the hash function, digest, and content kind (multicodec). See [ContentId and ContentStore](content-id-and-contentstore.md).
@@ -131,13 +157,19 @@ pub trait StorageRead: Debug + Send + Sync {
     async fn list_prefix_with_metadata(&self, prefix: &str)
         -> Result<Vec<RemoteObject>>;
 
-    /// Resolve a CAS address to a local filesystem path, if available.
-    fn resolve_local_path(&self, address: &str) -> Option<PathBuf> { None }
+    /// The bytes at `address` when this machine already has them: a local
+    /// file (mapped, or read when small) or bytes held in memory. `Ok(None)`
+    /// when absent or remote; `Err` when a local copy cannot be read.
+    fn get_local(&self, address: &str) -> Result<Option<ContentBytes>> { Ok(None) }
 
     /// Whether bytes read here may be persisted unencrypted outside this
     /// storage. Plain backends answer `true`; `EncryptedStorage` answers
     /// `false`; wrappers delegate.
     fn permits_plaintext_cache(&self) -> bool;
+
+    /// Whether reads leave the machine. A routing storage answers `true` when
+    /// any backend it routes to is remote; wrappers delegate.
+    fn is_remote(&self) -> bool;
 
     /// The key-rotation surface when this storage encrypts at rest, else
     /// `None`. Wrappers delegate; `EncryptedStorage` returns itself.
@@ -151,11 +183,13 @@ pub struct RemoteObject {
 }
 ```
 
-`permits_plaintext_cache` and `encryption_admin` have no default on purpose. A
-wrapper that forgot to delegate would otherwise re-open a plaintext copy of an
-encrypted ledger in the disk cache, or report an encrypted store as plaintext
-(to the status endpoint and to key rotation). Every implementation has to
-answer, so the compiler catches a missing delegation.
+`is_remote`, `permits_plaintext_cache` and `encryption_admin` have no default
+on purpose. A wrapper that forgot to delegate would otherwise attach a
+plaintext disk cache to an encrypted ledger, leave a remote one uncached, or
+report an encrypted store as plaintext (to the status endpoint and to key
+rotation). Every implementation has to answer, so the compiler catches a
+missing delegation. The first two are read once, by
+`StorageBackend::with_disk_cache`, when the store stack is assembled.
 
 `EncryptionAdmin` is what key rotation drives:
 
@@ -181,8 +215,9 @@ pub trait EncryptionAdmin: Send + Sync {
 - `list_prefix_with_metadata` is used by the bulk-import remote-source path so the
   importer can size each chunk before fetching. Backends without cheap size metadata
   return an error; callers can fall back to caller-supplied object lists
-- `resolve_local_path` lets callers (e.g., import scratch staging) skip a copy when
-  the storage already exposes data on the local filesystem (`FileStorage`)
+- `get_local` lets sync readers use bytes already on the machine — a mapping of a
+  `FileStorage` file, `MemoryStorage`'s own allocation, or `EncryptedStorage`'s
+  decryption of its inner storage's local copy — without a fetch or a copy
 - All methods return `fluree_db_core::Result<T>` (alias for `std::result::Result<T, Error>`)
 
 ### StorageWrite
@@ -402,6 +437,10 @@ impl StorageRead for MyReadOnlyStorage {
         true
     }
 
+    fn is_remote(&self) -> bool {
+        true
+    }
+
     fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>> {
         None
     }
@@ -439,6 +478,7 @@ impl StorageRead for MyStorage {
     async fn exists(&self, address: &str) -> Result<bool> { ... }
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> { ... }
     fn permits_plaintext_cache(&self) -> bool { true }
+    fn is_remote(&self) -> bool { true }
     fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>> { None }
 }
 
@@ -521,7 +561,7 @@ let store = BranchedContentStore::with_parents(storage, "mydb:dev", vec![parent]
 3. If no parent finds it, return the last `NotFound` error
 4. **Non-`NotFound` errors propagate immediately** — only `NotFound` triggers fallback
 
-`has()` and `resolve_local_path()` follow the same fallback pattern.
+`has()` and `get_local()` follow the same fallback pattern.
 
 ### Write Behavior
 
@@ -623,8 +663,9 @@ pub struct EncryptedStorage<S, K> {
 ```
 
 Built with `EncryptedStorage::new(inner, keys)` or `with_arc_keys`. It answers
-`permits_plaintext_cache() == false` and implements `EncryptionAdmin` for key
-rotation.
+`permits_plaintext_cache() == false`, serves `get_local` by decrypting the
+inner storage's local copy, and implements `EncryptionAdmin` for key rotation.
+Its range reads decrypt the whole object, so it reports no ranged reads.
 
 ### AddressIdentifierResolverStorage
 

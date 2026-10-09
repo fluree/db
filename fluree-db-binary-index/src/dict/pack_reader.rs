@@ -9,22 +9,14 @@
 //!   Local and remote packs load and validate on first lookup or background warming.
 //! - **`from_memory`**: In-memory constructor for testing.
 
-#[cfg(target_arch = "wasm32")]
-use crate::wasm_compat::memmap2;
 use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use once_cell::sync::OnceCell;
 
 use super::forward_pack::{lookup_in_pack, parse_pack_meta, ParsedPackMeta};
 use crate::format::wire_helpers::PackBranchEntry;
-use fluree_db_core::{ContentId, ContentStore};
-
-/// Global atomic counter for unique temp file names (avoids collisions
-/// across concurrent pack fetches within the same process).
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+use fluree_db_core::{ContentBytes, ContentId, ContentStore};
 
 // ============================================================================
 // PackHandle — owns routing info + backing store for a single pack
@@ -45,33 +37,18 @@ enum PackInner {
     /// Pack is fully loaded: metadata parsed, backing bytes available.
     Loaded {
         meta: ParsedPackMeta,
-        backing: LoadedBacking,
+        backing: ContentBytes,
     },
     /// Pack deferred: resolve locally or fetch from CAS on first lookup.
     Lazy {
         pack_cid: ContentId,
-        cache_path: PathBuf,
         loaded: OnceCell<LazyLoaded>,
     },
 }
 
-enum LoadedBacking {
-    Mmap(memmap2::Mmap),
-    InMemory(Arc<[u8]>),
-}
-
 struct LazyLoaded {
     meta: ParsedPackMeta,
-    backing: LoadedBacking,
-}
-
-impl LoadedBacking {
-    fn bytes(&self) -> &[u8] {
-        match self {
-            LoadedBacking::Mmap(mmap) => mmap.as_ref(),
-            LoadedBacking::InMemory(bytes) => bytes.as_ref(),
-        }
-    }
+    backing: ContentBytes,
 }
 
 impl PackHandle {
@@ -79,17 +56,13 @@ impl PackHandle {
     /// fetch + cache + load + parse on first call (subsequent calls return cached).
     fn ensure_loaded(&self, ctx: Option<&LoadContext>) -> io::Result<(&ParsedPackMeta, &[u8])> {
         match &self.inner {
-            PackInner::Loaded { meta, backing } => Ok((meta, backing.bytes())),
-            PackInner::Lazy {
-                pack_cid,
-                cache_path,
-                loaded,
-            } => {
+            PackInner::Loaded { meta, backing } => Ok((meta, backing)),
+            PackInner::Lazy { pack_cid, loaded } => {
                 let ctx = ctx.ok_or_else(|| io::Error::other("lazy pack without load context"))?;
                 let lazy = loaded.get_or_try_init(|| {
-                    fetch_and_load(self.first_id, self.last_id, pack_cid, cache_path, ctx)
+                    fetch_and_load(self.first_id, self.last_id, pack_cid, ctx)
                 })?;
-                Ok((&lazy.meta, lazy.backing.bytes()))
+                Ok((&lazy.meta, &lazy.backing))
             }
         }
     }
@@ -132,13 +105,11 @@ impl ForwardPackReader {
     /// trees eagerly, so a missing dictionary still fails at open.
     pub async fn from_pack_refs(
         cs: Arc<dyn ContentStore>,
-        cache_dir: &Path,
         refs: &[PackBranchEntry],
         expected_kind: u8,
         expected_ns_code: u16,
     ) -> io::Result<Self> {
-        Self::from_pack_refs_reusing(cs, cache_dir, refs, expected_kind, expected_ns_code, None)
-            .await
+        Self::from_pack_refs_reusing(cs, refs, expected_kind, expected_ns_code, None).await
     }
 
     /// [`Self::from_pack_refs`], carrying over every handle of `prev` whose
@@ -152,7 +123,6 @@ impl ForwardPackReader {
     /// the same kind and namespace code.
     pub async fn from_pack_refs_reusing(
         cs: Arc<dyn ContentStore>,
-        cache_dir: &Path,
         refs: &[PackBranchEntry],
         expected_kind: u8,
         expected_ns_code: u16,
@@ -208,15 +178,11 @@ impl ForwardPackReader {
                 }
             }
 
-            let cache_name = format!("{}.fpk", entry.pack_cid.digest_hex());
-            let cache_path = cache_dir.join(&cache_name);
-
-            // Use the same lazy path for local and remote packs. It probes
-            // local CAS and the disk cache before fetching, so opening a ledger
+            // Use the same lazy path for local and remote packs. It asks the
+            // store for local bytes before fetching, so opening a ledger
             // needs only the routing table, not every dictionary file.
             let inner = PackInner::Lazy {
                 pack_cid: entry.pack_cid.clone(),
-                cache_path,
                 loaded: OnceCell::new(),
             };
             packs.push(Arc::new(PackHandle {
@@ -263,7 +229,7 @@ impl ForwardPackReader {
                 last_id: meta.last_id,
                 inner: PackInner::Loaded {
                     meta,
-                    backing: LoadedBacking::InMemory(bytes),
+                    backing: ContentBytes::Shared(bytes),
                 },
             }));
         }
@@ -455,7 +421,6 @@ fn fetch_and_load(
     expected_first_id: u64,
     expected_last_id: u64,
     pack_cid: &ContentId,
-    cache_path: &Path,
     ctx: &LoadContext,
 ) -> io::Result<LazyLoaded> {
     // Residency-mode stores: serve the residency tier with shared zero-copy
@@ -464,38 +429,20 @@ fn fetch_and_load(
     // one-time, exactly as on native. Checked before any filesystem probe.
     #[cfg(any(target_arch = "wasm32", feature = "residency"))]
     if ctx.cs.miss_register().is_some() {
-        let bytes = crate::read::need_fetch::resident_or_need_fetch(
+        let backing = crate::read::need_fetch::resident_or_need_fetch(
             ctx.cs.as_ref(),
             pack_cid,
             crate::read::need_fetch::FetchKind::ForwardPack,
         )?;
-        let backing = LoadedBacking::InMemory(bytes);
-        let meta = parse_pack_meta(backing.bytes())?;
-        validate_lazy_meta(&meta, expected_first_id, expected_last_id, ctx)?;
-        return Ok(LazyLoaded { meta, backing });
+        return loaded(backing, expected_first_id, expected_last_id, ctx);
     }
 
-    // Fast paths: check if something appeared since construction.
-    if let Some(path) = ctx.cs.resolve_local_path(pack_cid) {
-        let backing = load_pack_backing(&path)?;
-        let meta = parse_pack_meta(backing.bytes())?;
-        validate_lazy_meta(&meta, expected_first_id, expected_last_id, ctx)?;
-        return Ok(LazyLoaded { meta, backing });
-    }
-    if let Some(bytes) = ctx.cs.resolve_cached_bytes(pack_cid) {
-        let backing = LoadedBacking::InMemory(bytes);
-        let meta = parse_pack_meta(backing.bytes())?;
-        validate_lazy_meta(&meta, expected_first_id, expected_last_id, ctx)?;
-        return Ok(LazyLoaded { meta, backing });
-    }
-    // A store the disk cache does not serve gets nothing written there, and
-    // nothing left there by an earlier run is consulted.
-    let disk_cache = crate::read::artifact_cache::uses_disk_cache(ctx.cs.as_ref());
-    if disk_cache && cache_path.exists() {
-        let backing = load_pack_backing(cache_path)?;
-        let meta = parse_pack_meta(backing.bytes())?;
-        validate_lazy_meta(&meta, expected_first_id, expected_last_id, ctx)?;
-        return Ok(LazyLoaded { meta, backing });
+    if let Some(backing) = ctx
+        .cs
+        .get_local(pack_cid)
+        .map_err(|e| io::Error::other(format!("forward pack {pack_cid}: {e}")))?
+    {
+        return loaded(backing, expected_first_id, expected_last_id, ctx);
     }
 
     // Remote fetch: bridge the sync lookup to the async CAS get via the shared
@@ -530,7 +477,6 @@ fn fetch_and_load(
     .map_err(|e| {
         tracing::debug!(
             cid = %pack_cid,
-            cache_path = %cache_path.display(),
             first_id = expected_first_id,
             last_id = expected_last_id,
             error = %e,
@@ -539,24 +485,17 @@ fn fetch_and_load(
         io::Error::other(format!("lazy pack fetch: {e}"))
     })?;
 
-    if !disk_cache {
-        // Heap-backed regardless of size: no disk copy outside the store.
-        let backing = LoadedBacking::InMemory(Arc::from(bytes));
-        let meta = parse_pack_meta(backing.bytes())?;
-        validate_lazy_meta(&meta, expected_first_id, expected_last_id, ctx)?;
-        return Ok(LazyLoaded { meta, backing });
-    }
+    loaded(bytes, expected_first_id, expected_last_id, ctx)
+}
 
-    // Write to cache, then re-open it. Re-opening rather than keeping `bytes`
-    // is deliberate: `load_pack_backing` is the single place that decides
-    // read-vs-mmap, so a large pack still ends up mapped (no heap duplication)
-    // and a small one still ends up on the heap, without duplicating the
-    // threshold logic here.
-    atomic_write_to_cache(cache_path, &bytes)?;
-    drop(bytes);
-
-    let backing = load_pack_backing(cache_path)?;
-    let meta = parse_pack_meta(backing.bytes())?;
+/// Parse and validate a pack's bytes.
+fn loaded(
+    backing: ContentBytes,
+    expected_first_id: u64,
+    expected_last_id: u64,
+    ctx: &LoadContext,
+) -> io::Result<LazyLoaded> {
+    let meta = parse_pack_meta(&backing)?;
     validate_lazy_meta(&meta, expected_first_id, expected_last_id, ctx)?;
     Ok(LazyLoaded { meta, backing })
 }
@@ -602,75 +541,6 @@ fn validate_lazy_meta(
 // Helpers
 // ============================================================================
 
-/// Packs at or below this many bytes are `read()` into the heap instead of
-/// being mapped. Override with `FLUREE_DICT_PACK_MMAP_MIN_BYTES`; 0 restores
-/// the old always-mmap behaviour.
-///
-/// **A mapping is a scarcer resource than the bytes it exposes.** Every mmap
-/// costs a VMA, and a process is hard-capped at `vm.max_map_count` (65,530 by
-/// default) *regardless of how much memory is free* — past it `mmap` returns
-/// ENOMEM, which surfaces here as "failed to load binary index: Cannot allocate
-/// memory (os error 12)" on a host with gigabytes idle. That is not a
-/// theoretical limit: dict packs are per-ID-range and never compacted, so a
-/// ledger's routing table grows without bound. Measured on one deployment,
-/// 23 ledgers held **103,426 packs** and the process carried **47,336
-/// mappings** against the 65,530 cap — every ledger load pushing it closer, and
-/// raising the container's memory limit doing nothing at all because bytes were
-/// never the constraint.
-///
-/// The size split works because pack sizes are extremely skewed: on that same
-/// deployment **91% of packs were under 4 KiB and 99.8% of the mapped ones were
-/// under 64 KiB, holding 30 MB between them.** Mapping a 113-byte file (the
-/// median!) spends a VMA and a whole page of address space to expose less than
-/// a cache line's worth of useful data. So this trades ~30 MB of heap for
-/// ~47,000 mappings, and the large packs that actually justify demand paging —
-/// 5,728 files holding 12.1 of the 12.5 GiB — still get mapped.
-const DEFAULT_MMAP_MIN_BYTES: u64 = 64 * 1024;
-
-fn mmap_min_bytes() -> u64 {
-    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("FLUREE_DICT_PACK_MMAP_MIN_BYTES")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(DEFAULT_MMAP_MIN_BYTES)
-    })
-}
-
-/// Open a pack: heap-read when small, mmap when large. See
-/// [`DEFAULT_MMAP_MIN_BYTES`] for why the small case is the important one.
-fn load_pack_backing(path: &Path) -> io::Result<LoadedBacking> {
-    let file = std::fs::File::open(path).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("open pack file {}: {}", path.display(), e),
-        )
-    })?;
-
-    // A failed `metadata()` falls through to mmap rather than erroring: the
-    // threshold is an optimisation, so losing the size must not lose the read.
-    let small = match file.metadata() {
-        Ok(meta) => meta.len() <= mmap_min_bytes(),
-        Err(_) => false,
-    };
-
-    if small {
-        // `read_to_end` on a fresh Vec, not `fs::read`, so the already-open
-        // handle is reused and the path is not resolved twice (a GC/promotion
-        // unlink between the two would turn a live pack into NotFound).
-        let mut bytes = Vec::new();
-        {
-            use std::io::Read;
-            let mut file = file;
-            file.read_to_end(&mut bytes)?;
-        }
-        return Ok(LoadedBacking::InMemory(Arc::from(bytes)));
-    }
-
-    // SAFETY: The file is an immutable CAS artifact, not concurrently modified.
-    Ok(LoadedBacking::Mmap(unsafe { memmap2::Mmap::map(&file)? }))
-}
-
 /// Page size used to stride `touch_pages`. 4 KiB is the smallest common page
 /// size; reading one byte per 4 KiB faults every page on hosts with larger
 /// pages too (just with redundant in-page reads), so warming stays correct
@@ -694,40 +564,17 @@ fn touch_pages(bytes: &[u8]) -> u64 {
     bytes.len() as u64
 }
 
-/// Write bytes to a cache file atomically (temp file + rename).
-///
-/// Ensures the parent directory exists so lazy fetches succeed even if the
-/// cache directory was removed between construction and first lookup.
-fn atomic_write_to_cache(cache_path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = cache_path.with_extension(format!(
-        "tmp.{}.{}",
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::write(&tmp, bytes)?;
-    match std::fs::rename(&tmp, cache_path) {
-        Ok(()) => Ok(()),
-        Err(_) if cache_path.exists() => {
-            // Another process won the race — discard our tmp and use theirs.
-            let _ = std::fs::remove_file(&tmp);
-            Ok(())
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Unique temp directory names across tests in this process.
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
     use super::*;
     use crate::dict::forward_pack::{encode_forward_pack, KIND_STRING_FWD, KIND_SUBJECT_FWD};
     use crate::format::wire_helpers::PackBranchEntry;
@@ -901,14 +748,16 @@ mod tests {
 
     /// Forces the lazy fetch path under a **current-thread** Tokio runtime.
     ///
-    /// `MemoryContentStore` always returns `None` from `resolve_local_path`,
-    /// so all packs become `Lazy`. The lookup triggers `fetch_and_load` which
-    /// uses `thread::spawn` + `Handle::block_on` — this test verifies that
-    /// pattern works on the single-threaded `#[tokio::test]` runtime.
+    /// A simulated remote store serves nothing locally, so the lookup triggers
+    /// `fetch_and_load`'s bridged fetch — this test verifies that bridge works
+    /// on the single-threaded `#[tokio::test]` runtime.
     #[tokio::test]
     async fn test_lazy_fetch_current_thread_runtime() {
         let pack_bytes = make_pack_bytes(0, 50);
-        let cs = MemoryContentStore::new();
+        let cs = fluree_db_core::content_store_for(
+            fluree_db_core::MemoryStorage::new().simulating_remote(),
+            "lazy:main",
+        );
 
         // Store the pack in the content store.
         let cid = cs
@@ -927,19 +776,12 @@ mod tests {
             pack_cid: cid,
         }];
 
-        let cache_dir =
-            std::env::temp_dir().join(format!("fluree_test_lazy_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&cache_dir);
-
-        let reader =
-            ForwardPackReader::from_pack_refs(Arc::new(cs), &cache_dir, &refs, KIND_STRING_FWD, 0)
-                .await
-                .unwrap();
-
-        // All packs should be Lazy (MemoryContentStore has no local path).
+        let reader = ForwardPackReader::from_pack_refs(Arc::new(cs), &refs, KIND_STRING_FWD, 0)
+            .await
+            .unwrap();
         assert_eq!(reader.pack_count(), 1);
 
-        // This triggers the lazy fetch via thread::spawn + block_on.
+        // This triggers the lazy fetch over the sync→async bridge.
         assert_eq!(
             reader.forward_lookup_str(0).unwrap(),
             Some("val_0".to_string())
@@ -955,7 +797,6 @@ mod tests {
         assert_eq!(reader.forward_lookup_str(50).unwrap(), None);
 
         // Cleanup.
-        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 
     /// A reload of a routing table that still names a pack must share the
@@ -975,16 +816,9 @@ mod tests {
             last_id: last,
             pack_cid: cid.clone(),
         };
-        let cache_dir = std::env::temp_dir().join(format!(
-            "fluree_test_pack_reuse_{}_{}",
-            std::process::id(),
-            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&cache_dir);
 
         let first = ForwardPackReader::from_pack_refs(
             Arc::clone(&cs),
-            &cache_dir,
             &[entry(0, 49, &p1)],
             KIND_STRING_FWD,
             0,
@@ -1000,7 +834,6 @@ mod tests {
 
         let second = ForwardPackReader::from_pack_refs_reusing(
             Arc::clone(&cs),
-            &cache_dir,
             &[entry(0, 49, &p1), entry(50, 99, &p2)],
             KIND_STRING_FWD,
             0,
@@ -1033,10 +866,8 @@ mod tests {
 
         // Same cid under a different id range is a different routing entry
         // (the mismatch is checked when the new handle is used).
-        let other_cache_dir = cache_dir.join("shifted");
         let shifted = ForwardPackReader::from_pack_refs_reusing(
             Arc::clone(&cs),
-            &other_cache_dir,
             &[entry(100, 149, &p1)],
             KIND_STRING_FWD,
             0,
@@ -1049,7 +880,6 @@ mod tests {
         // A reader for another stream never lends its handles.
         let other_stream = ForwardPackReader::from_pack_refs_reusing(
             Arc::clone(&cs),
-            &cache_dir.join("other-stream"),
             &[entry(0, 49, &p1)],
             KIND_SUBJECT_FWD,
             3,
@@ -1058,82 +888,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(other_stream.packs_shared_with(&first), 0);
-
-        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 
-    /// A small pack must be read onto the heap, not mapped — the whole point of
-    /// [`DEFAULT_MMAP_MIN_BYTES`]. Asserting on the backing VARIANT rather than
-    /// on lookups is deliberate: lookups pass either way, which is exactly why
-    /// the mapping leak went unnoticed for months. This is the only assertion
-    /// that can fail if someone reverts to always-mmap.
-    #[test]
-    fn small_packs_are_read_not_mapped() {
-        let bytes = make_pack_bytes(0, 10);
-        assert!(
-            (bytes.len() as u64) <= DEFAULT_MMAP_MIN_BYTES,
-            "fixture must be under the threshold to exercise the read path, got {} bytes",
-            bytes.len()
-        );
-
-        let dir =
-            std::env::temp_dir().join(format!("fluree_test_small_pack_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("small.fpk");
-        std::fs::write(&path, &bytes).unwrap();
-
-        let backing = load_pack_backing(&path).unwrap();
-        assert!(
-            matches!(backing, LoadedBacking::InMemory(_)),
-            "a {}-byte pack must not consume a VMA",
-            bytes.len()
-        );
-        // The bytes must survive the trip, or we have traded a mapping for a bug.
-        assert_eq!(backing.bytes(), bytes.as_slice());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Above the threshold we still map: large packs are where demand paging
-    /// actually pays, and this pins that the split is a split and not a
-    /// wholesale move to heap reads (which would pull GiB-sized packs into RAM).
-    #[test]
-    fn large_packs_are_still_mapped() {
-        let dir =
-            std::env::temp_dir().join(format!("fluree_test_large_pack_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("large.fpk");
-        // Content is irrelevant here — load_pack_backing does not parse.
-        std::fs::write(&path, vec![0u8; (DEFAULT_MMAP_MIN_BYTES + 1) as usize]).unwrap();
-
-        let backing = load_pack_backing(&path).unwrap();
-        assert!(
-            matches!(backing, LoadedBacking::Mmap(_)),
-            "packs over the threshold should still be mapped"
-        );
-        assert_eq!(backing.bytes().len(), (DEFAULT_MMAP_MIN_BYTES + 1) as usize);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The boundary is inclusive (`<=`), so a pack exactly at the threshold is
-    /// read. Pinned because an off-by-one here silently changes which side of
-    /// the split the most common pack size lands on.
-    #[test]
-    fn threshold_boundary_is_inclusive() {
-        let dir =
-            std::env::temp_dir().join(format!("fluree_test_edge_pack_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("edge.fpk");
-        std::fs::write(&path, vec![0u8; DEFAULT_MMAP_MIN_BYTES as usize]).unwrap();
-
-        assert!(matches!(
-            load_pack_backing(&path).unwrap(),
-            LoadedBacking::InMemory(_)
-        ));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
     /// Test store whose local-path probes are observable independently of CAS
     /// fetches. The same files can also stand in for a populated disk cache.
     #[derive(Debug)]
@@ -1175,19 +931,20 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ContentStore for FilePackStore {
-        fn permits_plaintext_cache(&self) -> bool {
-            true
-        }
-
-        fn is_remote(&self) -> bool {
-            !self.local
-        }
-
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             self.fallback.has(id).await
         }
-        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+        async fn get(
+            &self,
+            id: &ContentId,
+        ) -> fluree_db_core::Result<fluree_db_core::ContentBytes> {
             self.gets.fetch_add(1, Ordering::Relaxed);
+            if self.local {
+                // Local files are the authority, as for file storage.
+                return std::fs::read(self.path(id))
+                    .map(Into::into)
+                    .map_err(|e| fluree_db_core::Error::not_found(e.to_string()));
+            }
             self.fallback.get(id).await
         }
         async fn put(&self, kind: ContentKind, bytes: &[u8]) -> fluree_db_core::Result<ContentId> {
@@ -1203,9 +960,17 @@ mod tests {
         async fn release(&self, id: &ContentId) -> fluree_db_core::Result<()> {
             self.fallback.release(id).await
         }
-        fn resolve_local_path(&self, id: &ContentId) -> Option<PathBuf> {
+        fn get_local(
+            &self,
+            id: &ContentId,
+        ) -> fluree_db_core::Result<Option<fluree_db_core::ContentBytes>> {
             self.resolves.fetch_add(1, Ordering::Relaxed);
-            self.local.then(|| self.path(id))
+            if !self.local {
+                return Ok(None);
+            }
+            // SAFETY: the test never rewrites a file it has stored.
+            unsafe { fluree_db_core::ContentBytes::open(&self.path(id)) }
+                .map_err(|e| fluree_db_core::Error::io(e.to_string()))
         }
     }
 
@@ -1228,11 +993,26 @@ mod tests {
 
     #[tokio::test]
     async fn local_and_cached_packs_open_only_on_use() {
+        // A local store, then a remote one whose disk cache already holds the
+        // packs.
         for local in [true, false] {
             let cs = Arc::new(FilePackStore::new(local));
             let refs = vec![file_pack(&cs, 0, 50).await, file_pack(&cs, 100, 50).await];
+            let store: Arc<dyn ContentStore> = if local {
+                cs.clone()
+            } else {
+                let cache =
+                    fluree_db_core::disk_cache::DiskArtifactCache::for_dir(&cs.dir.join("cache"));
+                let cached = fluree_db_core::disk_cache::CachedContentStore::new(cs.clone(), cache);
+                for entry in &refs {
+                    let bytes = std::fs::read(cs.path(&entry.pack_cid)).unwrap();
+                    cached.keep_local(&entry.pack_cid, &bytes);
+                }
+                cs.resolves.store(0, Ordering::Relaxed);
+                Arc::new(cached)
+            };
             let reader =
-                ForwardPackReader::from_pack_refs(cs.clone(), &cs.dir, &refs, KIND_STRING_FWD, 0)
+                ForwardPackReader::from_pack_refs(store.clone(), &refs, KIND_STRING_FWD, 0)
                     .await
                     .unwrap();
             assert_eq!(
@@ -1251,8 +1031,7 @@ mod tests {
 
             // Reusing an unopened handle must remain lazy and share its first load.
             let reused = ForwardPackReader::from_pack_refs_reusing(
-                cs.clone(),
-                &cs.dir,
+                store.clone(),
                 &refs,
                 KIND_STRING_FWD,
                 0,
@@ -1292,16 +1071,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ContentStore for ResidentPackStore {
-        fn permits_plaintext_cache(&self) -> bool {
-            true
-        }
-        fn is_remote(&self) -> bool {
-            false
-        }
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             self.inner.has(id).await
         }
-        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+        async fn get(
+            &self,
+            id: &ContentId,
+        ) -> fluree_db_core::Result<fluree_db_core::ContentBytes> {
             self.gets.fetch_add(1, Ordering::Relaxed);
             self.inner.get(id).await
         }
@@ -1324,8 +1100,17 @@ mod tests {
         async fn release(&self, id: &ContentId) -> fluree_db_core::Result<()> {
             self.inner.release(id).await
         }
-        fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
-            self.resident.read().unwrap().get(id).cloned()
+        fn get_local(
+            &self,
+            id: &ContentId,
+        ) -> fluree_db_core::Result<Option<fluree_db_core::ContentBytes>> {
+            Ok(self
+                .resident
+                .read()
+                .unwrap()
+                .get(id)
+                .cloned()
+                .map(fluree_db_core::ContentBytes::Shared))
         }
     }
 
@@ -1352,15 +1137,9 @@ mod tests {
             last_id: 49,
             pack_cid: pack_cid.clone(),
         }];
-        let cache_dir = std::env::temp_dir().join(format!(
-            "fluree_lazy_resident_{}_{}",
-            std::process::id(),
-            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let reader =
-            ForwardPackReader::from_pack_refs(cs.clone(), &cache_dir, &refs, KIND_STRING_FWD, 0)
-                .await
-                .unwrap();
+        let reader = ForwardPackReader::from_pack_refs(cs.clone(), &refs, KIND_STRING_FWD, 0)
+            .await
+            .unwrap();
 
         assert_eq!(
             reader.forward_lookup_str(7).unwrap().as_deref(),
@@ -1371,26 +1150,18 @@ mod tests {
             0,
             "a resident pack must not be fetched"
         );
-        let resident = cs.resolve_cached_bytes(&pack_cid).unwrap();
+        let resident = cs.get_local(&pack_cid).unwrap().unwrap();
         assert!(
             matches!(
                 &reader.packs[0].inner,
                 PackInner::Lazy { loaded, .. }
                     if matches!(
                         loaded.get(),
-                        Some(LazyLoaded { backing: LoadedBacking::InMemory(bytes), .. })
-                            if Arc::ptr_eq(bytes, &resident)
+                        Some(LazyLoaded { backing, .. }) if backing.ptr_eq(&resident)
                     )
             ),
             "the loaded pack must be the store's own allocation"
         );
-        assert!(
-            std::fs::read_dir(&cache_dir)
-                .map(|entries| entries.count() == 0)
-                .unwrap_or(true),
-            "nothing of a resident pack lands in the disk cache"
-        );
-        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 
     #[tokio::test]
@@ -1398,7 +1169,7 @@ mod tests {
         let cs = Arc::new(FilePackStore::new(true));
         let refs = [file_pack(&cs, 0, 50).await];
         let reader = Arc::new(
-            ForwardPackReader::from_pack_refs(cs.clone(), &cs.dir, &refs, KIND_STRING_FWD, 0)
+            ForwardPackReader::from_pack_refs(cs.clone(), &refs, KIND_STRING_FWD, 0)
                 .await
                 .unwrap(),
         );
@@ -1438,7 +1209,7 @@ mod tests {
                 last_id: last,
                 pack_cid: entry.pack_cid.clone(),
             }];
-            let reader = ForwardPackReader::from_pack_refs(cs.clone(), &cs.dir, &refs, kind, ns)
+            let reader = ForwardPackReader::from_pack_refs(cs.clone(), &refs, kind, ns)
                 .await
                 .unwrap();
             let err = reader.forward_lookup_str(7).unwrap_err();
@@ -1448,7 +1219,6 @@ mod tests {
 
         let reader = ForwardPackReader::from_pack_refs(
             cs.clone(),
-            &cs.dir,
             std::slice::from_ref(&entry),
             KIND_STRING_FWD,
             0,
@@ -1480,10 +1250,9 @@ mod tests {
             pack_cid: entry.pack_cid.clone(),
         };
         for refs in [vec![reversed], vec![entry.clone(), entry]] {
-            let err =
-                ForwardPackReader::from_pack_refs(cs.clone(), &cs.dir, &refs, KIND_STRING_FWD, 0)
-                    .await
-                    .unwrap_err();
+            let err = ForwardPackReader::from_pack_refs(cs.clone(), &refs, KIND_STRING_FWD, 0)
+                .await
+                .unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         }
         assert_eq!(cs.resolves.load(Ordering::Relaxed), 0);
@@ -1503,10 +1272,9 @@ mod tests {
         }
         for run in 0..5 {
             let start = std::time::Instant::now();
-            let reader =
-                ForwardPackReader::from_pack_refs(cs.clone(), &cs.dir, &refs, KIND_STRING_FWD, 0)
-                    .await
-                    .unwrap();
+            let reader = ForwardPackReader::from_pack_refs(cs.clone(), &refs, KIND_STRING_FWD, 0)
+                .await
+                .unwrap();
             let open = start.elapsed();
             let first = std::time::Instant::now();
             assert_eq!(

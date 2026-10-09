@@ -116,18 +116,9 @@ where
         .ok_or(IndexerError::NoCommits)?;
 
     // Determine output directory for binary index artifacts
-    let staging_in_temp = config.data_dir.is_none();
     let data_dir = config
         .data_dir
         .unwrap_or_else(|| std::env::temp_dir().join("fluree-index"));
-    if staging_in_temp && !commit_store.permits_plaintext_cache() {
-        tracing::warn!(
-            ledger = %ledger_id,
-            ?data_dir,
-            "encrypted storage: index build staging defaults to the system temp directory; \
-             set IndexerConfig::data_dir to a directory on an encrypted volume"
-        );
-    }
     let ledger_id_path = fluree_db_core::address_path::ledger_id_to_path_prefix(ledger_id)
         .unwrap_or_else(|_| ledger_id.replace(':', "/"));
     let session_id = uuid::Uuid::new_v4().to_string();

@@ -2035,7 +2035,7 @@ mod tests {
             flakes: sorted_raw(),
             yielded: std::sync::atomic::AtomicUsize::new(0),
         };
-        let store = Arc::new(BinaryIndexStore::empty(std::env::temp_dir()));
+        let store = Arc::new(BinaryIndexStore::empty());
         let opts = RangeOptions {
             to_t: Some(10),
             ..Default::default()

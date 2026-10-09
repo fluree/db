@@ -105,14 +105,14 @@ impl GroupedCountDrain {
 /// and the optional sidecar bytes; [`LeafScan::load_leaflet`] reads one
 /// leaflet from them.
 pub(crate) struct LeafScan {
-    pub(crate) leaf_bytes: fluree_db_binary_index::SharedLeafBytes,
+    pub(crate) leaf_bytes: fluree_db_core::ContentBytes,
     pub(crate) header: fluree_db_binary_index::format::leaf::LeafHeaderV3,
     pub(crate) dir: fluree_db_binary_index::format::leaf::DecodedLeafDirV3,
     pub(crate) leaf_id: u128,
     /// Sidecar bytes for time-travel replay. `None` at `max_t` (the base
     /// leaflet alone is authoritative); always fetched when `need_replay`
     /// is true so `replay_leaflet_at_t` can reconstruct historical state.
-    pub(crate) sidecar_bytes: Option<Vec<u8>>,
+    pub(crate) sidecar_bytes: Option<fluree_db_core::ContentBytes>,
 }
 
 impl LeafScan {
@@ -258,7 +258,7 @@ pub(crate) fn prepare_leaf_for_scan(
     let leaf_bytes = store
         .get_leaf_bytes_shared(&leaf_entry.leaf_cid)
         .map_err(|e| QueryError::Internal(format!("fetch leaf: {e}")))?;
-    let sidecar_bytes: Option<Vec<u8>> = if need_replay {
+    let sidecar_bytes = if need_replay {
         store
             .fetch_sidecar_bytes_sync(leaf_entry.sidecar_cid.as_ref())
             .map_err(|e| QueryError::Internal(format!("fetch sidecar: {e}")))?

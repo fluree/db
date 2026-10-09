@@ -35,6 +35,9 @@ base64 = "0.22"
 
 [dev-dependencies]
 tokio = { workspace = true }
+# The disk artifact cache, to check an encrypted stack is assembled without one.
+fluree-db-core = { path = "../fluree-db-core", features = ["native"] }
+tempfile = "3"
 
 [lints]
 workspace = true

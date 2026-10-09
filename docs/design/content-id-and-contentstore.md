@@ -111,7 +111,10 @@ Previously, storage routing parsed URL path segments (e.g., looking for `"/commi
 #[async_trait]
 pub trait ContentStore: Debug + Send + Sync {
     /// Retrieve bytes by content ID
-    async fn get(&self, id: &ContentId) -> Result<Vec<u8>>;
+    async fn get(&self, id: &ContentId) -> Result<ContentBytes>;
+
+    /// The bytes when this machine already has them, without fetching
+    fn get_local(&self, id: &ContentId) -> Result<Option<ContentBytes>>;
 
     /// Store bytes, returning the computed ContentId
     async fn put(&self, kind: ContentKind, bytes: &[u8]) -> Result<ContentId>;
@@ -121,13 +124,25 @@ pub trait ContentStore: Debug + Send + Sync {
 }
 ```
 
+`ContentBytes` derefs to `[u8]` and is reference-counted whatever backs it — a
+heap buffer from a read or fetch, bytes a store already shares (memory storage),
+or a file mapping — so a clone never copies.
+
+Sync readers (the binary index's leaf, dictionary and arena loaders) call
+`get_local` first and fetch with `get` over the sync→async bridge only on
+`Ok(None)`. File storage answers `get_local` with a mapping (or a heap read for
+blobs at or below 64 KiB, which would otherwise spend a VMA each), memory
+storage with its stored bytes, and a remote store with `None`. `Err` means a
+local copy exists but cannot be read; it is surfaced rather than masked by a
+fetch.
+
 ### Relationship to Storage trait
 
 `ContentStore` is the primary abstraction for immutable object access. The `Storage` / `StorageRead` / `ContentAddressedWrite` traits handle address-routed I/O for the underlying storage backends (filesystem, S3, etc.), while `ContentStore` provides the content-addressed layer on top.
 
 ### Implementations
 
-- **`MemoryContentStore`**: In-memory `HashMap<ContentId, Vec<u8>>` for testing.
+- **`MemoryContentStore`**: In-memory `HashMap<ContentId, Arc<[u8]>>` for testing.
 - **`StorageContentStore<S: Storage>`**: Adapter that wraps a `Storage` implementation, mapping ContentIds to physical storage addresses. (`fluree-db-core/src/storage.rs`)
 - **Filesystem / S3 / IPFS**: Direct implementations that store objects keyed by CID.
 

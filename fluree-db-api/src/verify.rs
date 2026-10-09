@@ -213,7 +213,9 @@ impl crate::Fluree {
     /// Verify a ledger's commit chain and referenced objects.
     ///
     /// Read-only. Uses a branch-aware content store so the walk crosses
-    /// fork points. `max_commits` bounds the walk for very long chains.
+    /// fork points, and reads the storage itself: a disk-cache copy would
+    /// hide an object the storage has lost. `max_commits` bounds the walk
+    /// for very long chains.
     pub async fn verify_ledger(
         &self,
         ledger_id: &str,
@@ -226,7 +228,7 @@ impl crate::Fluree {
             .ok_or_else(|| ApiError::NotFound(ledger_id.to_string()))?;
 
         let store = fluree_db_nameservice::branched_content_store_for_record(
-            self.backend(),
+            &self.backend().without_disk_cache(),
             self.nameservice(),
             &record,
         )

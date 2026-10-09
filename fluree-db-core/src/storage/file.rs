@@ -952,6 +952,10 @@ impl FileStorage {
         .map_err(|e| crate::error::Error::io(format!("WAL replay join: {e}")))?
     }
 
+    fn local_read_error(path: &Path, e: std::io::Error) -> crate::error::Error {
+        crate::error::Error::io(format!("Failed to read {}: {e}", path.display()))
+    }
+
     fn recovery_error(base: &Path, e: std::io::Error) -> crate::error::Error {
         crate::error::Error::storage(format!("WAL recovery failed for {}: {e}", base.display()))
     }
@@ -1326,37 +1330,47 @@ impl StorageRead for FileStorage {
         Ok(bytes)
     }
 
-    fn resolve_local_path(&self, address: &str) -> Option<std::path::PathBuf> {
-        let path = self.resolve_path(address).ok()?;
-        // PRESENCE IS NOT VALIDITY. This returned any path that merely `exists()`,
-        // and callers then mmap or parse it directly — so a zero-length blob became
-        // an unrecoverable reader error rather than a miss the caller could heal.
-        // Excluding empty files here is what converts that poison back into a fetch.
-        // See `read_bytes` for why empty can never be legitimate content.
-        match std::fs::metadata(&path) {
-            Ok(m) if m.len() > 0 => Some(path),
-            Ok(_) => {
-                tracing::warn!(
-                    address,
-                    path = %path.display(),
-                    "zero-length blob ignored for local resolution; falling back to fetch"
-                );
-                None
-            }
+    fn get_local(&self, address: &str) -> Result<Option<super::ContentBytes>> {
+        let Ok(path) = self.resolve_path(address) else {
+            return Ok(None);
+        };
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // On a shared root a stopped owner's log may still hold this
                 // file. Applying it blocks, but only on a miss, and only when
                 // the root has owned logs at all.
                 match wal::replay_unowned(&self.base_path) {
-                    Ok(applied) if applied > 0 => std::fs::metadata(&path)
-                        .ok()
-                        .filter(|m| m.len() > 0)
-                        .map(|_| path),
-                    _ => None,
+                    Ok(applied) if applied > 0 => match std::fs::File::open(&path) {
+                        Ok(file) => file,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                        Err(e) => return Err(Self::local_read_error(&path, e)),
+                    },
+                    _ => return Ok(None),
                 }
             }
-            Err(_) => None,
+            Err(e) => return Err(Self::local_read_error(&path, e)),
+        };
+        let len = file
+            .metadata()
+            .map_err(|e| Self::local_read_error(&path, e))?
+            .len();
+        // PRESENCE IS NOT VALIDITY: a zero-length blob is failed-write debris
+        // (see `read_bytes`). Answering "not here" lets the caller fetch or
+        // rebuild instead of parsing nothing at some distant call site.
+        if len == 0 {
+            tracing::warn!(
+                address,
+                path = %path.display(),
+                "zero-length blob ignored for local reads; falling back to fetch"
+            );
+            return Ok(None);
         }
+        // SAFETY: every write lands by renaming a staged file into place
+        // (`write_atomic`, WAL replay), so an open file is never modified.
+        unsafe { super::ContentBytes::from_file(file, len) }
+            .map(Some)
+            .map_err(|e| Self::local_read_error(&path, e))
     }
 
     async fn read_byte_range(&self, address: &str, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
@@ -3041,18 +3055,61 @@ mod tests {
         );
     }
 
-    /// `resolve_local_path` hands a path to callers that mmap or parse it
-    /// directly, so returning a zero-length blob converts recoverable debris into
-    /// an unrecoverable reader error. Presence is not validity.
+    /// `get_local` hands bytes to callers that parse them directly, so
+    /// serving a zero-length blob converts recoverable debris into an
+    /// unrecoverable reader error. Presence is not validity.
     #[test]
-    fn resolve_local_path_rejects_a_zero_length_blob() {
+    fn get_local_rejects_a_zero_length_blob() {
         let (_dir, storage) = storage();
         plant_zero_length(&storage, "z/empty.dict");
 
         assert!(
-            storage.resolve_local_path("z/empty.dict").is_none(),
-            "a zero-length blob must not be offered as a local path"
+            storage.get_local("z/empty.dict").unwrap().is_none(),
+            "a zero-length blob must not be served locally"
         );
+    }
+
+    /// Small blobs are read into the heap and large ones mapped: a mapping
+    /// costs a VMA against `vm.max_map_count` however few bytes it exposes.
+    #[tokio::test]
+    async fn get_local_reads_small_blobs_and_maps_large_ones() {
+        let (_dir, storage) = storage();
+        let small = vec![1u8; crate::storage::DEFAULT_MMAP_MIN_BYTES as usize];
+        let large = vec![2u8; crate::storage::DEFAULT_MMAP_MIN_BYTES as usize + 1];
+        storage.write_bytes("z/small.dict", &small).await.unwrap();
+        storage.write_bytes("z/large.dict", &large).await.unwrap();
+
+        let read = storage.get_local("z/small.dict").unwrap().unwrap();
+        assert!(matches!(read, crate::ContentBytes::Owned(_)), "{read:?}");
+        assert_eq!(read, small);
+        let mapped = storage.get_local("z/large.dict").unwrap().unwrap();
+        assert!(
+            matches!(mapped, crate::ContentBytes::Mapped(_)),
+            "{mapped:?}"
+        );
+        assert_eq!(mapped, large);
+        assert!(storage.get_local("z/absent.dict").unwrap().is_none());
+    }
+
+    /// A local copy that exists but cannot be read is an error, not a miss:
+    /// a miss would send the caller to fetch, hiding the failure behind a
+    /// second read of the same file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_local_reports_an_unreadable_blob() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, storage) = storage();
+        storage
+            .write_bytes("z/locked.dict", b"bytes")
+            .await
+            .unwrap();
+        let path = storage.resolve_path("z/locked.dict").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&path).is_ok() {
+            // Running as root: permissions are not enforced.
+            return;
+        }
+        assert!(storage.get_local("z/locked.dict").is_err());
     }
 
     /// `exists` has to agree with `read_bytes`. Reporting a blob present that the
@@ -3190,7 +3247,7 @@ mod tests {
         storage.write_bytes("z/tiny.dict", b"x").await.unwrap();
 
         assert!(storage.exists("z/tiny.dict").await.unwrap());
-        assert!(storage.resolve_local_path("z/tiny.dict").is_some());
+        assert_eq!(storage.get_local("z/tiny.dict").unwrap().unwrap(), b"x");
         assert_eq!(storage.read_bytes("z/tiny.dict").await.unwrap(), b"x");
         // The ranged path agrees that one byte is present.
         assert_eq!(

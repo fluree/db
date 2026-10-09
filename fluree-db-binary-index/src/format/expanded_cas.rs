@@ -226,7 +226,7 @@ impl ChainCasIds {
             ))
         })?;
 
-        Ok(Some(bytes))
+        Ok(Some(bytes.into_vec()))
     }
 }
 
@@ -351,19 +351,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ContentStore for GetCountingStore {
-        fn permits_plaintext_cache(&self) -> bool {
-            self.inner.permits_plaintext_cache()
-        }
-
-        fn is_remote(&self) -> bool {
-            self.inner.is_remote()
-        }
-
         async fn has(&self, id: &ContentId) -> Result<bool> {
             self.inner.has(id).await
         }
 
-        async fn get(&self, id: &ContentId) -> Result<Vec<u8>> {
+        async fn get(&self, id: &ContentId) -> Result<fluree_db_core::ContentBytes> {
             *self.gets.lock().unwrap().entry(id.clone()).or_insert(0) += 1;
             self.inner.get(id).await
         }

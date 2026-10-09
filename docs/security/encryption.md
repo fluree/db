@@ -524,11 +524,14 @@ its session directory behind
 - **Storage overhead**: 22 bytes header + 16 bytes tag per object
 - **Memory**: Keys are kept in memory while the connection is open
 - **No disk cache**: because the read-through disk cache is bypassed (see above),
-  a remote backend such as S3 re-fetches an index artifact whenever it falls out
-  of the in-memory leaflet cache. Concurrent readers of the same artifact still
-  share one fetch. Size that cache (`cacheMaxMb`) for the working set. File
-  storage has no network round trip, but each cache miss re-reads and
-  decrypts the whole file rather than mapping it.
+  a remote backend such as S3 fetches each index leaf whole on its first open —
+  AES-GCM cannot decrypt part of an object, so range reads would each fetch it
+  whole anyway — and keeps the decrypted leaf in the in-memory leaflet cache
+  until it falls out. Concurrent readers of the same artifact still share one
+  fetch. Size that cache (`cacheMaxMb`) for the working set: decrypted leaves
+  count against it in full. File storage has no network round trip, but a leaf
+  that falls out of the cache is re-read and decrypted whole rather than
+  mapped.
 
 Modern CPUs with AES-NI instructions provide hardware acceleration, minimizing the performance impact.
 

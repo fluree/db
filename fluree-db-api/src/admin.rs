@@ -1391,7 +1391,7 @@ impl crate::Fluree {
             ledger_id: ledger_id.clone(),
             index_head_id: Some(head),
         };
-        match shared_refs_of_branches(backend, &[own], None).await {
+        match shared_refs_of_branches(backend, &[own]).await {
             Ok(refs) => refs,
             Err(e) => {
                 warnings.push(format!(
@@ -1442,7 +1442,7 @@ impl crate::Fluree {
                 return Vec::new();
             }
         };
-        let elsewhere = match shared_refs_of_branches(backend, &survivors, None).await {
+        let elsewhere = match shared_refs_of_branches(backend, &survivors).await {
             Ok(refs) => refs,
             Err(e) => {
                 warnings.push(format!(
@@ -2336,6 +2336,7 @@ impl crate::Fluree {
             track_fuel: true,
             ..Default::default()
         });
+        crate::warn_if_staging_plaintext(&self.backend, &indexer_config);
         let index_result = rebuild_index_from_commits_with_tracker(
             self.content_store(&ledger_id),
             reindex_tracker,
@@ -2462,7 +2463,6 @@ impl crate::Fluree {
                         gc_nameservice.as_ref(),
                         &gc_ledger_id,
                         siblings.as_deref(),
-                        None,
                     )
                     .await
                     .map(|_| ())
@@ -2641,18 +2641,6 @@ impl crate::Fluree {
         Ok((guards, branches, nested))
     }
 
-    /// Where a sweep may read index roots from local disk instead of storage.
-    ///
-    /// Only the background indexer's cache qualifies: reading through a
-    /// directory no builder writes would cost the writes and return no hits.
-    /// `None` without one, which plans against storage alone.
-    fn sweep_artifact_cache_dir(&self) -> Option<&std::path::Path> {
-        match &self.indexing_mode {
-            IndexingMode::Background(handle) => Some(handle.artifact_cache_dir()),
-            IndexingMode::Disabled => None,
-        }
-    }
-
     /// The storage a sweep enumerates and deletes through.
     ///
     /// `None` only for permanent (append-only) backends, which cannot list a
@@ -2676,14 +2664,7 @@ impl crate::Fluree {
         let ledger_name = parse_whole_ledger_input(ledger_name, WholeLedgerOperation::Sweep)?;
         let storage = self.sweepable_storage()?;
         let (_guards, branches, nested) = self.hold_ledger_for_maintenance(&ledger_name).await?;
-        Ok(plan_sweep(
-            &storage,
-            &ledger_name,
-            &branches,
-            &nested,
-            self.sweep_artifact_cache_dir(),
-        )
-        .await?)
+        Ok(plan_sweep(&storage, &self.backend, &ledger_name, &branches, &nested).await?)
     }
 
     /// Reclaim index artifacts that no live index chain references.
@@ -2698,14 +2679,7 @@ impl crate::Fluree {
         let storage = self.sweepable_storage()?;
         let (_guards, branches, nested) = self.hold_ledger_for_maintenance(&ledger_name).await?;
 
-        let plan = plan_sweep(
-            &storage,
-            &ledger_name,
-            &branches,
-            &nested,
-            self.sweep_artifact_cache_dir(),
-        )
-        .await?;
+        let plan = plan_sweep(&storage, &self.backend, &ledger_name, &branches, &nested).await?;
         info!(
             ledger_name = %ledger_name,
             orphans = plan.orphans.len(),
