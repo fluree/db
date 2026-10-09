@@ -84,8 +84,10 @@ Never change an expected count to make a run pass: `selftest.sh` proves them wit
 
 `it_iceberg_glue_moto` replays `fluree-db-api/tests/fixtures/iceberg/glue/` (this harness's tables,
 in bucket `fluree-glue-it` and Glue database `glue_it`, exported by `write_fixture.sh`) into a moto
-server through the AWS SDK, so CI needs no Python. It runs C3–C8 plus catalog browse and table
-preview through the Rust API. The CI `test` job provides moto as a service container and sets
+server through the AWS SDK, so CI needs no Python. It runs C3–C8, materialize scans, a time-pinned
+query, `/info`, catalog browse and table preview through the Rust API, and the same reads in
+`s3tables` mode against moto's S3 Tables (the fixture's `customers` metadata copied into the
+table's moto-managed warehouse bucket). The CI `test` job provides moto as a service container and sets
 `FLUREE_GLUE_LOCAL_ENDPOINT`; the test skips when that is unset, and `glue_moto_is_configured_in_ci`
 fails if the job's `FLUREE_GLUE_MOTO` marker is set without it. To run it locally against this
 harness's moto:

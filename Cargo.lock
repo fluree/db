@@ -2980,6 +2980,7 @@ dependencies = [
  "aws-sdk-dynamodb",
  "aws-sdk-glue",
  "aws-sdk-s3",
+ "aws-sdk-s3tables",
  "aws-sdk-sts",
  "base64 0.22.1",
  "bigdecimal 0.4.10",

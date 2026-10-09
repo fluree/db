@@ -1,5 +1,6 @@
-//! AWS Glue catalog mode, end to end, against moto: a local mock of S3 and the
-//! Glue Data Catalog. No AWS account and no live dependency.
+//! AWS Glue and S3 Tables catalog modes, end to end, against moto: a local mock
+//! of S3, the Glue Data Catalog and S3 Tables. No AWS account and no live
+//! dependency.
 //!
 //! The tables are a committed fixture (`tests/fixtures/iceberg/glue/`) written by
 //! pyiceberg's `GlueCatalog` the way Glue-integrated writers write them: the
@@ -21,7 +22,10 @@
 //! - materialize scans (full, incremental from a snapshot, pinned to one) and a
 //!   time-pinned query read the snapshots Glue's metadata names;
 //! - browse lists the Glue database and only its Iceberg tables; preview reads
-//!   the schema from the metadata file (Glue returns no inline metadata).
+//!   the schema from the metadata file (Glue returns no inline metadata);
+//! - S3 Tables: a table resolved through `GetTableMetadataLocation` (its
+//!   metadata file copied into the table's own moto-managed warehouse bucket), a
+//!   missing table classified as not-found on the wire, and browse.
 //!
 //! It runs when `FLUREE_GLUE_LOCAL_ENDPOINT` names a moto server (CI: the `test`
 //! job's `moto` service; locally: `scripts/glue-local/up.sh`, or any
@@ -230,12 +234,138 @@ async fn seed(endpoint: &str, fixture: &Fixture) {
     }
 }
 
+/// An S3 Tables table bucket in moto holding `customers` from the fixture, and
+/// its ARN. S3 Tables keeps a table's files in a managed warehouse bucket of its
+/// own and only accepts a metadata location inside it, so the fixture's current
+/// metadata file is copied there (its manifests are absolute paths into the
+/// already-seeded fixture bucket). Idempotent, like `seed`.
+async fn seed_s3_tables(endpoint: &str, fixture: &Fixture) -> String {
+    use aws_sdk_s3tables::error::ProvideErrorMetadata;
+
+    let credentials = aws_sdk_s3::config::Credentials::new("test", "test", None, None, "moto");
+    let tables = aws_sdk_s3tables::Client::from_conf(
+        aws_sdk_s3tables::Config::builder()
+            .behavior_version(aws_sdk_s3tables::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3tables::config::Region::new(REGION))
+            .credentials_provider(credentials.clone())
+            .endpoint_url(endpoint)
+            .build(),
+    );
+    let s3 = aws_sdk_s3::Client::from_conf(
+        aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new(REGION))
+            .credentials_provider(credentials)
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .build(),
+    );
+
+    let bucket_name = "fluree-s3tables-it";
+    let arn = match tables.create_table_bucket().name(bucket_name).send().await {
+        Ok(out) => out.arn().to_string(),
+        Err(e) => {
+            assert_eq!(
+                e.code(),
+                Some("ConflictException"),
+                "create table bucket: {e:?}"
+            );
+            let listed = tables
+                .list_table_buckets()
+                .prefix(bucket_name)
+                .send()
+                .await
+                .expect("list table buckets");
+            listed.table_buckets()[0].arn().to_string()
+        }
+    };
+    let namespace = fixture.database.as_str();
+    if let Err(e) = tables
+        .create_namespace()
+        .table_bucket_arn(&arn)
+        .namespace(namespace)
+        .send()
+        .await
+    {
+        assert_eq!(
+            e.code(),
+            Some("ConflictException"),
+            "create namespace: {e:?}"
+        );
+    }
+    if let Err(e) = tables
+        .create_table()
+        .table_bucket_arn(&arn)
+        .namespace(namespace)
+        .name("customers")
+        .format(aws_sdk_s3tables::types::OpenTableFormat::Iceberg)
+        .send()
+        .await
+    {
+        assert_eq!(e.code(), Some("ConflictException"), "create table: {e:?}");
+    }
+    // The same call the engine resolves a table with; it also returns the version
+    // token and warehouse location an update needs.
+    let table = tables
+        .get_table_metadata_location()
+        .table_bucket_arn(&arn)
+        .namespace(namespace)
+        .name("customers")
+        .send()
+        .await
+        .expect("get table metadata location");
+
+    // The fixture's current customers metadata, copied into the table's warehouse.
+    let (_, _, _, parameters) = fixture
+        .tables
+        .iter()
+        .find(|(name, ..)| name == "customers")
+        .expect("fixture customers");
+    let source = &parameters["metadata_location"];
+    let key = source
+        .strip_prefix(&format!("s3://{}/", fixture.bucket))
+        .expect("metadata in the fixture bucket");
+    let file = key.rsplit('/').next().expect("metadata file name");
+    let warehouse = table.warehouse_location().trim_end_matches('/');
+    let warehouse_bucket = warehouse.strip_prefix("s3://").expect("s3 warehouse");
+    s3.put_object()
+        .bucket(warehouse_bucket)
+        .key(format!("metadata/{file}"))
+        .body(
+            std::fs::read(fixture_dir().join("objects").join(key))
+                .expect("read fixture metadata")
+                .into(),
+        )
+        .send()
+        .await
+        .expect("put metadata into the warehouse");
+    let updated = tables
+        .update_table_metadata_location()
+        .table_bucket_arn(&arn)
+        .namespace(namespace)
+        .name("customers")
+        .version_token(table.version_token())
+        .metadata_location(format!("{warehouse}/metadata/{file}"))
+        .send()
+        .await;
+    match updated {
+        Ok(_) => {}
+        // moto 5.2.3 applies the update but answers with `namespace` as a string
+        // where the AWS model has a list, so the SDK cannot parse the 200. The
+        // engine's own GetTableMetadataLocation read below proves it took.
+        Err(e) if e.raw_response().is_some_and(|r| r.status().is_success()) => {}
+        Err(e) => panic!("point the table at its metadata: {e:?}"),
+    }
+    arn
+}
+
 /// The process's AWS SDK environment for the Fluree side: moto's dummy
 /// credentials, and Glue (only Glue) routed to moto. Set once, before anything
 /// builds a client; this binary's other test only reads unrelated variables.
 fn point_aws_sdk_at(endpoint: &str) {
     let missing = std::env::temp_dir().join("fluree-glue-moto-no-aws-config");
     std::env::set_var("AWS_ENDPOINT_URL_GLUE", endpoint);
+    std::env::set_var("AWS_ENDPOINT_URL_S3TABLES", endpoint);
     std::env::set_var("AWS_ACCESS_KEY_ID", "test");
     std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
     std::env::set_var("AWS_REGION", REGION);
@@ -256,6 +386,15 @@ fn point_aws_sdk_at(endpoint: &str) {
 /// the data through the source's own S3 endpoint.
 fn glue_connection(endpoint: &str) -> IcebergConnectionConfig {
     IcebergConnectionConfig::glue(Some(REGION.to_string()), None)
+        .with_s3_endpoint(endpoint)
+        .with_s3_path_style(true)
+        .with_s3_region(REGION)
+}
+
+/// The S3 Tables connection: the catalog through S3 Tables (its region from the
+/// ARN), the data through the source's own S3 endpoint.
+fn s3_tables_connection(endpoint: &str, table_bucket_arn: &str) -> IcebergConnectionConfig {
+    IcebergConnectionConfig::s3_tables(None, table_bucket_arn)
         .with_s3_endpoint(endpoint)
         .with_s3_path_style(true)
         .with_s3_region(REGION)
@@ -299,18 +438,18 @@ const OTHER: &str = r#"
 /// matches (or the error that says why it could not).
 async fn rows(
     fluree: &fluree_db_api::Fluree,
-    endpoint: &str,
+    connection: IcebergConnectionConfig,
     name: &str,
     mapping: String,
     select: &str,
     pattern: serde_json::Value,
 ) -> Result<usize, String> {
-    // Mapping-driven: each rr:tableName is a Glue `<database>.<table>`.
+    // Mapping-driven: each rr:tableName names a table in the catalog.
     let config = R2rmlCreateConfig {
         iceberg: IcebergCreateConfig::from_connection(
             name,
-            glue_connection(endpoint),
-            "default.default",
+            connection,
+            fluree_db_iceberg::config::MAPPING_DEFINED_TABLE,
         ),
         mapping: R2rmlMappingInput::Content(mapping),
         mapping_media_type: Some("text/turtle".to_string()),
@@ -342,6 +481,7 @@ async fn glue_catalog_mode_reads_tables_resolved_through_glue() {
     };
     let fixture = load_fixture();
     seed(&endpoint, &fixture).await;
+    let table_bucket_arn = seed_s3_tables(&endpoint, &fixture).await;
     point_aws_sdk_at(&endpoint);
     // Fluree's Iceberg disk caches (catalog pointers, metadata, Parquet) live under
     // the temp dir and outlive the process. Without a fresh one, a re-run (or a
@@ -370,7 +510,7 @@ async fn glue_catalog_mode_reads_tables_resolved_through_glue() {
         "one table resolved through Glue GetTable",
         rows(
             &fluree,
-            &endpoint,
+            glue_connection(&endpoint),
             "customers",
             mapping(db, CUSTOMERS),
             "?s",
@@ -383,7 +523,7 @@ async fn glue_catalog_mode_reads_tables_resolved_through_glue() {
         "three metadata files: Glue's current one is read",
         rows(
             &fluree,
-            &endpoint,
+            glue_connection(&endpoint),
             "orders",
             mapping(db, &orders_map("orders")),
             "?s",
@@ -396,7 +536,7 @@ async fn glue_catalog_mode_reads_tables_resolved_through_glue() {
         "the Glue pointer wins over an uncommitted 00099 metadata file",
         rows(
             &fluree,
-            &endpoint,
+            glue_connection(&endpoint),
             "orphan",
             mapping(db, &orders_map("orders_orphan")),
             "?s",
@@ -409,7 +549,7 @@ async fn glue_catalog_mode_reads_tables_resolved_through_glue() {
         "one source joins two Glue tables named by its mapping",
         rows(
             &fluree,
-            &endpoint,
+            glue_connection(&endpoint),
             "joined",
             mapping(db, &format!("{CUSTOMERS}{}", orders_map("orders"))),
             "?o",
@@ -474,20 +614,21 @@ async fn glue_catalog_mode_reads_tables_resolved_through_glue() {
         "a table missing from Glue fails clearly",
         rows(
             &fluree,
-            &endpoint,
+            glue_connection(&endpoint),
             "missing",
             mapping(db, &OTHER.replace("{table}", "no_such_table")),
             "?s",
             ty("ex:Row"),
         )
         .await,
-        Err("Table not found"),
+        // Only the Glue client words it this way: the error came from GetTable.
+        Err("Glue table glue_it.no_such_table not found"),
     );
     expect(
         "a non-Iceberg Glue table fails clearly",
         rows(
             &fluree,
-            &endpoint,
+            glue_connection(&endpoint),
             "hive",
             mapping(db, &OTHER.replace("{table}", "hive_table")),
             "?s",
@@ -497,6 +638,36 @@ async fn glue_catalog_mode_reads_tables_resolved_through_glue() {
         Err("is not an Iceberg table"),
     );
 
+    // S3 Tables: the same reads through `GetTableMetadataLocation`.
+    let s3t = || s3_tables_connection(&endpoint, &table_bucket_arn);
+    expect(
+        "s3tables: one table resolved via GetTableMetadataLocation",
+        rows(
+            &fluree,
+            s3t(),
+            "s3t-customers",
+            mapping(db, CUSTOMERS),
+            "?s",
+            ty("ex:Customer"),
+        )
+        .await,
+        Ok(50),
+    );
+    expect(
+        "s3tables: a table missing from the bucket fails clearly",
+        rows(
+            &fluree,
+            s3t(),
+            "s3t-missing",
+            mapping(db, &OTHER.replace("{table}", "no_such_table")),
+            "?s",
+            ty("ex:Row"),
+        )
+        .await,
+        // Only the S3 Tables client words it this way.
+        Err("S3 Tables table glue_it.no_such_table not found"),
+    );
+
     // `/info` for a Glue source: the catalog object and the per-table row count
     // (read from the metadata file Glue points at; Glue returns none inline).
     match fluree.ledger_info("customers:main").execute().await {
@@ -504,7 +675,11 @@ async fn glue_catalog_mode_reads_tables_resolved_through_glue() {
             let source = &info["source"];
             let count = source["table-row-counts"][format!("{db}.customers")].as_i64();
             let kind = source["catalog"]["type"].as_str();
-            let ok = count == Some(50) && kind == Some("glue");
+            // The mapping's table only: never the mapping-defined placeholder.
+            let tables = source["tables"].clone();
+            let ok = count == Some(50)
+                && kind == Some("glue")
+                && tables == serde_json::json!([format!("{db}.customers")]);
             eprintln!(
                 "{} info: catalog={kind:?} customers={count:?}",
                 if ok { "pass" } else { "FAIL" }
@@ -536,6 +711,26 @@ async fn glue_catalog_mode_reads_tables_resolved_through_glue() {
             }
         }
         Err(e) => failures.push(format!("browse: {e}")),
+    }
+
+    // S3 Tables browse: the namespace and its table.
+    match browse_iceberg_catalog(s3t(), BrowseDepth::Tables).await {
+        Ok(browse) => {
+            let ok = browse.namespaces.iter().any(|n| n == db)
+                && browse
+                    .tables
+                    .iter()
+                    .any(|t| t.namespace == db && t.name == "customers");
+            eprintln!(
+                "{} s3tables browse: {:?}",
+                if ok { "pass" } else { "FAIL" },
+                browse.tables
+            );
+            if !ok {
+                failures.push(format!("s3tables browse: {:?}", browse.tables));
+            }
+        }
+        Err(e) => failures.push(format!("s3tables browse: {e}")),
     }
 
     // Preview reads the schema from the metadata file Glue points at.
