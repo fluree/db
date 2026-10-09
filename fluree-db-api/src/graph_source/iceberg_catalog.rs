@@ -923,7 +923,7 @@ pub(crate) fn storage_query_error(
             bucket,
             key,
             region,
-            message,
+            message: query_safe_denial(context, message),
         },
         // §2's fail-closed error, raised inside a deferred `LazyS3Storage` build and
         // ferried out through the builder's `IcebergError` channel. Lift it back so
@@ -933,10 +933,53 @@ pub(crate) fn storage_query_error(
             fluree_db_query::QueryError::CatalogCredentialsNotVended { catalog_uri }
         }
         fluree_db_iceberg::IcebergError::CatalogAccessDenied { table, message } => {
-            fluree_db_query::QueryError::CatalogAccessDenied { table, message }
+            fluree_db_query::QueryError::CatalogAccessDenied {
+                table,
+                message: query_safe_denial(context, message),
+            }
         }
         other => fluree_db_query::QueryError::Internal(format!("{context}: {other}")),
     }
+}
+
+/// The reason a storage or catalog denial gives a QUERY client. AWS phrases a
+/// denial as `User: arn:aws:sts::<account>:assumed-role/<role>/… is not authorized
+/// to perform: s3:GetObject on resource: … because …`, which would hand any
+/// querying client the server's role and account. The ARNs are redacted and the
+/// reason kept; the full text goes to the server log. The onboarding and verify
+/// paths (`storage_api_error`, admin-facing, and what hosts classify runbooks by)
+/// keep the full text.
+pub(crate) fn query_safe_denial(context: &str, message: String) -> String {
+    match redact_aws_arns(&message) {
+        std::borrow::Cow::Borrowed(_) => message,
+        std::borrow::Cow::Owned(redacted) => {
+            tracing::warn!(context, denial = %message, "access denied (AWS identities redacted from the query error)");
+            redacted
+        }
+    }
+}
+
+/// `text` with every AWS ARN (`arn:aws…`, any partition) replaced by
+/// `arn:<redacted>`; borrowed when there is none.
+pub(crate) fn redact_aws_arns(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("arn:aws") {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("arn:aws") {
+        out.push_str(&rest[..at]);
+        out.push_str("arn:<redacted>");
+        let arn = &rest[at..];
+        let end = arn
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ')' | ']' | '}' | ';')
+            })
+            .unwrap_or(arn.len());
+        rest = &arn[end..];
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
 }
 
 /// Preview/browse-path analogue of [`storage_query_error`]: lift a
@@ -1426,6 +1469,67 @@ mod tests {
     /// A catalog's refusal (REST 401/403, AWS Glue / S3 Tables access denied) is
     /// the same typed 403 on the query path and the onboarding path, never an
     /// internal or config error.
+    /// A denial on the QUERY path does not hand the client the server's AWS
+    /// identity; the reason AWS gives stays. Onboarding keeps the full text.
+    #[test]
+    fn query_denials_redact_aws_identities_but_keep_the_reason() {
+        let aws = "User: arn:aws:sts::123456789012:assumed-role/FlureeServer/i-0abc is not \
+                   authorized to perform: glue:GetTable on resource: \
+                   arn:aws:glue:us-east-1:123456789012:table/sales/orders because no \
+                   identity-based policy allows the glue:GetTable action";
+        let redacted = super::redact_aws_arns(aws);
+        assert!(!redacted.contains("123456789012"), "{redacted}");
+        assert!(!redacted.contains("FlureeServer"), "{redacted}");
+        assert!(
+            redacted.contains("arn:<redacted> is not authorized"),
+            "{redacted}"
+        );
+        assert!(
+            redacted.contains("because no identity-based policy allows"),
+            "{redacted}"
+        );
+        // Other partitions, and quoted ARNs, are redacted too; text without an ARN
+        // is returned as is (no allocation).
+        assert_eq!(
+            super::redact_aws_arns("on \"arn:aws-cn:s3:::bucket/key\", denied"),
+            "on \"arn:<redacted>\", denied"
+        );
+        assert!(matches!(
+            super::redact_aws_arns("Catalog request failed (403 Forbidden): not yours"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+
+        let storage = fluree_db_iceberg::IcebergError::StorageAccessDenied {
+            bucket: "lake".to_string(),
+            key: "t/data/0.parquet".to_string(),
+            region: None,
+            message: aws.to_string(),
+        };
+        match super::storage_query_error("Failed to read data file", storage) {
+            fluree_db_query::QueryError::StorageAccessDenied { message, .. } => {
+                assert!(!message.contains("123456789012"), "{message}");
+                assert!(
+                    message.contains("because no identity-based policy"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected StorageAccessDenied, got {other:?}"),
+        }
+        let catalog = || fluree_db_iceberg::IcebergError::CatalogAccessDenied {
+            table: "sales.orders".to_string(),
+            message: aws.to_string(),
+        };
+        match super::storage_query_error("Failed to load table from catalog", catalog()) {
+            fluree_db_query::QueryError::CatalogAccessDenied { message, .. } => {
+                assert!(!message.contains("123456789012"), "{message}");
+            }
+            other => panic!("expected CatalogAccessDenied, got {other:?}"),
+        }
+        // Onboarding / verify (admin-facing) keep the full text.
+        let api = super::storage_api_error("Failed to load table sales.orders", catalog());
+        assert!(api.to_string().contains("123456789012"), "{api}");
+    }
+
     #[test]
     fn a_catalog_denial_lifts_to_a_typed_403_on_both_paths() {
         let denied = || fluree_db_iceberg::IcebergError::CatalogAccessDenied {

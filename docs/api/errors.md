@@ -158,9 +158,9 @@ A write rejected by a modify policy returns `403` with
 
 A query over a graph source also returns `403` when the source's catalog or object store refuses the read, with an `@type` naming which one refused:
 
-- `err:catalog/AccessDenied`: the catalog refused the table to the principal the source uses. This covers Iceberg REST catalogs (a `403` from `loadTable`, or a `401` that persists after one token refresh), AWS Glue and S3 Tables (the server's AWS identity lacks the catalog permission or a Lake Formation grant), and Unity Catalog for Delta sources. `error` reads `Catalog denied access to table '<table>': …`, followed by the catalog's own reply.
+- `err:catalog/AccessDenied`: the catalog refused the table to the principal the source uses. This covers Iceberg REST catalogs (a `403` from `loadTable`, or a `401` that persists after one token refresh), AWS Glue and S3 Tables (the server's AWS identity lacks the catalog permission or a Lake Formation grant), and Unity Catalog for Delta sources. `error` reads `Catalog denied access to table '<table>': …`, followed by the catalog's own reply. On a query, AWS identities in that reply (the server's role and account, as `arn:…`) are replaced with `arn:<redacted>`; the full text is in the server log.
 - `err:catalog/CredentialsNotVended`: an Iceberg REST catalog authorized the table but vended no storage credentials, and the source requires them. The read is refused rather than made with the server's own AWS identity.
-- `err:storage/AccessDenied`: the catalog answered, but the object store refused a read of the table's files (`Storage access denied for s3://…`).
+- `err:storage/AccessDenied`: the catalog answered, but the object store refused a read of the table's files (`Storage access denied for s3://…`). As above, a query's error redacts AWS identities from the store's reason and the server logs the full text.
 
 See [Iceberg → Connection Issues](../graph-sources/iceberg.md#connection-issues) for causes and fixes.
 
