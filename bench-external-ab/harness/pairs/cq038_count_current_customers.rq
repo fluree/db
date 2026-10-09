@@ -1,0 +1,3 @@
+# cq038 — verbatim corpus q038_count_current_customers.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT (COUNT(*) AS ?n) WHERE { ?s a edw:Customer ; edw:isCurrent true . }
