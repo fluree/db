@@ -228,7 +228,7 @@ parquet = { version = "58.4", default-features = false, features = ["zstd", "sna
 arrow = { version = "58.4", default-features = false }
 
 # LRU cache for Parquet footers
-lru = "0.12"
+lru = "0.18"
 
 # High-performance concurrent cache with TinyLFU eviction
 moka = { version = "0.12", features = ["sync"] }

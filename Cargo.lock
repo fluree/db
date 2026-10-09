@@ -2987,7 +2987,7 @@ dependencies = [
  "indexmap 2.13.0",
  "itoa",
  "libc",
- "lru 0.12.5",
+ "lru 0.18.5",
  "mimalloc",
  "moka",
  "num-bigint",
@@ -3223,7 +3223,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "hex",
  "libc",
- "lru 0.12.5",
+ "lru 0.18.5",
  "moka",
  "multihash",
  "num-bigint",
@@ -3306,7 +3306,7 @@ dependencies = [
  "fluree-db-iceberg",
  "fluree-db-tabular",
  "futures",
- "lru 0.12.5",
+ "lru 0.18.5",
  "percent-encoding",
  "reqwest 0.13.5",
  "serde",
@@ -3394,7 +3394,7 @@ dependencies = [
  "futures",
  "http 1.4.0",
  "hyper-rustls 0.24.2",
- "lru 0.12.5",
+ "lru 0.18.5",
  "parquet",
  "rand 0.8.8",
  "reqwest 0.13.5",
@@ -3647,7 +3647,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hashbrown 0.16.1",
  "indexmap 2.13.0",
- "lru 0.12.5",
+ "lru 0.18.5",
  "md-5",
  "moka",
  "num-bigint",
@@ -3701,7 +3701,7 @@ dependencies = [
  "fluree-db-core",
  "fluree-vocab",
  "hashbrown 0.16.1",
- "lru 0.12.5",
+ "lru 0.18.5",
  "num-bigint",
  "parking_lot",
  "smallvec",
@@ -4161,7 +4161,7 @@ dependencies = [
  "fluree-db-query",
  "fluree-search-protocol",
  "futures",
- "lru 0.12.5",
+ "lru 0.18.5",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -5641,20 +5641,20 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "lru"
-version = "0.12.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
-dependencies = [
- "hashbrown 0.15.5",
-]
-
-[[package]]
-name = "lru"
 version = "0.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1dc47f592c06f33f8e3aea9591776ec7c9f9e4124778ff8a3c3b87159f7e593"
 dependencies = [
  "hashbrown 0.16.1",
+]
+
+[[package]]
+name = "lru"
+version = "0.18.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef9ac18847474e638e3702b76c65d4eb93428471a74778ef0f1be711717f89b5"
+dependencies = [
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
