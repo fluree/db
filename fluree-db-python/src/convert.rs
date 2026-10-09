@@ -1,10 +1,13 @@
 //! Engine values to and from plain Python data.
 //!
 //! SPARQL terms cross the boundary as small tuples that `fluree/_terms.py`
-//! turns into Python values: `("iri", iri)`, `("bnode", label)`, and
-//! `("literal", lexical, datatype_iri, language)`. Unbound cells are `None`.
+//! turns into Python values: `("iri", iri)`, `("bnode", label)`,
+//! `("literal", lexical, datatype_iri, language)`, and for an RDF 1.2 triple
+//! term `("triple", subject, predicate, object)`, each part a term tuple.
+//! Unbound cells are `None`.
 
 use crate::error::{fluree_error, invalid_request};
+use fluree_db_api::rdf::{Datatype, Term};
 use fluree_db_api::{CommitRef, ResolvedFlake, ResolvedValue, TimeSpec};
 use fluree_db_core::{CommitSummary, ContentId};
 use fluree_db_sparql::ast::{QueryBody, SelectVariables};
@@ -39,7 +42,8 @@ pub(crate) fn to_json(obj: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
 }
 
 /// A JSON-LD document or query. Where a property's value goes, an RDF term —
-/// `IRI`, `BlankNode`, `LangString`, `Literal`, `Vector`, a Cypher `Node` —
+/// `IRI`, `BlankNode`, `LangString`, `Literal`, `Triple`, `Vector`, a Cypher
+/// `Node` —
 /// or a Python value with an XSD datatype — `Decimal`, `datetime`, `date`,
 /// `time`, an int past 64 bits, a non-finite float — becomes the JSON-LD
 /// value object that stores it as that term, so it reads back as it went in.
@@ -132,7 +136,12 @@ fn convert(obj: &Bound<'_, PyAny>, values: Values) -> PyResult<JsonValue> {
             } else {
                 values
             };
-            map.insert(key.to_owned(), convert(&value, entry)?);
+            let value = if key == "@reifies" && rdf {
+                reified(&value)?
+            } else {
+                convert(&value, entry)?
+            };
+            map.insert(key.to_owned(), value);
         }
         return Ok(JsonValue::Object(map));
     }
@@ -166,14 +175,17 @@ fn convert(obj: &Bound<'_, PyAny>, values: Values) -> PyResult<JsonValue> {
     })
 }
 
-/// The JSON-LD form of a `Literal`, `Node`, `Decimal`, `datetime`, `date`,
-/// or `time`; `None` for anything else.
+/// The JSON-LD form of a `Literal`, `Triple`, `Node`, `Decimal`, `datetime`,
+/// `date`, or `time`; `None` for anything else.
 fn rdf_value(obj: &Bound<'_, PyAny>) -> PyResult<Option<JsonValue>> {
     let py = obj.py();
     if obj.is_instance(term_class(py, &LITERAL_CLASS, "Literal")?)? {
         let value: String = obj.getattr("value")?.extract()?;
         let datatype: String = obj.getattr("datatype")?.extract()?;
         return Ok(Some(typed(value, &datatype)));
+    }
+    if obj.is_instance(term_class(py, &TRIPLE_CLASS, "Triple")?)? {
+        return triple_json(obj).map(Some);
     }
     if obj.is_instance(NODE_CLASS.import(py, "fluree._graph", "Node")?)? {
         return convert(&obj.getattr("element_id")?, Values::Rdf).map(Some);
@@ -200,6 +212,118 @@ fn rdf_value(obj: &Bound<'_, PyAny>) -> PyResult<Option<JsonValue>> {
     Ok(None)
 }
 
+/// A triple term as a property value: `{"@id": {"@id": subject, predicate:
+/// object}}`.
+fn triple_json(obj: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
+    Ok(serde_json::json!({ "@id": triple_node(obj)? }))
+}
+
+/// What `@reifies` names: the triple itself, as the node `{"@id": subject,
+/// predicate: object}` rather than a property value's triple term.
+fn reified(value: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
+    if value.is_instance(term_class(value.py(), &TRIPLE_CLASS, "Triple")?)? {
+        return triple_node(value).map(JsonValue::Object);
+    }
+    if let Ok(list) = value.cast::<PyList>() {
+        return list.iter().map(|item| reified(&item)).collect();
+    }
+    convert(value, Values::Rdf)
+}
+
+/// `{"@id": subject, predicate: object}`. `Triple` has already made its
+/// subject an `IRI` or `BlankNode` and its predicate an `IRI`.
+fn triple_node(obj: &Bound<'_, PyAny>) -> PyResult<serde_json::Map<String, JsonValue>> {
+    let subject = obj.getattr("subject")?;
+    let mut id: String = subject.extract()?;
+    if subject.is_instance(term_class(obj.py(), &BLANK_NODE_CLASS, "BlankNode")?)? {
+        id.insert_str(0, "_:");
+    }
+    let predicate: String = obj.getattr("predicate")?.extract()?;
+    let object = convert(&obj.getattr("object")?, Values::Rdf)?;
+    let mut node = serde_json::Map::with_capacity(2);
+    node.insert("@id".to_owned(), JsonValue::String(id));
+    node.insert(predicate, object);
+    Ok(node)
+}
+
+/// A Python RDF value as a graph term: what [`to_jsonld`] stores for it,
+/// as a term an RDF writer can write. A `Triple` becomes a triple term.
+pub(crate) fn ir_term(obj: &Bound<'_, PyAny>) -> PyResult<Term> {
+    let py = obj.py();
+    if obj.is_instance(term_class(py, &TRIPLE_CLASS, "Triple")?)? {
+        return Ok(Term::triple(
+            ir_term(&obj.getattr("subject")?)?,
+            ir_term(&obj.getattr("predicate")?)?,
+            ir_term(&obj.getattr("object")?)?,
+        ));
+    }
+    if let Ok(b) = obj.cast::<PyBool>() {
+        return Ok(Term::boolean(b.is_true()));
+    }
+    if obj.is_instance_of::<PyInt>() {
+        return Ok(match obj.extract::<i64>() {
+            Ok(i) => Term::integer(i),
+            Err(_) => Term::typed(obj.str()?.to_str()?, Datatype::xsd_integer()),
+        });
+    }
+    if obj.is_instance_of::<PyFloat>() {
+        let value: f64 = obj.extract()?;
+        // Python's repr is the shortest spelling that reads back as this
+        // float, which is usually how the source wrote it: `0.9957` rather
+        // than the canonical `9.957E-1`.
+        let lexical = if value.is_nan() {
+            "NaN".to_string()
+        } else if value.is_infinite() {
+            if value > 0.0 { "INF" } else { "-INF" }.to_string()
+        } else {
+            obj.repr()?.to_string()
+        };
+        return Ok(Term::typed(lexical, Datatype::xsd_double()));
+    }
+    if let Ok(text) = obj.cast::<PyString>() {
+        let text = text.to_str()?;
+        if obj.is_instance(term_class(py, &IRI_CLASS, "IRI")?)? {
+            return Ok(Term::iri(text));
+        }
+        if obj.is_instance(term_class(py, &BLANK_NODE_CLASS, "BlankNode")?)? {
+            return Ok(Term::blank(text));
+        }
+        if obj.is_instance(term_class(py, &LANG_STRING_CLASS, "LangString")?)? {
+            let language: String = obj.getattr("language")?.extract()?;
+            return Ok(Term::lang_string(text, language));
+        }
+        return Ok(Term::string(text));
+    }
+    // Everything else as its JSON-LD value: a typed `@value`, or an `@id`
+    // for a Cypher node.
+    let json = match convert(obj, Values::Rdf)? {
+        JsonValue::Object(map) => map,
+        other => return Err(PyTypeError::new_err(format!("{other} is not an RDF term"))),
+    };
+    if let Some(id) = json.get("@id").and_then(JsonValue::as_str) {
+        return Ok(match id.strip_prefix("_:") {
+            Some(label) => Term::blank(label),
+            None => Term::iri(id),
+        });
+    }
+    match (
+        json.get("@value"),
+        json.get("@type").and_then(JsonValue::as_str),
+    ) {
+        (Some(value), Some(datatype)) => {
+            let lexical = match value {
+                JsonValue::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            Ok(Term::typed(lexical, Datatype::from_iri(datatype)))
+        }
+        _ => Err(PyTypeError::new_err(format!(
+            "a {} is not an RDF term",
+            obj.get_type().name()?
+        ))),
+    }
+}
+
 fn typed(lexical: String, datatype: &str) -> JsonValue {
     serde_json::json!({ "@value": lexical, "@type": datatype })
 }
@@ -208,6 +332,7 @@ static IRI_CLASS: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static BLANK_NODE_CLASS: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static LANG_STRING_CLASS: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static LITERAL_CLASS: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static TRIPLE_CLASS: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static VECTOR_CLASS: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static NODE_CLASS: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static DATETIME_CLASS: PyOnceLock<Py<PyType>> = PyOnceLock::new();
@@ -218,6 +343,25 @@ static DECIMAL_CLASS: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 /// `iri` as a `fluree.IRI`.
 pub(crate) fn iri<'py>(py: Python<'py>, iri: &str) -> PyResult<Bound<'py, PyAny>> {
     term_class(py, &IRI_CLASS, "IRI")?.call1((iri,))
+}
+
+/// Whether `obj` is exactly a `fluree.IRI` or a `fluree.BlankNode`.
+pub(crate) fn is_node(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let (py, class) = (obj.py(), obj.get_type());
+    Ok(class.is(term_class(py, &IRI_CLASS, "IRI")?)
+        || class.is(term_class(py, &BLANK_NODE_CLASS, "BlankNode")?))
+}
+
+/// Whether `obj` is exactly a `fluree.Triple`.
+pub(crate) fn is_triple(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(obj
+        .get_type()
+        .is(term_class(obj.py(), &TRIPLE_CLASS, "Triple")?))
+}
+
+/// `label` as a `fluree.BlankNode`.
+pub(crate) fn blank_node<'py>(py: Python<'py>, label: &str) -> PyResult<Bound<'py, PyAny>> {
+    term_class(py, &BLANK_NODE_CLASS, "BlankNode")?.call1((label,))
 }
 
 fn term_class<'py>(
@@ -429,6 +573,16 @@ pub(crate) fn term<'py>(py: Python<'py>, term: &JsonValue) -> PyResult<Bound<'py
     match term["type"].as_str() {
         Some("uri") => ("iri", value).into_pyobject(py),
         Some("bnode") => ("bnode", value).into_pyobject(py),
+        Some("triple") => {
+            let parts = &term["value"];
+            (
+                "triple",
+                self::term(py, &parts["subject"])?,
+                self::term(py, &parts["predicate"])?,
+                self::term(py, &parts["object"])?,
+            )
+                .into_pyobject(py)
+        }
         Some("literal") => {
             let language = term.get("xml:lang").and_then(JsonValue::as_str);
             let datatype =
@@ -466,25 +620,43 @@ pub(crate) fn commit_summary<'py>(
 /// `(subject, predicate, object, assert, graph)`, the object a term tuple.
 /// The flake's IRIs must be whole, not compacted.
 pub(crate) fn flake<'py>(py: Python<'py>, flake: &ResolvedFlake) -> PyResult<Bound<'py, PyTuple>> {
-    let object = if flake.dt == "@id" {
-        ("iri", lexical(&flake.o)).into_pyobject(py)?
-    } else {
-        (
-            "literal",
-            lexical(&flake.o),
-            &flake.dt,
-            flake.lang.as_deref(),
-        )
-            .into_pyobject(py)?
-    };
+    let object = object_term(py, &flake.o, &flake.dt, flake.lang.as_deref())?;
     (&flake.s, &flake.p, object, flake.op, flake.graph.as_deref()).into_pyobject(py)
 }
 
-fn lexical(value: &ResolvedValue) -> String {
-    match value {
+/// A flake's object as a term tuple; a triple term's parts are term tuples too.
+fn object_term<'py>(
+    py: Python<'py>,
+    value: &ResolvedValue,
+    datatype: &str,
+    language: Option<&str>,
+) -> PyResult<Bound<'py, PyTuple>> {
+    let lexical = match value {
+        ResolvedValue::TripleTerm(t) => {
+            return (
+                "triple",
+                node_term(py, &t.s)?,
+                ("iri", t.p.as_str()).into_pyobject(py)?,
+                object_term(py, &t.o, &t.dt, t.lang.as_deref())?,
+            )
+                .into_pyobject(py);
+        }
         ResolvedValue::String(s) | ResolvedValue::Lexical(s) => s.clone(),
         ResolvedValue::Boolean(b) => b.to_string(),
         ResolvedValue::Long(n) => n.to_string(),
         ResolvedValue::Double(d) => d.to_string(),
+    };
+    if datatype == "@id" {
+        node_term(py, &lexical)
+    } else {
+        ("literal", lexical, datatype, language).into_pyobject(py)
+    }
+}
+
+/// A node reference: a blank node when it is `_:label`, else an IRI.
+fn node_term<'py>(py: Python<'py>, id: &str) -> PyResult<Bound<'py, PyTuple>> {
+    match id.strip_prefix("_:") {
+        Some(label) => ("bnode", label).into_pyobject(py),
+        None => ("iri", id).into_pyobject(py),
     }
 }

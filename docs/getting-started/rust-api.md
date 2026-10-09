@@ -820,6 +820,49 @@ All formats stream directly from the binary SPOT index. Memory usage is O(leafle
 
 See also: [CLI export](../cli/export.md) for command-line usage.
 
+### Parse and Serialize RDF
+
+`fluree_db_api::rdf` reads and writes RDF documents with no ledger involved: a document becomes a `Dataset` (a default graph and named graphs) and a `Dataset` becomes a document. [RDF documents](../reference/rdf-documents.md) shows how each syntax writes RDF 1.2 and lists the JSON-LD limits.
+
+```rust
+use fluree_db_api::rdf::{self, Dataset, PrefixMap, RdfFormat, Term};
+use std::collections::BTreeMap;
+
+fn main() -> Result<(), rdf::RdfError> {
+    let doc = r#"
+        PREFIX ex: <http://example.org/>
+        ex:alice ex:knows ex:bob {| ex:since 2020 |} .
+        ex:g { ex:carol ex:age 30 }
+    "#;
+    let dataset = rdf::parse(doc, RdfFormat::TriG, None)?;
+    assert_eq!(dataset.named.len(), 1);
+
+    // Build a dataset from quads; `r rdf:reifies <<( s p o )>>` is a reification.
+    let mut more = Dataset::new();
+    more.add_quad(
+        Term::iri("http://example.org/dave"),
+        Term::iri("http://example.org/likes"),
+        Term::string("tea"),
+        Some(&Term::iri("http://example.org/g")),
+    );
+
+    let prefixes = PrefixMap::from_map(BTreeMap::from([(
+        "ex".to_string(),
+        "http://example.org/".to_string(),
+    )]));
+    let trig = rdf::serialize(&dataset, RdfFormat::TriG, &prefixes)?;
+    let nquads = rdf::serialize(&more, RdfFormat::NQuads, &prefixes)?;
+    Ok(())
+}
+```
+
+- **Formats:** `RdfFormat` is Turtle, TriG, N-Triples, N-Quads or JSON-LD. It parses from a name (`"trig"`, `"n-quads"`, `"json-ld"`, …) and `RdfFormat::from_extension` maps `.ttl`, `.trig`, `.nt`, `.nq`, `.jsonld` and `.json`.
+- **JSON-LD:** a named graph is a `{"@id": g, "@graph": [...]}` node, an annotation is `@annotation` on a value, a reified triple is a node's `@reifies`, and a triple term is `{"@id": {"@id": s, p: o}}`. `serialize` writes the prefixes as the `@context` and compacts IRIs with them. An IRI that stays relative after expansion (a property with no context entry, say) is refused.
+- **Reading:** Turtle and TriG follow the W3C grammars, resolving relative IRIs against the `base` argument. N-Triples and N-Quads are read strictly: absolute IRIs, and one statement per line. Literals keep their lexical form.
+- **RDF 1.2:** a triple term is a `Term::TripleTerm`. An annotation or reified triple is a reification of its graph (`Graph::reifications`), and an annotation also asserts its triple. Writers write a reification of an asserted triple as an annotation where the format has one.
+- **Blank nodes:** blank nodes keep the document's labels. An anonymous one (`[]`, a collection, an annotation) is labeled `bN` apart from them, so a parsed dataset can be written in any format.
+- **Errors:** a malformed document is `RdfError::Syntax` with its line and column. A dataset with named graphs cannot be written as Turtle or N-Triples (`RdfError::Unwritable`).
+
 ### Materialize for Reuse
 
 When you need to run multiple queries against the same snapshot, materialize a `GraphSnapshot` once:

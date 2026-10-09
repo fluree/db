@@ -395,6 +395,10 @@ Supported SPARQL versions:
 Import accepts `.ttl`, `.nt`, `.nq`, `.trig`, and `.jsonld`/`.jsonl` files, each
 with transparent `.gz` / `.zst` decompression.
 
+Without a ledger, `fluree.parse` / `fluree.serialize` (Python) and
+`fluree_db_api::rdf` (Rust) read and write Turtle, TriG, N-Triples, N-Quads and
+JSON-LD; see [RDF documents](rdf-documents.md).
+
 ## Protocol Support
 
 ### HTTP and TLS

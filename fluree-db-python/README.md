@@ -74,10 +74,18 @@ with fluree.connect("./data") as conn:          # or fluree.connect(":memory:")
 A property value in a JSON-LD dict may be any value a query returns, and
 reads back as it went in: a `fluree.IRI` or `BlankNode` is a reference to that
 node, a `LangString` keeps its tag, a `Literal` its datatype, and a `Decimal`,
-`datetime`, `date` or `time` its XSD type. `fluree.Vector` and numpy arrays
-are embedding vectors. The same values work as query parameters and in JSON-LD
-`where` patterns. Keyword entries (`@id`, `@type`, `@context`) take plain
-strings.
+`datetime`, `date` or `time` its XSD type. A `fluree.Triple` is an RDF 1.2
+triple term, and `fluree.Vector` and numpy arrays are embedding vectors. The
+same values work as query parameters and in JSON-LD `where` patterns. Keyword
+entries (`@id`, `@type`, `@context`) take plain strings, except `"@reifies"`,
+which takes the `Triple` a node is about; that records a claim without
+asserting the triple:
+
+```python
+ex = "http://example.org/"
+ledger.insert({"@id": ex + "claim1", ex + "source": fluree.IRI(ex + "wiki"),
+               "@reifies": fluree.Triple(ex + "carol", ex + "age", 30)})
+```
 
 To make several writes one commit, use a transaction. Each write applies over
 the ones before it and is checked as it is staged; queries on the transaction
@@ -127,7 +135,9 @@ frozen view that every query sees identically.
 - Literals are Python values (`int`, `float`, `Decimal`, `datetime`, `str`,
   ...); IRIs are `fluree.IRI` and language-tagged strings
   `fluree.LangString`, both `str` subclasses. A literal with no lossless
-  Python type stays a `fluree.Literal`.
+  Python type stays a `fluree.Literal`. An RDF 1.2 triple term, such as the
+  `?t` of `?r rdf:reifies ?t`, is a `fluree.Triple(subject, predicate,
+  object)`, which unpacks like a tuple.
 - SPARQL `ASK` returns a `bool`, `CONSTRUCT` a JSON-LD document; JSON-LD
   queries (a `dict`) return their JSON result as Python objects.
 - `select()` is `query()` for tables: it takes a SPARQL `SELECT` or a Cypher
@@ -153,13 +163,13 @@ frozen view that every query sees identically.
                name="Alice", min=21)
   ```
 
-  A value is an `IRI`, `LangString`, `Literal` or `Vector`, a Python `str`,
-  `int`, `float`, `bool`, `Decimal`, `datetime`, `date` or `time`, a Cypher
-  `Node` (its `element_id`), or a `BlankNode` a query returned. A `BlankNode`
-  built from any other label raises `InvalidRequestError`: written in the
-  query, it would match every node. So does a parameter the query never
-  mentions, rather than leaving a misspelt variable unbound. JSON-LD queries
-  take none.
+  A value is an `IRI`, `LangString`, `Literal`, `Triple` or `Vector`, a
+  Python `str`, `int`, `float`, `bool`, `Decimal`, `datetime`, `date` or
+  `time`, a Cypher `Node` (its `element_id`), or a `BlankNode` a query
+  returned. A `BlankNode` built from any other label raises
+  `InvalidRequestError`: written in the query, it would match every node. So
+  does a parameter the query never mentions, rather than leaving a misspelt
+  variable unbound. JSON-LD queries take none.
 
 ### Cypher
 
@@ -327,6 +337,73 @@ never widen what a governed handle sees.
 - `ledger.archive(path)` writes a `.flpack` archive of the whole ledger, and
   `conn.restore(path, name)` loads one back.
 
+## RDF documents
+
+`fluree.parse()` and `fluree.serialize()` read and write Turtle, TriG,
+N-Triples, N-Quads and JSON-LD with no ledger involved, as lists of `fluree.Quad`
+(`subject, predicate, object, graph`; the graph is `None` for the default
+graph). Here a document's IRIs move to a new namespace:
+
+```python
+from pathlib import Path
+
+OLD, NEW = "http://old.example/", "http://new.example/"
+
+def move(term):
+    if isinstance(term, fluree.IRI) and term.startswith(OLD):
+        return fluree.IRI(NEW + term[len(OLD):])
+    if isinstance(term, fluree.Triple):
+        return fluree.Triple(*map(move, term))
+    return term
+
+quads = [fluree.Quad(*map(move, q)) for q in fluree.parse(Path("data.trig"))]
+text = fluree.serialize(quads, "trig", prefixes={"ex": NEW})
+ledger.insert(quads)                      # or write them straight to a ledger
+```
+
+JSON-LD reads from a dict or list as well as from text:
+
+```python
+quads = fluree.parse({
+    "@context": {"ex": "http://example.org/"},
+    "@id": "ex:alice",
+    "ex:knows": {"@id": "ex:bob", "@annotation": {"ex:since": 2020}},
+})
+# alice knows bob, plus (_:b1, rdf:reifies, Triple(alice, knows, bob))
+# and (_:b1, ex:since, 2020)
+text = fluree.serialize(quads, "jsonld", prefixes={"ex": "http://example.org/"})
+```
+
+- A path (a `Path`, not a `str`, which is the document's text) gives its
+  format by extension (`.ttl`, `.trig`, `.nt`, `.nq`, `.jsonld`, `.json`);
+  text needs `format=`, and a dict or list is JSON-LD. Turtle, TriG and
+  JSON-LD resolve relative IRIs against `base=`.
+- RDF 1.2 is read whole. A triple term is a `fluree.Triple`, and an
+  annotation or a reified triple is the quad `(reifier, rdf:reifies,
+  Triple(...))`, the annotated triple being a quad of its own. `serialize`
+  writes such quads back as annotations where the format has them. JSON-LD
+  writes these as `@annotation` on a value, a node's `@reifies`, and
+  `{"@id": {"@id": s, p: o}}`, and a named graph as `{"@id": g, "@graph":
+  [...]}`.
+- Literals are Python values, as in query results, so neither a number's
+  spelling nor a narrower datatype is kept (`"01"^^xsd:long` reads as `1`
+  and is written back as `xsd:integer`); a float is written in its shortest
+  form (`0.9957`). `literals="lexical"` keeps every typed literal but a plain
+  string as a `fluree.Literal` with its spelling and datatype, so a document
+  read and written back keeps its literals exactly.
+- Blank nodes keep the document's labels; an anonymous one gets a fresh
+  label.
+- JSON-LD contexts must be given inline: a `@context` URL is not fetched,
+  and a string context is taken as the vocabulary IRI (`"https://schema.org/"`
+  makes `name` `https://schema.org/name`). A property with no context entry is
+  an error rather than dropped.
+- `ledger.insert(quads)` and `upsert(quads)` write quads, named graphs
+  included.
+
+[RDF documents](https://fluree.github.io/db/reference/rdf-documents.html) in
+the Fluree documentation shows how each syntax writes named graphs,
+annotations, reified triples and triple terms.
+
 ## rdflib
 
 [rdflib](https://rdflib.readthedocs.io) reads formats Fluree does not, such as
@@ -418,7 +495,8 @@ async with fluree.aio.connect("./data") as conn:
         await txn.insert({...})
 ```
 
-Each call runs on a worker thread while the event loop carries on.
+Each call runs on a worker thread while the event loop carries on, as do
+`fluree.aio.parse()` and `fluree.aio.serialize()`.
 Cancelling a task that awaits a query (`asyncio.timeout`, a client that
 disconnects) stops the query in the engine; a write already under way still
 completes. Cancelled inside `async with ledger.transaction()`, the block waits

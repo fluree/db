@@ -11,8 +11,9 @@
 //! - Future: `FlureeIngestSink`: Converts events to transaction IR
 //! - Future: `StreamingSink`: Writes triples directly to output
 
-use crate::{Datatype, Graph, LiteralValue, Term, Triple};
-use std::collections::HashMap;
+use crate::{BlankId, Dataset, Datatype, Graph, LiteralValue, Term, Triple};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 /// Error returned by a [`GraphSink`] when it cannot accept an event.
 ///
@@ -230,6 +231,29 @@ pub trait GraphSink {
         ))
     }
 
+    /// Emit a list item in the named graph `graph`: [`Self::emit_list_item`]
+    /// as [`Self::emit_quad`] is [`Self::emit_triple`].
+    ///
+    /// Only called when [`Self::supports_quads`] returns `true`; the default
+    /// refuses, for the reason `emit_quad`'s does.
+    fn emit_quad_list_item(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        index: i32,
+        graph: TermId,
+    ) -> SinkResult {
+        let _ = (subject, predicate, object, index, graph);
+        debug_assert!(
+            self.supports_quads(),
+            "emit_quad_list_item called on a sink that does not support quads"
+        );
+        Err(SinkError::rejected(
+            "this sink is triple-only and cannot represent named graphs",
+        ))
+    }
+
     /// Called by the producer at each statement terminator, after the
     /// statement has parsed and emitted successfully.
     ///
@@ -366,15 +390,49 @@ pub trait GraphSink {
             "this sink cannot represent reified triples",
         ))
     }
+
+    /// Emit a reified-triple event whose attachment belongs to the named
+    /// graph `graph`, as an annotation inside a TriG graph block does. The
+    /// triple term itself belongs to no graph; the `rdf:reifies` link does.
+    ///
+    /// Only called when both [`Self::supports_quads`] and
+    /// [`Self::supports_reified_triples`] return `true`; the default refuses.
+    fn emit_quad_reified_triple(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        reifier: TermId,
+        graph: TermId,
+    ) -> SinkResult {
+        let _ = (subject, predicate, object, reifier, graph);
+        debug_assert!(
+            self.supports_quads() && self.supports_reified_triples(),
+            "emit_quad_reified_triple called on a sink that does not support it"
+        );
+        Err(SinkError::rejected(
+            "this sink cannot represent reified triples in named graphs",
+        ))
+    }
 }
 
 /// A sink that collects triples into a Graph
 ///
-/// This is the standard sink for building an in-memory graph from parser events.
+/// This is the standard sink for building an in-memory graph from parser
+/// events. It is triple-only unless built with
+/// [`GraphCollectorSink::with_named_graphs`], which also collects the named
+/// graphs of TriG and N-Quads into a [`Dataset`].
 #[derive(Debug)]
 pub struct GraphCollectorSink {
-    /// The graph being built
+    /// The graph being built (the default graph)
     graph: Graph,
+    /// Named graphs; `None` makes the sink triple-only.
+    named: Option<BTreeMap<Term, Graph>>,
+    /// The named graphs the current statement has written to, each with its
+    /// rewind point for [`GraphSink::abort_statement`]: its length and
+    /// reification count before the statement, or `None` when the statement
+    /// created it.
+    named_marks: Vec<(Term, Option<(usize, usize)>)>,
     /// Terms indexed by TermId
     terms: Vec<Term>,
     /// Counter for generating blank node IDs
@@ -407,6 +465,8 @@ impl GraphCollectorSink {
     pub fn new() -> Self {
         Self {
             graph: Graph::new(),
+            named: None,
+            named_marks: Vec::new(),
             terms: Vec::new(),
             blank_counter: 0,
             blank_labels: HashMap::new(),
@@ -421,6 +481,8 @@ impl GraphCollectorSink {
     pub fn with_base(base: impl Into<String>) -> Self {
         Self {
             graph: Graph::with_base(base),
+            named: None,
+            named_marks: Vec::new(),
             terms: Vec::new(),
             blank_counter: 0,
             blank_labels: HashMap::new(),
@@ -431,12 +493,79 @@ impl GraphCollectorSink {
         }
     }
 
+    /// A sink that also collects named graphs, for TriG and N-Quads; read
+    /// its product with [`Self::into_dataset`].
+    pub fn with_named_graphs() -> Self {
+        Self {
+            named: Some(BTreeMap::new()),
+            ..Self::new()
+        }
+    }
+
     /// Consume the sink and return the collected graph.
     ///
     /// This is the sink's *product*, distinct from the protocol's
-    /// [`GraphSink::finish`] (flush/finalize) — see the trait docs.
+    /// [`GraphSink::finish`] (flush/finalize) — see the trait docs. A sink
+    /// built [`Self::with_named_graphs`] is read with [`Self::into_dataset`].
     pub fn into_graph(self) -> Graph {
+        debug_assert!(
+            self.named.as_ref().is_none_or(BTreeMap::is_empty),
+            "into_graph would drop this sink's named graphs; use into_dataset"
+        );
         self.graph
+    }
+
+    /// Consume the sink and return the default graph and every named graph.
+    ///
+    /// Anonymous blank nodes (`[]`, collections, annotations) are labeled
+    /// `bN` here, or `bN_k` when the document wrote `_:bN` itself, so the
+    /// dataset can be written back in any RDF syntax. While parsing they are
+    /// `-bN`, a label no document can write (see [`GraphSink::term_blank`]).
+    pub fn into_dataset(self) -> Dataset {
+        let mut dataset = Dataset {
+            default: self.graph,
+            named: self.named.unwrap_or_default(),
+        };
+        if self.blank_counter == 0 {
+            return dataset;
+        }
+        let names: Vec<BlankId> = (1..=self.blank_counter)
+            .map(|n| {
+                let mut name = format!("b{n}");
+                let mut k = 0;
+                while self.blank_labels.contains_key(&name) {
+                    k += 1;
+                    name = format!("b{n}_{k}");
+                }
+                BlankId::new(name)
+            })
+            .collect();
+        dataset.default.terms_mut().for_each(|t| relabel(t, &names));
+        dataset.named = std::mem::take(&mut dataset.named)
+            .into_iter()
+            .map(|(mut name, mut graph)| {
+                relabel(&mut name, &names);
+                graph.terms_mut().for_each(|t| relabel(t, &names));
+                (name, graph)
+            })
+            .collect();
+        dataset
+    }
+
+    /// The named graph `graph`, noting its rewind point the first time the
+    /// current statement writes to it.
+    fn named_graph(&mut self, graph: TermId) -> std::result::Result<&mut Graph, SinkError> {
+        let Some(named) = self.named.as_mut() else {
+            return Err(SinkError::rejected(
+                "this sink is triple-only and cannot represent named graphs",
+            ));
+        };
+        let name = &self.terms[graph.0 as usize];
+        if !self.named_marks.iter().any(|(n, _)| n == name) {
+            let mark = named.get(name).map(|g| (g.len(), g.reifications_len()));
+            self.named_marks.push((name.clone(), mark));
+        }
+        Ok(named.entry(name.clone()).or_default())
     }
 
     /// Get the current graph (non-consuming)
@@ -505,6 +634,34 @@ impl GraphCollectorSink {
         self.literal_slots.push(id.0);
         self.literal_cursor = self.literal_slots.len();
         id
+    }
+}
+
+/// Give a minted `-bN` blank node in `term` its final label `names[N - 1]`.
+fn relabel(term: &mut Term, names: &[BlankId]) {
+    fn minted(term: &Term) -> bool {
+        match term {
+            Term::BlankNode(id) => id.as_str().starts_with('-'),
+            Term::TripleTerm(t) => t.iter().any(minted),
+            Term::Iri(_) | Term::Literal { .. } => false,
+        }
+    }
+    match term {
+        Term::BlankNode(id) => {
+            let n = id
+                .as_str()
+                .strip_prefix("-b")
+                .and_then(|n| n.parse::<usize>().ok());
+            if let Some(name) = n.and_then(|n| names.get(n.wrapping_sub(1))) {
+                *id = name.clone();
+            }
+        }
+        Term::TripleTerm(t) if t.iter().any(minted) => {
+            Arc::make_mut(t)
+                .iter_mut()
+                .for_each(|part| relabel(part, names));
+        }
+        Term::TripleTerm(_) | Term::Iri(_) | Term::Literal { .. } => {}
     }
 }
 
@@ -604,6 +761,7 @@ impl GraphSink for GraphCollectorSink {
         self.literal_cursor = 0;
         self.statement_mark = self.graph.len();
         self.reification_mark = self.graph.reifications_len();
+        self.named_marks.clear();
     }
 
     /// Roll the graph back to the statement's start, so a statement that
@@ -614,6 +772,21 @@ impl GraphSink for GraphCollectorSink {
         self.debug_assert_retiring_slots_are_literals();
         self.graph.truncate(self.statement_mark);
         self.graph.truncate_reifications(self.reification_mark);
+        if let Some(named) = self.named.as_mut() {
+            for (name, mark) in self.named_marks.drain(..) {
+                match mark {
+                    Some((len, reifications)) => {
+                        if let Some(graph) = named.get_mut(&name) {
+                            graph.truncate(len);
+                            graph.truncate_reifications(reifications);
+                        }
+                    }
+                    None => {
+                        named.remove(&name);
+                    }
+                }
+            }
+        }
         self.literal_cursor = 0;
     }
 
@@ -661,6 +834,57 @@ impl GraphSink for GraphCollectorSink {
         let p = self.get_term(predicate).clone();
         let o = self.get_term(object).clone();
         self.graph.add_list_item(s, p, o, index);
+        Ok(())
+    }
+
+    fn supports_quads(&self) -> bool {
+        self.named.is_some()
+    }
+
+    fn emit_quad(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        graph: TermId,
+    ) -> SinkResult {
+        let triple = Triple::new(
+            self.get_term(subject).clone(),
+            self.get_term(predicate).clone(),
+            self.get_term(object).clone(),
+        );
+        self.named_graph(graph)?.add(triple);
+        Ok(())
+    }
+
+    fn emit_quad_list_item(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        index: i32,
+        graph: TermId,
+    ) -> SinkResult {
+        let s = self.get_term(subject).clone();
+        let p = self.get_term(predicate).clone();
+        let o = self.get_term(object).clone();
+        self.named_graph(graph)?.add_list_item(s, p, o, index);
+        Ok(())
+    }
+
+    fn emit_quad_reified_triple(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        reifier: TermId,
+        graph: TermId,
+    ) -> SinkResult {
+        let s = self.get_term(subject).clone();
+        let p = self.get_term(predicate).clone();
+        let o = self.get_term(object).clone();
+        let r = self.get_term(reifier).clone();
+        self.named_graph(graph)?.add_reification(s, p, o, r);
         Ok(())
     }
 }
@@ -800,6 +1024,66 @@ mod tests {
         graph.sort();
         let indices: Vec<_> = graph.iter().map(|t| t.list_index().unwrap()).collect();
         assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn a_named_graph_collector_keeps_each_graph() {
+        let mut sink = GraphCollectorSink::with_named_graphs();
+        assert!(sink.supports_quads());
+        let (s, p, o) = (
+            sink.term_iri("http://ex/s"),
+            sink.term_iri("http://ex/p"),
+            sink.term_iri("http://ex/o"),
+        );
+        let (g, r) = (sink.term_iri("http://ex/g"), sink.term_blank(Some("r")));
+        sink.emit_triple(s, p, o).unwrap();
+        sink.emit_quad(s, p, o, g).unwrap();
+        sink.emit_quad_list_item(s, p, o, 0, g).unwrap();
+        sink.emit_quad_reified_triple(s, p, o, r, g).unwrap();
+        sink.end_statement();
+
+        let dataset = sink.into_dataset();
+        assert_eq!(dataset.default.len(), 1);
+        let named = &dataset.named[&Term::iri("http://ex/g")];
+        assert_eq!(named.len(), 2);
+        assert_eq!(named.reifications().len(), 1);
+    }
+
+    #[test]
+    fn an_aborted_statement_leaves_named_graphs_as_they_were() {
+        let mut sink = GraphCollectorSink::with_named_graphs();
+        let (s, p, o) = (
+            sink.term_iri("http://ex/s"),
+            sink.term_iri("http://ex/p"),
+            sink.term_iri("http://ex/o"),
+        );
+        let (kept, fresh) = (
+            sink.term_iri("http://ex/kept"),
+            sink.term_iri("http://ex/new"),
+        );
+        sink.emit_quad(s, p, o, kept).unwrap();
+        sink.end_statement();
+
+        let r = sink.term_blank(None);
+        sink.emit_quad(s, p, s, kept).unwrap();
+        sink.emit_quad_reified_triple(s, p, o, r, kept).unwrap();
+        sink.emit_quad(s, p, o, fresh).unwrap();
+        sink.abort_statement();
+
+        let dataset = sink.into_dataset();
+        assert_eq!(dataset.named.len(), 1, "the statement's new graph is gone");
+        let kept = &dataset.named[&Term::iri("http://ex/kept")];
+        assert_eq!(kept.len(), 1);
+        assert!(kept.reifications().is_empty());
+    }
+
+    #[test]
+    fn a_triple_only_collector_refuses_quads() {
+        let mut sink = GraphCollectorSink::new();
+        assert!(!sink.supports_quads());
+        let s = sink.term_iri("http://ex/s");
+        // Past the trait default's debug_assert: the override itself refuses.
+        assert!(sink.named_graph(s).is_err());
     }
 
     // =====================================================================
@@ -1043,6 +1327,41 @@ mod tests {
             !minted_label.starts_with(|c: char| c.is_alphanumeric() || c == '_'),
             "a mint that can lex as BLANK_NODE_LABEL can collide: {minted_label}"
         );
+    }
+
+    /// `into_dataset` relabels every mint, wherever it sits, to a label a
+    /// document can write, stepping past the labels the document used.
+    #[test]
+    fn a_dataset_labels_mints_apart_from_the_documents_labels() {
+        let mut sink = GraphCollectorSink::with_named_graphs();
+        let p = sink.term_iri("http://ex/p");
+        let (b1, b1_1) = (sink.term_blank(Some("b1")), sink.term_blank(Some("b1_1")));
+        let (m1, m2, m3) = (
+            sink.term_blank(None),
+            sink.term_blank(None),
+            sink.term_blank(None),
+        );
+        let nested = sink.term_triple(m2, p, b1).unwrap();
+        sink.emit_triple(m1, p, nested).unwrap();
+        sink.emit_reified_triple(b1, p, b1_1, m2).unwrap();
+        sink.emit_quad(m2, p, m1, m3).unwrap();
+        sink.end_statement();
+
+        let dataset = sink.into_dataset();
+        let blank = Term::blank;
+        let default: Vec<_> = dataset.default.iter().cloned().collect();
+        assert_eq!(
+            default,
+            [Triple::new(
+                blank("b1_2"),
+                Term::iri("http://ex/p"),
+                Term::triple(blank("b2"), Term::iri("http://ex/p"), blank("b1")),
+            )]
+        );
+        assert_eq!(dataset.default.reifications()[0].reifier, blank("b2"));
+        assert_eq!(dataset.default.reifications()[0].triple.o, blank("b1_1"));
+        let named = &dataset.named[&blank("b3")];
+        assert_eq!(named.iter().next().unwrap().s, blank("b2"));
     }
 
     // =====================================================================

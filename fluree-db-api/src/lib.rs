@@ -96,6 +96,7 @@ pub mod policy_builder;
 pub mod policy_view;
 pub mod profile;
 pub mod query;
+pub mod rdf;
 mod rebase;
 pub mod remote_service;
 mod revert;
@@ -172,7 +173,9 @@ pub use format::{
     QueryOutput,
 };
 pub use graph::Graph;
-pub use graph_commit_builder::{CommitBuilder, CommitDetail, ResolvedFlake, ResolvedValue};
+pub use graph_commit_builder::{
+    CommitBuilder, CommitDetail, ResolvedFlake, ResolvedTriple, ResolvedValue,
+};
 pub use graph_query_builder::{GraphQueryBuilder, GraphSnapshotQueryBuilder};
 pub use graph_snapshot::GraphSnapshot;
 pub use graph_source::{

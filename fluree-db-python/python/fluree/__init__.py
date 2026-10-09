@@ -50,7 +50,8 @@ from fluree._sources import (
     OAuth2,
     Unity,
 )
-from fluree._terms import IRI, BlankNode, LangString, Literal, Vector
+from fluree._rdf import RdfFormat, parse, serialize
+from fluree._terms import IRI, BlankNode, LangString, Literal, Quad, Triple, Vector
 from fluree.errors import (
     ConflictError,
     FlureeError,
@@ -95,7 +96,9 @@ __all__ = [
     "Path",
     "PermissionDeniedError",
     "QueryProfile",
+    "Quad",
     "QueryTimeoutError",
+    "RdfFormat",
     "RebaseResult",
     "Record",
     "Relationship",
@@ -108,6 +111,7 @@ __all__ = [
     "Snapshot",
     "SweepResult",
     "Transaction",
+    "Triple",
     "UniqueConstraintError",
     "Unity",
     "ValidationReport",
@@ -115,6 +119,8 @@ __all__ = [
     "Vector",
     "VerifyReport",
     "connect",
+    "parse",
+    "serialize",
     "set_log_level",
     "__version__",
 ]

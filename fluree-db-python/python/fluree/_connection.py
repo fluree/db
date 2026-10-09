@@ -14,7 +14,7 @@ from pathlib import Path
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any, Literal as _Literal, TypeVar, Union
 
-from fluree import _fluree
+from fluree import _fluree, _rdf
 from fluree._cypher import _table
 from fluree._frames import _rows_document
 from fluree._params import _cypher_params, _params, _sparql_params
@@ -1768,6 +1768,10 @@ def _json_query(query: Query) -> Any:
 
 
 def _rdf_payload(data: Data, format: Format | None) -> tuple[str, Any]:
+    if _rdf.is_quads(data):
+        if format is not None:
+            raise InvalidRequestError(f"a list of quads is RDF, not {format}")
+        return "turtle", _rdf.ledger_trig(data)
     if isinstance(data, os.PathLike):
         path = Path(data)
         if format is None:

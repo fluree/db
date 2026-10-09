@@ -132,20 +132,14 @@ impl AnnotationVerb {
     }
 }
 
-/// RDF 1.2 triple term: `<<( subject predicate object )>>`.
-///
-/// In v1 a `TripleTerm` is **only** valid as the object of `rdf:reifies`
-/// (bare triple-term *values* are deferred to the wave-2 PR-W2BC /
-/// first-class-value epic — see the burn-down roadmap D-1). The parser
-/// surfaces it via `parse_reifies_object` and the reified-triple
-/// desugaring; it never flows through ordinary object-position
-/// handling.
+/// RDF 1.2 triple term: `<<( subject predicate object )>>`, a value in object
+/// position under any predicate, its own object possibly another triple term.
+/// In an expression it is the `TRIPLE(s, p, o)` constructor.
 ///
 /// Note: `subject`/`object` may be reified triples (`SubjectTerm::
 /// QuotedTriple` / `Term::QuotedTriple`) when this node was produced by
 /// desugaring a *reified triple* — those denote reifier nodes and are
-/// desugared recursively at lowering. A user-written `<<( ... )>>`
-/// triple term still rejects nesting at parse time.
+/// desugared recursively at lowering.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TripleTerm {
     pub subject: SubjectTerm,

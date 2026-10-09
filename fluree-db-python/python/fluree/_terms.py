@@ -4,7 +4,9 @@ Literals become the Python type their datatype names (``int``, ``float``,
 ``Decimal``, ``datetime``, ...). Anything without a lossless Python type stays
 a :class:`Literal` carrying its lexical form and datatype, so no information
 is dropped. IRIs, blank nodes and language-tagged strings are ``str``
-subclasses: they print and compare like strings but keep what they are.
+subclasses: they print and compare like strings but keep what they are. An
+RDF 1.2 triple term is a :class:`Triple`, and a statement in a dataset a
+:class:`Quad`.
 """
 
 from __future__ import annotations
@@ -14,11 +16,13 @@ import json
 import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any, Callable
+from typing import Any, Callable, Iterator, TypeVar
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
 RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 EMBEDDING_VECTOR = "https://ns.flur.ee/db#embeddingVector"
+
+_T = TypeVar("_T")
 
 
 class IRI(str):
@@ -118,6 +122,93 @@ class Literal:
         return self.value
 
 
+@dataclass(frozen=True, slots=True)
+class Triple:
+    """An RDF 1.2 triple term: a triple used as a value, as the object of
+    ``rdf:reifies`` or of any other property, or inside another triple term.
+    It unpacks as ``subject, predicate, object``.
+
+    The subject is an :class:`IRI` or a :class:`BlankNode`, and the predicate
+    an :class:`IRI`; a plain ``str`` in either place is taken as an IRI. The
+    object is any value a property holds, another ``Triple`` included."""
+
+    subject: IRI | BlankNode
+    predicate: IRI
+    object: Any
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "subject", _node(self.subject, "triple term's subject"))
+        object.__setattr__(self, "predicate", _iri(self.predicate, "triple term's predicate"))
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter((self.subject, self.predicate, self.object))
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (Triple, (self.subject, self.predicate, self.object))
+
+
+@dataclass(frozen=True, slots=True)
+class Quad:
+    """A statement in a dataset: ``subject predicate object`` in ``graph``,
+    or in the default graph when ``graph`` is ``None``. It unpacks as
+    ``subject, predicate, object, graph``.
+
+    The subject and graph are an :class:`IRI` or a :class:`BlankNode`, and
+    the predicate an :class:`IRI`; a plain ``str`` in any of them is taken as
+    an IRI. The object is any value a property holds. A claim about a triple
+    is the quad ``(claim, rdf:reifies, Triple(...))``."""
+
+    subject: IRI | BlankNode
+    predicate: IRI
+    object: Any
+    graph: IRI | BlankNode | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "subject", _node(self.subject, "quad's subject"))
+        object.__setattr__(self, "predicate", _iri(self.predicate, "quad's predicate"))
+        if self.graph is not None:
+            object.__setattr__(self, "graph", _node(self.graph, "quad's graph"))
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter((self.subject, self.predicate, self.object, self.graph))
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (Quad, (self.subject, self.predicate, self.object, self.graph))
+
+
+def _unchecked(cls: type[_T], fields: tuple[str, ...]) -> Callable[..., _T]:
+    """A constructor for ``cls`` that sets ``fields`` without checking them,
+    three times faster than the class: for terms the readers produce, which
+    are already of the right kinds."""
+    slots = tuple(cls.__dict__[name].__set__ for name in fields)
+
+    def make(*values: Any) -> _T:
+        made = cls.__new__(cls)
+        for slot, value in zip(slots, values):
+            slot(made, value)
+        return made
+
+    return make
+
+
+def _node(value: Any, role: str) -> IRI | BlankNode:
+    """``value`` as an IRI or blank node; a plain ``str`` is an IRI."""
+    if isinstance(value, (IRI, BlankNode)):
+        return value
+    if type(value) is str:
+        return IRI(value)
+    raise TypeError(f"a {role} is an IRI or a blank node, not a {type(value).__name__}")
+
+
+def _iri(value: Any, role: str) -> IRI:
+    """``value`` as an IRI; a plain ``str`` is one."""
+    if isinstance(value, IRI):
+        return value
+    if type(value) is str:
+        return IRI(value)
+    raise TypeError(f"a {role} is an IRI, not a {type(value).__name__}")
+
+
 def _boolean(lexical: str) -> bool:
     if lexical in ("true", "1"):
         return True
@@ -196,6 +287,8 @@ def to_python(cell: tuple[Any, ...] | None) -> Any:
         return IRI(cell[1])
     if kind == "bnode":
         return BlankNode(cell[1])
+    if kind == "triple":
+        return Triple(to_python(cell[1]), to_python(cell[2]), to_python(cell[3]))
     _, lexical, datatype, language = cell
     if language is not None:
         return LangString(lexical, language)
@@ -206,3 +299,24 @@ def to_python(cell: tuple[Any, ...] | None) -> Any:
         except ValueError:
             pass
     return Literal(lexical, datatype)
+
+
+def to_lexical(cell: tuple[Any, ...]) -> Any:
+    """Like :func:`to_python`, but a typed literal other than ``xsd:string``
+    stays a :class:`Literal` with its lexical form, so ``"01"^^xsd:integer``
+    is ``Literal("01", xsd:integer)`` rather than ``1``."""
+    kind = cell[0]
+    if kind == "triple":
+        return Triple(to_lexical(cell[1]), to_lexical(cell[2]), to_lexical(cell[3]))
+    if kind != "literal":
+        return to_python(cell)
+    _, lexical, datatype, language = cell
+    if language is not None:
+        return LangString(lexical, language)
+    if datatype == XSD + "string":
+        return lexical
+    return Literal(lexical, datatype)
+
+
+trusted_quad = _unchecked(Quad, ("subject", "predicate", "object", "graph"))
+trusted_triple = _unchecked(Triple, ("subject", "predicate", "object"))

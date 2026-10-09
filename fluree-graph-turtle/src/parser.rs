@@ -1,6 +1,8 @@
 //! Turtle parser that emits to GraphSink.
 //!
 //! Parses Turtle syntax and emits triple events to a GraphSink implementation.
+//! TriG is a [`Dialect`] of the same parser: its graph blocks route every
+//! Turtle production inside them to the block's graph.
 //! Uses span-based token access: most tokens carry no data, and the parser
 //! extracts content from the source input via byte offsets.
 
@@ -13,7 +15,7 @@ use rustc_hash::FxHashMap;
 
 use crate::error::{Result, TurtleError};
 use crate::lex::{StreamingLexer, Token, TokenKind};
-use crate::options::{CollectionStyle, NumericStyle, ParserOptions};
+use crate::options::{CollectionStyle, Dialect, NumericStyle, ParserOptions};
 
 /// RDF well-known IRIs (imported from vocab crate)
 const RDF_TYPE: &str = rdf::TYPE;
@@ -63,6 +65,12 @@ pub struct Parser<'a, 'input, S> {
     /// `r rdf:reifies <<( s p o )>>` spelling by `TermId` equality without
     /// interning `rdf:reifies` into documents that never use it.
     reifies_term: Option<TermId>,
+    /// The named graph of the TriG graph block being parsed; `None` is the
+    /// default graph, and every Turtle document. Every emission goes through
+    /// the `sink_emit_*` helpers, so this one field is what puts all of a
+    /// block's productions — object lists, collections, property lists,
+    /// annotations — in its graph.
+    current_graph: Option<TermId>,
     /// Nesting depth of `{| … |}` annotation bodies currently being parsed.
     /// Non-zero means we are inside an annotation body, where further star
     /// constructs (annotation-of-annotation, reified triples) are the
@@ -137,6 +145,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             prefixes: FxHashMap::default(),
             base: None,
             reifies_term: None,
+            current_graph: None,
             annotation_depth: 0,
             nesting_depth: 0,
             options,
@@ -329,7 +338,10 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         predicate: TermId,
         object: TermId,
     ) -> Result<()> {
-        self.sink.emit_triple(subject, predicate, object)?;
+        match self.current_graph {
+            None => self.sink.emit_triple(subject, predicate, object)?,
+            Some(graph) => self.sink.emit_quad(subject, predicate, object, graph)?,
+        }
         self.emit_count += 1;
         Ok(())
     }
@@ -342,8 +354,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         object: TermId,
         index: i32,
     ) -> Result<()> {
-        self.sink
-            .emit_list_item(subject, predicate, object, index)?;
+        match self.current_graph {
+            None => self
+                .sink
+                .emit_list_item(subject, predicate, object, index)?,
+            Some(graph) => self
+                .sink
+                .emit_quad_list_item(subject, predicate, object, index, graph)?,
+        }
         self.emit_count += 1;
         Ok(())
     }
@@ -356,8 +374,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         object: TermId,
         reifier: TermId,
     ) -> Result<()> {
-        self.sink
-            .emit_reified_triple(subject, predicate, object, reifier)?;
+        match self.current_graph {
+            None => self
+                .sink
+                .emit_reified_triple(subject, predicate, object, reifier)?,
+            Some(graph) => self
+                .sink
+                .emit_quad_reified_triple(subject, predicate, object, reifier, graph)?,
+        }
         self.emit_count += 1;
         Ok(())
     }
@@ -527,7 +551,125 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             TokenKind::KwBase | TokenKind::KwSparqlBase => self.parse_base_directive(),
             TokenKind::KwVersion | TokenKind::KwSparqlVersion => self.parse_version_directive(),
             TokenKind::Eof => Ok(()),
+            // TriG's graph blocks; in Turtle these fall through to
+            // `parse_triples`, which rejects them.
+            TokenKind::KwGraph if self.options.dialect == Dialect::TriG => {
+                self.parse_graph_keyword_block()
+            }
+            // A bare `{ … }` is the default graph.
+            TokenKind::LBrace if self.options.dialect == Dialect::TriG => {
+                self.parse_wrapped_graph(None)
+            }
             _ => self.parse_triples(),
+        }
+    }
+
+    /// Whether the current token can name a graph: an IRI or a blank node.
+    /// Narrower than a subject on purpose — a `[ … ]` property list or a
+    /// collection has emitted its triples by the time a `{` could follow,
+    /// and neither can name a graph.
+    fn at_graph_label(&self) -> bool {
+        matches!(
+            self.current().kind,
+            TokenKind::Iri
+                | TokenKind::IriEscaped(_)
+                | TokenKind::PrefixedName
+                | TokenKind::PrefixedNameNs
+                | TokenKind::BlankNodeLabel
+                | TokenKind::Anon
+        )
+    }
+
+    /// `GRAPH label { … }`.
+    fn parse_graph_keyword_block(&mut self) -> Result<()> {
+        self.advance()?; // consume GRAPH
+        if !self.at_graph_label() {
+            return Err(TurtleError::parse(
+                self.current().start as usize,
+                format!(
+                    "expected a graph name (an IRI or a blank node) after GRAPH, found {}",
+                    self.current().kind
+                ),
+            ));
+        }
+        let label = self.parse_subject()?;
+        if !self.check(&TokenKind::LBrace) {
+            return Err(TurtleError::parse(
+                self.current().start as usize,
+                format!(
+                    "expected '{{' to open the graph block, found {}",
+                    self.current().kind
+                ),
+            ));
+        }
+        self.parse_wrapped_graph(Some(label))
+    }
+
+    /// `{ … }` with `graph` in scope for everything inside it. The block is
+    /// one statement to the sink, so its triples commit together.
+    fn parse_wrapped_graph(&mut self, graph: Option<TermId>) -> Result<()> {
+        // Once per block rather than per triple: a sink that cannot hold a
+        // named graph would otherwise have taken triples before the refusal.
+        if graph.is_some() && !self.sink.supports_quads() {
+            return Err(TurtleError::parse(
+                self.current().start as usize,
+                "the document has a named graph, which this parse's output cannot \
+                 represent without dropping the graph's name",
+            ));
+        }
+        self.advance()?; // consume `{`
+        let outer = std::mem::replace(&mut self.current_graph, graph);
+        let body = self.parse_graph_body();
+        self.current_graph = outer;
+        body?;
+        if !self.check(&TokenKind::RBrace) {
+            return Err(TurtleError::parse(
+                self.current().start as usize,
+                format!(
+                    "expected '}}' to close the graph block, found {}",
+                    self.current().kind
+                ),
+            ));
+        }
+        // Commit before stepping past `}`, as `end_statement_at_dot` does
+        // before a `.`: the lookahead lexes the next statement.
+        self.sink.end_statement();
+        self.committed_current = true;
+        self.advance()
+    }
+
+    /// The statements of a graph block, whose last `.` may be left out.
+    fn parse_graph_body(&mut self) -> Result<()> {
+        loop {
+            if matches!(self.current().kind, TokenKind::RBrace | TokenKind::Eof) {
+                return Ok(());
+            }
+            // As in `parse_triples`: only a property list or a reified triple
+            // may stand without a predicate-object list, having emitted its
+            // own triples.
+            let optional_predicates = matches!(
+                self.current().kind,
+                TokenKind::LBracket | TokenKind::ReifiedTripleStart
+            );
+            let subject = self.parse_subject()?;
+            if !(optional_predicates
+                && matches!(self.current().kind, TokenKind::Dot | TokenKind::RBrace))
+            {
+                self.parse_predicate_object_list(subject)?;
+            }
+            match self.current().kind {
+                TokenKind::Dot => self.advance()?,
+                TokenKind::RBrace => return Ok(()),
+                _ => {
+                    return Err(TurtleError::parse(
+                        self.current().start as usize,
+                        format!(
+                            "expected '.' or '}}' in a graph block, found {}",
+                            self.current().kind
+                        ),
+                    ))
+                }
+            }
         }
     }
 
@@ -760,11 +902,18 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
     /// Parse a triple statement.
     fn parse_triples(&mut self) -> Result<()> {
+        // TriG: a graph name followed by `{` opens a graph block. Only the
+        // token after the name tells, so it is parsed as a subject and then
+        // taken as the graph's name.
+        let graph_label = self.options.dialect == Dialect::TriG && self.at_graph_label();
         let optional_predicates = matches!(
             self.current().kind,
             TokenKind::LBracket | TokenKind::ReifiedTripleStart
         );
         let subject = self.parse_subject()?;
+        if graph_label && self.check(&TokenKind::LBrace) {
+            return self.parse_wrapped_graph(Some(subject));
+        }
         // Turtle grammar: `blankNodePropertyList predicateObjectList? '.'` and
         // (RDF 1.2) `reifiedTriple predicateObjectList? '.'` — the
         // predicate-object list is optional when the subject already emitted
@@ -840,6 +989,8 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                         | TokenKind::RBracket
                         | TokenKind::Eof
                         | TokenKind::AnnotationClose
+                        // TriG: a block's last statement may end at `}`.
+                        | TokenKind::RBrace
                 ) {
                     break;
                 }
@@ -1626,12 +1777,18 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                             r
                         }
                     };
-                    if !matches!(self.current().kind, TokenKind::AnnotationClose) {
-                        self.annotation_depth += 1;
-                        let body = self.parse_predicate_object_list(reifier);
-                        self.annotation_depth -= 1;
-                        body?;
+                    // `annotationBlock ::= '{|' predicateObjectList '|}'`.
+                    if self.check(&TokenKind::AnnotationClose) {
+                        return Err(TurtleError::parse(
+                            self.current().start as usize,
+                            "an annotation block '{| … |}' needs at least one predicate \
+                             and object",
+                        ));
                     }
+                    self.annotation_depth += 1;
+                    let body = self.parse_predicate_object_list(reifier);
+                    self.annotation_depth -= 1;
+                    body?;
                     self.expect(&TokenKind::AnnotationClose)?;
                 }
                 _ => break,
@@ -1699,6 +1856,20 @@ pub fn unescape_pn_local(local: &str) -> String {
 /// [`ParserOptions::default`].
 pub fn parse<S: GraphSink>(input: &str, sink: &mut S) -> Result<()> {
     Parser::new(input, sink)?.parse()
+}
+
+/// Parse a TriG document into GraphSink events: [`parse`] with
+/// [`Dialect::TriG`]. A named graph needs a sink that
+/// [supports quads](GraphSink::supports_quads); against one that does not,
+/// the parse fails rather than fold the graph into the default graph. For
+/// the faithful-RDF shape, use [`parse_with_options`] with
+/// `ParserOptions::conformant().with_dialect(Dialect::TriG)`.
+pub fn parse_trig<S: GraphSink>(input: &str, sink: &mut S) -> Result<()> {
+    parse_with_options(
+        input,
+        sink,
+        ParserOptions::default().with_dialect(Dialect::TriG),
+    )
 }
 
 /// Parse a Turtle document into GraphSink events under explicit

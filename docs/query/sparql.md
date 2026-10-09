@@ -395,6 +395,9 @@ subquery.
   remote `SERVICE`, whose body is sent to the endpoint as written.
 - `INSERT DATA` and `DELETE DATA` take no variables, so no parameters; use
   `INSERT { ... } WHERE { ... }`.
+- A parameter can be an RDF 1.2 triple term (in Python a `fluree.Triple`; in
+  JSON-LD `{"@id": {"@id": s, p: o}}`), so `?claim rdf:reifies $t` finds the
+  reifiers of one triple. It can't be a subject or a reifier.
 
 ## Aggregation
 
