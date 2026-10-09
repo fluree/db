@@ -183,7 +183,6 @@ impl IcebergGsConfig {
         ))
     }
 
-    /// Validate the configuration.
     /// Checks shared by the native-AWS catalog modes (Glue, S3 Tables).
     fn validate_aws_sdk_catalog(&self, mode: &str) -> Result<()> {
         // Every table is named `<namespace>.<table>`; nothing derives from a path.
@@ -214,6 +213,7 @@ impl IcebergGsConfig {
         }
     }
 
+    /// Validate the configuration.
     pub fn validate(&self) -> Result<()> {
         match &self.catalog {
             CatalogConfig::Rest { uri, .. } => {
