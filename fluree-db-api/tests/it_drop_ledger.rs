@@ -10,7 +10,7 @@
 use crate::support::start_background_indexer_local;
 use fluree_db_api::{DropMode, DropStatus, FlureeBuilder, IndexConfig, LedgerState, Novelty};
 use fluree_db_core::address_path::ledger_id_to_path_prefix;
-use fluree_db_core::LedgerSnapshot;
+use fluree_db_core::{ContentKind, LedgerSnapshot};
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
 use tokio::time::{timeout, Duration};
@@ -71,10 +71,12 @@ async fn drop_ledger_soft_mode_retracts_only() {
     assert!(!files.is_empty(), "Commit files should remain in soft mode");
 }
 
-/// The edge-annotation arenas have no storage layout of their own and land
-/// under the branch's `blob/` prefix; a hard drop must take them too.
+/// The legacy edge-annotation arenas have no storage layout of their own and
+/// sit under the branch's `blob/` prefix; a hard drop must take them too.
+/// Builds no longer write them, so the test places one where an older build
+/// left it.
 #[tokio::test]
-async fn hard_drop_removes_annotation_arenas_under_blob() {
+async fn hard_drop_removes_legacy_annotation_arenas_under_blob() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
         .build()
@@ -87,31 +89,25 @@ async fn hard_drop_removes_annotation_arenas_under_blob() {
             &json!({
                 "@context": {"ex": "http://example.org/"},
                 "@id": "ex:alice",
-                "ex:worksFor": {
-                    "@id": "ex:acme",
-                    "@annotation": {"@id": "ex:emp/alice-acme", "ex:role": "Engineer"}
-                }
+                "ex:name": "Alice"
             }),
         )
         .await
         .expect("insert");
-    fluree
-        .reindex(ledger_id, fluree_db_api::ReindexOptions::default())
-        .await
-        .expect("reindex");
 
     let storage = fluree.admin_storage().expect("managed backend");
     let blob_prefix = format!(
         "fluree:file://{}/blob/",
         ledger_id_to_path_prefix(ledger_id).unwrap()
     );
+    let arena = storage
+        .content_write_bytes(ContentKind::AnnotationForwardLeaf, ledger_id, b"EAFL1")
+        .await
+        .expect("write arena leaf");
     assert!(
-        !storage
-            .list_prefix(&blob_prefix)
-            .await
-            .expect("list")
-            .is_empty(),
-        "the reindex should have sealed an annotation arena under blob/"
+        arena.address.starts_with(&blob_prefix),
+        "an annotation arena leaf belongs under blob/: {}",
+        arena.address
     );
 
     fluree
