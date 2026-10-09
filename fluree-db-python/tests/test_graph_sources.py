@@ -172,6 +172,13 @@ def test_glue_and_s3_tables_mistakes_are_refused(conn):
         conn.map_iceberg("x", ORDERS_MAPPING, s3_tables=fluree.S3Tables("not-an-arn"))
     with pytest.raises(fluree.FlureeError, match="not an AWS region"):
         conn.map_iceberg("x", ORDERS_MAPPING, glue=fluree.Glue(region="evil.com"))
+    # REST-only settings would be ignored by Glue / S3 Tables: refused instead.
+    with pytest.raises(InvalidRequestError, match="auth applies to rest mode only"):
+        conn.map_iceberg("x", ORDERS_MAPPING, glue=fluree.Glue(), auth=Bearer("t"))
+    with pytest.raises(InvalidRequestError, match="vended_credentials applies to rest mode only"):
+        conn.map_iceberg("x", ORDERS_MAPPING, glue=fluree.Glue(), vended_credentials=True)
+    # Turning vending off agrees with every mode.
+    conn.map_iceberg("glue-no-vend", ORDERS_MAPPING, glue=fluree.Glue(), vended_credentials=False)
 
 
 def test_a_rest_catalog_source_can_take_its_tables_from_the_mapping(conn):

@@ -516,6 +516,10 @@ pub struct CatalogModeArgs<'a> {
     pub catalog_id: Option<&'a str>,
     /// S3 Tables table-bucket ARN (`s3tables`).
     pub table_bucket_arn: Option<&'a str>,
+    /// The REST-only settings (catalog auth, warehouse, a request for vended
+    /// credentials) the caller was given, by field name. Any other mode refuses
+    /// them rather than silently ignoring them.
+    pub rest_only: &'a [&'static str],
 }
 
 /// Why catalog-mode arguments do not describe a source. Field names are the
@@ -533,6 +537,11 @@ pub enum CatalogModeError {
     },
     /// A catalog mode with no R2RML mapping needs the source's own `table`.
     MissingTable { mode: &'static str },
+    /// `field` is a REST catalog setting, which this mode would ignore.
+    NotForMode {
+        mode: &'static str,
+        field: &'static str,
+    },
 }
 
 #[cfg(feature = "iceberg")]
@@ -550,6 +559,10 @@ impl CatalogModeError {
                 "{} is required for {mode} mode (or provide {} to define tables via mapping)",
                 spell("table"),
                 spell("r2rml")
+            ),
+            CatalogModeError::NotForMode { mode, field } => format!(
+                "{} applies to rest mode only; {mode} mode would ignore it",
+                spell(field)
             ),
         }
     }
@@ -572,14 +585,27 @@ impl IcebergConnectionConfig {
         } else {
             args.mode.to_lowercase()
         };
+        let refuse_rest_only = |mode: &'static str| match args.rest_only.first().copied() {
+            Some(field) => Err(CatalogModeError::NotForMode { mode, field }),
+            None => Ok(()),
+        };
         Ok(match mode.as_str() {
             "rest" => Self::rest(required(args.catalog_uri, "rest", "catalog_uri")?),
-            "direct" => Self::direct(required(args.table_location, "direct", "table_location")?),
-            "glue" => Self::glue(owned(args.region), owned(args.catalog_id)),
-            "s3tables" => Self::s3_tables(
-                owned(args.region),
-                required(args.table_bucket_arn, "s3tables", "table_bucket_arn")?,
-            ),
+            "direct" => {
+                refuse_rest_only("direct")?;
+                Self::direct(required(args.table_location, "direct", "table_location")?)
+            }
+            "glue" => {
+                refuse_rest_only("glue")?;
+                Self::glue(owned(args.region), owned(args.catalog_id))
+            }
+            "s3tables" => {
+                refuse_rest_only("s3tables")?;
+                Self::s3_tables(
+                    owned(args.region),
+                    required(args.table_bucket_arn, "s3tables", "table_bucket_arn")?,
+                )
+            }
             _ => return Err(CatalogModeError::UnknownMode(args.mode.to_string())),
         })
     }
@@ -2066,6 +2092,45 @@ mod tests {
             missing(mode_args("hadoop")),
             CatalogModeError::UnknownMode("hadoop".to_string())
         );
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn rest_only_settings_are_refused_by_other_modes() {
+        // Catalog auth or a warehouse given to a non-REST mode would be silently
+        // ignored; refuse it, naming the setting in the caller's spelling.
+        let auth = ["auth_bearer"];
+        let err = IcebergConnectionConfig::from_mode(CatalogModeArgs {
+            rest_only: &auth,
+            ..mode_args("glue")
+        })
+        .unwrap_err();
+        assert_eq!(
+            err.message(|f| format!("--{}", f.replace('_', "-"))),
+            "--auth-bearer applies to rest mode only; glue mode would ignore it"
+        );
+        for mode in ["direct", "s3tables"] {
+            let args = CatalogModeArgs {
+                table_location: Some("s3://b/w/ns/t"),
+                table_bucket_arn: Some(S3TABLES_ARN),
+                rest_only: &["warehouse"],
+                ..mode_args(mode)
+            };
+            assert!(matches!(
+                IcebergConnectionConfig::from_mode(args),
+                Err(CatalogModeError::NotForMode {
+                    field: "warehouse",
+                    ..
+                })
+            ));
+        }
+        // REST takes them.
+        IcebergConnectionConfig::from_mode(CatalogModeArgs {
+            catalog_uri: Some("https://polaris.example.com"),
+            rest_only: &["auth_bearer", "warehouse"],
+            ..mode_args("rest")
+        })
+        .unwrap();
     }
 
     #[cfg(feature = "iceberg")]

@@ -38,7 +38,8 @@ pub(crate) struct IcebergSpec {
     table: Option<String>,
     warehouse: Option<String>,
     auth: Option<Py<PyAny>>,
-    vended_credentials: bool,
+    /// `None` = REST's default (on); only REST can vend.
+    vended_credentials: Option<bool>,
     s3_region: Option<String>,
     s3_endpoint: Option<String>,
     s3_path_style: bool,
@@ -158,6 +159,17 @@ pub(crate) fn map_iceberg<'py>(
             ))
         }
     };
+    // Settings only a REST catalog uses: refused by any other mode rather than
+    // silently ignored. Turning vending off agrees with every mode, so only an
+    // explicit request for it counts.
+    let rest_only: Vec<&'static str> = [
+        ("warehouse", spec.warehouse.is_some()),
+        ("auth", spec.auth.is_some()),
+        ("vended_credentials", spec.vended_credentials == Some(true)),
+    ]
+    .into_iter()
+    .filter_map(|(name, given)| given.then_some(name))
+    .collect();
     // The same parse the CLI and server use: the mapping names the tables, so a
     // catalog mode needs no `table` of its own.
     let mode_args = CatalogModeArgs {
@@ -171,6 +183,7 @@ pub(crate) fn map_iceberg<'py>(
             .or_else(|| spec.s3_tables.as_ref().and_then(|t| t.region.as_deref())),
         catalog_id: spec.glue.as_ref().and_then(|g| g.catalog_id.as_deref()),
         table_bucket_arn: spec.s3_tables.as_ref().map(|t| t.table_bucket_arn.as_str()),
+        rest_only: &rest_only,
     };
     let iceberg =
         IcebergCreateConfig::from_mode(&common.name, mode_args, spec.table.as_deref(), true)
@@ -184,7 +197,7 @@ pub(crate) fn map_iceberg<'py>(
     if let CatalogMode::Rest(catalog) = &mut config.iceberg.connection.catalog_mode {
         catalog.warehouse = spec.warehouse;
         catalog.auth = auth(py, spec.auth.as_ref())?;
-        config.iceberg.connection.io.vended_credentials = spec.vended_credentials;
+        config.iceberg.connection.io.vended_credentials = spec.vended_credentials.unwrap_or(true);
     }
     let io = &mut config.iceberg.connection.io;
     io.s3_region = spec.s3_region;

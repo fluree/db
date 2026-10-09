@@ -246,7 +246,7 @@ class Connection:
         table: str | None = None,
         warehouse: str | None = None,
         auth: Auth | None = None,
-        vended_credentials: bool = True,
+        vended_credentials: bool | None = None,
         s3_region: str | None = None,
         s3_endpoint: str | None = None,
         s3_path_style: bool = False,
@@ -270,7 +270,8 @@ class Connection:
         (:class:`S3Tables`). A REST catalog's vended credentials are used
         unless ``vended_credentials`` is false; otherwise, and always for
         Glue and S3 Tables, S3 access uses the usual AWS environment and the
-        ``s3_*`` settings.
+        ``s3_*`` settings. ``warehouse``, ``auth`` and asking for vended
+        credentials apply to a REST catalog only, and are refused otherwise.
 
         ``order_by`` names the column that orders a key's rows, latest
         winning, for :meth:`GraphSource.materialize`. ``model`` names a

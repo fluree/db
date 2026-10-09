@@ -68,6 +68,8 @@ fluree iceberg map <NAME> [OPTIONS]
 
 **Authentication:**
 
+These options, and `--warehouse`, configure a REST catalog: any other `--mode` refuses them rather than ignore them.
+
 | Option | Description |
 |--------|-------------|
 | `--auth-bearer <TOKEN>` | Bearer token for REST catalog authentication. Stored with the graph source; prefer the option below |

@@ -669,6 +669,15 @@ pub(crate) fn secret_value(
     }
 }
 
+/// The REST-only settings a request set, by field name, for the shared parser
+/// to refuse in any other catalog mode (it would otherwise ignore them).
+fn given_rest_only(fields: &[(&'static str, bool)]) -> Vec<&'static str> {
+    fields
+        .iter()
+        .filter_map(|&(name, given)| given.then_some(name))
+        .collect()
+}
+
 fn build_iceberg_config(req: &IcebergMapRequest) -> Result<fluree_db_api::IcebergCreateConfig> {
     build_iceberg_config_allowing(req, &allowed_secret_env())
 }
@@ -678,6 +687,22 @@ fn build_iceberg_config_allowing(
     allowed_env: &str,
 ) -> Result<fluree_db_api::IcebergCreateConfig> {
     // One mode dispatch for every surface (the CLI parses its flags the same way).
+    let rest_only = given_rest_only(&[
+        ("auth_bearer", req.auth_bearer.is_some()),
+        ("auth_bearer_env", req.auth_bearer_env.is_some()),
+        ("oauth2_token_url", req.oauth2_token_url.is_some()),
+        ("oauth2_client_id", req.oauth2_client_id.is_some()),
+        ("oauth2_client_secret", req.oauth2_client_secret.is_some()),
+        (
+            "oauth2_client_secret_env",
+            req.oauth2_client_secret_env.is_some(),
+        ),
+        ("oauth2_scope", req.oauth2_scope.is_some()),
+        ("oauth2_audience", req.oauth2_audience.is_some()),
+        ("auth_google_metadata", req.auth_google_metadata),
+        ("auth_google_scopes", req.auth_google_scopes.is_some()),
+        ("warehouse", req.warehouse.is_some()),
+    ]);
     let mut config = fluree_db_api::IcebergCreateConfig::from_mode(
         &req.name,
         fluree_db_api::CatalogModeArgs {
@@ -687,6 +712,7 @@ fn build_iceberg_config_allowing(
             region: req.region.as_deref(),
             catalog_id: req.catalog_id.as_deref(),
             table_bucket_arn: req.table_bucket_arn.as_deref(),
+            rest_only: &rest_only,
         },
         req.table.as_deref(),
         req.r2rml.is_some(),
@@ -832,6 +858,20 @@ fn build_iceberg_connection_allowing(
 ) -> Result<fluree_db_api::IcebergConnectionConfig> {
     use fluree_db_api::IcebergConnectionConfig;
 
+    let rest_only = given_rest_only(&[
+        ("auth_bearer", req.auth_bearer.is_some()),
+        ("auth_bearer_env", req.auth_bearer_env.is_some()),
+        ("oauth2_token_url", req.oauth2_token_url.is_some()),
+        ("oauth2_client_id", req.oauth2_client_id.is_some()),
+        ("oauth2_client_secret", req.oauth2_client_secret.is_some()),
+        (
+            "oauth2_client_secret_env",
+            req.oauth2_client_secret_env.is_some(),
+        ),
+        ("oauth2_scope", req.oauth2_scope.is_some()),
+        ("oauth2_audience", req.oauth2_audience.is_some()),
+        ("warehouse", req.warehouse.is_some()),
+    ]);
     let mut conn = IcebergConnectionConfig::from_mode(fluree_db_api::CatalogModeArgs {
         mode: &req.mode,
         catalog_uri: req.catalog_uri.as_deref(),
@@ -839,6 +879,7 @@ fn build_iceberg_connection_allowing(
         region: req.region.as_deref(),
         catalog_id: req.catalog_id.as_deref(),
         table_bucket_arn: req.table_bucket_arn.as_deref(),
+        rest_only: &rest_only,
     })
     .map_err(|e| ServerError::bad_request(e.message(str::to_string)))?;
 
@@ -1531,6 +1572,27 @@ mod tests {
     fn build_iceberg_connection_s3tables_requires_arn() {
         // s3tables mode without an ARN is a 400, mirroring build_iceberg_config.
         let body = serde_json::json!({ "mode": "s3tables" });
+        let req: IcebergBrowseRequest = serde_json::from_value(body).unwrap();
+        assert!(build_iceberg_connection(&req.connection).is_err());
+    }
+
+    #[test]
+    fn rest_only_fields_are_refused_by_other_modes() {
+        // Catalog auth sent with mode glue would be ignored; refuse it.
+        let body = serde_json::json!({
+            "name": "orders",
+            "mode": "glue",
+            "auth_bearer": "token",
+            "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> ."
+        });
+        let req: IcebergMapRequest = serde_json::from_value(body).unwrap();
+        let err = build_iceberg_config(&req).unwrap_err().to_string();
+        assert!(
+            err.contains("auth_bearer applies to rest mode only"),
+            "{err}"
+        );
+
+        let body = serde_json::json!({ "mode": "direct", "table_location": "s3://b/w/ns/t", "warehouse": "wh" });
         let req: IcebergBrowseRequest = serde_json::from_value(body).unwrap();
         assert!(build_iceberg_connection(&req.connection).is_err());
     }
