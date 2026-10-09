@@ -4,6 +4,7 @@
 //! metadata (`ColumnBlockRef`) lives in the leaf-level leaflet directory —
 //! there is no per-leaflet local directory.
 
+use std::cell::RefCell;
 use std::io;
 
 /// Column identifier. Determines the semantic meaning and element type
@@ -195,10 +196,11 @@ pub fn decode_column_u64(data: &[u8], block_ref: &ColumnBlockRef) -> io::Result<
             "column block extends beyond data",
         ));
     }
-    let decompressed =
-        zstd::bulk::decompress(&data[start..end], block_ref.uncompressed_len as usize)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    Ok(le_bytes_to_u64_vec(&decompressed))
+    with_decompressed(
+        &data[start..end],
+        block_ref.uncompressed_len as usize,
+        le_bytes_to_u64_vec,
+    )
 }
 
 /// Decode a compressed column block of `u32` values.
@@ -211,10 +213,11 @@ pub fn decode_column_u32(data: &[u8], block_ref: &ColumnBlockRef) -> io::Result<
             "column block extends beyond data",
         ));
     }
-    let decompressed =
-        zstd::bulk::decompress(&data[start..end], block_ref.uncompressed_len as usize)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    Ok(le_bytes_to_u32_vec(&decompressed))
+    with_decompressed(
+        &data[start..end],
+        block_ref.uncompressed_len as usize,
+        le_bytes_to_u32_vec,
+    )
 }
 
 /// Decode a compressed column block of `u16` values.
@@ -227,10 +230,36 @@ pub fn decode_column_u16(data: &[u8], block_ref: &ColumnBlockRef) -> io::Result<
             "column block extends beyond data",
         ));
     }
-    let decompressed =
-        zstd::bulk::decompress(&data[start..end], block_ref.uncompressed_len as usize)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    Ok(le_bytes_to_u16_vec(&decompressed))
+    with_decompressed(
+        &data[start..end],
+        block_ref.uncompressed_len as usize,
+        le_bytes_to_u16_vec,
+    )
+}
+
+thread_local! {
+    /// One zstd decompression context and output buffer per thread. A fresh
+    /// context per column block (what `zstd::bulk::decompress` does) costs an
+    /// allocation and a zeroed workspace, a fixed tax that small leaflets pay
+    /// once per column per leaflet.
+    static DECOMPRESS: RefCell<Option<(zstd::bulk::Decompressor<'static>, Vec<u8>)>> =
+        const { RefCell::new(None) };
+}
+
+/// Decompress `src` (at most `len` bytes of output) and hand the bytes to `f`.
+fn with_decompressed<R>(src: &[u8], len: usize, f: impl FnOnce(&[u8]) -> R) -> io::Result<R> {
+    let invalid = |e| io::Error::new(io::ErrorKind::InvalidData, e);
+    DECOMPRESS.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some((zstd::bulk::Decompressor::new()?, Vec::new()));
+        }
+        let (dctx, buf) = slot.as_mut().expect("decompressor initialized above");
+        buf.clear();
+        buf.reserve(len);
+        dctx.decompress_to_buffer(src, buf).map_err(invalid)?;
+        Ok(f(buf))
+    })
 }
 
 // ============================================================================
