@@ -31,6 +31,12 @@ All `@vector` values are stored as **IEEE-754 binary32 (f32)** arrays. This mean
 
 If you need higher precision (f64) or different vector formats (sparse, integer), store them as a custom RDF datatype string.
 
+### Length
+
+A vector has 1 to 65,535 elements. In each graph, all the vectors a property holds have the same length: the length of the first vector the property received in that graph. Retracting vectors does not reset it, because the ledger keeps their history. A write that breaks either rule is refused with an `Invalid vector` error, and nothing in it is committed.
+
+To keep embeddings of two lengths, such as those of two models, put them on two properties or in two graphs.
+
 ### Inserting vectors (JSON-LD)
 
 Use `"@type": "@vector"` to annotate a numeric array as a vector:
