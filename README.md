@@ -41,7 +41,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/fluree/db/releases/late
 irm https://github.com/fluree/db/releases/latest/download/fluree-db-cli-installer.ps1 | iex
 ```
 
-Pre-built binaries and the changelog for every release are on the [GitHub Releases page](https://github.com/fluree/db/releases).
+Pre-built binaries and the changelog for every release are on the [GitHub Releases page](https://github.com/fluree/db/releases). Pre-releases install from Homebrew as `fluree/tap/fluree-beta`, beside the stable `fluree` ([details](docs/getting-started/quickstart-server.md#option-2-homebrew-macos--linux)).
 
 ## Zero to graph in 60 seconds
 

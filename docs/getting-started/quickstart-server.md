@@ -16,6 +16,15 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/fluree/db/releases/late
 brew install fluree/tap/fluree
 ```
 
+`fluree` installs stable releases only. To try a pre-release, install `fluree-beta`, which follows the newest release, pre-release or stable. It installs beside `fluree` without replacing the `fluree` on your `PATH`, so you run it by its path:
+
+```bash
+brew install fluree/tap/fluree-beta
+"$(brew --prefix fluree/tap/fluree-beta)/bin/fluree" --version
+```
+
+To make the beta your default `fluree`, put `$(brew --prefix fluree/tap/fluree-beta)/bin` first in your `PATH`; take it out to go back to the stable release. When a stable release supersedes the beta, `brew upgrade` moves `fluree-beta` to it.
+
 ### Option 3: PowerShell (Windows)
 
 Open PowerShell and run:
