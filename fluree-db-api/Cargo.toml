@@ -121,7 +121,7 @@ csv = "1.4"
 percent-encoding = "2"
 
 # Opt-in AWS + LocalStack testing deps (feature-gated)
-testcontainers = { version = "0.23", optional = true }
+testcontainers = { version = "0.28", optional = true }
 aws-config = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
 aws-sdk-glue = { workspace = true, optional = true }
