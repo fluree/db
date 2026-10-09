@@ -1578,23 +1578,52 @@ mod tests {
 
     #[test]
     fn rest_only_fields_are_refused_by_other_modes() {
-        // Catalog auth sent with mode glue would be ignored; refuse it.
-        let body = serde_json::json!({
-            "name": "orders",
-            "mode": "glue",
-            "auth_bearer": "token",
-            "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> ."
-        });
-        let req: IcebergMapRequest = serde_json::from_value(body).unwrap();
-        let err = build_iceberg_config(&req).unwrap_err().to_string();
-        assert!(
-            err.contains("auth_bearer applies to rest mode only"),
-            "{err}"
-        );
+        // Catalog auth or a warehouse sent with another mode would be ignored;
+        // refuse each one, on both request shapes.
+        let connection_fields = [
+            "auth_bearer",
+            "auth_bearer_env",
+            "oauth2_token_url",
+            "oauth2_client_id",
+            "oauth2_client_secret",
+            "oauth2_client_secret_env",
+            "oauth2_scope",
+            "oauth2_audience",
+            "warehouse",
+        ];
+        let map_only = ["auth_google_metadata", "auth_google_scopes"];
+        let given = |field: &str| match field {
+            "auth_google_metadata" => serde_json::json!(true),
+            _ => serde_json::json!("x"),
+        };
 
-        let body = serde_json::json!({ "mode": "direct", "table_location": "s3://b/w/ns/t", "warehouse": "wh" });
-        let req: IcebergBrowseRequest = serde_json::from_value(body).unwrap();
-        assert!(build_iceberg_connection(&req.connection).is_err());
+        for field in connection_fields.iter().chain(&map_only) {
+            let mut body = serde_json::json!({
+                "name": "orders",
+                "mode": "glue",
+                "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> ."
+            });
+            body[*field] = given(field);
+            let req: IcebergMapRequest = serde_json::from_value(body).unwrap();
+            let err = build_iceberg_config(&req).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("{field} applies to rest mode only")),
+                "{field}: {err}"
+            );
+        }
+        for field in connection_fields {
+            let mut body =
+                serde_json::json!({ "mode": "direct", "table_location": "s3://b/w/ns/t" });
+            body[field] = given(field);
+            let req: IcebergBrowseRequest = serde_json::from_value(body).unwrap();
+            let err = build_iceberg_connection(&req.connection)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("{field} applies to rest mode only")),
+                "{field}: {err}"
+            );
+        }
     }
 
     #[test]

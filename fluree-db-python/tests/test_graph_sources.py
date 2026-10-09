@@ -177,6 +177,15 @@ def test_glue_and_s3_tables_mistakes_are_refused(conn):
         conn.map_iceberg("x", ORDERS_MAPPING, glue=fluree.Glue(), auth=Bearer("t"))
     with pytest.raises(InvalidRequestError, match="vended_credentials applies to rest mode only"):
         conn.map_iceberg("x", ORDERS_MAPPING, glue=fluree.Glue(), vended_credentials=True)
+    with pytest.raises(InvalidRequestError, match="warehouse applies to rest mode only"):
+        conn.map_iceberg("x", ORDERS_MAPPING, glue=fluree.Glue(), warehouse="w")
+    with pytest.raises(InvalidRequestError, match="auth applies to rest mode only"):
+        conn.map_iceberg(
+            "x",
+            ORDERS_MAPPING,
+            s3_tables=fluree.S3Tables("arn:aws:s3tables:us-east-1:123456789012:bucket/b"),
+            auth=Bearer("t"),
+        )
     # Turning vending off agrees with every mode.
     conn.map_iceberg("glue-no-vend", ORDERS_MAPPING, glue=fluree.Glue(), vended_credentials=False)
 
