@@ -4477,9 +4477,9 @@ pub(crate) mod tests {
             .expect("first remote open");
         assert_eq!(handle.dir().entries.len(), 1);
         let first_range_calls = store.range_calls();
-        assert!(
-            first_range_calls >= 2,
-            "expected initial remote open to fetch header+directory"
+        assert_eq!(
+            first_range_calls, 1,
+            "initial remote open fetches header+directory in one request"
         );
         drop(handle);
 
@@ -4601,9 +4601,9 @@ pub(crate) mod tests {
             "dir-only open must never fetch the full blob"
         );
         let first_range_calls = store.range_calls();
-        assert!(
-            first_range_calls >= 2,
-            "expected header + directory range reads"
+        assert_eq!(
+            first_range_calls, 1,
+            "header + directory come from one range read"
         );
 
         let dir2 = binary_store
