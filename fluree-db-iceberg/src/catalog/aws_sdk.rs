@@ -53,12 +53,23 @@ enum SdkFailure {
 /// Classify a catalog SDK error by its modeled error code, falling back to the
 /// raw HTTP status. Glue reports a missing database or table as
 /// `EntityNotFoundException`; S3 Tables as `NotFoundException`. Glue's denial is
-/// unmodeled (`AccessDeniedException`, HTTP 400); S3 Tables' is
-/// `ForbiddenException` / `AccessDeniedException` (HTTP 403).
+/// unmodeled (`AccessDeniedException`, HTTP 400), as are its credential failures
+/// (`ExpiredTokenException`, `UnrecognizedClientException`,
+/// `InvalidSignatureException`); S3 Tables' are `ForbiddenException` /
+/// `AccessDeniedException` (HTTP 403).
 fn classify_sdk_failure(code: Option<&str>, http_status: Option<u16>) -> SdkFailure {
     match code {
         Some("EntityNotFoundException" | "NotFoundException") => SdkFailure::NotFound,
-        Some("AccessDeniedException" | "ForbiddenException") => SdkFailure::AccessDenied,
+        // A refusal, or credentials the service will not accept: Glue reports an
+        // expired session or an unknown key as HTTP 400 codes, so match the code,
+        // and an expired session reads as a denial on both catalogs.
+        Some(
+            "AccessDeniedException"
+            | "ForbiddenException"
+            | "ExpiredTokenException"
+            | "UnrecognizedClientException"
+            | "InvalidSignatureException",
+        ) => SdkFailure::AccessDenied,
         _ => match http_status {
             Some(404) => SdkFailure::NotFound,
             Some(403) => SdkFailure::AccessDenied,
@@ -417,6 +428,18 @@ mod tests {
         );
         assert_eq!(classify_sdk_failure(None, Some(404)), NotFound);
         assert_eq!(classify_sdk_failure(None, Some(403)), AccessDenied);
+        // Glue's credential failures arrive as HTTP 400 codes, not a 403.
+        for code in [
+            "ExpiredTokenException",
+            "UnrecognizedClientException",
+            "InvalidSignatureException",
+        ] {
+            assert_eq!(
+                classify_sdk_failure(Some(code), Some(400)),
+                AccessDenied,
+                "{code}"
+            );
+        }
         assert_eq!(
             classify_sdk_failure(Some("ThrottlingException"), Some(400)),
             Other
