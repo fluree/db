@@ -17,7 +17,8 @@
 use crate::wasm_compat::memmap2;
 use std::io;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use fluree_db_core::ContentId;
 
@@ -365,7 +366,16 @@ pub struct RangeReadLeafHandle {
     fetcher: Arc<dyn RangeReadFetcher>,
     /// CID for the history sidecar, if one exists.
     sidecar_cid: Option<ContentId>,
+    /// Leaflet loads served by range reads so far.
+    range_loads: AtomicUsize,
+    /// The whole leaf, once this handle has seen a scan.
+    whole: OnceLock<Vec<u8>>,
 }
+
+/// Range-read leaflet loads one handle serves before it fetches the rest of
+/// the leaf in one request. A point read touches one or two leaflets; past
+/// that a remote store's per-request latency outweighs the extra bytes.
+const SCAN_WHOLE_LEAF_AFTER: usize = 3;
 
 /// Gap threshold for coalescing adjacent range reads (bytes).
 /// If two column blocks are within this many bytes of each other,
@@ -393,7 +403,33 @@ impl RangeReadLeafHandle {
             leaf_id,
             fetcher,
             sidecar_cid,
+            range_loads: AtomicUsize::new(0),
+            whole: OnceLock::new(),
         }
+    }
+
+    /// The whole leaf once the access pattern turns into a scan: fetched in
+    /// one request after `SCAN_WHOLE_LEAF_AFTER` range-read leaflet loads,
+    /// while leaflets remain to be read.
+    fn whole_for_scan(&self, leaflet_idx: usize) -> io::Result<Option<&[u8]>> {
+        if let Some(bytes) = self.whole.get() {
+            return Ok(Some(bytes));
+        }
+        let loads = self.range_loads.fetch_add(1, Ordering::Relaxed) + 1;
+        if loads <= SCAN_WHOLE_LEAF_AFTER || leaflet_idx + 1 >= self.dir.entries.len() {
+            return Ok(None);
+        }
+        let payload_end = self
+            .dir
+            .entries
+            .iter()
+            .map(|e| e.payload_offset as u64 + e.payload_len as u64)
+            .max()
+            .unwrap_or(0);
+        let bytes = self
+            .fetcher
+            .fetch_range(&self.leaf_cid, 0..self.payload_base + payload_end)?;
+        Ok(Some(self.whole.get_or_init(|| bytes)))
     }
 
     /// Compute the absolute byte range for a column block within the leaf blob.
@@ -488,7 +524,7 @@ impl LeafHandle for RangeReadLeafHandle {
         &self,
         leaflet_idx: usize,
         projection: &ColumnProjection,
-        _order: RunSortOrder,
+        order: RunSortOrder,
     ) -> io::Result<ColumnBatch> {
         use super::column_types::ColumnData;
         use crate::format::column_block::{
@@ -496,6 +532,9 @@ impl LeafHandle for RangeReadLeafHandle {
         };
 
         let entry = &self.dir.entries[leaflet_idx];
+        if let Some(bytes) = self.whole_for_scan(leaflet_idx)? {
+            return load_leaflet_columns(bytes, entry, self.dir.payload_base, projection, order);
+        }
         let row_count = entry.row_count as usize;
         let eff = projection.effective();
 
@@ -1161,5 +1200,48 @@ mod tests {
                 "{leaflets} leaflets"
             );
         }
+    }
+
+    /// A scan over a range-read leaf switches to one whole-leaf fetch after
+    /// `SCAN_WHOLE_LEAF_AFTER` leaflets, and decodes the same rows.
+    #[test]
+    fn range_read_scan_fetches_whole_leaf_once() {
+        let mut writer = LeafWriter::new(RunSortOrder::Post, 4, 100_000, 1);
+        writer.set_skip_history(true);
+        let ot = OType::XSD_INTEGER.as_u16();
+        for i in 0..80u64 {
+            writer.push_record(make_rec(i + 1, 1, ot, i, 1)).unwrap();
+        }
+        let leaf = writer.finish().unwrap().remove(0);
+        let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf.leaf_cid.to_bytes().as_ref());
+        let full = FullBlobLeafHandle::new(leaf.leaf_bytes.clone(), None, leaf_id).unwrap();
+
+        let mut fetcher = MockFetcher::new();
+        fetcher.insert(&leaf.leaf_cid, leaf.leaf_bytes);
+        let fetcher = Arc::new(fetcher);
+        let (dir, payload_base) =
+            fetch_header_and_directory(fetcher.as_ref(), &leaf.leaf_cid).unwrap();
+        let leaflets = dir.entries.len();
+        assert_eq!(leaflets, 20);
+        let handle = RangeReadLeafHandle::new(
+            leaf.leaf_cid,
+            dir,
+            payload_base,
+            leaf_id,
+            Arc::clone(&fetcher) as Arc<dyn RangeReadFetcher>,
+            None,
+        );
+        let proj = ColumnProjection::all();
+        for i in 0..leaflets {
+            let got = handle.load_columns(i, &proj, RunSortOrder::Post).unwrap();
+            let want = full.load_columns(i, &proj, RunSortOrder::Post).unwrap();
+            assert_eq!(got.row_count, want.row_count);
+            for r in 0..got.row_count {
+                assert_eq!(got.s_id.get(r), want.s_id.get(r));
+                assert_eq!(got.o_key.get(r), want.o_key.get(r));
+            }
+        }
+        // directory + SCAN_WHOLE_LEAF_AFTER range reads + one whole-leaf read
+        assert_eq!(fetcher.request_count(), 1 + SCAN_WHOLE_LEAF_AFTER + 1);
     }
 }
