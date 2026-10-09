@@ -386,10 +386,7 @@ fn parse_node_value(
             let ctx = if let Some(e) = entry {
                 if let Some(ref nested) = e.context {
                     let mut merged = context.clone();
-                    merged.terms.extend(nested.terms.clone());
-                    if nested.vocab.is_some() {
-                        merged.vocab = nested.vocab.clone();
-                    }
+                    apply_scoped_context(&mut merged, nested);
                     Cow::Owned(merged)
                 } else {
                     Cow::Borrowed(context)
@@ -504,11 +501,7 @@ fn parse_type<'c>(
         for orig_t in original_types {
             if let Some(entry) = context.get(orig_t) {
                 if let Some(ref sub_ctx) = entry.context {
-                    let updated_context = updated_context.to_mut();
-                    updated_context.terms.extend(sub_ctx.terms.clone());
-                    if sub_ctx.vocab.is_some() {
-                        updated_context.vocab = sub_ctx.vocab.clone();
-                    }
+                    apply_scoped_context(updated_context.to_mut(), sub_ctx);
                 }
             }
         }
@@ -516,6 +509,44 @@ fn parse_type<'c>(
         Ok((types, updated_context))
     } else {
         Ok((vec![], Cow::Borrowed(context)))
+    }
+}
+
+/// Apply a scoped (property- or type-scoped) context's terms to the active
+/// context. A scoped context is parsed on its own, when its term is defined,
+/// so a term IRI it writes as a compact IRI over a prefix it does not define
+/// (`{"b": {"@id": "ex:b"}}` under an outer `ex`) is still compact there. It
+/// is expanded here, against the active context the scoped context applies
+/// to, before the scoped terms take effect; left compact, it would expand a
+/// key to the compact string and store that as an IRI.
+fn apply_scoped_context(active: &mut ParsedContext, scoped: &ParsedContext) {
+    let resolve = |iri: &str| -> Option<String> {
+        let (prefix, suffix) = iri::parse_prefix(iri)?;
+        let prefix_iri = active.get(&prefix)?.id.as_deref()?;
+        (!prefix_iri.starts_with('@')).then(|| format!("{prefix_iri}{suffix}"))
+    };
+    let resolved: Vec<(String, ContextEntry)> = scoped
+        .terms
+        .iter()
+        .map(|(term, entry)| {
+            let mut entry = entry.clone();
+            if let Some(iri) = entry.id.as_deref().and_then(resolve) {
+                entry.id = Some(iri);
+            }
+            if let Some(iri) = entry.reverse.as_deref().and_then(resolve) {
+                entry.reverse = Some(iri);
+            }
+            if let Some(TypeValue::Iri(datatype)) = &entry.type_ {
+                if let Some(iri) = resolve(datatype) {
+                    entry.type_ = Some(TypeValue::Iri(iri));
+                }
+            }
+            (term.clone(), entry)
+        })
+        .collect();
+    active.terms.extend(resolved);
+    if scoped.vocab.is_some() {
+        active.vocab = scoped.vocab.clone();
     }
 }
 
@@ -1298,6 +1329,57 @@ mod tests {
         assert!(
             matches!(err, JsonLdError::NestingTooDeep),
             "expected NestingTooDeep, got: {err}"
+        );
+    }
+
+    /// A scoped context's term IRIs written as compact IRIs over a prefix the
+    /// outer context defines expand against that context, at every level of
+    /// a chain of scoped contexts, in both expansion modes; they used to stay
+    /// compact (`"ex:b"` as a key).
+    #[test]
+    fn scoped_context_terms_expand_against_the_active_context() {
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "a": {"@id": "ex:a", "@context": {
+                    "b": {"@id": "ex:b", "@context": {
+                        "c": {"@id": "ex:c", "@context": {"@vocab": "http://deep/"}}
+                    }}
+                }}
+            },
+            "@id": "ex:root",
+            "a": {"b": {"c": {"z": 1, "@type": "T"}}}
+        });
+        let expected = json!({
+            "@id": "http://example.org/root",
+            "http://example.org/a": [{
+                "http://example.org/b": [{
+                    "http://example.org/c": [{"@type": ["http://deep/T"], "http://deep/z": [{"@value": 1}]}]
+                }]
+            }]
+        });
+        for (mode, expanded) in [
+            ("permissive", crate::expand(&doc)),
+            ("strict", crate::expand_checked(&doc)),
+        ] {
+            let expanded = expanded.unwrap_or_else(|e| panic!("{mode}: {e}"));
+            assert_eq!(expanded, expected, "{mode}");
+        }
+
+        // A scoped datatype over the outer prefix expands too.
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "a": {"@id": "ex:a", "@context": {"n": {"@id": "ex:n", "@type": "ex:Num"}}}
+            },
+            "@id": "ex:root",
+            "a": {"n": "5"}
+        });
+        let expanded = crate::expand_checked(&doc).unwrap();
+        assert_eq!(
+            expanded["http://example.org/a"][0]["http://example.org/n"][0]["@type"],
+            json!("http://example.org/Num"),
+            "{expanded}"
         );
     }
 
