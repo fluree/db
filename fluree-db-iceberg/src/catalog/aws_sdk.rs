@@ -515,4 +515,99 @@ mod tests {
         );
         assert!(matches!(other, IcebergError::Catalog(_)), "{other:?}");
     }
+
+    /// A catalog endpoint answering every request with one AWS error, in the
+    /// service's wire shape: the code in `x-amzn-ErrorType` and in the body.
+    async fn catalog_refusing(status: u16, code: &str) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        let bare = code.split(':').next().unwrap_or(code);
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(
+                wiremock::ResponseTemplate::new(status)
+                    .insert_header("x-amzn-ErrorType", code)
+                    .set_body_raw(
+                        format!(r#"{{"__type":"{bare}","message":"User: arn:aws:sts::123456789012:assumed-role/R/s is not authorized"}}"#),
+                        "application/json",
+                    ),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn glue_at(endpoint: &str) -> GlueSdkCatalogClient {
+        use aws_sdk_glue::config::{retry::RetryConfig, BehaviorVersion, Credentials, Region};
+        let conf = aws_sdk_glue::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .endpoint_url(endpoint)
+            .retry_config(RetryConfig::disabled())
+            .build();
+        GlueSdkCatalogClient {
+            client: aws_sdk_glue::Client::from_conf(conf),
+            catalog_id: None,
+        }
+    }
+
+    fn s3_tables_at(endpoint: &str) -> S3TablesSdkCatalogClient {
+        use aws_sdk_s3tables::config::{retry::RetryConfig, BehaviorVersion, Credentials, Region};
+        let conf = aws_sdk_s3tables::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .endpoint_url(endpoint)
+            .retry_config(RetryConfig::disabled())
+            .build();
+        S3TablesSdkCatalogClient {
+            client: aws_sdk_s3tables::Client::from_conf(conf),
+            table_bucket_arn: "arn:aws:s3tables:us-east-1:123456789012:bucket/b".to_string(),
+        }
+    }
+
+    /// What each catalog's refusals look like on the wire reach `load_table`'s
+    /// caller typed: Glue's as HTTP 400 codes (its `AccessDeniedException` with
+    /// the service's `:http://…` suffix), S3 Tables' as 403 / 404.
+    #[tokio::test]
+    async fn catalog_refusals_on_the_wire_are_typed() {
+        let table = TableIdentifier::new("sales", "orders");
+        let denied = |r: Result<LoadTableResponse>| match r {
+            Err(IcebergError::CatalogAccessDenied { table, message }) => {
+                assert_eq!(table, "sales.orders");
+                assert!(message.contains("is not authorized"), "{message}");
+            }
+            other => panic!("expected CatalogAccessDenied, got {other:?}"),
+        };
+        let not_found = |r: Result<LoadTableResponse>, what: &str| match r {
+            Err(IcebergError::TableNotFound(message)) => {
+                assert!(message.contains(what), "{message}");
+            }
+            other => panic!("expected TableNotFound, got {other:?}"),
+        };
+
+        for code in [
+            "AccessDeniedException:http://internal.amazon.com/coral/com.amazon.coral.service/",
+            "ExpiredTokenException",
+            "UnrecognizedClientException",
+            "InvalidSignatureException",
+        ] {
+            let server = catalog_refusing(400, code).await;
+            denied(glue_at(&server.uri()).load_table(&table, false).await);
+        }
+        let server = catalog_refusing(400, "EntityNotFoundException").await;
+        not_found(
+            glue_at(&server.uri()).load_table(&table, false).await,
+            "Glue table sales.orders not found",
+        );
+
+        for code in ["ForbiddenException", "AccessDeniedException"] {
+            let server = catalog_refusing(403, code).await;
+            denied(s3_tables_at(&server.uri()).load_table(&table, false).await);
+        }
+        let server = catalog_refusing(404, "NotFoundException").await;
+        not_found(
+            s3_tables_at(&server.uri()).load_table(&table, false).await,
+            "S3 Tables table sales.orders not found",
+        );
+    }
 }
