@@ -665,6 +665,37 @@ fn test_limit_offset() {
     }
 }
 
+/// `LIMIT` and `OFFSET` take values up to `i64::MAX`; a larger one is
+/// reported as too large, not as a missing integer.
+#[test]
+fn test_limit_offset_beyond_the_largest_value() {
+    let max =
+        assert_parses("SELECT * WHERE { } LIMIT 9223372036854775807 OFFSET 9223372036854775807");
+    if let QueryBody::Select(q) = &max.body {
+        assert_eq!(
+            q.modifiers.limit.as_ref().map(|l| l.value),
+            Some(i64::MAX as u64)
+        );
+        assert_eq!(
+            q.modifiers.offset.as_ref().map(|o| o.value),
+            Some(i64::MAX as u64)
+        );
+    }
+    for clause in ["LIMIT", "OFFSET"] {
+        let result = assert_parse_error(
+            &format!("SELECT * WHERE {{ }} {clause} 9223372036854775808"),
+            &format!("{clause} is too large: the largest supported value is 9223372036854775807"),
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .all(|d| !d.message.contains("expected integer")),
+            "{clause}"
+        );
+    }
+}
+
 #[test]
 fn test_order_by() {
     let ast = assert_parses("SELECT * WHERE { } ORDER BY ?name");

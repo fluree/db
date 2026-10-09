@@ -400,6 +400,12 @@ path = "tests/it_repeated_var_fast_path_guards.rs"
 name = "it_count_star_row_multiplicity"
 path = "tests/it_count_star_row_multiplicity.rs"
 
+# Own binary: toggles the process-global fast-path kill switch and asserts
+# fast-path routing.
+[[test]]
+name = "it_topk_large_limit_offset"
+path = "tests/it_topk_large_limit_offset.rs"
+
 # Own binary: toggles the process-global fast-path kill switch AND asserts
 # fast-path routing, so it must not share a process with either.
 [[test]]
