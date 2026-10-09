@@ -342,41 +342,91 @@ jobs:
       PLAN: ${{ needs.plan.outputs.val }}
       GITHUB_USER: "axo bot"
       GITHUB_EMAIL: "admin+bot@axo.dev"
-    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
+    # Every release publishes, pre-releases included. A stable release updates
+    # `fluree` and `fluree-beta`; a pre-release updates only `fluree-beta`, a
+    # keg-only formula users opt into. dist's own `publish-prereleases` would
+    # overwrite `fluree` with the pre-release instead.
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: true
           repository: "fluree/homebrew-tap"
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-      # So we have access to the formula
+      # Outside the tap checkout, so only the formulae chosen below reach it.
       - name: Fetch homebrew formulae
         uses: actions/download-artifact@v7
         with:
           pattern: artifacts-*
-          path: Formula/
+          path: ${{ runner.temp }}/dist-artifacts
           merge-multiple: true
-      # This is extra complex because you can make your Formula name not match your app name
-      # so we need to find releases with a *.rb file, and publish with that filename.
       - name: Commit formula files
+        env:
+          ARTIFACTS: ${{ runner.temp }}/dist-artifacts
+          # Under a `Formula` directory: brew style applies its formula cops by path.
+          STAGED: ${{ runner.temp }}/formulae/Formula
         run: |
           git config --global user.name "${GITHUB_USER}"
           git config --global user.email "${GITHUB_EMAIL}"
+          export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+          brew update
 
+          prerelease=$(echo "$PLAN" | jq '.announcement_is_prerelease')
+          mkdir -p "$STAGED"
+          : > "$STAGED/manifest"
           for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith(".rb")] | any)'); do
             filename=$(echo "$release" | jq '.artifacts[] | select(endswith(".rb"))' --raw-output)
-            name=$(echo "$filename" | sed "s/\.rb$//")
+            name=${filename%.rb}
             version=$(echo "$release" | jq .app_version --raw-output)
 
-            export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
-            brew update
-            # We avoid reformatting user-provided data such as the app description and homepage.
-            brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}" || true
-
-            git add "Formula/${filename}"
-            git commit -m "${name} ${version}"
+            if [ "$prerelease" = false ]; then
+              cp "$ARTIFACTS/$filename" "$STAGED/$filename"
+              echo "$name $version" >> "$STAGED/manifest"
+            fi
+            # `<name>-beta` is Homebrew's class `<Class>Beta`. Keg-only, so it
+            # installs beside the stable formula rather than conflicting with it.
+            awk '
+              sub(/^class [A-Za-z0-9]+/, "&Beta") { renamed = 1 }
+              /^  desc "/ { sub(/"$/, " (including pre-releases)\"") }
+              { print }
+              /^  license / { print "  keg_only \"it installs the same commands as the stable formula\"" }
+              END { exit !renamed }
+            ' "$ARTIFACTS/$filename" > "$STAGED/$name-beta.rb"
+            echo "$name-beta $version" >> "$STAGED/manifest"
           done
-          git push
+          # We avoid reformatting user-provided data such as the app description and homepage.
+          brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "$STAGED"/*.rb || true
+
+          # Rebuilt on the tap's latest commit each attempt, so a concurrent
+          # push is retried rather than lost. A formula only moves forward:
+          # re-running an older release leaves a newer one in place.
+          branch=$(git rev-parse --abbrev-ref HEAD)
+          for attempt in 1 2 3 4 5; do
+            git fetch origin "$branch"
+            git reset --hard FETCH_HEAD
+            message=()
+            while read -r name version; do
+              current=$(sed -n 's/^  version "\(.*\)"$/\1/p' "Formula/$name.rb" 2>/dev/null || true)
+              # Debian ordering with `-` as `~` sorts 4.2.4-beta.2 before 4.2.4.
+              if [ -n "$current" ] && dpkg --compare-versions "${version//-/\~}" lt "${current//-/\~}"; then
+                echo "::notice::Formula/$name.rb is at $current, newer than $version; left as is"
+                continue
+              fi
+              cp "$STAGED/$name.rb" "Formula/$name.rb"
+              git add "Formula/$name.rb"
+              git diff --cached --quiet -- "Formula/$name.rb" || message+=("$name $version")
+            done < "$STAGED/manifest"
+            if git diff --cached --quiet; then
+              echo "The tap already has these formulae"
+              exit 0
+            fi
+            git commit -m "$(printf '%s, ' "${message[@]}" | sed 's/, $//')"
+            if git push origin "HEAD:$branch"; then
+              exit 0
+            fi
+            sleep $((attempt * 5))
+          done
+          echo "::error::Could not push to the tap after 5 attempts"
+          exit 1
 
   # Publish the fluree-bin package to the Arch User Repository (stable releases only).
   publish-aur:
