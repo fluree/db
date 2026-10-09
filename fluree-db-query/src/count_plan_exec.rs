@@ -2756,27 +2756,13 @@ fn execute_chain(
                         crate::fast_path_common::projection_sid_okey()
                     };
 
-                    let batch = if let Some(cache) = self.store.leaflet_cache() {
-                        use fluree_db_binary_index::read::column_loader::load_columns_cached_via_handle;
-                        let idx_u32: u32 = idx.try_into().map_err(|_| {
-                            QueryError::Internal("leaflet idx exceeds u32".to_string())
-                        })?;
-                        load_columns_cached_via_handle(
-                            handle.as_ref(),
-                            cache,
-                            fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
-                                leaf_id: handle.leaf_id(),
-                                leaflet_idx: idx_u32,
-                                order: RunSortOrder::Psot,
-                                decode_set: fluree_db_binary_index::ColumnSet::ALL,
-                            },
-                        )
-                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                    } else {
-                        handle
-                            .load_columns(idx, &projection, RunSortOrder::Psot)
-                            .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                    };
+                    let batch = crate::fast_path_common::load_leaflet_projection(
+                        self.store,
+                        handle.as_ref(),
+                        idx,
+                        &projection,
+                        RunSortOrder::Psot,
+                    )?;
 
                     self.row = 0;
                     self.batch = Some(batch);

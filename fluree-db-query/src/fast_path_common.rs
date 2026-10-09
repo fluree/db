@@ -121,6 +121,35 @@ pub fn projection_sid_only() -> ColumnProjection {
     }
 }
 
+/// Decode `projection`'s columns of leaflet `idx`, through the leaflet cache
+/// when the store has one. The cache key carries the column set, so a narrow
+/// request is served by an exact or `ALL` entry and never decodes columns the
+/// caller doesn't read.
+pub(crate) fn load_leaflet_projection(
+    store: &BinaryIndexStore,
+    handle: &dyn fluree_db_binary_index::read::leaf_access::LeafHandle,
+    idx: usize,
+    projection: &ColumnProjection,
+    order: RunSortOrder,
+) -> Result<ColumnBatch> {
+    let batch = match store.leaflet_cache() {
+        Some(cache) => load_columns_cached_via_handle(
+            handle,
+            cache,
+            fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
+                leaf_id: handle.leaf_id(),
+                leaflet_idx: idx
+                    .try_into()
+                    .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?,
+                order,
+                decode_set: projection.effective(),
+            },
+        ),
+        None => handle.load_columns(idx, projection, order),
+    };
+    batch.map_err(|e| QueryError::Internal(format!("load columns: {e}")))
+}
+
 /// Projection that loads only the OKey column (internal, not output).
 #[inline]
 pub fn projection_okey_only() -> ColumnProjection {
@@ -860,26 +889,13 @@ impl<'a> PsotSubjectCountIter<'a> {
                 if entry.row_count == 0 || entry.p_const != Some(self.p_id) {
                     continue;
                 }
-                let batch = if let Some(cache) = self.store.leaflet_cache() {
-                    let idx_u32: u32 = idx
-                        .try_into()
-                        .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?;
-                    load_columns_cached_via_handle(
-                        handle.as_ref(),
-                        cache,
-                        fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
-                            leaf_id: handle.leaf_id(),
-                            leaflet_idx: idx_u32,
-                            order: RunSortOrder::Psot,
-                            decode_set: ColumnSet::ALL,
-                        },
-                    )
-                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                } else {
-                    handle
-                        .load_columns(idx, &projection, RunSortOrder::Psot)
-                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                };
+                let batch = load_leaflet_projection(
+                    self.store,
+                    handle.as_ref(),
+                    idx,
+                    &projection,
+                    RunSortOrder::Psot,
+                )?;
                 self.row = 0;
                 self.batch = Some(batch);
                 return Ok(Some(()));
@@ -1090,26 +1106,13 @@ impl<'a> PsotSubjectSeek<'a> {
                 if last.s_id.as_u64() < target_s {
                     continue;
                 }
-                let batch = if let Some(cache) = self.store.leaflet_cache() {
-                    let idx_u32: u32 = idx
-                        .try_into()
-                        .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?;
-                    load_columns_cached_via_handle(
-                        handle.as_ref(),
-                        cache,
-                        fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
-                            leaf_id: handle.leaf_id(),
-                            leaflet_idx: idx_u32,
-                            order: RunSortOrder::Psot,
-                            decode_set: ColumnSet::ALL,
-                        },
-                    )
-                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                } else {
-                    handle
-                        .load_columns(idx, &self.projection, RunSortOrder::Psot)
-                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                };
+                let batch = load_leaflet_projection(
+                    self.store,
+                    handle.as_ref(),
+                    idx,
+                    &self.projection,
+                    RunSortOrder::Psot,
+                )?;
                 self.row = 0;
                 self.batch = Some(batch);
                 return Ok(Some(()));
@@ -1298,30 +1301,13 @@ impl<'a> PostObjectGroupCountIter<'a> {
                     // off every IRI group sorting after the leaflet's o_type.)
                     continue;
                 }
-                let batch = if let Some(cache) = self.store.leaflet_cache() {
-                    let idx_u32: u32 = idx
-                        .try_into()
-                        .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?;
-                    load_columns_cached_via_handle(
-                        handle.as_ref(),
-                        cache,
-                        fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
-                            leaf_id: handle.leaf_id(),
-                            leaflet_idx: idx_u32,
-                            order: RunSortOrder::Post,
-                            decode_set: ColumnSet::ALL,
-                        },
-                    )
-                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                } else {
-                    handle
-                        .load_columns(
-                            idx,
-                            if mixed { &proj_otype_okey } else { &proj_okey },
-                            RunSortOrder::Post,
-                        )
-                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                };
+                let batch = load_leaflet_projection(
+                    self.store,
+                    handle.as_ref(),
+                    idx,
+                    if mixed { &proj_otype_okey } else { &proj_okey },
+                    RunSortOrder::Post,
+                )?;
                 self.row = 0;
                 self.batch = Some(batch);
                 self.mixed = mixed;
@@ -1541,34 +1527,17 @@ impl<'a> PsotSubjectWeightedSumIter<'a> {
                     continue;
                 }
 
-                let batch = if let Some(cache) = self.store.leaflet_cache() {
-                    let idx_u32: u32 = idx
-                        .try_into()
-                        .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?;
-                    load_columns_cached_via_handle(
-                        handle.as_ref(),
-                        cache,
-                        fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
-                            leaf_id: handle.leaf_id(),
-                            leaflet_idx: idx_u32,
-                            order: RunSortOrder::Psot,
-                            decode_set: ColumnSet::ALL,
-                        },
-                    )
-                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                } else {
-                    handle
-                        .load_columns(
-                            idx,
-                            if mixed {
-                                &proj_sid_otype_okey
-                            } else {
-                                &proj_sid_okey
-                            },
-                            RunSortOrder::Psot,
-                        )
-                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                };
+                let batch = load_leaflet_projection(
+                    self.store,
+                    handle.as_ref(),
+                    idx,
+                    if mixed {
+                        &proj_sid_otype_okey
+                    } else {
+                        &proj_sid_okey
+                    },
+                    RunSortOrder::Psot,
+                )?;
                 self.row = 0;
                 self.batch = Some(batch);
                 self.mixed = mixed;

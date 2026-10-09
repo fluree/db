@@ -552,8 +552,18 @@ fn load_v6_batch(
     leaf_id: u128,
     leaflet_idx: u32,
 ) -> Result<fluree_db_binary_index::ColumnBatch> {
-    if let Some(c) = cache {
-        load_leaflet_columns_cached(
+    let mut needed = ColumnSet::EMPTY;
+    needed.insert(ColumnId::OKey);
+    if entry.o_type_const.is_none() {
+        needed.insert(ColumnId::OType);
+    }
+    // Mixed-predicate leaflets need the per-row `p_id` column to verify each
+    // row belongs to the queried predicate.
+    if entry.p_const.is_none() {
+        needed.insert(ColumnId::PId);
+    }
+    let batch = match cache {
+        Some(c) => load_leaflet_columns_cached(
             leaf_bytes,
             entry,
             payload_base,
@@ -562,29 +572,18 @@ fn load_v6_batch(
                 leaf_id,
                 leaflet_idx,
                 order,
-                decode_set: ColumnSet::ALL,
+                decode_set: needed,
             },
-        )
-        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))
-    } else {
-        let mut needed = ColumnSet::EMPTY;
-        needed.insert(ColumnId::OKey);
-        if entry.o_type_const.is_none() {
-            needed.insert(ColumnId::OType);
+        ),
+        None => {
+            let projection = ColumnProjection {
+                output: ColumnSet::EMPTY,
+                internal: needed,
+            };
+            load_leaflet_columns(leaf_bytes, entry, payload_base, &projection, order)
         }
-        // Mixed-predicate leaflets need the per-row `p_id` column to verify
-        // each row belongs to the queried predicate; the cached path always
-        // loads all columns, so this is only a concern for the no-cache path.
-        if entry.p_const.is_none() {
-            needed.insert(ColumnId::PId);
-        }
-        let projection = ColumnProjection {
-            output: ColumnSet::EMPTY,
-            internal: needed,
-        };
-        load_leaflet_columns(leaf_bytes, entry, payload_base, &projection, order)
-            .map_err(|e| QueryError::Internal(format!("load columns: {e}")))
-    }
+    };
+    batch.map_err(|e| QueryError::Internal(format!("load columns: {e}")))
 }
 
 /// Resolve a predicate [`Ref`] to its V6 binary index `p_id`.
