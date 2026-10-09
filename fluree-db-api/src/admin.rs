@@ -1549,7 +1549,7 @@ impl crate::Fluree {
         // and all object subkinds (branches, leaves, dicts when per-branch);
         // `config/` covers the LedgerConfig blob and the default-context blob,
         // both stored as `ContentKind::LedgerConfig`; `blob/` holds every kind
-        // with no layout of its own, which includes the edge-annotation arenas.
+        // with no layout of its own, which includes the legacy edge-annotation arenas.
         let subprefixes = vec![
             format!("fluree:{storage_method}://{branch_prefix}/commit/"),
             format!("fluree:{storage_method}://{branch_prefix}/txn/"),
