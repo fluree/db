@@ -316,11 +316,11 @@ async fn multi_query_partial_failure_reports_per_alias_error() {
     create_ledger(&app, "mq:partial").await;
     insert_one(&app, "mq:partial", "ex:p", "P").await;
 
-    // 'bad' uses a SPARQL string that the envelope validator can't tell
-    // apart from a valid query (parse failure defers to the downstream
-    // parser) — so envelope-level checks pass, snapshot resolution
-    // succeeds against mq:partial, and dispatch reports the per-alias
-    // SPARQL parse error.
+    // 'bad' parses, so envelope-level checks pass and snapshot resolution
+    // succeeds against mq:partial, but its WHERE uses a prefix it never
+    // declares: the query fails when it runs, and dispatch reports that as
+    // the alias's error. (A sub-query that does not parse is refused with the
+    // envelope; see `multi_query_sparql_sibling_that_does_not_parse_is_refused`.)
     let envelope = json!({
         "queries": {
             "good": {
@@ -334,7 +334,7 @@ async fn multi_query_partial_failure_reports_per_alias_error() {
             },
             "bad": {
                 "language": "sparql",
-                "query": "SELECT ?x FROM <mq:partial> WHERE { this is not valid SPARQL }"
+                "query": "SELECT ?x FROM <mq:partial> WHERE { ?x undeclared:p ?y }"
             }
         }
     });
@@ -346,6 +346,136 @@ async fn multi_query_partial_failure_reports_per_alias_error() {
     assert!(
         body["errors"]["bad"].is_object(),
         "bad alias should land in errors, got: {body}"
+    );
+}
+
+// =============================================================================
+// The ledgers a SPARQL sub-query reads
+// =============================================================================
+
+/// Every ledger a SPARQL sub-query reads is pinned to the envelope snapshot,
+/// whether its `FROM` names it as a bracketed IRI or as a prefixed name.
+#[tokio::test]
+async fn multi_query_snapshot_pins_every_ledger_a_sparql_sibling_reads() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "mq:p1").await;
+    create_ledger(&app, "mq:p2").await;
+    insert_one(&app, "mq:p1", "ex:a", "A").await;
+    insert_one(&app, "mq:p2", "ex:b", "B-1").await;
+    // A moment between mq:p2's two commits.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let as_of = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    insert_one(&app, "mq:p2", "ex:c", "B-2").await;
+
+    let envelope = json!({
+        "asOf": as_of,
+        "queries": {
+            "both": {
+                "language": "sparql",
+                "query": "PREFIX ex: <http://example.org/> \
+                          SELECT ?name FROM <mq:p1> FROM mq:p2 WHERE { ?s ex:name ?name }"
+            }
+        }
+    });
+    let (status, body) = post_envelope(&app, &envelope).await;
+    assert_eq!(status, StatusCode::OK, "got body: {body}");
+    assert_eq!(body["status"], "ok", "got body: {body}");
+    for ledger in ["mq:p1", "mq:p2"] {
+        assert_eq!(
+            body["snapshot"]["ledgers"][ledger], 1,
+            "{ledger} must be pinned to the envelope snapshot, got: {body}"
+        );
+    }
+    let text = body["results"]["both"].to_string();
+    assert!(
+        text.contains("\"A\"") && text.contains("\"B-1\""),
+        "both ledgers' rows at the snapshot expected, got: {body}"
+    );
+    assert!(
+        !text.contains("\"B-2\""),
+        "mq:p2 must be read at the snapshot, not at its head, got: {body}"
+    );
+}
+
+/// A sub-query's `min-t` covers every ledger it reads, a prefixed `FROM`
+/// member included.
+#[tokio::test]
+async fn multi_query_sub_query_min_t_covers_every_ledger_it_reads() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        query_min_t_timeout_ms: 300,
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    let app = build_router(state);
+    create_ledger(&app, "mq:m1").await;
+    create_ledger(&app, "mq:m2").await;
+    insert_one(&app, "mq:m1", "ex:a", "A-1").await;
+    insert_one(&app, "mq:m1", "ex:b", "A-2").await;
+    insert_one(&app, "mq:m2", "ex:c", "B").await;
+
+    // mq:m1 is at t=2, mq:m2 (the prefixed member) at t=1.
+    let envelope = |min_t: i64| {
+        json!({
+            "queries": {
+                "both": {
+                    "language": "sparql",
+                    "query": "PREFIX ex: <http://example.org/> \
+                              SELECT ?name FROM <mq:m1> FROM mq:m2 WHERE { ?s ex:name ?name }",
+                    "opts": { "min-t": min_t }
+                }
+            }
+        })
+    };
+    let (status, body) = post_envelope(&app, &envelope(1)).await;
+    assert_eq!(status, StatusCode::OK, "control, got body: {body}");
+
+    let (status, body) = post_envelope(&app, &envelope(2)).await;
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT, "got body: {body}");
+    assert!(
+        body.to_string().contains("current t=1"),
+        "the wait must be on mq:m2, got: {body}"
+    );
+}
+
+/// A SPARQL sub-query that does not parse refuses the whole envelope with the
+/// parser's error.
+#[tokio::test]
+async fn multi_query_sparql_sibling_that_does_not_parse_is_refused() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "mq:pf").await;
+    insert_one(&app, "mq:pf", "ex:p", "P").await;
+
+    let envelope = json!({
+        "queries": {
+            "good": {
+                "language": "jsonld",
+                "query": {
+                    "@context": { "ex": "http://example.org/" },
+                    "from": "mq:pf",
+                    "select": ["?name"],
+                    "where": { "@id": "?s", "ex:name": "?name" }
+                }
+            },
+            "bad": {
+                "language": "sparql",
+                "query": "SELECT ?x FROM <mq:pf> WHERE { this is not valid SPARQL }"
+            }
+        }
+    });
+    let (status, body) = post_envelope(&app, &envelope).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got body: {body}");
+    let message = body.to_string();
+    assert!(
+        message.contains("'bad'") && message.contains("SPARQL"),
+        "the error names the sub-query and the parse failure, got: {body}"
     );
 }
 

@@ -77,9 +77,9 @@ use super::snapshot::{
 };
 use crate::format::{FormatterConfig, OutputFormat};
 use crate::query::multi::{
-    apply_sparql_context, merged_context, merged_opts, validate_envelope, MultiQueryBounds,
+    merged_context, merged_opts, sparql_subquery_text, validate_envelope, MultiQueryBounds,
     MultiQueryRequest, MultiQueryResponse, MultiQuerySubquery, MultiQueryValidationError,
-    SparqlContextDirectives, SubqueryLanguage,
+    SubqueryLanguage,
 };
 use crate::{
     ApiError, Fluree, GovernanceOptions, QueryExecutionOptions, TrackingOptions, TrackingTally,
@@ -785,12 +785,10 @@ async fn execute_subquery(
             let sparql = sub.query.as_str().unwrap_or_default();
 
             // SPARQL has no inner JSON-LD context — directives come
-            // from the envelope context only.
-            let directives = envelope_context
-                .map(SparqlContextDirectives::from_context)
-                .unwrap_or_default();
-            let with_directives = apply_sparql_context(sparql, &directives);
-            let with_snapshot = apply_snapshot_to_sparql(&with_directives, snapshot);
+            // from the envelope context only. Validation reads this
+            // sub-query's dataset from the same text.
+            let text = sparql_subquery_text(sparql, envelope_context);
+            let with_snapshot = apply_snapshot_to_sparql(&text, snapshot);
 
             let tracking = if tracking_enabled {
                 Some(tracking_opts)

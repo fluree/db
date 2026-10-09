@@ -41,7 +41,7 @@ Fluree exposes two query styles over HTTP:
   - `urn:default`, the name [`/info`](../api/endpoints.md#get-infoledger-id) lists the default graph under, is accepted wherever `default` is, and `GRAPH <urn:default> { ... }` reads the default graph as `GRAPH <ledger:main>` does. A write cannot name a graph `urn:default` (see [SPARQL UPDATE](../query/sparql.md))
   - `GRAPH <iri> { ... }` and `GRAPH ?g { ... }` resolve the ledger's registered user named graphs **without** an explicit `FROM NAMED` (the reserved `#txn-meta` / `#config` graphs stay private). Supplying `FROM NAMED` still narrows resolution to exactly the graphs listed.
 
-If the request body tries to target a different ledger than the one in the URL, the server rejects it with a "Ledger mismatch" error.
+A single `from` that names a different ledger than the one in the URL is rejected with a "Ledger mismatch" error. A JSON-LD array `from`, or a `fromNamed`, may name other ledgers, as on `POST /query`; each is read under the caller's access rights.
 
 #### Named graphs with no default graph (changed in 4.1.4)
 

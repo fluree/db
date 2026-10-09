@@ -219,7 +219,7 @@ A sub-query whose opts didn't enable tracking will not appear in the `tracking` 
 | HTTP code | Meaning |
 |-----------|---------|
 | `200` | Envelope parsed, validated, executed. Body's `status` reports the aggregate (`ok` / `partial` / `all_failed`). Per-alias errors and timeouts live inside `errors`. |
-| `400` | Envelope validation failed (bounds violation, `asOf` collision, missing `from`, malformed body, history query, envelope `max-fuel`, `maxConcurrency: 0`, etc.), or an ISO `asOf` is malformed or falls before a referenced ledger's first commit. No `results` / `errors` keys — the body is the standard error shape. |
+| `400` | Envelope validation failed (bounds violation, `asOf` collision, missing `from`, malformed body, a SPARQL sub-query that does not parse, history query, envelope `max-fuel`, `maxConcurrency: 0`, etc.), or an ISO `asOf` is malformed or falls before a referenced ledger's first commit. No `results` / `errors` keys — the body is the standard error shape. |
 | `401` | Authentication required and missing. |
 | `404` | A referenced ledger does not exist. |
 | `500` | Envelope infrastructure failed: snapshot resolution couldn't load a ledger that exists, response would exceed the configured size cap during assembly, server-side panic. |
@@ -490,7 +490,7 @@ concept across ledgers.
     },
     "bad": {
       "language": "sparql",
-      "query":    "SELECT ?x FROM <myledger> WHERE { this is not SPARQL }"
+      "query":    "SELECT ?x FROM <myledger> WHERE { ?x undeclared:p ?y }"
     }
   }
 }
@@ -504,10 +504,16 @@ Response (HTTP 200):
   "snapshot": { "asOf": "...", "ledgers": { "myledger": 42 } },
   "results":  { "good": [ ... ] },
   "errors":   {
-    "bad": { "code": "api_error", "message": "SPARQL parse error: ..." }
+    "bad": { "code": "api_error", "message": "SPARQL lowering error: ..." }
   }
 }
 ```
+
+A sub-query that fails while it runs is reported in `errors` like this. A
+SPARQL sub-query that does not parse is different. The envelope cannot tell
+which ledgers it reads, so the whole envelope is refused with `400 Bad
+Request` and the parser's error. A single query that does not parse is
+refused the same way.
 
 ---
 
