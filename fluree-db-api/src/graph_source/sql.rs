@@ -476,7 +476,7 @@ impl SqlSource {
             ))
         })?;
         let cache = fluree.r2rml_cache();
-        let key = super::r2rml::rest_client_cache_key(&record.graph_source_id, &record.config);
+        let key = super::r2rml::catalog_client_cache_key(&record.graph_source_id, &record.config);
         let client = match cache.sql_client(&key) {
             Some(c) => c,
             None => {

@@ -797,6 +797,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-glue"
+version = "1.142.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc77647907307c70ffd751db85653804552e4a3c27f054d3af7a0874ef4dfe22"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-s3"
 version = "1.128.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -829,6 +853,30 @@ dependencies = [
  "sha2",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "aws-sdk-s3tables"
+version = "1.54.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e0ec266873694efc365debded01f44e27a0de3946a3ac15d24c489759e5ddf8"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
 ]
 
 [[package]]
@@ -2930,7 +2978,9 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-dynamodb",
+ "aws-sdk-glue",
  "aws-sdk-s3",
+ "aws-sdk-s3tables",
  "aws-sdk-sts",
  "base64 0.22.1",
  "bigdecimal 0.4.10",
@@ -3377,7 +3427,9 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-credential-types",
+ "aws-sdk-glue",
  "aws-sdk-s3",
+ "aws-sdk-s3tables",
  "aws-smithy-http-client",
  "bytes",
  "chrono",

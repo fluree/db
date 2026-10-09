@@ -105,6 +105,19 @@ jobs:
     # 6h default again. Per-test kills are handled by `slow-timeout` in
     # `.config/nextest.toml`; this is the job-level safety net.
     timeout-minutes: 45
+    # moto mocks S3 and the AWS Glue Data Catalog for `it_iceberg_glue_moto`
+    # (fluree-db-api, feature `glue-moto`), which replays a committed
+    # Glue-written Iceberg fixture into it. `glue_moto_is_configured_in_ci` fails
+    # if FLUREE_GLUE_MOTO is set without the endpoint, so a skipped run cannot
+    # read as a pass.
+    services:
+      moto:
+        image: motoserver/moto:5.2.3
+        ports:
+          - 5000:5000
+    env:
+      FLUREE_GLUE_MOTO: "1"
+      FLUREE_GLUE_LOCAL_ENDPOINT: http://127.0.0.1:5000
     steps:
       - name: Runner capacity
         run: |

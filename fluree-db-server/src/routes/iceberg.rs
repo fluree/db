@@ -21,7 +21,7 @@ use super::ledger::forward_write_request;
 pub struct IcebergMapRequest {
     /// Graph source name
     pub name: String,
-    /// Catalog mode: "rest" (default) or "direct"
+    /// Catalog mode: "rest" (default), "direct", "glue", or "s3tables"
     #[serde(default = "default_mode")]
     pub mode: String,
     /// REST catalog URI
@@ -30,6 +30,12 @@ pub struct IcebergMapRequest {
     pub table: Option<String>,
     /// S3 table location (direct mode)
     pub table_location: Option<String>,
+    /// AWS region (glue / s3tables mode)
+    pub region: Option<String>,
+    /// AWS Glue catalog id for cross-account access (glue mode)
+    pub catalog_id: Option<String>,
+    /// AWS S3 Tables table-bucket ARN (s3tables mode)
+    pub table_bucket_arn: Option<String>,
     /// R2RML mapping source
     pub r2rml: Option<String>,
     /// R2RML mapping media type
@@ -663,6 +669,15 @@ pub(crate) fn secret_value(
     }
 }
 
+/// The REST-only settings a request set, by field name, for the shared parser
+/// to refuse in any other catalog mode (it would otherwise ignore them).
+fn given_rest_only(fields: &[(&'static str, bool)]) -> Vec<&'static str> {
+    fields
+        .iter()
+        .filter_map(|&(name, given)| given.then_some(name))
+        .collect()
+}
+
 fn build_iceberg_config(req: &IcebergMapRequest) -> Result<fluree_db_api::IcebergCreateConfig> {
     build_iceberg_config_allowing(req, &allowed_secret_env())
 }
@@ -671,38 +686,38 @@ fn build_iceberg_config_allowing(
     req: &IcebergMapRequest,
     allowed_env: &str,
 ) -> Result<fluree_db_api::IcebergCreateConfig> {
-    let mode = req.mode.to_lowercase();
-    let mut config = match mode.as_str() {
-        "rest" => {
-            let catalog_uri = req
-                .catalog_uri
-                .as_ref()
-                .ok_or_else(|| ServerError::bad_request("catalog_uri is required for rest mode"))?;
-            let table = req.table.as_deref().unwrap_or_default();
-            if table.is_empty() && req.r2rml.is_none() {
-                return Err(ServerError::bad_request(
-                    "table is required for rest mode (or provide r2rml to define tables via mapping)",
-                ));
-            }
-            let table = if table.is_empty() {
-                "default.default"
-            } else {
-                table
-            };
-            fluree_db_api::IcebergCreateConfig::new(&req.name, catalog_uri, table)
-        }
-        "direct" => {
-            let location = req.table_location.as_ref().ok_or_else(|| {
-                ServerError::bad_request("table_location is required for direct mode")
-            })?;
-            fluree_db_api::IcebergCreateConfig::new_direct(&req.name, location)
-        }
-        other => {
-            return Err(ServerError::bad_request(format!(
-                "unknown catalog mode '{other}'. Use 'rest' or 'direct'."
-            )));
-        }
-    };
+    // One mode dispatch for every surface (the CLI parses its flags the same way).
+    let rest_only = given_rest_only(&[
+        ("auth_bearer", req.auth_bearer.is_some()),
+        ("auth_bearer_env", req.auth_bearer_env.is_some()),
+        ("oauth2_token_url", req.oauth2_token_url.is_some()),
+        ("oauth2_client_id", req.oauth2_client_id.is_some()),
+        ("oauth2_client_secret", req.oauth2_client_secret.is_some()),
+        (
+            "oauth2_client_secret_env",
+            req.oauth2_client_secret_env.is_some(),
+        ),
+        ("oauth2_scope", req.oauth2_scope.is_some()),
+        ("oauth2_audience", req.oauth2_audience.is_some()),
+        ("auth_google_metadata", req.auth_google_metadata),
+        ("auth_google_scopes", req.auth_google_scopes.is_some()),
+        ("warehouse", req.warehouse.is_some()),
+    ]);
+    let mut config = fluree_db_api::IcebergCreateConfig::from_mode(
+        &req.name,
+        fluree_db_api::CatalogModeArgs {
+            mode: &req.mode,
+            catalog_uri: req.catalog_uri.as_deref(),
+            table_location: req.table_location.as_deref(),
+            region: req.region.as_deref(),
+            catalog_id: req.catalog_id.as_deref(),
+            table_bucket_arn: req.table_bucket_arn.as_deref(),
+            rest_only: &rest_only,
+        },
+        req.table.as_deref(),
+        req.r2rml.is_some(),
+    )
+    .map_err(|e| ServerError::bad_request(e.message(str::to_string)))?;
 
     if let Some(ref branch) = req.branch {
         config = config.with_branch(branch);
@@ -787,13 +802,19 @@ fn build_iceberg_config_allowing(
 /// (a subset of [`IcebergMapRequest`], minus `name`/`table`/`r2rml`).
 #[derive(Deserialize)]
 pub struct IcebergConnectionRequest {
-    /// Catalog mode: "rest" (default) or "direct"
+    /// Catalog mode: "rest" (default), "direct", "glue", or "s3tables"
     #[serde(default = "default_mode")]
     pub mode: String,
     /// REST catalog URI
     pub catalog_uri: Option<String>,
     /// S3 table location (direct mode)
     pub table_location: Option<String>,
+    /// AWS region (glue / s3tables mode)
+    pub region: Option<String>,
+    /// AWS Glue catalog id for cross-account access (glue mode)
+    pub catalog_id: Option<String>,
+    /// AWS S3 Tables table-bucket ARN (s3tables mode)
+    pub table_bucket_arn: Option<String>,
     /// Bearer token for catalog auth
     pub auth_bearer: Option<String>,
     /// Environment variable of this server holding the bearer token; see
@@ -837,27 +858,30 @@ fn build_iceberg_connection_allowing(
 ) -> Result<fluree_db_api::IcebergConnectionConfig> {
     use fluree_db_api::IcebergConnectionConfig;
 
-    let mode = req.mode.to_lowercase();
-    let mut conn = match mode.as_str() {
-        "rest" => {
-            let catalog_uri = req
-                .catalog_uri
-                .as_ref()
-                .ok_or_else(|| ServerError::bad_request("catalog_uri is required for rest mode"))?;
-            IcebergConnectionConfig::rest(catalog_uri)
-        }
-        "direct" => {
-            let location = req.table_location.as_ref().ok_or_else(|| {
-                ServerError::bad_request("table_location is required for direct mode")
-            })?;
-            IcebergConnectionConfig::direct(location)
-        }
-        other => {
-            return Err(ServerError::bad_request(format!(
-                "unknown catalog mode '{other}'. Use 'rest' or 'direct'."
-            )));
-        }
-    };
+    let rest_only = given_rest_only(&[
+        ("auth_bearer", req.auth_bearer.is_some()),
+        ("auth_bearer_env", req.auth_bearer_env.is_some()),
+        ("oauth2_token_url", req.oauth2_token_url.is_some()),
+        ("oauth2_client_id", req.oauth2_client_id.is_some()),
+        ("oauth2_client_secret", req.oauth2_client_secret.is_some()),
+        (
+            "oauth2_client_secret_env",
+            req.oauth2_client_secret_env.is_some(),
+        ),
+        ("oauth2_scope", req.oauth2_scope.is_some()),
+        ("oauth2_audience", req.oauth2_audience.is_some()),
+        ("warehouse", req.warehouse.is_some()),
+    ]);
+    let mut conn = IcebergConnectionConfig::from_mode(fluree_db_api::CatalogModeArgs {
+        mode: &req.mode,
+        catalog_uri: req.catalog_uri.as_deref(),
+        table_location: req.table_location.as_deref(),
+        region: req.region.as_deref(),
+        catalog_id: req.catalog_id.as_deref(),
+        table_bucket_arn: req.table_bucket_arn.as_deref(),
+        rest_only: &rest_only,
+    })
+    .map_err(|e| ServerError::bad_request(e.message(str::to_string)))?;
 
     if let Some(token) = secret_value(
         "auth_bearer",
@@ -1516,6 +1540,115 @@ mod tests {
         assert!(req.depth.is_none());
         let conn = build_iceberg_connection(&req.connection).unwrap();
         assert!(conn.is_direct());
+    }
+
+    #[test]
+    fn browse_request_glue_mode_builds_glue_connection() {
+        // The connection builder must accept the glue mode + its region/catalog_id
+        // fields (browse/preview/generate/validate parity with iceberg/map).
+        let body = serde_json::json!({
+            "mode": "glue",
+            "region": "us-east-1",
+            "catalog_id": "123456789012"
+        });
+        let req: IcebergBrowseRequest = serde_json::from_value(body).unwrap();
+        let conn = build_iceberg_connection(&req.connection).unwrap();
+        assert!(conn.is_glue());
+    }
+
+    #[test]
+    fn browse_request_s3tables_mode_builds_s3tables_connection() {
+        let body = serde_json::json!({
+            "mode": "s3tables",
+            "region": "us-east-1",
+            "table_bucket_arn": "arn:aws:s3tables:us-east-1:123456789012:bucket/my-bucket"
+        });
+        let req: IcebergBrowseRequest = serde_json::from_value(body).unwrap();
+        let conn = build_iceberg_connection(&req.connection).unwrap();
+        assert!(conn.is_s3tables());
+    }
+
+    #[test]
+    fn build_iceberg_connection_s3tables_requires_arn() {
+        // s3tables mode without an ARN is a 400, mirroring build_iceberg_config.
+        let body = serde_json::json!({ "mode": "s3tables" });
+        let req: IcebergBrowseRequest = serde_json::from_value(body).unwrap();
+        assert!(build_iceberg_connection(&req.connection).is_err());
+    }
+
+    #[test]
+    fn rest_only_fields_are_refused_by_other_modes() {
+        // Catalog auth or a warehouse sent with another mode would be ignored;
+        // refuse each one, on both request shapes.
+        let connection_fields = [
+            "auth_bearer",
+            "auth_bearer_env",
+            "oauth2_token_url",
+            "oauth2_client_id",
+            "oauth2_client_secret",
+            "oauth2_client_secret_env",
+            "oauth2_scope",
+            "oauth2_audience",
+            "warehouse",
+        ];
+        let map_only = ["auth_google_metadata", "auth_google_scopes"];
+        let given = |field: &str| match field {
+            "auth_google_metadata" => serde_json::json!(true),
+            _ => serde_json::json!("x"),
+        };
+
+        for field in connection_fields.iter().chain(&map_only) {
+            let mut body = serde_json::json!({
+                "name": "orders",
+                "mode": "glue",
+                "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> ."
+            });
+            body[*field] = given(field);
+            let req: IcebergMapRequest = serde_json::from_value(body).unwrap();
+            let err = build_iceberg_config(&req).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("{field} applies to rest mode only")),
+                "{field}: {err}"
+            );
+        }
+        for field in connection_fields {
+            let mut body =
+                serde_json::json!({ "mode": "direct", "table_location": "s3://b/w/ns/t" });
+            body[field] = given(field);
+            let req: IcebergBrowseRequest = serde_json::from_value(body).unwrap();
+            let err = build_iceberg_connection(&req.connection)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("{field} applies to rest mode only")),
+                "{field}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn map_request_glue_mode_is_mapping_driven() {
+        // Like rest, a glue source whose tables come from its R2RML mapping needs
+        // no `table` of its own; each rr:tableName is a Glue `<database>.<table>`.
+        let body = serde_json::json!({
+            "name": "orders",
+            "mode": "glue",
+            "region": "us-east-1",
+            "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> ."
+        });
+        let req: IcebergMapRequest = serde_json::from_value(body).unwrap();
+        let config = build_iceberg_config(&req).unwrap();
+        assert!(config.connection.is_glue());
+        config.validate().unwrap();
+
+        // Without a mapping it needs one, and says so in the wire spelling.
+        let body = serde_json::json!({ "name": "orders", "mode": "glue" });
+        let req: IcebergMapRequest = serde_json::from_value(body).unwrap();
+        let err = build_iceberg_config(&req).unwrap_err().to_string();
+        assert!(
+            err.contains("table is required for glue mode (or provide r2rml"),
+            "{err}"
+        );
     }
 
     #[test]

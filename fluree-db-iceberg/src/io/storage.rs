@@ -178,7 +178,7 @@ fn http1_only_http_client() -> aws_sdk_s3::config::SharedHttpClient {
 /// failures) lives in the source chain. Walking it turns opaque failures into
 /// actionable messages — important for diagnosing GCS S3-interop misconfig.
 #[cfg(feature = "aws")]
-fn error_chain(err: &dyn std::error::Error) -> String {
+pub(crate) fn error_chain(err: &dyn std::error::Error) -> String {
     use std::fmt::Write;
     let mut msg = err.to_string();
     let mut source = err.source();

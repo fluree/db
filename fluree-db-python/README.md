@@ -244,10 +244,14 @@ people.select("PREFIX ex: <http://example.org/> SELECT ?name WHERE { ?p ex:name 
 
 - The mapping is Turtle text or a path to a Turtle file. Give each object map
   an `rr:datatype`: a column without one reads back as a string.
-- An Iceberg table is read directly from `table_location`, or through a REST
-  catalog (`catalog_uri=`, `warehouse=`, `auth=`). Delta tables are found under
-  `root`, at locations in `tables`, or through a `fluree.Unity` catalog. A SQL
-  source pushes queries to any Trino-protocol endpoint.
+- An Iceberg table is read directly from `table_location`, or through a
+  catalog: a REST catalog (`catalog_uri=`, `warehouse=`, `auth=`), an AWS Glue
+  Data Catalog (`glue=fluree.Glue(region=...)`, each `rr:tableName` a Glue
+  `<database>.<table>`), or an AWS S3 Tables table bucket
+  (`s3_tables=fluree.S3Tables(table_bucket_arn)`). Glue and S3 Tables read with
+  the usual AWS environment. Delta tables are found under `root`, at locations
+  in `tables`, or through a `fluree.Unity` catalog. A SQL source pushes queries
+  to any Trino-protocol endpoint.
 - Secrets can be `fluree.EnvVar("NAME")`, read where the tables are read,
   rather than stored with the source.
 - `conn.graph_sources()` lists them, `conn.graph_source(name)` finds one, and

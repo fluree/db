@@ -1,0 +1,11 @@
+@base <http://example.org/mapping/> .
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<#Customers> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "demo.customers_hinted" ] ;
+  rr:subjectMap [ rr:template "http://example.org/customer/{customer_id}" ; rr:class ex:Customer ] ;
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:country ; rr:objectMap [ rr:column "country" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:birthDate ; rr:objectMap [ rr:column "birth_date" ; rr:datatype xsd:date ] ] .
