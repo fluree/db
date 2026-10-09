@@ -225,6 +225,16 @@ pub(crate) fn catalog_client_cache_key(graph_source_id: &str, config: &str) -> S
     format!("{graph_source_id}\u{1f}{:016x}", config_fingerprint(config))
 }
 
+/// Key for the `loadTable` caches that OUTLIVE a query (the in-memory cross-query
+/// cache and the persisted disk pointer): the per-query `lt_key` plus the source
+/// config's fingerprint. A source dropped and re-created under the same name with
+/// a different catalog (URI, region, Glue catalog id, S3 Tables bucket) then never
+/// answers from the old one's pointer, which neither cache invalidates on drop.
+/// Per-query state (the session pin) stays on `lt_key`: one query sees one config.
+fn cross_query_key(lt_key: &str, raw_config: &str) -> String {
+    format!("{lt_key}\u{1f}{:016x}", config_fingerprint(raw_config))
+}
+
 /// The process-wide catalog client for a catalog-backed source — REST, AWS Glue,
 /// or AWS S3 Tables — or `None` for Direct, which has no catalog. Every query-path
 /// client comes from here, so all three catalogs share one client cache, one
@@ -3072,6 +3082,7 @@ async fn resolve_catalog_load_and_storage(
     table_id: TableIdentifier,
     io: IoConfig,
     lt_key: String,
+    cross_query_key: String,
     catalog_uri: String,
     catalog_vends: bool,
 ) -> QueryResult<(Arc<IcebergStorageBackend>, LoadTableResponse)> {
@@ -3082,7 +3093,7 @@ async fn resolve_catalog_load_and_storage(
     } else {
         let pinned = session.pinned_metadata_location(&lt_key);
         let cross_query = if pinned.is_none() {
-            cache.get_rest_load_table(&lt_key)
+            cache.get_rest_load_table(&cross_query_key)
         } else {
             None
         };
@@ -3101,7 +3112,7 @@ async fn resolve_catalog_load_and_storage(
                 .await
                 .map_err(|e| storage_query_error("Failed to load table from catalog", e))?;
             cache.put_rest_load_table(
-                lt_key.clone(),
+                cross_query_key.clone(),
                 Arc::new(super::catalog_session::CachedLoadTable::from_response(
                     &actual,
                 )),
@@ -3450,6 +3461,7 @@ impl FlureeR2rmlProvider<'_> {
             &table_id.namespace,
             &table_id.table,
         );
+        let xq_key = cross_query_key(&lt_key, &record.config);
         let disk = self.catalog_disk_cache();
         let source_time = self.source_time(graph_source_id);
         let storage_io = iceberg_config.storage_io().into_owned();
@@ -3466,7 +3478,7 @@ impl FlureeR2rmlProvider<'_> {
             let session_loc = self.session.pinned_metadata_location(&lt_key);
             let from_session = session_loc.is_some();
             let candidate = session_loc
-                .or_else(|| disk.get_metadata_location(&lt_key, pin_min_snapshot_ms(source_time)));
+                .or_else(|| disk.get_metadata_location(&xq_key, pin_min_snapshot_ms(source_time)));
             if let Some(loc) = candidate {
                 let cached = self
                     .metadata_from_caches(&loc)
@@ -3503,6 +3515,7 @@ impl FlureeR2rmlProvider<'_> {
                     let io = storage_io.clone();
                     let table_id = table_id.clone();
                     let lt_key_b = lt_key.clone();
+                    let xq_key_b = xq_key.clone();
                     let uri_b = catalog_label.clone();
                     let builder: super::lazy_storage::StorageBuilder<
                         'static,
@@ -3514,6 +3527,7 @@ impl FlureeR2rmlProvider<'_> {
                         let io = io.clone();
                         let table_id = table_id.clone();
                         let lt_key = lt_key_b.clone();
+                        let xq_key = xq_key_b.clone();
                         let catalog_uri = uri_b.clone();
                         Box::pin(async move {
                             let built = if catalog_vends {
@@ -3524,6 +3538,7 @@ impl FlureeR2rmlProvider<'_> {
                                     table_id,
                                     io,
                                     lt_key,
+                                    xq_key,
                                     catalog_uri,
                                     catalog_vends,
                                 )
@@ -3602,7 +3617,7 @@ impl FlureeR2rmlProvider<'_> {
                     // query skips it too: the entry carries only a location, so
                     // whether it is new enough for the pin can't be checked.
                     let cross_query = if pinned.is_none() && source_time.is_none() {
-                        cache.get_rest_load_table(&lt_key)
+                        cache.get_rest_load_table(&xq_key)
                     } else {
                         None
                     };
@@ -3631,7 +3646,7 @@ impl FlureeR2rmlProvider<'_> {
                         // (never this query's pin), so other queries see the newest
                         // snapshot within the TTL.
                         cache.put_rest_load_table(
-                            lt_key.clone(),
+                            xq_key.clone(),
                             Arc::new(super::catalog_session::CachedLoadTable::from_response(
                                 &actual,
                             )),
@@ -3821,7 +3836,7 @@ impl FlureeR2rmlProvider<'_> {
         // the as_of_t rider (grep r2rml-as-of-t). The eager `storage` is already
         // built (a pointer/metadata miss forced the GET), so it wraps in `ready`.
         disk.put_metadata_location(
-            &lt_key,
+            &xq_key,
             &load_response.metadata_location,
             metadata
                 .current_snapshot()
@@ -5540,6 +5555,31 @@ mod tests {
         .expect("explicit vended_credentials=false must use the ambient chain");
     }
 
+    /// A source dropped and re-created under the same name with another catalog
+    /// must not answer from the old one's pointer: the caches that outlive a query
+    /// key on the config, while the per-query key (the session pin) does not.
+    #[test]
+    fn cross_query_keys_follow_the_catalog_config() {
+        let lt = super::super::catalog_session::IcebergCatalogSession::load_table_key(
+            "orders:main",
+            "sales",
+            "orders",
+        );
+        let glue_east =
+            r#"{"catalog":{"type":"glue","region":"us-east-1"},"table":"sales.orders"}"#;
+        let glue_west =
+            r#"{"catalog":{"type":"glue","region":"us-west-2"},"table":"sales.orders"}"#;
+        assert_eq!(
+            cross_query_key(&lt, glue_east),
+            cross_query_key(&lt, glue_east)
+        );
+        assert_ne!(
+            cross_query_key(&lt, glue_east),
+            cross_query_key(&lt, glue_west)
+        );
+        assert!(cross_query_key(&lt, glue_east).starts_with(&lt));
+    }
+
     /// The incremental / materialize scans make the query path's §2 decision too
     /// (they used to build ambient storage regardless): a source that requires
     /// vended credentials, whose catalog vended none, is refused before any client
@@ -6277,7 +6317,11 @@ mod tests {
                 .await
                 .unwrap();
             let gs_id = format!("{name}:main");
-            let lt_key = IcebergCatalogSession::load_table_key(&gs_id, "ns", "t");
+            // The caches that outlive a query are keyed by the source's config too.
+            let lt_key = cross_query_key(
+                &IcebergCatalogSession::load_table_key(&gs_id, "ns", "t"),
+                &config,
+            );
             sources.push((layer, gs_id, lt_key));
         }
         let (_, pointer_gs, pointer_key) = &sources[0];
