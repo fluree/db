@@ -14,7 +14,7 @@
 //! across ledgers. Transitive cross-ledger imports land in a
 //! follow-up.
 
-use super::types::{SchemaArtifactWire, WireObject, WireOrigin, WireTriple};
+use super::types::{ModelHead, SchemaArtifactWire, WireObject, WireOrigin, WireTriple};
 use super::CrossLedgerError;
 use super::ResolveCtx;
 use fluree_db_core::{
@@ -31,15 +31,16 @@ use fluree_db_core::{
     fields(
         model_ledger = canonical_model_ledger_id,
         graph_iri = graph_iri,
-        resolved_t = resolved_t,
+        resolved_t = head.t,
     ),
 )]
 pub(super) async fn materialize_schema(
     canonical_model_ledger_id: &str,
     graph_iri: &str,
-    resolved_t: i64,
+    head: &ModelHead,
     ctx: &ResolveCtx<'_>,
 ) -> Result<SchemaArtifactWire, CrossLedgerError> {
+    let resolved_t = head.t;
     use fluree_vocab::{owl, rdf, rdfs};
 
     // 1. Open M at resolved_t.
@@ -198,6 +199,7 @@ pub(super) async fn materialize_schema(
             model_ledger_id: canonical_model_ledger_id.to_string(),
             graph_iri: graph_iri.to_string(),
             resolved_t,
+            commit_id: head.commit_id.clone(),
         },
         triples,
     })

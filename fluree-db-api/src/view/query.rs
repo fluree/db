@@ -1608,15 +1608,15 @@ impl Fluree {
         // could disagree if M advances between awaits — that breaks
         // the resolver's per-request consistency contract.
         //
-        // Seeded from `db.cross_ledger_resolved_ts` so a preceding
+        // Seeded from `db.cross_ledger_resolved_heads` so a preceding
         // `wrap_policy` call's captures carry forward: policy and
         // reasoning/rules on the same M must agree on which
         // version of M they're enforcing, even though they enter
         // through separate Rust API calls.
-        let mut ctx = crate::cross_ledger::ResolveCtx::with_resolved_ts(
+        let mut ctx = crate::cross_ledger::ResolveCtx::with_resolved_heads(
             &db.as_graph_db_ref().snapshot.ledger_id,
             self,
-            (**db.cross_ledger_resolved_ts()).clone(),
+            (**db.cross_ledger_resolved_heads()).clone(),
         );
 
         // Cross-ledger `f:rulesSource`: when M is referenced via

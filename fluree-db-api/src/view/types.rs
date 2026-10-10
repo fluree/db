@@ -229,15 +229,15 @@ pub struct GraphDb {
     ///
     /// `wrap_policy` and `query` are separate Rust API calls but
     /// model a single HTTP request; if both touch the same model
-    /// ledger M, they must observe the same `resolved_t` for M.
+    /// ledger M, they must observe the same head of M.
     /// Carrying this map on the view lets `wrap_policy` capture
-    /// M's head-t and the subsequent `query` reuse that capture
+    /// M's head and the subsequent `query` reuse that capture
     /// when building its own `ResolveCtx`.
     ///
     /// Empty by default. Cloned via `Arc` so policy-wrap doesn't
     /// inflate the cached `GraphDb` cost.
-    pub(crate) cross_ledger_resolved_ts:
-        Arc<std::collections::HashMap<fluree_db_core::LedgerId, i64>>,
+    pub(crate) cross_ledger_resolved_heads:
+        Arc<std::collections::HashMap<fluree_db_core::LedgerId, crate::cross_ledger::ModelHead>>,
 
     // ========================================================================
     // Graph source context (optional — set when view is created from a graph source)
@@ -316,7 +316,7 @@ impl GraphDb {
             query_time_rules_allowed: true,
             datalog_override_allowed: true,
             rules_source_g_id: None,
-            cross_ledger_resolved_ts: Arc::new(std::collections::HashMap::new()),
+            cross_ledger_resolved_heads: Arc::new(std::collections::HashMap::new()),
             graph_source_id: None,
             graph_source_time: None,
         }
@@ -722,20 +722,23 @@ impl GraphDb {
     }
 
     /// Replace the carried governance-context capture (per-ledger
-    /// `resolved_t`s seen so far in this logical request).
-    pub fn with_cross_ledger_resolved_ts(
+    /// model heads seen so far in this logical request).
+    pub fn with_cross_ledger_resolved_heads(
         mut self,
-        ts: Arc<std::collections::HashMap<fluree_db_core::LedgerId, i64>>,
+        heads: Arc<
+            std::collections::HashMap<fluree_db_core::LedgerId, crate::cross_ledger::ModelHead>,
+        >,
     ) -> Self {
-        self.cross_ledger_resolved_ts = ts;
+        self.cross_ledger_resolved_heads = heads;
         self
     }
 
     /// Read the carried governance-context capture.
-    pub fn cross_ledger_resolved_ts(
+    pub fn cross_ledger_resolved_heads(
         &self,
-    ) -> &Arc<std::collections::HashMap<fluree_db_core::LedgerId, i64>> {
-        &self.cross_ledger_resolved_ts
+    ) -> &Arc<std::collections::HashMap<fluree_db_core::LedgerId, crate::cross_ledger::ModelHead>>
+    {
+        &self.cross_ledger_resolved_heads
     }
 }
 
