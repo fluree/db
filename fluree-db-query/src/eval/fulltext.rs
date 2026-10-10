@@ -292,17 +292,10 @@ fn resolve_string_id(
     dict_novelty: Option<&fluree_db_core::DictNovelty>,
     text: &str,
 ) -> Option<u32> {
-    // Try persisted reverse dict first
-    if let Ok(Some(id)) = binary_store.find_string_id(text) {
-        return Some(id);
-    }
-    // Try novelty dict
-    if let Some(dn) = dict_novelty {
-        if let Some(id) = dn.strings.find_string(text) {
-            return Some(id);
-        }
-    }
-    None
+    fluree_db_binary_index::DictLookup::new(binary_store, dict_novelty)
+        .string_id(text)
+        .ok()
+        .flatten()
 }
 
 /// Get or build the novelty delta for `(g_id, p_id, lang_id)`, using the

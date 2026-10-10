@@ -66,7 +66,7 @@ use crate::ir::{Expression, Pattern};
 use crate::join::{
     batched_subject_probe_binary, make_dict_overlay, prepare_leaf_for_scan, SubjectProbeParams,
 };
-use crate::object_binding::{equality_norm, materialized_object_binding, EqualityNorm};
+use crate::object_binding::{materialized_object_binding, EqualityNorm};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::seed::BatchSeedOperator;
 use crate::temporal_mode::PlanningContext;
@@ -1093,7 +1093,7 @@ impl Operator for RangeSemiJoinOperator {
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         if self.norm.is_none() {
-            self.norm = equality_norm(ctx);
+            self.norm = EqualityNorm::for_ctx(ctx);
         }
         self.restore_child();
         if ctx.binary_store.is_none()
@@ -1236,7 +1236,7 @@ impl Operator for RangeSemiJoinOperator {
                     crate::fast_path_outcome::FastPathOutcome::Proceed,
                 );
 
-                let (store, gv) = EqualityNorm::parts(&self.norm);
+                let norm = self.norm.as_ref();
                 let mut fallback_rows: Vec<usize> = Vec::new();
                 for (row, keep_row) in keep.iter_mut().enumerate() {
                     if !*keep_row {
@@ -1253,7 +1253,7 @@ impl Operator for RangeSemiJoinOperator {
                         }
                         Some(Binding::Poisoned) => false,
                         Some(subject) => {
-                            let key = binding_to_group_key_normalized(subject, store, gv);
+                            let key = binding_to_group_key_normalized(subject, norm);
                             let mut any = false;
                             for value in index.values.values_of(&key) {
                                 if self.value_passes(c, interval, &batch, row, value, ctx)? {

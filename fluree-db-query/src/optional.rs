@@ -35,7 +35,7 @@ use crate::join::{
     batched_subject_probe_binary, BindInstruction, PatternPosition, SubjectProbeParams,
     UnifyInstruction,
 };
-use crate::object_binding::{equality_norm, EqualityNorm};
+use crate::object_binding::EqualityNorm;
 use crate::operator::flush::FlushSchedule;
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
@@ -165,25 +165,14 @@ pub trait OptionalBuilder: Send + Sync {
 /// Encoded id of a subject binding, for the batched probes; `None` when the
 /// binding has none.
 fn resolve_subject_id(binding: &Binding, ctx: &ExecutionContext<'_>) -> Result<Option<u64>> {
-    let Some(store) = ctx.binary_store.as_deref() else {
+    let Some(dicts) = ctx.dict_lookup() else {
         return Ok(None);
     };
     match binding {
         Binding::EncodedSid { s_id, .. } => Ok(Some(*s_id)),
-        Binding::Sid { sid, .. } => {
-            // Persisted reverse dict first, then DictNovelty — subjects
-            // minted after the last index resolve to novelty s_ids, the
-            // same id space the overlay ops are translated into.
-            let persisted = store
-                .find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}")))?;
-            Ok(persisted.or_else(|| {
-                ctx.dict_novelty
-                    .as_ref()
-                    .filter(|dn| dn.is_initialized())
-                    .and_then(|dn| dn.subjects.find_subject(sid.namespace_code, &sid.name))
-            }))
-        }
+        Binding::Sid { sid, .. } => dicts
+            .subject_id(sid.namespace_code, &sid.name)
+            .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}"))),
         _ => Ok(None),
     }
 }
@@ -1474,8 +1463,8 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
         }
         let seed_vars: Vec<VarId> = seed_cols.iter().map(|&c| req_schema[c]).collect();
 
-        let norm = equality_norm(ctx);
-        let (store, gv) = EqualityNorm::parts(&norm);
+        let norm = EqualityNorm::for_ctx(ctx);
+        let norm = norm.as_ref();
 
         // Per row: full correlation key (for matching) + distinct seed tuple
         // over the seeded subset. A poisoned/unbound correlation var can never
@@ -1530,15 +1519,11 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
             }
             let key: Vec<GroupKeyOwned> = corr_cols
                 .iter()
-                .map(|&c| {
-                    binding_to_group_key_normalized(required_batch.get_by_col(row, c), store, gv)
-                })
+                .map(|&c| binding_to_group_key_normalized(required_batch.get_by_col(row, c), norm))
                 .collect();
             let seed_key: Vec<GroupKeyOwned> = seed_cols
                 .iter()
-                .map(|&c| {
-                    binding_to_group_key_normalized(required_batch.get_by_col(row, c), store, gv)
-                })
+                .map(|&c| binding_to_group_key_normalized(required_batch.get_by_col(row, c), norm))
                 .collect();
             if seen_seed.insert(seed_key) {
                 seed_rows.push(
@@ -1613,7 +1598,7 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
             for r in 0..batch.len() {
                 let key: Vec<GroupKeyOwned> = out_corr_cols
                     .iter()
-                    .map(|&c| binding_to_group_key_normalized(batch.get_by_col(r, c), store, gv))
+                    .map(|&c| binding_to_group_key_normalized(batch.get_by_col(r, c), norm))
                     .collect();
                 let projected: Vec<Binding> = out_opt_cols
                     .iter()
@@ -2034,6 +2019,7 @@ impl OptionalBuilder for AnnotationValueOptionalBuilder {
         // filtered planned scans) — cached across required batches — then
         // pure hash lookups per row.
         let maps = self.sidecar_maps(ctx, view).await?;
+        let norm = EqualityNorm::for_ctx(ctx);
         let opt_schema: Arc<[VarId]> = Arc::from(vec![self.ann_var].into_boxed_slice());
         let mut pending = Vec::with_capacity(required_batch.len() - start_row);
         for row in start_row..required_batch.len() {
@@ -2041,8 +2027,12 @@ impl OptionalBuilder for AnnotationValueOptionalBuilder {
                 self.row_sid(&self.s_src, required_batch, row, view)?,
                 self.row_sid(&self.p_src, required_batch, row, view)?,
             );
-            let o =
-                crate::annotation_edge_probe::row_obj_key(required_batch, row, &self.o_src, view);
+            let o = crate::annotation_edge_probe::row_obj_key(
+                required_batch,
+                row,
+                &self.o_src,
+                norm.as_ref(),
+            );
             let ((Some(s), Some(p)), false) = (
                 key,
                 matches!(o, crate::group_aggregate::GroupKeyOwned::Absent),

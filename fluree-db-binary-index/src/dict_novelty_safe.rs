@@ -1,13 +1,62 @@
-//! Unified, "safe" DictNovelty population helpers.
+//! Unified, "safe" DictNovelty population and lookup.
 //!
 //! Goal: ensure we **never** allocate a novelty ID for an entry that already exists in the
 //! persisted dictionaries (`BinaryIndexStore`). This prevents multiple internal IDs from
-//! decoding to the same logical IRI / string.
+//! decoding to the same logical IRI / string. [`DictLookup`] reads in the same order, so a
+//! value maps to the one id that encoded bindings carry for it.
 
 use crate::BinaryIndexStore;
 use fluree_db_core::{DictNovelty, Flake, FlakeValue, Sid};
 use std::collections::HashSet;
 use std::io;
+
+/// Value → id lookups over the persisted dictionaries, then the novelty layer.
+#[derive(Clone, Copy)]
+pub struct DictLookup<'a> {
+    store: &'a BinaryIndexStore,
+    novelty: Option<&'a DictNovelty>,
+}
+
+impl<'a> DictLookup<'a> {
+    /// An uninitialized novelty layer allocates no ids, so it is skipped.
+    pub fn new(store: &'a BinaryIndexStore, novelty: Option<&'a DictNovelty>) -> Self {
+        Self {
+            store,
+            novelty: novelty.filter(|dn| dn.is_initialized()),
+        }
+    }
+
+    pub fn store(&self) -> &'a BinaryIndexStore {
+        self.store
+    }
+
+    pub fn subject_id(&self, ns_code: u16, name: &str) -> io::Result<Option<u64>> {
+        if let Some(id) = self.store.find_subject_id_by_parts(ns_code, name)? {
+            return Ok(Some(id));
+        }
+        Ok(self
+            .novelty
+            .and_then(|dn| dn.subjects.find_subject(ns_code, name)))
+    }
+
+    pub fn subject_id_for_iri(&self, iri: &str) -> io::Result<Option<u64>> {
+        if let Some(id) = self.store.find_subject_id(iri)? {
+            return Ok(Some(id));
+        }
+        let Some(dn) = self.novelty else {
+            return Ok(None);
+        };
+        let sid = self.store.encode_iri(iri);
+        Ok(dn.subjects.find_subject(sid.namespace_code, &sid.name))
+    }
+
+    pub fn string_id(&self, value: &str) -> io::Result<Option<u32>> {
+        if let Some(id) = self.store.find_string_id(value)? {
+            return Ok(Some(id));
+        }
+        Ok(self.novelty.and_then(|dn| dn.strings.find_string(value)))
+    }
+}
 
 #[inline]
 fn subject_is_persisted(store: &BinaryIndexStore, sid: &Sid) -> io::Result<bool> {

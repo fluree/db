@@ -62,7 +62,7 @@ use crate::error::Result;
 use crate::execute::build_where_operators_seeded;
 use crate::group_aggregate::CompositeGroupKey;
 use crate::ir::{Pattern, TriplePattern};
-use crate::object_binding::{equality_norm, EqualityNorm};
+use crate::object_binding::EqualityNorm;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::seed::{EmptyOperator, SeedOperator};
 use crate::temporal_mode::PlanningContext;
@@ -149,7 +149,7 @@ impl MembershipJoinOperator {
             self.key_vars
                 .iter()
                 .map(|v| batch.get(row_idx, *v).unwrap_or(&Binding::Unbound)),
-            &self.norm,
+            self.norm.as_ref(),
         )
     }
 
@@ -262,7 +262,7 @@ impl Operator for MembershipJoinOperator {
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         if self.norm.is_none() {
-            self.norm = equality_norm(ctx);
+            self.norm = EqualityNorm::for_ctx(ctx);
         }
         // Keep/drop is only join-equivalent over a single graph; with more
         // than one in scope a ground triple can match once per graph.

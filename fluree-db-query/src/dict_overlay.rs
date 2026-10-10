@@ -16,7 +16,7 @@
 //! let iri = overlay.resolve_subject_iri(s_id)?;
 //! ```
 
-use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
+use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore, DictLookup};
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::flake::FlakeMeta;
 use fluree_db_core::ns_vec_bi_dict::NsVecBiDict;
@@ -146,6 +146,11 @@ impl DictOverlay {
         &self.graph_view
     }
 
+    /// Persisted dictionaries, then this overlay's `DictNovelty`.
+    fn dict_lookup(&self) -> DictLookup<'_> {
+        DictLookup::new(self.graph_view.store(), Some(&self.dict_novelty))
+    }
+
     // ========================================================================
     // Subject dictionary (delegated to DictNovelty)
     // ========================================================================
@@ -156,22 +161,10 @@ impl DictOverlay {
     /// fallback. Ephemeral fallback is only used when DictNovelty is
     /// uninitialized (range provider path).
     pub fn assign_subject_id(&mut self, iri: &str) -> io::Result<u64> {
-        // 1. Persisted tree (canonical — must be first)
-        if let Some(id) = self.graph_view.store().find_subject_id(iri)? {
+        if let Some(id) = self.dict_lookup().subject_id_for_iri(iri)? {
             return Ok(id);
         }
-        // 2. DictNovelty
-        if self.dict_novelty.is_initialized() {
-            let sid = self.graph_view.store().encode_iri(iri);
-            if let Some(id) = self
-                .dict_novelty
-                .subjects
-                .find_subject(sid.namespace_code, &sid.name)
-            {
-                return Ok(id);
-            }
-        }
-        // 3. Ephemeral fallback (for range provider path)
+        // Ephemeral fallback (for range provider path)
         let sid = self.graph_view.store().encode_iri(iri);
         Ok(self
             .ext_subjects
@@ -184,25 +177,13 @@ impl DictOverlay {
     /// prefix_trie decomposition since we already have ns_code + suffix).
     /// Falls back to ephemeral allocation when DictNovelty is uninitialized.
     pub fn assign_subject_id_from_sid(&mut self, sid: &Sid) -> io::Result<u64> {
-        // 1. Persisted tree (canonical encoding guarantees exact-parts match)
         if let Some(id) = self
-            .graph_view
-            .store()
-            .find_subject_id_by_parts(sid.namespace_code, &sid.name)?
+            .dict_lookup()
+            .subject_id(sid.namespace_code, &sid.name)?
         {
             return Ok(id);
         }
-        // 2. DictNovelty (populated during commit — guaranteed hit for novelty subjects)
-        if self.dict_novelty.is_initialized() {
-            if let Some(id) = self
-                .dict_novelty
-                .subjects
-                .find_subject(sid.namespace_code, &sid.name)
-            {
-                return Ok(id);
-            }
-        }
-        // 3. Ephemeral fallback (for range provider path)
+        // Ephemeral fallback (for range provider path)
         Ok(self
             .ext_subjects
             .assign_or_lookup(sid.namespace_code, sid.name.as_ref()))
@@ -297,17 +278,10 @@ impl DictOverlay {
     ///
     /// Tries: persisted tree → DictNovelty → ephemeral fallback.
     pub fn assign_string_id(&mut self, value: &str) -> io::Result<u32> {
-        // 1. Persisted tree
-        if let Some(id) = self.graph_view.store().find_string_id(value)? {
+        if let Some(id) = self.dict_lookup().string_id(value)? {
             return Ok(id);
         }
-        // 2. DictNovelty (populated during commit)
-        if self.dict_novelty.is_initialized() {
-            if let Some(id) = self.dict_novelty.strings.find_string(value) {
-                return Ok(id);
-            }
-        }
-        // 3. Ephemeral fallback (for range provider path)
+        // Ephemeral fallback (for range provider path)
         Ok(self.ext_strings.assign_or_lookup(value))
     }
 

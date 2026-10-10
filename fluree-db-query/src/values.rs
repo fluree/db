@@ -13,6 +13,7 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
 use crate::group_aggregate::{binding_to_group_key_normalized, CompositeGroupKey};
+use crate::object_binding::{normalize_for_key, EqualityNorm};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
@@ -55,6 +56,7 @@ pub struct ValuesOperator {
     /// binding is a wildcard; Iri/IriMatch compare through SID decoding) —
     /// always scanned per input row alongside any hash bucket.
     fallback_value_rows: Vec<usize>,
+    norm: Option<EqualityNorm>,
 }
 
 /// Binding classes whose VALUES compatibility goes through decode-based
@@ -114,6 +116,7 @@ impl ValuesOperator {
             child_col_to_val_idx,
             value_index: None,
             fallback_value_rows: Vec::new(),
+            norm: None,
         }
     }
 
@@ -144,7 +147,7 @@ impl ValuesOperator {
                 // while dataset execution can produce `IriMatch` bindings. We treat
                 // Sid vs IriMatch/Iri as comparable by decoding the SID using the
                 // primary db in the execution context.
-                if !bindings_compatible_for_values(ctx, child_val, values_val) {
+                if !bindings_compatible_for_values(ctx, self.norm.as_ref(), child_val, values_val) {
                     return false;
                 }
             }
@@ -171,14 +174,11 @@ impl ValuesOperator {
 
     /// Build the value-row hash lane (see the field docs). Called once per
     /// open, on the first batch.
-    fn build_value_index(&mut self, ctx: &ExecutionContext<'_>) {
+    fn build_value_index(&mut self) {
         let has_overlap = self.overlap_positions.iter().any(Option::is_some);
         if !has_overlap || self.value_rows.len() < VALUES_HASH_MIN_ROWS {
             return;
         }
-        let gv = ctx.graph_view();
-        let store_arc = crate::object_binding::equality_norm_store(ctx);
-        let store = store_arc.as_deref();
         let mut index: FxHashMap<CompositeGroupKey, Vec<usize>> = FxHashMap::default();
         let mut fallback: Vec<usize> = Vec::new();
         'rows: for (i, row) in self.value_rows.iter().enumerate() {
@@ -192,7 +192,7 @@ impl ValuesOperator {
                     fallback.push(i);
                     continue 'rows;
                 }
-                keys.push(binding_to_group_key_normalized(b, store, gv.as_ref()));
+                keys.push(binding_to_group_key_normalized(b, self.norm.as_ref()));
             }
             index.entry(CompositeGroupKey(keys)).or_default().push(i);
         }
@@ -249,10 +249,11 @@ impl Operator for ValuesOperator {
         self.state = OperatorState::Open;
         self.value_index = None;
         self.fallback_value_rows.clear();
+        self.norm = EqualityNorm::for_ctx(ctx);
         if ctx.scan_provenance_ledger.is_some() {
             self.stamp_value_rows(ctx);
         }
-        self.build_value_index(ctx);
+        self.build_value_index();
         Ok(())
     }
 
@@ -303,9 +304,6 @@ impl Operator for ValuesOperator {
             .map(|_| Vec::with_capacity(max_rows))
             .collect();
 
-        let gv = ctx.graph_view();
-        let norm_store_arc = crate::object_binding::equality_norm_store(ctx);
-        let norm_store = norm_store_arc.as_deref();
         for row_idx in 0..input_batch.len() {
             // Get input row as slice of references
             let input_row: Vec<&Binding> = (0..child_num_cols)
@@ -325,7 +323,7 @@ impl Operator for ValuesOperator {
                     if b.is_unbound_or_poisoned() || hash_fragile(b) {
                         return None;
                     }
-                    keys.push(binding_to_group_key_normalized(b, norm_store, gv.as_ref()));
+                    keys.push(binding_to_group_key_normalized(b, self.norm.as_ref()));
                 }
                 Some(
                     index
@@ -384,32 +382,14 @@ impl Operator for ValuesOperator {
     }
 }
 
-fn bindings_compatible_for_values(ctx: &ExecutionContext<'_>, a: &Binding, b: &Binding) -> bool {
-    if a == b {
+fn bindings_compatible_for_values(
+    ctx: &ExecutionContext<'_>,
+    norm: Option<&EqualityNorm>,
+    a: &Binding,
+    b: &Binding,
+) -> bool {
+    if a == b || normalize_for_key(a, norm) == normalize_for_key(b, norm) {
         return true;
-    }
-
-    // Encoded scan output vs decoded VALUES constants: normalize the decoded
-    // side to its encoded form and retry the structural comparison.
-    if let Some(store) = crate::object_binding::equality_norm_store(ctx) {
-        let an = crate::object_binding::encoded_equivalent(a, &store);
-        let bn = crate::object_binding::encoded_equivalent(b, &store);
-        if (an.is_some() || bn.is_some()) && an.as_ref().unwrap_or(a) == bn.as_ref().unwrap_or(b) {
-            return true;
-        }
-    }
-
-    // Arena-backed NUM_BIG scan output vs a decoded decimal/bigint constant:
-    // the constant can't encode (handles are per-predicate), so decode the
-    // encoded side and compare by value.
-    if crate::object_binding::is_numbig_encoded(a) || crate::object_binding::is_numbig_encoded(b) {
-        if let Some(gv) = ctx.graph_view() {
-            let am = crate::group_aggregate::materialize_encoded(a, Some(&gv));
-            let bm = crate::group_aggregate::materialize_encoded(b, Some(&gv));
-            if am == bm {
-                return true;
-            }
-        }
     }
 
     match (a, b) {

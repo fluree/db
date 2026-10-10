@@ -35,6 +35,7 @@ use crate::eval::PreparedBoolExpression;
 use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::{GraphName, Pattern};
+use crate::object_binding::EqualityNorm;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::r2rml::policy::{R2rmlPolicyGate, Verdict};
 use crate::r2rml::{ColumnBatchStream, PushdownCapabilities};
@@ -576,6 +577,7 @@ struct SqlBlockSource {
     caches: Vec<BlockCache>,
     /// The branches run as one statement (see [`UnionLayout`]).
     grouped: bool,
+    norm: Option<EqualityNorm>,
 }
 
 impl SqlBlockSource {
@@ -613,6 +615,7 @@ impl SqlBlockSource {
             outer_rows: 0,
             caches,
             grouped,
+            norm: None,
         }
     }
 
@@ -954,7 +957,7 @@ impl SqlBlockSource {
                 .map(|jv| {
                     row.iter()
                         .find(|(v, b)| v == jv && b.is_bound())
-                        .map(|(_, b)| join_key(b, ctx))
+                        .map(|(_, b)| join_key(b, ctx, self.norm.as_ref()))
                 })
                 .collect();
             if key.iter().all(Option::is_some) {
@@ -999,7 +1002,7 @@ impl SqlBlockSource {
                     poisoned = true;
                     break;
                 }
-                key.push(b.is_bound().then(|| join_key(b, ctx)));
+                key.push(b.is_bound().then(|| join_key(b, ctx, self.norm.as_ref())));
             }
             if poisoned {
                 continue;
@@ -1215,7 +1218,7 @@ impl SqlBlockSource {
                     break;
                 }
                 if b.is_bound() {
-                    key.push(Some(join_key(b, ctx)));
+                    key.push(Some(join_key(b, ctx, self.norm.as_ref())));
                 } else {
                     all_bound = false;
                     key.push(None);
@@ -1288,7 +1291,7 @@ impl SqlBlockSource {
                     .filter_map(|jv| {
                         prod.iter()
                             .find(|(v, _)| v == jv)
-                            .map(|(_, b)| join_key(b, ctx))
+                            .map(|(_, b)| join_key(b, ctx, self.norm.as_ref()))
                     })
                     .collect();
                 if pkey.len() != join_vars.len() {
@@ -1379,13 +1382,10 @@ impl SqlBlockSource {
 /// ledger `Sid`, an `IriMatch`, a raw `Iri`) keys by its IRI string, so an
 /// outer ledger value joins the block's raw IRI; anything else uses the
 /// engine's normalized key.
-fn join_key(b: &Binding, ctx: &ExecutionContext<'_>) -> GroupKeyOwned {
+fn join_key(b: &Binding, ctx: &ExecutionContext<'_>, norm: Option<&EqualityNorm>) -> GroupKeyOwned {
     match terms::iri_of_binding(b, Some(ctx.active_snapshot)) {
         Some(iri) => GroupKeyOwned::MaterializedSid(0, iri.into()),
-        None => {
-            let gv = ctx.graph_view();
-            binding_to_group_key_normalized(b, ctx.binary_store.as_deref(), gv.as_ref())
-        }
+        None => binding_to_group_key_normalized(b, norm),
     }
 }
 
@@ -1410,6 +1410,7 @@ impl Operator for SqlBlockSource {
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         self.child.open(ctx).await?;
         self.state = OperatorState::Open;
+        self.norm = EqualityNorm::for_ctx(ctx);
         Ok(())
     }
 

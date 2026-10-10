@@ -25,7 +25,7 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
-use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm};
+use crate::object_binding::{normalize_for_key, EqualityNorm};
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
 };
@@ -114,8 +114,8 @@ impl GroupByOperator {
         self.group_key_indices
             .iter()
             .map(|&idx| {
-                let (store, gv) = EqualityNorm::parts(&self.norm);
-                normalize_for_key(&row[idx], store, gv)
+                let norm = self.norm.as_ref();
+                normalize_for_key(&row[idx], norm).into_owned()
             })
             .collect()
     }
@@ -176,7 +176,7 @@ impl Operator for GroupByOperator {
         self.groups.clear();
         self.emit_iter = None;
         if self.norm.is_none() {
-            self.norm = equality_norm(ctx);
+            self.norm = EqualityNorm::for_ctx(ctx);
         }
         Ok(())
     }

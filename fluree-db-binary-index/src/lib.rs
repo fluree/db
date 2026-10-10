@@ -18,6 +18,7 @@ pub mod format;
 pub mod read;
 
 // ── Read-side types ─────────────────────────────────────────────────────────
+pub use dict_novelty_safe::DictLookup;
 pub use read::batched_lookup::{
     batched_lookup_inbound_refs, batched_lookup_predicate_refs, batched_lookup_subject_properties,
 };

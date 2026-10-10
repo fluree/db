@@ -6,7 +6,7 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
-use crate::object_binding::{equality_norm, normalize_for_key_cow, EqualityNorm};
+use crate::object_binding::{normalize_for_key, EqualityNorm};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
@@ -135,7 +135,7 @@ impl Operator for DistinctOperator {
         self.child.open(ctx).await?;
         self.seen.clear();
         if self.norm.is_none() {
-            self.norm = equality_norm(ctx);
+            self.norm = EqualityNorm::for_ctx(ctx);
         }
         self.state = OperatorState::Open;
         Ok(())
@@ -199,14 +199,15 @@ impl Operator for DistinctOperator {
 
             for row_idx in 0..batch.len() {
                 if self.norm.is_some() {
-                    let (store, gv) = EqualityNorm::parts(&self.norm);
+                    let norm = self.norm.as_ref();
                     // Normalize decoded bindings to encoded form so mixed
                     // representations of the same value dedup (encoded
                     // bindings pass through untouched, borrowed).
                     scratch.clear();
-                    scratch.extend((0..num_cols).map(|col| {
-                        normalize_for_key_cow(batch.get_by_col(row_idx, col), store, gv)
-                    }));
+                    scratch.extend(
+                        (0..num_cols)
+                            .map(|col| normalize_for_key(batch.get_by_col(row_idx, col), norm)),
+                    );
                     // `Cow` hashes as the binding it wraps, so this equals the
                     // stored `Vec<Binding>` hash the map recomputes on rehash.
                     let mut h = FxHasher::default();
