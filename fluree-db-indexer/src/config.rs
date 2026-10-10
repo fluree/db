@@ -257,13 +257,19 @@ pub struct IndexerConfig {
     /// more leaflets (and therefore more leaves) for the same dataset, which
     /// can be useful for tests that need multi-leaf coverage with small data.
     ///
-    /// Default: 25,000.
+    /// Default: [`DEFAULT_LEAFLET_ROWS`].
     pub leaflet_rows: usize,
 
-    /// Leaflets per leaf file (FLI3).
-    ///
-    /// Default: 10.
+    /// Leaflets per leaf file (FLI3); sizes leaves only when
+    /// `leaf_target_rows` is `None`.
     pub leaflets_per_leaf: usize,
+
+    /// Rows per leaf blob, independent of the leaflet size. `None` derives
+    /// `leaflet_rows × leaflets_per_leaf` (the [`Self::small`] preset, and
+    /// any config built with [`Self::with_leaflets_per_leaf`]). Default:
+    /// [`DEFAULT_LEAF_TARGET_ROWS`], the size bulk import uses, so rebuilds
+    /// and incremental merges keep the leaf size an import produced.
+    pub leaf_target_rows: Option<usize>,
 
     /// Maximum cumulative commit bytes to load during an incremental
     /// commit-chain walk. If the walk exceeds this budget, incremental
@@ -363,6 +369,14 @@ pub const DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS: usize = 100_000;
 /// retrying.
 pub const DEFAULT_CATCHUP_INTERVAL_SECS: u64 = 300;
 
+/// Rows per leaflet, the unit of decode and caching. Shared by bulk import,
+/// rebuild, and incremental builds.
+pub const DEFAULT_LEAFLET_ROWS: usize = 25_000;
+
+/// Rows per leaf, the unit of storage and remote fetch. Shared by bulk
+/// import, rebuild, and incremental builds.
+pub const DEFAULT_LEAF_TARGET_ROWS: usize = 250_000;
+
 impl Default for IndexerConfig {
     fn default() -> Self {
         Self {
@@ -381,8 +395,9 @@ impl Default for IndexerConfig {
             incremental_max_commits: DEFAULT_INCREMENTAL_MAX_COMMITS,
             incremental_max_concurrency: DEFAULT_INCREMENTAL_MAX_CONCURRENCY,
             incremental_leaf_upload_concurrency: DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY,
-            leaflet_rows: 25_000,
+            leaflet_rows: DEFAULT_LEAFLET_ROWS,
             leaflets_per_leaf: 10,
+            leaf_target_rows: Some(DEFAULT_LEAF_TARGET_ROWS),
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
@@ -431,8 +446,9 @@ impl IndexerConfig {
             incremental_max_commits: DEFAULT_INCREMENTAL_MAX_COMMITS,
             incremental_max_concurrency: DEFAULT_INCREMENTAL_MAX_CONCURRENCY,
             incremental_leaf_upload_concurrency: DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY,
-            leaflet_rows: 25_000,
+            leaflet_rows: DEFAULT_LEAFLET_ROWS,
             leaflets_per_leaf: 10,
+            leaf_target_rows: Some(DEFAULT_LEAF_TARGET_ROWS),
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
@@ -443,7 +459,9 @@ impl IndexerConfig {
         }
     }
 
-    /// Create a configuration optimized for small datasets
+    /// Create a configuration optimized for small datasets. Leaves hold
+    /// `leaflet_rows × leaflets_per_leaf` rows, so shrinking `leaflet_rows`
+    /// shrinks leaves too.
     pub fn small() -> Self {
         Self {
             leaf_target_bytes: 50_000,
@@ -461,8 +479,9 @@ impl IndexerConfig {
             incremental_max_commits: DEFAULT_INCREMENTAL_MAX_COMMITS,
             incremental_max_concurrency: DEFAULT_INCREMENTAL_MAX_CONCURRENCY,
             incremental_leaf_upload_concurrency: DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY,
-            leaflet_rows: 25_000,
+            leaflet_rows: DEFAULT_LEAFLET_ROWS,
             leaflets_per_leaf: 10,
+            leaf_target_rows: None,
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
@@ -491,8 +510,9 @@ impl IndexerConfig {
             incremental_max_commits: DEFAULT_INCREMENTAL_MAX_COMMITS,
             incremental_max_concurrency: DEFAULT_INCREMENTAL_MAX_CONCURRENCY,
             incremental_leaf_upload_concurrency: DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY,
-            leaflet_rows: 25_000,
+            leaflet_rows: DEFAULT_LEAFLET_ROWS,
             leaflets_per_leaf: 10,
+            leaf_target_rows: Some(DEFAULT_LEAF_TARGET_ROWS),
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
@@ -533,7 +553,22 @@ impl IndexerConfig {
 
     pub fn with_leaflets_per_leaf(mut self, n: usize) -> Self {
         self.leaflets_per_leaf = n.max(1);
+        self.leaf_target_rows = None;
         self
+    }
+
+    pub fn with_leaf_target_rows(mut self, rows: usize) -> Self {
+        self.leaf_target_rows = Some(rows.max(1));
+        self
+    }
+
+    /// Rows per leaf for rebuild and incremental builds.
+    pub fn effective_leaf_target_rows(&self) -> usize {
+        self.leaf_target_rows.unwrap_or_else(|| {
+            self.leaflet_rows
+                .max(1)
+                .saturating_mul(self.leaflets_per_leaf.max(1))
+        })
     }
 
     /// Builder method to set the stalled-ledger re-sweep interval.
@@ -692,5 +727,26 @@ mod tests {
         // Concurrency is clamped to at least 1.
         let config2 = IndexerConfig::default().with_incremental_max_concurrency(0);
         assert_eq!(config2.incremental_max_concurrency, 1);
+    }
+
+    #[test]
+    fn leaf_target_rows_derives_unless_set() {
+        let explicit = IndexerConfig::default().with_leaflet_rows(4_096);
+        assert_eq!(
+            explicit.effective_leaf_target_rows(),
+            DEFAULT_LEAF_TARGET_ROWS,
+            "changing leaflet rows keeps the shared leaf size"
+        );
+        let small = IndexerConfig::small().with_leaflet_rows(100);
+        assert_eq!(
+            small.effective_leaf_target_rows(),
+            100 * small.leaflets_per_leaf
+        );
+        let per_leaf = IndexerConfig::default()
+            .with_leaflet_rows(10)
+            .with_leaflets_per_leaf(2);
+        assert_eq!(per_leaf.effective_leaf_target_rows(), 20);
+        let set = IndexerConfig::small().with_leaf_target_rows(1_000);
+        assert_eq!(set.effective_leaf_target_rows(), 1_000);
     }
 }

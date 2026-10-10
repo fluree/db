@@ -242,13 +242,15 @@ pub struct ImportConfig {
     /// setting. `0` disables coalescing entirely (every file is its own chunk,
     /// the legacy behavior). Default: 64.
     pub coalesce_small_files_threshold: usize,
-    /// Number of records per leaflet in the index. Default: 25_000.
+    /// Number of records per leaflet in the index. Default:
+    /// [`fluree_db_indexer::config::DEFAULT_LEAFLET_ROWS`].
     /// Larger values produce fewer, bigger leaflets (less I/O, more memory per read).
     pub leaflet_rows: usize,
     /// Number of leaflets per leaf file. Default: 10.
     /// Larger values produce fewer, bigger leaf files (less tree depth, bigger reads).
     pub leaflets_per_leaf: usize,
-    /// Target rows per leaf. Default: 250_000.
+    /// Target rows per leaf. Default:
+    /// [`fluree_db_indexer::config::DEFAULT_LEAF_TARGET_ROWS`].
     pub leaf_target_rows: usize,
     /// Optional progress callback invoked at key pipeline milestones.
     pub progress: Option<ProgressFn>,
@@ -325,9 +327,9 @@ impl Default for ImportConfig {
             chunk_max_flakes: 20_000_000,
             max_inflight_chunks: 0,
             coalesce_small_files_threshold: 64,
-            leaflet_rows: 25_000,
+            leaflet_rows: fluree_db_indexer::config::DEFAULT_LEAFLET_ROWS,
             leaflets_per_leaf: 10,
-            leaf_target_rows: 250_000,
+            leaf_target_rows: fluree_db_indexer::config::DEFAULT_LEAF_TARGET_ROWS,
             progress: None,
             tracker: Tracker::disabled(),
             ndjson_first_line_context: FirstLineContextPolicy::Auto,
@@ -3226,8 +3228,10 @@ impl<'a> ImportBuilder<'a> {
         self
     }
 
-    /// Set the number of records per leaflet. Default: 25_000.
-    /// Larger values produce fewer, bigger leaflets (less I/O overhead).
+    /// Set the number of records per leaflet. Default:
+    /// [`fluree_db_indexer::config::DEFAULT_LEAFLET_ROWS`]. Larger values
+    /// produce fewer, bigger leaflets (less per-leaflet overhead, more decode
+    /// per point read).
     pub fn leaflet_rows(mut self, n: usize) -> Self {
         self.config.leaflet_rows = n;
         self
@@ -3240,7 +3244,8 @@ impl<'a> ImportBuilder<'a> {
         self
     }
 
-    /// Set the target rows per leaf. Default: 250_000.
+    /// Set the target rows per leaf. Default:
+    /// [`fluree_db_indexer::config::DEFAULT_LEAF_TARGET_ROWS`].
     pub fn leaf_target_rows(mut self, n: usize) -> Self {
         self.config.leaf_target_rows = n;
         self

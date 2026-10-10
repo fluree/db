@@ -550,7 +550,7 @@ async fn run_bulk_import(
     if let Some(ns) = import_opts.skolem_namespace.as_deref() {
         builder = builder.skolem_namespace(ns);
     }
-    if import_opts.leaflet_rows != 25_000 {
+    if import_opts.leaflet_rows != fluree_db_indexer::config::DEFAULT_LEAFLET_ROWS {
         builder = builder.leaflet_rows(import_opts.leaflet_rows);
     }
     if import_opts.leaflets_per_leaf != 10 {

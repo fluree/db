@@ -455,10 +455,7 @@ async fn execute_phase2_task(
         g_id,
         zstd_level: 1,
         leaflet_target_rows: config.leaflet_rows.max(1),
-        leaf_target_rows: config
-            .leaflet_rows
-            .max(1)
-            .saturating_mul(config.leaflets_per_leaf.max(1)),
+        leaf_target_rows: config.effective_leaf_target_rows(),
         // Fact identity is order-independent; collect base-row matches from
         // the SPOT task only (they feed the Phase 3b stats deltas).
         collect_matched: order == RunSortOrder::Spot,
@@ -4813,7 +4810,7 @@ fn build_fresh_default_graph_v3(
     use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
 
     let leaflet_target = config.leaflet_rows.max(1);
-    let leaf_target = leaflet_target.saturating_mul(config.leaflets_per_leaf.max(1));
+    let leaf_target = config.effective_leaf_target_rows();
 
     let mut writer = LeafWriter::new(order, leaflet_target, leaf_target, 1);
     for rec in sorted_records {
