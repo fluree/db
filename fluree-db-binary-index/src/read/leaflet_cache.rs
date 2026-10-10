@@ -225,10 +225,11 @@ enum CacheKey {
     ///
     /// Key = xxh3_128 of a canonical ledger-info cache key string.
     LedgerInfo(u128),
-    /// V3 (FLI3) decoded column batch. Content-addressed via `leaf_id`
-    /// (derived from leaf CID) — immutable, self-invalidating on rewrite.
-    /// `leaflet_idx` selects which leaflet within the leaf.
-    V3Batch(V3BatchCacheKey),
+    /// V3 (FLI3) decoded column batch, one per leaflet whatever its columns.
+    /// Content-addressed via `leaf_id` (derived from leaf CID) — immutable,
+    /// self-invalidating on rewrite. `leaflet_idx` selects which leaflet
+    /// within the leaf.
+    V3Batch(V3LeafletKey),
     /// Translated overlay ops for ONE immutable novelty segment.
     /// Key = `xxh3_128(store_id, seg_id, index)` — see
     /// [`LeafletCache::segment_ops_key`]. The store-instance id makes the key
@@ -249,11 +250,61 @@ pub struct V3BatchCacheKey {
     pub leaf_id: u128,
     /// Leaflet slot within the leaf (0..leaflet_count).
     pub leaflet_idx: u32,
-    /// `ColumnSet` bitmask of the columns decoded into this cached batch.
-    /// Projection-aware: a narrow batch (e.g. one decoded without the `t`
-    /// column for a current-time scan) caches under a different key than a full
-    /// decode, so it is never served to a query that needs the omitted column.
+    /// `ColumnSet` bitmask of the columns the caller needs. A leaflet has one
+    /// cache entry holding every column decoded for it so far; a request it
+    /// covers is served projected, and a wider one decodes only the missing
+    /// columns and widens the entry.
     pub columns: u16,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct V3LeafletKey {
+    leaf_id: u128,
+    leaflet_idx: u32,
+}
+
+impl From<&V3BatchCacheKey> for V3LeafletKey {
+    fn from(key: &V3BatchCacheKey) -> Self {
+        Self {
+            leaf_id: key.leaf_id,
+            leaflet_idx: key.leaflet_idx,
+        }
+    }
+}
+
+/// A leaflet's decoded columns and which columns they are (`AbsentDefault`
+/// also encodes an all-sentinel column, so the batch alone cannot say).
+#[derive(Clone)]
+struct CachedV3Batch {
+    columns: super::column_types::ColumnSet,
+    batch: super::column_types::ColumnBatch,
+}
+
+impl CachedV3Batch {
+    fn serve(
+        &self,
+        want: super::column_types::ColumnSet,
+    ) -> Option<super::column_types::ColumnBatch> {
+        if self.columns == want {
+            Some(self.batch.clone())
+        } else if self.columns.covers(want) {
+            Some(self.batch.project_to(want))
+        } else {
+            None
+        }
+    }
+
+    /// `self` widened by a decode of `columns` from the same leaflet.
+    fn widen(
+        &self,
+        decoded: &super::column_types::ColumnBatch,
+        columns: super::column_types::ColumnSet,
+    ) -> Self {
+        Self {
+            columns: self.columns.union(columns),
+            batch: self.batch.with_columns_from(decoded, columns),
+        }
+    }
 }
 
 // ============================================================================
@@ -375,7 +426,7 @@ enum CachedEntry {
     VectorShard(Arc<crate::arena::vector::VectorShard>),
     LedgerInfo(Arc<[u8]>),
     /// V3 decoded column batch (base columns, no overlay/replay applied).
-    V3Batch(super::column_types::ColumnBatch),
+    V3Batch(CachedV3Batch),
     /// Translated overlay ops for one novelty segment.
     SegmentOps(Arc<CachedOverlaySegment>),
 }
@@ -401,7 +452,7 @@ impl CachedEntry {
                     + shard.values.capacity() * std::mem::size_of::<f32>()
             }
             CachedEntry::LedgerInfo(bytes) => bytes.len(),
-            CachedEntry::V3Batch(batch) => batch.byte_size(),
+            CachedEntry::V3Batch(entry) => entry.batch.byte_size(),
             CachedEntry::SegmentOps(seg) => seg.byte_size(),
         }
     }
@@ -881,69 +932,104 @@ impl LeafletCache {
     // V3 column batch cache (FLI3 decoded leaflets)
     // ========================================================================
 
-    /// Get a cached V3 column batch (read-only, no insertion).
-    pub fn get_v3_batch(&self, key: &V3BatchCacheKey) -> Option<super::column_types::ColumnBatch> {
+    fn get_v3_entry(&self, key: &V3LeafletKey) -> Option<CachedV3Batch> {
         match self.inner.get(&CacheKey::V3Batch(key.clone())) {
-            Some(CachedEntry::V3Batch(batch)) => Some(batch),
+            Some(CachedEntry::V3Batch(entry)) => Some(entry),
             _ => None,
         }
     }
 
+    /// Get a cached V3 column batch covering `key.columns` (read-only, no
+    /// insertion).
+    pub fn get_v3_batch(&self, key: &V3BatchCacheKey) -> Option<super::column_types::ColumnBatch> {
+        self.get_v3_entry(&key.into())?
+            .serve(super::column_types::ColumnSet(key.columns))
+    }
+
     /// Get or decode a V3 column batch with single-flight and error propagation.
     ///
-    /// On cache miss, calls `decode_fn` to produce the batch, inserts it, and
-    /// returns the cached copy. Uses `try_get_with` so concurrent callers for
-    /// the same leaflet share one decompression.
+    /// `decode_fn` decodes the given columns of the leaflet. A cold leaflet
+    /// decodes `key.columns` once, shared by concurrent callers via
+    /// `try_get_with`. A leaflet cached with fewer columns than requested
+    /// decodes only the missing ones and widens its entry, so each leaflet
+    /// stays one decoded copy whichever projections read it.
     pub fn try_get_or_decode_v3_batch<F>(
         &self,
         key: V3BatchCacheKey,
         decode_fn: F,
     ) -> io::Result<super::column_types::ColumnBatch>
     where
-        F: FnOnce() -> io::Result<super::column_types::ColumnBatch>,
+        F: FnOnce(super::column_types::ColumnSet) -> io::Result<super::column_types::ColumnBatch>,
     {
+        let want = super::column_types::ColumnSet(key.columns);
+        let slot = V3LeafletKey::from(&key);
+        let mut decode_fn = Some(decode_fn);
         // Fast path: a plain hit must not pay the block_in_place cost.
-        if let Some(batch) = self.get_v3_batch(&key) {
+        let entry = match self.get_v3_entry(&slot) {
+            Some(entry) => entry,
+            None => {
+                // Run the single-flight wait/init in a blocking region so a
+                // waiter promotes a replacement worker (see in_blocking_region).
+                let result = in_blocking_region(|| {
+                    self.inner
+                        .try_get_with(CacheKey::V3Batch(slot.clone()), || {
+                            let decode = decode_fn.take().expect("init runs at most once");
+                            decode(want).map(|batch| {
+                                CachedEntry::V3Batch(CachedV3Batch {
+                                    columns: want,
+                                    batch,
+                                })
+                            })
+                        })
+                });
+                match result {
+                    Ok(CachedEntry::V3Batch(entry)) => entry,
+                    Ok(_) => unreachable!("V3Batch key always maps to V3Batch entry"),
+                    Err(arc_err) => return Err(arc_io_error(arc_err)),
+                }
+            }
+        };
+        if let Some(batch) = entry.serve(want) {
             return Ok(batch);
         }
-        // Superset fallback: a warm-on-write `ColumnSet::ALL` batch covers any
-        // narrower request. Serve it projected down rather than re-decoding —
-        // the invariant is that a cached batch may satisfy a request only when
-        // its columns ⊇ the requested columns, and ALL ⊇ everything.
-        let all_columns = super::column_types::ColumnSet::ALL.0;
-        if key.columns != all_columns {
-            let all_key = V3BatchCacheKey {
-                leaf_id: key.leaf_id,
-                leaflet_idx: key.leaflet_idx,
-                columns: all_columns,
-            };
-            if let Some(all_batch) = self.get_v3_batch(&all_key) {
-                return Ok(all_batch.project_to(super::column_types::ColumnSet(key.columns)));
+        // Only an entry another caller decoded can fall short of `want`.
+        let decode = decode_fn
+            .take()
+            .expect("decode_fn unused when the entry was not ours");
+        let missing = want.difference(entry.columns);
+        let decoded = decode(missing)?;
+        let widened = entry.widen(&decoded, missing);
+        let batch = widened
+            .serve(want)
+            .expect("widened entry covers the request");
+        self.store_widened(slot, widened);
+        Ok(batch)
+    }
+
+    /// Insert `widened` unless a concurrent widening already covers it,
+    /// keeping any columns that one added.
+    fn store_widened(&self, slot: V3LeafletKey, widened: CachedV3Batch) {
+        let widened = match self.get_v3_entry(&slot) {
+            Some(current) if current.columns.covers(widened.columns) => return,
+            Some(current) => {
+                let extra = current.columns.difference(widened.columns);
+                widened.widen(&current.batch, extra)
             }
-        }
-        // Run the single-flight wait/init in a blocking region so a
-        // waiter promotes a replacement worker (see in_blocking_region).
-        let result = in_blocking_region(|| {
-            self.inner.try_get_with(CacheKey::V3Batch(key), || {
-                decode_fn().map(CachedEntry::V3Batch)
-            })
-        });
-        match result {
-            Ok(CachedEntry::V3Batch(batch)) => Ok(batch),
-            Ok(_) => unreachable!("V3Batch key always maps to V3Batch entry"),
-            Err(arc_err) => Err(arc_io_error(arc_err)),
-        }
+            None => widened,
+        };
+        self.inner
+            .insert(CacheKey::V3Batch(slot), CachedEntry::V3Batch(widened));
     }
 
     /// Warm-on-write: seed a decoded V3 column batch the *writer* already holds.
     ///
-    /// Counterpart to [`Self::insert_leaf_dir`] for the column data. The key's
-    /// `columns` bitmask must match the projection a reader will request, or the
-    /// warmed entry is simply never hit (never mis-served) — so seed the common
-    /// projection(s) only. Content-addressed leaf id makes this always safe.
+    /// Counterpart to [`Self::insert_leaf_dir`] for the column data. The batch
+    /// joins whatever the leaflet's entry already holds; readers needing any
+    /// subset of `key.columns` are served from it. Content-addressed leaf id
+    /// makes this always safe.
     pub fn insert_v3_batch(&self, key: V3BatchCacheKey, batch: super::column_types::ColumnBatch) {
-        self.inner
-            .insert(CacheKey::V3Batch(key), CachedEntry::V3Batch(batch));
+        let columns = super::column_types::ColumnSet(key.columns);
+        self.store_widened((&key).into(), CachedV3Batch { columns, batch });
     }
 
     // ========================================================================
@@ -1160,7 +1246,7 @@ mod tests {
             columns: ColumnSet::CORE.0,
         };
         let served = cache
-            .try_get_or_decode_v3_batch(core_key, || panic!("must not decode: ALL covers CORE"))
+            .try_get_or_decode_v3_batch(core_key, |_| panic!("must not decode: ALL covers CORE"))
             .expect("superset hit");
 
         // Requested (CORE) columns carry real data; omitted ones are absent.
@@ -1175,9 +1261,95 @@ mod tests {
         // A request for columns NOT covered (here, an exact ALL request) still
         // hits the stored ALL batch directly.
         let full = cache
-            .try_get_or_decode_v3_batch(all_key, || panic!("must not decode: exact ALL hit"))
+            .try_get_or_decode_v3_batch(all_key, |_| panic!("must not decode: exact ALL hit"))
             .expect("exact hit");
         assert!(!full.t.is_absent(), "exact ALL request keeps t");
+    }
+
+    #[test]
+    fn test_v3_batch_widens_one_entry_decoding_only_missing_columns() {
+        use crate::format::column_block::ColumnId;
+        use crate::read::column_types::{ColumnBatch, ColumnData, ColumnSet};
+        let cache = LeafletCache::with_max_bytes(10 * 1024 * 1024);
+        let full = ColumnBatch {
+            row_count: 2,
+            s_id: ColumnData::Block(vec![10u64, 11].into()),
+            o_key: ColumnData::Block(vec![100u64, 101].into()),
+            p_id: ColumnData::Const(5),
+            o_type: ColumnData::Const(7),
+            o_i: ColumnData::Block(vec![0u32, 1].into()),
+            t: ColumnData::Block(vec![3u32, 4].into()),
+        };
+        let key = |columns: ColumnSet| V3BatchCacheKey {
+            leaf_id: 0xBEEF,
+            leaflet_idx: 0,
+            columns: columns.0,
+        };
+        let decoded = std::cell::RefCell::new(Vec::new());
+        let decode = |columns: ColumnSet| {
+            decoded.borrow_mut().push(columns);
+            Ok(full.project_to(columns))
+        };
+        let narrow = ColumnSet::single(ColumnId::SId).union(ColumnSet::single(ColumnId::PId));
+
+        let first = cache
+            .try_get_or_decode_v3_batch(key(narrow), decode)
+            .unwrap();
+        assert!(first.t.is_absent());
+        let wide = cache
+            .try_get_or_decode_v3_batch(key(ColumnSet::ALL), decode)
+            .unwrap();
+        assert_eq!(
+            *decoded.borrow(),
+            vec![narrow, ColumnSet::ALL.difference(narrow)],
+            "the wide read decodes only the columns the narrow entry lacks"
+        );
+        assert_eq!(wide.s_id.get(1), 11);
+        assert_eq!(wide.p_id.get(0), 5);
+        assert_eq!(wide.o_key.get(0), 100);
+        assert_eq!(wide.t.get(1), 4);
+
+        let again = cache
+            .try_get_or_decode_v3_batch(key(narrow), |_| panic!("covered by the widened entry"))
+            .unwrap();
+        assert_eq!(again.s_id.get(0), 10);
+        assert!(again.o_key.is_absent() && again.t.is_absent());
+        cache.inner.run_pending_tasks();
+        assert_eq!(cache.entry_count(), 1, "one entry per leaflet");
+    }
+
+    #[test]
+    fn test_v3_batch_insert_joins_existing_columns() {
+        use crate::format::column_block::ColumnId;
+        use crate::read::column_types::{ColumnBatch, ColumnData, ColumnSet};
+        let cache = LeafletCache::with_max_bytes(10 * 1024 * 1024);
+        let full = ColumnBatch {
+            row_count: 1,
+            s_id: ColumnData::Block(vec![10u64].into()),
+            o_key: ColumnData::Block(vec![100u64].into()),
+            p_id: ColumnData::Const(5),
+            o_type: ColumnData::Const(7),
+            o_i: ColumnData::AbsentDefault,
+            t: ColumnData::Block(vec![3u32].into()),
+        };
+        let key = |columns: ColumnSet| V3BatchCacheKey {
+            leaf_id: 0xF00D,
+            leaflet_idx: 1,
+            columns: columns.0,
+        };
+        let t = ColumnSet::single(ColumnId::T);
+        cache.insert_v3_batch(key(ColumnSet::CORE), full.project_to(ColumnSet::CORE));
+        cache.insert_v3_batch(key(t), full.project_to(t));
+        let core_and_t = ColumnSet::CORE.union(t);
+        let served = cache
+            .get_v3_batch(&key(core_and_t))
+            .expect("both inserts joined");
+        assert_eq!(served.s_id.get(0), 10);
+        assert_eq!(served.t.get(0), 3);
+        assert!(
+            cache.get_v3_batch(&key(ColumnSet::ALL)).is_none(),
+            "o_i was never decoded, so ALL is not covered"
+        );
     }
 
     #[test]
