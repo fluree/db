@@ -852,17 +852,17 @@ impl Fluree {
             let source = source.expect("checked above");
             // Seed from any prior governance-context capture stored
             // on the view (e.g., an earlier `wrap_policy` in the
-            // same logical request). The merged resolved_ts is
+            // same logical request). The merged resolved_heads is
             // written back below so the subsequent `query` call's
-            // own ResolveCtx observes the same per-ledger head-t.
+            // own ResolveCtx observes the same per-ledger head.
             //
             // `ledger_id_owned` keeps the id alive past the
             // eventual `view` move at the end of this branch.
             let ledger_id_owned = view.snapshot.ledger_id.clone();
-            let mut ctx = crate::cross_ledger::ResolveCtx::with_resolved_ts(
+            let mut ctx = crate::cross_ledger::ResolveCtx::with_resolved_heads(
                 &ledger_id_owned,
                 self,
-                (**view.cross_ledger_resolved_ts()).clone(),
+                (**view.cross_ledger_resolved_heads()).clone(),
             );
             // The class-filter chain, identity contract (bind-only, never a
             // rule selector), and PolicyRules dispatch all live in the shared
@@ -932,7 +932,7 @@ impl Fluree {
             // logical request sees the same M version policy did.
             let view = view
                 .with_policy(Arc::new(policy_ctx))
-                .with_cross_ledger_resolved_ts(Arc::new(ctx.resolved_ts));
+                .with_cross_ledger_resolved_heads(Arc::new(ctx.resolved_heads));
             return Ok(view);
         }
 
@@ -957,10 +957,10 @@ impl Fluree {
         {
             Some(reasoning) => {
                 let ledger_id_owned = view.snapshot.ledger_id.clone();
-                let mut ctx = crate::cross_ledger::ResolveCtx::with_resolved_ts(
+                let mut ctx = crate::cross_ledger::ResolveCtx::with_resolved_heads(
                     &ledger_id_owned,
                     self,
-                    (**view.cross_ledger_resolved_ts()).clone(),
+                    (**view.cross_ledger_resolved_heads()).clone(),
                 );
                 crate::cross_ledger::resolve_schema_closure_bundle(
                     reasoning,

@@ -964,12 +964,13 @@ pub(crate) async fn resolve_cross_ledger_schema_for_tx(
 
 /// Identity of the shape source a compiled-SHACL cache entry was built from.
 ///
-/// `CrossLedger` carries the wire origin — model ledger, graph, and the `t`
-/// the wire was materialized at. M's head advancing produces a new
-/// `resolved_t` (one cheap nameservice lookup per transaction detects this),
+/// `CrossLedger` carries the wire origin — model ledger, graph, and the head
+/// (`t` and commit) the wire was materialized at. M's head moving produces a
+/// new origin (one cheap nameservice lookup per transaction detects this),
 /// which misses here and forces a recompile; an unchanged head reuses the
 /// already-translated, already-parsed shapes (including pre-parsed sh:sparql
-/// ASTs) with zero re-query of M.
+/// ASTs) with zero re-query of M. The commit is what tells a recreated or
+/// rebased M apart from the one cached at the same `t`.
 #[cfg(feature = "shacl")]
 #[derive(Clone, PartialEq, Eq)]
 enum CachedShapeSource {
@@ -978,6 +979,7 @@ enum CachedShapeSource {
         model_ledger_id: String,
         graph_iri: String,
         resolved_t: i64,
+        commit_id: Option<fluree_db_core::ContentId>,
     },
 }
 
@@ -1229,6 +1231,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
                     model_ledger_id: wire.origin.model_ledger_id.clone(),
                     graph_iri: wire.origin.graph_iri.clone(),
                     resolved_t: wire.origin.resolved_t,
+                    commit_id: wire.origin.commit_id.clone(),
                 };
                 precompiled = probe_shacl_compile_cache(base, &source);
                 cache_source = Some(source);

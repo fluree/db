@@ -3520,10 +3520,10 @@ pub struct Fluree {
     leaflet_cache: std::sync::Arc<fluree_db_binary_index::LeafletCache>,
     /// Per-instance cache for resolved cross-ledger governance
     /// artifacts (`f:policySource` from a model ledger, etc.). Keyed
-    /// on `(ArtifactKind, model_ledger_id, graph_iri, resolved_t)`
+    /// on `(ArtifactKind, model_ledger_id, graph_iri, model head)`
     /// so a single entry is reusable across every data ledger on
     /// this instance that references the same model graph at the
-    /// same model `t`.
+    /// same model head commit.
     governance_cache: std::sync::Arc<cross_ledger::GovernanceCache>,
     /// Indexing mode (disabled or background with handle)
     pub indexing_mode: tx::IndexingMode,

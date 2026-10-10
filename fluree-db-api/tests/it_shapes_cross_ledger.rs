@@ -808,6 +808,84 @@ async fn model_head_advance_recompiles_shapes() {
         .expect("deactivated shape must no longer reject");
 }
 
+/// A model ledger dropped and created again under its name restarts at the
+/// same `t`. D's compiled shapes are cached by the wire's origin, so a
+/// recreated M with other shapes must still recompile.
+#[tokio::test]
+async fn recreated_model_ledger_shapes_replace_the_cached_compile() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let model_id = "test/cross-ledger-shapes/recreate-model:main";
+    let data_id = "test/cross-ledger-shapes/recreate-data:main";
+    let data = seed_cross_ledger_person_shape(&fluree, model_id, data_id, "").await;
+
+    // Conforming write first: an empty namespace delta afterwards makes the
+    // next transactions eligible for the compile cache.
+    fluree
+        .insert(
+            data,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:alice",
+                "@type": "ex:Person",
+                "ex:name": "Alice"
+            }),
+        )
+        .await
+        .expect("conforming Person must pass");
+    let nameless_bob = || async {
+        fluree
+            .graph(data_id)
+            .transact()
+            .insert(&json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:bob",
+                "@type": "ex:Person"
+            }))
+            .commit()
+            .await
+    };
+    let err = nameless_bob()
+        .await
+        .expect_err("M requires a name: compiled and cached");
+    assert!(
+        err.to_string().contains("SHACL") || format!("{err:?}").contains("ShaclViolation"),
+        "expected ShaclViolation, got: {err:?}"
+    );
+
+    // The new M, at the dropped M's t, deactivates the shape.
+    fluree
+        .drop_ledger(
+            "test/cross-ledger-shapes/recreate-model",
+            fluree_db_api::DropMode::Hard,
+        )
+        .await
+        .expect("drop M");
+    let model = genesis_ledger(&fluree, model_id);
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(
+            r"
+            @prefix sh:   <http://www.w3.org/ns/shacl#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:   <http://example.org/ns/> .
+            GRAPH <http://example.org/governance/shapes> {
+                ex:PersonShape rdf:type sh:NodeShape ;
+                               sh:targetClass ex:Person ;
+                               sh:property ex:pshape_name ;
+                               sh:deactivated true .
+                ex:pshape_name sh:path ex:name ; sh:minCount 1 .
+            }
+        ",
+        )
+        .execute()
+        .await
+        .expect("seed the new M");
+
+    nameless_bob()
+        .await
+        .expect("the new M's deactivated shape must no longer reject");
+}
+
 /// A `f:shapesSource` whose `f:ledger` names the data ledger itself is a
 /// same-ledger reference in cross-ledger clothing. A write that stages under
 /// the ledger's write lock (a SPARQL update always does) then opened the

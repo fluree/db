@@ -1280,3 +1280,115 @@ async fn multiple_targeted_query_rules_any_allow_grants_across_materializations(
         );
     }
 }
+
+/// A model ledger dropped and created again under its name restarts at the
+/// same `t`. The policies D enforces are the new ledger's, never the dropped
+/// one's cached at that `t`.
+#[tokio::test]
+async fn recreated_model_ledger_policies_replace_the_dropped_ones() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let model_id = "test/cross-ledger-recreate/model:main";
+    let data_id = "test/cross-ledger-recreate/data:main";
+    let policy_graph_iri = "http://example.org/m-policies";
+    let seed_model = |allow: bool| {
+        format!(
+            r"
+            @prefix f:    <https://ns.flur.ee/db#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:   <http://example.org/ns/> .
+
+            GRAPH <{policy_graph_iri}> {{
+                ex:users
+                    rdf:type    f:AccessPolicy ;
+                    f:action    f:view ;
+                    f:onClass   ex:User ;
+                    f:allow     {allow} .
+            }}
+        "
+        )
+    };
+
+    let model = genesis_ledger(&fluree, model_id);
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&seed_model(false))
+        .execute()
+        .await
+        .expect("seed M deny");
+
+    let data = genesis_ledger(&fluree, data_id);
+    let data = fluree
+        .insert(
+            data,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:alice", "@type": "ex:User", "ex:name": "Alice"
+            }),
+        )
+        .await
+        .expect("seed D")
+        .ledger;
+    let config_iri = config_graph_iri(data_id);
+    fluree
+        .stage_owned(data)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:    <https://ns.flur.ee/db#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:policyDefaults <urn:cfg:policy> .
+                <urn:cfg:policy> f:defaultAllow false .
+                <urn:cfg:policy> f:policyClass f:AccessPolicy .
+                <urn:cfg:policy> f:policySource <urn:cfg:policy-ref> .
+                <urn:cfg:policy-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:policy-src> .
+                <urn:cfg:policy-src> f:ledger <{model_id}> ;
+                                     f:graphSelector <{policy_graph_iri}> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed D config");
+
+    let users = || async {
+        let wrapped = fluree
+            .db_with_policy(data_id, &GovernanceOptions::default())
+            .await
+            .expect("db_with_policy");
+        fluree
+            .query(
+                &wrapped,
+                &json!({"@context": {"ex": "http://example.org/ns/"}, "select": "?u",
+                        "where": {"@id": "?u", "@type": "ex:User"}}),
+            )
+            .await
+            .expect("query")
+            .to_jsonld(&wrapped.snapshot)
+            .expect("jsonld")
+    };
+    assert_eq!(users().await, json!([]), "M denies users");
+
+    fluree
+        .drop_ledger(
+            "test/cross-ledger-recreate/model",
+            fluree_db_api::DropMode::Hard,
+        )
+        .await
+        .expect("drop M");
+    let model = genesis_ledger(&fluree, model_id);
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&seed_model(true))
+        .execute()
+        .await
+        .expect("seed the new M allow");
+
+    assert_eq!(
+        users().await,
+        json!(["ex:alice"]),
+        "the new M, at the dropped M's t, allows users"
+    );
+}
