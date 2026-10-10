@@ -74,6 +74,8 @@ mod it_multi_ledger_formatting;
 mod it_multi_query;
 #[path = "it_novelty_dictionary_decode.rs"]
 mod it_novelty_dictionary_decode;
+#[path = "it_novelty_encoded_equality.rs"]
+mod it_novelty_encoded_equality;
 #[path = "it_scaling_bench.rs"]
 mod it_scaling_bench;
 #[path = "it_select_star_novelty.rs"]

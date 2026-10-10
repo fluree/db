@@ -16,7 +16,7 @@ use fluree_db_binary_index::read::column_types::ColumnSet;
 use fluree_db_binary_index::{
     resolve_overlay_ops, sort_overlay_ops, sort_overlay_ops_stable, BinaryCursor, BinaryFilter,
     BinaryGraphView, BinaryIndexStore, CachedOverlaySegment, ColumnBatch, ColumnProjection,
-    LeafletCache, OverlayOp,
+    DictLookup, LeafletCache, OverlayOp,
 };
 use fluree_db_core::o_type::{DecodeKind, OType};
 use fluree_db_core::subject_id::SubjectId;
@@ -3690,17 +3690,10 @@ fn resolve_subject_v3(
     store: &BinaryIndexStore,
     dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
 ) -> std::io::Result<u64> {
-    // 1. Persisted (canonical encoding guarantees exact-parts match)
-    if let Some(id) = store.find_subject_id_by_parts(sid.namespace_code, &sid.name)? {
+    if let Some(id) = DictLookup::new(store, dict_novelty.map(Arc::as_ref))
+        .subject_id(sid.namespace_code, &sid.name)?
+    {
         return Ok(id);
-    }
-    // 2. DictNovelty
-    if let Some(dn) = dict_novelty {
-        if dn.is_initialized() {
-            if let Some(id) = dn.subjects.find_subject(sid.namespace_code, &sid.name) {
-                return Ok(id);
-            }
-        }
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
@@ -3711,7 +3704,6 @@ fn resolve_subject_v3(
     ))
 }
 
-/// Resolve a string value to a string_id using persisted dict then DictNovelty.
 /// Look up `value`'s string-dict id across the persisted and novelty dicts.
 ///
 /// `Ok(None)` is a genuine miss — the value is in neither dict — and carries no
@@ -3724,19 +3716,7 @@ fn find_string_id_v3(
     store: &BinaryIndexStore,
     dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
 ) -> std::io::Result<Option<u32>> {
-    // 1. Persisted
-    if let Some(id) = store.find_string_id(value)? {
-        return Ok(Some(id));
-    }
-    // 2. DictNovelty
-    if let Some(dn) = dict_novelty {
-        if dn.is_initialized() {
-            if let Some(id) = dn.strings.find_string(value) {
-                return Ok(Some(id));
-            }
-        }
-    }
-    Ok(None)
+    DictLookup::new(store, dict_novelty.map(Arc::as_ref)).string_id(value)
 }
 
 /// [`find_string_id_v3`] for callers that treat "not in dict" as an error,

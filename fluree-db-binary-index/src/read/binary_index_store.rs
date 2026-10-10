@@ -3101,6 +3101,11 @@ impl BinaryGraphView {
         self.dict_novelty.is_some()
     }
 
+    /// Value → id lookups matching this view's decode routing.
+    pub fn dict_lookup(&self) -> crate::DictLookup<'_> {
+        crate::DictLookup::new(&self.store, self.dict_novelty.as_deref())
+    }
+
     // ── Internal watermark helpers ──────────────────────────────────────
 
     /// If `s_id` is above the watermark for its namespace, resolve from

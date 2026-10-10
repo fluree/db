@@ -26,7 +26,7 @@ use crate::error::{QueryError, Result};
 use crate::execute::build_where_operators_seeded;
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::{Pattern, SubqueryPattern};
-use crate::object_binding::{equality_norm, EqualityNorm};
+use crate::object_binding::EqualityNorm;
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
 };
@@ -504,7 +504,7 @@ impl Operator for SubqueryOperator {
         self.state = OperatorState::Open;
         self.materialized = None;
         if self.norm.is_none() {
-            self.norm = equality_norm(ctx);
+            self.norm = EqualityNorm::for_ctx(ctx);
         }
         Ok(())
     }
@@ -690,9 +690,9 @@ impl SubqueryOperator {
                 if binding.is_none_or(|b| matches!(b, Binding::Unbound)) {
                     unbound.push(col);
                 }
-                let (store, gv) = EqualityNorm::parts(&self.norm);
+                let norm = self.norm.as_ref();
                 binding
-                    .map(|b| binding_to_group_key_normalized(b, store, gv))
+                    .map(|b| binding_to_group_key_normalized(b, norm))
                     .unwrap_or(GroupKeyOwned::Absent)
             })
             .collect();
@@ -739,7 +739,7 @@ impl SubqueryOperator {
         // load-bearing in BOTH per-row and join mode — it is not a per-row
         // no-op.
         if !self.reconcile_vars.is_empty() {
-            let (store, gv) = EqualityNorm::parts(&self.norm);
+            let norm = self.norm.as_ref();
             let incompatible = self.reconcile_vars.iter().any(|v| {
                 let parent = parent_batch.get(row_idx, *v);
                 let sub = self.select_index.get(v).and_then(|&i| subquery_row(i));
@@ -748,8 +748,8 @@ impl SubqueryOperator {
                         if !matches!(p, Binding::Unbound | Binding::Poisoned)
                             && !matches!(s, Binding::Unbound | Binding::Poisoned) =>
                     {
-                        binding_to_group_key_normalized(p, store, gv)
-                            != binding_to_group_key_normalized(s, store, gv)
+                        binding_to_group_key_normalized(p, norm)
+                            != binding_to_group_key_normalized(s, norm)
                     }
                     _ => false,
                 }
@@ -883,7 +883,7 @@ impl SubqueryOperator {
                 mat._memory.add(ctx, index_bytes)?;
                 index_bytes = 0;
             }
-            let (store, gv) = EqualityNorm::parts(&self.norm);
+            let norm = self.norm.as_ref();
             let key: Vec<_> = self
                 .join_keys
                 .iter()
@@ -891,7 +891,7 @@ impl SubqueryOperator {
                     self.select_index
                         .get(v)
                         .and_then(|&col| row.get(col))
-                        .map(|b| binding_to_group_key_normalized(b, store, gv))
+                        .map(|b| binding_to_group_key_normalized(b, norm))
                         .unwrap_or(GroupKeyOwned::Absent)
                 })
                 .collect();

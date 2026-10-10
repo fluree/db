@@ -15,9 +15,7 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::execute::build_where_operators_seeded;
 use crate::ir::Pattern;
-use crate::object_binding::{
-    equality_norm, normalize_for_key, normalize_for_key_cow, EqualityNorm,
-};
+use crate::object_binding::{normalize_for_key, EqualityNorm};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
@@ -158,9 +156,9 @@ impl MinusOperator {
             let Some(column) = batch.column(*var) else {
                 return;
             };
-            let (store, gv) = EqualityNorm::parts(&self.norm);
+            let norm = self.norm.as_ref();
             for binding in column.iter().filter(|b| b.is_matchable()) {
-                let key = normalize_for_key_cow(binding, store, gv);
+                let key = normalize_for_key(binding, norm);
                 if let Binding::EncodedSid { s_id, .. } = key.as_ref() {
                     self.minus_subjects.insert(*s_id);
                 } else {
@@ -180,8 +178,8 @@ impl MinusOperator {
                 match binding {
                     Some(b) if b.is_matchable() => {
                         key_bindings.push(Some({
-                            let (store, gv) = EqualityNorm::parts(&self.norm);
-                            normalize_for_key(b, store, gv)
+                            let norm = self.norm.as_ref();
+                            normalize_for_key(b, norm).into_owned()
                         }));
                     }
                     _ => {
@@ -232,8 +230,8 @@ impl MinusOperator {
             if !binding.is_matchable() {
                 return false;
             }
-            let (store, gv) = EqualityNorm::parts(&self.norm);
-            let key = normalize_for_key_cow(binding, store, gv);
+            let norm = self.norm.as_ref();
+            let key = normalize_for_key(binding, norm);
             if let Binding::EncodedSid { s_id, .. } = key.as_ref() {
                 return self.minus_subjects.contains(s_id);
             }
@@ -250,8 +248,8 @@ impl MinusOperator {
             match binding {
                 Some(b) if b.is_matchable() => {
                     input_bindings.push(Some({
-                        let (store, gv) = EqualityNorm::parts(&self.norm);
-                        normalize_for_key(b, store, gv)
+                        let norm = self.norm.as_ref();
+                        normalize_for_key(b, norm).into_owned()
                     }));
                 }
                 _ => {
@@ -410,7 +408,7 @@ impl Operator for MinusOperator {
         self.minus_hash.clear();
         self.minus_wildcards.clear();
         if self.norm.is_none() {
-            self.norm = equality_norm(ctx);
+            self.norm = EqualityNorm::for_ctx(ctx);
         }
         // Materialize the MINUS subtree once with an empty seed (fresh scope).
         // MINUS is always uncorrelated — the subtree doesn't see outer variables.

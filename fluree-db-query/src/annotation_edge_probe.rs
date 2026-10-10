@@ -45,11 +45,13 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::{Pattern, Ref, Term, TriplePattern};
+use crate::object_binding::EqualityNorm;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::annotation_arena::AnnotationArenaReader;
+use fluree_db_binary_index::DictLookup;
 use fluree_db_core::edge::{id_datatype_sid, EdgeKey};
 use fluree_db_core::storage::ContentStore;
 use fluree_db_core::{AnnotationIndexRoot, FlakeValue, Sid, StatsView};
@@ -680,15 +682,12 @@ pub(crate) fn row_obj_key(
     batch: &Batch,
     row: usize,
     pos: &EdgePos,
-    view: Option<&fluree_db_binary_index::BinaryGraphView>,
+    norm: Option<&EqualityNorm>,
 ) -> GroupKeyOwned {
-    let store = view.map(fluree_db_binary_index::BinaryGraphView::store);
     match pos {
-        EdgePos::Const(sid) => {
-            binding_to_group_key_normalized(&Binding::sid(sid.clone()), store, view)
-        }
+        EdgePos::Const(sid) => binding_to_group_key_normalized(&Binding::sid(sid.clone()), norm),
         EdgePos::Var(v) => match batch.get(row, *v) {
-            Some(b) => binding_to_group_key_normalized(b, store, view),
+            Some(b) => binding_to_group_key_normalized(b, norm),
             None => GroupKeyOwned::Absent,
         },
     }
@@ -783,7 +782,8 @@ async fn drain_object_keys(
         Term::Var(v) => Some(*v),
         _ => None,
     };
-    let store = view.map(fluree_db_binary_index::BinaryGraphView::store);
+    let norm = EqualityNorm::for_ctx(ctx);
+    let norm = norm.as_ref();
     let mut op = crate::execute::build_where_operators_seeded(
         None,
         std::slice::from_ref(&Pattern::Triple(triple.clone())),
@@ -807,13 +807,13 @@ async fn drain_object_keys(
             let obj = match o_v {
                 Some(v) => batch
                     .get(r, v)
-                    .map(|b| binding_to_group_key_normalized(b, store, view))
+                    .map(|b| binding_to_group_key_normalized(b, norm))
                     .unwrap_or(GroupKeyOwned::Absent),
                 // Constant object (typed relationship / fixed endpoint):
                 // the scan already filtered to it; record the constant.
                 None => match &triple.o {
                     Term::Sid(sid) => {
-                        binding_to_group_key_normalized(&Binding::sid(sid.clone()), store, view)
+                        binding_to_group_key_normalized(&Binding::sid(sid.clone()), norm)
                     }
                     _ => GroupKeyOwned::Absent,
                 },
@@ -1108,7 +1108,8 @@ impl HashAnnotationEdgeProbeOperator {
         driving: &std::collections::HashSet<GroupKeyOwned>,
         keep_all: bool,
     ) -> Result<HashMap<GroupKeyOwned, Vec<SweptEdge>>> {
-        let store = view.map(fluree_db_binary_index::BinaryGraphView::store);
+        let norm = EqualityNorm::for_ctx(ctx);
+        let norm = norm.as_ref();
         let mut op = crate::execute::build_where_operators_seeded(
             None,
             std::slice::from_ref(&Pattern::Triple(self.base.clone())),
@@ -1123,12 +1124,12 @@ impl HashAnnotationEdgeProbeOperator {
             for row in 0..batch.len() {
                 let (s_key, s_b) = match &self.s_pos {
                     EdgePos::Const(sid) => (
-                        binding_to_group_key_normalized(&Binding::sid(sid.clone()), store, view),
+                        binding_to_group_key_normalized(&Binding::sid(sid.clone()), norm),
                         None,
                     ),
                     EdgePos::Var(v) => {
                         let b = batch.get(row, *v).cloned().unwrap_or(Binding::Unbound);
-                        (binding_to_group_key_normalized(&b, store, view), Some(b))
+                        (binding_to_group_key_normalized(&b, norm), Some(b))
                     }
                 };
                 if matches!(s_key, GroupKeyOwned::Absent)
@@ -1142,7 +1143,7 @@ impl HashAnnotationEdgeProbeOperator {
                 let Some(p_sid) = resolve_pos_pred(&batch, row, &self.p_pos, view)? else {
                     continue;
                 };
-                let o_key = row_obj_key(&batch, row, &self.o_pos, view);
+                let o_key = row_obj_key(&batch, row, &self.o_pos, norm);
                 if matches!(o_key, GroupKeyOwned::Absent) {
                     continue;
                 }
@@ -1224,7 +1225,8 @@ impl HashAnnotationEdgeProbeOperator {
     async fn probe_all(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         let view = ctx.graph_view();
         let view = view.as_ref();
-        let store = view.map(fluree_db_binary_index::BinaryGraphView::store);
+        let norm = EqualityNorm::for_ctx(ctx);
+        let norm = norm.as_ref();
 
         let mut child_batches: Vec<Batch> = Vec::new();
         let mut driving: std::collections::HashSet<GroupKeyOwned> =
@@ -1240,14 +1242,13 @@ impl HashAnnotationEdgeProbeOperator {
                     EdgePos::Const(sid) => {
                         driving.insert(binding_to_group_key_normalized(
                             &Binding::sid(sid.clone()),
-                            store,
-                            view,
+                            norm,
                         ));
                     }
                     EdgePos::Var(v) => match batch.get(row, *v) {
                         None | Some(Binding::Unbound) => keep_all = true,
                         Some(b) => {
-                            driving.insert(binding_to_group_key_normalized(b, store, view));
+                            driving.insert(binding_to_group_key_normalized(b, norm));
                         }
                     },
                 }
@@ -1316,7 +1317,7 @@ impl HashAnnotationEdgeProbeOperator {
                         EdgePos::Const(_) => None, // constrained by the scan pattern itself
                         EdgePos::Var(v) => match batch.get(row, *v) {
                             None | Some(Binding::Unbound) => None,
-                            Some(b) => Some(binding_to_group_key_normalized(b, store, view)),
+                            Some(b) => Some(binding_to_group_key_normalized(b, norm)),
                         },
                     }
                 };
@@ -1514,11 +1515,6 @@ impl Operator for HashAnnotationEdgeProbeOperator {
 /// default-graph edge. Named-graph attachments (`EdgeKey.g = Some`) are
 /// skipped, as the arena probe lane skips them.
 /// The dictionaries the enumeration lane encodes through.
-struct Dicts<'a> {
-    store: Option<&'a fluree_db_binary_index::BinaryIndexStore>,
-    dict_novelty: Option<&'a fluree_db_core::dict_novelty::DictNovelty>,
-}
-
 pub struct AnnotationEnumerateOperator {
     child: BoxedOperator,
     /// Constant relationship predicate to filter the walk by, or the
@@ -1588,7 +1584,7 @@ impl AnnotationEnumerateOperator {
     /// which the lane's empty-overlay gate makes unexpected. Encoded rows
     /// keep the downstream join and aggregate in id space: the materialized
     /// form cost 40% of P2's time in `Arc<str>` clone/drop churn.
-    fn ref_binding(sid: &Sid, dicts: &Dicts<'_>) -> Binding {
+    fn ref_binding(sid: &Sid, dicts: Option<DictLookup<'_>>) -> Binding {
         match Self::lookup_ref_id(sid, dicts) {
             Some(s_id) => Binding::encoded_sid(s_id),
             None => Binding::sid(sid.clone()),
@@ -1601,7 +1597,7 @@ impl AnnotationEnumerateOperator {
     fn memoized_ref_binding(
         memo: &mut FxHashMap<Sid, Option<u64>>,
         sid: &Sid,
-        dicts: &Dicts<'_>,
+        dicts: Option<DictLookup<'_>>,
     ) -> Binding {
         const MAX_ENTRIES: usize = 1 << 18;
         let resolved = match memo.get(sid) {
@@ -1621,18 +1617,11 @@ impl AnnotationEnumerateOperator {
         }
     }
 
-    fn lookup_ref_id(sid: &Sid, dicts: &Dicts<'_>) -> Option<u64> {
-        let persisted = dicts.store.and_then(|st| {
-            st.find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                .ok()
-                .flatten()
-        });
-        persisted.or_else(|| {
-            dicts
-                .dict_novelty
-                .filter(|dn| dn.is_initialized())
-                .and_then(|dn| dn.subjects.find_subject(sid.namespace_code, &sid.name))
-        })
+    fn lookup_ref_id(sid: &Sid, dicts: Option<DictLookup<'_>>) -> Option<u64> {
+        dicts?
+            .subject_id(sid.namespace_code, &sid.name)
+            .ok()
+            .flatten()
     }
 
     /// The reified object as a binding, exactly as the base scan would have
@@ -1641,7 +1630,7 @@ impl AnnotationEnumerateOperator {
     fn object_binding(
         memo: &mut FxHashMap<Sid, Option<u64>>,
         edge: &EdgeKey,
-        dicts: &Dicts<'_>,
+        dicts: Option<DictLookup<'_>>,
     ) -> Binding {
         match (&edge.o, &edge.lang) {
             (FlakeValue::Ref(sid), _) => Self::memoized_ref_binding(memo, sid, dicts),
@@ -1650,7 +1639,7 @@ impl AnnotationEnumerateOperator {
         }
     }
 
-    fn emit(&mut self, edge: &EdgeKey, ann: &Sid, dicts: &Dicts<'_>) {
+    fn emit(&mut self, edge: &EdgeKey, ann: &Sid, dicts: Option<DictLookup<'_>>) {
         let s_b = Self::memoized_ref_binding(&mut self.ref_ids, &edge.s, dicts);
         let p_b = match self.p_pos {
             EdgePos::Var(_) => Some(match self.pred_ids.get(&edge.p) {
@@ -1763,12 +1752,9 @@ impl Operator for AnnotationEnumerateOperator {
             self.leaves = Some(entries.into_iter().map(|e| e.leaf_cid).collect());
         }
         let view = ctx.graph_view();
-        let dicts = Dicts {
-            store: view
-                .as_ref()
-                .map(fluree_db_binary_index::BinaryGraphView::store),
-            dict_novelty: ctx.dict_novelty.as_deref(),
-        };
+        let dicts = view
+            .as_ref()
+            .map(fluree_db_binary_index::BinaryGraphView::dict_lookup);
         loop {
             if let Some(batch) = self.drain_chunk() {
                 return Ok(Some(batch));
@@ -1803,7 +1789,7 @@ impl Operator for AnnotationEnumerateOperator {
                         continue;
                     }
                 }
-                self.emit(edge, ann, &dicts);
+                self.emit(edge, ann, dicts);
             }
         }
     }
@@ -1830,15 +1816,12 @@ mod tests {
 
     #[test]
     fn enumerate_memo_caches_ref_lookups_and_their_misses() {
-        let dicts = Dicts {
-            store: None,
-            dict_novelty: None,
-        };
+        let dicts = None;
         let mut memo = FxHashMap::default();
         let alice = Sid::new(100, "alice");
-        let direct = AnnotationEnumerateOperator::ref_binding(&alice, &dicts);
-        let first = AnnotationEnumerateOperator::memoized_ref_binding(&mut memo, &alice, &dicts);
-        let second = AnnotationEnumerateOperator::memoized_ref_binding(&mut memo, &alice, &dicts);
+        let direct = AnnotationEnumerateOperator::ref_binding(&alice, dicts);
+        let first = AnnotationEnumerateOperator::memoized_ref_binding(&mut memo, &alice, dicts);
+        let second = AnnotationEnumerateOperator::memoized_ref_binding(&mut memo, &alice, dicts);
         assert_eq!(
             memo.len(),
             1,
@@ -1978,7 +1961,7 @@ mod tests {
         let s = Sid::new(3, "s");
         let p1 = Sid::new(2, "p1");
         let p2 = Sid::new(2, "p2");
-        let ok = |s: &Sid| binding_to_group_key_normalized(&Binding::sid(s.clone()), None, None);
+        let ok = |s: &Sid| binding_to_group_key_normalized(&Binding::sid(s.clone()), None);
         let o1 = ok(&Sid::new(3, "o1"));
         let o2 = ok(&Sid::new(3, "o2"));
         let maps = AnnotationSidecarMaps::from_slot_pairs(
@@ -2001,7 +1984,7 @@ mod tests {
         let (a1, a2) = (Sid::new(1, "a1"), Sid::new(1, "a2"));
         let s = Sid::new(3, "hub");
         let p = Sid::new(2, "TREATS");
-        let ok = |s: &Sid| binding_to_group_key_normalized(&Binding::sid(s.clone()), None, None);
+        let ok = |s: &Sid| binding_to_group_key_normalized(&Binding::sid(s.clone()), None);
         let (o1, o2) = (ok(&Sid::new(3, "o1")), ok(&Sid::new(3, "o2")));
         let maps = AnnotationSidecarMaps::from_slot_pairs(
             vec![(a1.clone(), s.clone()), (a2.clone(), s.clone())],

@@ -1274,6 +1274,16 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
+    /// Value → id lookups over the persisted dictionaries, then this snapshot's
+    /// novelty — the id space overlay translation and the probe lanes use.
+    pub fn dict_lookup(&self) -> Option<fluree_db_binary_index::DictLookup<'_>> {
+        let store = self.binary_store.as_deref()?;
+        Some(fluree_db_binary_index::DictLookup::new(
+            store,
+            self.dict_novelty.as_deref(),
+        ))
+    }
+
     /// Return a `BinaryGraphView` for the current graph, combining the binary store
     /// with `binary_g_id`.
     ///

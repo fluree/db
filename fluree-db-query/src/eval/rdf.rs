@@ -6,7 +6,7 @@ use crate::binding::{Binding, RowAccess};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::ir::Expression;
-use fluree_db_binary_index::BinaryIndexStore;
+use fluree_db_binary_index::{BinaryIndexStore, DictLookup};
 use fluree_db_core::value_id::ObjKind;
 use fluree_db_core::{DatatypeDictId, Sid};
 use std::sync::Arc;
@@ -307,12 +307,15 @@ fn fast_same_term_encoded_ids<R: RowAccess>(
                 let Some(other) = other_expr.eval_to_comparable(row, Some(ctx))? else {
                     return Ok(Some(false));
                 };
+                // Encoded ids come from the persisted or the novelty
+                // dictionary, so the constant must be looked up in both.
+                let dicts = DictLookup::new(store, ctx.dict_novelty.as_deref());
                 let rhs_s_id_opt = match other {
-                    ComparableValue::Sid(sid) => store
-                        .find_subject_id_by_parts(sid.namespace_code, sid.name.as_ref())
+                    ComparableValue::Sid(sid) => dicts
+                        .subject_id(sid.namespace_code, sid.name.as_ref())
                         .map_err(|e| QueryError::Internal(format!("find_subject_id: {e}")))?,
-                    ComparableValue::Iri(iri) => store
-                        .find_subject_id(iri.as_ref())
+                    ComparableValue::Iri(iri) => dicts
+                        .subject_id_for_iri(iri.as_ref())
                         .map_err(|e| QueryError::Internal(format!("find_subject_id: {e}")))?,
                     _ => return Ok(None),
                 };

@@ -15,6 +15,7 @@ use crate::fast_path_common::{
 };
 use crate::group_aggregate::{binding_to_group_key_normalized, CompositeGroupKey};
 use crate::ir::triple::{Ref, Term, TriplePattern};
+use crate::object_binding::EqualityNorm;
 use crate::object_binding::{late_materialized_object_binding, materialized_object_binding};
 use crate::operator::flush::FlushSchedule;
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
@@ -51,7 +52,7 @@ struct GroupedCountDrain {
     output_columns: Vec<usize>,
     groups: hashbrown::HashMap<CompositeGroupKey, CountGroup, FxBuildHasher>,
     key: CompositeGroupKey,
-    graph_view: Option<BinaryGraphView>,
+    norm: Option<EqualityNorm>,
     counted_rows: u64,
 }
 
@@ -66,13 +67,8 @@ impl GroupedCountDrain {
             &self.output_columns
         };
         self.key.0.clear();
-        let store = self.graph_view.as_ref().map(BinaryGraphView::store);
         self.key.0.extend(columns.iter().map(|&col| {
-            binding_to_group_key_normalized(
-                batch.get_by_col(row, col),
-                store,
-                self.graph_view.as_ref(),
-            )
+            binding_to_group_key_normalized(batch.get_by_col(row, col), self.norm.as_ref())
         }));
         let (_, group) = self
             .groups
@@ -1554,28 +1550,15 @@ impl Operator for NestedLoopJoinOperator {
 
                 let resolved: Option<u64> = {
                     let left_batch = self.current_left_batch.as_ref().unwrap();
-                    let store = ctx.binary_store.as_deref();
-                    // Persisted reverse dict first, then DictNovelty: a subject
-                    // minted after the last index resolves to a novelty s_id —
-                    // the same id space the overlay ops are translated into —
-                    // so novelty-only left subjects stay on the batched lane
-                    // (the merge injects their facts) instead of each paying a
-                    // per-row fallback scan.
+                    // A subject minted after the last index resolves to its
+                    // novelty s_id, so novelty-only left subjects stay on the
+                    // batched lane instead of each paying a per-row fallback scan.
+                    let dicts = ctx.dict_lookup();
                     let resolve_subject = |sid: &Sid| -> Option<u64> {
-                        store
-                            .and_then(|s| {
-                                s.find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                                    .ok()
-                                    .flatten()
-                            })
-                            .or_else(|| {
-                                ctx.dict_novelty
-                                    .as_ref()
-                                    .filter(|dn| dn.is_initialized())
-                                    .and_then(|dn| {
-                                        dn.subjects.find_subject(sid.namespace_code, &sid.name)
-                                    })
-                            })
+                        dicts?
+                            .subject_id(sid.namespace_code, &sid.name)
+                            .ok()
+                            .flatten()
                     };
                     match left_batch.get_by_col(left_row, left_col) {
                         Binding::EncodedSid { s_id, .. } => Some(*s_id),
@@ -1719,7 +1702,7 @@ impl Operator for NestedLoopJoinOperator {
             output_columns,
             groups: hashbrown::HashMap::with_hasher(FxBuildHasher),
             key: CompositeGroupKey(Vec::with_capacity(group_vars.len())),
-            graph_view: ctx.graph_view(),
+            norm: EqualityNorm::for_ctx(ctx),
             counted_rows: 0,
         });
         let result: Result<u64> = async {

@@ -20,7 +20,7 @@ use crate::execute::build_where_operators_seeded;
 use crate::exists::any_solution;
 use crate::group_aggregate::{CompositeGroupKey, GroupKeyOwned};
 use crate::ir::Pattern;
-use crate::object_binding::{equality_norm, EqualityNorm};
+use crate::object_binding::EqualityNorm;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::seed::{EmptyOperator, SeedOperator};
 use crate::temporal_mode::PlanningContext;
@@ -170,7 +170,7 @@ impl SemijoinOperator {
             positions
                 .iter()
                 .map(|&p| batch.get_by_col(row_idx, self.key_col_indices[p])),
-            &self.norm,
+            self.norm.as_ref(),
         );
         Ok(Some(
             self.partial_key_sets[positions.as_slice()].contains(&key),
@@ -186,7 +186,7 @@ impl SemijoinOperator {
         let mut correlated_rows = 0usize;
         for row_idx in 0..batch.len() {
             let has_match = if self.all_keys_bound(batch, row_idx) {
-                let key = row_key(batch, row_idx, &self.key_col_indices, &self.norm);
+                let key = row_key(batch, row_idx, &self.key_col_indices, self.norm.as_ref());
                 self.key_set.contains(&key)
             } else if let Some(found) =
                 self.partial_has_match(ctx, batch, row_idx, &mut positions)?
@@ -223,7 +223,7 @@ fn row_key(
     batch: &Batch,
     row_idx: usize,
     cols: &[usize],
-    norm: &Option<EqualityNorm>,
+    norm: Option<&EqualityNorm>,
 ) -> CompositeGroupKey {
     CompositeGroupKey::normalized(cols.iter().map(|&ci| batch.get_by_col(row_idx, ci)), norm)
 }
@@ -244,7 +244,7 @@ impl Operator for SemijoinOperator {
             ));
         }
         if self.norm.is_none() {
-            self.norm = equality_norm(ctx);
+            self.norm = EqualityNorm::for_ctx(ctx);
         }
 
         // Build phase: execute inner patterns once, collect distinct key tuples.
@@ -279,7 +279,7 @@ impl Operator for SemijoinOperator {
                 ctx.checkpoint()?;
                 let previous_keys = self.key_set.len();
                 for row_idx in 0..batch.len() {
-                    let key = row_key(&batch, row_idx, &inner_key_col_indices, &self.norm);
+                    let key = row_key(&batch, row_idx, &inner_key_col_indices, self.norm.as_ref());
                     self.key_set.insert(key);
                 }
                 // Charge only new retained keys, not duplicate inner solutions.
@@ -419,7 +419,7 @@ mod tests {
         );
         op.key_col_indices = vec![0, 1, 2];
         for row in 0..keys.len() {
-            op.key_set.insert(row_key(&keys, row, &[0, 1, 2], &None));
+            op.key_set.insert(row_key(&keys, row, &[0, 1, 2], None));
         }
         op
     }

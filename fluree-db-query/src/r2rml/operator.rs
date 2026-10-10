@@ -37,6 +37,7 @@ use crate::eval::PreparedBoolExpression;
 use crate::filter::filter_batch;
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::R2rmlPattern;
+use crate::object_binding::EqualityNorm;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::r2rml::policy::R2rmlPolicyGate;
 use crate::r2rml::ColumnBatchStream;
@@ -733,9 +734,8 @@ impl R2rmlScanOperator {
         if join_vars.is_empty() {
             return JoinPlan::Cross;
         }
-        let store = ctx.binary_store.as_deref();
-        let gv = ctx.graph_view();
-        let gv = gv.as_ref();
+        let norm = EqualityNorm::for_ctx(ctx);
+        let norm = norm.as_ref();
 
         let mut full_index: HashMap<Vec<GroupKeyOwned>, Vec<usize>> = HashMap::new();
         let mut partial_rows: Vec<(usize, Vec<Option<GroupKeyOwned>>)> = Vec::new();
@@ -751,7 +751,7 @@ impl R2rmlScanOperator {
                     break;
                 }
                 if b.is_bound() {
-                    key.push(Some(binding_to_group_key_normalized(b, store, gv)));
+                    key.push(Some(binding_to_group_key_normalized(b, norm)));
                 } else {
                     all_bound = false;
                     key.push(None);
@@ -1726,9 +1726,8 @@ fn emit_produced_window(
             full_index,
             partial_rows,
         } => {
-            let store = ctx.binary_store.as_deref();
-            let gv = ctx.graph_view();
-            let gv = gv.as_ref();
+            let norm = EqualityNorm::for_ctx(ctx);
+            let norm = norm.as_ref();
             for prod in produced {
                 // A produced row always binds every pattern var, so its join key
                 // is complete.
@@ -1737,7 +1736,7 @@ fn emit_produced_window(
                     .filter_map(|jv| {
                         prod.iter()
                             .find(|(v, _)| v == jv)
-                            .map(|(_, b)| binding_to_group_key_normalized(b, store, gv))
+                            .map(|(_, b)| binding_to_group_key_normalized(b, norm))
                     })
                     .collect();
                 if pkey.len() != join_vars.len() {

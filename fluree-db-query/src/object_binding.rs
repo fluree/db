@@ -1,10 +1,11 @@
 use crate::binding::Binding;
-use fluree_db_binary_index::BinaryIndexStore;
+use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore, DictLookup};
 use fluree_db_core::ids::DatatypeDictId;
 use fluree_db_core::o_type::{DecodeKind, OType};
 use fluree_db_core::value_id::{ObjKey, ObjKind};
-use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
+use fluree_db_core::{DatatypeConstraint, DictNovelty, FlakeValue, Sid};
 use fluree_vocab::xsd_names;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 fn encoded_i_val(o_i: u32) -> i32 {
@@ -204,23 +205,18 @@ pub(crate) fn late_materialized_object_binding(
 ///
 /// Returns `None` when the binding is already encoded or has no encoded
 /// equivalent (value absent from the dictionaries, datatypes the scan keeps
-/// materialized). That is sound: late materialization runs only with an empty
-/// overlay, so a value outside the persisted dictionaries cannot equal any
-/// encoded binding.
+/// materialized). The lookup must cover novelty: the batched probe lanes encode
+/// novelty rows with `DictNovelty` ids, so a value outside both dictionaries is
+/// the only one that cannot equal an encoded binding.
 ///
 /// The encoded identity fields are `(o_kind, o_key, dt_id, lang_id)` —
 /// `i_val`/`t`/`op` are metadata excluded from `PartialEq`/`Hash`, and `p_id`
 /// only participates for NUM_BIG (which this never produces).
-pub(crate) fn encoded_equivalent(binding: &Binding, store: &BinaryIndexStore) -> Option<Binding> {
+fn encoded_equivalent(binding: &Binding, dicts: DictLookup<'_>) -> Option<Binding> {
     match binding {
         Binding::Sid { sid, t, op } => {
-            // Blank nodes stay decoded on the scan path too.
-            if sid.namespace_code == fluree_vocab::namespaces::BLANK_NODE {
-                return None;
-            }
-            let s_id = store
-                .find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                .ok()??;
+            // Skolemized blank nodes are dictionary subjects, encoded like IRIs.
+            let s_id = dicts.subject_id(sid.namespace_code, &sid.name).ok()??;
             Some(Binding::EncodedSid {
                 s_id,
                 t: *t,
@@ -228,10 +224,7 @@ pub(crate) fn encoded_equivalent(binding: &Binding, store: &BinaryIndexStore) ->
             })
         }
         Binding::Iri(iri) | Binding::IriMatch { iri, .. } => {
-            let sid = store.encode_iri(iri.as_ref());
-            let s_id = store
-                .find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                .ok()??;
+            let s_id = dicts.subject_id_for_iri(iri.as_ref()).ok()??;
             Some(Binding::EncodedSid {
                 s_id,
                 t: None,
@@ -247,8 +240,8 @@ pub(crate) fn encoded_equivalent(binding: &Binding, store: &BinaryIndexStore) ->
         } => {
             let (o_kind, o_key, dt_id, lang_id) = match (val, dtc) {
                 (FlakeValue::String(s), DatatypeConstraint::LangTag(tag)) => {
-                    let str_id = store.find_string_id(s).ok()??;
-                    let lang_id = store.find_lang_id(tag)?;
+                    let str_id = dicts.string_id(s).ok()??;
+                    let lang_id = dicts.store().find_lang_id(tag)?;
                     (
                         ObjKind::LEX_ID.as_u8(),
                         u64::from(str_id),
@@ -266,12 +259,12 @@ pub(crate) fn encoded_equivalent(binding: &Binding, store: &BinaryIndexStore) ->
                     } else {
                         return None;
                     };
-                    let str_id = store.find_string_id(s).ok()??;
+                    let str_id = dicts.string_id(s).ok()??;
                     (ObjKind::LEX_ID.as_u8(), u64::from(str_id), dt_id, 0)
                 }
                 // JSON shares the string dictionary, keyed by its serialized text.
                 (FlakeValue::Json(s), _) => {
-                    let str_id = store.find_string_id(s).ok()??;
+                    let str_id = dicts.string_id(s).ok()??;
                     (
                         ObjKind::JSON_ID.as_u8(),
                         u64::from(str_id),
@@ -357,87 +350,63 @@ fn is_xsd(dt: &Sid, name: &str) -> bool {
     dt.namespace_code == fluree_vocab::namespaces::XSD && dt.name.as_ref() == name
 }
 
-/// Store handle for representation normalization at equality surfaces.
+/// Representation normalization for equality surfaces (DISTINCT, GROUP BY,
+/// MINUS, semijoin, VALUES, join and subquery keys), where a stream can carry
+/// one term both encoded and decoded.
 ///
-/// Present only for single-ledger binary execution — the only mode that
-/// emits encoded bindings, and the only mode where one store's dictionaries
-/// are authoritative for every row.
-pub(crate) fn equality_norm_store(
-    ctx: &crate::context::ExecutionContext<'_>,
-) -> Option<Arc<BinaryIndexStore>> {
-    if ctx.is_multi_ledger() {
-        return None;
-    }
-    ctx.binary_store.clone()
-}
-
-/// Store + graph view for representation normalization at equality surfaces
-/// (DISTINCT, GROUP BY, MINUS, semijoin, subquery keys). The store encodes
-/// decoded bindings to their dictionary form; the graph view decodes
-/// arena-backed NUM_BIG values to their canonical numeric form.
+/// Present only for single-ledger binary execution — the only mode that emits
+/// encoded bindings, and the only mode where one store's dictionaries are
+/// authoritative for every row.
 pub(crate) struct EqualityNorm {
     store: Arc<BinaryIndexStore>,
-    gv: Option<fluree_db_binary_index::BinaryGraphView>,
+    dict_novelty: Option<Arc<DictNovelty>>,
+    /// Decodes arena-backed NUM_BIG values; absent when the dataset spans
+    /// several graphs, whose arenas differ.
+    gv: Option<BinaryGraphView>,
 }
 
 impl EqualityNorm {
-    pub(crate) fn parts(
-        norm: &Option<Self>,
-    ) -> (
-        Option<&BinaryIndexStore>,
-        Option<&fluree_db_binary_index::BinaryGraphView>,
-    ) {
-        match norm {
-            Some(n) => (Some(&n.store), n.gv.as_ref()),
-            None => (None, None),
+    pub(crate) fn for_ctx(ctx: &crate::context::ExecutionContext<'_>) -> Option<Self> {
+        if ctx.is_multi_ledger() {
+            return None;
         }
+        Some(Self {
+            store: ctx.binary_store.clone()?,
+            dict_novelty: ctx.dict_novelty.clone(),
+            gv: ctx.graph_view(),
+        })
     }
-}
 
-/// Build an [`EqualityNorm`] when single-ledger binary execution applies.
-pub(crate) fn equality_norm(ctx: &crate::context::ExecutionContext<'_>) -> Option<EqualityNorm> {
-    let store = equality_norm_store(ctx)?;
-    Some(EqualityNorm {
-        store,
-        gv: ctx.graph_view(),
-    })
-}
-
-/// Normalize one binding for use in an equality/hash key.
-pub(crate) fn normalize_for_key(
-    binding: &Binding,
-    store: Option<&BinaryIndexStore>,
-    gv: Option<&fluree_db_binary_index::BinaryGraphView>,
-) -> Binding {
-    normalize_for_key_cow(binding, store, gv).into_owned()
-}
-
-/// [`normalize_for_key`] without the clone: an already-encoded binding (the
-/// common case on the indexed scan path) is returned borrowed, so a hot
-/// equality surface such as `DISTINCT` can hash and probe a row without
-/// copying it and only materializes the key for rows it actually keeps.
-pub(crate) fn normalize_for_key_cow<'a>(
-    binding: &'a Binding,
-    store: Option<&BinaryIndexStore>,
-    gv: Option<&fluree_db_binary_index::BinaryGraphView>,
-) -> std::borrow::Cow<'a, Binding> {
-    use std::borrow::Cow;
-    // Arena-keyed NUM_BIG values normalize by DECODING: handles are scoped
-    // per (graph, predicate), so the encoded form is not a canonical key for
-    // one value across predicates or against decoded rows (VALUES, BIND,
-    // novelty raw-merge). The decoded BigDecimal/BigInt compares and hashes
-    // by numeric value.
-    if is_numbig_encoded(binding) {
-        if let Some(gv) = gv {
-            let materialized = crate::group_aggregate::materialize_encoded(binding, Some(gv));
-            if !matches!(materialized, Binding::EncodedLit { .. }) {
-                return Cow::Owned(materialized);
+    /// `binding` in the form equal terms share: decoded values take their
+    /// dictionary encoding, arena NUM_BIG values their decoded number.
+    pub(crate) fn normalize<'a>(&self, binding: &'a Binding) -> Cow<'a, Binding> {
+        // NUM_BIG handles are scoped per (graph, predicate), so the encoded
+        // form is not canonical across predicates or against decoded rows.
+        if is_numbig_encoded(binding) {
+            if let Some(gv) = &self.gv {
+                let materialized = crate::group_aggregate::materialize_encoded(binding, Some(gv));
+                if !matches!(materialized, Binding::EncodedLit { .. }) {
+                    return Cow::Owned(materialized);
+                }
             }
+            return Cow::Borrowed(binding);
         }
-        return Cow::Borrowed(binding);
+        let dicts = DictLookup::new(&self.store, self.dict_novelty.as_deref());
+        match encoded_equivalent(binding, dicts) {
+            Some(encoded) => Cow::Owned(encoded),
+            None => Cow::Borrowed(binding),
+        }
     }
-    match store.and_then(|s| encoded_equivalent(binding, s)) {
-        Some(encoded) => Cow::Owned(encoded),
+}
+
+/// [`EqualityNorm::normalize`], or `binding` unchanged where no
+/// normalization applies.
+pub(crate) fn normalize_for_key<'a>(
+    binding: &'a Binding,
+    norm: Option<&EqualityNorm>,
+) -> Cow<'a, Binding> {
+    match norm {
+        Some(norm) => norm.normalize(binding),
         None => Cow::Borrowed(binding),
     }
 }

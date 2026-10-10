@@ -255,7 +255,12 @@ impl AggState {
     /// * `binding` - The binding value to incorporate
     /// * `gv` - Optional graph view for materializing encoded bindings (needed for MIN/MAX).
     ///   When the graph view is novelty-aware, watermark routing is handled internally.
-    fn update(&mut self, binding: &Binding, gv: Option<&BinaryGraphView>) {
+    fn update(
+        &mut self,
+        binding: &Binding,
+        gv: Option<&BinaryGraphView>,
+        norm: Option<&crate::object_binding::EqualityNorm>,
+    ) {
         match self {
             AggState::Count { n } => {
                 // COUNT: count non-Unbound values (COUNT(*) counts all via CountAll variant)
@@ -271,12 +276,7 @@ impl AggState {
                     // Convert binding to owned group key for HashSet,
                     // normalizing decoded bindings so mixed-representation
                     // streams count as one value.
-                    let key = binding_to_group_key_normalized(
-                        binding,
-                        gv.map(BinaryGraphView::store),
-                        gv,
-                    );
-                    seen.insert(key);
+                    seen.insert(binding_to_group_key_normalized(binding, norm));
                 }
             }
             AggState::Sum { acc, poisoned } => {
@@ -462,32 +462,16 @@ impl Hash for MaterializedLitKey {
     }
 }
 
-/// [`binding_to_group_key_owned`] with representation normalization, so
+/// [`binding_to_group_key_owned`] over [`normalize_for_key`], so
 /// mixed-representation streams (encoded scan output meeting decoded
-/// VALUES/UNION/BIND bindings) key identically. Pass the store whenever the
-/// stream may contain late-materialized bindings; pass the graph view so
-/// arena-backed NUM_BIG values key by decoded numeric value (handles are
-/// per-(graph, predicate) and not canonical across representations).
+/// VALUES/UNION/BIND bindings) key identically.
+///
+/// [`normalize_for_key`]: crate::object_binding::normalize_for_key
 pub(crate) fn binding_to_group_key_normalized(
     binding: &Binding,
-    store: Option<&fluree_db_binary_index::BinaryIndexStore>,
-    gv: Option<&BinaryGraphView>,
+    norm: Option<&crate::object_binding::EqualityNorm>,
 ) -> GroupKeyOwned {
-    if crate::object_binding::is_numbig_encoded(binding) {
-        if let Some(gv) = gv {
-            let materialized = materialize_encoded(binding, Some(gv));
-            if !matches!(materialized, Binding::EncodedLit { .. }) {
-                return binding_to_group_key_owned(&materialized);
-            }
-        }
-        return binding_to_group_key_owned(binding);
-    }
-    if let Some(store) = store {
-        if let Some(normalized) = crate::object_binding::encoded_equivalent(binding, store) {
-            return binding_to_group_key_owned(&normalized);
-        }
-    }
-    binding_to_group_key_owned(binding)
+    binding_to_group_key_owned(&crate::object_binding::normalize_for_key(binding, norm))
 }
 
 /// Convert a binding to an owned group key.
@@ -659,13 +643,12 @@ impl CompositeGroupKey {
     /// identically (see [`binding_to_group_key_normalized`]).
     pub(crate) fn normalized<'a>(
         bindings: impl IntoIterator<Item = &'a Binding>,
-        norm: &Option<crate::object_binding::EqualityNorm>,
+        norm: Option<&crate::object_binding::EqualityNorm>,
     ) -> Self {
-        let (store, gv) = crate::object_binding::EqualityNorm::parts(norm);
         Self(
             bindings
                 .into_iter()
-                .map(|b| binding_to_group_key_normalized(b, store, gv))
+                .map(|b| binding_to_group_key_normalized(b, norm))
                 .collect(),
         )
     }
@@ -706,6 +689,7 @@ pub struct GroupAggregateOperator {
     /// When novelty-aware (via `ExecutionContext::graph_view()`), watermark routing
     /// for novelty-only subject/string IDs is handled internally.
     graph_view: Option<BinaryGraphView>,
+    norm: Option<crate::object_binding::EqualityNorm>,
     /// Variables required by downstream operators; if set, output is trimmed.
     out_schema: Option<Arc<[VarId]>>,
     /// Child columns each `COUNT(DISTINCT *)` spec composes its solution from,
@@ -787,6 +771,7 @@ impl GroupAggregateOperator {
             partitioned_groups: Vec::new(),
             emit_iter: None,
             graph_view,
+            norm: None,
             out_schema: None,
             row_distinct_cols,
             has_row_distinct,
@@ -829,11 +814,9 @@ impl GroupAggregateOperator {
 
     /// Write a row's composite group key into `key`, reusing its allocation.
     fn fill_group_key(&self, batch: &Batch, row_idx: usize, key: &mut CompositeGroupKey) {
-        let store = self.graph_view.as_ref().map(BinaryGraphView::store);
         key.0.clear();
         key.0.extend(self.group_key_indices.iter().map(|&col_idx| {
-            let binding = batch.get_by_col(row_idx, col_idx);
-            binding_to_group_key_normalized(binding, store, self.graph_view.as_ref())
+            binding_to_group_key_normalized(batch.get_by_col(row_idx, col_idx), self.norm.as_ref())
         }));
     }
 
@@ -843,11 +826,12 @@ impl GroupAggregateOperator {
     /// construction — normalized the same way group keys are so a mixed
     /// encoded/decoded stream does not double-count.
     fn extract_row_key(&self, batch: &Batch, row_idx: usize, cols: &[usize]) -> Vec<GroupKeyOwned> {
-        let store = self.graph_view.as_ref().map(BinaryGraphView::store);
         cols.iter()
             .map(|&col_idx| {
-                let binding = batch.get_by_col(row_idx, col_idx);
-                binding_to_group_key_normalized(binding, store, self.graph_view.as_ref())
+                binding_to_group_key_normalized(
+                    batch.get_by_col(row_idx, col_idx),
+                    self.norm.as_ref(),
+                )
             })
             .collect()
     }
@@ -907,6 +891,7 @@ impl Operator for GroupAggregateOperator {
         if self.graph_view.is_none() {
             self.graph_view = ctx.graph_view();
         }
+        self.norm = crate::object_binding::EqualityNorm::for_ctx(ctx);
         Ok(())
     }
 
@@ -1049,7 +1034,11 @@ impl Operator for GroupAggregateOperator {
                                 match spec.input_col {
                                     Some(col_idx) => {
                                         let binding = batch.get_by_col(row_idx, col_idx);
-                                        group_state.agg_states[agg_idx].update(binding, gv_ref);
+                                        group_state.agg_states[agg_idx].update(
+                                            binding,
+                                            gv_ref,
+                                            self.norm.as_ref(),
+                                        );
                                     }
                                     // COUNT(DISTINCT *) - count distinct solutions
                                     None if matches!(
@@ -1155,7 +1144,11 @@ impl Operator for GroupAggregateOperator {
                             match spec.input_col {
                                 Some(col_idx) => {
                                     let binding = batch.get_by_col(row_idx, col_idx);
-                                    group_state.agg_states[agg_idx].update(binding, gv_ref);
+                                    group_state.agg_states[agg_idx].update(
+                                        binding,
+                                        gv_ref,
+                                        self.norm.as_ref(),
+                                    );
                                 }
                                 // COUNT(DISTINCT *) - count distinct solutions
                                 None if matches!(
