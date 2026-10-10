@@ -118,6 +118,7 @@ where
 
     // Determine output directory for binary index artifacts
     let staging_in_temp = config.data_dir.is_none();
+    let leaf_target_rows = config.effective_leaf_target_rows();
     let data_dir = config
         .data_dir
         .unwrap_or_else(|| std::env::temp_dir().join("fluree-index"));
@@ -900,7 +901,7 @@ where
                     index_dir: index_dir.clone(),
                     g_id,
                     leaflet_target_rows: config.leaflet_rows,
-                    leaf_target_rows: config.leaflet_rows * config.leaflets_per_leaf,
+                    leaf_target_rows,
                     zstd_level: 1,
                     run_budget_bytes: config.run_budget_bytes,
                     worker_count: 1,

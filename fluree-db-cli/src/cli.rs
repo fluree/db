@@ -356,9 +356,10 @@ pub enum Commands {
         #[arg(long)]
         skolem_namespace: Option<String>,
 
-        /// Records per leaflet in index files. Default: 25000.
-        /// Larger values produce fewer, bigger leaflets (less I/O, more memory per read).
-        #[arg(long, default_value_t = 25_000)]
+        /// Records per leaflet in index files.
+        /// Larger values produce fewer, bigger leaflets (less per-leaflet
+        /// overhead, more decode per point read).
+        #[arg(long, default_value_t = fluree_db_indexer::config::DEFAULT_LEAFLET_ROWS)]
         leaflet_rows: usize,
 
         /// Leaflets per leaf file. Default: 10.
