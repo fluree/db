@@ -4,6 +4,7 @@
 //! metadata (`ColumnBlockRef`) lives in the leaf-level leaflet directory —
 //! there is no per-leaflet local directory.
 
+use std::cell::RefCell;
 use std::io;
 
 /// Column identifier. Determines the semantic meaning and element type
@@ -128,7 +129,7 @@ pub fn encode_column_u64(
     zstd_level: i32,
 ) -> std::io::Result<(Vec<u8>, ColumnBlockRef)> {
     let raw = u64_slice_to_le_bytes(values);
-    let compressed = zstd::bulk::compress(&raw, zstd_level)
+    let compressed = compress(&raw, zstd_level)
         .map_err(|e| std::io::Error::other(format!("zstd compress u64 column: {e}")))?;
     let r = ColumnBlockRef {
         col_id: col_id.to_u16(),
@@ -148,7 +149,7 @@ pub fn encode_column_u32(
     zstd_level: i32,
 ) -> std::io::Result<(Vec<u8>, ColumnBlockRef)> {
     let raw = u32_slice_to_le_bytes(values);
-    let compressed = zstd::bulk::compress(&raw, zstd_level)
+    let compressed = compress(&raw, zstd_level)
         .map_err(|e| std::io::Error::other(format!("zstd compress u32 column: {e}")))?;
     let r = ColumnBlockRef {
         col_id: col_id.to_u16(),
@@ -168,7 +169,7 @@ pub fn encode_column_u16(
     zstd_level: i32,
 ) -> std::io::Result<(Vec<u8>, ColumnBlockRef)> {
     let raw = u16_slice_to_le_bytes(values);
-    let compressed = zstd::bulk::compress(&raw, zstd_level)
+    let compressed = compress(&raw, zstd_level)
         .map_err(|e| std::io::Error::other(format!("zstd compress u16 column: {e}")))?;
     let r = ColumnBlockRef {
         col_id: col_id.to_u16(),
@@ -195,10 +196,11 @@ pub fn decode_column_u64(data: &[u8], block_ref: &ColumnBlockRef) -> io::Result<
             "column block extends beyond data",
         ));
     }
-    let decompressed =
-        zstd::bulk::decompress(&data[start..end], block_ref.uncompressed_len as usize)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    Ok(le_bytes_to_u64_vec(&decompressed))
+    with_decompressed(
+        &data[start..end],
+        block_ref.uncompressed_len as usize,
+        le_bytes_to_u64_vec,
+    )
 }
 
 /// Decode a compressed column block of `u32` values.
@@ -211,10 +213,11 @@ pub fn decode_column_u32(data: &[u8], block_ref: &ColumnBlockRef) -> io::Result<
             "column block extends beyond data",
         ));
     }
-    let decompressed =
-        zstd::bulk::decompress(&data[start..end], block_ref.uncompressed_len as usize)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    Ok(le_bytes_to_u32_vec(&decompressed))
+    with_decompressed(
+        &data[start..end],
+        block_ref.uncompressed_len as usize,
+        le_bytes_to_u32_vec,
+    )
 }
 
 /// Decode a compressed column block of `u16` values.
@@ -227,10 +230,57 @@ pub fn decode_column_u16(data: &[u8], block_ref: &ColumnBlockRef) -> io::Result<
             "column block extends beyond data",
         ));
     }
-    let decompressed =
-        zstd::bulk::decompress(&data[start..end], block_ref.uncompressed_len as usize)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    Ok(le_bytes_to_u16_vec(&decompressed))
+    with_decompressed(
+        &data[start..end],
+        block_ref.uncompressed_len as usize,
+        le_bytes_to_u16_vec,
+    )
+}
+
+thread_local! {
+    /// One zstd decompression context and output buffer per thread. A fresh
+    /// context per column block (what `zstd::bulk::decompress` does) costs an
+    /// allocation and a zeroed workspace, a fixed tax that small leaflets pay
+    /// once per column per leaflet.
+    static DECOMPRESS: RefCell<Option<(zstd::bulk::Decompressor<'static>, Vec<u8>)>> =
+        const { RefCell::new(None) };
+}
+
+thread_local! {
+    /// One zstd compression context per thread, for the same reason as
+    /// [`DECOMPRESS`]: a fresh context per column block is a fixed tax that
+    /// small leaflets pay once per column per leaflet on every leaf write.
+    static COMPRESS: RefCell<Option<(i32, zstd::bulk::Compressor<'static>)>> =
+        const { RefCell::new(None) };
+}
+
+/// `zstd::bulk::compress(raw, level)` on this thread's reused context; the
+/// output is byte-identical.
+fn compress(raw: &[u8], level: i32) -> io::Result<Vec<u8>> {
+    COMPRESS.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.as_ref().is_none_or(|(l, _)| *l != level) {
+            *slot = Some((level, zstd::bulk::Compressor::new(level)?));
+        }
+        let (_, cctx) = slot.as_mut().expect("compressor initialized above");
+        cctx.compress(raw)
+    })
+}
+
+/// Decompress `src` (at most `len` bytes of output) and hand the bytes to `f`.
+fn with_decompressed<R>(src: &[u8], len: usize, f: impl FnOnce(&[u8]) -> R) -> io::Result<R> {
+    let invalid = |e| io::Error::new(io::ErrorKind::InvalidData, e);
+    DECOMPRESS.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some((zstd::bulk::Decompressor::new()?, Vec::new()));
+        }
+        let (dctx, buf) = slot.as_mut().expect("decompressor initialized above");
+        buf.clear();
+        buf.reserve(len);
+        dctx.decompress_to_buffer(src, buf).map_err(invalid)?;
+        Ok(f(buf))
+    })
 }
 
 // ============================================================================
@@ -288,6 +338,28 @@ fn le_bytes_to_u16_vec(data: &[u8]) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Leaf CIDs hash the encoded bytes, so the reused context must match a
+    /// fresh one exactly, including after switching levels.
+    #[test]
+    fn reused_compressor_matches_fresh_compress() {
+        let inputs: Vec<Vec<u8>> = (0..4u64)
+            .map(|k| {
+                (0..5000u64)
+                    .flat_map(|i| (i * k + i / 7).to_le_bytes())
+                    .collect()
+            })
+            .collect();
+        for level in [1, 3, 1, 9, 3] {
+            for raw in &inputs {
+                assert_eq!(
+                    compress(raw, level).unwrap(),
+                    zstd::bulk::compress(raw, level).unwrap(),
+                    "level {level}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn column_block_ref_roundtrip() {
