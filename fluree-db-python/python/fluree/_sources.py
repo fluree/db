@@ -119,6 +119,36 @@ class Unity:
 
 
 @dataclass(frozen=True, slots=True)
+class Glue:
+    """An AWS Glue Data Catalog that Iceberg tables are found through: each
+    mapped ``rr:tableName`` is a Glue ``<database>.<table>``, whose current
+    metadata file Glue names. The catalog call and the S3 reads use the usual
+    AWS environment, never vended credentials. ``region`` is the catalog's
+    region (else ``s3_region``, else the AWS region chain); ``catalog_id``
+    reads another account's catalog."""
+
+    region: str | None = None
+    catalog_id: str | None = None
+
+    def _json(self) -> dict[str, Any]:
+        return {"region": self.region, "catalog_id": self.catalog_id}
+
+
+@dataclass(frozen=True, slots=True)
+class S3Tables:
+    """An AWS S3 Tables table bucket that Iceberg tables are found in, named by
+    its ARN (``arn:aws:s3tables:<region>:<account>:bucket/<name>``): each
+    mapped ``rr:tableName`` is a ``<namespace>.<table>`` in the bucket. The
+    region defaults to the ARN's. Reads use the usual AWS environment."""
+
+    table_bucket_arn: str
+    region: str | None = None
+
+    def _json(self) -> dict[str, Any]:
+        return {"table_bucket_arn": self.table_bucket_arn, "region": self.region}
+
+
+@dataclass(frozen=True, slots=True)
 class AzureServicePrincipal:
     """Microsoft Entra service-principal credentials for Delta tables in
     ADLS Gen2 or OneLake."""

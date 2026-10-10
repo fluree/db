@@ -17,10 +17,14 @@ Apache Iceberg is an open table format for huge analytical datasets. It provides
 
 ### Catalog Modes
 
-Fluree supports two ways to discover Iceberg metadata:
+Fluree supports four ways to discover Iceberg metadata:
 
-- **REST catalog**: discover table metadata via an Iceberg REST catalog API (e.g., Polaris).
+- **REST catalog**: discover table metadata via an Iceberg REST catalog API (e.g., Polaris, Snowflake Horizon).
 - **Direct S3 (no catalog server)**: bypass REST discovery and read `version-hint.text` from the table’s `metadata/` directory to resolve the current metadata file.
+- **AWS Glue Data Catalog** (`--mode glue`): look the table up with Glue `GetTable` through the native AWS SDK (`aws-sdk-glue`) and read the Iceberg metadata file named by the table's `metadata_location` parameter; manifests and data files are then read from S3. The catalog pointer is authoritative: no `version-hint.text` is needed, and uncommitted or orphaned metadata files in the table's `metadata/` directory are never read. The Glue *database* is the table identifier's namespace (`<database>.<table>`); `--catalog-id` reads another account's catalog (default: the caller's account).
+- **AWS S3 Tables** (`--mode s3tables`): the same native-SDK approach via `aws-sdk-s3tables` against an S3 Tables table bucket (`--table-bucket-arn`), resolving the metadata file with `GetTableMetadataLocation`.
+
+Glue and S3 Tables use the **ambient** AWS credential chain (environment variables, the shared config and credentials files including `AWS_PROFILE` and SSO, or the container / instance role) for both the catalog call and the S3 reads; the SDK signs its own requests. They do not use vended credentials: the CLI and server turn them off for these modes, and a stored config with `io.vended_credentials: true` is refused. Glue tables whose files can be read only with Lake Formation–vended credentials are not supported yet ([#1456](https://github.com/fluree/db/issues/1456)): the ambient identity must be able to read the table's files in S3 itself. Catalogs that vend credentials over the Iceberg REST API (Snowflake Horizon / Polaris) use REST mode.
 
 ### CLI
 
@@ -46,6 +50,20 @@ fluree iceberg map execution-log \
   --table-location s3://bucket/warehouse/logs/execution_log \
   --r2rml mappings/execution_log.ttl \
   --model governance:main
+
+# AWS Glue Data Catalog (native SDK, ambient AWS credentials)
+# (each rr:tableName in the mapping is a Glue <database>.<table>)
+fluree iceberg map warehouse-orders \
+  --mode glue \
+  --region us-east-1 \
+  --r2rml mappings/orders.ttl
+
+# AWS S3 Tables (native SDK, ambient AWS credentials; the region comes from the ARN)
+# (each rr:tableName in the mapping is a <namespace>.<table> in the table bucket)
+fluree iceberg map warehouse-orders \
+  --mode s3tables \
+  --table-bucket-arn arn:aws:s3tables:us-east-1:123456789012:bucket/analytics \
+  --r2rml mappings/orders.ttl
 
 # Google Cloud Storage — see "Google Cloud Storage (GCS)" below
 fluree iceberg map orders \
@@ -101,7 +119,24 @@ curl -X POST http://localhost:8090/v1/fluree/iceberg/map \
   }'
 ```
 
-R2RML can be omitted to auto-generate a direct mapping. An optional `"model": "governance:main"` names the model ledger that governs the source (see [Access policy](#access-policy)). AWS credentials for `direct` mode are read from the server's environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, or an attached instance role). See the [Graph Source Endpoints](../api/endpoints.md#graph-source-endpoints) section in the API reference for the complete request/response schema.
+```bash
+# AWS Glue Data Catalog (native AWS SDK, the server's ambient AWS credentials)
+curl -X POST http://localhost:8090/v1/fluree/iceberg/map \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{
+    "name": "warehouse-orders",
+    "mode": "glue",
+    "region": "us-east-1",
+    "table": "sales.orders",
+    "r2rml": "...",
+    "r2rml_type": "text/turtle"
+  }'
+```
+
+For AWS S3 Tables, send `"mode": "s3tables"` and `"table_bucket_arn": "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics"` in place of `region`; a Glue catalog in another account takes `"catalog_id": "123456789012"`. With `r2rml`, `table` may be omitted in `glue` and `s3tables` modes, as in `rest`: each `rr:tableName` names a table.
+
+Without `r2rml` the source is registered as a plain Iceberg source with no mapping. An optional `"model": "governance:main"` names the model ledger that governs the source (see [Access policy](#access-policy)). AWS credentials for `direct`, `glue` and `s3tables` modes come from the server's ambient AWS credential chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, `AWS_REGION`, or an attached instance role). See the [Graph Source Endpoints](../api/endpoints.md#graph-source-endpoints) section in the API reference for the complete request/response schema.
 
 ### Rust API
 
@@ -145,11 +180,38 @@ let config = R2rmlCreateConfig::new_direct(
 fluree.create_r2rml_graph_source(config).await?;
 ```
 
+**AWS Glue / S3 Tables:**
+
+There is no `R2rmlCreateConfig` shorthand for these modes; build the connection with `IcebergConnectionConfig::glue(region, catalog_id)` or `IcebergConnectionConfig::s3_tables(region, table_bucket_arn)` and wrap it. Both turn vended credentials off.
+
+```rust
+use fluree_db_api::{
+    IcebergConnectionConfig, IcebergCreateConfig, R2rmlCreateConfig, R2rmlMappingInput,
+};
+
+let mapping = std::fs::read_to_string("mappings/orders.ttl")?;
+
+let connection = IcebergConnectionConfig::glue(Some("us-east-1".to_string()), None);
+// AWS S3 Tables instead (the region comes from the ARN):
+// let connection = IcebergConnectionConfig::s3_tables(
+//     None,
+//     "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics",
+// );
+
+let config = R2rmlCreateConfig {
+    iceberg: IcebergCreateConfig::from_connection("warehouse-orders", connection, "sales.orders"),
+    mapping: R2rmlMappingInput::Content(mapping),
+    mapping_media_type: None,
+};
+
+fluree.create_r2rml_graph_source(config).await?;
+```
+
 ### Stored Configuration Format (Nameservice)
 
 Iceberg graph sources are persisted as an `IcebergGsConfig` JSON document in the nameservice record’s `config` field.
 
-Note the nesting: the graph source is “Iceberg” (this page), and `catalog.type` selects the **catalog mode** (`rest` vs `direct`) used to discover Iceberg metadata. Optional top-level fields not shown below: `mapping` (the stored R2RML address and media type), `delete` and `order_by` (materialization conventions), and `model` (the governing model ledger, see [Access policy](#access-policy)).
+Note the nesting: the graph source is “Iceberg” (this page), and `catalog.type` selects the **catalog mode** (`rest`, `direct`, `glue` or `s3tables`) used to discover Iceberg metadata. Optional top-level fields not shown below: `mapping` (the stored R2RML address and media type), `delete` and `order_by` (materialization conventions), and `model` (the governing model ledger, see [Access policy](#access-policy)).
 
 **REST catalog config:**
 
@@ -239,6 +301,35 @@ disk. Ideal for local development and test datasets.
 }
 ```
 
+**AWS Glue Data Catalog config:**
+
+```json
+{
+  "catalog": {
+    "type": "glue",
+    "region": "us-east-1",
+    "catalog_id": "123456789012"
+  },
+  "table": "sales.orders",
+  "io": { "vended_credentials": false }
+}
+```
+
+**AWS S3 Tables config:**
+
+```json
+{
+  "catalog": {
+    "type": "s3tables",
+    "table_bucket_arn": "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics"
+  },
+  "table": "sales.orders",
+  "io": { "vended_credentials": false }
+}
+```
+
+`region` is optional in both (S3 Tables defaults to the ARN's region, and refuses a `region` that contradicts it), as is Glue's `catalog_id` (default: the caller's account). `io.vended_credentials` must be `false`: these catalogs vend no credentials, so a config that requires them is refused. `io.s3_region`, `io.s3_endpoint` and `io.s3_path_style` apply to the S3 reads as in the other modes.
+
 ### Enabling local tables
 
 `FLUREE_ICEBERG_LOCAL_ROOTS` is a colon-separated list of absolute directories,
@@ -322,7 +413,7 @@ whose manifests reference files *outside* its own root is not remapped.)
 
 Direct mode assumes `table_location` points at a **valid Iceberg table layout** (created by `iceberg-rust`, Spark, etc.), including the `metadata/` directory and referenced metadata/manifest files. Fluree does not create or “bootstrap” Iceberg tables; it only reads them.
 
-**When to use Direct vs REST:**
+**When to use which mode:**
 | Scenario | Recommended |
 |----------|-------------|
 | Shared catalog (multiple consumers) | REST |
@@ -330,6 +421,8 @@ Direct mode assumes `table_location` points at a **valid Iceberg table layout** 
 | `iceberg-rust` / Spark appending to known S3 path | Direct |
 | Need catalog-managed credentials (vended) | REST |
 | Minimizing infrastructure (no catalog server) | Direct |
+| Tables registered in the AWS Glue Data Catalog (by Athena, Spark, Trino, pyiceberg, …) | Glue |
+| Tables in an AWS S3 Tables table bucket | S3 Tables |
 
 ### Google Cloud Storage (GCS)
 
@@ -669,6 +762,13 @@ target. The materializer enforces what it can and documents the rest:
   Materializing makes the guard *more* important, not less: a query returning
   deleted rows is a transient wrong answer, but a materialized twin commits them
   as state and advances the watermark past the window.
+- **Credentials are decided exactly as on the query path**, for `materialize`
+  and `track` alike, incremental scans included. A REST source with vended
+  credentials on whose catalog vends none is refused with
+  `err:catalog/CredentialsNotVended`, never read with the server's own AWS
+  identity; and catalog auth held as a reference (an `auth_bearer_env` /
+  `oauth2_client_secret_env` variable, or an embedder's secret reference) is
+  resolved as it is for a query.
 - **Foreign-key (`rr:refObjectMap`) edges are not materialized.** The virtual
   query path resolves them at query time; the materializer does not yet index
   parent tables, so FK edges are absent from the twin (each pass logs a warning
@@ -909,7 +1009,7 @@ A time-pinned read always uses the current mapping. Columns are matched by Icebe
 
 ### AWS Credentials
 
-For S3-backed Iceberg (both REST and Direct modes):
+For S3-backed Iceberg (every catalog mode):
 
 ```bash
 export AWS_ACCESS_KEY_ID=your-key
@@ -917,7 +1017,16 @@ export AWS_SECRET_ACCESS_KEY=your-secret
 export AWS_REGION=us-east-1
 ```
 
-REST catalog mode also supports vended credentials (credentials issued by the catalog). Direct mode uses only ambient AWS credentials (env vars, IAM roles, `~/.aws/credentials`).
+REST catalog mode also supports vended credentials (credentials issued by the catalog). Direct, Glue and S3 Tables modes use only the ambient AWS credential chain (env vars, `~/.aws/credentials` and `~/.aws/config` including `AWS_PROFILE` and SSO, IAM roles); Glue and S3 Tables use it for the catalog call as well as the S3 reads.
+
+**Scope the server's identity.** In `direct`, `glue` and `s3tables` modes a server reads with its **own** ambient AWS identity, not the caller's, so anyone allowed to map a graph source on that server can read any table that identity can reach. Scope the server's IAM role, and the Lake Formation grants and bucket policies behind it, to the tables the server should serve. (A REST source with vended credentials turned off also reads its files with that identity.)
+
+**Regions and endpoints (Glue, S3 Tables):**
+
+- The Glue API is called in `--region` (JSON `region`), else `--s3-region`, else the AWS SDK's region chain (`AWS_REGION`, the profile's region, instance metadata). The S3 Tables API is called in the table bucket ARN's region; a `--region` that contradicts the ARN is refused. ARNs in every AWS partition (`aws`, `aws-cn`, `aws-us-gov`) are accepted.
+- S3 reads use `--s3-region` when given, else the catalog's region.
+- Region values must be AWS region codes (e.g. `us-east-1`); anything else is refused.
+- The catalog API endpoint follows the standard AWS SDK overrides: `AWS_ENDPOINT_URL_GLUE`, `AWS_ENDPOINT_URL_S3TABLES`, `AWS_ENDPOINT_URL`, or `endpoint_url` in the shared config file — for a private endpoint, or a local mock such as moto. S3 reads honor `--s3-endpoint`, `--s3-path-style` and `--s3-region` exactly as in the other modes (MinIO, private endpoints).
 
 **Google Cloud Storage:** when the endpoint is the GCS S3-interoperability host, reads go through the AWS S3 SDK (transport pinned to HTTP/1.1), signing requests with AWS SigV4 using GCS HMAC interop keys — the same `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` shown above (set them to your HMAC keys). See [Google Cloud Storage (GCS)](#google-cloud-storage-gcs).
 
@@ -1117,30 +1226,40 @@ triples map a scan skipped because its predicates were hidden.
 
 ### Connection Issues
 
-```json
-{
-  "error": "IcebergConnectionError",
-  "message": "Cannot connect to Glue catalog"
-}
-```
+**AWS Glue / S3 Tables.** `fluree iceberg map` tests the connection for REST catalogs only; for these modes it reports `Connection: not tested`, and catalog errors first surface on the first query. To check a connection before querying, use [`POST /iceberg/catalog/verify`](../api/endpoints.md#post-api_base_urlicebergcatalogverify).
 
-**Solutions:**
-- Check AWS credentials
-- Verify IAM permissions
-- Check network connectivity
+| Error | Cause |
+|---|---|
+| `… Table not found: Glue table sales.nope not found: …EntityNotFoundException…` | No such Glue database or table in this catalog and region. Check the `<database>.<table>` name, `--region`, and (for another account's catalog) `--catalog-id`. |
+| ``… Glue table sales.t is not an Iceberg table: it has no `metadata_location` parameter`` | The Glue table is a Hive / Parquet table, not an Iceberg one. Only tables that carry `metadata_location` can be mapped; catalog browse lists only those. |
+| A query fails with HTTP `403`, `@type` `err:catalog/AccessDenied`: `Catalog denied access to table 'sales.orders': …` | The catalog refused this principal the table. For a REST catalog, the bearer or OAuth2 token lacks access to the table, or the role it acts as lacks grants on it: the catalog's `loadTable` answered `403`, or `401` again after one token refresh, and its reply follows as `Catalog request failed (403 …): …` (or `(401 …)`). For Glue and S3 Tables, the ambient AWS identity may not call the catalog operation (for example `glue:GetTable`, or `s3tables:GetTableMetadataLocation`), or a Lake Formation grant is missing. |
+| A query fails with HTTP `403`, `@type` `err:storage/AccessDenied`: `Storage access denied for s3://…` | The catalog answered, but the identity cannot read the table's files in S3. Glue tables readable only with Lake Formation–vended credentials are not supported yet ([#1456](https://github.com/fluree/db/issues/1456)). |
+| `Vended credentials are not supported with the Glue catalog …` (or `S3 Tables catalog`) | A stored config sets `io.vended_credentials: true`; these modes read with the ambient chain only. Set it to `false` (the CLI and server do so automatically). |
+| `… is not an AWS region (expected e.g. us-east-1)` | `--region` / `--s3-region` must be an AWS region code. |
+| `S3Tables catalog.region '…' contradicts the table bucket ARN's region '…'` | Omit `--region`; S3 Tables uses the ARN's region. |
+
+Credentials, regions and endpoint overrides for these modes are described under [AWS Credentials](#aws-credentials).
+
+**A dropped table, or revoked catalog access, is noticed only after the cache window.** Once a table has been read, its current metadata location is cached: for up to `FLUREE_ICEBERG_LOADTABLE_TTL_SECS` (default 60 s) in the server's memory and `FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS` (default 300 s) on disk, across restarts. Within that window a query does not ask Glue or S3 Tables again, so a table dropped from the catalog, or a revoked `glue:GetTable` or Lake Formation grant, is not seen until it passes. S3 still authorizes every data read. (A REST catalog that vends credentials is asked again sooner: once the in-memory entry expires, a query that must read data files asks it for fresh credentials.) Set either variable to `0` to always ask (see [Configuration](../operations/configuration.md)). Re-creating a source under the same name with a different catalog never reuses the old one's cached location.
+
+To try the Glue mode without an AWS account, `scripts/glue-local/` in the repository runs moto (a local mock of S3 and the Glue Data Catalog), writes Glue-catalogued tables with pyiceberg, and grades a `fluree` binary against them; see its `README.md`.
 
 ### Schema Mismatch
 
-```json
-{
-  "error": "SchemaMismatchError",
-  "message": "Column 'order_date' not found in Iceberg table"
-}
-```
+Mapping a source compiles the R2RML mapping (a mapping that does not parse or compile is refused with HTTP `400`: `Failed to parse R2RML Turtle: …` or `Failed to compile R2RML mapping: …`), but does not check its table and column names against the tables. To check them before saving or querying, send the mapping to `POST {api_base_url}/iceberg/r2rml/validate` with the connection fields of [`/iceberg/map`](../api/endpoints.md#post-api_base_urlicebergmap) and the mapping as inline Turtle in `r2rml`. It is read-only and admin-protected, and answers `200` whether or not the mapping is sound: `compiled_ok` is `false` for a mapping that does not compile, and each entry of `diagnostics` has a `severity`, a `code`, and the `table`, `column` and `message` it concerns:
 
-**Solutions:**
-- Update R2RML mapping configuration (if the mapping references missing columns)
-- Verify table name and catalog
+| `code` | `severity` | `message` |
+|---|---|---|
+| `compileError` | `error` | `R2RML mapping failed to compile: …` |
+| `tableNotFound` | `error` | `Table 'sales.orders' referenced by TriplesMap <…> was not found in the live catalog schema.` When the catalog could not load the table, its reason follows in parentheses. |
+| `columnNotFound` | `error` | `Column 'order_date' referenced by the mapping does not exist in table 'sales.orders'.` |
+| `casingMismatch` | `warning` | `Column 'ORDER_DATE' does not match the live schema's casing; the schema spells it 'order_date'. Iceberg field names are case-sensitive — fix the casing to match.` |
+| `joinTypeMismatch` | `error` | `Join key type mismatch: child column '…' is … but parent column '…' is …; the join will never match.` |
+| `noSafeSubjectKey` | `warning` | `Subject-key column '…' is nullable (…); rows with a NULL value here produce no subject and are silently dropped. …` |
+
+Fix the names in the mapping to match the table (Iceberg column names are case-sensitive), or the table identifier and catalog when the table itself is not found.
+
+At query time a column the table does not have is read like a NULL: the triples it would supply are not produced, and a row whose subject template names it produces no subject, so the query returns fewer results instead of failing. Only when none of the columns a scan needs exist does the query fail, with HTTP `400` `err:db/InvalidQuery`: `None of the projected columns [...] exist in table schema. Available: [...]`.
 
 ### Slow Queries
 

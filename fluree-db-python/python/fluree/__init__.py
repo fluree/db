@@ -45,9 +45,11 @@ from fluree._sources import (
     AzureServicePrincipal,
     Bearer,
     EnvVar,
+    Glue,
     GraphSource,
     MaterializeResult,
     OAuth2,
+    S3Tables,
     Unity,
 )
 from fluree._terms import IRI, BlankNode, LangString, Literal, Vector
@@ -79,6 +81,7 @@ __all__ = [
     "EnvVar",
     "FlureeError",
     "FullText",
+    "Glue",
     "GraphSource",
     "IRI",
     "IndexStatus",
@@ -104,6 +107,7 @@ __all__ = [
     "RevertPreview",
     "RevertResult",
     "RowStream",
+    "S3Tables",
     "ShaclViolationError",
     "Snapshot",
     "SweepResult",

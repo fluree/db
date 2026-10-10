@@ -183,6 +183,36 @@ impl IcebergGsConfig {
         ))
     }
 
+    /// Checks shared by the native-AWS catalog modes (Glue, S3 Tables).
+    fn validate_aws_sdk_catalog(&self, mode: &str) -> Result<()> {
+        // Every table is named `<namespace>.<table>`; nothing derives from a path.
+        self.table_identifier()?;
+        // The catalog returns a metadata location only — never credentials — so
+        // a source that requires vended credentials could never be satisfied.
+        // Refuse it here, as Direct mode does, rather than read with the ambient
+        // identity the config said not to use.
+        if self.io.vended_credentials {
+            return Err(IcebergError::Config(format!(
+                "Vended credentials are not supported with the {mode} catalog — it reads S3 \
+                 with the ambient AWS credential chain; set io.vended_credentials = false"
+            )));
+        }
+        self.io.validate_s3_overrides()
+    }
+
+    /// The IO settings this source's S3 reads use. For the native-AWS catalog
+    /// modes (Glue, S3 Tables) `s3_region` falls back to the catalog's own
+    /// region — see [`IoConfig::with_catalog_region`]; every other mode reads
+    /// with `io` as configured.
+    pub fn storage_io(&self) -> std::borrow::Cow<'_, IoConfig> {
+        match self.catalog.aws_region() {
+            Some(region) if self.io.s3_region.is_none() => {
+                std::borrow::Cow::Owned(self.io.with_catalog_region(Some(region)))
+            }
+            _ => std::borrow::Cow::Borrowed(&self.io),
+        }
+    }
+
     /// Validate the configuration.
     pub fn validate(&self) -> Result<()> {
         match &self.catalog {
@@ -225,6 +255,14 @@ impl IcebergGsConfig {
                             .to_string(),
                     ));
                 }
+            }
+            CatalogConfig::Glue { .. } => {
+                self.catalog.validate_aws_sdk_catalog()?;
+                self.validate_aws_sdk_catalog("Glue")?;
+            }
+            CatalogConfig::S3Tables { .. } => {
+                self.catalog.validate_aws_sdk_catalog()?;
+                self.validate_aws_sdk_catalog("S3 Tables")?;
             }
         }
 
@@ -279,9 +317,124 @@ pub enum CatalogConfig {
         /// `metadata/` subdirectory with Iceberg metadata files.
         table_location: String,
     },
+
+    /// AWS Glue Data Catalog via the native AWS SDK (`aws-sdk-glue`).
+    ///
+    /// Resolves the table's `metadata_location` from Glue `GetTable`, then reads
+    /// metadata/manifests/data from S3 with the ambient AWS credential chain. The
+    /// Glue *database* is the table identifier's namespace. No REST/SigV4/vended
+    /// credentials are involved — the SDK signs its own calls.
+    Glue {
+        /// AWS region. Falls back to the SDK default chain / `io.s3_region` if `None`.
+        #[serde(default)]
+        region: Option<String>,
+        /// Glue catalog id for cross-account access (`None` = the caller's account).
+        #[serde(default)]
+        catalog_id: Option<String>,
+    },
+
+    /// AWS S3 Tables via the native AWS SDK (`aws-sdk-s3tables`).
+    ///
+    /// Resolves the table's metadata location from `GetTableMetadataLocation`,
+    /// then reads from the managed table bucket with the ambient AWS credential
+    /// chain.
+    S3Tables {
+        /// AWS region. Falls back to the SDK default chain / `io.s3_region` if `None`.
+        #[serde(default)]
+        region: Option<String>,
+        /// The S3 Tables table-bucket ARN
+        /// (`arn:aws:s3tables:<region>:<account>:bucket/<name>`).
+        table_bucket_arn: String,
+    },
 }
 
 impl CatalogConfig {
+    /// The region configured on a native-AWS catalog mode (Glue, S3 Tables);
+    /// `None` for REST and Direct, which call no AWS catalog API.
+    ///
+    /// An S3 Tables bucket ARN names its region, so S3 Tables falls back to it.
+    pub fn aws_region(&self) -> Option<&str> {
+        match self {
+            CatalogConfig::Glue { region, .. } => region.as_deref(),
+            CatalogConfig::S3Tables {
+                region,
+                table_bucket_arn,
+            } => region
+                .as_deref()
+                .or_else(|| s3tables_bucket_arn_region(table_bucket_arn).ok()),
+            CatalogConfig::Rest { .. } | CatalogConfig::Direct { .. } => None,
+        }
+    }
+
+    /// Validate a native-AWS catalog's own settings (Glue, S3 Tables): region
+    /// shape, a non-empty Glue catalog id, a well-formed S3 Tables bucket ARN
+    /// whose region agrees with `region`. No-op for REST and Direct. Shared by
+    /// [`IcebergGsConfig::validate`] and the onboarding (browse/preview) path,
+    /// which has a catalog but no table.
+    pub fn validate_aws_sdk_catalog(&self) -> Result<()> {
+        match self {
+            CatalogConfig::Glue { region, catalog_id } => {
+                validate_aws_region("catalog.region", region.as_deref())?;
+                if catalog_id.as_deref().is_some_and(|id| id.trim().is_empty()) {
+                    return Err(IcebergError::Config(
+                        "Glue catalog.catalog_id must not be empty (omit it for the caller's \
+                         account)"
+                            .to_string(),
+                    ));
+                }
+            }
+            CatalogConfig::S3Tables {
+                region,
+                table_bucket_arn,
+            } => {
+                validate_aws_region("catalog.region", region.as_deref())?;
+                let arn_region = s3tables_bucket_arn_region(table_bucket_arn)?;
+                // The bucket lives in the ARN's region; a different `region` could
+                // only send the catalog call to the wrong endpoint.
+                if let Some(region) = region.as_deref().filter(|r| *r != arn_region) {
+                    return Err(IcebergError::Config(format!(
+                        "S3Tables catalog.region '{region}' contradicts the table bucket ARN's \
+                         region '{arn_region}' (omit catalog.region to use the ARN's)"
+                    )));
+                }
+            }
+            CatalogConfig::Rest { .. } | CatalogConfig::Direct { .. } => {}
+        }
+        Ok(())
+    }
+
+    /// Whether this catalog can vend storage credentials. Only a REST catalog
+    /// can; Direct has no catalog, and Glue / S3 Tables return a metadata
+    /// location only, so their reads always use the ambient AWS identity.
+    pub fn vends_credentials(&self) -> bool {
+        matches!(self, CatalogConfig::Rest { .. })
+    }
+
+    /// A display label for the catalog in logs and errors: the REST URI, the
+    /// Glue catalog id (`aws-glue` for the caller's own account), the S3 Tables
+    /// bucket ARN, or the Direct table location.
+    pub fn catalog_label(&self) -> &str {
+        match self {
+            CatalogConfig::Rest { uri, .. } => uri,
+            CatalogConfig::Direct { table_location } => table_location,
+            CatalogConfig::Glue { catalog_id, .. } => catalog_id.as_deref().unwrap_or("aws-glue"),
+            CatalogConfig::S3Tables {
+                table_bucket_arn, ..
+            } => table_bucket_arn,
+        }
+    }
+
+    /// The region a native-AWS catalog's API is called in — see
+    /// [`aws_catalog_region`]. `None` for REST and Direct.
+    pub fn aws_catalog_region<'a>(&'a self, io: &'a IoConfig) -> Option<&'a str> {
+        match self {
+            CatalogConfig::Glue { .. } | CatalogConfig::S3Tables { .. } => {
+                aws_catalog_region(self.aws_region(), io)
+            }
+            CatalogConfig::Rest { .. } | CatalogConfig::Direct { .. } => None,
+        }
+    }
+
     /// Create a REST catalog config with common defaults.
     pub fn rest(uri: impl Into<String>) -> Self {
         CatalogConfig::Rest {
@@ -304,6 +457,19 @@ impl CatalogConfig {
         }
         CatalogConfig::Direct {
             table_location: loc,
+        }
+    }
+
+    /// Create an AWS Glue Data Catalog config.
+    pub fn glue(region: Option<String>, catalog_id: Option<String>) -> Self {
+        CatalogConfig::Glue { region, catalog_id }
+    }
+
+    /// Create an AWS S3 Tables catalog config from a table-bucket ARN.
+    pub fn s3_tables(region: Option<String>, table_bucket_arn: impl Into<String>) -> Self {
+        CatalogConfig::S3Tables {
+            region,
+            table_bucket_arn: table_bucket_arn.into(),
         }
     }
 }
@@ -339,6 +505,17 @@ enum TaggedCatalogConfig {
     },
     Direct {
         table_location: String,
+    },
+    Glue {
+        #[serde(default)]
+        region: Option<String>,
+        #[serde(default)]
+        catalog_id: Option<String>,
+    },
+    S3Tables {
+        #[serde(default)]
+        region: Option<String>,
+        table_bucket_arn: String,
     },
 }
 
@@ -381,6 +558,16 @@ impl From<CatalogConfigHelper> for CatalogConfig {
             CatalogConfigHelper::Tagged(TaggedCatalogConfig::Direct { table_location }) => {
                 CatalogConfig::Direct { table_location }
             }
+            CatalogConfigHelper::Tagged(TaggedCatalogConfig::Glue { region, catalog_id }) => {
+                CatalogConfig::Glue { region, catalog_id }
+            }
+            CatalogConfigHelper::Tagged(TaggedCatalogConfig::S3Tables {
+                region,
+                table_bucket_arn,
+            }) => CatalogConfig::S3Tables {
+                region,
+                table_bucket_arn,
+            },
         }
     }
 }
@@ -402,6 +589,16 @@ impl From<CatalogConfig> for CatalogConfigHelper {
             CatalogConfig::Direct { table_location } => {
                 CatalogConfigHelper::Tagged(TaggedCatalogConfig::Direct { table_location })
             }
+            CatalogConfig::Glue { region, catalog_id } => {
+                CatalogConfigHelper::Tagged(TaggedCatalogConfig::Glue { region, catalog_id })
+            }
+            CatalogConfig::S3Tables {
+                region,
+                table_bucket_arn,
+            } => CatalogConfigHelper::Tagged(TaggedCatalogConfig::S3Tables {
+                region,
+                table_bucket_arn,
+            }),
         }
     }
 }
@@ -455,6 +652,103 @@ impl Default for IoConfig {
             s3_endpoint: None,
             s3_path_style: false,
         }
+    }
+}
+
+impl IoConfig {
+    /// These settings with `s3_region` falling back to a native-AWS catalog's
+    /// region: a lake's catalog and its data normally share a region, so a user
+    /// who names only the catalog's region still reads S3 there. An explicit
+    /// `s3_region` wins — the data may live in another region than the catalog.
+    pub fn with_catalog_region(&self, catalog_region: Option<&str>) -> IoConfig {
+        IoConfig {
+            s3_region: self
+                .s3_region
+                .clone()
+                .or_else(|| catalog_region.map(str::to_string)),
+            ..self.clone()
+        }
+    }
+
+    /// Validate the S3 overrides that end up in an SDK endpoint: the region's
+    /// shape (it becomes part of a hostname) and the endpoint's SSRF guard.
+    pub fn validate_s3_overrides(&self) -> Result<()> {
+        validate_aws_region("io.s3_region", self.s3_region.as_deref())?;
+        if let Some(endpoint) = self.s3_endpoint.as_deref() {
+            crate::net::validate_s3_endpoint(endpoint)?;
+        }
+        Ok(())
+    }
+}
+
+/// The table identifier a catalog-mode source (rest, glue, s3tables) records
+/// when ALL its tables come from its R2RML mapping (each `rr:tableName` names
+/// one). It satisfies the `namespace.table` shape the config requires and is
+/// never loaded; anything that lists a mapped source's tables skips it.
+pub const MAPPING_DEFINED_TABLE: &str = "default.default";
+
+/// The region a native-AWS catalog's API (Glue `GetTable`, S3 Tables
+/// `GetTableMetadataLocation`) is called in: the mode's own `region`, else
+/// `io.s3_region` (the same region the data reads use), else `None`, which
+/// defers to the AWS SDK's region chain (`AWS_REGION`, profile, IMDS).
+///
+/// The one resolution both the query path and the browse/preview path use, so
+/// the catalog call and the S3 reads cannot disagree about a region the user
+/// gave only once.
+pub fn aws_catalog_region<'a>(mode_region: Option<&'a str>, io: &'a IoConfig) -> Option<&'a str> {
+    mode_region.or(io.s3_region.as_deref())
+}
+
+/// The region of an S3 Tables table-bucket ARN,
+/// `arn:<partition>:s3tables:<region>:<account-id>:bucket/<name>`, or a config
+/// error naming what is wrong with it. Accepts every AWS partition (`aws`,
+/// `aws-cn`, `aws-us-gov`).
+pub fn s3tables_bucket_arn_region(arn: &str) -> Result<&str> {
+    let invalid = |why: &str| {
+        IcebergError::Config(format!(
+            "S3Tables table_bucket_arn must be an S3 Tables bucket ARN \
+             (arn:aws:s3tables:<region>:<account-id>:bucket/<name>); {why}: {arn}"
+        ))
+    };
+    let parts: Vec<&str> = arn.splitn(6, ':').collect();
+    let [prefix, partition, service, region, account, resource] = parts.as_slice() else {
+        return Err(invalid("it has too few ':'-separated parts"));
+    };
+    if *prefix != "arn" || !partition.starts_with("aws") || *service != "s3tables" {
+        return Err(invalid("it is not an s3tables ARN"));
+    }
+    if account.len() != 12 || !account.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid("the account id is not 12 digits"));
+    }
+    if resource.strip_prefix("bucket/").is_none_or(str::is_empty) {
+        return Err(invalid("the resource is not bucket/<name>"));
+    }
+    validate_aws_region("table_bucket_arn region", Some(region))?;
+    Ok(region)
+}
+
+/// Refuse a region that is not shaped like an AWS region (`us-east-1`,
+/// `us-gov-west-1`, `cn-north-1`). The AWS SDK interpolates the region into the
+/// service hostname (`glue.<region>.amazonaws.com`), so a value carrying `.`,
+/// `/` or `:` would point a signed request at another host.
+pub fn validate_aws_region(field: &str, region: Option<&str>) -> Result<()> {
+    let Some(region) = region else {
+        return Ok(());
+    };
+    let well_formed = !region.is_empty()
+        && region.len() <= 32
+        && region.split('-').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        });
+    if well_formed {
+        Ok(())
+    } else {
+        Err(IcebergError::Config(format!(
+            "{field} '{region}' is not an AWS region (expected e.g. us-east-1)"
+        )))
     }
 }
 
@@ -596,6 +890,230 @@ mod tests {
         let table_id = config.table_identifier().unwrap();
         assert_eq!(table_id.namespace, "ns");
         assert_eq!(table_id.table, "table");
+    }
+
+    // ── AWS Glue / S3 Tables ──
+
+    const S3TABLES_ARN: &str = "arn:aws:s3tables:us-east-1:123456789012:bucket/demo";
+
+    /// A Glue / S3 Tables source as the API builds one: vended credentials off.
+    fn aws_sdk_config(catalog: CatalogConfig, table: &str) -> IcebergGsConfig {
+        IcebergGsConfig {
+            catalog,
+            table: TableConfig::Identifier(table.to_string()),
+            io: IoConfig {
+                vended_credentials: false,
+                ..Default::default()
+            },
+            mapping: None,
+            delete: None,
+            order_by: None,
+            model: None,
+            default_allow: None,
+        }
+    }
+
+    #[test]
+    fn test_parse_tagged_glue_config() {
+        let json = r#"{
+            "catalog": { "type": "glue", "region": "us-east-1" },
+            "table": "sales.orders",
+            "io": { "vended_credentials": false }
+        }"#;
+        let config: IcebergGsConfig = serde_json::from_str(json).unwrap();
+        match &config.catalog {
+            CatalogConfig::Glue { region, catalog_id } => {
+                assert_eq!(region, &Some("us-east-1".to_string()));
+                assert_eq!(catalog_id, &None);
+            }
+            other => panic!("Expected Glue variant, got {other:?}"),
+        }
+        let table_id = config.table_identifier().unwrap();
+        assert_eq!(table_id.namespace, "sales");
+        assert_eq!(table_id.table, "orders");
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_parse_tagged_s3tables_config() {
+        let json = format!(
+            r#"{{
+            "catalog": {{ "type": "s3tables", "region": "us-east-1", "table_bucket_arn": "{S3TABLES_ARN}" }},
+            "table": "sales.orders",
+            "io": {{ "vended_credentials": false }}
+        }}"#
+        );
+        let config: IcebergGsConfig = serde_json::from_str(&json).unwrap();
+        match &config.catalog {
+            CatalogConfig::S3Tables {
+                region,
+                table_bucket_arn,
+            } => {
+                assert_eq!(region, &Some("us-east-1".to_string()));
+                assert_eq!(table_bucket_arn, S3TABLES_ARN);
+            }
+            other => panic!("Expected S3Tables variant, got {other:?}"),
+        }
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_aws_sdk_configs_roundtrip_with_their_tags() {
+        for (catalog, tag) in [
+            (CatalogConfig::glue(Some("us-east-1".into()), None), "glue"),
+            (CatalogConfig::s3_tables(None, S3TABLES_ARN), "s3tables"),
+        ] {
+            let config = aws_sdk_config(catalog.clone(), "sales.orders");
+            let json = config.to_json().unwrap();
+            assert!(json.contains(&format!("\"type\":\"{tag}\"")), "{json}");
+            assert_eq!(IcebergGsConfig::from_json(&json).unwrap().catalog, catalog);
+        }
+    }
+
+    #[test]
+    fn test_validate_aws_sdk_catalogs() {
+        let glue = || CatalogConfig::glue(Some("us-east-1".into()), None);
+        aws_sdk_config(glue(), "sales.orders").validate().unwrap();
+
+        // The table identifier must be `namespace.table`.
+        assert!(aws_sdk_config(glue(), "").validate().is_err());
+        // An S3 Tables source needs a table-bucket ARN.
+        let err = aws_sdk_config(CatalogConfig::s3_tables(None, "not-an-arn"), "ns.t")
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("ARN"), "{err}");
+        // An empty catalog id is refused rather than sent to Glue.
+        let err = aws_sdk_config(CatalogConfig::glue(None, Some(" ".into())), "ns.t")
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("catalog_id"), "{err}");
+    }
+
+    #[test]
+    fn test_aws_sdk_catalogs_refuse_vended_credentials() {
+        // Neither catalog vends: a source that requires vended credentials could
+        // only be served by the ambient identity it asked not to use.
+        for catalog in [
+            CatalogConfig::glue(None, None),
+            CatalogConfig::s3_tables(None, S3TABLES_ARN),
+        ] {
+            let mut config = aws_sdk_config(catalog, "sales.orders");
+            config.io.vended_credentials = true;
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("Vended credentials are not supported"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_aws_regions_must_be_region_shaped() {
+        // The SDK puts the region into the service hostname, so anything that is
+        // not a plain region label is refused before a client is built.
+        for bad in [
+            "evil.com",
+            "us-east-1.evil.com",
+            "x/y",
+            "us-east-1:443",
+            "US-EAST-1",
+            "",
+            "-",
+        ] {
+            let config = aws_sdk_config(CatalogConfig::glue(Some(bad.into()), None), "ns.t");
+            assert!(config.validate().is_err(), "region {bad:?} must be refused");
+            let mut io_bad = aws_sdk_config(CatalogConfig::glue(None, None), "ns.t");
+            io_bad.io.s3_region = Some(bad.into());
+            assert!(
+                io_bad.validate().is_err(),
+                "s3_region {bad:?} must be refused"
+            );
+        }
+        for good in ["us-east-1", "eu-central-2", "us-gov-west-1", "cn-north-1"] {
+            validate_aws_region("region", Some(good)).unwrap();
+        }
+        validate_aws_region("region", None).unwrap();
+    }
+
+    #[test]
+    fn test_s3tables_bucket_arn_is_parsed_and_names_the_region() {
+        assert_eq!(
+            s3tables_bucket_arn_region(S3TABLES_ARN).unwrap(),
+            "us-east-1"
+        );
+        assert_eq!(
+            s3tables_bucket_arn_region("arn:aws-cn:s3tables:cn-north-1:123456789012:bucket/b")
+                .unwrap(),
+            "cn-north-1"
+        );
+        for bad in [
+            "not-an-arn",
+            "arn:aws:s3:us-east-1:123456789012:bucket/b",
+            "arn:aws:s3tables:us-east-1:1234:bucket/b",
+            "arn:aws:s3tables:us-east-1:123456789012:table/b",
+            "arn:aws:s3tables:us-east-1:123456789012:bucket/",
+            "arn:aws:s3tables:evil.com:123456789012:bucket/b",
+        ] {
+            assert!(
+                s3tables_bucket_arn_region(bad).is_err(),
+                "{bad} must be refused"
+            );
+        }
+
+        // With no catalog.region the ARN's region is the catalog's region...
+        let arn_only = CatalogConfig::s3_tables(None, S3TABLES_ARN);
+        assert_eq!(arn_only.aws_region(), Some("us-east-1"));
+        assert_eq!(
+            aws_sdk_config(arn_only, "ns.t")
+                .storage_io()
+                .s3_region
+                .as_deref(),
+            Some("us-east-1")
+        );
+        // ...and a region that contradicts the ARN is refused.
+        let err = aws_sdk_config(
+            CatalogConfig::s3_tables(Some("eu-west-1".into()), S3TABLES_ARN),
+            "ns.t",
+        )
+        .validate()
+        .unwrap_err();
+        assert!(err.to_string().contains("contradicts"), "{err}");
+    }
+
+    #[test]
+    fn test_aws_region_resolution_falls_back_both_ways() {
+        let io_with = |s3_region: Option<&str>| IoConfig {
+            vended_credentials: false,
+            s3_region: s3_region.map(str::to_string),
+            ..Default::default()
+        };
+        // Catalog call: the mode's region, else io.s3_region, else the SDK chain.
+        let glue = CatalogConfig::glue(Some("us-west-2".into()), None);
+        assert_eq!(
+            glue.aws_catalog_region(&io_with(Some("eu-west-1"))),
+            Some("us-west-2")
+        );
+        let glue_bare = CatalogConfig::glue(None, None);
+        assert_eq!(
+            glue_bare.aws_catalog_region(&io_with(Some("eu-west-1"))),
+            Some("eu-west-1")
+        );
+        assert_eq!(glue_bare.aws_catalog_region(&io_with(None)), None);
+        // REST / Direct call no AWS catalog API.
+        assert_eq!(
+            CatalogConfig::rest("https://c").aws_catalog_region(&io_with(Some("x"))),
+            None
+        );
+
+        // S3 reads: an explicit s3_region wins (data may live elsewhere), else the
+        // catalog's region.
+        let mut config = aws_sdk_config(glue, "ns.t");
+        assert_eq!(config.storage_io().s3_region.as_deref(), Some("us-west-2"));
+        config.io.s3_region = Some("eu-west-1".into());
+        assert_eq!(config.storage_io().s3_region.as_deref(), Some("eu-west-1"));
+        // Other modes read with io as configured.
+        let rest = aws_sdk_config(CatalogConfig::rest("https://c"), "ns.t");
+        assert_eq!(rest.storage_io().s3_region, None);
     }
 
     // ── Validation ──

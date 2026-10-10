@@ -15,7 +15,7 @@
 //!
 //! The provider's own table scan mirrors the catalog/storage/plan/read drive of
 //! the WP-DB2 sampler ([`sample_iceberg_rows`](super::iceberg_sample)): it reuses
-//! the shared [`rest_catalog_client`] + [`build_preview_storage`] helpers and the
+//! the shared [`catalog_client`] + [`build_preview_storage`] helpers and the
 //! `SendScanPlanner` + `read_task` primitives, but streams **all** of a table's
 //! data files (not a bounded first-row-group peek). It deliberately does NOT call
 //! [`FlureeR2rmlProvider::scan_table`](super::r2rml) — that method resolves its
@@ -29,14 +29,15 @@
 //! property filters. The wildcard "View Instances" crawl (which regroups a flat
 //! scan into per-subject JSON-LD documents) lives in [`super::crawl`] and is left
 //! to the persisted path; serving it over an ephemeral mapping would be a future
-//! extension. REST catalogs only (Direct mode returns the shared
-//! [`rest_catalog_client`] typed error) — mirroring the sampler's own scope.
+//! extension. Catalog modes only — REST, AWS Glue, AWS S3 Tables (Direct mode
+//! returns the shared [`catalog_client`] typed error) — mirroring the sampler's
+//! own scope.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use fluree_db_iceberg::catalog::{parse_table_identifier, RestCatalogClient, SendCatalogClient};
+use fluree_db_iceberg::catalog::{parse_table_identifier, SendCatalogClient};
 use fluree_db_iceberg::io::{ColumnBatch, SendIcebergStorage, SendParquetReader};
 use fluree_db_iceberg::metadata::TableMetadata;
 use fluree_db_iceberg::scan::{ScanConfig, SendScanPlanner};
@@ -47,7 +48,7 @@ use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use futures::StreamExt;
 
 use crate::graph_source::config::IcebergConnectionConfig;
-use crate::graph_source::iceberg_catalog::{build_preview_storage, rest_catalog_client};
+use crate::graph_source::iceberg_catalog::{build_preview_storage, catalog_client};
 use crate::view::{GraphDb, QueryInput};
 use crate::{QueryExecutionOptions, Result};
 
@@ -69,9 +70,9 @@ const PROVISIONAL_GS_ID: &str = "provisional:main";
 pub(crate) struct EphemeralR2rmlProvider {
     /// Iceberg connection (catalog mode + IO) the scan resolves storage from.
     conn: IcebergConnectionConfig,
-    /// REST catalog client, built once for the whole query so a multi-table join
+    /// Catalog client, built once for the whole query so a multi-table join
     /// does one OAuth exchange, not one per table.
-    catalog: Arc<RestCatalogClient>,
+    catalog: Arc<dyn SendCatalogClient>,
     /// The candidate mapping under test, returned to the operator verbatim.
     mapping: Arc<CompiledR2rmlMapping>,
 }
@@ -105,7 +106,7 @@ impl EphemeralR2rmlProvider {
             ))
         })?;
 
-        // Load table metadata via the shared REST catalog client.
+        // Load table metadata via the shared catalog client.
         let load = SendCatalogClient::load_table(
             self.catalog.as_ref(),
             &table_id,
@@ -113,9 +114,10 @@ impl EphemeralR2rmlProvider {
         )
         .await
         .map_err(|e| {
-            QueryError::Internal(format!(
-                "Failed to load table '{table_name}' from catalog: {e}"
-            ))
+            crate::graph_source::iceberg_catalog::storage_query_error(
+                &format!("Failed to load table '{table_name}' from catalog"),
+                e,
+            )
         })?;
 
         // Build S3 storage exactly as the preview/sample paths do: vended creds
@@ -295,13 +297,13 @@ impl crate::Fluree {
                 crate::ApiError::config(format!("Failed to compile provisional R2RML mapping: {e}"))
             })?;
 
-        // Build the REST catalog client once (Direct mode fails fast with the
+        // Build the catalog client once (Direct mode fails fast with the
         // shared typed error). Reused across every table scan in this query.
-        let (catalog, _uri, _warehouse) = rest_catalog_client(&conn, "provisional R2RML query")?;
+        let (catalog, _uri, _warehouse) = catalog_client(&conn, "provisional R2RML query").await?;
 
         let provider = EphemeralR2rmlProvider {
             conn,
-            catalog: Arc::new(catalog),
+            catalog,
             mapping: Arc::new(compiled),
         };
 
