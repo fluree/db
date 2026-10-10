@@ -17,11 +17,12 @@
 use crate::wasm_compat::memmap2;
 use std::io;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use fluree_db_core::ContentId;
 
-use crate::format::column_block::{ColumnBlockRef, ColumnId};
+use crate::format::column_block::{ColumnBlockRef, ColumnId, COLUMN_BLOCK_REF_SIZE};
 use crate::format::history_sidecar::{decode_history_segment, HistEntryV2, HistorySegmentRef};
 use crate::format::leaf::{
     decode_leaf_dir_v3_with_base, decode_leaf_header_v3, DecodedLeafDirV3, LeafletDirEntryV3,
@@ -365,7 +366,16 @@ pub struct RangeReadLeafHandle {
     fetcher: Arc<dyn RangeReadFetcher>,
     /// CID for the history sidecar, if one exists.
     sidecar_cid: Option<ContentId>,
+    /// Leaflet loads served by range reads so far.
+    range_loads: AtomicUsize,
+    /// The whole leaf, once this handle has seen a scan.
+    whole: OnceLock<Vec<u8>>,
 }
+
+/// Range-read leaflet loads one handle serves before it fetches the rest of
+/// the leaf in one request. A point read touches one or two leaflets; past
+/// that a remote store's per-request latency outweighs the extra bytes.
+const SCAN_WHOLE_LEAF_AFTER: usize = 3;
 
 /// Gap threshold for coalescing adjacent range reads (bytes).
 /// If two column blocks are within this many bytes of each other,
@@ -393,7 +403,33 @@ impl RangeReadLeafHandle {
             leaf_id,
             fetcher,
             sidecar_cid,
+            range_loads: AtomicUsize::new(0),
+            whole: OnceLock::new(),
         }
+    }
+
+    /// The whole leaf once the access pattern turns into a scan: fetched in
+    /// one request after `SCAN_WHOLE_LEAF_AFTER` range-read leaflet loads,
+    /// while leaflets remain to be read.
+    fn whole_for_scan(&self, leaflet_idx: usize) -> io::Result<Option<&[u8]>> {
+        if let Some(bytes) = self.whole.get() {
+            return Ok(Some(bytes));
+        }
+        let loads = self.range_loads.fetch_add(1, Ordering::Relaxed) + 1;
+        if loads <= SCAN_WHOLE_LEAF_AFTER || leaflet_idx + 1 >= self.dir.entries.len() {
+            return Ok(None);
+        }
+        let payload_end = self
+            .dir
+            .entries
+            .iter()
+            .map(|e| e.payload_offset as u64 + e.payload_len as u64)
+            .max()
+            .unwrap_or(0);
+        let bytes = self
+            .fetcher
+            .fetch_range(&self.leaf_cid, 0..self.payload_base + payload_end)?;
+        Ok(Some(self.whole.get_or_init(|| bytes)))
     }
 
     /// Compute the absolute byte range for a column block within the leaf blob.
@@ -488,7 +524,7 @@ impl LeafHandle for RangeReadLeafHandle {
         &self,
         leaflet_idx: usize,
         projection: &ColumnProjection,
-        _order: RunSortOrder,
+        order: RunSortOrder,
     ) -> io::Result<ColumnBatch> {
         use super::column_types::ColumnData;
         use crate::format::column_block::{
@@ -496,6 +532,9 @@ impl LeafHandle for RangeReadLeafHandle {
         };
 
         let entry = &self.dir.entries[leaflet_idx];
+        if let Some(bytes) = self.whole_for_scan(leaflet_idx)? {
+            return load_leaflet_columns(bytes, entry, self.dir.payload_base, projection, order);
+        }
         let row_count = entry.row_count as usize;
         let eff = projection.effective();
 
@@ -756,51 +795,36 @@ impl LeafHandle for RangeReadLeafHandle {
 // Helper: fetch header + directory from remote leaf
 // ============================================================================
 
+/// Speculative first read: the header plus a directory of up to ~330
+/// six-column leaflets in one request. Remote stores are latency-bound, so
+/// over-reading a small leaf's payload costs nothing next to a second trip.
+const SPECULATIVE_HEADER_DIR_BYTES: u64 = 64 * 1024;
+
+/// Largest directory entry: 80 fixed + 6 column refs + 20 history bytes.
+const MAX_DIR_ENTRY_BYTES: u64 = 80 + 6 * COLUMN_BLOCK_REF_SIZE as u64 + 20;
+
 /// Fetch enough of a V3 leaf blob to decode the header and full directory.
 ///
-/// Strategy:
-/// 1. Fetch the first 72 bytes (header) to get `leaflet_count`.
-/// 2. Estimate directory size as `leaflet_count * 120` (generous).
-/// 3. Fetch `0..(72 + estimated_dir_size)` in one request.
-/// 4. If the directory extends beyond the fetched bytes, fetch the remainder.
+/// One speculative request covers the header and most directories; a
+/// directory that outgrows it is fetched once more at its exact upper bound
+/// (`leaflet_count` × the largest entry).
 ///
-/// Returns the parsed directory, payload base offset, and leaf_id.
+/// Returns the parsed directory and payload base offset.
 pub fn fetch_header_and_directory(
     fetcher: &dyn RangeReadFetcher,
     leaf_cid: &ContentId,
 ) -> io::Result<(DecodedLeafDirV3, u64)> {
-    // Step 1: fetch header to learn leaflet_count.
-    let header_bytes = fetcher.fetch_range(leaf_cid, 0..LEAF_V3_HEADER_SIZE as u64)?;
-    let header = decode_leaf_header_v3(&header_bytes)?;
-
-    // Step 2: estimate total header+directory size and fetch.
-    let estimated_dir_size = header.leaflet_count as u64 * 120;
-    let estimated_total = LEAF_V3_HEADER_SIZE as u64 + estimated_dir_size;
-    let full_header_dir = fetcher.fetch_range(leaf_cid, 0..estimated_total)?;
-
-    // Step 3: try to parse directory. If we fetched enough, this succeeds.
-    // On failure, double the estimate up to 3 times (covers up to ~960 bytes
-    // per leaflet, far beyond any realistic directory entry size).
-    let mut buf = full_header_dir;
-    let mut parsed: Option<DecodedLeafDirV3> = None;
-    for _ in 0..3 {
-        match decode_leaf_dir_v3_with_base(&buf, &header) {
-            Ok(dir) => {
-                parsed = Some(dir);
-                break;
-            }
-            Err(_) => {
-                // Directory was larger than estimated — double and retry.
-                let next_size = (buf.len() as u64) * 2;
-                buf = fetcher.fetch_range(leaf_cid, 0..next_size)?;
-            }
-        }
+    let mut buf = fetcher.fetch_range(leaf_cid, 0..SPECULATIVE_HEADER_DIR_BYTES)?;
+    let header = decode_leaf_header_v3(&buf)?;
+    if let Ok(dir) = decode_leaf_dir_v3_with_base(&buf, &header) {
+        let payload_base = dir.payload_base as u64;
+        return Ok((dir, payload_base));
     }
-    // Final attempt after tripling the budget.
-    let dir = match parsed {
-        Some(dir) => dir,
-        None => decode_leaf_dir_v3_with_base(&buf, &header)?,
-    };
+    let upper = LEAF_V3_HEADER_SIZE as u64 + header.leaflet_count as u64 * MAX_DIR_ENTRY_BYTES;
+    if upper > buf.len() as u64 {
+        buf = fetcher.fetch_range(leaf_cid, 0..upper)?;
+    }
+    let dir = decode_leaf_dir_v3_with_base(&buf, &header)?;
     let payload_base = dir.payload_base as u64;
     Ok((dir, payload_base))
 }
@@ -1148,5 +1172,76 @@ mod tests {
             assert_eq!(f.t, r.t);
             assert_eq!(f.op, r.op);
         }
+    }
+
+    /// One request covers header + directory for a typical leaf; a directory
+    /// past the speculative window costs exactly one more.
+    #[test]
+    fn header_and_directory_request_count() {
+        fn leaf_with_leaflets(n: u64) -> (Vec<u8>, ContentId) {
+            let mut writer = LeafWriter::new(RunSortOrder::Post, 1, 100_000, 1);
+            writer.set_skip_history(true);
+            let ot = OType::XSD_INTEGER.as_u16();
+            for i in 0..n {
+                writer.push_record(make_rec(i + 1, 1, ot, i, 1)).unwrap();
+            }
+            let leaf = writer.finish().unwrap().remove(0);
+            (leaf.leaf_bytes, leaf.leaf_cid)
+        }
+        for (leaflets, want_requests) in [(5, 1), (800, 2)] {
+            let (bytes, cid) = leaf_with_leaflets(leaflets);
+            let mut fetcher = MockFetcher::new();
+            fetcher.insert(&cid, bytes);
+            let (dir, _) = fetch_header_and_directory(&fetcher, &cid).unwrap();
+            assert_eq!(dir.entries.len() as u64, leaflets);
+            assert_eq!(
+                fetcher.request_count(),
+                want_requests,
+                "{leaflets} leaflets"
+            );
+        }
+    }
+
+    /// A scan over a range-read leaf switches to one whole-leaf fetch after
+    /// `SCAN_WHOLE_LEAF_AFTER` leaflets, and decodes the same rows.
+    #[test]
+    fn range_read_scan_fetches_whole_leaf_once() {
+        let mut writer = LeafWriter::new(RunSortOrder::Post, 4, 100_000, 1);
+        writer.set_skip_history(true);
+        let ot = OType::XSD_INTEGER.as_u16();
+        for i in 0..80u64 {
+            writer.push_record(make_rec(i + 1, 1, ot, i, 1)).unwrap();
+        }
+        let leaf = writer.finish().unwrap().remove(0);
+        let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf.leaf_cid.to_bytes().as_ref());
+        let full = FullBlobLeafHandle::new(leaf.leaf_bytes.clone(), None, leaf_id).unwrap();
+
+        let mut fetcher = MockFetcher::new();
+        fetcher.insert(&leaf.leaf_cid, leaf.leaf_bytes);
+        let fetcher = Arc::new(fetcher);
+        let (dir, payload_base) =
+            fetch_header_and_directory(fetcher.as_ref(), &leaf.leaf_cid).unwrap();
+        let leaflets = dir.entries.len();
+        assert_eq!(leaflets, 20);
+        let handle = RangeReadLeafHandle::new(
+            leaf.leaf_cid,
+            dir,
+            payload_base,
+            leaf_id,
+            Arc::clone(&fetcher) as Arc<dyn RangeReadFetcher>,
+            None,
+        );
+        let proj = ColumnProjection::all();
+        for i in 0..leaflets {
+            let got = handle.load_columns(i, &proj, RunSortOrder::Post).unwrap();
+            let want = full.load_columns(i, &proj, RunSortOrder::Post).unwrap();
+            assert_eq!(got.row_count, want.row_count);
+            for r in 0..got.row_count {
+                assert_eq!(got.s_id.get(r), want.s_id.get(r));
+                assert_eq!(got.o_key.get(r), want.o_key.get(r));
+            }
+        }
+        // directory + SCAN_WHOLE_LEAF_AFTER range reads + one whole-leaf read
+        assert_eq!(fetcher.request_count(), 1 + SCAN_WHOLE_LEAF_AFTER + 1);
     }
 }
