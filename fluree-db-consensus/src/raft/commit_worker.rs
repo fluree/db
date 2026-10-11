@@ -911,7 +911,7 @@ impl Worker {
                             ))
                         }
                     })?;
-                    out.push(Base64Bytes(bytes));
+                    out.push(Base64Bytes(bytes.into_vec()));
                 }
                 Ok::<_, WorkerError>(out)
             }

@@ -1083,9 +1083,9 @@ async fn merged_history_push() -> fluree_db_api::PushCommitsRequest {
                 let txn_bytes = store.get(txn).await.unwrap();
                 request
                     .blobs
-                    .insert(txn.to_string(), Base64Bytes(txn_bytes));
+                    .insert(txn.to_string(), Base64Bytes(txn_bytes.into_vec()));
             }
-            out.push(Base64Bytes(bytes));
+            out.push(Base64Bytes(bytes.into_vec()));
         }
     }
     request
