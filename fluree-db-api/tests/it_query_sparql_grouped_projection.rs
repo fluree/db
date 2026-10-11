@@ -1217,6 +1217,46 @@ async fn exists_body_variables_are_free_over_the_group_row() {
     }
 }
 
+/// A grouped ASK counts every solution: its boolean result cannot see
+/// duplicates, but HAVING's aggregates can, so the WHERE keeps them. e1 has two
+/// tags besides its area, so `?e ?p ?o` gives Net five rows (e1 three times) and
+/// the whole graph eight.
+#[tokio::test]
+async fn grouped_ask_counts_every_solution() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "grouped-projection/ask-fan-out:main").await;
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:e1",
+                "ex:tag": ["x", "y"]
+            }),
+        )
+        .await
+        .expect("tags")
+        .ledger;
+    for (body, expected) in [
+        (
+            "ASK { ?e ex:area ?a . ?e ?p ?o } GROUP BY ?a HAVING (COUNT(?e) > 4)",
+            true,
+        ),
+        (
+            "ASK { ?e ex:area ?a . ?e ?p ?o } GROUP BY ?a HAVING (COUNT(?e) > 5)",
+            false,
+        ),
+        ("ASK { ?e ?p ?o } HAVING (COUNT(*) > 7)", true),
+        ("ASK { ?e ?p ?o } HAVING (COUNT(*) > 8)", false),
+    ] {
+        let answer = run(&fluree, &ledger, body)
+            .await
+            .to_jsonld(&ledger.snapshot)
+            .expect("to_jsonld");
+        assert_eq!(answer, json!(expected), "{body}");
+    }
+}
+
 /// The equijoin fold (`FILTER(?e = ?f)` → one variable) keeps `?f` free in an
 /// EXISTS body over the group row: `?f` is not a key, so renaming it to the key
 /// `?e` there would correlate the body with each group. Each folded query is

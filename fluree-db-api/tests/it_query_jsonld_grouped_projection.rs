@@ -708,6 +708,44 @@ async fn jsonld_ask_groups() {
     }
 }
 
+/// A grouped `ask` counts every solution (the SPARQL twin is
+/// `grouped_ask_counts_every_solution`): e1 has two tags besides its area, so
+/// Net has five `?e ?p ?o` rows and the whole graph eight.
+#[tokio::test]
+async fn jsonld_grouped_ask_counts_every_solution() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "jsonld-grouped/ask-fan-out:main").await;
+    let ctx = json!({"ex": "http://example.org/"});
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({"@context": ctx, "@id": "ex:e1", "ex:tag": ["x", "y"]}),
+        )
+        .await
+        .expect("tags")
+        .ledger;
+    let by_area = json!([{"@id": "?e", "ex:area": "?a"}, {"@id": "?e", "?p": "?o"}]);
+    let every = json!({"@id": "?e", "?p": "?o"});
+    for (ask, group_by, having, expected) in [
+        (&by_area, Some(json!(["?a"])), "(> (count ?e) 4)", true),
+        (&by_area, Some(json!(["?a"])), "(> (count ?e) 5)", false),
+        (&every, None, "(> (count ?o) 7)", true),
+        (&every, None, "(> (count ?o) 8)", false),
+    ] {
+        let mut query = json!({"@context": ctx, "ask": ask, "having": having});
+        if let Some(group_by) = group_by {
+            query["groupBy"] = group_by;
+        }
+        let answer = support::query_jsonld(&fluree, &ledger, &query)
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{query}"))
+            .to_jsonld_async(ledger.as_graph_db_ref(0))
+            .await
+            .expect("to_jsonld_async");
+        assert_eq!(answer, JsonValue::Bool(expected), "{query}");
+    }
+}
+
 /// `groupBy` / `having` group a `construct`: the template is instantiated once
 /// per group, and a template variable that is not a key is unbound in the group
 /// solution, so its triples are skipped (the SPARQL CONSTRUCT twin is
