@@ -97,10 +97,12 @@ pub fn substitute_params(ast: &mut SparqlAst, params: &ParamMap) -> Result<()> {
             }
             subst.pattern(&mut q.where_clause.pattern)?;
             subst.modifiers(&mut q.modifiers, &[])?;
+            subst.trailing_values(q.values.as_deref_mut())?;
         }
         QueryBody::Ask(q) => {
             subst.pattern(&mut q.where_clause.pattern)?;
             subst.modifiers(&mut q.modifiers, &[])?;
+            subst.trailing_values(q.values.as_deref_mut())?;
         }
         QueryBody::Describe(q) => {
             if let DescribeTarget::Resources(resources) = &mut q.target {
@@ -116,6 +118,7 @@ pub fn substitute_params(ast: &mut SparqlAst, params: &ParamMap) -> Result<()> {
                 subst.pattern(&mut where_clause.pattern)?;
             }
             subst.modifiers(&mut q.modifiers, &[])?;
+            subst.trailing_values(q.values.as_deref_mut())?;
         }
         QueryBody::Update(request) => {
             for op in &mut request.operations {
@@ -628,10 +631,16 @@ impl<'p> Substitution<'p> {
         }
         self.pattern(pattern)?;
         self.modifiers(modifiers, &grouped)?;
-        if let Some(values) = values {
-            self.pattern(values)?;
+        self.trailing_values(values)
+    }
+
+    /// A query's trailing VALUES clause, which every query form may have:
+    /// the variables it assigns can't be parameters.
+    fn trailing_values(&mut self, values: Option<&mut GraphPattern>) -> Result<()> {
+        match values {
+            Some(values) => self.pattern(values),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     fn modifiers(&mut self, modifiers: &mut SolutionModifiers, grouped: &[Arc<str>]) -> Result<()> {
@@ -1074,6 +1083,10 @@ mod tests {
             "SELECT (?o AS ?x) WHERE { ?s <p> ?o }",
             "SELECT ?x WHERE { ?s <p> ?o } GROUP BY (?o AS ?x)",
             "SELECT ?s WHERE { ?s <p> ?o } VALUES ?x { 1 }",
+            "ASK { ?s <p> ?x } VALUES ?x { 1 }",
+            "CONSTRUCT { ?s <p> ?x } WHERE { ?s <p> ?x } VALUES ?x { 1 }",
+            "DESCRIBE ?s WHERE { ?s <p> ?x } VALUES ?x { 1 }",
+            "DESCRIBE ?s VALUES ?x { 1 }",
         ] {
             let err = substituted(sparql, json!({"x": 1})).unwrap_err();
             assert!(err.reason.contains("assigned"), "{sparql}: {err}");

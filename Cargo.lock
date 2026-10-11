@@ -3868,6 +3868,7 @@ dependencies = [
  "async-trait",
  "fluree-db-core",
  "fluree-db-query",
+ "fluree-db-r2rml",
  "fluree-db-sparql",
  "fluree-vocab",
  "parking_lot",
@@ -4042,6 +4043,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ulid",
+ "xxhash-rust",
  "zstd",
 ]
 
