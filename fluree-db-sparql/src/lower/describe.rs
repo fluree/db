@@ -15,7 +15,7 @@ use crate::SourceSpan;
 use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
 use fluree_db_query::ir::{
-    ConstructTemplate as QueryConstructTemplate, Expression, Pattern, Query, QueryOutput,
+    ConstructTemplate as QueryConstructTemplate, Expression, Function, Pattern, Query, QueryOutput,
     SubqueryPattern,
 };
 use fluree_db_query::parse::encode::IriEncoder;
@@ -27,6 +27,13 @@ use super::{LowerError, LoweringContext, Result};
 impl<E: IriEncoder> LoweringContext<'_, E> {
     /// Lower a DESCRIBE query to a Query.
     pub(super) fn lower_describe(&mut self, describe: &DescribeQuery) -> Result<Query> {
+        // DESCRIBE never groups, whatever its targets.
+        if describe.modifiers.group_by.is_some() || describe.modifiers.having.is_some() {
+            return Err(LowerError::unsupported_form(
+                "DESCRIBE with GROUP BY/HAVING",
+                describe.span,
+            ));
+        }
         let ctx = self.build_jsonld_context()?;
         let ctx_val = self.build_jsonld_context_value();
 
@@ -75,11 +82,25 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             }]);
         }
 
-        // 2) WHERE-derived targets (DESCRIBE ?x WHERE { ... } / DESCRIBE * WHERE { ... })
-        if let Some(where_clause) = &describe.where_clause {
-            // Lower WHERE clause patterns first (so variable IDs are registered).
-            let where_patterns = self.lower_graph_pattern(&where_clause.pattern)?;
-
+        // 2) WHERE-derived targets (DESCRIBE ?x WHERE { ... } / DESCRIBE * WHERE { ... }).
+        // A trailing VALUES clause joins the WHERE's solutions right after it,
+        // as in a sub-SELECT (DESCRIBE never groups); without a WHERE it joins
+        // the one empty solution (`DESCRIBE ?x VALUES ?x { <a> <b> }`).
+        let where_patterns = match (&describe.where_clause, describe.values.as_deref()) {
+            (None, None) => None,
+            (where_clause, values) => {
+                // Lower WHERE clause patterns first (so variable IDs are registered).
+                let mut patterns = match where_clause {
+                    Some(where_clause) => self.lower_graph_pattern(&where_clause.pattern)?,
+                    None => Vec::new(),
+                };
+                if let Some(values) = values {
+                    patterns.extend(self.lower_graph_pattern(values)?);
+                }
+                Some(patterns)
+            }
+        };
+        if let Some(where_patterns) = where_patterns {
             let target_vars = self.describe_target_vars(&describe.target, &where_patterns);
             if !target_vars.is_empty() {
                 let mut subq = SubqueryPattern::new(target_vars.clone(), where_patterns);
@@ -92,24 +113,32 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     &target_vars,
                 )?;
 
-                // Map each selected target var to ?__describe.
-                let bind_patterns = if target_vars.len() == 1 {
-                    vec![Pattern::Bind {
-                        var: describe_var,
-                        expr: Expression::Var(target_vars[0]),
-                    }]
-                } else {
-                    let mut inner = Vec::with_capacity(target_vars.len());
-                    for v in &target_vars {
-                        inner.push(vec![Pattern::Bind {
+                // Map each selected target var to ?__describe. A target a
+                // solution leaves unbound describes nothing: the expansion scan
+                // would read an unbound ?__describe as a free subject.
+                let describe_target = |v: VarId| {
+                    [
+                        Pattern::Filter(Expression::Call {
+                            func: Function::Bound,
+                            args: vec![Expression::Var(v)],
+                        }),
+                        Pattern::Bind {
                             var: describe_var,
-                            expr: Expression::Var(*v),
-                        }]);
-                    }
+                            expr: Expression::Var(v),
+                        },
+                    ]
+                };
+                let bind_patterns = if target_vars.len() == 1 {
+                    describe_target(target_vars[0]).to_vec()
+                } else {
+                    let inner = target_vars
+                        .iter()
+                        .map(|v| describe_target(*v).to_vec())
+                        .collect();
                     vec![Pattern::Union(inner)]
                 };
 
-                let mut branch = Vec::with_capacity(2 + bind_patterns.len());
+                let mut branch = Vec::with_capacity(1 + bind_patterns.len());
                 branch.push(Pattern::Subquery(subq));
                 branch.extend(bind_patterns);
                 branches.push(branch);
@@ -189,14 +218,6 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         subq: &mut SubqueryPattern,
         select_vars: &[VarId],
     ) -> Result<()> {
-        // DESCRIBE supports LIMIT/OFFSET/ORDER BY (but not GROUP BY/HAVING in this lowering).
-        if modifiers.group_by.is_some() || modifiers.having.is_some() {
-            return Err(LowerError::unsupported_form(
-                "DESCRIBE with GROUP BY/HAVING",
-                span,
-            ));
-        }
-
         let BaseModifiers {
             limit,
             offset,

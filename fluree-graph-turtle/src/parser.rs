@@ -13,7 +13,7 @@ use rustc_hash::FxHashMap;
 
 use crate::error::{Result, TurtleError};
 use crate::lex::{StreamingLexer, Token, TokenKind};
-use crate::options::{CollectionStyle, NumericStyle, ParserOptions};
+use crate::options::{CollectionStyle, NumericStyle, ParserOptions, RelativeIris};
 
 /// RDF well-known IRIs (imported from vocab crate)
 const RDF_TYPE: &str = rdf::TYPE;
@@ -21,12 +21,46 @@ const RDF_FIRST: &str = rdf::FIRST;
 const RDF_REST: &str = rdf::REST;
 const RDF_NIL: &str = rdf::NIL;
 
+/// Where a [`Parser`] reads its tokens: a [`StreamingLexer`] over its input,
+/// or tokens a caller lexed from that input already ([`SegmentParser`]). The
+/// parser is generic over it, so the lexer path compiles as it always has.
+pub trait TokenStream {
+    /// The next token, and an end-of-input token once there are none left.
+    fn next_token(&mut self) -> Result<Token>;
+}
+
+impl TokenStream for StreamingLexer<'_> {
+    #[inline]
+    fn next_token(&mut self) -> Result<Token> {
+        StreamingLexer::next_token(self)
+    }
+}
+
+/// One piece of a document's tokens, lexed already, and the byte offset its
+/// end of input is reported at.
+struct LexedTokens<'t> {
+    rest: std::slice::Iter<'t, Token>,
+    eof: u32,
+}
+
+impl TokenStream for LexedTokens<'_> {
+    #[inline]
+    fn next_token(&mut self) -> Result<Token> {
+        Ok(self
+            .rest
+            .next()
+            .cloned()
+            .unwrap_or_else(|| Token::new(TokenKind::Eof, self.eof, self.eof)))
+    }
+}
+
 /// Turtle parser state.
-pub struct Parser<'a, 'input, S> {
+pub struct Parser<'a, 'input, S, L = StreamingLexer<'input>> {
     /// Source input for span extraction.
     input: &'input str,
-    /// Streaming lexer — produces tokens on demand (no Vec<Token>).
-    lexer: StreamingLexer<'input>,
+    /// Streaming lexer — produces tokens on demand (no Vec<Token>). A
+    /// [`SegmentParser`] reads tokens lexed already instead.
+    lexer: L,
     /// The current token (most recently lexed).
     current_token: Token,
     sink: &'a mut S,
@@ -108,7 +142,20 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         crate::error::check_input_len(input.len())?;
         let mut lexer = StreamingLexer::new(input);
         let current_token = lexer.next_token()?;
+        Ok(Self::with_lexer(input, sink, options, lexer, current_token))
+    }
+}
 
+impl<'a, 'input, S: GraphSink, L: TokenStream> Parser<'a, 'input, S, L> {
+    /// A parser over `input` reading `lexer`'s tokens, positioned at
+    /// `current_token`.
+    fn with_lexer(
+        input: &'input str,
+        sink: &'a mut S,
+        options: ParserOptions,
+        lexer: L,
+        current_token: Token,
+    ) -> Self {
         // Pre-size caches based on input length. ~20 bytes per token on
         // average in Turtle, ~3 tokens per unique term → ~60 bytes per
         // unique term. Cap at 2M to avoid reserving hundreds of MB for
@@ -119,7 +166,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         let mut prefixed_term_cache = FxHashMap::default();
         prefixed_term_cache.reserve(est_unique);
 
-        Ok(Self {
+        Self {
             input,
             lexer,
             current_token,
@@ -142,7 +189,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             options,
             emit_count: 0,
             committed_current: false,
-        })
+        }
     }
 
     /// Run `f` one nesting level deeper, erroring past
@@ -168,6 +215,11 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
     /// Parse the entire Turtle document.
     pub fn parse(mut self) -> Result<()> {
+        self.parse_statements()
+    }
+
+    /// Parse every statement of the current input.
+    fn parse_statements(&mut self) -> Result<()> {
         let span = tracing::debug_span!(
             "turtle_parse_events",
             statement_count = tracing::field::Empty,
@@ -1644,6 +1696,10 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
         let base = match &self.base {
             Some(b) => b,
+            // A ledger id used as an IRI reference (see `RelativeIris`).
+            None if self.options.relative_iris == RelativeIris::Verbatim => {
+                return Ok(reference.to_string());
+            }
             None => {
                 // RFC 3986 §5.1: a relative reference needs a base. Keeping it
                 // verbatim, as this used to, writes a relative IRI into the
@@ -1729,6 +1785,54 @@ pub fn parse_with_prefixes_base<S: GraphSink>(
     parse_with_prefixes_base_options(input, sink, prefixes, base, ParserOptions::default())
 }
 
+/// One parser over the pieces of a document, parsed in order: a TriG
+/// document's default-graph runs and graph-block contents, say, when a driver
+/// routes each piece to its own graph. The driver lexes the document once
+/// and hands each piece's tokens over, so nothing is lexed twice. Prefixes
+/// and the base a piece declares apply to the pieces after it, and the term
+/// caches and the sink carry over, exactly as between the statements of one
+/// document; nothing is re-seeded per piece. Error positions are the
+/// document's.
+pub struct SegmentParser<'a, 'input, S> {
+    parser: Parser<'a, 'input, S, LexedTokens<'input>>,
+}
+
+impl<'a, 'input, S: GraphSink> SegmentParser<'a, 'input, S> {
+    /// A parser over `input` with no prefixes and no base yet.
+    pub fn new(input: &'input str, sink: &'a mut S, options: ParserOptions) -> Result<Self> {
+        crate::error::check_input_len(input.len())?;
+        let lexer = LexedTokens {
+            rest: [].iter(),
+            eof: 0,
+        };
+        let eof = Token::new(TokenKind::Eof, 0, 0);
+        Ok(Self {
+            parser: Parser::with_lexer(input, sink, options, lexer, eof),
+        })
+    }
+
+    /// Parse the next piece: `tokens`, lexed from the input, which end at
+    /// byte `end` (where a statement the piece cuts short is reported).
+    pub fn parse(&mut self, tokens: &'input [Token], end: usize) -> Result<()> {
+        self.parser.lexer = LexedTokens {
+            rest: tokens.iter(),
+            eof: end as u32,
+        };
+        self.parser.current_token = self.parser.lexer.next_token()?;
+        self.parser.parse_statements()
+    }
+
+    /// How relative IRI references resolve in the pieces after this call.
+    pub fn set_relative_iris(&mut self, relative_iris: RelativeIris) {
+        self.parser.options.relative_iris = relative_iris;
+    }
+
+    /// The sink, between pieces.
+    pub fn sink_mut(&mut self) -> &mut S {
+        self.parser.sink
+    }
+}
+
 /// [`parse_with_prefixes_base`] under explicit [`ParserOptions`].
 ///
 /// This is the full entry point — every other `parse*` function is this one
@@ -1766,6 +1870,63 @@ pub fn parse_with_prefixes_base_options<S: GraphSink>(
 mod tests {
     use super::*;
     use fluree_graph_ir::{Graph, GraphCollectorSink, Term};
+
+    /// Declarations carry from one piece to the next, the relative-IRI mode
+    /// applies per piece, and error positions are the document's.
+    #[test]
+    fn a_segment_parser_carries_declarations_across_pieces() {
+        let pieces = [
+            "@prefix ex: <http://example.org/> .\n",
+            "ex:a ex:p ex:b .\n",
+            "ex:a ex:p <org/x:main> .\n",
+            "ex:a ex:p <rel> .\n",
+            "ex:a ex:p ;",
+        ];
+        let doc = pieces.concat();
+        let tokens = crate::lex::tokenize(&doc).unwrap();
+        // Each piece's tokens, and the byte offset it ends at.
+        let piece = |i: usize| {
+            let start: usize = pieces[..i].iter().map(|p| p.len()).sum();
+            let end = start + pieces[i].len();
+            let in_piece = |t: &Token| {
+                !matches!(t.kind, TokenKind::Eof) && (start..end).contains(&(t.start as usize))
+            };
+            let first = tokens.iter().position(in_piece).unwrap();
+            let count = tokens[first..].iter().take_while(|t| in_piece(t)).count();
+            (&tokens[first..first + count], end)
+        };
+        let mut sink = GraphCollectorSink::new();
+        {
+            let mut parser = SegmentParser::new(&doc, &mut sink, ParserOptions::default()).unwrap();
+            let (t, end) = piece(0);
+            parser.parse(t, end).unwrap();
+            let (t, end) = piece(1);
+            parser.parse(t, end).unwrap();
+            parser.set_relative_iris(RelativeIris::Verbatim);
+            let (t, end) = piece(2);
+            parser.parse(t, end).unwrap();
+            parser.set_relative_iris(RelativeIris::Resolve);
+            let (t, end) = piece(3);
+            assert!(parser.parse(t, end).is_err());
+            let (t, end) = piece(4);
+            let start = end - pieces[4].len();
+            match parser.parse(t, end) {
+                Err(TurtleError::Parse { position, .. }) => {
+                    assert!((start..end).contains(&position), "{position}");
+                }
+                other => panic!("expected a positioned parse error, got {other:?}"),
+            }
+        }
+        let graph = sink.into_graph();
+        let objects: Vec<String> = graph
+            .iter()
+            .map(|t| match &t.o {
+                Term::Iri(iri) => iri.to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(objects, ["http://example.org/b", "org/x:main"]);
+    }
 
     /// Counts for a document whose only prefixed names are two `e:x`.
     fn prefixed_cache_counts(doc: &str) -> (u64, u64) {

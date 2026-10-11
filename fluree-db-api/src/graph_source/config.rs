@@ -457,6 +457,27 @@ pub enum CatalogMode {
         /// "file:///data/warehouse/my_namespace/my_table"
         table_location: String,
     },
+    /// Resolve tables via the AWS Glue Data Catalog using the native AWS SDK.
+    ///
+    /// The Glue *database* is the table identifier's namespace. Credentials come
+    /// from the ambient AWS credential chain — no REST/SigV4 or vended
+    /// credentials are involved.
+    Glue {
+        /// AWS region. Falls back to the SDK default chain / `io.s3_region` if `None`.
+        region: Option<String>,
+        /// Glue catalog id for cross-account access (`None` = the caller's account).
+        catalog_id: Option<String>,
+    },
+    /// Resolve tables via AWS S3 Tables using the native AWS SDK.
+    ///
+    /// Credentials come from the ambient AWS credential chain.
+    S3Tables {
+        /// AWS region. Falls back to the SDK default chain / `io.s3_region` if `None`.
+        region: Option<String>,
+        /// The S3 Tables table-bucket ARN
+        /// (`arn:aws:s3tables:<region>:<account>:bucket/<name>`).
+        table_bucket_arn: String,
+    },
 }
 
 /// REST catalog mode configuration.
@@ -476,8 +497,119 @@ pub struct RestCatalogMode {
     pub auth: fluree_db_iceberg::auth::AuthConfig,
 }
 
+/// The catalog-mode fields every surface collects — CLI flags, the server's JSON
+/// body — exactly as given. [`IcebergConnectionConfig::from_mode`] and
+/// [`IcebergCreateConfig::from_mode`] parse them in ONE place, so a catalog mode
+/// added there reaches every surface, with the same rules and messages.
+#[cfg(feature = "iceberg")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CatalogModeArgs<'a> {
+    /// `rest` (also when empty), `direct`, `glue`, or `s3tables`; case-insensitive.
+    pub mode: &'a str,
+    /// REST catalog URI (`rest`).
+    pub catalog_uri: Option<&'a str>,
+    /// Table directory or warehouse root (`direct`).
+    pub table_location: Option<&'a str>,
+    /// AWS region of the catalog (`glue`, `s3tables`).
+    pub region: Option<&'a str>,
+    /// Glue catalog id for cross-account access (`glue`).
+    pub catalog_id: Option<&'a str>,
+    /// S3 Tables table-bucket ARN (`s3tables`).
+    pub table_bucket_arn: Option<&'a str>,
+    /// The REST-only settings (catalog auth, warehouse, a request for vended
+    /// credentials) the caller was given, by field name. Any other mode refuses
+    /// them rather than silently ignoring them.
+    pub rest_only: &'a [&'static str],
+}
+
+/// Why catalog-mode arguments do not describe a source. Field names are the
+/// snake_case wire names; [`CatalogModeError::message`] renders them in the
+/// caller's own spelling (`--catalog-uri` on the CLI, `catalog_uri` in JSON).
+#[cfg(feature = "iceberg")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogModeError {
+    /// `mode` is not a catalog mode.
+    UnknownMode(String),
+    /// The mode needs `field`.
+    MissingField {
+        mode: &'static str,
+        field: &'static str,
+    },
+    /// A catalog mode with no R2RML mapping needs the source's own `table`.
+    MissingTable { mode: &'static str },
+    /// `field` is a REST catalog setting, which this mode would ignore.
+    NotForMode {
+        mode: &'static str,
+        field: &'static str,
+    },
+}
+
+#[cfg(feature = "iceberg")]
+impl CatalogModeError {
+    /// The error message, with each field name rendered by `spell`.
+    pub fn message(&self, spell: impl Fn(&str) -> String) -> String {
+        match self {
+            CatalogModeError::UnknownMode(mode) => format!(
+                "unknown catalog mode '{mode}'. Use 'rest', 'direct', 'glue', or 's3tables'."
+            ),
+            CatalogModeError::MissingField { mode, field } => {
+                format!("{} is required for {mode} mode", spell(field))
+            }
+            CatalogModeError::MissingTable { mode } => format!(
+                "{} is required for {mode} mode (or provide {} to define tables via mapping)",
+                spell("table"),
+                spell("r2rml")
+            ),
+            CatalogModeError::NotForMode { mode, field } => format!(
+                "{} applies to rest mode only; {mode} mode would ignore it",
+                spell(field)
+            ),
+        }
+    }
+}
+
 #[cfg(feature = "iceberg")]
 impl IcebergConnectionConfig {
+    /// Parse a catalog mode and its fields into a connection with default IO —
+    /// the one dispatch every surface goes through (see [`CatalogModeArgs`]).
+    pub fn from_mode(args: CatalogModeArgs<'_>) -> std::result::Result<Self, CatalogModeError> {
+        let required = |value: Option<&str>, mode: &'static str, field: &'static str| {
+            value
+                .filter(|v| !v.trim().is_empty())
+                .map(str::to_string)
+                .ok_or(CatalogModeError::MissingField { mode, field })
+        };
+        let owned = |value: Option<&str>| value.map(str::to_string);
+        let mode = if args.mode.is_empty() {
+            "rest".to_string()
+        } else {
+            args.mode.to_lowercase()
+        };
+        let refuse_rest_only = |mode: &'static str| match args.rest_only.first().copied() {
+            Some(field) => Err(CatalogModeError::NotForMode { mode, field }),
+            None => Ok(()),
+        };
+        Ok(match mode.as_str() {
+            "rest" => Self::rest(required(args.catalog_uri, "rest", "catalog_uri")?),
+            "direct" => {
+                refuse_rest_only("direct")?;
+                Self::direct(required(args.table_location, "direct", "table_location")?)
+            }
+            "glue" => {
+                refuse_rest_only("glue")?;
+                Self::glue(owned(args.region), owned(args.catalog_id))
+            }
+            "s3tables" => {
+                refuse_rest_only("s3tables")?;
+                Self::s3_tables(
+                    owned(args.region),
+                    required(args.table_bucket_arn, "s3tables", "table_bucket_arn")?,
+                )
+            }
+            _ => return Err(CatalogModeError::UnknownMode(args.mode.to_string())),
+        })
+    }
+
     /// Create a REST-catalog connection with default IO (vended credentials on).
     pub fn rest(catalog_uri: impl Into<String>) -> Self {
         Self {
@@ -496,6 +628,35 @@ impl IcebergConnectionConfig {
         Self {
             catalog_mode: CatalogMode::Direct {
                 table_location: table_location.into(),
+            },
+            io: fluree_db_iceberg::config::IoConfig {
+                vended_credentials: false,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Create an AWS Glue Data Catalog connection (native AWS SDK). Vended
+    /// credentials are forced off — the SDK reads S3 with the ambient/IAM
+    /// credential chain.
+    pub fn glue(region: Option<String>, catalog_id: Option<String>) -> Self {
+        Self {
+            catalog_mode: CatalogMode::Glue { region, catalog_id },
+            io: fluree_db_iceberg::config::IoConfig {
+                vended_credentials: false,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Create an AWS S3 Tables connection (native AWS SDK) from a table-bucket
+    /// ARN. Vended credentials are forced off — the SDK reads the managed table
+    /// bucket with the ambient/IAM credential chain.
+    pub fn s3_tables(region: Option<String>, table_bucket_arn: impl Into<String>) -> Self {
+        Self {
+            catalog_mode: CatalogMode::S3Tables {
+                region,
+                table_bucket_arn: table_bucket_arn.into(),
             },
             io: fluree_db_iceberg::config::IoConfig {
                 vended_credentials: false,
@@ -642,6 +803,9 @@ impl IcebergConnectionConfig {
             CatalogMode::Direct { .. } => {
                 tracing::warn!("with_oauth2_scope has no effect in Direct catalog mode");
             }
+            CatalogMode::Glue { .. } | CatalogMode::S3Tables { .. } => {
+                tracing::warn!("with_oauth2_scope has no effect in Glue/S3Tables catalog mode");
+            }
         }
         self
     }
@@ -668,6 +832,9 @@ impl IcebergConnectionConfig {
             }
             CatalogMode::Direct { .. } => {
                 tracing::warn!("with_oauth2_audience has no effect in Direct catalog mode");
+            }
+            CatalogMode::Glue { .. } | CatalogMode::S3Tables { .. } => {
+                tracing::warn!("with_oauth2_audience has no effect in Glue/S3Tables catalog mode");
             }
         }
         self
@@ -716,6 +883,59 @@ impl IcebergConnectionConfig {
         match &self.catalog_mode {
             CatalogMode::Rest(rest) => &rest.catalog_uri,
             CatalogMode::Direct { table_location } => table_location,
+            CatalogMode::Glue { catalog_id, .. } => catalog_id.as_deref().unwrap_or("aws-glue"),
+            CatalogMode::S3Tables {
+                table_bucket_arn, ..
+            } => table_bucket_arn,
+        }
+    }
+
+    /// This connection's native-AWS catalog (Glue, S3 Tables) as the engine
+    /// config models it, so region resolution and validation are the engine's
+    /// own rules rather than a copy; `None` for REST and Direct.
+    fn aws_sdk_catalog(&self) -> Option<fluree_db_iceberg::config::CatalogConfig> {
+        use fluree_db_iceberg::config::CatalogConfig;
+        match &self.catalog_mode {
+            CatalogMode::Glue { region, catalog_id } => {
+                Some(CatalogConfig::glue(region.clone(), catalog_id.clone()))
+            }
+            CatalogMode::S3Tables {
+                region,
+                table_bucket_arn,
+            } => Some(CatalogConfig::s3_tables(
+                region.clone(),
+                table_bucket_arn.clone(),
+            )),
+            CatalogMode::Rest(_) | CatalogMode::Direct { .. } => None,
+        }
+    }
+
+    /// The region an AWS Glue / S3 Tables catalog API is called in (see
+    /// [`fluree_db_iceberg::config::CatalogConfig::aws_catalog_region`]), after
+    /// validating the catalog's settings; `Ok(None)` defers to the AWS SDK's
+    /// region chain, and is always the answer for REST and Direct.
+    pub fn aws_catalog_region(&self) -> crate::Result<Option<String>> {
+        let Some(catalog) = self.aws_sdk_catalog() else {
+            return Ok(None);
+        };
+        let invalid = |e: fluree_db_iceberg::IcebergError| crate::ApiError::config(e.to_string());
+        catalog.validate_aws_sdk_catalog().map_err(invalid)?;
+        self.io.validate_s3_overrides().map_err(invalid)?;
+        Ok(catalog.aws_catalog_region(&self.io).map(str::to_string))
+    }
+
+    /// The IO settings this connection's S3 reads use: for Glue / S3 Tables,
+    /// `s3_region` falls back to the catalog's region (see
+    /// [`fluree_db_iceberg::config::IoConfig::with_catalog_region`]).
+    pub fn storage_io(&self) -> std::borrow::Cow<'_, fluree_db_iceberg::config::IoConfig> {
+        let catalog_region = self
+            .aws_sdk_catalog()
+            .and_then(|c| c.aws_region().map(str::to_string));
+        match catalog_region {
+            Some(region) if self.io.s3_region.is_none() => {
+                std::borrow::Cow::Owned(self.io.with_catalog_region(Some(&region)))
+            }
+            _ => std::borrow::Cow::Borrowed(&self.io),
         }
     }
 
@@ -728,6 +948,16 @@ impl IcebergConnectionConfig {
     pub fn is_direct(&self) -> bool {
         matches!(self.catalog_mode, CatalogMode::Direct { .. })
     }
+
+    /// Returns `true` if this connection uses AWS Glue catalog mode.
+    pub fn is_glue(&self) -> bool {
+        matches!(self.catalog_mode, CatalogMode::Glue { .. })
+    }
+
+    /// Returns `true` if this connection uses AWS S3 Tables catalog mode.
+    pub fn is_s3tables(&self) -> bool {
+        matches!(self.catalog_mode, CatalogMode::S3Tables { .. })
+    }
 }
 
 #[cfg(feature = "iceberg")]
@@ -738,10 +968,35 @@ impl IcebergCreateConfig {
         catalog_uri: impl Into<String>,
         table_identifier: impl Into<String>,
     ) -> Self {
+        Self::from_connection(
+            name,
+            IcebergConnectionConfig::rest(catalog_uri),
+            table_identifier,
+        )
+    }
+
+    /// Create a new Iceberg graph source config for direct S3 access (no REST catalog).
+    pub fn new_direct(name: impl Into<String>, table_location: impl Into<String>) -> Self {
+        Self::from_connection(
+            name,
+            IcebergConnectionConfig::direct(table_location),
+            String::new(),
+        )
+    }
+
+    /// Create a graph source config over any connection (REST, Direct, AWS Glue,
+    /// AWS S3 Tables). `table_identifier` is the source's own `namespace.table`
+    /// (empty for Direct, whose table comes from its location). Every other field
+    /// starts unset; this is the one place they are listed.
+    pub fn from_connection(
+        name: impl Into<String>,
+        connection: IcebergConnectionConfig,
+        table_identifier: impl Into<String>,
+    ) -> Self {
         Self {
             name: name.into(),
             branch: None,
-            connection: IcebergConnectionConfig::rest(catalog_uri),
+            connection,
             table_identifier: table_identifier.into(),
             delete_convention: None,
             model: None,
@@ -750,18 +1005,34 @@ impl IcebergCreateConfig {
         }
     }
 
-    /// Create a new Iceberg graph source config for direct S3 access (no REST catalog).
-    pub fn new_direct(name: impl Into<String>, table_location: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            branch: None,
-            connection: IcebergConnectionConfig::direct(table_location),
-            table_identifier: String::new(),
-            delete_convention: None,
-            model: None,
-            default_allow: None,
-            order_by: None,
-        }
+    /// Parse a catalog mode, its fields, and the source's own `table` into a
+    /// create config — the one dispatch every surface goes through (see
+    /// [`CatalogModeArgs`]). A catalog mode (rest, glue, s3tables) needs `table`
+    /// unless the source's tables come from an R2RML mapping (`has_mapping`), in
+    /// which case each `rr:tableName` names its table; Direct ignores `table`.
+    pub fn from_mode(
+        name: impl Into<String>,
+        args: CatalogModeArgs<'_>,
+        table: Option<&str>,
+        has_mapping: bool,
+    ) -> std::result::Result<Self, CatalogModeError> {
+        let connection = IcebergConnectionConfig::from_mode(args)?;
+        let mode = match &connection.catalog_mode {
+            CatalogMode::Direct { .. } => {
+                return Ok(Self::from_connection(name, connection, String::new()));
+            }
+            CatalogMode::Rest(_) => "rest",
+            CatalogMode::Glue { .. } => "glue",
+            CatalogMode::S3Tables { .. } => "s3tables",
+        };
+        let table = match table.map(str::trim).filter(|t| !t.is_empty()) {
+            Some(table) => table,
+            // A mapping-defined source has no table of its own; the placeholder
+            // only satisfies the identifier shape and is never loaded.
+            None if has_mapping => fluree_db_iceberg::config::MAPPING_DEFINED_TABLE,
+            None => return Err(CatalogModeError::MissingTable { mode }),
+        };
+        Ok(Self::from_connection(name, connection, table))
     }
 
     /// Set the branch name.
@@ -934,7 +1205,10 @@ impl IcebergCreateConfig {
     /// Get the table identifier string (for REST mode), or derive from location (for direct mode).
     pub fn table_identifier_display(&self) -> String {
         match &self.connection.catalog_mode {
-            CatalogMode::Rest(_) => self.table_identifier.clone(),
+            // REST / Glue / S3Tables all carry an explicit `namespace.table`.
+            CatalogMode::Rest(_) | CatalogMode::Glue { .. } | CatalogMode::S3Tables { .. } => {
+                self.table_identifier.clone()
+            }
             CatalogMode::Direct { table_location } => {
                 let path = table_location
                     .trim_start_matches("s3://")
@@ -957,37 +1231,55 @@ impl IcebergCreateConfig {
     pub fn to_iceberg_gs_config(&self) -> IcebergGsConfig {
         use fluree_db_iceberg::config::{CatalogConfig, TableConfig};
 
-        match &self.connection.catalog_mode {
-            CatalogMode::Rest(rest) => IcebergGsConfig {
-                catalog: CatalogConfig::Rest {
+        // Per mode: only the catalog, the table identifier and the vended flag
+        // differ. Everything else is set ONCE below, so a source-level field
+        // (model, delete convention, ...) cannot be dropped for one mode.
+        let mut io = self.connection.io.clone();
+        let (catalog, table) = match &self.connection.catalog_mode {
+            CatalogMode::Rest(rest) => (
+                CatalogConfig::Rest {
                     catalog_type: "polaris".to_string(),
                     uri: rest.catalog_uri.clone(),
                     auth: rest.auth.clone(),
                     warehouse: rest.warehouse.clone(),
                 },
-                table: TableConfig::Identifier(self.table_identifier.clone()),
-                io: self.connection.io.clone(),
-                mapping: None,
-                delete: self.delete_convention.clone(),
-                order_by: self.order_by.clone(),
-                model: self.model.clone(),
-                default_allow: self.default_allow,
-            },
+                self.table_identifier.clone(),
+            ),
             CatalogMode::Direct { table_location } => {
                 // Direct never uses vended credentials, regardless of the io flag.
-                let mut io = self.connection.io.clone();
                 io.vended_credentials = false;
-                IcebergGsConfig {
-                    catalog: CatalogConfig::direct(table_location),
-                    table: TableConfig::Identifier(String::new()),
-                    io,
-                    mapping: None,
-                    delete: self.delete_convention.clone(),
-                    order_by: self.order_by.clone(),
-                    model: self.model.clone(),
-                    default_allow: self.default_allow,
-                }
+                (CatalogConfig::direct(table_location), String::new())
             }
+            CatalogMode::Glue { region, catalog_id } => {
+                // Glue never vends: S3 is read with the ambient AWS credential chain.
+                io.vended_credentials = false;
+                (
+                    CatalogConfig::glue(region.clone(), catalog_id.clone()),
+                    self.table_identifier.clone(),
+                )
+            }
+            CatalogMode::S3Tables {
+                region,
+                table_bucket_arn,
+            } => {
+                // S3 Tables never vends: the managed table bucket is read with the
+                // ambient AWS credential chain.
+                io.vended_credentials = false;
+                (
+                    CatalogConfig::s3_tables(region.clone(), table_bucket_arn.clone()),
+                    self.table_identifier.clone(),
+                )
+            }
+        };
+        IcebergGsConfig {
+            catalog,
+            table: TableConfig::Identifier(table),
+            io,
+            mapping: None,
+            delete: self.delete_convention.clone(),
+            order_by: self.order_by.clone(),
+            model: self.model.clone(),
+            default_allow: self.default_allow,
         }
     }
 
@@ -1044,6 +1336,20 @@ impl IcebergCreateConfig {
                 fluree_db_iceberg::ensure_local_location_allowed(table_location)
                     .map_err(|e| crate::ApiError::config(e.to_string()))?;
             }
+            CatalogMode::Glue { .. } | CatalogMode::S3Tables { .. } => {
+                if self.table_identifier.trim().is_empty() {
+                    return Err(crate::ApiError::config(
+                        "Table identifier cannot be empty for AWS Glue / S3 Tables catalog mode \
+                         (use namespace.table, or an R2RML mapping)",
+                    ));
+                }
+                // Region shape, table bucket ARN, table identifier, vended flag:
+                // one set of rules, owned by `fluree_db_iceberg::config`, so this
+                // gate and the query-time gate cannot disagree.
+                self.to_iceberg_gs_config()
+                    .validate()
+                    .map_err(|e| crate::ApiError::config(e.to_string()))?;
+            }
         }
 
         // Validate the tombstone/delete convention at creation time rather than
@@ -1065,6 +1371,16 @@ impl IcebergCreateConfig {
     /// Returns `true` if this config uses direct S3 catalog mode.
     pub fn is_direct(&self) -> bool {
         self.connection.is_direct()
+    }
+
+    /// Returns `true` if this config uses AWS Glue catalog mode.
+    pub fn is_glue(&self) -> bool {
+        self.connection.is_glue()
+    }
+
+    /// Returns `true` if this config uses AWS S3 Tables catalog mode.
+    pub fn is_s3tables(&self) -> bool {
+        self.connection.is_s3tables()
     }
 }
 
@@ -1457,7 +1773,9 @@ mod tests {
     fn oauth2_auth(config: &IcebergCreateConfig) -> &fluree_db_iceberg::auth::AuthConfig {
         match &config.connection.catalog_mode {
             CatalogMode::Rest(rest) => &rest.auth,
-            CatalogMode::Direct { .. } => panic!("expected REST catalog mode"),
+            CatalogMode::Direct { .. }
+            | CatalogMode::Glue { .. }
+            | CatalogMode::S3Tables { .. } => panic!("expected REST catalog mode"),
         }
     }
 
@@ -1486,7 +1804,9 @@ mod tests {
     fn conn_auth(conn: &IcebergConnectionConfig) -> &fluree_db_iceberg::auth::AuthConfig {
         match &conn.catalog_mode {
             CatalogMode::Rest(rest) => &rest.auth,
-            CatalogMode::Direct { .. } => panic!("expected REST catalog mode"),
+            CatalogMode::Direct { .. }
+            | CatalogMode::Glue { .. }
+            | CatalogMode::S3Tables { .. } => panic!("expected REST catalog mode"),
         }
     }
 
@@ -1683,5 +2003,267 @@ mod tests {
             Some("application/ld+json"),
             "an explicit media type must be preserved"
         );
+    }
+
+    // ── Catalog modes: one dispatch for every surface (CLI, server) ──
+
+    #[cfg(feature = "iceberg")]
+    const S3TABLES_ARN: &str = "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics";
+
+    #[cfg(feature = "iceberg")]
+    fn mode_args(mode: &str) -> CatalogModeArgs<'_> {
+        CatalogModeArgs {
+            mode,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn from_mode_parses_every_catalog_mode() {
+        let rest = IcebergConnectionConfig::from_mode(CatalogModeArgs {
+            catalog_uri: Some("https://polaris.example.com"),
+            ..mode_args("REST")
+        })
+        .unwrap();
+        assert!(rest.is_rest());
+        // An empty mode is the default, rest.
+        assert!(IcebergConnectionConfig::from_mode(CatalogModeArgs {
+            catalog_uri: Some("https://polaris.example.com"),
+            ..mode_args("")
+        })
+        .unwrap()
+        .is_rest());
+        let direct = IcebergConnectionConfig::from_mode(CatalogModeArgs {
+            table_location: Some("s3://bucket/warehouse/ns/t"),
+            ..mode_args("direct")
+        })
+        .unwrap();
+        assert!(direct.is_direct());
+        let glue = IcebergConnectionConfig::from_mode(CatalogModeArgs {
+            region: Some("us-east-1"),
+            catalog_id: Some("123456789012"),
+            ..mode_args("Glue")
+        })
+        .unwrap();
+        match &glue.catalog_mode {
+            CatalogMode::Glue { region, catalog_id } => {
+                assert_eq!(region.as_deref(), Some("us-east-1"));
+                assert_eq!(catalog_id.as_deref(), Some("123456789012"));
+            }
+            other => panic!("expected glue, got {other:?}"),
+        }
+        assert!(!glue.io.vended_credentials, "glue never vends");
+        let s3tables = IcebergConnectionConfig::from_mode(CatalogModeArgs {
+            table_bucket_arn: Some(S3TABLES_ARN),
+            ..mode_args("s3tables")
+        })
+        .unwrap();
+        assert!(s3tables.is_s3tables());
+        assert!(!s3tables.io.vended_credentials, "s3tables never vends");
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn from_mode_names_what_is_missing_in_each_surfaces_spelling() {
+        let missing = |args| IcebergConnectionConfig::from_mode(args).unwrap_err();
+        let cli = |field: &str| format!("--{}", field.replace('_', "-"));
+        assert_eq!(
+            missing(mode_args("rest")).message(cli),
+            "--catalog-uri is required for rest mode"
+        );
+        assert_eq!(
+            missing(mode_args("direct")).message(str::to_string),
+            "table_location is required for direct mode"
+        );
+        assert_eq!(
+            missing(mode_args("s3tables")).message(cli),
+            "--table-bucket-arn is required for s3tables mode"
+        );
+        // A blank value is as missing as an absent one.
+        assert!(matches!(
+            missing(CatalogModeArgs {
+                table_bucket_arn: Some("  "),
+                ..mode_args("s3tables")
+            }),
+            CatalogModeError::MissingField { .. }
+        ));
+        assert_eq!(
+            missing(mode_args("hadoop")),
+            CatalogModeError::UnknownMode("hadoop".to_string())
+        );
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn rest_only_settings_are_refused_by_other_modes() {
+        // Catalog auth or a warehouse given to a non-REST mode would be silently
+        // ignored; refuse it, naming the setting in the caller's spelling.
+        let auth = ["auth_bearer"];
+        let err = IcebergConnectionConfig::from_mode(CatalogModeArgs {
+            rest_only: &auth,
+            ..mode_args("glue")
+        })
+        .unwrap_err();
+        assert_eq!(
+            err.message(|f| format!("--{}", f.replace('_', "-"))),
+            "--auth-bearer applies to rest mode only; glue mode would ignore it"
+        );
+        for mode in ["direct", "s3tables"] {
+            let args = CatalogModeArgs {
+                table_location: Some("s3://b/w/ns/t"),
+                table_bucket_arn: Some(S3TABLES_ARN),
+                rest_only: &["warehouse"],
+                ..mode_args(mode)
+            };
+            assert!(matches!(
+                IcebergConnectionConfig::from_mode(args),
+                Err(CatalogModeError::NotForMode {
+                    field: "warehouse",
+                    ..
+                })
+            ));
+        }
+        // REST takes them.
+        IcebergConnectionConfig::from_mode(CatalogModeArgs {
+            catalog_uri: Some("https://polaris.example.com"),
+            rest_only: &["auth_bearer", "warehouse"],
+            ..mode_args("rest")
+        })
+        .unwrap();
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn create_from_mode_needs_a_table_unless_a_mapping_defines_them() {
+        let glue = || mode_args("glue");
+        // A mapping-defined source has no table of its own (each rr:tableName is
+        // one), for glue and s3tables exactly as for rest.
+        let mapped = IcebergCreateConfig::from_mode("gs", glue(), None, true).unwrap();
+        assert_eq!(
+            mapped.table_identifier,
+            fluree_db_iceberg::config::MAPPING_DEFINED_TABLE
+        );
+        let named =
+            IcebergCreateConfig::from_mode("gs", glue(), Some("sales.orders"), true).unwrap();
+        assert_eq!(named.table_identifier, "sales.orders");
+        let err = IcebergCreateConfig::from_mode("gs", glue(), Some(" "), false).unwrap_err();
+        assert_eq!(
+            err.message(str::to_string),
+            "table is required for glue mode (or provide r2rml to define tables via mapping)"
+        );
+        // Direct takes its table from the location.
+        let direct = IcebergCreateConfig::from_mode(
+            "gs",
+            CatalogModeArgs {
+                table_location: Some("s3://bucket/warehouse/ns/t"),
+                ..mode_args("direct")
+            },
+            Some("ignored.table"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(direct.table_identifier, "");
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn every_catalog_mode_keeps_the_source_level_fields() {
+        // The per-mode conversion builds ONE IcebergGsConfig: a source-level field
+        // (governance model, delete convention, ...) cannot be dropped for a mode.
+        let connections = [
+            IcebergConnectionConfig::rest("https://polaris.example.com"),
+            IcebergConnectionConfig::direct("s3://bucket/warehouse/ns/t"),
+            IcebergConnectionConfig::glue(Some("us-east-1".into()), None),
+            IcebergConnectionConfig::s3_tables(None, S3TABLES_ARN),
+        ];
+        for connection in connections {
+            let mut config = IcebergCreateConfig::from_connection("gs", connection, "ns.t");
+            config.model = Some("governance:main".to_string());
+            config.default_allow = Some(false);
+            config.order_by = Some("updated_at".to_string());
+            config.delete_convention = Some(fluree_db_iceberg::DeleteConvention {
+                column: "op".to_string(),
+                deleted_values: vec![Some("D".to_string())],
+            });
+            let gs = config.to_iceberg_gs_config();
+            assert_eq!(
+                gs.model.as_deref(),
+                Some("governance:main"),
+                "{:?}",
+                gs.catalog
+            );
+            assert_eq!(gs.default_allow, Some(false), "{:?}", gs.catalog);
+            assert_eq!(
+                gs.order_by.as_deref(),
+                Some("updated_at"),
+                "{:?}",
+                gs.catalog
+            );
+            assert!(gs.delete.is_some(), "{:?}", gs.catalog);
+        }
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn aws_catalog_modes_validate_with_the_engine_rules() {
+        let glue = |region: &str| {
+            IcebergCreateConfig::from_connection(
+                "gs",
+                IcebergConnectionConfig::glue(Some(region.to_string()), None),
+                "sales.orders",
+            )
+        };
+        glue("us-east-1").validate().unwrap();
+        // The engine's region-shape rule reaches the API gate.
+        let err = glue("us-east-1.evil.com").validate().unwrap_err();
+        assert!(err.to_string().contains("not an AWS region"), "{err}");
+        let arn = IcebergCreateConfig::from_connection(
+            "gs",
+            IcebergConnectionConfig::s3_tables(Some("eu-west-1".into()), S3TABLES_ARN),
+            "sales.orders",
+        );
+        let err = arn.validate().unwrap_err();
+        assert!(err.to_string().contains("contradicts"), "{err}");
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn connection_region_and_storage_io_resolve_like_the_engine() {
+        // Glue: the catalog region, else s3_region; the reads, s3_region else region.
+        let glue = IcebergConnectionConfig::glue(Some("us-west-2".into()), None);
+        assert_eq!(
+            glue.aws_catalog_region().unwrap().as_deref(),
+            Some("us-west-2")
+        );
+        assert_eq!(glue.storage_io().s3_region.as_deref(), Some("us-west-2"));
+        let glue = glue.with_s3_region("eu-west-1");
+        assert_eq!(
+            glue.aws_catalog_region().unwrap().as_deref(),
+            Some("us-west-2")
+        );
+        assert_eq!(glue.storage_io().s3_region.as_deref(), Some("eu-west-1"));
+        let bare = IcebergConnectionConfig::glue(None, None).with_s3_region("eu-west-1");
+        assert_eq!(
+            bare.aws_catalog_region().unwrap().as_deref(),
+            Some("eu-west-1")
+        );
+        // S3 Tables: the ARN names the region.
+        let s3tables = IcebergConnectionConfig::s3_tables(None, S3TABLES_ARN);
+        assert_eq!(
+            s3tables.aws_catalog_region().unwrap().as_deref(),
+            Some("us-east-1")
+        );
+        assert_eq!(
+            s3tables.storage_io().s3_region.as_deref(),
+            Some("us-east-1")
+        );
+        // REST / Direct: no AWS catalog API; io untouched.
+        let rest = IcebergConnectionConfig::rest("https://polaris.example.com");
+        assert_eq!(rest.aws_catalog_region().unwrap(), None);
+        assert_eq!(rest.storage_io().s3_region, None);
+        // A malformed region is refused before any client is built.
+        let bad = IcebergConnectionConfig::glue(Some("x/y".into()), None);
+        assert!(bad.aws_catalog_region().is_err());
     }
 }

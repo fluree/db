@@ -7,7 +7,7 @@ impl super::Parser<'_> {
     /// Parse an ASK query.
     ///
     /// ASK queries return a boolean indicating whether the pattern matches.
-    /// Grammar: ASK DatasetClause* WhereClause SolutionModifier
+    /// Grammar: ASK DatasetClause* WhereClause SolutionModifier ValuesClause
     pub(super) fn parse_ask_query(&mut self) -> Option<AskQuery> {
         let start = self.stream.current_span();
 
@@ -23,8 +23,10 @@ impl super::Parser<'_> {
         // Parse WHERE clause
         let where_clause = self.parse_where_clause()?;
 
-        // Parse solution modifiers (though most don't make sense for ASK)
+        // Parse solution modifiers: GROUP BY, HAVING, LIMIT and OFFSET decide
+        // whether a solution remains.
         let modifiers = self.parse_solution_modifiers();
+        let values = self.parse_trailing_values();
 
         let span = start.union(self.stream.previous_span());
 
@@ -32,6 +34,7 @@ impl super::Parser<'_> {
             dataset,
             where_clause,
             modifiers,
+            values,
             span,
         })
     }
@@ -40,6 +43,7 @@ impl super::Parser<'_> {
     ///
     /// DESCRIBE returns RDF data about resources.
     /// Grammar: DESCRIBE ( VarOrIri+ | '*' ) DatasetClause* WhereClause? SolutionModifier
+    /// ValuesClause
     pub(super) fn parse_describe_query(&mut self) -> Option<DescribeQuery> {
         let start = self.stream.current_span();
 
@@ -87,6 +91,7 @@ impl super::Parser<'_> {
 
         // Parse solution modifiers
         let modifiers = self.parse_solution_modifiers();
+        let values = self.parse_trailing_values();
 
         let span = start.union(self.stream.previous_span());
 
@@ -95,6 +100,7 @@ impl super::Parser<'_> {
             dataset,
             where_clause,
             modifiers,
+            values,
             dataset_offset,
             span,
         })
