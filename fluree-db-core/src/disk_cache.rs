@@ -928,6 +928,7 @@ impl ContentStore for CachedContentStore {
             return self.fetch(id, None).await.map(Into::into);
         };
         if let Some(bytes) = read_entry(&path) {
+            crate::storage::record_read(id, "cache", &bytes);
             return Ok(bytes);
         }
         let bytes = self.fetch(id, Some(&path)).await?;
@@ -940,7 +941,11 @@ impl ContentStore for CachedContentStore {
         if let Some(bytes) = self.inner.get_local(id)? {
             return Ok(Some(bytes));
         }
-        Ok(self.entry(id).and_then(|path| read_entry(&path)))
+        let bytes = self.entry(id).and_then(|path| read_entry(&path));
+        if let Some(bytes) = &bytes {
+            crate::storage::record_read(id, "cache", bytes);
+        }
+        Ok(bytes)
     }
 
     async fn get_range(
@@ -952,6 +957,7 @@ impl ContentStore for CachedContentStore {
             .entry(id)
             .and_then(|path| read_entry_range(&path, range.clone()))
         {
+            crate::storage::record_read(id, "cache-range", &bytes);
             return Ok(bytes);
         }
         self.inner.get_range(id, range).await

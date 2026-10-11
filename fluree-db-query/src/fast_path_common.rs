@@ -295,19 +295,27 @@ pub fn cursor_projection_otype_okey() -> ColumnProjection {
 /// - `GEO_POINT` (packed lat/long — not a linear value order) and `BLANK_NODE`;
 /// - overflow big numerics / JSON / vector arena handles (equality-only).
 ///
+/// Inline decimals (`XSD_DECIMAL_INLINE`) ARE admitted: their key is an
+/// order-preserving base-10 float code (raw `u64` order == numeric order), so a
+/// single-`o_type` scan yields them in value order like the other numerics.
+///
 /// Within one `o_type`, this equals the SPARQL `ORDER BY` order; mixing
-/// `o_type`s under one predicate is rejected by the operator at runtime.
+/// `o_type`s under one predicate is rejected by the operator at runtime — which
+/// also means a predicate with both inline and arena (NUM_BIG) decimals can't
+/// use this path, so the inline-only scan never silently drops arena rows.
 #[inline]
 pub const fn is_post_desc_orderable(o_type: u16) -> bool {
     let ot = OType::from_u16(o_type);
     // XSD_BOOLEAN (0x0002), the signed/unsigned/constrained integers and floats
-    // (is_numeric: 0x0003..=0x0012), and the order-preserving temporal types
+    // (is_numeric: 0x0003..=0x0012), the order-preserving temporal types
     // (is_temporal: XSD_DATE 0x0013..=XSD_DURATION 0x001D, minus XSD_DURATION
-    // which is dict-backed). Excludes GEO_POINT (0x001E), BLANK_NODE (0x001F),
-    // and every dict-backed/lang/arena type.
+    // which is dict-backed), and inline decimals (XSD_DECIMAL_INLINE 0x0020).
+    // Excludes GEO_POINT (0x001E), BLANK_NODE (0x001F), and every
+    // dict-backed/lang/arena type.
     o_type == OType::XSD_BOOLEAN.as_u16()
         || ot.is_numeric()
         || (ot.is_temporal() && o_type != OType::XSD_DURATION.as_u16())
+        || o_type == OType::XSD_DECIMAL_INLINE.as_u16()
 }
 
 // ---------------------------------------------------------------------------
@@ -2479,13 +2487,15 @@ pub struct ObjectProbeOps {
 
 impl ObjectProbeOps {
     /// Filter `ops` (one predicate's resolved ops, any sort order) to the
-    /// `IRI_REF` subset and index it object-major. Returns `None` when no op
+    /// `o_type` subset and index it object-major. Returns `None` when no op
     /// can affect the lane — callers then run their unmodified scan.
-    pub fn new(ops: &[fluree_db_binary_index::read::types::OverlayOp]) -> Option<Self> {
-        let iri_ref = OType::IRI_REF.as_u16();
+    pub fn new(
+        ops: &[fluree_db_binary_index::read::types::OverlayOp],
+        o_type: u16,
+    ) -> Option<Self> {
         let mut subset: Vec<ObjectProbeOp> = ops
             .iter()
-            .filter(|o| o.o_type == iri_ref)
+            .filter(|o| o.o_type == o_type)
             .map(|o| ObjectProbeOp {
                 o_key: o.o_key,
                 s_id: o.s_id,
@@ -3917,11 +3927,53 @@ pub fn cursor_fast_path_for_predicate(
     match ctx.policy_enforcer.as_ref() {
         Some(enforcer) => match enforcer.classify_view_predicate(pred_sid) {
             PredicateCoverage::Covered => PredicateFastPath::Decline,
+            // A triple-term object is checked as the triple it names, whose
+            // predicate the view may cover even when this one is not.
+            PredicateCoverage::UncoveredAllow
+                if enforcer.view_restricts_anything()
+                    && predicate_may_hold_triple_terms(ctx, pred_sid) =>
+            {
+                PredicateFastPath::Decline
+            }
             PredicateCoverage::UncoveredAllow => PredicateFastPath::Allow,
             PredicateCoverage::UncoveredDeny => PredicateFastPath::Empty,
         },
         None => PredicateFastPath::Allow,
     }
+}
+
+/// Whether `pred_sid`'s objects in the active graph may include triple terms.
+/// Triple terms carry no datatype tag of their own, so an `UNKNOWN` tag, an
+/// unknown set, or novelty the stats do not see answers yes. Without a store
+/// no lane reads raw rows, so there is nothing to decline.
+fn predicate_may_hold_triple_terms(ctx: &ExecutionContext<'_>, pred_sid: &Sid) -> bool {
+    if fluree_db_core::is_rdf_reifies(pred_sid) {
+        return true;
+    }
+    let Some(store) = ctx.binary_store.as_ref() else {
+        return false;
+    };
+    let Some(p_id) = store.sid_to_p_id(pred_sid) else {
+        return true;
+    };
+    let overlay = ctx.overlay();
+    let stats_see_novelty = overlay
+        .as_any()
+        .downcast_ref::<fluree_db_novelty::Novelty>()
+        .is_some()
+        || overlay.epoch() == 0
+        || overlay.is_effectively_empty();
+    if !stats_see_novelty {
+        return true;
+    }
+    let stats_view = crate::stats_cache::cached_stats_view_for_db(
+        fluree_db_core::GraphDbRef::new(ctx.active_snapshot, ctx.binary_g_id, overlay, ctx.to_t)
+            .with_runtime_small_dicts_opt(ctx.runtime_small_dicts),
+        Some(store),
+        false,
+    );
+    crate::binary_scan::observed_datatypes(stats_view.as_deref(), ctx.binary_g_id, p_id)
+        .is_none_or(|tags| tags.contains(&fluree_db_core::ValueTypeTag::UNKNOWN))
 }
 
 /// Shared single-predicate fast-path gate: normalize `predicate` against
@@ -4362,6 +4414,12 @@ mod tests {
         assert_eq!(
             cursor_fast_path_for_predicate(&ctx_allow, &name),
             PredicateFastPath::Allow
+        );
+        // Links' triple terms are checked as the triples they name, which
+        // the view may cover: never a raw read under a restricting policy.
+        assert_eq!(
+            cursor_fast_path_for_predicate(&ctx_allow, fluree_db_core::rdf_reifies_sid()),
+            PredicateFastPath::Decline
         );
         // Uncovered predicate + default-deny => short-circuit to Empty.
         let ctx_deny = make_ctx(false);

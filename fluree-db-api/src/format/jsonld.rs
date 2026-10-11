@@ -293,6 +293,11 @@ fn write_lit(
     dtc: &fluree_db_core::DatatypeConstraint,
     compactor: &IriCompactor,
 ) -> Result<()> {
+    if let FlakeValue::TripleTerm(term) = val {
+        let node =
+            super::triple_term_node(term, compactor, |o| format_binding(None, o, compactor))?;
+        return push_value(out, &node);
+    }
     let dt = dtc.datatype();
     let dt_full = compactor.decode_sid(dt)?;
     let dt_compact = compactor.compact_sid(dt)?;
@@ -425,6 +430,11 @@ fn format_binding(
         Binding::Iri(iri) => Ok(JsonValue::String(iri.to_string())),
 
         // Literal value - never contains Ref (enforced by Binding::from_object)
+        Binding::Lit {
+            val: FlakeValue::TripleTerm(term),
+            ..
+        } => super::triple_term_node(term, compactor, |o| format_binding(result, o, compactor)),
+
         Binding::Lit { val, dtc, .. } => {
             let dt = dtc.datatype();
             // Full datatype IRI string (e.g., "http://www.w3.org/2001/XMLSchema#string" or "@json")
@@ -512,6 +522,7 @@ fn format_binding(
                     FlakeValue::DayTimeDuration(v) => Ok(JsonValue::String(v.to_string())),
                     FlakeValue::Duration(v) => Ok(JsonValue::String(v.to_string())),
                     FlakeValue::GeoPoint(v) => Ok(JsonValue::String(v.to_string())),
+                    FlakeValue::TripleTerm(_) => unreachable!("rendered as an embedded node"),
                 };
             }
 
@@ -561,6 +572,7 @@ fn format_binding(
                 FlakeValue::DayTimeDuration(v) => JsonValue::String(v.to_string()),
                 FlakeValue::Duration(v) => JsonValue::String(v.to_string()),
                 FlakeValue::GeoPoint(v) => JsonValue::String(v.to_string()),
+                FlakeValue::TripleTerm(_) => unreachable!("rendered as an embedded node"),
             };
 
             Ok(json!({

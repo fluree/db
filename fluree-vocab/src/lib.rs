@@ -581,6 +581,9 @@ pub mod rdf_names {
 
     /// rdf:nil local name
     pub const NIL: &str = "nil";
+
+    /// rdf:reifies local name (RDF 1.2 reifier predicate)
+    pub const REIFIES: &str = "reifies";
 }
 
 /// OWL vocabulary constants
@@ -1631,6 +1634,9 @@ pub mod fluree {
     /// The `@fulltext` shorthand in JSON-LD resolves to this IRI.
     pub const FULL_TEXT: &str = "https://ns.flur.ee/db#fullText";
 
+    /// f:tripleTerm — datatype marker of an RDF 1.2 triple-term object
+    pub const TRIPLE_TERM: &str = "https://ns.flur.ee/db#tripleTerm";
+
     /// Full IRI for db:t predicate (used in RDF-Star annotation matching)
     pub const DB_T: &str = "https://ns.flur.ee/db#t";
 
@@ -1917,6 +1923,10 @@ pub mod db {
     /// edge is a list element. Always omitted in v1 (list-occurrence
     /// annotations are deferred).
     pub const REIFIES_LIST_INDEX: &str = "reifiesListIndex";
+
+    /// db:tripleTerm - the datatype marker Fluree gives an RDF 1.2 triple
+    /// term object (`<<( s p o )>>`), the way `@id` marks a reference.
+    pub const TRIPLE_TERM: &str = "tripleTerm";
 }
 
 /// Edge-annotation system predicate IRIs (`https://ns.flur.ee/db#reifies*`).

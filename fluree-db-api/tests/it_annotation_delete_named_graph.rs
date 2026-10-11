@@ -1,13 +1,6 @@
-//! Deleting a named-graph annotation by id retracts its whole bundle and
-//! its body in that graph.
-//!
-//! The by-id delete names the bundle's subject, predicate and object slots.
-//! The cascade then cleaned up the annotation's body (LPG mode) through a
-//! range read whose index-resident rows carry no graph, so the body's
-//! retraction landed in the default graph and the body survived in its own
-//! graph. And nothing retracted the bundle's `f:reifiesGraph` anchor, which
-//! stayed behind describing nothing. Both now come from the stored facts of
-//! the annotation, graph stamped.
+//! Deleting a named-graph annotation by id, in LPG mode, retracts its
+//! `rdf:reifies` link and its body in that graph, and nothing in the default
+//! graph.
 
 use crate::support;
 use fluree_db_api::{FlureeBuilder, LedgerState};
@@ -19,7 +12,7 @@ const EX: &str = "http://example.org/";
 const G1: &str = "http://example.org/g1";
 
 /// Every current fact of `subject` in `graph` (None = default), as
-/// `pred=value`, sorted — `f:reifies*` included.
+/// `pred=value`, sorted — `rdf:reifies` included.
 async fn facts(ledger: &LedgerState, graph: Option<&str>, subject: &str) -> Vec<String> {
     let g_id = match graph {
         None => 0,
@@ -58,7 +51,7 @@ async fn facts(ledger: &LedgerState, graph: Option<&str>, subject: &str) -> Vec<
 }
 
 #[tokio::test]
-async fn by_id_delete_of_a_named_graph_annotation_retracts_bundle_and_body_in_that_graph() {
+async fn by_id_delete_of_a_named_graph_annotation_retracts_link_and_body_in_that_graph() {
     for indexed in [false, true] {
         let dir = tempfile::tempdir().expect("tempdir");
         let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
@@ -90,7 +83,7 @@ async fn by_id_delete_of_a_named_graph_annotation_retracts_bundle_and_body_in_th
         }
         let before = facts(&ledger, Some(G1), "empA").await;
         assert!(
-            before.iter().any(|f| f.starts_with("reifiesGraph="))
+            before.iter().any(|f| f.starts_with("reifies=TripleTerm"))
                 && before.iter().any(|f| f == "role=Engineer"),
             "indexed={indexed}: precondition {before:?}"
         );
@@ -115,7 +108,7 @@ async fn by_id_delete_of_a_named_graph_annotation_retracts_bundle_and_body_in_th
             assert_eq!(
                 facts(&ledger, Some(G1), "empA").await,
                 Vec::<String>::new(),
-                "indexed={indexed}, {phase}: the bundle (anchor included) and the body are gone"
+                "indexed={indexed}, {phase}: the link and the body are gone"
             );
             assert_eq!(
                 facts(&ledger, Some(G1), "alice").await,
@@ -131,8 +124,8 @@ async fn by_id_delete_of_a_named_graph_annotation_retracts_bundle_and_body_in_th
         // Nothing of the annotation's was ever in the default graph, so
         // nothing may be retracted there.
         assert_eq!(
-            r.receipt.retract_count, 5,
-            "indexed={indexed}: three named slots, the anchor, and the body"
+            r.receipt.retract_count, 2,
+            "indexed={indexed}: the link and the body"
         );
     }
 }

@@ -2634,7 +2634,7 @@ fn nested_triple_term_in_subject_is_rejected() {
         &format!(
             "{RDF_PREFIX}{EX_PREFIX}SELECT * WHERE {{ ?ann rdf:reifies <<( <<( ex:a ex:b ex:c )>> ex:p ex:o )>> . }}"
         ),
-        "nested triple terms",
+        "cannot be a triple term",
     );
 }
 

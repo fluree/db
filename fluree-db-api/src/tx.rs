@@ -2257,8 +2257,7 @@ fn bounded_read_subjects(
         return None;
     }
     let retracts = !txn.delete_templates.is_empty() || txn.txn_type == TxnType::Upsert;
-    if retracts && (ledger.snapshot.has_annotations || ledger.novelty.attachments.has_annotations())
-    {
+    if retracts && (ledger.snapshot.has_annotations || ledger.novelty.has_annotations()) {
         return None;
     }
 

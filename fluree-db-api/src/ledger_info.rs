@@ -6,7 +6,8 @@
 //!
 //! ```json
 //! {
-//!   "ledger": { "alias", "t", "commit-t", "index-t", "flakes", "size", "named-graphs" },
+//!   "ledger": { "alias", "t", "commit-t", "index-t", "flakes", "size", "named-graphs",
+//!               "needs-link-reindex" (only when true) },
 //!   "graph": "urn:default",
 //!   "stats": { "flakes", "size", "properties": { ... }, "classes": { ... } },
 //!   "commit": { ... },
@@ -151,6 +152,14 @@ pub struct Ledger {
     /// Registered named graphs (always includes `urn:default`).
     #[serde(rename = "named-graphs")]
     pub named_graphs: Vec<NamedGraph>,
+    /// The index predates RDF 1.2 triple-term links: the ledger's
+    /// annotations read only after a full reindex. Omitted when false.
+    #[serde(
+        rename = "needs-link-reindex",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub needs_link_reindex: bool,
 }
 
 /// One entry in `ledger.named-graphs`.
@@ -818,6 +827,7 @@ fn build_ledger_block(ledger: &LedgerState, stats: &IndexStats) -> Ledger {
         flakes: Some(stats.flakes as i64),
         size: stats.size,
         named_graphs,
+        needs_link_reindex: ledger.snapshot.needs_link_reindex,
     }
 }
 
@@ -1533,6 +1543,7 @@ pub fn build_virtual_ledger_info(
                 flakes: total_rows,
                 size: 0,
             }],
+            needs_link_reindex: false,
         },
         graph: DEFAULT_GRAPH_IRI.to_string(),
         stats: Stats {

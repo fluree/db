@@ -100,6 +100,20 @@ impl PropertyStatEntry {
     }
 }
 
+// === Reification Link Statistics ===
+
+/// Live `rdf:reifies` links whose triple term has one inner predicate,
+/// ledger-wide. A predicate's handle interval holds its terms, not its live
+/// links: one term can have many reifiers, and a term outlives its retracted
+/// links, so the planner reads this count instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkStatEntry {
+    /// The inner predicate's SID as (namespace_code, name).
+    pub sid: (u16, String),
+    /// Live links.
+    pub count: u64,
+}
+
 // === Index Statistics ===
 
 /// Index statistics (fast estimates).
@@ -158,6 +172,9 @@ pub struct IndexStats {
     ///   unknown — permanently for that chain, until a full rebuild resets
     ///   the boundary to genesis.
     pub historical_since_t: Option<i64>,
+    /// Live `rdf:reifies` links per inner predicate. `None` when the stats
+    /// predate the count, which consumers must read as unknown.
+    pub links: Option<Vec<LinkStatEntry>>,
 }
 
 impl IndexStats {

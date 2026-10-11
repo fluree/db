@@ -496,11 +496,11 @@ async fn an_identical_refresh_with_blank_nodes_commits_nothing() {
 }
 
 /// Replacing an annotated language-tagged value retracts the edge as
-/// stored, which lets the annotation cascade find and retract the edge's
-/// `f:reifies*` bundle. With the tag dropped the retraction named no stored
-/// edge, so both the old value and its annotation survived.
+/// stored. With the tag dropped the retraction named no stored edge, so the
+/// old value survived. Outside LPG mode RDF 1.2 entails no cascade: the
+/// reifier's link outlives the edge it names.
 #[tokio::test]
-async fn upsert_over_an_annotated_lang_value_cascades_the_annotation() {
+async fn upsert_over_an_annotated_lang_value_retracts_the_edge_as_stored() {
     for indexed in [false, true] {
         let mut h = Harness::new(&format!("annotated-{indexed}")).await;
         h.insert(&jsonld(json!({
@@ -522,18 +522,19 @@ async fn upsert_over_an_annotated_lang_value_cascades_the_annotation() {
             vec!["label=b@en"],
             "indexed={indexed}"
         );
-        // The edge, its bundle and the anonymous annotation's body.
-        assert!(
-            receipt.retract_count > 1,
-            "indexed={indexed}: the annotation cascade must retract the bundle \
-             (retracts={})",
-            receipt.retract_count
+        assert_eq!(
+            receipt.retract_count, 1,
+            "indexed={indexed}: only the replaced edge"
         );
         let annotations =
             support::decode_annotations_for_subject(h.ledger(), 0, &format!("{EX}s")).await;
-        assert!(
-            annotations.is_empty(),
-            "indexed={indexed}: the retracted edge keeps no annotation: {annotations:?}"
+        assert_eq!(
+            annotations
+                .iter()
+                .map(|k| (k.o.clone(), k.lang.clone()))
+                .collect::<Vec<_>>(),
+            [(FlakeValue::String("a".into()), Some("en".to_string()))],
+            "indexed={indexed}: the link still names the replaced edge"
         );
     }
 }

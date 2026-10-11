@@ -137,9 +137,14 @@ impl ApiFulltextConfigProvider {
         }
 
         // 1. Load ledger state (snapshot + novelty).
-        let mut state = LedgerState::load(self.nameservice.as_ref(), ledger_id, &self.backend)
-            .await
-            .map_err(|e| format!("LedgerState::load: {e}"))?;
+        let (mut state, root) = LedgerState::load_decoding_root(
+            self.nameservice.as_ref(),
+            ledger_id,
+            &self.backend,
+            crate::ledger_manager::decode_index_root,
+        )
+        .await
+        .map_err(|e| format!("LedgerState::load: {e}"))?;
 
         // 2. If an index exists, load the binary store so the config graph
         //    can be read via the indexed side too. Without this, only
@@ -152,6 +157,7 @@ impl ApiFulltextConfigProvider {
             &mut state,
             Some(Arc::clone(&self.leaflet_cache)),
             None,
+            root,
         )
         .await
         .map_err(|e| format!("load binary index store: {e}"))?;

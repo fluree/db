@@ -1226,11 +1226,7 @@ async fn stage_commit_flakes(
 ) -> std::result::Result<fluree_db_ledger::StagedLedger, fluree_db_transact::TransactError> {
     let mut options = fluree_db_transact::StageOptions::new()
         .with_index_config(index_config)
-        .with_graph_sids(graph_sids)
-        // Push applies commits that were authored and written elsewhere, so
-        // authoring invariants are advisory here. See
-        // `StageOptions::replaying_commit`.
-        .replaying_commit();
+        .with_graph_sids(graph_sids);
     if let Some(policy_ctx) = policy_ctx.filter(|p| !p.wrapper().is_root()) {
         options = options.with_policy(policy_ctx);
     }
@@ -1479,11 +1475,19 @@ fn apply_pushed_commits_to_state(
         })?;
         Arc::make_mut(&mut runtime_small_dicts).populate_from_flakes(flakes);
         // Apply to novelty.
-        novelty
+        let links = novelty
             .apply_commit(flakes.clone(), *t, &reverse_graph)
             .map_err(|e| {
                 PushError::Internal(format!("novelty apply_commit failed at t={t}: {e}"))
             })?;
+        fluree_db_binary_index::dict_novelty_safe::populate_dict_novelty_safe(
+            Arc::make_mut(&mut dict_novelty),
+            store_opt,
+            links.iter(),
+        )
+        .map_err(|e| {
+            PushError::Internal(format!("populate_dict_novelty_safe failed at t={t}: {e}"))
+        })?;
     }
 
     base.novelty = Arc::new(novelty);

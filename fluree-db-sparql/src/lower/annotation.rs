@@ -3,19 +3,18 @@
 //! Translates the AST shapes (`TriplePattern.annotation`,
 //! `GraphPattern::AnnotationTarget`, and reified-triple terms
 //! `SubjectTerm::QuotedTriple` / `Term::QuotedTriple`) into the
-//! existing query IR (`Pattern::EdgeAnnotation` and
-//! `Pattern::AnnotationTarget`). The IR's
-//! `expand_edge_annotation_patterns` step (in `fluree-db-query`)
-//! handles the f:reifies* fan-out from there.
+//! query IR: annotation syntax to `Pattern::EdgeAnnotation`, whose
+//! `f:reifies*` fan-out `expand_edge_annotation_patterns` (in
+//! `fluree-db-query`) handles, and reified triples to the `rdf:reifies`
+//! link (`fluree_db_query::ir::lower_reified_link`).
 //!
 //! Reified triples desugar exactly per SPARQL 1.2: a `<< s p o ~ r? >>`
 //! term denotes its reifier node `r` (fresh when unnamed) and adds the
 //! pattern `r rdf:reifies <<( s p o )>>` — emitted here as a sibling
-//! `Pattern::AnnotationTarget`. Nested reified triples recurse.
+//! link. Nested reified triples recurse.
 //!
-//! Sibling triples about a reifier variable are NOT folded into
-//! `body` — they sit in the surrounding scope and join via the
-//! standard executor on the bound reifier var. See
+//! Sibling triples about a reifier variable sit in the surrounding
+//! scope and join via the standard executor on the bound reifier var. See
 //! `docs/concepts/edge-annotations.md` "SPARQL 1.2 / RDF 1.2 surface"
 //! for the rationale.
 
@@ -25,7 +24,7 @@ use crate::span::SourceSpan;
 
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_query::ir::triple::{Ref, Term as IrTerm, TriplePattern as IrTriplePattern};
-use fluree_db_query::ir::Pattern;
+use fluree_db_query::ir::{lower_reified_link, Pattern};
 use fluree_db_query::parse::encode::IriEncoder;
 
 use std::collections::HashMap;
@@ -33,11 +32,15 @@ use std::collections::HashMap;
 use super::path::PathObject;
 use super::{LoweringContext, Result};
 
-/// Prefix used for registry names of synthetic variables that must
-/// stay invisible to `SELECT *` and unmatchable by user input. `#`
-/// is comment-start in SPARQL, so no user variable can lex with this
-/// prefix.
-pub(super) const INTERNAL_VAR_PREFIX: &str = "#";
+/// Registry-name prefix of the variable an anonymous reifier (`{| |}`, a
+/// bare `~`) lowers to. `#` is comment-start in SPARQL, so no user variable
+/// can lex with it, and `SELECT *` hides it.
+pub(super) const ANONYMOUS_REIFIER_PREFIX: &str = "?#__ann_";
+
+/// The variable an anonymous reifier lowers to.
+pub(super) fn is_anonymous_reifier(name: &str) -> bool {
+    name.starts_with(ANONYMOUS_REIFIER_PREFIX)
+}
 
 /// Per-BGP memo of already-desugared reified-triple occurrences, keyed
 /// by source span. A quoted triple shared across several triple
@@ -64,6 +67,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 edge: edge.clone(),
                 annotation: annotation_ref,
                 body,
+                term: fluree_db_query::ir::term_components::fresh_term_var(self.vars),
             });
         }
         Ok(())
@@ -71,10 +75,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
     /// Lower a `GraphPattern::AnnotationTarget` (the
     /// `?ann rdf:reifies <<( s p o )>>` form and the standalone
-    /// reified-triple statement it desugars from) into
-    /// `Pattern::AnnotationTarget` IR (plus any sibling targets from
-    /// nested reified triples inside the triple term). Emits an empty
-    /// body — surrounding sibling triples about the reifier join
+    /// reified-triple statement it desugars from) into the link (plus
+    /// sibling links from nested reified triples inside the triple
+    /// term). Surrounding sibling triples about the reifier join
     /// through the standard executor.
     pub(super) fn lower_annotation_target_pattern(
         &mut self,
@@ -84,17 +87,13 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         let mut out = Vec::new();
         let annotation_ref = self.lower_subject(reifier)?;
         let edge = self.lower_triple_term(triple_term, &mut out)?;
-        out.push(Pattern::AnnotationTarget {
-            annotation: annotation_ref,
-            edge,
-            body: Vec::new(),
-        });
+        lower_reified_link(annotation_ref, edge, self.encoder, self.vars, &mut out);
         Ok(out)
     }
 
     /// Desugar an RDF 1.2 reified triple `<< s p o ~ r? >>` used as a
-    /// term: emit `r rdf:reifies <<( s p o )>>` (as
-    /// `Pattern::AnnotationTarget`) into `out` and return the reifier
+    /// term: emit the link `r rdf:reifies <<( s p o )>>` into `out` and
+    /// return the reifier
     /// ref that stands in the reified triple's position. Nested
     /// reified triples in `s`/`o` recurse; repeated occurrences (same
     /// source span) reuse the memoized reifier.
@@ -118,11 +117,13 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         let p = self.lower_predicate(&qt.predicate)?;
         let (o, dtc) = self.lower_object_desugared(&qt.object, cache, out, true)?;
 
-        out.push(Pattern::AnnotationTarget {
-            annotation: annotation_ref.clone(),
-            edge: IrTriplePattern { s, p, o, dtc },
-            body: Vec::new(),
-        });
+        lower_reified_link(
+            annotation_ref.clone(),
+            IrTriplePattern { s, p, o, dtc },
+            self.encoder,
+            self.vars,
+            out,
+        );
         cache.insert(qt.span, annotation_ref.clone());
         Ok(annotation_ref)
     }
@@ -143,6 +144,15 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             SparqlTerm::QuotedTriple(qt) => {
                 let r = self.lower_reified_triple(qt, cache, out)?;
                 Ok((r.into(), None))
+            }
+            SparqlTerm::TripleTerm(tt) => {
+                let term = self.lower_triple_term(tt, out)?;
+                Ok(fluree_db_query::ir::lower_term_object(
+                    term,
+                    self.encoder,
+                    self.vars,
+                    out,
+                ))
             }
             other if with_constraint => self.lower_object_with_constraint(other),
             other => self.lower_object_with_term_constraint(other),
@@ -173,11 +183,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 // as a comment-start outside string literals, so no user
                 // variable can ever lex with this name. `lower_select_clause`
                 // filters these out of `SELECT *` expansion.
-                let var_id = self.vars.get_or_insert(&format!(
-                    "?{}__ann_{}",
-                    INTERNAL_VAR_PREFIX,
-                    self.vars.len()
-                ));
+                let var_id = self
+                    .vars
+                    .get_or_insert(&format!("{ANONYMOUS_REIFIER_PREFIX}{}", self.vars.len()));
                 Ok(Ref::Var(var_id))
             }
         }
@@ -186,8 +194,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     /// Lower the `{| verb obj ; verb obj |}` body to a flat list of
     /// patterns whose subject is the reifier: `Pattern::Triple` for
     /// simple predicates, property-path patterns for path verbs
-    /// (`{| :r/:q 'x' |}`), plus sibling `Pattern::AnnotationTarget`s
-    /// for reified-triple objects.
+    /// (`{| :r/:q 'x' |}`), plus sibling links for reified-triple objects.
     ///
     /// Each entry's object is lowered through
     /// `lower_object_with_constraint` so literal objects pin the scan

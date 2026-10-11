@@ -635,6 +635,20 @@ pub enum TemplateTerm {
 
     /// Blank node (will be skolemized to a Sid during flake generation)
     BlankNode(String),
+
+    /// An RDF 1.2 triple term, its positions resolved per solution; only an
+    /// object position takes one.
+    TripleTerm(Box<TemplateTripleTerm>),
+}
+
+/// The positions of a [`TemplateTerm::TripleTerm`], with the object's
+/// datatype or language tag when the template declares one.
+#[derive(Debug, Clone)]
+pub struct TemplateTripleTerm {
+    pub s: TemplateTerm,
+    pub p: TemplateTerm,
+    pub o: TemplateTerm,
+    pub dtc: Option<fluree_db_core::DatatypeConstraint>,
 }
 
 impl TemplateTerm {
@@ -651,6 +665,18 @@ impl TemplateTerm {
     /// Check if this term is bound (not a variable)
     pub fn is_bound(&self) -> bool {
         !self.is_var()
+    }
+
+    /// This term, or each position of a triple term, recursively.
+    pub fn for_each_leaf<'a>(&'a self, f: &mut impl FnMut(&'a TemplateTerm)) {
+        match self {
+            TemplateTerm::TripleTerm(t) => {
+                for term in [&t.s, &t.p, &t.o] {
+                    term.for_each_leaf(f);
+                }
+            }
+            leaf => f(leaf),
+        }
     }
 }
 

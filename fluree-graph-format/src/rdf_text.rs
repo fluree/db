@@ -245,9 +245,19 @@ fn push_nt_term(out: &mut String, term: &Term) {
             language,
         } => {
             push_quoted(out, value);
+            // Tags are case-insensitive; the canonical form is lowercase.
+            let language = language.as_deref().map(str::to_ascii_lowercase);
             push_literal_suffix(out, datatype, language.as_deref(), |out, iri| {
                 syntax::push_iri_ref(out, iri);
             });
+        }
+        Term::TripleTerm(t) => {
+            out.push_str("<<( ");
+            for term in t.iter() {
+                push_nt_term(out, term);
+                out.push(' ');
+            }
+            out.push_str(")>>");
         }
     }
 }
@@ -271,6 +281,14 @@ fn push_turtle_term(out: &mut String, term: &Term, prefixes: &PrefixMap) {
             push_literal_suffix(out, datatype, language.as_deref(), |out, iri| {
                 prefixes.push_iri(out, iri);
             });
+        }
+        Term::TripleTerm(t) => {
+            out.push_str("<<( ");
+            for term in t.iter() {
+                push_turtle_term(out, term, prefixes);
+                out.push(' ');
+            }
+            out.push_str(")>>");
         }
     }
 }

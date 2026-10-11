@@ -37,6 +37,7 @@ pub mod error;
 pub mod expand;
 pub mod iri;
 pub mod normalize;
+pub mod triple_term;
 
 // GraphSink adapter for emitting triples to fluree-graph-ir
 pub mod adapter;

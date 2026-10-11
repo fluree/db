@@ -537,6 +537,54 @@ async fn user_graph_iris(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> Vec
     out
 }
 
+/// A `GRAPH ?g` name is an IRI an INSERT template can write as a subject or
+/// an object.
+#[tokio::test]
+async fn test_sparql_update_writes_graph_names_as_terms() {
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/sparql-update-graph-name-terms:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = run_sparql_update(
+        &fluree,
+        ledger,
+        r#"INSERT DATA {
+            GRAPH <https://example.org/g/1> { <https://example.org/a> <https://example.org/status> "x" . }
+            GRAPH <https://example.org/g/2> { <https://example.org/b> <https://example.org/status> "y" . }
+        }"#,
+    )
+    .await
+    .ledger;
+    run_sparql_update(
+        &fluree,
+        ledger,
+        r"INSERT { ?s <https://example.org/source> ?g . ?g <https://example.org/holds> ?s }
+           WHERE { GRAPH ?g { ?s <https://example.org/status> ?o } }",
+    )
+    .await;
+    assert_eq!(
+        graph_values(
+            &fluree,
+            ledger_id,
+            "https://example.org/a",
+            "https://example.org/source"
+        )
+        .await,
+        vec!["https://example.org/g/1"]
+    );
+    assert_eq!(
+        graph_values(
+            &fluree,
+            ledger_id,
+            "https://example.org/g/2",
+            "https://example.org/holds"
+        )
+        .await,
+        vec!["https://example.org/b"]
+    );
+}
+
 #[tokio::test]
 async fn test_sparql_update_graph_variable_rewrites_in_place() {
     // #1513: DELETE/INSERT with `GRAPH ?g` templates rewrites each match in

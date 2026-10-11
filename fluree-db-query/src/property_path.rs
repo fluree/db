@@ -80,7 +80,7 @@ pub fn path_max_visited() -> usize {
 /// properties are already excluded by the `Ref`-object filter in the scan.
 #[inline]
 pub(crate) fn is_reserved_edge_predicate(p: &Sid) -> bool {
-    fluree_db_core::is_rdf_type(p) || fluree_db_core::is_reserved_reifies_predicate(p)
+    fluree_db_core::is_rdf_type(p) || fluree_db_core::is_scan_hidden_predicate(p)
 }
 
 /// Re-encode a pattern-constant predicate `Sid` into the active graph's dict,
@@ -699,7 +699,7 @@ impl PropertyPathOperator {
             // cancellation poll, so it polls here — a large `?s :p* ?o` stays
             // killable by the query timeout instead of running to completion.
             crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
-            if fluree_db_core::is_reserved_reifies_predicate(&flake.p) {
+            if fluree_db_core::is_scan_hidden_predicate(&flake.p) {
                 continue;
             }
             let Flake { s, o, dt, m, .. } = flake;

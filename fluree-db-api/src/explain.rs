@@ -8,7 +8,7 @@ use crate::format::iri::IriCompactor;
 use crate::query::helpers::{parse_jsonld_query, parse_sparql_to_ir};
 use fluree_db_core::{is_rdf_type, StatsView};
 use fluree_db_query::{
-    expand_edge_annotation_patterns, explain_execution_hints, parse_query, ExplainPlan,
+    expand_edge_annotation_patterns_for, explain_execution_hints, parse_query, ExplainPlan,
     OptimizationStatus, Pattern, Query, Ref, Term, TriplePattern, VarId, VarRegistry,
 };
 use serde_json::{json, Map, Value as JsonValue};
@@ -71,58 +71,6 @@ fn triple_pattern_to_user_object(
     })
 }
 
-/// If the triple's predicate is one of the seven `f:reifies*` system
-/// predicates, return a short slot name. Used by `/explain` to tag
-/// triples that came from edge-annotation expansion so the planner's
-/// chosen ordering (annotation-first vs edge-first probe) is
-/// observable.
-fn annotation_role_for(tp: &TriplePattern) -> Option<&'static str> {
-    use fluree_db_core::namespaces::{
-        is_reifies_datatype, is_reifies_graph, is_reifies_lang, is_reifies_list_index,
-        is_reifies_object, is_reifies_predicate, is_reifies_subject,
-    };
-    use fluree_vocab::reifies_iris;
-
-    let by_sid = match &tp.p {
-        Ref::Sid(sid) => {
-            if is_reifies_subject(sid) {
-                Some("subject")
-            } else if is_reifies_predicate(sid) {
-                Some("predicate")
-            } else if is_reifies_object(sid) {
-                Some("object")
-            } else if is_reifies_graph(sid) {
-                Some("graph")
-            } else if is_reifies_datatype(sid) {
-                Some("datatype")
-            } else if is_reifies_lang(sid) {
-                Some("lang")
-            } else if is_reifies_list_index(sid) {
-                Some("listIndex")
-            } else {
-                None
-            }
-        }
-        _ => None,
-    };
-    if by_sid.is_some() {
-        return by_sid;
-    }
-    if let Ref::Iri(iri) = &tp.p {
-        return match iri.as_ref() {
-            reifies_iris::SUBJECT => Some("subject"),
-            reifies_iris::PREDICATE => Some("predicate"),
-            reifies_iris::OBJECT => Some("object"),
-            reifies_iris::GRAPH => Some("graph"),
-            reifies_iris::DATATYPE => Some("datatype"),
-            reifies_iris::LANG => Some("lang"),
-            reifies_iris::LIST_INDEX => Some("listIndex"),
-            _ => None,
-        };
-    }
-    None
-}
-
 fn normalize_ref_snap(snapshot: &fluree_db_core::LedgerSnapshot, r: &Ref) -> Ref {
     match r {
         Ref::Iri(iri) => snapshot
@@ -172,12 +120,13 @@ fn logical_node(
     vars: &VarRegistry,
     compactor: &IriCompactor,
     stats: Option<&StatsView>,
+    pins: &std::collections::HashMap<VarId, fluree_db_core::Sid>,
     bound_vars: &HashSet<VarId>,
 ) -> JsonValue {
-    use fluree_db_query::planner::{estimate_pattern, PatternEstimate};
+    use fluree_db_query::planner::{estimate_in_group, PatternEstimate};
 
     let mut node = Map::new();
-    let category = match estimate_pattern(p, bound_vars, stats) {
+    let category = match estimate_in_group(p, pins, bound_vars, stats) {
         PatternEstimate::Source { row_count } => {
             node.insert(
                 "estimate".into(),
@@ -202,10 +151,11 @@ fn logical_node(
     // sees it). A fresh local per list means UNION branches each start from `bound_vars`.
     let children = |ps: &[Pattern]| -> JsonValue {
         let mut local = bound_vars.clone();
+        let pins = fluree_db_query::planner::link_pins(ps);
         JsonValue::Array(
             ps.iter()
                 .map(|c| {
-                    let n = logical_node(c, vars, compactor, stats, &local);
+                    let n = logical_node(c, vars, compactor, stats, &pins, &local);
                     local.extend(c.produced_vars());
                     n
                 })
@@ -281,6 +231,19 @@ fn logical_node(
             );
             node.insert("rows".into(), json!(rows.len()));
         }
+        Pattern::TermComponents(tc) => {
+            node.insert("kind".into(), json!("term-components"));
+            node.insert("term".into(), json!(vars.name(tc.term).to_string()));
+            node.insert(
+                "vars".into(),
+                json!(tc
+                    .components()
+                    .into_iter()
+                    .filter_map(fluree_db_query::ir::Component::var)
+                    .map(|v| vars.name(v).to_string())
+                    .collect::<Vec<_>>()),
+            );
+        }
         Pattern::PropertyPath(pp) => {
             node.insert("kind".into(), json!("property-path"));
             node.insert(
@@ -328,10 +291,6 @@ fn logical_node(
         }
         Pattern::EdgeAnnotation { body, .. } => {
             node.insert("kind".into(), json!("edge-annotation"));
-            node.insert("patterns".into(), children(body));
-        }
-        Pattern::AnnotationTarget { body, .. } => {
-            node.insert("kind".into(), json!("annotation-target"));
             node.insert("patterns".into(), children(body));
         }
     }
@@ -409,19 +368,12 @@ fn plan_patterns_to_json(
             inputs.insert("fallback".to_string(), json!(inp.fallback));
         }
 
-        let mut entry = json!({
+        json!({
             "type": typ,
             "pattern": triple_pattern_to_user_object(tp, vars, compactor),
             "selectivity": selectivity,
             "inputs": JsonValue::Object(inputs),
-        });
-        if let Some(role) = annotation_role_for(tp) {
-            entry
-                .as_object_mut()
-                .expect("entry is object")
-                .insert("annotation-role".to_string(), json!(role));
-        }
-        entry
+        })
     };
 
     // Original order is the query's triple pattern order.
@@ -505,12 +457,11 @@ fn explain_from_parsed(
                 Pattern::Subquery(sq) => {
                     collect_triples_in_order(out, &sq.patterns, normalize_ref, normalize_term);
                 }
-                // The `DefaultGraphSource` wrapper is introduced by
-                // `expand_edge_annotation_patterns` to keep `f:reifies*`
-                // lookups per-source-correlated in multi-graph default
-                // contexts. For explain purposes the triples inside it
-                // are the ones the optimizer sees, so recurse like
-                // `Graph` does.
+                // The `DefaultGraphSource` wrapper is introduced by the
+                // edge-annotation expansion to keep a chain per-source-
+                // correlated under a default-graph union. For explain
+                // purposes the triples inside it are the ones the optimizer
+                // sees, so recurse like `Graph` does.
                 Pattern::DefaultGraphSource { patterns, .. } => {
                     collect_triples_in_order(out, patterns, normalize_ref, normalize_term);
                 }
@@ -521,13 +472,12 @@ fn explain_from_parsed(
         }
     }
 
-    // Expand edge-annotation IR into the same triple chain the
-    // executor uses (`Pattern::EdgeAnnotation` /
-    // `Pattern::AnnotationTarget` → base edge + 3 `f:reifies*` lookups
-    // + body). Without this, edge-annotation queries appear as empty
-    // in `/explain` output because `collect_triples_in_order` doesn't
-    // descend into those container patterns.
-    let expanded_patterns = expand_edge_annotation_patterns(&parsed.patterns);
+    // Expand edge-annotation IR into the same chain the executor uses
+    // (`Pattern::EdgeAnnotation` → body + the reifier's link + base edge).
+    // Without this, edge-annotation queries appear as empty in `/explain`
+    // output because `collect_triples_in_order` doesn't descend into those
+    // container patterns. A single ledger's default graph is one graph.
+    let expanded_patterns = expand_edge_annotation_patterns_for(&parsed.patterns, false);
 
     let mut triples_in_order = Vec::new();
     collect_triples_in_order(
@@ -537,22 +487,10 @@ fn explain_from_parsed(
         &normalize_term,
     );
 
-    // Build a stats view from whatever is available on the snapshot.
-    // Mirrors `stats_cache::cached_stats_view_for_db`: when only the
-    // annotation index is present (e.g. on a freshly-arena-built ledger
-    // before regular stats land), the merged `f:reifies*` entries are
-    // still useful for planning. Without this, `/explain` would report
-    // "no stats" while the planner happily uses arena-derived stats.
-    let stats_view = if snapshot.stats.is_some() || snapshot.annotation_index.is_some() {
-        let base = snapshot.stats.clone().unwrap_or_default();
-        let mut view = StatsView::from_db_stats_with_namespaces(&base, snapshot);
-        if let Some(ann) = snapshot.annotation_index.as_ref() {
-            view.merge_annotation_stats(&ann.stats, snapshot.namespaces());
-        }
-        Some(view)
-    } else {
-        None
-    };
+    let stats_view = snapshot
+        .stats
+        .as_ref()
+        .map(|stats| StatsView::from_db_stats_with_namespaces(stats, snapshot));
     let stats_available = stats_view
         .as_ref()
         .map(fluree_db_core::StatsView::has_property_stats)
@@ -578,11 +516,12 @@ fn explain_from_parsed(
         // Thread the evolving bound-var set through the ordered plan so each node's
         // estimate is context-aware (a bound-subject scan, not a full predicate scan).
         let mut bound: HashSet<VarId> = HashSet::new();
+        let pins = fluree_db_query::planner::link_pins(&ordered);
         JsonValue::Array(
             ordered
                 .iter()
                 .map(|p| {
-                    let n = logical_node(p, vars, &compactor, stats_view.as_ref(), &bound);
+                    let n = logical_node(p, vars, &compactor, stats_view.as_ref(), &pins, &bound);
                     bound.extend(p.produced_vars());
                     n
                 })
@@ -627,8 +566,7 @@ fn explain_from_parsed(
     let (original, optimized) =
         plan_patterns_to_json(&explain, &triples_in_order, vars, &compactor);
 
-    // Minimal statistics summary (stable + useful). `total-flakes` is
-    // zero when only annotation-derived stats are available.
+    // Minimal statistics summary (stable + useful).
     let total_flakes = snapshot.stats.as_ref().map(|s| s.flakes).unwrap_or(0);
     let statistics = json!({
         "total-flakes": total_flakes,

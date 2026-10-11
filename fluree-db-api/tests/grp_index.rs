@@ -9,6 +9,8 @@ mod it_disk_cache_locality;
 mod it_duration_index_roundtrip;
 #[path = "it_fwd_pack_compaction.rs"]
 mod it_fwd_pack_compaction;
+#[path = "it_index_root_reads.rs"]
+mod it_index_root_reads;
 #[path = "it_index_sweep.rs"]
 mod it_index_sweep;
 #[path = "it_indexing_fuel.rs"]

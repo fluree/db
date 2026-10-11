@@ -51,7 +51,9 @@ use std::collections::{BTreeMap, HashMap};
 /// Several reifiers on one edge produce one annotated object value each
 /// (the parallel-annotation shape). A reification is attached to the first
 /// occurrence of its base triple only, so a document that states an edge
-/// twice does not mint its bundle twice.
+/// twice does not mint its bundle twice. A reification whose triple the
+/// graph does not assert becomes a node naming it with `@reifies`:
+/// `{ "@id": r, "@reifies": { "@id": s, p: o } }`.
 ///
 /// # Errors
 ///
@@ -64,7 +66,7 @@ pub fn graph_to_transaction_json(graph: &Graph) -> Result<JsonValue> {
     if let Some(r) = graph
         .reifications()
         .iter()
-        .find(|r| r.triple.p.as_iri() == Some(RDF_TYPE_IRI))
+        .find(|r| r.triple.p.as_iri() == Some(RDF_TYPE_IRI) && graph.triples().contains(&r.triple))
     {
         return Err(TurtleError::Unsupported(format!(
             "an annotation on an rdf:type edge (<{}> a <{}> ~ {}) cannot be expressed on \
@@ -152,12 +154,26 @@ pub fn graph_to_transaction_json(graph: &Graph) -> Result<JsonValue> {
         nodes.push(JsonValue::Object(node));
     }
 
-    // Every attachment names a base triple the producer also emitted
-    // (`GraphSink::emit_reified_triple` contract), so nothing is left over.
-    debug_assert!(
-        reifiers.is_empty(),
-        "reifications without a base triple in the graph: {reifiers:?}"
-    );
+    // A reification whose triple the graph does not assert (`<< s p o >>`,
+    // `r rdf:reifies <<( s p o )>>`) names the triple through `@reifies`.
+    let mut unasserted: Vec<(String, &Triple)> = reifiers
+        .into_iter()
+        .flat_map(|(triple, attached)| {
+            attached
+                .into_iter()
+                .map(move |reifier| (term_to_subject_key(reifier), triple))
+        })
+        .collect();
+    unasserted.sort_by(|a, b| a.0.cmp(&b.0));
+    for (reifier, triple) in unasserted {
+        let mut reified = Map::new();
+        reified.insert(
+            "@id".to_string(),
+            JsonValue::String(term_to_subject_key(&triple.s)),
+        );
+        reified.insert(term_to_iri(&triple.p), term_to_object_value(&triple.o));
+        nodes.push(json!({ "@id": reifier, "@reifies": reified }));
+    }
 
     Ok(JsonValue::Array(nodes))
 }
@@ -167,8 +183,9 @@ fn term_to_subject_key(term: &Term) -> String {
     match term {
         Term::Iri(iri) => iri.to_string(),
         Term::BlankNode(id) => format!("_:{}", id.as_str()),
-        Term::Literal { .. } => {
-            // Literals shouldn't be subjects in RDF, but handle gracefully
+        Term::Literal { .. } | Term::TripleTerm(_) => {
+            // Literals and triple terms shouldn't be subjects in RDF, but
+            // handle gracefully
             "_:literal".to_string()
         }
     }
@@ -185,6 +202,16 @@ fn term_to_iri(term: &Term) -> String {
 /// Convert an object term to a JSON-LD value object.
 fn term_to_object_value(term: &Term) -> JsonValue {
     match term {
+        // The JSON-LD-star embedded node a triple-term value takes.
+        Term::TripleTerm(t) => {
+            let mut node = Map::new();
+            node.insert(
+                "@id".to_string(),
+                JsonValue::String(term_to_subject_key(&t[0])),
+            );
+            node.insert(term_to_iri(&t[1]), term_to_object_value(&t[2]));
+            json!({ "@id": node })
+        }
         Term::Iri(iri) => {
             json!({ "@id": iri.as_ref() })
         }
@@ -248,7 +275,7 @@ fn term_to_type_value(term: &Term) -> Option<JsonValue> {
     match term {
         Term::Iri(iri) => Some(JsonValue::String(iri.to_string())),
         Term::BlankNode(id) => Some(JsonValue::String(format!("_:{}", id.as_str()))),
-        Term::Literal { .. } => None,
+        Term::Literal { .. } | Term::TripleTerm(_) => None,
     }
 }
 
@@ -417,11 +444,34 @@ mod tests {
     }
 
     #[test]
-    fn reified_triple_in_subject_position_annotates_the_base_edge() {
+    fn reified_triple_names_its_unasserted_triple_with_reifies() {
         let json = parse("<< ex:alice ex:knows ex:bob >> ex:certainty 0.5 .");
-        let alice = node(&json, "http://example.org/alice");
-        let ann = &alice["http://example.org/knows"][0]["@annotation"];
-        let reifier = ann["@id"].as_str().expect("blank reifier id");
+        assert!(
+            json.as_array()
+                .unwrap()
+                .iter()
+                .all(|n| n["@id"] != "http://example.org/alice"),
+            "the reified triple is not asserted: {json:#}"
+        );
+        let reifier = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|n| n.get("@reifies").and(n["@id"].as_str()))
+            .expect("a @reifies node");
+        let reifies = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|n| n.get("@reifies"))
+            .unwrap();
+        assert_eq!(
+            reifies,
+            &json!({
+                "@id": "http://example.org/alice",
+                "http://example.org/knows": {"@id": "http://example.org/bob"}
+            })
+        );
         assert_eq!(
             node(&json, reifier)["http://example.org/certainty"][0]["@value"],
             "0.5"

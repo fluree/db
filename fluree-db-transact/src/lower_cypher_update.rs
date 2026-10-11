@@ -44,7 +44,7 @@ use fluree_db_cypher::ast::{
     RemoveItem, SetClause, SetItem, Statement, Update, Variable, WithClause, WriteClause,
 };
 
-use crate::ir::{TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType};
+use crate::ir::{TemplateTerm, TemplateTripleTerm, TripleTemplate, Txn, TxnOpts, TxnType};
 use crate::namespace::NamespaceRegistry;
 
 /// Errors raised by Cypher → Txn lowering.
@@ -1066,8 +1066,8 @@ impl<'a> CypherLowering<'a> {
     }
 
     /// `SET n = { ... }` — replace all scalar node properties visible to Cypher.
-    /// Labels (`rdf:type`), relationship edges (ref-valued objects), and
-    /// `f:reifies*` sidecar facts are not node properties and are preserved.
+    /// Labels (`rdf:type`), relationship edges (ref-valued objects), and a
+    /// relationship's `rdf:reifies` link are not properties and are preserved.
     fn replace_property_map(&mut self, target: &str, map: &MapLit) -> Result<(), LowerCypherError> {
         self.push_optional_old_data_properties(target);
         for (key, val_expr) in &map.entries {
@@ -1587,12 +1587,12 @@ impl<'a> CypherLowering<'a> {
         let p_expr = UnresolvedExpression::var(&p_name);
         let p_str = unresolved_call("str", vec![p_expr.clone()]);
         let old_expr = UnresolvedExpression::var(&old_name);
-        let mut filters = Vec::with_capacity(2 + reifies_iris::ALL.len());
+        let mut filters = Vec::with_capacity(3 + reifies_iris::ALL.len());
         filters.push(unresolved_call(
             "!=",
             vec![p_str.clone(), UnresolvedExpression::string(rdf::TYPE)],
         ));
-        for iri in reifies_iris::ALL {
+        for iri in std::iter::once(rdf::REIFIES).chain(reifies_iris::ALL) {
             filters.push(unresolved_call(
                 "!=",
                 vec![p_str.clone(), UnresolvedExpression::string(iri)],
@@ -1734,7 +1734,7 @@ impl<'a> CypherLowering<'a> {
         ));
 
         // LPG semantics: every Cypher-created relationship gets identity — a
-        // fresh `f:reifies*` reifier bundle — so it is visible to named reads
+        // fresh reifier and its `rdf:reifies` link — so it is visible to named reads
         // (`-[r:T]->`), deletable by `DELETE r`, guarded by bare `DELETE n`,
         // and not collapsed with a parallel edge. The annotation blank node is
         // freshened per WHERE solution (SPARQL §3.1.3), so batched edge inserts
@@ -1758,7 +1758,7 @@ impl<'a> CypherLowering<'a> {
             }
             None => self.fresh_bnode(),
         };
-        self.emit_reifier_bundle(&ann, &s, &type_sid, &o)?;
+        self.emit_reifier_link(&ann, &s, &type_sid, &o);
         if let Some(props) = &rel.props {
             self.emit_property_triples(&ann, props)?;
         }
@@ -1766,33 +1766,24 @@ impl<'a> CypherLowering<'a> {
         Ok(())
     }
 
-    fn emit_reifier_bundle(
+    /// `ann rdf:reifies <<( s p o )>>`.
+    fn emit_reifier_link(
         &mut self,
         ann: &TemplateTerm,
         s: &TemplateTerm,
         p_sid: &Sid,
         o: &TemplateTerm,
-    ) -> Result<(), LowerCypherError> {
-        let subj_pred = self.ns.sid_for_iri(reifies_iris::SUBJECT);
-        let pred_pred = self.ns.sid_for_iri(reifies_iris::PREDICATE);
-        let obj_pred = self.ns.sid_for_iri(reifies_iris::OBJECT);
-
+    ) {
         self.insert_templates.push(TripleTemplate::new(
             ann.clone(),
-            TemplateTerm::Sid(subj_pred),
-            s.clone(),
+            TemplateTerm::Sid(fluree_db_core::rdf_reifies_sid().clone()),
+            TemplateTerm::TripleTerm(Box::new(TemplateTripleTerm {
+                s: s.clone(),
+                p: TemplateTerm::Sid(p_sid.clone()),
+                o: o.clone(),
+                dtc: None,
+            })),
         ));
-        self.insert_templates.push(TripleTemplate::new(
-            ann.clone(),
-            TemplateTerm::Sid(pred_pred),
-            TemplateTerm::Sid(p_sid.clone()),
-        ));
-        self.insert_templates.push(TripleTemplate::new(
-            ann.clone(),
-            TemplateTerm::Sid(obj_pred),
-            o.clone(),
-        ));
-        Ok(())
     }
 
     fn emit_property_triples(

@@ -326,6 +326,7 @@ mod tests {
             }]),
             graphs: None,
             historical_since_t: None,
+            links: None,
         }
     }
 
@@ -545,6 +546,7 @@ mod tests {
             ]),
             graphs: None,
             historical_since_t: None,
+            links: None,
         };
 
         let person_only: HashSet<Sid> = [person.clone()].into_iter().collect();

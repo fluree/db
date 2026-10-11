@@ -1044,6 +1044,122 @@ SELECT ?p ?org WHERE {
     assert_eq!(normalize_rows(&rows), expected);
 }
 
+/// A small outer side seeds the semijoin's build with its own keys. An
+/// unbound OPTIONAL key seeds as a free variable, so its projected lookup
+/// still sees every match.
+#[tokio::test]
+async fn semijoin_seeds_its_build_from_a_small_outer_side() {
+    use fluree_db_api::{QueryInput, ReindexOptions};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "negation:seeded-semijoin";
+    seed_knows_works_for(&fluree, ledger_id).await;
+    let not_exists = r"PREFIX ex: <http://example.com/>
+SELECT ?p ?org WHERE {
+  ?p ex:knows ?f .
+  OPTIONAL { ?p ex:worksFor ?org }
+  FILTER NOT EXISTS { ?p ex:knows ?x . ?x ex:worksFor ?org }
+}";
+    let cases = [
+        (
+            not_exists.to_string(),
+            json!([["ex:carol", "ex:globex"], ["ex:dave", null]]),
+        ),
+        (
+            not_exists.replace("NOT EXISTS", "EXISTS"),
+            json!([["ex:alice", null]]),
+        ),
+    ];
+    for indexed in [false, true] {
+        if indexed {
+            fluree
+                .reindex(ledger_id, ReindexOptions::default())
+                .await
+                .expect("reindex");
+        }
+        let view = fluree.db(ledger_id).await.expect("view");
+        for (query, expected) in &cases {
+            let result = fluree
+                .query(&view, QueryInput::Sparql(query))
+                .await
+                .expect("query");
+            assert_eq!(
+                normalize_rows(&result.to_jsonld(&view.snapshot).unwrap()),
+                normalize_rows(expected),
+                "indexed={indexed}: {query}"
+            );
+        }
+    }
+}
+
+/// An outer side past one seeded build's keys is seeded a chunk at a time,
+/// so annotated edges on a much larger predicate are checked against their
+/// base triples without building the whole predicate, and every chunk is
+/// probed against its own keys.
+#[tokio::test]
+async fn semijoin_seeds_a_large_outer_side_chunk_by_chunk() {
+    use fluree_db_api::{QueryInput, ReindexOptions};
+
+    const HUB_LIKES: usize = 2_500;
+    const OTHER_LIKES: usize = 60_000;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "negation:chunked-semijoin";
+    let mut ttl = String::from("VERSION \"1.2\"\n@prefix ex: <http://example.com/> .\n");
+    for i in 0..HUB_LIKES {
+        ttl.push_str(&format!("ex:post{i} ex:author ex:hub .\n"));
+        // Every tenth edge is reified without being asserted.
+        if i % 10 == 0 {
+            ttl.push_str(&format!(
+                "<< ex:liker{i} ex:likes ex:post{i} >> ex:at {i} .\n"
+            ));
+        } else {
+            ttl.push_str(&format!(
+                "ex:liker{i} ex:likes ex:post{i} {{| ex:at {i} |}} .\n"
+            ));
+        }
+    }
+    for i in 0..OTHER_LIKES {
+        ttl.push_str(&format!("ex:fan{i} ex:likes ex:other{} .\n", i % 97));
+    }
+    fluree
+        .upsert_turtle(genesis_ledger(&fluree, ledger_id), &ttl)
+        .await
+        .expect("seed");
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    let asserted = HUB_LIKES - HUB_LIKES / 10;
+    let count = |body: &str| {
+        format!(
+            "PREFIX ex: <http://example.com/>\n\
+             SELECT (COUNT(*) AS ?n) WHERE {{ ?post ex:author ex:hub . {body} }}"
+        )
+    };
+    let view = fluree.db(ledger_id).await.expect("view");
+    for (query, expected) in [
+        (count("?liker ex:likes ?post {| ex:at ?at |}"), asserted),
+        (
+            count(
+                "<< ?liker ex:likes ?post >> ex:at ?at \
+                 FILTER NOT EXISTS { ?liker ex:likes ?post }",
+            ),
+            HUB_LIKES / 10,
+        ),
+    ] {
+        let result = fluree
+            .query(&view, QueryInput::Sparql(&query))
+            .await
+            .expect("query");
+        assert_eq!(
+            result.to_jsonld(&view.snapshot).unwrap(),
+            json!([[expected]]),
+            "{query}"
+        );
+    }
+}
+
 /// A missing OPTIONAL binding must use a reusable existence lookup, while
 /// bound values still constrain the inner match and outer duplicates survive.
 #[tokio::test]
@@ -1117,11 +1233,13 @@ async fn optional_exists_reuses_partial_keys_across_batches() {
             normalize_rows(&result.to_jsonld(&view.snapshot).unwrap()),
             expected
         );
+        // One lookup per seeded chunk of the 1,500 outer keys, or one for an
+        // unseeded build: reused across rows either way.
         let builds = spans.find_events("semijoin partial-key lookup built");
-        assert_eq!(
-            builds.len(),
-            1,
-            "indexed={indexed}: expected one reused lookup"
+        assert!(
+            (1..=2).contains(&builds.len()),
+            "indexed={indexed}: expected a reused lookup, got {}",
+            builds.len()
         );
         let probes = spans.find_events("semijoin partial-key probes");
         let projected: usize = probes

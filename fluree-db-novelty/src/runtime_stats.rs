@@ -6,8 +6,8 @@ use fluree_db_core::is_rdf_type;
 use fluree_db_core::range_provider::{RangeProvider, RangeQuery};
 use fluree_db_core::{
     ClassPropertyUsage, ClassRefCount, ClassStatEntry, GraphId, GraphPropertyStatEntry,
-    GraphStatsEntry, IndexStats, LedgerSnapshot, OverlayProvider, PropertyStatEntry, RangeMatch,
-    RangeOptions, RangeTest, RuntimePredicateId, RuntimeSmallDicts, Sid, ValueTypeTag,
+    GraphStatsEntry, IndexStats, LedgerSnapshot, LinkStatEntry, OverlayProvider, PropertyStatEntry,
+    RangeMatch, RangeOptions, RangeTest, RuntimePredicateId, RuntimeSmallDicts, Sid, ValueTypeTag,
 };
 use fluree_db_core::{Flake, FlakeMeta, FlakeValue};
 use fluree_vocab::namespaces::FLUREE_COMMIT;
@@ -584,6 +584,7 @@ fn assemble_fast_stats_inner(
         .map(|(idx, entry)| (entry.g_id, idx))
         .collect();
     let mut flakes_delta: i64 = 0;
+    let mut link_deltas: HashMap<Sid, i64> = HashMap::new();
     let mut graph_subject_classes: HashMap<(GraphId, Sid), HashSet<Sid>> = HashMap::new();
     // The subset of `graph_subject_classes` whose membership is new relative to
     // the base index — see [`RestatedAttribution`]. Only built when this pass
@@ -643,6 +644,12 @@ fn assemble_fast_stats_inner(
                 }
             }
             continue;
+        }
+
+        if let FlakeValue::TripleTerm(term) = &flake.o {
+            if fluree_db_core::is_rdf_reifies(&flake.p) {
+                *link_deltas.entry(term.p.clone()).or_insert(0) += delta;
+            }
         }
 
         let datatype_tag = runtime_datatype_tag(flake);
@@ -729,6 +736,7 @@ fn assemble_fast_stats_inner(
         classes: None,
         graphs: None,
         historical_since_t: indexed.historical_since_t,
+        links: finalize_links(indexed, snapshot, link_deltas),
     };
     if graphs.is_empty() {
         // The base's per-graph section is `None` or empty, so this copies nothing.
@@ -1222,6 +1230,39 @@ fn graph_id_for_flake(snapshot: &LedgerSnapshot, flake: &Flake) -> GraphId {
         .decode_sid(g_sid)
         .and_then(|iri| snapshot.graph_registry.graph_id_for_iri(&iri))
         .unwrap_or(0)
+}
+
+/// The base's live-link counts moved by novelty's links. A ledger never
+/// indexed starts from none; a base whose counts are unknown stays unknown.
+fn finalize_links(
+    indexed: &IndexStats,
+    snapshot: &LedgerSnapshot,
+    deltas: HashMap<Sid, i64>,
+) -> Option<Vec<LinkStatEntry>> {
+    let base: &[LinkStatEntry] = match &indexed.links {
+        Some(links) => links,
+        None if snapshot.t == 0 => &[],
+        None => return None,
+    };
+    let mut counts: HashMap<(u16, String), i64> = base
+        .iter()
+        .map(|l| (l.sid.clone(), l.count as i64))
+        .collect();
+    for (sid, delta) in deltas {
+        *counts
+            .entry((sid.namespace_code, sid.name.to_string()))
+            .or_insert(0) += delta;
+    }
+    let mut links: Vec<LinkStatEntry> = counts
+        .into_iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(sid, n)| LinkStatEntry {
+            sid,
+            count: n as u64,
+        })
+        .collect();
+    links.sort_by(|a, b| a.sid.cmp(&b.sid));
+    Some(links)
 }
 
 fn indexed_t(indexed: &IndexStats, snapshot: &LedgerSnapshot) -> i64 {
@@ -1801,6 +1842,7 @@ mod tests {
             classes: None,
             graphs: None,
             historical_since_t: None,
+            links: None,
         }
     }
 
@@ -1884,6 +1926,7 @@ mod tests {
             classes: None,
             graphs: None,
             historical_since_t: None,
+            links: None,
         };
         assert_eq!(
             fluree_db_core::StatsView::from_db_stats(&indexed).is_property_ref_only(&p),
@@ -1997,6 +2040,7 @@ mod tests {
             classes: None,
             graphs: None,
             historical_since_t: None,
+            links: None,
         };
         let alice = sid(10, "alice");
         let bob = sid(10, "bob");
@@ -2091,6 +2135,7 @@ mod tests {
                 classes: Some(vec![]),
             }]),
             historical_since_t: None,
+            links: None,
         };
         let snapshot = LedgerSnapshot::genesis("test:main");
         let mut novelty = Novelty::new(1);
@@ -2150,6 +2195,7 @@ mod tests {
                 }]),
             }]),
             historical_since_t: None,
+            links: None,
         };
         let snapshot = LedgerSnapshot::genesis("test:main");
         let mut novelty = Novelty::new(1);
@@ -2254,6 +2300,7 @@ mod tests {
             properties: Some(Vec::new()),
             classes: None,
             graphs: None,
+            links: None,
         };
         (snapshot, indexed, provider)
     }
@@ -2628,6 +2675,7 @@ mod tests {
             }]),
             classes: None,
             graphs: None,
+            links: None,
         };
         let mut novelty = Novelty::new(0);
         novelty
@@ -2696,6 +2744,7 @@ mod tests {
                 properties: vec![],
                 classes,
             }]),
+            links: None,
         }
     }
 
@@ -2998,6 +3047,7 @@ mod tests {
                 classes: Some(base_classes),
             }]),
             historical_since_t: Some(0),
+            links: None,
         };
 
         let mut novelty = Novelty::new(1);
@@ -3142,5 +3192,80 @@ mod tests {
 
         let merged = assemble_planner_stats(&indexed, &genesis, &novelty, 3, Some(&lookup));
         assert!(!Arc::ptr_eq(&merged, &indexed), "a real window must merge");
+    }
+
+    /// Novelty's links move the base's live-link counts by inner predicate. A
+    /// ledger never indexed counts from none; a base without counts stays
+    /// unknown.
+    #[test]
+    fn novelty_links_move_the_live_link_counts() {
+        let knows = sid(10, "knows");
+        let likes = sid(10, "likes");
+        let link = |reifier: &str, p: &Sid, t: i64, op: bool| {
+            let term = fluree_db_core::TripleTermValue {
+                s: sid(10, "alice"),
+                p: p.clone(),
+                o: FlakeValue::Ref(sid(10, "bob")),
+                dt: fluree_db_core::edge::id_datatype_sid(),
+                lang: None,
+            };
+            Flake::new(
+                sid(10, reifier),
+                fluree_db_core::rdf_reifies_sid().clone(),
+                FlakeValue::TripleTerm(Box::new(term)),
+                fluree_db_core::triple_term_datatype_sid().clone(),
+                t,
+                op,
+                None,
+            )
+        };
+        let mut novelty = Novelty::new(1);
+        novelty
+            .apply_commit(
+                vec![link("r1", &knows, 2, true), link("r2", &likes, 2, true)],
+                2,
+                &HashMap::new(),
+            )
+            .expect("links");
+        novelty
+            .apply_commit(vec![link("r3", &knows, 3, false)], 3, &HashMap::new())
+            .expect("retract");
+
+        let mut indexed = mixed_property_index(&sid(10, "p"));
+        indexed.links = Some(vec![LinkStatEntry {
+            sid: (10, "knows".to_string()),
+            count: 5,
+        }]);
+        let mut snapshot = LedgerSnapshot::genesis("test:main");
+        snapshot.t = 1;
+        let merged = assemble_fast_stats(&indexed, &snapshot, &novelty, 3, None);
+        assert_eq!(
+            merged.links,
+            Some(vec![
+                LinkStatEntry {
+                    sid: (10, "knows".to_string()),
+                    count: 5
+                },
+                LinkStatEntry {
+                    sid: (10, "likes".to_string()),
+                    count: 1
+                },
+            ])
+        );
+
+        indexed.links = None;
+        let merged = assemble_fast_stats(&indexed, &snapshot, &novelty, 3, None);
+        assert_eq!(merged.links, None, "unknown base counts stay unknown");
+
+        let genesis = LedgerSnapshot::genesis("test:main");
+        let merged = assemble_fast_stats(&IndexStats::default(), &genesis, &novelty, 3, None);
+        assert_eq!(
+            merged.links,
+            Some(vec![LinkStatEntry {
+                sid: (10, "likes".to_string()),
+                count: 1
+            }]),
+            "a ledger never indexed counts its novelty's links"
+        );
     }
 }

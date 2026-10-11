@@ -915,13 +915,12 @@ async fn discovery_advertises_source_upload_when_presign_enabled() {
 }
 
 #[tokio::test]
-async fn source_upload_with_relationships_seals_annotation_arena() {
+async fn source_upload_with_relationships_imports_annotated_edges() {
     let (_tmp, state) = presign_test_state().await;
     let dst = "src-cypher-rel/data:main";
 
     // Relationship CREATEs reify edges (EdgePolicy::Annotated default), so the
-    // imported ledger carries f:reifies* facts; the post-import reindex must
-    // leave a sealed annotation arena, not scan-fallback.
+    // imported ledger carries annotations.
     let cypher = br#"CREATE (:Person {name: "Alice"});
 CREATE (:Person {name: "Bob"});
 MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS {since: 2020}]->(b);
@@ -943,15 +942,11 @@ MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS {s
     assert_eq!(
         final_status["result"]["root_id"].as_str(),
         expected_root.as_deref(),
-        "job result must return the post-seal nameservice root"
+        "job result must return the nameservice root"
     );
     assert!(
         handle.snapshot.has_annotations,
         "imported ledger carries annotations"
-    );
-    assert!(
-        handle.snapshot.annotation_index.is_some(),
-        "post-import reindex must seal the annotation arena"
     );
 
     // The relationship is queryable through the Cypher surface.

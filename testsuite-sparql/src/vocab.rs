@@ -97,6 +97,20 @@ pub mod rdft {
         "http://www.w3.org/ns/rdftest#TestNTriplesPositiveSyntax";
     pub const TEST_NTRIPLES_NEGATIVE_SYNTAX: &str =
         "http://www.w3.org/ns/rdftest#TestNTriplesNegativeSyntax";
+    pub const TEST_NTRIPLES_POSITIVE_C14N: &str =
+        "http://www.w3.org/ns/rdftest#TestNTriplesPositiveC14N";
+    pub const TEST_NQUADS_POSITIVE_SYNTAX: &str =
+        "http://www.w3.org/ns/rdftest#TestNQuadsPositiveSyntax";
+    pub const TEST_NQUADS_NEGATIVE_SYNTAX: &str =
+        "http://www.w3.org/ns/rdftest#TestNQuadsNegativeSyntax";
+    pub const TEST_NQUADS_POSITIVE_C14N: &str =
+        "http://www.w3.org/ns/rdftest#TestNQuadsPositiveC14N";
+    pub const TEST_TRIG_POSITIVE_SYNTAX: &str =
+        "http://www.w3.org/ns/rdftest#TestTrigPositiveSyntax";
+    pub const TEST_TRIG_NEGATIVE_SYNTAX: &str =
+        "http://www.w3.org/ns/rdftest#TestTrigNegativeSyntax";
+    pub const TEST_TRIG_EVAL: &str = "http://www.w3.org/ns/rdftest#TestTrigEval";
+    pub const TEST_TRIG_NEGATIVE_EVAL: &str = "http://www.w3.org/ns/rdftest#TestTrigNegativeEval";
 }
 
 /// Standard RDF vocabulary

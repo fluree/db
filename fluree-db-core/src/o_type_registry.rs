@@ -84,6 +84,7 @@ impl OTypeRegistry {
             ObjKind::VECTOR_ID => OType::VECTOR,
             ObjKind::JSON_ID => OType::RDF_JSON,
             ObjKind::NUM_BIG => OType::NUM_BIG_OVERFLOW,
+            ObjKind::NUM_DEC => OType::XSD_DECIMAL_INLINE,
             ObjKind::G_YEAR => OType::XSD_G_YEAR,
             ObjKind::G_YEAR_MONTH => OType::XSD_G_YEAR_MONTH,
             ObjKind::G_MONTH => OType::XSD_G_MONTH,
@@ -92,6 +93,7 @@ impl OTypeRegistry {
             ObjKind::YEAR_MONTH_DUR => OType::XSD_YEAR_MONTH_DURATION,
             ObjKind::DAY_TIME_DUR => OType::XSD_DAY_TIME_DURATION,
             ObjKind::GEO_POINT => OType::GEO_POINT,
+            ObjKind::TRIPLE_TERM => OType::TRIPLE_TERM,
 
             // Blank nodes are currently represented as REF_ID SIDs whose namespace code is
             // `namespaces::BLANK_NODE`. We intentionally map all REF_ID to `OType::IRI_REF`
@@ -323,6 +325,10 @@ mod tests {
         assert_eq!(
             reg.resolve(ObjKind::NUM_BIG, DatatypeDictId::DECIMAL, 0),
             OType::NUM_BIG_OVERFLOW
+        );
+        assert_eq!(
+            reg.resolve(ObjKind::NUM_DEC, DatatypeDictId::DECIMAL, 0),
+            OType::XSD_DECIMAL_INLINE
         );
         assert_eq!(
             reg.resolve(ObjKind::GEO_POINT, DatatypeDictId::STRING, 0),

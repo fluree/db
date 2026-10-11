@@ -109,6 +109,11 @@ pub enum DictKind {
     VectorShard { p_id: u32 },
     /// Per-predicate vector arena manifest (VAM1 JSON format).
     VectorManifest { p_id: u32 },
+    /// Triple-term forward pack for one inner predicate (FPK1, kind 2):
+    /// per-predicate sequence → encoded `TermKey`.
+    TermForward { p_id: u32 },
+    /// Triple-term reverse tree: encoded `TermKey` → handle (DTB1/DLR1).
+    TermReverse,
 }
 
 // ============================================================================

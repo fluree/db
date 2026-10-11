@@ -38,10 +38,9 @@ pub struct ExportConfig<'a> {
     pub overlay: Option<&'a dyn OverlayProvider>,
     /// Dictionary novelty for resolving IDs from committed-but-not-yet-indexed transactions.
     pub dict_novelty: Option<&'a Arc<DictNovelty>>,
-    /// Forward annotation lookup. `None` means this export emits the raw
-    /// `f:reifies*` system facts as ordinary triples (`--raw-reifies`, or a
-    /// ledger that has never carried an annotation) and the writers run
-    /// exactly the loop they ran before RDF 1.2 output existed.
+    /// Edge → reifier lookup. `None` means this export writes each
+    /// `rdf:reifies` link as an ordinary triple (`--raw-reifies`, or a ledger
+    /// that has never carried an annotation) rather than as annotation syntax.
     pub annotations: Option<&'a AnnotationProbe<'a>>,
     /// SID of the graph being scanned, as `EdgeKey.g` recorded it. `None` for
     /// the default graph. Only read when `annotations` is `Some`.
@@ -341,6 +340,14 @@ impl<'a> ExportResolver<'a> {
                         self.decode_string_novelty(ot.decode_kind(), o_key)
                     }
                     DecodeKind::IriRef => self.decode_iri_ref_novelty(o_key),
+                    // A provisional handle names a term only novelty holds.
+                    DecodeKind::TripleTermDict => {
+                        fluree_db_core::triple_term::novelty_term_index(o_key)
+                            .zip(self.dict_novelty.filter(|dn| dn.is_initialized()))
+                            .and_then(|(index, dn)| dn.terms.resolve(index))
+                            .map(|term| FlakeValue::TripleTerm(Box::new(term.clone())))
+                            .ok_or(e)
+                    }
                     _ => Err(e),
                 }
             }
@@ -392,10 +399,13 @@ impl crate::export_annotations::ReifierSubject for ExportResolver<'_> {
 /// annotation syntax, so the common path allocates nothing.
 struct AnnotationContext<'a> {
     probe: &'a AnnotationProbe<'a>,
-    /// `p_id`s of the seven `f:reifies*` predicates in this store's id space,
-    /// persisted and ephemeral. Hoisted out of the row loop: suppression is
-    /// then a scan of at most fourteen `u32`s, not an IRI comparison.
+    /// `p_id`s of the seven legacy `f:reifies*` predicates in this store's id
+    /// space, persisted and ephemeral. Hoisted out of the row loop: suppression
+    /// is then a scan of at most fourteen `u32`s, not an IRI comparison.
     reifies_p_ids: Vec<u32>,
+    /// `rdf:reifies`' `p_id`s, persisted and ephemeral: a triple-term row
+    /// under any other predicate is a value, not a link.
+    link_p_ids: Vec<u32>,
     graph_sid: Option<Sid>,
 }
 
@@ -415,11 +425,31 @@ impl<'a> AnnotationContext<'a> {
                 .filter(|(_, sid)| fluree_db_core::namespaces::is_reserved_reifies_predicate(sid))
                 .map(|(p_id, _)| *p_id),
         );
+        let mut link_p_ids: Vec<u32> = resolver
+            .store
+            .find_predicate_id(fluree_vocab::rdf::REIFIES)
+            .into_iter()
+            .collect();
+        link_p_ids.extend(
+            resolver
+                .ephemeral_preds_reverse
+                .iter()
+                .filter(|(_, sid)| fluree_db_core::is_rdf_reifies(sid))
+                .map(|(p_id, _)| *p_id),
+        );
         Some(Self {
             probe,
             reifies_p_ids,
+            link_p_ids,
             graph_sid: config.graph_sid.clone(),
         })
+    }
+
+    /// An `rdf:reifies` link row: replaced by annotation syntax, and written
+    /// as the triple it is under `--raw-reifies`.
+    #[inline]
+    fn is_link_row(&self, p_id: u32, o_type: u16) -> bool {
+        o_type == OType::TRIPLE_TERM.as_u16() && self.link_p_ids.contains(&p_id)
     }
 
     #[inline]
@@ -428,35 +458,63 @@ impl<'a> AnnotationContext<'a> {
     }
 }
 
-/// Live reifiers for every row of `batch`, row-aligned.
+/// A batch's annotation reads, row-aligned: each base edge's live reifiers,
+/// and for each link row whether it gives way to the `~ <r>` marker on its
+/// asserted edge. A link whose triple is not asserted has no edge to carry
+/// it, so it is written as a row.
+#[derive(Default)]
+struct BatchAnnotations {
+    reifiers: Vec<Vec<Sid>>,
+    markers: Vec<bool>,
+}
+
+impl BatchAnnotations {
+    fn reifiers(&self, row: usize) -> &[Sid] {
+        self.reifiers.get(row).map_or(&[], Vec::as_slice)
+    }
+
+    fn is_marker(&self, row: usize) -> bool {
+        self.markers.get(row).copied().unwrap_or(false)
+    }
+}
+
+/// Read `batch`'s annotations ([`BatchAnnotations`]).
 ///
-/// Returns an empty vec when the export is not emitting annotation syntax;
-/// callers treat a missing entry as "no reifiers", so no writer needs a
-/// branch on the mode.
+/// Returns empty annotations when the export is not emitting annotation
+/// syntax; callers treat a missing entry as "no reifiers", so no writer needs
+/// a branch on the mode.
 ///
 /// This re-decodes each row's subject, predicate and object to build its
 /// `EdgeKey` — work the row writer then does again. That duplication is
 /// deliberate path separation: it happens only for ledgers that carry
 /// annotations, and it keeps the row writers' existing loop untouched for
 /// every ledger that does not.
-async fn batch_reifiers(
+async fn batch_annotations(
     resolver: &ExportResolver<'_>,
     ann: Option<&AnnotationContext<'_>>,
     batch: &ColumnBatch,
     g_id: GraphId,
-) -> io::Result<Vec<Vec<Sid>>> {
+) -> io::Result<BatchAnnotations> {
     let Some(ann) = ann else {
-        return Ok(Vec::new());
+        return Ok(BatchAnnotations::default());
     };
+    let mut markers = vec![false; batch.row_count];
     let mut edges: Vec<EdgeKey> = Vec::new();
     let mut edge_row: Vec<usize> = Vec::new();
-    for row in 0..batch.row_count {
+    for (row, marker) in markers.iter_mut().enumerate() {
         let p_id = batch.p_id.get_or(row, 0);
-        if ann.is_reifies_row(p_id) {
-            continue; // the bundle itself is never an annotated edge
-        }
         let o_type = batch.o_type.get_or(row, 0);
         let o_key = batch.o_key.get(row);
+        if ann.is_link_row(p_id, o_type) {
+            *marker = match resolver.decode_value(o_type, o_key, p_id, g_id)? {
+                FlakeValue::TripleTerm(term) => !ann.probe.link_is_unasserted(g_id, &term).await?,
+                _ => true,
+            };
+            continue;
+        }
+        if ann.is_reifies_row(p_id) {
+            continue;
+        }
         let Some(p) = resolver.resolve_predicate_sid(p_id) else {
             continue;
         };
@@ -494,18 +552,15 @@ async fn batch_reifiers(
         });
         edge_row.push(row);
     }
-    let per_edge = ann.probe.live_reifiers(&edges).await?;
-    let mut out = vec![Vec::new(); batch.row_count];
-    for (i, row) in edge_row.into_iter().enumerate() {
-        out[row] = per_edge[i].clone();
+    let per_edge = ann
+        .probe
+        .live_reifiers(g_id, &edges, resolver.store, resolver.dict_novelty)
+        .await?;
+    let mut reifiers = vec![Vec::new(); batch.row_count];
+    for (row, edge_reifiers) in edge_row.into_iter().zip(per_edge) {
+        reifiers[row] = edge_reifiers;
     }
-    Ok(out)
-}
-
-/// Reifiers for one row, or the empty slice.
-#[inline]
-fn row_reifiers(reifiers: &[Vec<Sid>], row: usize) -> &[Sid] {
-    reifiers.get(row).map_or(&[], Vec::as_slice)
+    Ok(BatchAnnotations { reifiers, markers })
 }
 
 /// IRI → prefixed name compression for Turtle/TriG (and JSON-LD compact IRIs).
@@ -552,11 +607,11 @@ pub async fn export_graph_turtle<W: Write>(
     // to rather than appended after the stream, so a subject never opens twice
     // (see `UntranslatedBySubject`).
     let (untranslated, untranslated_reifiers) =
-        resolve_untranslated(ann.as_ref(), untranslated).await?;
+        resolve_untranslated(&resolver, ann.as_ref(), untranslated, config.g_id).await?;
     let mut untranslated = UntranslatedBySubject::new(store, untranslated);
 
     while let Some(batch) = cursor.next_batch()? {
-        let reifiers = batch_reifiers(&resolver, ann.as_ref(), &batch, config.g_id).await?;
+        let reifiers = batch_annotations(&resolver, ann.as_ref(), &batch, config.g_id).await?;
         write_turtle_batch(
             &resolver,
             ann.as_ref(),
@@ -609,27 +664,15 @@ pub async fn export_graph_turtle<W: Write>(
     Ok(stats)
 }
 
-/// Split untranslated overlay rows into the bundle rows annotation syntax
+/// Split untranslated overlay rows into the link rows annotation syntax
 /// replaces and the base rows that may carry a marker, resolving every
-/// reifier in one probe call.
-///
-/// Untranslated rows never pass through `is_reifies_row` — only the
-/// translated writers call it — so before this they reached the output raw:
-/// a *partial* `f:reifies*` bundle (the rows that did translate were
-/// suppressed) and no `~ <r>` on the edge it described. Round-tripping that
-/// file plants a reserved predicate in the target ledger as ordinary data.
-///
-/// Filtering them alone would have been worse than the leak. The unresolved
-/// counter only moves where the translated path calls `note_bundle_in_scope`,
-/// so a silent filter converts a visible wrong answer into an invisible one.
-/// Suppression and accounting are the same change.
-///
-/// One `live_reifiers` call for the whole untranslated set rather than one
-/// per row: `batch_reifiers` is already a per-row probe on annotated ledgers,
-/// and stacking a second one is the wrong direction for that cost.
+/// reifier in one probe call. Suppressed links are noted in scope, as the
+/// translated writers note theirs, so the unresolved count stays honest.
 async fn resolve_untranslated(
+    resolver: &ExportResolver<'_>,
     ann: Option<&AnnotationContext<'_>>,
     rows: Vec<Flake>,
+    g_id: GraphId,
 ) -> io::Result<(Vec<Flake>, HashMap<EdgeKey, Vec<Sid>>)> {
     let Some(ann) = ann else {
         // `--raw-reifies` and annotation-free ledgers want the rows verbatim.
@@ -637,14 +680,26 @@ async fn resolve_untranslated(
     };
     let mut base: Vec<Flake> = Vec::with_capacity(rows.len());
     for f in rows {
+        if fluree_db_core::is_rdf_reifies(&f.p) {
+            let unasserted = match &f.o {
+                FlakeValue::TripleTerm(term) => ann.probe.link_is_unasserted(g_id, term).await?,
+                _ => false,
+            };
+            if !unasserted {
+                ann.probe.note_link_sid(&f.s);
+                continue;
+            }
+        }
         if fluree_db_core::namespaces::is_reserved_reifies_predicate(&f.p) {
-            ann.probe.note_bundle_sid(f.s.clone());
             continue;
         }
         base.push(f);
     }
     let keys: Vec<EdgeKey> = base.iter().map(EdgeKey::from_flake).collect();
-    let live = ann.probe.live_reifiers(&keys).await?;
+    let live = ann
+        .probe
+        .live_reifiers(g_id, &keys, resolver.store, resolver.dict_novelty)
+        .await?;
     let mut map: HashMap<EdgeKey, Vec<Sid>> = HashMap::new();
     for (key, reifiers) in keys.into_iter().zip(live) {
         if !reifiers.is_empty() {
@@ -667,7 +722,7 @@ fn untranslated_reifiers_for<'m>(map: &'m HashMap<EdgeKey, Vec<Sid>>, flake: &Fl
 fn write_turtle_batch<W: Write>(
     resolver: &ExportResolver,
     ann: Option<&AnnotationContext<'_>>,
-    reifiers: &[Vec<Sid>],
+    reifiers: &BatchAnnotations,
     untranslated_reifiers: &HashMap<EdgeKey, Vec<Sid>>,
     batch: &ColumnBatch,
     g_id: GraphId,
@@ -682,14 +737,14 @@ fn write_turtle_batch<W: Write>(
         let p_id = batch.p_id.get_or(row, 0);
         let o_type = batch.o_type.get_or(row, 0);
         let o_key = batch.o_key.get(row);
-
-        // The `f:reifies*` bundle is the on-disk encoding of an annotation,
-        // not a triple the ledger was asked to hold. It is replaced by the
-        // `~ <r>` markers emitted below, and re-emitting it too would produce
-        // a file the write path refuses to ingest.
+        // Annotation syntax replaces each link with the `~ <r>` marker
+        // emitted below; a legacy `f:reifies*` bundle is read as its link.
         if let Some(ann) = ann {
+            if ann.is_link_row(p_id, o_type) && reifiers.is_marker(row) {
+                ann.probe.note_link_in_scope(resolver, s_id);
+                continue;
+            }
             if ann.is_reifies_row(p_id) {
-                ann.probe.note_bundle_in_scope(resolver, s_id);
                 continue;
             }
         }
@@ -753,7 +808,7 @@ fn write_turtle_batch<W: Write>(
         // a random seek per reifier, out of scan order, at the exact moment
         // the base edge is written.
         if let Some(ann) = ann {
-            for reifier in row_reifiers(reifiers, row) {
+            for reifier in reifiers.reifiers(row) {
                 let Some(iri) = resolver.store.sid_to_iri(reifier) else {
                     continue;
                 };
@@ -867,20 +922,22 @@ pub async fn export_graph_jsonld<W: Write>(
     let mut current_props: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
     let mut first_node = true;
     let (untranslated, untranslated_reifiers) =
-        resolve_untranslated(ann.as_ref(), untranslated).await?;
+        resolve_untranslated(&resolver, ann.as_ref(), untranslated, config.g_id).await?;
     let mut untranslated = UntranslatedBySubject::new(store, untranslated);
 
     while let Some(batch) = cursor.next_batch()? {
-        let reifiers = batch_reifiers(&resolver, ann.as_ref(), &batch, config.g_id).await?;
+        let reifiers = batch_annotations(&resolver, ann.as_ref(), &batch, config.g_id).await?;
         for row in 0..batch.row_count {
             let s_id = batch.s_id.get(row);
             let p_id = batch.p_id.get_or(row, 0);
             let o_type = batch.o_type.get_or(row, 0);
             let o_key = batch.o_key.get(row);
-
             if let Some(ann) = ann.as_ref() {
+                if ann.is_link_row(p_id, o_type) && reifiers.is_marker(row) {
+                    ann.probe.note_link_in_scope(&resolver, s_id);
+                    continue;
+                }
                 if ann.is_reifies_row(p_id) {
-                    ann.probe.note_bundle_in_scope(&resolver, s_id);
                     continue;
                 }
             }
@@ -899,22 +956,28 @@ pub async fn export_graph_jsonld<W: Write>(
                 continue;
             }
 
-            // Convert to JSON-LD value
-            let jval = flake_to_jsonld(&value, store, o_type, prefixes);
-            // One value per reifier, each carrying `@annotation` — the JSON-LD
-            // shape `parse/edge_annotations.rs` ingests. Repeating the base
-            // value is how the keyword attaches to an edge: two reifiers on
-            // one edge are two annotated occurrences of the same triple, which
-            // re-ingest to one triple and two bundles.
-            let jvals = match ann.as_ref() {
-                Some(ann) => annotated_jsonld_values(
-                    &resolver,
-                    ann,
-                    &jval,
-                    row_reifiers(&reifiers, row),
-                    prefixes,
-                ),
-                None => vec![jval],
+            let (key, jvals) = match reifies_jsonld(&p_iri, &value, store, prefixes) {
+                Some(block) => (REIFIES_KEY.to_string(), vec![block]),
+                None => {
+                    let jval = flake_to_jsonld(&value, store, o_type, prefixes);
+                    // One value per reifier, each carrying `@annotation` — the
+                    // JSON-LD shape `parse/edge_annotations.rs` ingests.
+                    // Repeating the base value is how the keyword attaches to
+                    // an edge: two reifiers on one edge are two annotated
+                    // occurrences of the same triple, which re-ingest to one
+                    // triple and two links.
+                    let jvals = match ann.as_ref() {
+                        Some(ann) => annotated_jsonld_values(
+                            &resolver,
+                            ann,
+                            &jval,
+                            reifiers.reifiers(row),
+                            prefixes,
+                        ),
+                        None => vec![jval],
+                    };
+                    (compact_iri(&p_iri, prefixes), jvals)
+                }
             };
 
             // Check if we've moved to a new subject
@@ -941,11 +1004,10 @@ pub async fn export_graph_jsonld<W: Write>(
             }
 
             // Append value to the right predicate bucket
-            let compact_p = compact_iri(&p_iri, prefixes);
-            if let Some(entry) = current_props.iter_mut().find(|(k, _)| *k == compact_p) {
+            if let Some(entry) = current_props.iter_mut().find(|(k, _)| *k == key) {
                 entry.1.extend(jvals);
             } else {
-                current_props.push((compact_p, jvals));
+                current_props.push((key, jvals));
             }
 
             stats.triples_written += 1;
@@ -1013,10 +1075,19 @@ fn merge_untranslated_jsonld(
 ) {
     let store = resolver.store;
     for flake in flakes {
-        let (Some(p_iri), Some(jval)) = (
-            store.sid_to_iri(&flake.p),
-            flake_to_jsonld_raw(flake, store, prefixes),
-        ) else {
+        let Some(p_iri) = store.sid_to_iri(&flake.p) else {
+            stats.rows_skipped += 1;
+            continue;
+        };
+        if let Some(block) = reifies_jsonld(&p_iri, &flake.o, store, prefixes) {
+            match props.iter_mut().find(|(k, _)| k == REIFIES_KEY) {
+                Some(entry) => entry.1.push(block),
+                None => props.push((REIFIES_KEY.to_string(), vec![block])),
+            }
+            stats.triples_written += 1;
+            continue;
+        }
+        let Some(jval) = flake_to_jsonld_raw(flake, store, prefixes) else {
             stats.rows_skipped += 1;
             continue;
         };
@@ -1040,6 +1111,55 @@ fn merge_untranslated_jsonld(
         }
         stats.triples_written += 1;
     }
+}
+
+const REIFIES_KEY: &str = "@reifies";
+
+/// An `rdf:reifies` link's triple as the JSON-LD `@reifies` block — the
+/// form JSON-LD inserts take for a reification. `None` for any other row.
+fn reifies_jsonld(
+    p_iri: &str,
+    value: &FlakeValue,
+    store: &BinaryIndexStore,
+    prefixes: &PrefixMap,
+) -> Option<serde_json::Value> {
+    match value {
+        FlakeValue::TripleTerm(term) if p_iri == fluree_vocab::rdf::REIFIES => {
+            triple_term_jsonld(term, store, prefixes)
+        }
+        _ => None,
+    }
+}
+
+/// A triple term as the JSON-LD node naming its triple, `{"@id": s, p: o}`;
+/// as a value it is wrapped as `{"@id": {...}}`, a nested term included.
+/// `None` when a component has no IRI.
+fn triple_term_jsonld(
+    term: &fluree_db_core::TripleTermValue,
+    store: &BinaryIndexStore,
+    prefixes: &PrefixMap,
+) -> Option<serde_json::Value> {
+    let meta = term.lang.clone().map(|lang| fluree_db_core::FlakeMeta {
+        lang: Some(lang),
+        i: None,
+    });
+    let object = Flake::new(
+        term.s.clone(),
+        term.p.clone(),
+        term.o.clone(),
+        term.dt.clone(),
+        0,
+        true,
+        meta,
+    );
+    let object = flake_to_jsonld_raw(&object, store, prefixes)?;
+    let mut block = serde_json::Map::new();
+    block.insert(
+        "@id".to_string(),
+        serde_json::Value::String(compact_iri(&store.sid_to_iri(&term.s)?, prefixes)),
+    );
+    block.insert(compact_iri(&store.sid_to_iri(&term.p)?, prefixes), object);
+    Some(serde_json::Value::Object(block))
 }
 
 /// JSON-LD value for an untranslated overlay flake, deriving the language tag
@@ -1106,6 +1226,9 @@ fn flake_to_jsonld_raw(
             "@value": v,
             "@type": compact_iri(&dt_iri().unwrap_or_else(|| "https://ns.flur.ee/db#vector".to_string()), prefixes)
         })),
+        FlakeValue::TripleTerm(term) => {
+            Some(serde_json::json!({ "@id": triple_term_jsonld(term, store, prefixes)? }))
+        }
         // Temporal / other types always encode into V3 ops.
         _ => None,
     }
@@ -1418,6 +1541,15 @@ fn flake_to_jsonld(
         }
 
         FlakeValue::Null => serde_json::Value::Null,
+        FlakeValue::TripleTerm(term) => match triple_term_jsonld(term, store, prefixes) {
+            Some(node) => serde_json::json!({ "@id": node }),
+            None => {
+                let dt = resolve_datatype_iri(store, o_type)
+                    .unwrap_or_else(|| format!("{}tripleTerm", fluree_vocab::fluree::DB));
+                let compact_dt = compact_iri(&dt, prefixes);
+                serde_json::json!({ "@value": value.to_string(), "@type": compact_dt })
+            }
+        },
     }
 }
 
@@ -1491,7 +1623,7 @@ pub async fn export_graph_ntriples<W: Write>(
     let resolver = ExportResolver::new(store, config.dict_novelty, &ephemeral_preds);
     let ann = AnnotationContext::new(&resolver, config);
     let (untranslated, untranslated_reifiers) =
-        resolve_untranslated(ann.as_ref(), untranslated).await?;
+        resolve_untranslated(&resolver, ann.as_ref(), untranslated, config.g_id).await?;
 
     let mut stats = ExportStats::default();
     let graph_term = config.graph_iri.as_deref().map(|iri| {
@@ -1503,7 +1635,7 @@ pub async fn export_graph_ntriples<W: Write>(
     });
 
     while let Some(batch) = cursor.next_batch()? {
-        let reifiers = batch_reifiers(&resolver, ann.as_ref(), &batch, config.g_id).await?;
+        let reifiers = batch_annotations(&resolver, ann.as_ref(), &batch, config.g_id).await?;
         write_batch(
             &resolver,
             ann.as_ref(),
@@ -1542,7 +1674,7 @@ pub async fn export_graph_ntriples<W: Write>(
 fn write_batch<W: Write>(
     resolver: &ExportResolver,
     ann: Option<&AnnotationContext<'_>>,
-    reifiers: &[Vec<Sid>],
+    reifiers: &BatchAnnotations,
     batch: &ColumnBatch,
     g_id: GraphId,
     graph_term: Option<&str>,
@@ -1554,10 +1686,12 @@ fn write_batch<W: Write>(
         let p_id = batch.p_id.get_or(row, 0);
         let o_type = batch.o_type.get_or(row, 0);
         let o_key = batch.o_key.get(row);
-
         if let Some(ann) = ann {
+            if ann.is_link_row(p_id, o_type) && reifiers.is_marker(row) {
+                ann.probe.note_link_in_scope(resolver, s_id);
+                continue;
+            }
             if ann.is_reifies_row(p_id) {
-                ann.probe.note_bundle_in_scope(resolver, s_id);
                 continue;
             }
         }
@@ -1606,7 +1740,7 @@ fn write_batch<W: Write>(
         // spelling is a triple term as the object of `rdf:reifies`, which
         // Fluree's Turtle and N-Quads readers both accept.
         if let Some(ann) = ann {
-            for reifier in row_reifiers(reifiers, row) {
+            for reifier in reifiers.reifiers(row) {
                 let Some(r_iri) = resolver.store.sid_to_iri(reifier) else {
                     continue;
                 };
@@ -1668,6 +1802,25 @@ fn write_object<W: Write>(
     store: &BinaryIndexStore,
     o_type: u16,
 ) -> io::Result<()> {
+    let dt = resolve_datatype_iri(store, o_type);
+    write_value(
+        w,
+        value,
+        store,
+        store.resolve_lang_tag(o_type),
+        dt.as_deref(),
+    )
+}
+
+/// Write an object value as an N-Triples term, given its language tag and
+/// datatype IRI.
+fn write_value<W: Write>(
+    w: &mut W,
+    value: &FlakeValue,
+    store: &BinaryIndexStore,
+    lang: Option<&str>,
+    dt: Option<&str>,
+) -> io::Result<()> {
     match value {
         FlakeValue::Ref(sid) => {
             let iri = store
@@ -1678,7 +1831,7 @@ fn write_object<W: Write>(
 
         FlakeValue::String(s) => {
             // Check for language tag first (takes precedence over datatype)
-            if let Some(lang) = store.resolve_lang_tag(o_type) {
+            if let Some(lang) = lang {
                 w.write_all(b"\"")?;
                 syntax::write_string(w, s)?;
                 write_lang_tag(w, lang)?;
@@ -1686,12 +1839,11 @@ fn write_object<W: Write>(
             }
 
             // Resolve datatype; omit ^^<xsd:string> (implicit)
-            let dt_iri = resolve_datatype_iri(store, o_type);
             w.write_all(b"\"")?;
             syntax::write_string(w, s)?;
             w.write_all(b"\"")?;
-            if let Some(dt) = &dt_iri {
-                if *dt != xsd::STRING {
+            if let Some(dt) = dt {
+                if dt != xsd::STRING {
                     w.write_all(b"^^<")?;
                     syntax::write_iri(w, dt)?;
                     w.write_all(b">")?;
@@ -1706,7 +1858,8 @@ fn write_object<W: Write>(
         FlakeValue::Long(n) => write_typed_literal(
             w,
             &n.to_string(),
-            &resolve_datatype_iri(store, o_type).unwrap_or_else(|| xsd::LONG.to_string()),
+            &dt.map(str::to_string)
+                .unwrap_or_else(|| xsd::LONG.to_string()),
         ),
         FlakeValue::Double(f) => write_typed_literal(
             // W3C canonical xsd:double form (1.0E6; NaN/INF/-INF preserved). Resolve
@@ -1716,17 +1869,19 @@ fn write_object<W: Write>(
             // silently re-typed (CRITICAL-3 #1529 review).
             w,
             &canonical_xsd_double(*f),
-            &resolve_datatype_iri(store, o_type).unwrap_or_else(|| xsd::DOUBLE.to_string()),
+            &dt.map(str::to_string)
+                .unwrap_or_else(|| xsd::DOUBLE.to_string()),
         ),
         FlakeValue::BigInt(n) => write_typed_literal(
             w,
             &n.to_string(),
-            &resolve_datatype_iri(store, o_type).unwrap_or_else(|| xsd::INTEGER.to_string()),
+            &dt.map(str::to_string)
+                .unwrap_or_else(|| xsd::INTEGER.to_string()),
         ),
         FlakeValue::Decimal(d) => write_typed_literal(
             w,
             &d.to_string(),
-            &resolve_datatype_iri(store, o_type)
+            &dt.map(str::to_string)
                 .unwrap_or_else(|| "http://www.w3.org/2001/XMLSchema#decimal".to_string()),
         ),
 
@@ -1734,84 +1889,62 @@ fn write_object<W: Write>(
         FlakeValue::DateTime(v) => write_typed_literal_display(
             w,
             v.as_ref(),
-            store,
-            o_type,
+            dt,
             "http://www.w3.org/2001/XMLSchema#dateTime",
         ),
-        FlakeValue::Date(v) => write_typed_literal_display(
-            w,
-            v.as_ref(),
-            store,
-            o_type,
-            "http://www.w3.org/2001/XMLSchema#date",
-        ),
-        FlakeValue::Time(v) => write_typed_literal_display(
-            w,
-            v.as_ref(),
-            store,
-            o_type,
-            "http://www.w3.org/2001/XMLSchema#time",
-        ),
-        FlakeValue::GYear(v) => write_typed_literal_display(
-            w,
-            v.as_ref(),
-            store,
-            o_type,
-            "http://www.w3.org/2001/XMLSchema#gYear",
-        ),
+        FlakeValue::Date(v) => {
+            write_typed_literal_display(w, v.as_ref(), dt, "http://www.w3.org/2001/XMLSchema#date")
+        }
+        FlakeValue::Time(v) => {
+            write_typed_literal_display(w, v.as_ref(), dt, "http://www.w3.org/2001/XMLSchema#time")
+        }
+        FlakeValue::GYear(v) => {
+            write_typed_literal_display(w, v.as_ref(), dt, "http://www.w3.org/2001/XMLSchema#gYear")
+        }
         FlakeValue::GYearMonth(v) => write_typed_literal_display(
             w,
             v.as_ref(),
-            store,
-            o_type,
+            dt,
             "http://www.w3.org/2001/XMLSchema#gYearMonth",
         ),
         FlakeValue::GMonth(v) => write_typed_literal_display(
             w,
             v.as_ref(),
-            store,
-            o_type,
+            dt,
             "http://www.w3.org/2001/XMLSchema#gMonth",
         ),
-        FlakeValue::GDay(v) => write_typed_literal_display(
-            w,
-            v.as_ref(),
-            store,
-            o_type,
-            "http://www.w3.org/2001/XMLSchema#gDay",
-        ),
+        FlakeValue::GDay(v) => {
+            write_typed_literal_display(w, v.as_ref(), dt, "http://www.w3.org/2001/XMLSchema#gDay")
+        }
         FlakeValue::GMonthDay(v) => write_typed_literal_display(
             w,
             v.as_ref(),
-            store,
-            o_type,
+            dt,
             "http://www.w3.org/2001/XMLSchema#gMonthDay",
         ),
         FlakeValue::YearMonthDuration(v) => write_typed_literal_display(
             w,
             v.as_ref(),
-            store,
-            o_type,
+            dt,
             "http://www.w3.org/2001/XMLSchema#yearMonthDuration",
         ),
         FlakeValue::DayTimeDuration(v) => write_typed_literal_display(
             w,
             v.as_ref(),
-            store,
-            o_type,
+            dt,
             "http://www.w3.org/2001/XMLSchema#dayTimeDuration",
         ),
         FlakeValue::Duration(v) => write_typed_literal_display(
             w,
             v.as_ref(),
-            store,
-            o_type,
+            dt,
             "http://www.w3.org/2001/XMLSchema#duration",
         ),
 
         // Extension types
         FlakeValue::Json(s) => {
-            let dt = resolve_datatype_iri(store, o_type)
+            let dt = dt
+                .map(str::to_string)
                 .unwrap_or_else(|| "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON".to_string());
             w.write_all(b"\"")?;
             syntax::write_string(w, s)?;
@@ -1820,7 +1953,8 @@ fn write_object<W: Write>(
             w.write_all(b">")
         }
         FlakeValue::Vector(v) => {
-            let dt = resolve_datatype_iri(store, o_type)
+            let dt = dt
+                .map(str::to_string)
                 .unwrap_or_else(|| "https://ns.flur.ee/db#vector".to_string());
             // Serialize as JSON array string
             let json = serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string());
@@ -1831,7 +1965,8 @@ fn write_object<W: Write>(
             w.write_all(b">")
         }
         FlakeValue::GeoPoint(bits) => {
-            let dt = resolve_datatype_iri(store, o_type)
+            let dt = dt
+                .map(str::to_string)
                 .unwrap_or_else(|| "http://www.opengis.net/ont/geosparql#wktLiteral".to_string());
             let wkt = bits.to_string(); // "POINT(lng lat)"
             w.write_all(b"\"")?;
@@ -1842,6 +1977,21 @@ fn write_object<W: Write>(
         }
 
         FlakeValue::Null => Ok(()), // should have been filtered above
+        FlakeValue::TripleTerm(term) => {
+            let iri = |sid: &Sid| {
+                store
+                    .sid_to_iri(sid)
+                    .unwrap_or_else(|| format!("_:unknown_{sid}"))
+            };
+            w.write_all(b"<<( ")?;
+            write_iri_or_bnode(w, &iri(&term.s))?;
+            w.write_all(b" ")?;
+            write_iri_or_bnode(w, &iri(&term.p))?;
+            w.write_all(b" ")?;
+            let dt = store.sid_to_iri(&term.dt);
+            write_value(w, &term.o, store, term.lang.as_deref(), dt.as_deref())?;
+            w.write_all(b" )>>")
+        }
     }
 }
 
@@ -1940,6 +2090,10 @@ fn write_raw_object<W: Write>(
             let dt = dt_iri().unwrap_or_else(|| "https://ns.flur.ee/db#vector".to_string());
             let json = serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string());
             write_typed_literal(w, &json, &dt)?;
+            Ok(true)
+        }
+        FlakeValue::TripleTerm(_) => {
+            write_value(w, &flake.o, store, None, None)?;
             Ok(true)
         }
         // Temporal and other types always encode into V3 ops, so they should
@@ -2228,13 +2382,10 @@ fn write_typed_literal<W: Write>(w: &mut W, lexical: &str, datatype_iri: &str) -
 fn write_typed_literal_display<W: Write, T: std::fmt::Display>(
     w: &mut W,
     value: &T,
-    store: &BinaryIndexStore,
-    o_type: u16,
+    dt: Option<&str>,
     fallback_dt: &str,
 ) -> io::Result<()> {
-    let lexical = value.to_string();
-    let dt = resolve_datatype_iri(store, o_type).unwrap_or_else(|| fallback_dt.to_string());
-    write_typed_literal(w, &lexical, &dt)
+    write_typed_literal(w, &value.to_string(), dt.unwrap_or(fallback_dt))
 }
 
 #[cfg(test)]

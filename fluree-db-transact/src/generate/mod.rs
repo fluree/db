@@ -9,7 +9,6 @@ pub mod accumulator;
 pub mod flakes;
 
 pub use accumulator::FlakeAccumulator;
-pub(crate) use flakes::bundle_templates;
 #[cfg(feature = "import")]
 pub(crate) use flakes::DT_ID;
 pub use flakes::{infer_datatype, FlakeGenerator};

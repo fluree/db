@@ -87,10 +87,10 @@ pub fn parse_s_expression(s: &str) -> Result<UnresolvedExpression> {
         });
     }
 
-    // Parse arguments, then keep the IRI classification only where an RDF
-    // term comparison is actually being made (see `compares_rdf_terms`).
+    // Parse arguments, then keep the IRI classification only where the
+    // operator reads RDF terms (see `takes_rdf_terms`).
     let mut args = parse_s_expression_args(rest)?;
-    if !compares_rdf_terms(&op_lower) {
+    if !takes_rdf_terms(&op_lower) {
         demote_iri_atoms(&mut args);
     }
     let args = args;
@@ -271,8 +271,9 @@ fn classify_unquoted_atom(s: &str) -> UnresolvedExpression {
     }
 }
 
-/// Operators whose operands are compared as RDF *terms*, and so are the only
-/// places an unquoted atom may mean an IRI.
+/// Operators whose operands are RDF *terms* (compared as terms, or, for
+/// `triple`, built into one), and so are the only places an unquoted atom may
+/// mean an IRI.
 ///
 /// Everywhere else an unquoted atom is the string it has always been. Without
 /// this restriction the classifier reaches every argument position, which is
@@ -283,10 +284,10 @@ fn classify_unquoted_atom(s: &str) -> UnresolvedExpression {
 /// to write a literal. Identity comparison is the one position where an IRI
 /// operand is both meaningful and what the author must have meant — a string
 /// could never have matched an IRI-valued variable there.
-fn compares_rdf_terms(op_lower: &str) -> bool {
+fn takes_rdf_terms(op_lower: &str) -> bool {
     matches!(
         op_lower,
-        "=" | "eq" | "!=" | "<>" | "ne" | "in" | "not-in" | "notin" | "sameterm"
+        "=" | "eq" | "!=" | "<>" | "ne" | "in" | "not-in" | "notin" | "sameterm" | "triple"
     )
 }
 
@@ -510,7 +511,7 @@ fn list_tokens_to_expr(items: &[SexprToken]) -> Result<UnresolvedExpression> {
     let parsed: Result<Vec<UnresolvedExpression>> =
         arg_tokens.iter().map(expr_from_sexpr_token).collect();
     let mut args = parsed?;
-    if !compares_rdf_terms(&op_lower) {
+    if !takes_rdf_terms(&op_lower) {
         demote_iri_atoms(&mut args);
     }
     let args = args;

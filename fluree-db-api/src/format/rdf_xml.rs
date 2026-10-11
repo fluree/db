@@ -144,8 +144,8 @@ fn write_subject_attr(subject: &Term, out: &mut String) -> Result<()> {
             out.push('"');
             Ok(())
         }
-        Term::Literal { .. } => Err(FormatError::InvalidBinding(
-            "RDF/XML subjects cannot be literals".to_string(),
+        Term::Literal { .. } | Term::TripleTerm(_) => Err(FormatError::InvalidBinding(
+            "RDF/XML subjects cannot be literals or triple terms".to_string(),
         )),
     }
 }
@@ -185,15 +185,18 @@ fn write_predicate_object(
             push_node_id(id.as_str(), out);
             out.push('"');
         }
-        Some(Term::Literal { .. }) => {
+        Some(Term::Literal { .. } | Term::TripleTerm(_)) => {
             return Err(FormatError::InvalidBinding(
-                "a reifier cannot be a literal".to_string(),
+                "a reifier cannot be a literal or a triple term".to_string(),
             ))
         }
         None => {}
     }
 
     match object {
+        Term::TripleTerm(_) => Err(FormatError::InvalidBinding(
+            "RDF/XML output does not write triple-term values".to_string(),
+        )),
         Term::Iri(iri) if iri.starts_with("_:") => {
             out.push_str(r#" rdf:nodeID=""#);
             push_node_id(&iri[2..], out);

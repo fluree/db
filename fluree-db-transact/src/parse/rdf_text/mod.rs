@@ -423,6 +423,17 @@ impl GraphSink for Capture<'_, '_> {
     fn supports_reified_triples(&self) -> bool {
         self.sink.supports_reified_triples()
     }
+    fn supports_triple_terms(&self) -> bool {
+        self.sink.supports_triple_terms()
+    }
+    fn term_triple(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+    ) -> std::result::Result<TermId, fluree_graph_ir::SinkError> {
+        self.sink.term_triple(subject, predicate, object)
+    }
     fn emit_reified_triple(
         &mut self,
         subject: TermId,
@@ -460,6 +471,12 @@ mod tests {
             TemplateTerm::Value(FlakeValue::String(s)) => format!("{s:?}"),
             TemplateTerm::Value(v) => format!("{v:?}"),
             TemplateTerm::Var(v) => format!("?{v:?}"),
+            TemplateTerm::TripleTerm(tt) => format!(
+                "<<( {} {} {} )>>",
+                term(ns, &tt.s),
+                term(ns, &tt.p),
+                term(ns, &tt.o)
+            ),
         }
     }
 
@@ -639,7 +656,6 @@ mod tests {
         let block = rendered(&format!("{EX}GRAPH <http://g> {{\n{body}}}\n"));
         let mut stripped: Vec<String> = block
             .iter()
-            .filter(|t| !t.contains("reifiesGraph"))
             .map(|t| t.trim_start_matches("[http://g] ").to_string())
             .collect();
         stripped.sort();
@@ -650,12 +666,8 @@ mod tests {
         assert!(
             block
                 .iter()
-                .any(|t| t.contains("reifiesGraph") && t.ends_with("<http://g>")),
-            "a named-graph bundle carries its anchor: {block:?}"
-        );
-        assert!(
-            !default.iter().any(|t| t.contains("reifiesGraph")),
-            "a default-graph bundle has none"
+                .any(|t| t.starts_with("[http://g] ") && t.contains("#reifies> <<(")),
+            "a named-graph reifier's link is in its graph: {block:?}"
         );
         // Collections keep order and duplicates.
         for (i, v) in ["c", "a", "b", "a"].iter().enumerate() {
@@ -914,7 +926,7 @@ mod tests {
             .parts
             .templates
             .iter()
-            .any(|t| render(&ns, t).contains("reifiesGraph")));
+            .any(|t| render(&ns, t).contains("#reifies> <<(")));
         let (parsed, _) = parse_ok(
             &format!("{EX}ex:a ex:p 1 .\n"),
             Placement::Into(Some(target)),

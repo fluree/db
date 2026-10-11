@@ -110,16 +110,19 @@ Key properties:
   materializing simple string values during `ORDER BY` comparisons. This flag must be cleared on the first
   post-import write because incremental dictionary appends break the invariant.
   When the flag is absent (older roots) or false, query execution must assume no lexical ordering.
-- **Header flag bytes.** Byte 5 carries section/feature flags (`HAS_STATS`, `HAS_ANNOTATIONS`,
-  `HAS_ANNOTATION_INDEX`, …). Byte 6 is the *extended-flags* byte (low byte of the historically-zero
-  `pad(2)` field; legacy roots wrote `0`):
-  - bit 0 `HAD_ANNOTATION_ARENA` — sticky, see `docs/design/edge-annotations.md`.
+- **Header flag bytes.** Byte 5 carries section/feature flags (`HAS_STATS`, `HAS_ANNOTATIONS`, …).
+  Bit 7 is reserved: roots from earlier releases set it for an annotation-arena section (`u32` length +
+  CBOR, before the term dictionary) that readers skip, keeping only its two branch CIDs so the next
+  build releases the arena's blobs. Byte 6 is the *extended-flags* byte (low byte of the
+  historically-zero `pad(2)` field; legacy roots wrote `0`):
+  - bit 0 — reserved (a retired annotation-arena bit; ignored).
   - bit 1 `LIST_META_TRACKED` + bit 2 `HAS_LIST_META` — three-state `IndexRoot.has_list_meta:
     Option<bool>`. `Some(false)` (tracked, clear) means the indexer observed every row and none carries
     an RDF-list position (`o_i == LIST_INDEX_NONE`); filtered-DELETE staging then skips its
     per-retraction list-meta hydration when novelty agrees. `Some(true)` is sticky. A zero byte decodes
     to `None` (untracked — legacy roots, bulk import) and consumers must assume lists may exist; a full
     rebuild, or any incremental pass that sees a list row, moves the root out of that state.
+  - bit 3 `HAS_TERM_DICT` — the root ends with the triple-term dictionary section.
 
 At a high level the root contains:
 

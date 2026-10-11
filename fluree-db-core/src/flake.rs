@@ -505,6 +505,7 @@ impl Flake {
             FlakeValue::Ref(sid) => 8 + sid.name.len(),
             FlakeValue::Vector(v) => 8 + v.len() * 8, // length prefix + 8 bytes per f64
             FlakeValue::GeoPoint(_) => 8,             // packed u64
+            FlakeValue::TripleTerm(t) => 48 + t.s.name.len() + t.p.name.len(),
         };
 
         // Metadata size
@@ -550,6 +551,7 @@ impl Flake {
             FlakeValue::Ref(sid) => 8 + sid.name.len() as u64,
             FlakeValue::Vector(v) => (v.len() * 8) as u64,
             FlakeValue::GeoPoint(_) => 8,
+            FlakeValue::TripleTerm(t) => 48 + (t.s.name.len() + t.p.name.len()) as u64,
         };
 
         let m_size: u64 = match &self.m {

@@ -153,6 +153,15 @@ pub(crate) fn late_materialized_object_binding(
             i_val: encoded_i_val(o_i),
             t,
         }),
+        DecodeKind::TripleTermDict => Some(Binding::EncodedLit {
+            o_kind: ObjKind::TRIPLE_TERM.as_u8(),
+            o_key,
+            p_id,
+            dt_id: 0,
+            lang_id: 0,
+            i_val: encoded_i_val(o_i),
+            t,
+        }),
         // The arena holds overflow integers and decimals alike, so `dt_id` is
         // a placeholder: decode, then resolve via
         // `BinaryIndexStore::resolve_dt_id_sid_for_value`.
@@ -187,6 +196,13 @@ pub(crate) fn late_materialized_object_binding(
                 t,
             })
         }
+        // Inline decimals decode cheaply from `o_key` alone (no arena, unlike
+        // NUM_BIG), so we decline the encoded fast path and let the caller
+        // materialize a `FlakeValue::Decimal`. That keeps them on the ordinary
+        // value path for equality/aggregate surfaces, where they compare by
+        // canonical BigDecimal against decoded sources (VALUES, BIND, novelty,
+        // and arena-backed decimals on other roots).
+        DecodeKind::Decimal => None,
         _ => None,
     }
 }
@@ -337,6 +353,12 @@ pub(crate) fn encoded_equivalent(binding: &Binding, store: &BinaryIndexStore) ->
                         0,
                     )
                 }
+                // A link scan binds a term as its handle.
+                (FlakeValue::TripleTerm(term), _) => {
+                    let (_, handle) =
+                        crate::binary_scan::compose_term_handle(term, store, None).ok()?;
+                    (ObjKind::TRIPLE_TERM.as_u8(), handle, 0, 0)
+                }
                 _ => return None,
             };
             Some(Binding::EncodedLit {
@@ -442,6 +464,63 @@ pub(crate) fn normalize_for_key_cow<'a>(
     }
 }
 
+/// Whether a BIND's computed value agrees with the value the row already
+/// holds for its variable. Plain equality is representation-bound: a scan
+/// binds `EncodedSid`, a VALUES row or a decoded term binds `Sid`, and the
+/// two never compare equal. Normalize both sides to their dictionary form
+/// first, as the join surfaces do, and compare a predicate id against a
+/// subject id through the shared SID.
+pub(crate) fn bind_unifies(
+    existing: &Binding,
+    computed: &Binding,
+    ctx: Option<&crate::context::ExecutionContext<'_>>,
+) -> bool {
+    if existing == computed {
+        return true;
+    }
+    let Some(ctx) = ctx else {
+        return false;
+    };
+    if ctx.is_multi_ledger() {
+        return false;
+    }
+    let Some(store) = ctx.binary_store.as_deref() else {
+        return false;
+    };
+    let as_sid = |b: &Binding| -> Option<Binding> {
+        match b {
+            Binding::EncodedPid { p_id } => store
+                .p_sid_table()
+                .get(*p_id as usize)
+                .cloned()
+                .map(Binding::sid),
+            _ => None,
+        }
+    };
+    let a = as_sid(existing);
+    let b = as_sid(computed);
+    let a = a.as_ref().unwrap_or(existing);
+    let b = b.as_ref().unwrap_or(computed);
+    let gv = (is_numbig_encoded(a) || is_numbig_encoded(b))
+        .then(|| ctx.graph_view())
+        .flatten();
+    if normalize_for_key_cow(a, Some(store), gv.as_ref()).as_ref()
+        == normalize_for_key_cow(b, Some(store), gv.as_ref()).as_ref()
+    {
+        return true;
+    }
+    // An id novelty assigned (a subject or string no index holds yet) has no
+    // store form to normalize to, so compare what the two name.
+    if !(a.is_encoded() || b.is_encoded()) {
+        return false;
+    }
+    let Some(view) = ctx.graph_view() else {
+        return false;
+    };
+    crate::group_aggregate::materialize_encoded(a, Some(&view))
+        == crate::group_aggregate::materialize_encoded(b, Some(&view))
+}
+
 /// True if this is an arena-backed (NUM_BIG) encoded literal.
 pub(crate) fn is_numbig_encoded(binding: &Binding) -> bool {
     matches!(
@@ -514,6 +593,25 @@ mod tests {
             } if o_kind == ObjKind::DATE.as_u8()
                 && dt_id == DatatypeDictId::DATE.as_u16()
         ));
+    }
+
+    #[test]
+    fn late_materialized_object_binding_declines_inline_decimal() {
+        // Inline decimals decode cheaply, so the encoded fast path declines and
+        // the caller materializes a FlakeValue::Decimal — they never become an
+        // EncodedLit (which would need every equality surface to learn NUM_DEC).
+        use fluree_db_core::value_id::ObjKey;
+        let binding = late_materialized_object_binding(
+            OType::XSD_DECIMAL_INLINE.as_u16(),
+            ObjKey::encode_decimal(&"19.99".parse().unwrap())
+                .unwrap()
+                .as_u64(),
+            7,
+            0,
+            u32::MAX,
+            None,
+        );
+        assert!(binding.is_none());
     }
 
     #[test]

@@ -35,6 +35,7 @@ use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
 use fluree_db_core::o_type_registry::OTypeRegistry;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 // ============================================================================
 // Remap table abstractions (memory-friendly)
@@ -982,6 +983,7 @@ pub struct SortedCommitMergeReaderV2<S: SubjectRemap, R: StringRemap> {
     string_remap: R,
     lang_remap: Vec<u16>,
     target_g_id: u16,
+    term_ctx: Option<Arc<TermRemapCtx>>,
     current: Option<RunRecordV2>,
 }
 
@@ -993,6 +995,7 @@ impl<S: SubjectRemap, R: StringRemap> SortedCommitMergeReaderV2<S, R> {
         string_remap: R,
         lang_remap: Vec<u16>,
         target_g_id: u16,
+        term_ctx: Option<Arc<TermRemapCtx>>,
     ) -> io::Result<Self> {
         let mut reader = Self {
             reader: SortedCommitReaderV2::open(path, record_count)?,
@@ -1000,6 +1003,7 @@ impl<S: SubjectRemap, R: StringRemap> SortedCommitMergeReaderV2<S, R> {
             string_remap,
             lang_remap,
             target_g_id,
+            term_ctx,
             current: None,
         };
         reader.advance_to_next()?;
@@ -1022,6 +1026,7 @@ impl<S: SubjectRemap, R: StringRemap> SortedCommitMergeReaderV2<S, R> {
                 &self.subject_remap,
                 &self.string_remap,
                 lang_remap,
+                self.term_ctx.as_deref(),
             )?;
             self.current = Some(record);
             return Ok(());
@@ -1234,12 +1239,81 @@ fn cmp_run_record_as_v2_g_spot(
         .then(a.i.cmp(&b.i))
 }
 
+/// Per-chunk context that turns a link record's term ordinal into a global
+/// triple-term handle.
+///
+/// The chunk's term table holds one V2 pseudo-record per reified base edge in
+/// sorted-local ids. Resolving an ordinal remaps that entry with the same
+/// tables the chunk's records use, then interns the resulting `TermKey` in
+/// the build-wide dictionary. Interning is idempotent, so every phase that
+/// reads the chunk resolves the same ordinal to the same handle.
+pub struct TermRemapCtx {
+    terms: Vec<RunRecordV2>,
+    builder: Arc<std::sync::Mutex<fluree_db_binary_index::dict::TermDictBuilder>>,
+}
+
+impl TermRemapCtx {
+    /// Load a chunk's term table.
+    pub fn load(
+        path: &Path,
+        record_count: u64,
+        builder: Arc<std::sync::Mutex<fluree_db_binary_index::dict::TermDictBuilder>>,
+    ) -> io::Result<Self> {
+        let mut terms = Vec::with_capacity(record_count as usize);
+        for r in SortedCommitReaderV2::open(path, record_count)? {
+            terms.push(r?);
+        }
+        Ok(Self { terms, builder })
+    }
+
+    /// The global handle for the term at `ordinal`.
+    pub fn handle_for<S: SubjectRemap + ?Sized, R: StringRemap + ?Sized>(
+        &self,
+        ordinal: u64,
+        subject_remap: &S,
+        string_remap: &R,
+        lang_remap: Option<&[u16]>,
+    ) -> io::Result<u64> {
+        let mut term = *self.terms.get(ordinal as usize).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "term ordinal {ordinal} out of range (table holds {})",
+                    self.terms.len()
+                ),
+            )
+        })?;
+        remap_v2_record(
+            &mut term,
+            subject_remap,
+            string_remap,
+            lang_remap,
+            Some(self),
+        )?;
+        let o_type = fluree_db_core::o_type::OType::from_u16(term.o_type);
+        if fluree_db_core::triple_term::is_lexical_term_object(o_type) {
+            term.o_key = u64::from(string_remap.get(term.o_key as usize)?);
+        }
+        let key = fluree_db_core::triple_term::TermKey {
+            s_id: term.s_id.as_u64(),
+            p_id: term.p_id,
+            o_type,
+            o_key: term.o_key,
+        };
+        self.builder
+            .lock()
+            .map_err(|_| io::Error::other("term dictionary builder lock poisoned"))?
+            .get_or_insert(key)
+    }
+}
+
 #[inline]
 pub fn remap_v2_record<S: SubjectRemap + ?Sized, R: StringRemap + ?Sized>(
     record: &mut RunRecordV2,
     subject_remap: &S,
     string_remap: &R,
     lang_remap: Option<&[u16]>,
+    term_ctx: Option<&TermRemapCtx>,
 ) -> io::Result<()> {
     use fluree_db_core::o_type::{DecodeKind, OType};
     use fluree_db_core::subject_id::SubjectId;
@@ -1254,6 +1328,15 @@ pub fn remap_v2_record<S: SubjectRemap + ?Sized, R: StringRemap + ?Sized>(
         }
         DecodeKind::StringDict => {
             record.o_key = string_remap.get(record.o_key as usize)? as u64;
+        }
+        DecodeKind::TripleTermDict => {
+            let ctx = term_ctx.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "triple-term record in a chunk without a term table",
+                )
+            })?;
+            record.o_key = ctx.handle_for(record.o_key, subject_remap, string_remap, lang_remap)?;
         }
         _ => {}
     }
@@ -1455,6 +1538,7 @@ pub fn remap_sorted_commit_v2_to_runs<S: SubjectRemap + ?Sized, R: StringRemap +
     string_remap: &R,
     lang_remap: &[u16],
     target_g_id: u16,
+    term_ctx: Option<&TermRemapCtx>,
     writer: &mut super::run_writer::MultiOrderRunWriter,
     mut stats_hook: Option<&mut crate::stats::IdStatsHook>,
     progress: Option<&std::sync::atomic::AtomicU64>,
@@ -1475,7 +1559,13 @@ pub fn remap_sorted_commit_v2_to_runs<S: SubjectRemap + ?Sized, R: StringRemap +
         if record.g_id != target_g_id {
             continue;
         }
-        remap_v2_record(&mut record, subject_remap, string_remap, lang_remap_opt)?;
+        remap_v2_record(
+            &mut record,
+            subject_remap,
+            string_remap,
+            lang_remap_opt,
+            term_ctx,
+        )?;
         if let Some(ref mut hook) = stats_hook {
             let stats_record = crate::stats::stats_record_from_v2(&record, 1);
             hook.on_record(&stats_record);
@@ -1597,6 +1687,10 @@ pub struct SortedCommitInfo {
     /// Duplicate statements collapsed by the within-chunk dedup (step 4b).
     /// `record_count` is the post-dedup count.
     pub duplicates_removed: u64,
+    /// Triple-term table `(path, record_count)`: V2 pseudo-records for the
+    /// chunk's reified base edges in ordinal order, sorted-local ids. `None`
+    /// when the chunk reified nothing.
+    pub term_table: Option<(PathBuf, u64)>,
 }
 
 /// Sort, remap, and write a sorted commit file from buffered parse output.
@@ -1632,6 +1726,7 @@ pub const TYPES_MAP_ENTRY_SIZE: usize = 18;
 #[allow(clippy::too_many_arguments)]
 pub fn sort_remap_and_write_sorted_commit(
     mut records: Vec<RunRecord>,
+    mut terms: Vec<RunRecord>,
     subjects: crate::run_index::resolve::chunk_dict::ChunkSubjectDict,
     strings: crate::run_index::resolve::chunk_dict::ChunkStringDict,
     subject_vocab_path: &Path,
@@ -1685,7 +1780,7 @@ pub fn sort_remap_and_write_sorted_commit(
                 // Raw tags that normalize identically collapse to one dict id.
                 old_to_lex[*old_id as usize] = lang_dict.get_or_insert(Some(tag));
             }
-            for record in &mut records {
+            for record in records.iter_mut().chain(terms.iter_mut()) {
                 if record.lang_id != 0 {
                     record.lang_id = old_to_lex[record.lang_id as usize];
                 }
@@ -1723,6 +1818,20 @@ pub fn sort_remap_and_write_sorted_commit(
             remap_record(record, &subject_remap, &string_remap)?;
         }
     }
+    // Term-table entries keep their ordinal order (link records address them
+    // by position), so they are remapped but never sorted. A decimal,
+    // big-integer or vector object there holds a string id, not an arena
+    // handle.
+    use fluree_db_core::value_id::{ObjKey, ObjKind};
+    for term in &mut terms {
+        remap_record(term, &subject_remap, &string_remap)?;
+        let kind = ObjKind::from_u8(term.o_kind);
+        if kind == ObjKind::NUM_BIG || kind == ObjKind::VECTOR_ID {
+            let local = ObjKey::from_u64(term.o_key).decode_u32_id() as usize;
+            term.o_key =
+                ObjKey::encode_u32_id(StringRemap::get(&string_remap[..], local)?).as_u64();
+        }
+    }
 
     // A.2 step 4: Sort records by the V2-native graph-prefixed SPOT key without
     // materializing a second full-size record buffer.
@@ -1756,6 +1865,18 @@ pub fn sort_remap_and_write_sorted_commit(
         writer.push(&RunRecordV2::from_v1(record, otype_registry))?;
     }
     let spool_info = writer.finish()?;
+
+    let term_table = if terms.is_empty() {
+        None
+    } else {
+        let path = commit_path.with_extension("terms");
+        let mut tw = SortedCommitWriterV2::new(&path, chunk_idx)?;
+        for term in &terms {
+            tw.push(&RunRecordV2::from_v1(term, otype_registry))?;
+        }
+        let info = tw.finish()?;
+        Some((info.path, info.record_count))
+    };
 
     // A.3b: Optionally extract rdf:type edges into a tiny sidecar file.
     // Records are already remapped to sorted-local IDs (step A.2), so both
@@ -1791,6 +1912,7 @@ pub fn sort_remap_and_write_sorted_commit(
         string_count,
         types_map_path,
         duplicates_removed,
+        term_table,
     })
 }
 
@@ -2362,6 +2484,7 @@ mod tests {
 
         let info = sort_remap_and_write_sorted_commit(
             records,
+            Vec::new(),
             subj_dict,
             str_dict,
             &subj_vocab,
@@ -2432,6 +2555,7 @@ mod tests {
 
         let info = sort_remap_and_write_sorted_commit(
             records,
+            Vec::new(),
             subj_dict,
             str_dict,
             &dir.join("subjects.voc"),
@@ -2492,6 +2616,7 @@ mod tests {
         let lang_vocab = dir.join("languages.voc");
         let info = sort_remap_and_write_sorted_commit(
             records,
+            Vec::new(),
             subj_dict,
             str_dict,
             &dir.join("subjects.voc"),
@@ -2556,6 +2681,7 @@ mod tests {
 
         let info = sort_remap_and_write_sorted_commit(
             records,
+            Vec::new(),
             subj_dict,
             str_dict,
             &subj_vocab,
@@ -2612,6 +2738,7 @@ mod tests {
 
         let info = sort_remap_and_write_sorted_commit(
             records,
+            Vec::new(),
             subj_dict,
             str_dict,
             &dir.join("subj.voc"),
@@ -2645,8 +2772,9 @@ mod tests {
             info.record_count,
             &subject_remap,
             &string_remap,
-            &[], // no lang remap
-            0,   // target g_id (default graph)
+            &[],  // no lang remap
+            0,    // target g_id (default graph)
+            None, // no term table
             &mut writer,
             Some(&mut stats_hook),
             None,

@@ -41,6 +41,7 @@ pub mod pack_builder;
 pub mod pack_reader;
 pub mod reader;
 pub mod reverse_leaf;
+pub mod term_dict;
 pub mod varint;
 
 pub use branch::DictBranch;
@@ -49,3 +50,4 @@ pub use forward_pack::ForwardPack;
 pub use global_dict::{LanguageTagDict, PredicateDict};
 pub use pack_reader::ForwardPackReader;
 pub use reader::DictTreeReader;
+pub use term_dict::{TermDictBuilder, TermDictReader};

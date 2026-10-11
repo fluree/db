@@ -1245,41 +1245,32 @@ async fn import_jsonld_user_authored_expanded_reifies_iri_is_rejected() {
     );
 }
 
-/// End-to-end: imported annotation-bearing ledger → follow-up
-/// `fluree.reindex(...)` (the same call the CLI's
-/// `fluree create --import` auto-seal step makes) seals the
-/// annotation arena.
-///
-/// Closes the bulk-import seal gap. `ApiAttachmentEventsProvider`
-/// scans the base index for `f:reifies*` flakes when the running
-/// `AttachmentNovelty` overlay is empty but the snapshot's sticky
-/// bit says annotations exist — so the freshly-imported state
-/// (where the f:reifies* flakes live in the base index, not the
-/// overlay) still produces a complete `Authoritative` event set
-/// for the indexer's arena builder.
+/// An export written before links carries each annotation as `f:reifies*`
+/// triples; importing it stores the annotation's `rdf:reifies` link and not
+/// the slots.
 #[tokio::test]
-async fn import_then_reindex_seals_annotation_arena() {
+async fn import_of_reifies_slots_writes_the_link() {
     let db_dir = tempfile::tempdir().expect("db tmpdir");
     let data_dir = tempfile::tempdir().expect("data tmpdir");
 
-    let ttl = r"
+    let ttl = r#"
 @prefix ex: <http://example.org/> .
 @prefix f:  <https://ns.flur.ee/db#> .
 
 ex:alice ex:worksFor ex:acme .
 
-_:ann1 f:reifiesSubject   ex:alice ;
-       f:reifiesPredicate ex:worksFor ;
-       f:reifiesObject    ex:acme .
-";
+ex:ann1 f:reifiesSubject   ex:alice ;
+        f:reifiesPredicate ex:worksFor ;
+        f:reifiesObject    ex:acme ;
+        ex:role            "Engineer" .
+"#;
     let ttl_path = write_ttl(data_dir.path(), "annotated.ttl", ttl);
 
     let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
-        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
         .build()
         .expect("build file-backed Fluree");
 
-    let ledger_id = "test/import-then-reindex:main";
+    let ledger_id = "test/import-reifies-slots:main";
     let result = fluree
         .create(ledger_id)
         .import(&ttl_path)
@@ -1287,26 +1278,47 @@ _:ann1 f:reifiesSubject   ex:alice ;
         .execute()
         .await
         .expect("import should succeed");
-
     assert!(result.has_annotations, "annotation import must signal");
 
-    // Auto-seal step: same call the CLI's run_bulk_import makes when
-    // `result.has_annotations` is true.
-    fluree
-        .reindex(ledger_id, fluree_db_api::ReindexOptions::default())
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let sparql = "PREFIX ex: <http://example.org/>\n\
+                  PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+                  SELECT ?r ?o ?role WHERE { ?r rdf:reifies <<( ex:alice ex:worksFor ?o )>> ; ex:role ?role }";
+    let json = support::query_sparql(&fluree, &ledger, sparql)
         .await
-        .expect("reindex must succeed");
+        .expect("link query")
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json");
+    let bindings = json["results"]["bindings"].as_array().expect("bindings");
+    assert_eq!(bindings.len(), 1, "{json:#}");
+    assert_eq!(bindings[0]["r"]["value"], "http://example.org/ann1");
+    assert_eq!(bindings[0]["o"]["value"], "http://example.org/acme");
+    assert_eq!(bindings[0]["role"]["value"], "Engineer");
 
-    let post = fluree.ledger(ledger_id).await.expect("reload");
+    let slots = fluree_db_core::range_with_overlay(
+        &ledger.snapshot,
+        0,
+        ledger.novelty.as_ref(),
+        fluree_db_core::comparator::IndexType::Spot,
+        fluree_db_core::range::RangeTest::Eq,
+        fluree_db_core::range::RangeMatch::subject(
+            ledger
+                .snapshot
+                .encode_iri("http://example.org/ann1")
+                .expect("ann1"),
+        ),
+        fluree_db_core::range::RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan ann1");
     assert!(
-        post.snapshot.has_annotations,
-        "sticky bit must survive the seal pass"
-    );
-    assert!(
-        post.snapshot.annotation_index.is_some(),
-        "annotation arena must be sealed after the auto-seal reindex"
+        !slots
+            .iter()
+            .any(|f| fluree_db_core::is_reserved_reifies_predicate(&f.p)),
+        "the slots are not stored: {slots:#?}"
     );
 }
+
 // N-Triples (.nt) import tests
 //
 // N-Triples is a strict subset of Turtle, so `.nt` files dispatch to the same

@@ -312,15 +312,15 @@ fn item_shape() -> Value {
     })
 }
 
-/// `n` items whose `xsd:decimal` weights no index has seen, plus one weighing
-/// `outlier` when given.
+/// `n` items whose high-precision `xsd:decimal` weights cannot inline and no
+/// index has seen, plus one weighing `outlier` when given.
 fn items(n: usize, outlier: Option<&str>) -> Value {
     let mut nodes: Vec<Value> = (0..n)
         .map(|i| {
             json!({
                 "@id": format!("ex:item{i}"),
                 "@type": "ex:Item",
-                "ex:weight": {"@value": format!("{}.{:03}", i % 10, i), "@type": "xsd:decimal"}
+                "ex:weight": {"@value": format!("{}.123456789012345678{:03}", i % 10, i), "@type": "xsd:decimal"}
             })
         })
         .collect();
@@ -371,7 +371,7 @@ async fn indexed_item_ledger(
 /// probe.
 const PROBE_RAW_BOUND: usize = 4;
 
-/// Decimals new to the transaction are absent from the persisted NumBig
+/// Overflow decimals new to the transaction are absent from the persisted NumBig
 /// arena, so they cannot translate. Staged probes still have to find each
 /// subject's own values among the transaction's flakes — both when the
 /// predicate is unindexed (overlay-only lane, seeking to the probe's span)
@@ -423,7 +423,7 @@ async fn shacl_over_staged_view_sees_untranslatable_decimals() {
         let err = fluree
             .insert_with_opts(
                 ledger,
-                &items(50, Some("99.5")),
+                &items(50, Some("99.1234567890123456789")),
                 opts(),
                 CommitOpts::default(),
                 &quiet_index_cfg(),

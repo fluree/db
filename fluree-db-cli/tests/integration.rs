@@ -2365,8 +2365,7 @@ fn a_trig_body_under_another_name_is_refused_by_one_graph_commands() {
 // ============================================================================
 
 /// One edge, two reifiers, each with properties. Built by `insert` + `index`,
-/// which leaves the annotation arena **unsealed** — so this fixture exercises
-/// the base-index scan fallback, the path a plain `fluree index` produces.
+/// the path a plain `fluree index` produces.
 fn seed_annotated_indexed(tmp: &TempDir, ledger: &str) {
     fluree_cmd(tmp).args(["create", ledger]).assert().success();
     fluree_cmd(tmp)
@@ -2386,8 +2385,7 @@ fn seed_annotated_indexed(tmp: &TempDir, ledger: &str) {
     fluree_cmd(tmp).args(["index", ledger]).assert().success();
 }
 
-/// The same data through `create --from`, which runs an auto-seal reindex —
-/// so this fixture exercises the **sealed annotation arena** instead.
+/// The same data through `create --from`, the bulk-import path.
 fn seed_annotated_sealed(tmp: &TempDir, ledger: &str) {
     let src = tmp.path().join(format!("{ledger}-src"));
     std::fs::create_dir_all(&src).unwrap();
@@ -2429,11 +2427,10 @@ fn export_turtle_emits_annotation_syntax() {
         .stdout(predicate::str::contains("ex:confidence"));
 }
 
-/// Same assertions against the arena-less ledger a plain `fluree index`
-/// leaves behind. Without this the suite would only ever see a sealed arena,
-/// and the fallback would be untested on the commoner workflow.
+/// Same assertions against a ledger built by `insert` + `index`, the commoner
+/// workflow.
 #[test]
-fn export_turtle_emits_annotation_syntax_without_a_sealed_arena() {
+fn export_turtle_emits_annotation_syntax_after_insert_and_index() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
     seed_annotated_indexed(&tmp, "annu");
@@ -2446,8 +2443,8 @@ fn export_turtle_emits_annotation_syntax_without_a_sealed_arena() {
         .stdout(predicate::str::contains("ns.flur.ee/db#reifies").not());
 }
 
-/// And against a ledger with no index at all, where the attachment overlay is
-/// the whole history.
+/// And against a ledger with no index at all, where novelty is the whole
+/// history.
 #[test]
 fn export_turtle_emits_annotation_syntax_on_a_never_indexed_ledger() {
     let tmp = TempDir::new().unwrap();
@@ -2508,9 +2505,9 @@ fn export_jsonld_emits_annotation_blocks() {
         .stdout(predicate::str::contains("ns.flur.ee/db#reifies").not());
 }
 
-/// The escape hatch: pre-4.2 bytes, for anyone consuming them.
+/// `--raw-reifies` writes each annotation as its stored link.
 #[test]
-fn export_raw_reifies_keeps_the_system_facts() {
+fn export_raw_reifies_writes_the_links() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
     seed_annotated_sealed(&tmp, "ann4");
@@ -2519,8 +2516,11 @@ fn export_raw_reifies_keeps_the_system_facts() {
         .args(["export", "ann4", "--format", "turtle", "--raw-reifies"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("reifiesSubject"))
-        .stdout(predicate::str::contains(" ~ ").not());
+        .stdout(predicate::str::contains(
+            "<<( <http://example.org/alice> <http://example.org/knows> <http://example.org/bob> )>>",
+        ))
+        .stdout(predicate::str::contains(" ~ ").not())
+        .stdout(predicate::str::contains("ns.flur.ee/db#reifies").not());
 }
 
 /// Export → re-ingest → query, per format.
@@ -2571,9 +2571,124 @@ fn export_annotations_round_trip_in_every_format() {
     }
 }
 
-/// The bundle is up to seven predicates, not the three the issue showed: a
-/// plain literal adds `reifiesDatatype`, a language-tagged one adds
-/// `reifiesLang`. Each object shape has to reach the output.
+/// A reifier of a triple the ledger does not assert has no edge to carry a
+/// `~` marker: it is written as its `rdf:reifies` link (`@reifies` in
+/// JSON-LD), and re-importing it reifies the triple without asserting it.
+/// `fluree info` says when an annotated ledger's index predates triple-term
+/// links (a ledger written and indexed by 4.2.3), so annotation reads will
+/// refuse until a reindex; a current ledger says nothing.
+#[test]
+fn info_flags_an_index_that_predates_links() {
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+    let dir = TempDir::new().unwrap();
+    fluree_cmd(&dir).arg("init").assert().success();
+    copy_dir(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../fluree-db-api/tests/fixtures/prelink-annotations"),
+        &dir.path().join(".fluree/storage"),
+    );
+    fluree_cmd(&dir)
+        .args(["info", "ann"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "predates RDF 1.2 triple-term links",
+        ));
+
+    fluree_cmd(&dir)
+        .args(["create", "plain"])
+        .assert()
+        .success();
+    fluree_cmd(&dir)
+        .args([
+            "insert",
+            "plain",
+            "-e",
+            "@prefix ex: <http://example.org/> . ex:a ex:b ex:c .",
+        ])
+        .assert()
+        .success();
+    fluree_cmd(&dir).args(["index", "plain"]).assert().success();
+    fluree_cmd(&dir)
+        .args(["info", "plain"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("predates").not());
+}
+
+#[test]
+fn export_round_trips_reifications_of_unasserted_triples() {
+    let src = TempDir::new().unwrap();
+    fluree_cmd(&src).arg("init").assert().success();
+    let data = src.path().join("unasserted-src");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(
+        data.join("a.ttl"),
+        "@prefix ex: <http://example.org/> .\n\
+         ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.8 |} .\n\
+         << ex:alice ex:knows ex:carol ~ ex:claim2 >> ex:confidence 0.5 .\n",
+    )
+    .unwrap();
+    fluree_cmd(&src)
+        .args(["create", "unasserted", "--from"])
+        .arg(&data)
+        .assert()
+        .success();
+
+    for (fmt, ext) in [("turtle", "ttl"), ("ntriples", "nt"), ("jsonld", "jsonld")] {
+        let out = src.path().join(format!("unasserted.{ext}"));
+        fluree_cmd(&src)
+            .args(["export", "unasserted", "--format", fmt, "-o"])
+            .arg(&out)
+            .assert()
+            .success();
+
+        let dst = TempDir::new().unwrap();
+        fluree_cmd(&dst).arg("init").assert().success();
+        fluree_cmd(&dst)
+            .args(["create", "unasserted", "--from"])
+            .arg(&out)
+            .assert()
+            .success();
+        fluree_cmd(&dst)
+            .args([
+                "query",
+                "unasserted",
+                "--sparql",
+                "PREFIX ex: <http://example.org/> \
+                 SELECT ?r ?c WHERE { << ex:alice ex:knows ?o ~ ?r >> ex:confidence ?c }",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("claim1"))
+            .stdout(predicate::str::contains("claim2"));
+        fluree_cmd(&dst)
+            .args([
+                "query",
+                "unasserted",
+                "--sparql",
+                "PREFIX ex: <http://example.org/> SELECT ?o WHERE { ex:alice ex:knows ?o }",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("bob"))
+            .stdout(predicate::str::contains("carol").not());
+    }
+}
+
+/// A link's object keeps its datatype and language tag, so each object shape
+/// — a ref, a plain literal, a language-tagged one — has to reach the output.
 #[test]
 fn export_annotation_object_shapes() {
     let tmp = TempDir::new().unwrap();
@@ -2647,13 +2762,10 @@ fn export_without_annotations_is_unchanged() {
         .stdout(predicate::str::contains("~").not());
 }
 
-/// An annotation written inside a named graph is not represented in the
-/// output today: the forward lookup export uses is blind to named graphs,
-/// though the rows are in the ledger and SPARQL reads them. Export must say
-/// so — suppressing the `f:reifies*` rows and then emitting no marker is
-/// exactly the silent truncation this work exists to remove.
+/// An annotation written inside a named graph is exported like any other:
+/// its link lives in the edge's graph, where the export's lookup finds it.
 #[test]
-fn export_reports_annotations_it_could_not_resolve() {
+fn export_resolves_named_graph_annotations() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
     let src = tmp.path().join("gann-src");
@@ -2675,24 +2787,8 @@ fn export_reports_annotations_it_could_not_resolve() {
         .args(["export", "gann", "--format", "trig", "--all-graphs"])
         .assert()
         .success()
-        .stderr(predicate::str::contains(
-            "1 edge annotations could not be resolved",
-        ))
-        .stderr(predicate::str::contains("--raw-reifies"));
-
-    // And the named remedy works: the bundle comes out verbatim.
-    fluree_cmd(&tmp)
-        .args([
-            "export",
-            "gann",
-            "--format",
-            "trig",
-            "--all-graphs",
-            "--raw-reifies",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("reifiesSubject"));
+        .stdout(predicate::str::contains("ex:p ex:y ~ ex:cG"))
+        .stderr(predicate::str::contains("could not be resolved").not());
 }
 
 /// Two exports of the same ledger must produce the same bytes.
@@ -2830,34 +2926,22 @@ fn an_untranslated_annotation_exports_with_its_marker() {
         .stdout(predicate::str::contains("<http://example.org/src>"));
 }
 
-/// The counter still fires when an annotation genuinely cannot be resolved.
-///
-/// Paired with the test above on purpose. "No warning" is satisfied by a
-/// counter that has stopped working, so a `MustNotFire` assertion alone
-/// cannot distinguish "nothing was dropped" from "the accounting is dead".
-///
-/// The fixture is an annotation inside a named graph, which the base-index
-/// seal scan cannot key on this branch.
-///
-/// **This canary has a known expiry**, recorded here so the next person does
-/// not mistake its retirement for a regression: the stacked seal fix makes
-/// named-graph annotations resolve, at which point this stops firing and
-/// must be replaced rather than deleted. The replacement wanted is a bundle
-/// the decoder rejects outright — a `GraphMismatch` or a malformed bundle —
-/// which is a corruption state rather than a defect, and which no supported
-/// write surface can produce, since every write path rejects hand-written
-/// `f:reifies*`.
+/// An export written before links whose `f:reifies*` bundle names a triple
+/// the file never asserts imports as a reifier of that unasserted triple. The
+/// export has no edge to hang a `~` marker on, so it writes the link itself,
+/// and nothing goes unresolved.
 #[test]
-fn the_unresolved_counter_still_fires_when_it_should() {
+fn an_old_bundle_naming_an_unasserted_triple_exports_as_its_link() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
     let src = tmp.path().join("mf-src");
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(
-        src.join("a.trig"),
+        src.join("a.ttl"),
         "@prefix ex: <http://example.org/> .\n\
-         GRAPH <http://example.org/g1> { \
-             ex:x ex:p ex:y ~ ex:cG {| ex:src ex:d |} . }\n",
+         @prefix f: <https://ns.flur.ee/db#> .\n\
+         ex:cG f:reifiesSubject ex:x ; f:reifiesPredicate ex:p ; \
+             f:reifiesObject ex:y ; ex:src ex:d .\n",
     )
     .unwrap();
     fluree_cmd(&tmp)
@@ -2867,12 +2951,14 @@ fn the_unresolved_counter_still_fires_when_it_should() {
         .success();
 
     fluree_cmd(&tmp)
-        .args(["export", "mf", "--format", "trig", "--all-graphs"])
+        .args(["export", "mf", "--format", "turtle"])
         .assert()
         .success()
-        .stderr(predicate::str::contains(
-            "1 edge annotations could not be resolved",
-        ));
+        .stdout(predicate::str::contains(
+            "rdf:reifies <<( <http://example.org/x> <http://example.org/p> \
+             <http://example.org/y> )>>",
+        ))
+        .stderr(predicate::str::contains("could not be resolved").not());
 }
 
 /// Every object shape keeps its annotation, including the big-numeric ones.
@@ -2882,8 +2968,8 @@ fn the_unresolved_counter_still_fires_when_it_should() {
 /// returns `None` for the `NUM_BIG_OVERFLOW` arena, because that arena holds
 /// both overflow `xsd:integer` and `xsd:decimal` and the o_type alone cannot
 /// say which. The `else { continue }` then skipped the row before it could
-/// be matched against the arena, so the marker was lost on *every* lookup
-/// path, sealed arena included, and the reifier came out as an orphan.
+/// be matched, so the marker was lost on *every* lookup path and the reifier
+/// came out as an orphan.
 ///
 /// `resolve_datatype_sid_for_value` exists for exactly that ambiguity —
 /// added for #1329, where the same gap rendered big numerics with an empty
@@ -2953,26 +3039,13 @@ fn big_numeric_objects_keep_their_annotations() {
 }
 
 /// A point-in-time export shows an annotation that was live at that time,
-/// even though it has since been retracted.
+/// even though it has since been retracted: export reads the links as of the
+/// requested `t`, not HEAD.
 ///
-/// It did not, on the arena-less path. `scan_base_index_for_attachment_events_in`
-/// computed its own upper bound as `t.max(snapshot.t)` — right for a seal
-/// pass, which wants the whole of history, and wrong for a read at a
-/// requested `t`. Raising the bound to HEAD means the range never returns a
-/// bundle retracted after the requested time, and the filter below it can
-/// only *drop* rows, never restore them. The annotation vanished from an
-/// export that should contain it, and because no edge was then known to be
-/// annotated, nothing incremented the unresolved counter either — silent.
-///
-/// The bound is now the caller's: seal callers clamp it themselves, the
-/// export passes the requested time.
-///
-/// Three things the fixture needs, or it passes without exercising the bug:
-/// the ledger must be **indexed past** the requested `t` (otherwise
-/// `snapshot.t` is 0 and the clamp is a no-op), the annotation must be
-/// **retracted after** it (otherwise it is live at HEAD too), and the scan
-/// must be the annotation source (`FLUREE_EXPORT_ANNOTATION_SCAN`), since
-/// that is the path the bound belongs to.
+/// Two things the fixture needs, or it passes without exercising the bound:
+/// the ledger must be **indexed past** the requested `t`, so the link's
+/// assert and retract both come from the index, and the annotation must be
+/// **retracted after** it (otherwise it is live at HEAD too).
 #[test]
 fn a_point_in_time_export_keeps_an_annotation_retracted_later() {
     let tmp = TempDir::new().unwrap();
@@ -3009,7 +3082,6 @@ fn a_point_in_time_export_keeps_an_annotation_retracted_later() {
     // At HEAD the annotation is gone — that is the retract working.
     fluree_cmd(&tmp)
         .args(["export", "tt", "--format", "turtle"])
-        .env("FLUREE_EXPORT_ANNOTATION_SCAN", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains("~ <http://example.org/c1>").not());
@@ -3017,7 +3089,6 @@ fn a_point_in_time_export_keeps_an_annotation_retracted_later() {
     // At t=1 it was live, so it must be in the output.
     fluree_cmd(&tmp)
         .args(["export", "tt", "--format", "turtle", "--at", "1"])
-        .env("FLUREE_EXPORT_ANNOTATION_SCAN", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains("~ <http://example.org/c1>"))

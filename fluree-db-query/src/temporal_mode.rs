@@ -80,6 +80,11 @@ pub struct PlanningContext {
     /// (which assume bag cardinality over the union). Only ever `true` in
     /// current mode — history datasets keep per-event (assert/retract) rows.
     pub multi_default_graph: bool,
+    /// Whether the default graph is a union of two or more graphs, in any mode
+    /// (unlike [`Self::multi_default_graph`]). An annotated edge then reads its
+    /// base edge and its link one member at a time, so the two come from the
+    /// same graph.
+    pub default_graph_union: bool,
     /// What an unmatched OPTIONAL binds its optional-only variables to — the
     /// surface language's null semantics. Folded in from `Query` at the plan
     /// root; defaults to SPARQL's `Unbound`.
@@ -99,6 +104,7 @@ impl PlanningContext {
             mode: TemporalMode::Current,
             allow_semantic_elision: false,
             multi_default_graph: false,
+            default_graph_union: false,
             unmatched_optional: UnmatchedOptional::Unbound,
             row_goal: None,
         }
@@ -111,6 +117,7 @@ impl PlanningContext {
             mode: TemporalMode::History,
             allow_semantic_elision: false,
             multi_default_graph: false,
+            default_graph_union: false,
             unmatched_optional: UnmatchedOptional::Unbound,
             row_goal: None,
         }
@@ -135,6 +142,7 @@ impl PlanningContext {
     #[inline]
     pub const fn with_multi_default_graph(mut self, multi: bool) -> Self {
         self.multi_default_graph = multi && self.mode.is_current();
+        self.default_graph_union = multi;
         self
     }
 

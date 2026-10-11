@@ -1,4 +1,4 @@
-//! Dictionary novelty overlay for subjects and strings.
+//! Dictionary novelty overlay for subjects, strings and triple terms.
 //!
 //! `DictNovelty` is a LedgerState-scoped layer that tracks novel dictionary
 //! entries (subjects and strings) introduced by commits since the last index
@@ -42,7 +42,8 @@ use std::sync::Arc;
 
 use crate::ns_vec_bi_dict::{lookup_key, NsVecBiDict};
 use crate::vec_bi_dict::VecBiDict;
-use crate::{Flake, FlakeValue};
+use crate::{Flake, FlakeValue, TripleTermValue};
+use std::collections::HashMap;
 
 /// Does not match `namespaces::OVERFLOW` (0xFFFE); no production path assigns this
 /// code, so the special case below is never taken (#1843).
@@ -76,6 +77,7 @@ pub fn subject_reverse_key(ns_code: u16, suffix: &str) -> Box<[u8]> {
 pub struct DictNovelty {
     pub subjects: SubjectDictNovelty,
     pub strings: StringDictNovelty,
+    pub terms: TermDictNovelty,
     initialized: bool,
 }
 
@@ -88,6 +90,7 @@ impl DictNovelty {
         Self {
             subjects: SubjectDictNovelty::default(),
             strings: StringDictNovelty::default(),
+            terms: TermDictNovelty::default(),
             initialized: true,
         }
     }
@@ -101,6 +104,7 @@ impl DictNovelty {
         Self {
             subjects: SubjectDictNovelty::default(),
             strings: StringDictNovelty::default(),
+            terms: TermDictNovelty::default(),
             initialized: false,
         }
     }
@@ -134,6 +138,7 @@ impl DictNovelty {
                 watermark: string_wm,
                 parent: None,
             },
+            terms: TermDictNovelty::default(),
             initialized: true,
         }
     }
@@ -171,6 +176,7 @@ impl DictNovelty {
             .retire_seen_through(t, trimmed_wm, overflow_wm);
         let strings = self.strings.inner.retire_seen_through(t, string_wm + 1);
         self.strings.watermark = string_wm;
+        self.terms.retire_seen_through(t);
         Some((subjects, strings))
     }
 
@@ -185,6 +191,11 @@ impl DictNovelty {
                 inner: VecBiDict::new(parent.strings.inner.next_id()),
                 watermark: parent.strings.watermark,
                 parent: Some(Arc::clone(&parent)),
+            },
+            terms: TermDictNovelty {
+                base: parent.terms.next_index(),
+                parent: Some(Arc::clone(&parent)),
+                ..TermDictNovelty::default()
             },
             initialized: parent.initialized,
         }
@@ -243,9 +254,29 @@ impl DictNovelty {
                 FlakeValue::String(s) | FlakeValue::Json(s) => {
                     self.strings.assign_or_lookup_at(s, flake.t);
                 }
+                FlakeValue::TripleTerm(term) => self.register_term(term, flake.t),
                 _ => {}
             }
         }
+    }
+
+    /// Register a term's subject, object and the term itself; a nested term
+    /// first, since the outer term's key names its handle.
+    fn register_term(&mut self, term: &TripleTermValue, t: i64) {
+        self.subjects
+            .assign_or_lookup_at(term.s.namespace_code, &term.s.name, t);
+        match &term.o {
+            FlakeValue::Ref(sid) => {
+                self.subjects
+                    .assign_or_lookup_at(sid.namespace_code, &sid.name, t);
+            }
+            FlakeValue::String(s) | FlakeValue::Json(s) => {
+                self.strings.assign_or_lookup_at(s, t);
+            }
+            FlakeValue::TripleTerm(inner) => self.register_term(inner, t),
+            _ => {}
+        }
+        self.terms.assign_or_lookup_at(term, t);
     }
 
     /// Populate the novelty dictionaries from a slice of flakes.
@@ -482,6 +513,114 @@ impl StringDictNovelty {
 // ===========================================================================
 // Tests
 // ===========================================================================
+
+// ---------------------------------------------------------------------------
+// TermDictNovelty
+// ---------------------------------------------------------------------------
+
+/// Triple-term dictionary novelty: the terms novelty's links name, each with
+/// an index that, under the term's inner predicate id, forms a provisional
+/// handle (`triple_term::novelty_term_handle`). Readers try the persisted
+/// dictionary first, so a term the index interned keeps its handle.
+#[derive(Clone, Debug, Default)]
+pub struct TermDictNovelty {
+    /// `(term, earliest t seen)`, by index minus `base`.
+    entries: Vec<(Arc<TripleTermValue>, i64)>,
+    by_term: HashMap<Arc<TripleTermValue>, u32>,
+    /// Index of this layer's first entry: a layer allocates above its parent.
+    base: u32,
+    parent: Option<Arc<DictNovelty>>,
+}
+
+impl TermDictNovelty {
+    /// Look up or assign the index of `term`, here or in a parent.
+    pub fn assign_or_lookup_at(&mut self, term: &TripleTermValue, t: i64) -> u32 {
+        if let Some(&local) = self.by_term.get(term) {
+            let entry = &mut self.entries[(local - self.base) as usize];
+            entry.1 = entry.1.min(t);
+            return local;
+        }
+        if let Some(index) = self.parent.as_ref().and_then(|p| p.terms.find(term)) {
+            return index;
+        }
+        let index = self.next_index();
+        let term = Arc::new(term.clone());
+        self.by_term.insert(Arc::clone(&term), index);
+        self.entries.push((term, t));
+        index
+    }
+
+    /// The index of `term`, here or in a parent.
+    pub fn find(&self, term: &TripleTermValue) -> Option<u32> {
+        let mut dict = self;
+        loop {
+            if let Some(&index) = dict.by_term.get(term) {
+                return Some(index);
+            }
+            dict = &dict.parent.as_ref()?.terms;
+        }
+    }
+
+    /// The term at `index`, here or in a parent.
+    pub fn resolve(&self, index: u32) -> Option<&TripleTermValue> {
+        let mut dict = self;
+        loop {
+            if index >= dict.base {
+                return dict
+                    .entries
+                    .get((index - dict.base) as usize)
+                    .map(|(term, _)| term.as_ref());
+            }
+            dict = &dict.parent.as_ref()?.terms;
+        }
+    }
+
+    /// Every term, parents first, with its index.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, &TripleTermValue)> + '_ {
+        let mut chain = vec![self];
+        let mut dict = self;
+        while let Some(parent) = dict.parent.as_ref() {
+            dict = &parent.terms;
+            chain.push(dict);
+        }
+        chain.reverse();
+        chain.into_iter().flat_map(|dict| {
+            dict.entries
+                .iter()
+                .enumerate()
+                .map(move |(i, (term, _))| (dict.base + i as u32, term.as_ref()))
+        })
+    }
+
+    fn next_index(&self) -> u32 {
+        self.base + self.entries.len() as u32
+    }
+
+    /// Drop terms first seen at or before `t` (the index now interns them)
+    /// and renumber the rest from zero. Returns the number dropped.
+    fn retire_seen_through(&mut self, t: i64) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|(_, seen)| *seen > t);
+        self.by_term = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, (term, _))| (Arc::clone(term), i as u32))
+            .collect();
+        self.base = 0;
+        before - self.entries.len()
+    }
+
+    /// Number of terms, parents included.
+    pub fn len(&self) -> usize {
+        self.entries.len() + self.parent.as_ref().map_or(0, |p| p.terms.len())
+    }
+
+    /// True when no term has been registered here or in a parent.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -753,7 +892,7 @@ mod tests {
         let layer = DictNovelty::layered_over(Arc::clone(&parent));
         assert!(Arc::ptr_eq(layer.parent().unwrap(), &parent));
         // One `Arc` per sub-dictionary; nothing is copied.
-        assert_eq!(Arc::strong_count(&parent), 3);
+        assert_eq!(Arc::strong_count(&parent), 4);
         assert!(layer.is_initialized());
 
         let alice = parent.subjects.find_subject(2, "alice").unwrap();
@@ -838,8 +977,8 @@ mod tests {
         drop(a);
         assert_eq!(
             Arc::strong_count(&parent),
-            3,
-            "only b's two references remain"
+            4,
+            "only b's three references remain"
         );
         assert_eq!(parent.subjects.len(), 3);
         assert_eq!(parent.subjects.find_subject(2, "from-a"), None);
@@ -916,5 +1055,78 @@ mod tests {
             layer.retire_seen_through(5, &[0, 9], 7).is_none(),
             "a layer never retires"
         );
+    }
+
+    fn term(s: &str, o: i64) -> TripleTermValue {
+        TripleTermValue {
+            s: crate::Sid::new(9, s),
+            p: crate::Sid::new(9, "p"),
+            o: FlakeValue::Long(o),
+            dt: crate::Sid::new(2, "integer"),
+            lang: None,
+        }
+    }
+
+    /// Link flakes register their term and its components; a layer numbers
+    /// above its parent and reads through it; a publish drops the terms it
+    /// covered and renumbers the rest.
+    #[test]
+    fn terms_register_layer_and_retire() {
+        let mut d = DictNovelty::with_watermarks(vec![], 0);
+        let link = |t: i64, term: TripleTermValue| {
+            Flake::new(
+                crate::Sid::new(9, "r"),
+                crate::namespaces::rdf_reifies_sid().clone(),
+                FlakeValue::TripleTerm(Box::new(term)),
+                crate::namespaces::triple_term_datatype_sid().clone(),
+                t,
+                true,
+                None,
+            )
+        };
+        d.populate_from_flakes(&[link(1, term("a", 1)), link(2, term("b", 2))]);
+        assert_eq!(d.terms.find(&term("a", 1)), Some(0));
+        assert_eq!(d.terms.find(&term("b", 2)), Some(1));
+        assert!(d.subjects.find_subject(9, "a").is_some());
+
+        let parent = Arc::new(d.clone());
+        let mut layer = DictNovelty::layered_over(Arc::clone(&parent));
+        assert_eq!(layer.terms.assign_or_lookup_at(&term("a", 1), 3), 0);
+        assert_eq!(layer.terms.assign_or_lookup_at(&term("c", 3), 3), 2);
+        assert_eq!(layer.terms.resolve(1), Some(&term("b", 2)));
+        assert_eq!(layer.terms.resolve(2), Some(&term("c", 3)));
+        assert_eq!(parent.terms.find(&term("c", 3)), None);
+        assert_eq!(layer.terms.len(), 3);
+
+        d.retire_seen_through(1, &[], 0).unwrap();
+        assert_eq!(d.terms.find(&term("a", 1)), None);
+        assert_eq!(d.terms.find(&term("b", 2)), Some(0));
+        assert_eq!(d.terms.resolve(0), Some(&term("b", 2)));
+    }
+
+    /// A nested term registers before the term holding it, with its subject.
+    #[test]
+    fn nested_terms_register_inner_first() {
+        let mut d = DictNovelty::with_watermarks(vec![], 0);
+        let inner = term("inner", 1);
+        let outer = TripleTermValue {
+            s: crate::Sid::new(9, "outer"),
+            p: crate::Sid::new(9, "p"),
+            o: FlakeValue::TripleTerm(Box::new(inner.clone())),
+            dt: crate::namespaces::triple_term_datatype_sid().clone(),
+            lang: None,
+        };
+        d.populate_from_flakes(&[Flake::new(
+            crate::Sid::new(9, "doc"),
+            crate::Sid::new(9, "mentions"),
+            FlakeValue::TripleTerm(Box::new(outer.clone())),
+            crate::namespaces::triple_term_datatype_sid().clone(),
+            1,
+            true,
+            None,
+        )]);
+        assert_eq!(d.terms.find(&inner), Some(0));
+        assert_eq!(d.terms.find(&outer), Some(1));
+        assert!(d.subjects.find_subject(9, "inner").is_some());
     }
 }

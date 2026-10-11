@@ -20,13 +20,13 @@
 //! document.
 
 use crate::error::TransactError;
-use crate::generate::{bundle_templates, infer_datatype, validate_value_dt_pair};
-use crate::ir::{TemplateTerm, TripleTemplate};
+use crate::generate::{infer_datatype, validate_value_dt_pair};
+use crate::ir::{TemplateTerm, TemplateTripleTerm, TripleTemplate};
 use crate::namespace::{NamespaceRegistry, NsAllocator};
 use crate::value_convert::{convert_native_literal, convert_string_literal};
 use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
 use fluree_db_novelty::{TxnMetaEntry, TxnMetaValue};
-use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
+use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkError, SinkResult, TermId};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3;
@@ -60,13 +60,15 @@ enum SinkTerm {
         /// scope.
         meta: Option<Result<TxnMetaValue, String>>,
     },
+    /// A triple term `<<( s p o )>>`: an object only.
+    Triple { term: TemplateTerm, hash: u128 },
 }
 
 /// What a parsed RDF text document stages.
 #[derive(Debug)]
 pub struct RdfTextParts {
-    /// One template per statement, graph set, plus the `f:reifies*`
-    /// bundle templates of any RDF 1.2 annotations.
+    /// One template per statement, graph set, plus the `rdf:reifies` link
+    /// of each RDF 1.2 reified triple.
     pub templates: Vec<TripleTemplate>,
     /// Every named graph the document writes to (its labeled blocks).
     pub write_graphs: BTreeSet<String>,
@@ -102,7 +104,7 @@ pub struct TemplateSink<'a> {
     txn_meta: Vec<TxnMetaEntry>,
     content_id: u128,
     /// Data statements accepted so far (not `<#txn-meta>` entries, not
-    /// annotation bundles).
+    /// reifier links).
     statements: usize,
     /// First error; surfaced by [`Self::into_parts`] so a bad document fails
     /// the whole transaction rather than committing part of it.
@@ -173,7 +175,9 @@ impl<'a> TemplateSink<'a> {
 
     fn hash(&self, id: TermId) -> u128 {
         match self.term(id) {
-            SinkTerm::Node { hash, .. } | SinkTerm::Literal { hash, .. } => *hash,
+            SinkTerm::Node { hash, .. }
+            | SinkTerm::Literal { hash, .. }
+            | SinkTerm::Triple { hash, .. } => *hash,
         }
     }
 
@@ -181,14 +185,14 @@ impl<'a> TemplateSink<'a> {
     fn node(&self, id: TermId) -> Option<TemplateTerm> {
         match self.term(id) {
             SinkTerm::Node { term, .. } => Some(term.clone()),
-            SinkTerm::Literal { .. } => None,
+            SinkTerm::Literal { .. } | SinkTerm::Triple { .. } => None,
         }
     }
 
     /// An object: a node, or a literal value with its datatype constraint.
     fn object(&self, id: TermId) -> (TemplateTerm, Option<DatatypeConstraint>) {
         match self.term(id) {
-            SinkTerm::Node { term, .. } => (term.clone(), None),
+            SinkTerm::Node { term, .. } | SinkTerm::Triple { term, .. } => (term.clone(), None),
             SinkTerm::Literal { value, dtc, .. } => {
                 (TemplateTerm::Value(value.clone()), Some(dtc.clone()))
             }
@@ -207,14 +211,11 @@ impl<'a> TemplateSink<'a> {
         self.content_id = self.content_id.wrapping_add(hash_parts(b"S", parts));
     }
 
-    /// Emit `template` in the current scope: the stand-in for `GraphScope::emit`.
+    /// Emit `template` in the current scope.
     fn emit(&mut self, template: TripleTemplate) {
         match &self.scope {
             Scope::Default => self.templates.push(template),
-            Scope::Named(iri) => {
-                let iri = Arc::clone(iri);
-                graph_scope_emit(&iri, template, self.ns, &mut self.templates);
-            }
+            Scope::Named(iri) => self.templates.push(template.in_graph(Arc::clone(iri))),
             Scope::TxnMeta => unreachable!("txn-meta statements are not templates"),
         }
     }
@@ -260,6 +261,20 @@ impl<'a> TemplateSink<'a> {
             return;
         }
         let (object, dtc) = self.object(o);
+        // `rdf:reifies` names a triple term, as in `FlakeSink`; the
+        // reified-triple forms arrive via `emit_reified_triple`.
+        if fluree_db_core::is_rdf_reifies(&predicate)
+            && !matches!(object, TemplateTerm::TripleTerm(_))
+        {
+            if self.error.is_none() {
+                self.error = Some(TransactError::UnsupportedFeature(
+                    "'rdf:reifies' takes a triple term as its object; write the reified-triple \
+                     form (`<< s p o >>` or `~ <reifier>`) rather than an ordinary object"
+                        .to_string(),
+                ));
+            }
+            return;
+        }
         if let (TemplateTerm::Value(v), Some(dtc)) = (&object, &dtc) {
             if let Err(e) = validate_value_dt_pair(v, dtc.datatype()) {
                 if self.error.is_none() {
@@ -306,7 +321,7 @@ impl<'a> TemplateSink<'a> {
                 self.fail("blank nodes not allowed as txn-meta subject");
                 return;
             }
-            SinkTerm::Literal { .. } => {
+            SinkTerm::Literal { .. } | SinkTerm::Triple { .. } => {
                 self.fail("a literal cannot be a subject");
                 return;
             }
@@ -328,6 +343,9 @@ impl<'a> TemplateSink<'a> {
                 name: sid.name.to_string(),
             }),
             SinkTerm::Node { .. } => Err("blank nodes not allowed in txn-meta objects".to_string()),
+            SinkTerm::Triple { .. } => {
+                Err("txn-meta does not support triple-term values".to_string())
+            }
             SinkTerm::Literal { meta, .. } => meta
                 .clone()
                 .unwrap_or_else(|| Err("unsupported txn-meta literal".to_string())),
@@ -360,34 +378,6 @@ impl<'a> TemplateSink<'a> {
             dt_name: dt.name.to_string(),
         }
     }
-}
-
-/// The one rule that puts a template in its graph and, when it writes
-/// `f:reifiesSubject` in a named graph, adds the bundle's `f:reifiesGraph`
-/// anchor, so a template bundle never states its own anchor. It stands in
-/// for `GraphScope::emit`, which is to own this rule for every template
-/// source; when that lands, the sink routes through it and this goes.
-fn graph_scope_emit(
-    iri: &Arc<str>,
-    template: TripleTemplate,
-    ns: &mut NamespaceRegistry,
-    out: &mut Vec<TripleTemplate>,
-) {
-    let anchors = matches!(
-        &template.predicate,
-        TemplateTerm::Sid(p) if fluree_db_core::is_reifies_subject(p)
-    );
-    let template = template.in_graph(Arc::clone(iri));
-    if anchors {
-        let anchor = TripleTemplate::new(
-            template.subject.clone(),
-            TemplateTerm::Sid(fluree_db_core::namespaces::reifies_graph_sid().clone()),
-            TemplateTerm::Sid(ns.sid_for_iri(iri)),
-        )
-        .in_graph(Arc::clone(iri));
-        out.push(anchor);
-    }
-    out.push(template);
 }
 
 fn is_commit_this_iri(iri: &str) -> bool {
@@ -573,8 +563,38 @@ impl GraphSink for TemplateSink<'_> {
         true
     }
 
-    /// An RDF 1.2 reifier attachment: the `f:reifies*` bundle templates, in
-    /// the current graph. The parser has already emitted the base triple.
+    fn supports_triple_terms(&self) -> bool {
+        true
+    }
+
+    fn term_triple(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+    ) -> Result<TermId, SinkError> {
+        let (Some(s), Some(p @ TemplateTerm::Sid(_))) = (self.node(subject), self.node(predicate))
+        else {
+            return Err(SinkError::rejected(
+                "a triple term's subject must be an IRI or blank node, and its predicate an IRI",
+            ));
+        };
+        let (o, dtc) = self.object(object);
+        let hash = hash_parts(
+            b"T",
+            &[
+                &self.hash(subject).to_le_bytes(),
+                &self.hash(predicate).to_le_bytes(),
+                &self.hash(object).to_le_bytes(),
+            ],
+        );
+        let term = TemplateTerm::TripleTerm(Box::new(TemplateTripleTerm { s, p, o, dtc }));
+        Ok(self.add(SinkTerm::Triple { term, hash }))
+    }
+
+    /// An RDF 1.2 reified triple: its `rdf:reifies` link, in the current
+    /// graph. Only the annotation syntax asserts the base triple, which the
+    /// parser has already emitted.
     fn emit_reified_triple(
         &mut self,
         subject: TermId,
@@ -613,9 +633,20 @@ impl GraphSink for TemplateSink<'_> {
                 &rh.to_le_bytes(),
             ],
         ));
-        for template in bundle_templates(s, p, o, dtc, ann) {
-            self.emit(template);
+        if let (TemplateTerm::Value(v), Some(dtc)) = (&o, &dtc) {
+            if let Err(e) = validate_value_dt_pair(v, dtc.datatype()) {
+                if self.error.is_none() {
+                    self.error = Some(e);
+                }
+                return Ok(());
+            }
         }
+        let term = TemplateTripleTerm { s, p, o, dtc };
+        self.emit(TripleTemplate::new(
+            ann,
+            TemplateTerm::Sid(fluree_db_core::rdf_reifies_sid().clone()),
+            TemplateTerm::TripleTerm(Box::new(term)),
+        ));
         Ok(())
     }
 }

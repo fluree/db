@@ -113,7 +113,7 @@ pub fn unsupported_subscope_error(graph_iris: &[&str], kinds: &[&str]) -> crate:
 /// - `GRAPH` is its own scope — already covered by the rewrite guard;
 /// - `SERVICE` targets another ledger or endpoint, which may have a native
 ///   index, so refusing on its body would reject a query that works;
-/// - the RDF-star `EdgeAnnotation`/`AnnotationTarget` bodies are left untouched
+/// - the RDF-star `EdgeAnnotation` bodies are left untouched
 ///   here exactly as the rewriter leaves them (RDF-star over a graph source is
 ///   undefined rather than confirmed silently-empty).
 pub fn unsupported_outside_graph_scopes(patterns: &[Pattern]) -> Vec<&'static str> {
@@ -128,6 +128,7 @@ fn collect_unsupported_outside_graph_scopes(patterns: &[Pattern], kinds: &mut Ve
             // The three kinds the rewriter flags, named identically so one
             // query reads the same whichever guard refuses it.
             Pattern::PropertyPath(_) => kinds.push("property path"),
+            Pattern::TermComponents(_) => kinds.push("triple-term components"),
             Pattern::ShortestPath(_) => kinds.push("shortest path"),
             Pattern::Subquery(_) => kinds.push("subquery"),
             // Containers whose bodies evaluate against this view.
@@ -158,8 +159,7 @@ fn collect_unsupported_outside_graph_scopes(patterns: &[Pattern], kinds: &mut Ve
             | Pattern::S2Search(_)
             | Pattern::Graph { .. }
             | Pattern::Service(_)
-            | Pattern::EdgeAnnotation { .. }
-            | Pattern::AnnotationTarget { .. } => {}
+            | Pattern::EdgeAnnotation { .. } => {}
         }
     }
 }
@@ -343,6 +343,11 @@ pub fn rewrite_patterns_for_r2rml(
                 result_patterns.push(pattern.clone());
                 origins.push(i);
             }
+            Pattern::TermComponents(_) => {
+                unsupported.push("triple-term components");
+                result_patterns.push(pattern.clone());
+                origins.push(i);
+            }
             Pattern::ShortestPath(_) => {
                 unsupported.push("shortest path");
                 result_patterns.push(pattern.clone());
@@ -358,8 +363,8 @@ pub fn rewrite_patterns_for_r2rml(
             // IndexSearch/VectorSearch/GeoSearch/S2Search carry their own
             // `graph_source_id` and route independently; `R2rml` is already
             // converted; nested `Graph`/`DefaultGraphSource` re-enter routing
-            // for their own target; the RDF-star `EdgeAnnotation`/
-            // `AnnotationTarget` are expanded during planning (RDF-star over
+            // for their own target; the RDF-star `EdgeAnnotation` is
+            // expanded during planning (RDF-star over
             // R2RML is undefined — left untouched here, not silently-empty in
             // the confirmed sense).
             Pattern::Filter(_)
@@ -373,7 +378,6 @@ pub fn rewrite_patterns_for_r2rml(
             | Pattern::S2Search(_)
             | Pattern::Graph { .. }
             | Pattern::EdgeAnnotation { .. }
-            | Pattern::AnnotationTarget { .. }
             | Pattern::DefaultGraphSource { .. } => {
                 result_patterns.push(pattern.clone());
                 origins.push(i);

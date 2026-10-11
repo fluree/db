@@ -546,7 +546,7 @@ fn report_rdf_stats(alias: &str, format: ExportFormat, stats: &ExportStats, grap
     if stats.annotations_unresolved > 0 {
         eprintln!(
             "  {} {} edge annotations could not be resolved and are NOT in the output; \
-             re-run with --raw-reifies to emit them as f:reifies* triples",
+             re-run with --raw-reifies to emit them as rdf:reifies triples",
             "warning:".yellow(),
             stats.annotations_unresolved,
         );

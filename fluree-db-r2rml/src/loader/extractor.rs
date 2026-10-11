@@ -675,6 +675,7 @@ fn describe_term(term: &Term) -> String {
         Term::Iri(iri) => format!("IRI <{iri}>"),
         Term::BlankNode(_) => "a blank node".to_string(),
         Term::Literal { value, .. } => format!("literal \"{}\"", value.lexical()),
+        Term::TripleTerm(_) => format!("triple term {term}"),
     }
 }
 

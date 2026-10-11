@@ -128,7 +128,15 @@ impl OType {
     /// Blank node (`_:b{id}`) — `o_key` is the atomic bnode integer.
     pub const BLANK_NODE: Self = Self(0x001F);
 
-    // Tag `00` payload range 0x0020–0x3FFF reserved for future embedded types.
+    /// `xsd:decimal` stored **inline** as an exact, order-preserving base-10
+    /// float key (see [`ObjKey::encode_decimal`]) — canonical *and* value-ordered.
+    /// Distinct from the lossy f64 [`XSD_DECIMAL`](Self::XSD_DECIMAL) lane: this
+    /// carries the exact value with no arena handle. Only written by new-format
+    /// index roots; large/high-precision decimals still fall back to the NumBig
+    /// arena ([`NUM_BIG_OVERFLOW`](Self::NUM_BIG_OVERFLOW)).
+    pub const XSD_DECIMAL_INLINE: Self = Self(0x0020);
+
+    // Tag `00` payload range 0x0021–0x3FFF reserved for future embedded types.
 
     // ── Tag `10` — Fluree-reserved dictionary/arena-backed ─────────────
 
@@ -158,8 +166,11 @@ impl OType {
     pub const NUM_BIG_OVERFLOW: Self = Self(0x800B);
     /// Spatial (complex geometry) — `o_key` is a spatial arena handle.
     pub const SPATIAL_COMPLEX: Self = Self(0x800C);
+    /// RDF 1.2 triple term — `o_key` is a triple-term dictionary handle
+    /// (`(inner p_id << 32) | seq`, see `fluree_db_core::triple_term`).
+    pub const TRIPLE_TERM: Self = Self(0x800D);
 
-    // Tag `10` payload range 0x800D–0xBFFF reserved for future Fluree domains.
+    // Tag `10` payload range 0x800E–0xBFFF reserved for future Fluree domains.
 
     // ── Tag `11` — rdf:langString ──────────────────────────────────────
 
@@ -336,10 +347,10 @@ impl OType {
         self.0 >= Self::XSD_DOUBLE.0 && self.0 <= Self::XSD_DECIMAL.0
     }
 
-    /// True if this is any numeric type (integer or float, inline only).
+    /// True if this is an inline numeric type (integer, float, or exact decimal).
     #[inline]
     pub const fn is_numeric(self) -> bool {
-        self.is_integer() || self.is_float()
+        self.is_integer() || self.is_float() || self.0 == Self::XSD_DECIMAL_INLINE.0
     }
 
     /// True if this is a temporal type (date/time/dateTime/gYear/etc./durations).
@@ -416,6 +427,7 @@ impl OType {
             0x001D => DecodeKind::Duration,
             0x001E => DecodeKind::GeoPoint,
             0x001F => DecodeKind::BlankNode,
+            0x0020 => DecodeKind::Decimal,
             _ => DecodeKind::Sentinel, // future embedded types
         }
     }
@@ -430,6 +442,7 @@ impl OType {
             0x800A => DecodeKind::StringDict, // fulltext (string dict + BM25)
             0x800B => DecodeKind::NumBigArena,
             0x800C => DecodeKind::SpatialArena,
+            0x800D => DecodeKind::TripleTermDict,
             _ => DecodeKind::Sentinel, // future Fluree domains
         }
     }
@@ -489,6 +502,11 @@ pub enum DecodeKind {
     NumBigArena,
     /// Spatial arena handle (per-predicate).
     SpatialArena,
+    /// Triple-term dictionary handle (ledger-global, partitioned by inner predicate).
+    TripleTermDict,
+    /// Exact inline `xsd:decimal` — o_key is an order-preserving base-10 float
+    /// code (see [`super::value_id::ObjKey::decode_decimal`]). Not arena-backed.
+    Decimal,
 }
 
 impl DecodeKind {
@@ -519,6 +537,8 @@ impl DecodeKind {
             21 => Some(Self::VectorArena),
             22 => Some(Self::NumBigArena),
             23 => Some(Self::SpatialArena),
+            24 => Some(Self::TripleTermDict),
+            25 => Some(Self::Decimal),
             _ => None,
         }
     }
@@ -561,6 +581,7 @@ impl fmt::Debug for OType {
             0x001D => write!(f, "OType::XSD_DURATION"),
             0x001E => write!(f, "OType::GEO_POINT"),
             0x001F => write!(f, "OType::BLANK_NODE"),
+            0x0020 => write!(f, "OType::XSD_DECIMAL_INLINE"),
             0x8000 => write!(f, "OType::XSD_STRING"),
             0x8001 => write!(f, "OType::XSD_ANY_URI"),
             0x8002 => write!(f, "OType::XSD_NORMALIZED_STRING"),
@@ -574,6 +595,7 @@ impl fmt::Debug for OType {
             0x800A => write!(f, "OType::FULLTEXT"),
             0x800B => write!(f, "OType::NUM_BIG_OVERFLOW"),
             0x800C => write!(f, "OType::SPATIAL_COMPLEX"),
+            0x800D => write!(f, "OType::TRIPLE_TERM"),
             v if self.is_lang_string() => write!(f, "OType::LANG_STRING({})", v & 0x3FFF),
             v if self.is_customer_datatype() => {
                 write!(f, "OType::CUSTOMER({})", v & 0x3FFF)
@@ -652,6 +674,9 @@ mod tests {
 
         assert!(OType::XSD_INTEGER.is_numeric());
         assert!(OType::XSD_DOUBLE.is_numeric());
+        assert!(OType::XSD_DECIMAL_INLINE.is_numeric());
+        assert!(!OType::XSD_DECIMAL_INLINE.is_float());
+        assert!(!OType::NUM_BIG_OVERFLOW.is_numeric());
         assert!(!OType::XSD_DATE.is_numeric());
 
         assert!(OType::XSD_DATE.is_temporal());
@@ -735,6 +760,15 @@ mod tests {
             OType::NUM_BIG_OVERFLOW.decode_kind(),
             DecodeKind::NumBigArena
         );
+        assert_eq!(OType::TRIPLE_TERM.decode_kind(), DecodeKind::TripleTermDict);
+        assert_eq!(DecodeKind::TripleTermDict as u8, 24);
+        assert_eq!(DecodeKind::Decimal as u8, 25);
+        assert_eq!(DecodeKind::from_u8(25), Some(DecodeKind::Decimal));
+        assert_eq!(OType::XSD_DECIMAL_INLINE.decode_kind(), DecodeKind::Decimal);
+        assert_eq!(
+            DecodeKind::from_u8(DecodeKind::TripleTermDict as u8),
+            Some(DecodeKind::TripleTermDict)
+        );
         assert_eq!(OType::lang_string(5).decode_kind(), DecodeKind::StringDict);
         assert_eq!(
             OType::customer_datatype(10).decode_kind(),
@@ -768,6 +802,7 @@ mod tests {
             OType::IRI_REF,
             OType::VECTOR,
             OType::NUM_BIG_OVERFLOW,
+            OType::TRIPLE_TERM,
         ] {
             assert!(!ot.is_string_keyed(), "{ot:?}");
         }

@@ -11,8 +11,8 @@ Throughout, the running example is employment: a `worksFor` edge that needs a `r
 | You have… | Use | Why |
 |---|---|---|
 | JSON-LD writes, or you need named-graph edges, or literal-valued edges | **JSON-LD `@annotation`** | Most complete surface — covers everything below. |
-| A SPARQL 1.1/1.2 pipeline, or you're porting RDF-star data | **SPARQL 1.2 annotation tail** (`{\| \|}`, `~`, `rdf:reifies`) | Standards syntax. Default-graph only today. |
-| A Turtle / N-Triples / TriG / N-Quads file with RDF 1.2 annotations | **Ingest it as-is** — `insert`, `upsert`, `import` and `graph sync` all accept `{\| \|}`, `~`, `<< >>` and `rdf:reifies <<( )>>`, and TriG `GRAPH { }` blocks accept them too (TriG via `insert` / `upsert` / `import` / `/sync`) | Same on-disk shape as `@annotation`; the reified triple is asserted; re-`upsert` the file to update claim bodies (see [Turtle ingest](../transactions/turtle.md#edge-annotations-rdf-12--turtle-star)). |
+| A SPARQL 1.1/1.2 pipeline, or you're porting RDF-star data | **SPARQL 1.2 annotation tail** (`{\| \|}`, `~`, `rdf:reifies`) | Standards syntax, in the default graph and named graphs. |
+| A Turtle / N-Triples / TriG / N-Quads file with RDF 1.2 annotations | **Ingest it as-is** — `insert`, `upsert`, `import` and `graph sync` all accept `{\| \|}`, `~`, `<< >>` and `rdf:reifies <<( )>>`, and TriG `GRAPH { }` blocks accept them too (TriG via `insert` / `upsert` / `import` / `/sync`) | Same on-disk shape as `@annotation`; the annotation syntax asserts its triple, `<< >>` and `rdf:reifies` do not; re-`upsert` the file to update claim bodies (see [Turtle ingest](../transactions/turtle.md#edge-annotations-rdf-12--turtle-star)). |
 
 ## Attach metadata to a relationship
 
@@ -170,9 +170,9 @@ Once you've bound the annotation — by `@id` or by selector — it's an ordinar
 }
 ```
 
-## Retract an edge — and understand the cascade
+## Retract an edge — and understand what stays
 
-Retracting the base edge cascades to the annotation's attachment. What happens to the annotation's *body* depends on the mode.
+Retracting the base edge retracts that triple and nothing else, as RDF 1.2 defines it: the annotation's link and body stay, and the annotation syntax (`@annotation`, `{| |}`) stops matching it because it joins the edge. `@reifies` still finds it.
 
 ```json
 {
@@ -183,8 +183,7 @@ Retracting the base edge cascades to the annotation's attachment. What happens t
 }
 ```
 
-- **RDF mode (default):** anonymous annotation subjects on the edge are fully removed (attachment + body). Explicit-IRI annotations keep their body facts as ordinary RDF — only the attachment is retracted, so a user-named resource is never deleted by surprise.
-- **LPG mode (`opts.lpgEdgeLifecycle: true`):** explicit-IRI annotations cascade their body too — the property-graph "delete the relationship deletes its properties" lifecycle.
+To delete the edge's annotations with it — the property-graph "delete the relationship deletes its properties" lifecycle — set LPG mode:
 
 ```json
 {
@@ -193,7 +192,7 @@ Retracting the base edge cascades to the annotation's attachment. What happens t
 }
 ```
 
-History preserves both events either way — query at the pre-retract `t` and the annotation comes back. See [Retractions](../transactions/retractions.md#edge-annotation-cascade) for the metadata-only-retract and same-transaction-replacement rules.
+History preserves every event either way — query at the pre-retract `t` and the annotation comes back. See [Retractions](../transactions/retractions.md#edge-annotation-cascade).
 
 ## The same patterns in SPARQL 1.2
 
@@ -235,7 +234,7 @@ SELECT ?person ?org WHERE {
 }
 ```
 
-The triple term `<<( s p o )>>` is accepted **only** as the object of `rdf:reifies`. The bare, parenthesis-free `<< s p o >>` form is the separate Fluree `f:t`/`f:op` flake-metadata construct — the two don't compose. Per-operation reifier rules (variables are template-only; blank/anonymous reifiers are rejected in `DELETE DATA`) are tabulated in the [concept doc](../concepts/edge-annotations.md#sparql-update-rules-by-operation).
+The triple term `<<( s p o )>>` names a reifier's triple as the object of `rdf:reifies`; under any other predicate it is an ordinary stored value (see [Triple terms as values](../concepts/edge-annotations.md#triple-terms-as-values)). The parenthesis-free `<< s p o ~ :r >>` is a reified triple: it stands for its reifier and does not assert `s p o` (a reifier-less `<< s p o >>` under `f:t` / `f:op` is the separate flake-metadata construct). Per-operation reifier rules (variables are template-only; blank/anonymous reifiers are rejected in `DELETE DATA`) are tabulated in the [concept doc](../concepts/edge-annotations.md#sparql-update-rules-by-operation).
 
 ## Annotate an edge inside a named graph
 
@@ -255,7 +254,7 @@ Edge annotations live in the same graph as the edge they reify. On the JSON-LD s
 }
 ```
 
-> **SPARQL UPDATE is default-graph only today.** An annotation tail inside an explicit `GRAPH { }` block or under a `WITH <g>` template is rejected — use the JSON-LD surface above for named-graph edge annotations.
+> **Named graphs.** An annotation tail inside a `GRAPH { }` block or under a `WITH <g>` template writes the link and body into that graph, beside the triple.
 
 ## Keep a Turtle claims file in sync
 
@@ -291,12 +290,12 @@ SPARQL
 The natural-looking SPARQL form deletes more than the claim:
 
 ```sparql
-# Retracts the base edge ex:alice ex:knows ex:bob — and with it the
-# attachment of EVERY claim on that edge, not only ex:claim1.
+# Retracts the base edge ex:alice ex:knows ex:bob — so the annotation
+# syntax stops matching EVERY claim on that edge, not only ex:claim1.
 DELETE DATA { ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.9 |} . }
 ```
 
-`DELETE DATA` / `DELETE WHERE` with an annotation tail always retract the base edge, and the edge retract cascades to all of its annotations ([Retractions](../transactions/retractions.md#edge-annotation-cascade)). SPARQL has no form for "retract this one claim, keep the edge". Use the JSON-LD by-id retract, which removes exactly one attachment:
+`DELETE DATA` / `DELETE WHERE` with an annotation tail always retract the base edge ([Retractions](../transactions/retractions.md#edge-annotation-cascade)). To retract one claim and keep the edge, retract its link — the JSON-LD by-id retract, which removes exactly one attachment:
 
 ```json
 {
@@ -308,15 +307,15 @@ DELETE DATA { ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.9 |} . }
 }
 ```
 
-The edge and every other claim on it stay live. In RDF mode the named claim's body (`ex:confidence`, `ex:source`) survives as ordinary RDF about `ex:claim1` — retract it in the same transaction if it should go too; in LPG mode (`opts.lpgEdgeLifecycle: true`) the body is removed with the attachment.
+The edge and every other claim on it stay live. The named claim's body (`ex:confidence`, `ex:source`) survives as ordinary RDF about `ex:claim1` — retract it in the same transaction if it should go too; in LPG mode (`opts.lpgEdgeLifecycle: true`) the body is removed with the attachment.
 
 ## Gotchas
 
-- **An annotation reifies exactly one live edge.** A single edge carries many parallel annotations, but one annotation `@id` can't point at two edges at once. To re-home an explicit-IRI annotation, retract the old attachment and assert the new one in the same transaction.
-- **Deleting a claim with `DELETE DATA { … ~ :claim {| … |} }` deletes the edge** and detaches every other claim on it. Retract one claim with the JSON-LD by-id form (see [above](#retract-one-claim-and-keep-the-edge)).
+- **One annotation `@id` may reify several triples**, and a single edge carries many parallel annotations. To re-home an explicit-IRI annotation, retract the old attachment and assert the new one in the same transaction; a JSON-LD upsert of the annotation does that for you.
+- **Deleting a claim with `DELETE DATA { … ~ :claim {| … |} }` deletes the edge**, so the annotation syntax stops matching every other claim on it. Retract one claim with the JSON-LD by-id form (see [above](#retract-one-claim-and-keep-the-edge)).
 - **Don't write `f:reifies*` predicates by hand.** They're reserved and rejected on every write surface; they're also hidden from `?p` scans and `select: "*"`. Use `@annotation` / the annotation tail. (See [Vocabulary](../reference/vocabulary.md#edge-annotation-predicates-reserved).)
 - **Empty `@annotation: {}`** is a no-op in RDF mode (no subject minted); in LPG mode it mints a property-less relationship with identity.
-- **Not yet supported** (all reject cleanly, no silent partial results): annotations on `@list` elements, reifiers for unasserted triples, triple terms as object values, annotation output in Turtle/CONSTRUCT, and the SPARQL 1.2 triple-term functions (`TRIPLE`, `isTRIPLE`, …). See [Current limits](../concepts/edge-annotations.md#current-limits).
+- **Not yet supported** (all reject cleanly, no silent partial results): annotations on `@list` elements. See [Current limits](../concepts/edge-annotations.md#current-limits).
 
 ## See also
 
