@@ -55,7 +55,7 @@ pub(super) fn validate_body(
     }
     walk_patterns(&query.patterns, snapshot, rule, origin)?;
     if let Some(values) = &query.post_values {
-        walk_patterns(std::slice::from_ref(values), snapshot, rule, origin)?;
+        walk_patterns(&values.to_patterns(), snapshot, rule, origin)?;
     }
     Ok(())
 }

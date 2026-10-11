@@ -1362,15 +1362,6 @@ pub fn pattern_shares_variables(pattern: &Pattern, bound_vars: &HashSet<VarId>) 
         .any(|v| bound_vars.contains(v))
 }
 
-/// Variables some pattern of `patterns` may bind (see [`must_bind_vars`] for
-/// the ones bound on every row).
-fn produced_vars_of(patterns: &[Pattern]) -> HashSet<VarId> {
-    patterns
-        .iter()
-        .flat_map(super::ir::Pattern::produced_vars)
-        .collect()
-}
-
 /// Try to nest a deferred pattern into a compound pattern's inner lists.
 ///
 /// Returns `true` if the pattern was nested, `false` if the pattern is not
@@ -1389,7 +1380,7 @@ fn try_nest_deferred(compound: &mut Pattern, deferred: &DeferredPattern) -> bool
         Pattern::Union(branches) => {
             let produced_in_every_branch = branches
                 .iter()
-                .map(|b| produced_vars_of(b))
+                .map(|b| crate::ir::pattern::produced_vars_of(b))
                 .reduce(|mut union_vars, branch_vars| {
                     union_vars.retain(|v| branch_vars.contains(v));
                     union_vars
@@ -1562,8 +1553,9 @@ struct DeferredPattern {
     /// `?b` otherwise drains the VALUES before the OPTIONAL that introduces `?b`
     /// is placed at all. Empty for every dependency-placed deferral.
     after_indices: Vec<usize>,
-    /// For FILTER, EXISTS, NOT EXISTS and BIND: who binds each variable the
-    /// pattern reads (see [`attach_filter_binders`]). Empty for everything else.
+    /// For FILTER, EXISTS, NOT EXISTS, BIND and UNWIND: who binds each variable
+    /// the pattern reads (see [`attach_filter_binders`]). Empty for everything
+    /// else.
     binders: Vec<VarBinders>,
 }
 
@@ -1596,6 +1588,11 @@ impl VarBinders {
 /// VALUES UNDEF column lets them run before the triple that actually binds the
 /// variable.
 ///
+/// What a pattern reads is [`deferred_required_vars`]. A BIND or UNWIND target
+/// is an output: a pattern that also binds it joins on the value the BIND or
+/// UNWIND produces, so it is not a binder to wait for. An UNWIND held behind
+/// one overwrites the value that pattern bound.
+///
 /// `seed_bound_in_every_row` are the seed variables no pattern can change;
 /// any other seed variable may be unbound on some rows and gets binders too.
 fn attach_filter_binders(
@@ -1622,7 +1619,7 @@ fn attach_filter_binders(
         .iter_mut()
         .filter(|dp| waits_for_binders(&dp.pattern))
     {
-        let mut reads = dp.pattern.referenced_vars();
+        let mut reads = deferred_required_vars(&dp.pattern);
         reads.sort_unstable();
         reads.dedup();
         for v in reads {
@@ -3034,12 +3031,6 @@ fn drain_ready_deferred(
     }
 }
 
-/// Return the *input* variables that must be bound before a deferred pattern
-/// can execute.
-///
-/// - FILTER: all referenced variables
-/// - BIND: the expression's variables (not the target variable)
-///
 /// Variables a subquery correlates on: its SELECT-list variables that are also
 /// produced by some OTHER pattern in the enclosing group. These must be bound
 /// before the subquery runs, so the planner defers it until they are. An empty
@@ -3050,7 +3041,7 @@ fn drain_ready_deferred(
 /// seeding it per outer row is equivalent to evaluating the subquery once and
 /// filtering its output to that value, so it can run once and be hash-joined.
 ///
-/// Two safety conditions on this declassification:
+/// Three safety conditions on this declassification:
 /// 1. **No inner slice.** With `LIMIT`/`OFFSET`, the per-row restriction changes
 ///    which rows survive the slice (e.g. `ORDER BY DESC(?x) LIMIT 1` means "top
 ///    row per outer binding"), so such a subquery stays genuinely correlated.
@@ -3061,6 +3052,12 @@ fn drain_ready_deferred(
 ///    key would scan rather than filter). That is exactly [`must_bind_vars`],
 ///    which this site shares with the VALUES/OPTIONAL barrier so the two
 ///    cannot drift apart.
+/// 3. **Not a pinned import.** A Cypher `CALL (p)` import
+///    ([`SubqueryPattern::pinned_vars`]) is a per-row binding by contract. The
+///    body can nest a sliced, `DISTINCT` or aggregating `WITH` that reads it,
+///    where per-row seeding and one evaluation differ, so the import stays a
+///    correlation input and the CALL waits for its producer. The executor
+///    still evaluates once and hash-joins when the body allows it.
 fn subquery_correlation_vars(
     sq: &SubqueryPattern,
     siblings: &[Pattern],
@@ -3107,7 +3104,7 @@ fn subquery_correlation_vars(
     for (j, p) in siblings.iter().enumerate().take(self_idx) {
         debug_assert!(j < self_idx);
         for v in p.produced_vars() {
-            if select.contains(&v) && !self_produced.contains(&v) {
+            if select.contains(&v) && (!self_produced.contains(&v) || sq.pinned_vars.contains(&v)) {
                 corr.insert(v);
             }
         }
@@ -3169,6 +3166,13 @@ fn subquery_pipeline_output_vars(
     outputs
 }
 
+/// The *input* variables of a deferred pattern: the ones that must be bound
+/// before it can execute, and the ones [`attach_filter_binders`] waits on.
+///
+/// - FILTER: all referenced variables
+/// - BIND / UNWIND: the expression's variables, not the target variable
+/// - ShortestPath: its start anchors
+/// - EXISTS / NOT EXISTS: every variable they mention
 fn deferred_required_vars(pattern: &Pattern) -> Vec<VarId> {
     match pattern {
         Pattern::Filter(expr) => expr.referenced_vars(),
@@ -3177,7 +3181,8 @@ fn deferred_required_vars(pattern: &Pattern) -> Vec<VarId> {
         // Only the start anchors an Enumerate path search; requiring the end
         // would deadlock when no other pattern produces it.
         Pattern::ShortestPath(sp) => sp.required_input_vars(),
-        // Other patterns should not be classified as Deferred, but handle
+        // EXISTS / NOT EXISTS correlate on everything they mention. Other
+        // patterns should not be classified as Deferred, but handle
         // gracefully by returning all referenced variables.
         other => other.referenced_vars(),
     }
@@ -3377,9 +3382,9 @@ mod tests {
                         function: AggregateFn::Avg(input, InputSemantics::List),
                         output_var: average,
                     }),
-                    binds: vec![],
                 }),
                 having: None,
+                binds: vec![],
             }),
         );
         let pipeline = Pattern::Subquery(
@@ -5686,6 +5691,30 @@ mod tests {
         );
     }
 
+    /// A BIND or UNWIND target is its output, so a triple that also binds it
+    /// joins on that value instead of holding it back. Placed after the
+    /// triple, an UNWIND overwrote the value the triple matched.
+    #[test]
+    fn bind_and_unwind_run_before_a_triple_that_binds_their_target() {
+        let (s, x) = (VarId(0), VarId(1));
+        let lookup = triple(s, "num", x);
+        let long = |n| Expression::Const(FlakeValue::Long(n));
+        let bind = Pattern::Bind {
+            var: x,
+            expr: long(3),
+        };
+        let unwind = Pattern::Unwind {
+            var: x,
+            list: Expression::call(Function::Range, vec![long(1), long(3)]),
+        };
+        let held: Vec<Vec<Pattern>> = [bind, unwind]
+            .into_iter()
+            .map(|binder| reorder_patterns(&[binder, lookup.clone()], None, &HashSet::new()))
+            .filter(|reordered| matches!(reordered[0], Pattern::Triple(_)))
+            .collect();
+        assert!(held.is_empty(), "held behind the triple: {held:?}");
+    }
+
     #[test]
     fn test_reorder_expander_after_sources() {
         // OPTIONAL should be placed after all sources and reducers. A required
@@ -6847,9 +6876,13 @@ mod tests {
 
     /// A grouped sub-SELECT: `SELECT <select> { <body> } GROUP BY <group_key>`.
     fn grouped_sq(select: Vec<VarId>, group_key: VarId, body: Vec<Pattern>) -> Pattern {
-        Pattern::Subquery(crate::ir::SubqueryPattern::new(select, body).with_grouping(
-            crate::ir::Grouping::assemble(vec![group_key], vec![], vec![], None).unwrap(),
-        ))
+        Pattern::Subquery(
+            crate::ir::SubqueryPattern::new(select, body).with_grouping(
+                crate::ir::Grouping::assemble(vec![group_key], vec![], vec![], None)
+                    .expect("valid grouping")
+                    .unwrap(),
+            ),
+        )
     }
 
     #[test]
@@ -7088,6 +7121,7 @@ mod tests {
             vec![],
             None,
         )
+        .expect("valid grouping")
         .expect("aggregate present")
     }
 

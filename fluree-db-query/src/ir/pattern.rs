@@ -2,6 +2,7 @@
 //! `SubqueryPattern`, `ServicePattern`, plus the small `GraphName` /
 //! `ServiceEndpoint` types they depend on.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::adapters::{
@@ -152,6 +153,10 @@ impl SubqueryPattern {
         for p in &mut self.patterns {
             p.substitute_var(old, new);
         }
+        let rename_order_bind: fn(&mut Expression, VarId, VarId) = self
+            .grouping
+            .as_ref()
+            .map_or(Expression::substitute_var, |g| g.group_row_renamer(old));
         if let Some(g) = &mut self.grouping {
             g.substitute_var(old, new);
         }
@@ -164,7 +169,7 @@ impl SubqueryPattern {
             if *v == old {
                 *v = new;
             }
-            expr.substitute_var(old, new);
+            rename_order_bind(expr, old, new);
         }
     }
 
@@ -539,6 +544,12 @@ pub fn values_column_all_undef(rows: &[Vec<Binding>], col: usize) -> bool {
         && rows
             .iter()
             .all(|row| matches!(row.get(col), Some(Binding::Unbound)))
+}
+
+/// Variables some pattern of `patterns` may bind (the planner's
+/// `must_bind_vars` gives the ones bound on every row).
+pub fn produced_vars_of(patterns: &[Pattern]) -> HashSet<VarId> {
+    patterns.iter().flat_map(Pattern::produced_vars).collect()
 }
 
 impl Pattern {

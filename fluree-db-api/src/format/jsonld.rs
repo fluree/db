@@ -177,8 +177,9 @@ pub fn format_string(
     Ok(out)
 }
 
-/// Streaming counterpart of [`format_binding_with_result`]: materialize an
-/// encoded top binding, then stream it.
+/// Streaming counterpart of [`format_binding_with_result`]: materialize every
+/// encoded binding, at the top or inside a per-group list, list or map, then
+/// stream it.
 ///
 /// Exposed to `agent_json`, whose row cells use JSON-LD value shaping.
 pub(super) fn write_value_with_result(
@@ -187,17 +188,22 @@ pub(super) fn write_value_with_result(
     binding: &Binding,
     compactor: &IriCompactor,
 ) -> Result<()> {
-    if binding.is_encoded() {
-        let materialized = materialize::materialize_binding(result, binding)?;
-        return write_value_with_result(out, result, &materialized, compactor);
-    }
-    write_value(out, binding, compactor)
+    write_value(out, Some(result), binding, compactor)
 }
 
-/// Streaming counterpart of [`format_binding`] (no `QueryResult`): encoded
-/// bindings error here, exactly as the DOM path does. Grouped elements recurse
-/// through this same no-materialize path.
-fn write_value(out: &mut String, binding: &Binding, compactor: &IriCompactor) -> Result<()> {
+/// Streaming counterpart of [`format_binding`]. With a `QueryResult`, an
+/// encoded binding is materialized wherever it sits; without one it errors,
+/// exactly as the DOM path does.
+fn write_value(
+    out: &mut String,
+    result: Option<&QueryResult>,
+    binding: &Binding,
+    compactor: &IriCompactor,
+) -> Result<()> {
+    if let (Some(result), true) = (result, binding.is_encoded()) {
+        let materialized = materialize::materialize_binding(result, binding)?;
+        return write_value(out, Some(result), &materialized, compactor);
+    }
     match binding {
         Binding::Unbound | Binding::Poisoned => out.push_str("null"),
         // A reference is a bare compacted IRI string (not an `{"@id":...}` object).
@@ -223,7 +229,7 @@ fn write_value(out: &mut String, binding: &Binding, compactor: &IriCompactor) ->
                 if i > 0 {
                     out.push(',');
                 }
-                write_value(out, v, compactor)?;
+                write_value(out, result, v, compactor)?;
             }
             out.push(']');
         }
@@ -257,7 +263,7 @@ fn write_value(out: &mut String, binding: &Binding, compactor: &IriCompactor) ->
                 if i > 0 {
                     out.push(',');
                 }
-                write_value(out, v, compactor)?;
+                write_value(out, result, v, compactor)?;
             }
             out.push(']');
         }
@@ -270,7 +276,7 @@ fn write_value(out: &mut String, binding: &Binding, compactor: &IriCompactor) ->
                 }
                 push_json_string(out, k);
                 out.push(':');
-                write_value(out, v, compactor)?;
+                write_value(out, result, v, compactor)?;
             }
             out.push('}');
         }
@@ -288,7 +294,8 @@ fn write_lit(
     compactor: &IriCompactor,
 ) -> Result<()> {
     if let FlakeValue::TripleTerm(term) = val {
-        let node = super::triple_term_node(term, compactor, |o| format_binding(o, compactor))?;
+        let node =
+            super::triple_term_node(term, compactor, |o| format_binding(None, o, compactor))?;
         return push_value(out, &node);
     }
     let dt = dtc.datatype();
@@ -393,10 +400,20 @@ fn write_scalar(out: &mut String, val: &FlakeValue, json_as_string: bool) -> Res
     Ok(())
 }
 
-/// Format a single binding to JSON-LD Query JSON
+/// Format a single binding to JSON-LD Query JSON, materializing every encoded
+/// binding through `result` when there is one: at the top or inside a
+/// per-group list, list or map. Without one, an encoded binding errors.
 ///
 /// Note: Binding::Lit NEVER contains FlakeValue::Ref (Rust invariant)
-pub(crate) fn format_binding(binding: &Binding, compactor: &IriCompactor) -> Result<JsonValue> {
+fn format_binding(
+    result: Option<&QueryResult>,
+    binding: &Binding,
+    compactor: &IriCompactor,
+) -> Result<JsonValue> {
+    if let (Some(result), true) = (result, binding.is_encoded()) {
+        let materialized = super::materialize::materialize_binding(result, binding)?;
+        return format_binding(Some(result), &materialized, compactor);
+    }
     match binding {
         Binding::Unbound | Binding::Poisoned => Ok(JsonValue::Null),
 
@@ -416,7 +433,7 @@ pub(crate) fn format_binding(binding: &Binding, compactor: &IriCompactor) -> Res
         Binding::Lit {
             val: FlakeValue::TripleTerm(term),
             ..
-        } => super::triple_term_node(term, compactor, |o| format_binding(o, compactor)),
+        } => super::triple_term_node(term, compactor, |o| format_binding(result, o, compactor)),
 
         Binding::Lit { val, dtc, .. } => {
             let dt = dtc.datatype();
@@ -581,7 +598,7 @@ pub(crate) fn format_binding(binding: &Binding, compactor: &IriCompactor) -> Res
         Binding::Grouped(values) => {
             let arr: Result<Vec<_>> = values
                 .iter()
-                .map(|v| format_binding(v, compactor))
+                .map(|v| format_binding(result, v, compactor))
                 .collect();
             Ok(JsonValue::Array(arr?))
         }
@@ -617,7 +634,7 @@ pub(crate) fn format_binding(binding: &Binding, compactor: &IriCompactor) -> Res
         Binding::List(values) => {
             let arr: Result<Vec<_>> = values
                 .iter()
-                .map(|v| format_binding(v, compactor))
+                .map(|v| format_binding(result, v, compactor))
                 .collect();
             Ok(JsonValue::Array(arr?))
         }
@@ -625,7 +642,7 @@ pub(crate) fn format_binding(binding: &Binding, compactor: &IriCompactor) -> Res
         Binding::Map(entries) => {
             let mut obj = serde_json::Map::with_capacity(entries.len());
             for (k, v) in entries {
-                obj.insert(k.to_string(), format_binding(v, compactor)?);
+                obj.insert(k.to_string(), format_binding(result, v, compactor)?);
             }
             Ok(JsonValue::Object(obj))
         }
@@ -637,12 +654,7 @@ pub(crate) fn format_binding_with_result(
     binding: &Binding,
     compactor: &IriCompactor,
 ) -> Result<JsonValue> {
-    if binding.is_encoded() {
-        let materialized = super::materialize::materialize_binding(result, binding)?;
-        return format_binding_with_result(result, &materialized, compactor);
-    }
-
-    format_binding(binding, compactor)
+    format_binding(Some(result), binding, compactor)
 }
 
 // NOTE: encoded binding materialization is centralized in `format::materialize`.
@@ -743,7 +755,7 @@ mod tests {
     fn test_format_binding_sid_id_not_vocab_compacted() {
         let compactor = make_vocab_compactor();
         let binding = Binding::sid(Sid::new(100, "summer")); // http://example.org/lists/summer
-        let result = format_binding(&binding, &compactor).unwrap();
+        let result = format_binding(None, &binding, &compactor).unwrap();
         assert_eq!(result, json!("http://example.org/lists/summer"));
         assert_ne!(
             result,
@@ -759,7 +771,7 @@ mod tests {
             FlakeValue::String("Alice".to_string()),
             Sid::new(2, "string"),
         );
-        let result = format_binding(&binding, &compactor).unwrap();
+        let result = format_binding(None, &binding, &compactor).unwrap();
         assert_eq!(result, json!("Alice"));
     }
 
@@ -767,7 +779,7 @@ mod tests {
     fn test_format_binding_long() {
         let compactor = make_test_compactor();
         let binding = Binding::lit(FlakeValue::Long(42), Sid::new(2, "long"));
-        let result = format_binding(&binding, &compactor).unwrap();
+        let result = format_binding(None, &binding, &compactor).unwrap();
         assert_eq!(result, json!(42));
     }
 
@@ -775,7 +787,7 @@ mod tests {
     fn test_format_binding_double() {
         let compactor = make_test_compactor();
         let binding = Binding::lit(FlakeValue::Double(3.13), Sid::new(2, "double"));
-        let result = format_binding(&binding, &compactor).unwrap();
+        let result = format_binding(None, &binding, &compactor).unwrap();
         assert_eq!(result, json!(3.13));
     }
 
@@ -787,7 +799,7 @@ mod tests {
     fn test_format_binding_double_stays_json_number() {
         let compactor = make_test_compactor();
         let binding = Binding::lit(FlakeValue::Double(1_000_000.0), Sid::new(2, "double"));
-        let result = format_binding(&binding, &compactor).unwrap();
+        let result = format_binding(None, &binding, &compactor).unwrap();
         assert!(result.is_number(), "double must be a JSON number: {result}");
         assert_eq!(result, json!(1_000_000.0));
         assert_ne!(result, json!("1.0E6"));
@@ -797,7 +809,7 @@ mod tests {
     fn test_format_binding_boolean() {
         let compactor = make_test_compactor();
         let binding = Binding::lit(FlakeValue::Boolean(true), Sid::new(2, "boolean"));
-        let result = format_binding(&binding, &compactor).unwrap();
+        let result = format_binding(None, &binding, &compactor).unwrap();
         assert_eq!(result, json!(true));
     }
 
@@ -805,7 +817,7 @@ mod tests {
     fn test_format_binding_sid() {
         let compactor = make_test_compactor();
         let binding = Binding::sid(Sid::new(100, "alice"));
-        let result = format_binding(&binding, &compactor).unwrap();
+        let result = format_binding(None, &binding, &compactor).unwrap();
         // Without @context, returns full IRI
         assert_eq!(result, json!("http://example.org/alice"));
     }
@@ -814,7 +826,7 @@ mod tests {
     fn test_format_binding_unbound() {
         let compactor = make_test_compactor();
         let binding = Binding::Unbound;
-        let result = format_binding(&binding, &compactor).unwrap();
+        let result = format_binding(None, &binding, &compactor).unwrap();
         assert_eq!(result, JsonValue::Null);
     }
 
@@ -822,7 +834,7 @@ mod tests {
     fn test_format_binding_language_tagged() {
         let compactor = make_test_compactor();
         let binding = Binding::lit_lang(FlakeValue::String("Hello".to_string()), "en");
-        let result = format_binding(&binding, &compactor).unwrap();
+        let result = format_binding(None, &binding, &compactor).unwrap();
         assert_eq!(result, json!({"@value": "Hello", "@language": "en"}));
     }
 
@@ -833,7 +845,7 @@ mod tests {
             Binding::lit(FlakeValue::Long(1), Sid::new(2, "long")),
             Binding::lit(FlakeValue::Long(2), Sid::new(2, "long")),
         ]);
-        let result = format_binding(&binding, &compactor).unwrap();
+        let result = format_binding(None, &binding, &compactor).unwrap();
         assert_eq!(result, json!([1, 2]));
     }
 
@@ -987,6 +999,7 @@ mod tests {
         r.output = fluree_db_query::ir::QueryOutput::Select {
             projection: Projection::Scalar(Column::Var(x)),
             restriction: None,
+            ungrouped: fluree_db_query::ir::UngroupedProjection::PerGroupList,
         };
         assert!(r.output.should_flatten_scalar());
         assert_parity(&r, &c);
@@ -1034,7 +1047,7 @@ mod tests {
             FlakeValue::Json(r#"{"name":"Alice","age":30}"#.to_string()),
             Sid::new(3, "JSON"), // rdf:JSON
         );
-        let result = format_binding(&binding, &compactor).unwrap();
+        let result = format_binding(None, &binding, &compactor).unwrap();
         assert_eq!(result, json!({"name": "Alice", "age": 30}));
     }
 
@@ -1049,7 +1062,7 @@ mod tests {
             FlakeValue::String(r#"{"name":"Alice","age":30}"#.to_string()),
             Sid::new(3, "JSON"), // rdf:JSON
         );
-        let result = format_binding(&binding, &compactor).unwrap();
+        let result = format_binding(None, &binding, &compactor).unwrap();
         assert_eq!(
             result,
             json!({"name": "Alice", "age": 30}),

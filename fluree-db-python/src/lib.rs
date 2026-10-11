@@ -14,6 +14,10 @@
 //!   periodically to deliver signals, so Ctrl-C cancels a running query.
 //! - **Snapshots are frozen.** `Snapshot` pins one `GraphDb`; every query on it
 //!   sees the same state however the ledger moves on.
+//!
+//! The module is the `extension` feature, which maturin turns on; without it
+//! the crate is empty (see Cargo.toml).
+#![cfg(feature = "extension")]
 
 mod branch;
 mod connection;

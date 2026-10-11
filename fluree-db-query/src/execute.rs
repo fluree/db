@@ -163,8 +163,9 @@ mod tests {
         );
     }
 
+    /// A sort key nothing binds orders nothing: dropped, not a plan error.
     #[test]
-    fn test_build_operator_tree_validates_sort_vars() {
+    fn test_build_operator_tree_drops_sort_keys_nothing_binds() {
         let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
@@ -172,7 +173,7 @@ mod tests {
             patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
             reasoning: ReasoningConfig::default(),
             grouping: None,
-            ordering: vec![SortSpec::asc(VarId(99))], // Invalid var
+            ordering: vec![SortSpec::asc(VarId(99))], // nothing binds ?99
             order_binds: Vec::new(),
             limit: None,
             offset: None,
@@ -188,10 +189,7 @@ mod tests {
             None,
             &crate::temporal_mode::PlanningContext::current(),
         );
-        match result {
-            Err(e) => assert!(e.to_string().contains("Sort variable")),
-            Ok(_) => panic!("Expected error for invalid sort var"),
-        }
+        assert!(result.is_ok(), "{:?}", result.err());
     }
 
     #[test]

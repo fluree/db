@@ -50,7 +50,11 @@ pub use adapters::{
 };
 pub use expression::{ArithmeticOp, CompareOp, Expression, Function};
 pub use fluree_db_core::value::FlakeValue;
-pub use grouping::{AggregateFn, AggregateSpec, Aggregation, Grouping, InputSemantics};
+pub use grouping::{
+    having_as_filter, read_as_unbound, sample_ungrouped_reads, AggregateFn, AggregateSpec,
+    Aggregation, Grouping, GroupingError, InputSemantics, ReadStage, SelectExprPlacement,
+    SelectExprPlacer, UngroupedRead,
+};
 pub use path::{
     PathDirection, PathModifier, PathNodeFilter, PathStep, PropertyPathPattern, ShortestPathMode,
     ShortestPathPattern,
@@ -60,7 +64,10 @@ pub use projection::{
     Column, ForwardItem, HydrationSpec, NestedModifiers, NestedOrderKey, NestedSelectSpec,
     Projection, Root,
 };
-pub use query::{ConstructTemplate, Query, QueryOutput, Restriction, TemplateReification};
+pub use query::{
+    ConstructTemplate, PostValues, Query, QueryOutput, Restriction, TemplateReification,
+    UngroupedProjection,
+};
 pub use reasoning::{ReasoningConfig, ReasoningModes};
 pub use term_components::{
     lower_reified_link, lower_term_object, lower_term_value, Component, TermComponentsPattern,

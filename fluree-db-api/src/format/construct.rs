@@ -424,9 +424,10 @@ impl TermResolver<'_> {
                     "Encoded bindings should have been materialized before CONSTRUCT IR conversion"
                 )
             }
-            // GROUP BY + CONSTRUCT is not supported (semantics undefined)
+            // Lowering unbinds every template variable a group row does not
+            // bind (`ConstructTemplate::unbind_outside_group_row`).
             Binding::Grouped(_) => Err(FormatError::InvalidBinding(
-                "CONSTRUCT does not support GROUP BY (Binding::Grouped encountered)".to_string(),
+                "a CONSTRUCT template variable is a per-group list (Binding::Grouped)".to_string(),
             )),
             Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {
                 Err(FormatError::InvalidBinding(
