@@ -43,6 +43,18 @@ pub enum QueryError {
     #[error("Invalid query: {0}")]
     InvalidQuery(String),
 
+    /// An invalid query (the plan-time grouped-read check): after grouping, a
+    /// stage reads a variable the grouping neither keys, aggregates nor binds;
+    /// or an aggregate reads a variable nothing binds, or outputs one that is
+    /// already bound.
+    ///
+    /// Typed rather than [`Self::InvalidQuery`] because the planner has no
+    /// variable names: it carries the variable's id, and
+    /// [`Self::name_variables`] renders the name wherever the query's
+    /// registry is at hand. Treat it as `InvalidQuery` everywhere else.
+    #[error("Invalid query: {}", .0.message())]
+    UngroupedRead(crate::ir::UngroupedRead),
+
     /// Invalid filter expression
     #[error("Invalid filter: {0}")]
     InvalidFilter(String),
@@ -265,6 +277,17 @@ impl QueryError {
     /// Create an execution error (runtime configuration/environment issue).
     pub fn execution(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())
+    }
+
+    /// Name the variables in an error that carries only their ids: an
+    /// [`Self::UngroupedRead`] becomes an [`Self::InvalidQuery`] naming them
+    /// from `vars`. Every other error is returned unchanged.
+    #[must_use]
+    pub fn name_variables(self, vars: &crate::var_registry::VarRegistry) -> Self {
+        match self {
+            Self::UngroupedRead(read) => Self::InvalidQuery(read.named_message(vars)),
+            other => other,
+        }
     }
 
     /// Create an [`Self::R2rmlUnsupportedPattern`] refusal with an actionable

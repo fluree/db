@@ -1046,9 +1046,9 @@ mod tests {
                     },
                 ])
                 .expect("non-empty"),
-                binds: Vec::new(),
             },
             having: None,
+            binds: Vec::new(),
         });
 
         Query {

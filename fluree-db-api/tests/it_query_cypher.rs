@@ -1339,20 +1339,62 @@ async fn cypher_collect_through_with() {
         .collect();
     assert_eq!(rows, vec![json!("Bob"), json!("Carol")], "{unwound}");
 
-    // ORDER BY directly on a collect() list in the same WITH is still rejected
-    // (sorting a list value is unsound in v1).
-    assert!(
-        fluree
-            .query_cypher(
-                &db,
-                r#"MATCH (p:Person)-[:KNOWS]->(f:Person)
-                   WITH p, collect(f.name) AS friends ORDER BY friends
-                   RETURN p.name, friends"#,
-            )
+    // ORDER BY on a collect() list in the same WITH, or on a list built from
+    // one, is still rejected (sorting a list value is unsound in v1).
+    for order_by in ["friends", "tail(friends)", "friends + ['x']"] {
+        let query = format!(
+            "MATCH (p:Person)-[:KNOWS]->(f:Person) \
+             WITH p, collect(f.name) AS friends ORDER BY {order_by} RETURN p.name, friends"
+        );
+        assert!(
+            fluree.query_cypher(&db, &query).await.is_err(),
+            "ORDER BY on a collect() list in WITH is rejected: {query}"
+        );
+    }
+
+    // An ORDER BY key that reads the list and yields a scalar sorts after the
+    // aggregation, in a WITH and in a RETURN.
+    for (query, expected) in [
+        (
+            "MATCH (p:Person)-[:KNOWS]->(f:Person) \
+             WITH p, collect(f.name) AS friends ORDER BY size(friends) \
+             RETURN p.name AS name, size(friends) AS n",
+            json!([["Bob", 1], ["Alice", 2]]),
+        ),
+        (
+            "MATCH (p:Person)-[:KNOWS]->(f:Person) \
+             RETURN p.name AS name, collect(f.name) AS friends ORDER BY size(friends) DESC",
+            json!(["Alice", "Bob"]),
+        ),
+        (
+            "MATCH (p:Person)-[:KNOWS]->(f:Person) \
+             WITH p, collect(f.name) AS friends ORDER BY any(x IN friends WHERE x = 'Bob') \
+             RETURN p.name AS name",
+            json!([["Bob"], ["Alice"]]),
+        ),
+    ] {
+        let cj = fluree
+            .query_cypher(&db, query)
             .await
-            .is_err(),
-        "ORDER BY on a collect() list in WITH is rejected"
-    );
+            .unwrap_or_else(|e| panic!("{e}\n{query}"))
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .expect("cypher json");
+        let rows: Vec<JsonValue> = cj["results"][0]["data"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|r| r["row"].clone())
+            .collect();
+        let rows = match expected.as_array().and_then(|e| e.first()) {
+            // Names only: the friends list's order is unspecified.
+            Some(JsonValue::String(_)) => {
+                JsonValue::Array(rows.iter().map(|r| r[0].clone()).collect())
+            }
+            _ => JsonValue::Array(rows),
+        };
+        assert_eq!(rows, expected, "{query}");
+    }
 }
 
 #[tokio::test]
