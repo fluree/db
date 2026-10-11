@@ -123,51 +123,17 @@ pub fn format(
             .collect();
 
         for row_idx in 0..batch.len() {
-            let has_grouped = cols.iter().any(|&c| {
-                matches!(
-                    c.map(|c| batch.get_by_col(row_idx, c)),
-                    Some(Binding::Grouped(_))
-                )
-            });
-
-            if has_grouped {
-                // Rare path: cartesian-expand grouped columns into multiple rows.
-                let cells: Vec<Option<&Binding>> = cols
-                    .iter()
-                    .map(|&c| c.map(|c| batch.get_by_col(row_idx, c)))
-                    .collect();
-                let wrote = write_grouped_rows(
-                    &mut out,
-                    result,
-                    &cells,
-                    &head_names,
-                    compactor,
-                    gv,
-                    select_one,
-                )?;
-                if select_one && wrote {
-                    break 'outer;
+            // Stream the row straight into the buffer.
+            out.push_str("<result>");
+            for (k, &col) in cols.iter().enumerate() {
+                if let Some(col) = col {
+                    let binding = batch.get_by_col(row_idx, col);
+                    write_binding_cell(&mut out, result, binding, &head_names[k], compactor, gv)?;
                 }
-            } else {
-                // Fast path: stream the row straight into the buffer.
-                out.push_str("<result>");
-                for (k, &col) in cols.iter().enumerate() {
-                    if let Some(col) = col {
-                        let binding = batch.get_by_col(row_idx, col);
-                        write_binding_cell(
-                            &mut out,
-                            result,
-                            binding,
-                            &head_names[k],
-                            compactor,
-                            gv,
-                        )?;
-                    }
-                }
-                out.push_str("</result>");
-                if select_one {
-                    break 'outer;
-                }
+            }
+            out.push_str("</result>");
+            if select_one {
+                break 'outer;
             }
         }
     }
@@ -231,11 +197,7 @@ fn write_term(
             write_term(out, result, &materialized, compactor, gv)?;
         }
 
-        Binding::Grouped(_) => {
-            return Err(FormatError::InvalidBinding(
-                "Binding::Grouped should be disaggregated before SPARQL XML formatting".to_string(),
-            ));
-        }
+        Binding::Grouped(_) => return Err(super::sparql::grouped_cell_error()),
         Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {
             return Err(FormatError::InvalidBinding(
                 "SPARQL results have no path/list type (Cypher-only)".to_string(),
@@ -368,66 +330,6 @@ fn write_literal(
 /// preserving the special-value spellings (`NaN`, `INF`, `-INF`).
 fn write_double(out: &mut String, d: f64) {
     fluree_graph_ir::push_canonical_xsd_double(out, d);
-}
-
-/// Cartesian-expand a row containing `Grouped` columns into multiple `<result>`
-/// elements (one per combination), preserving the original disaggregation order
-/// where the first grouped column varies slowest. Returns whether any row was
-/// written (an empty grouped column drops the source row, matching prior
-/// behavior). `cells` is aligned with `head_names`; `None` entries are omitted.
-fn write_grouped_rows(
-    out: &mut String,
-    result: &QueryResult,
-    cells: &[Option<&Binding>],
-    head_names: &[String],
-    compactor: &IriCompactor,
-    gv: Option<&BinaryGraphView>,
-    select_one: bool,
-) -> Result<bool> {
-    // Collect grouped columns; an empty group means zero output rows.
-    let mut grouped: Vec<&[Binding]> = Vec::new();
-    for cell in cells {
-        if let Some(Binding::Grouped(values)) = cell {
-            if values.is_empty() {
-                return Ok(false);
-            }
-            grouped.push(values.as_slice());
-        }
-    }
-
-    let total: usize = grouped.iter().map(|v| v.len()).product();
-    let combos = if select_one { total.min(1) } else { total };
-
-    for combo in 0..combos {
-        // Mixed-radix decode: last grouped column varies fastest so the first
-        // varies slowest, matching the original nested-loop expansion order.
-        let mut picks = vec![0usize; grouped.len()];
-        let mut rem = combo;
-        for gi in (0..grouped.len()).rev() {
-            let r = grouped[gi].len();
-            picks[gi] = rem % r;
-            rem /= r;
-        }
-
-        out.push_str("<result>");
-        let mut gi = 0usize;
-        for (k, cell) in cells.iter().enumerate() {
-            match cell {
-                Some(Binding::Grouped(_)) => {
-                    let chosen = &grouped[gi][picks[gi]];
-                    gi += 1;
-                    write_binding_cell(out, result, chosen, &head_names[k], compactor, gv)?;
-                }
-                Some(binding) => {
-                    write_binding_cell(out, result, binding, &head_names[k], compactor, gv)?;
-                }
-                None => {} // absent column → Unbound → omitted
-            }
-        }
-        out.push_str("</result>");
-    }
-
-    Ok(combos > 0)
 }
 
 fn strip_question_mark(var_name: &str) -> String {
@@ -758,10 +660,11 @@ mod tests {
         assert!(xml.contains("a &amp; b &lt; c &gt; d"), "{xml}");
     }
 
+    /// A per-group list has no SPARQL-results form: the XML writer refuses it
+    /// rather than expanding it into one `<result>` per element.
     #[test]
-    fn grouped_disaggregates_in_cartesian_order() {
+    fn grouped_cell_is_a_format_error() {
         let c = make_test_compactor();
-        // Two grouped columns; first (sorted) var must vary slowest.
         let r = make_result(
             &["?a", "?b"],
             vec![vec![
@@ -769,38 +672,10 @@ mod tests {
                     Binding::lit(FlakeValue::Long(10), Sid::new(2, "long")),
                     Binding::lit(FlakeValue::Long(20), Sid::new(2, "long")),
                 ]),
-                Binding::Grouped(vec![
-                    Binding::lit(FlakeValue::Long(1), Sid::new(2, "long")),
-                    Binding::lit(FlakeValue::Long(2), Sid::new(2, "long")),
-                ]),
+                Binding::lit(FlakeValue::Long(1), Sid::new(2, "long")),
             ]],
         );
-        let xml = fmt(&r, &c);
-        // Expect 4 <result> rows in order (a=10,b=1),(a=10,b=2),(a=20,b=1),(a=20,b=2).
-        assert_eq!(xml.matches("<result>").count(), 4, "{xml}");
-        let results_section = &xml[xml.find("<results>").unwrap()..];
-        let blocks: Vec<&str> = results_section
-            .split("<result>")
-            .skip(1)
-            .map(|s| s.split("</result>").next().unwrap())
-            .collect();
-        assert_eq!(blocks.len(), 4);
-        let pairs: Vec<(i64, i64)> = blocks
-            .iter()
-            .map(|blk| (seg_val(blk, "a"), seg_val(blk, "b")))
-            .collect();
-        assert_eq!(pairs, vec![(10, 1), (10, 2), (20, 1), (20, 2)], "{xml}");
-    }
-
-    /// Extract the integer literal value of `<binding name="{name}">…</binding>`.
-    fn seg_val(blk: &str, name: &str) -> i64 {
-        let start = blk.find(&format!(r#"<binding name="{name}">"#)).unwrap();
-        let seg = &blk[start..];
-        // Skip to the end of the <literal ...> opening tag, then read until '<'.
-        let lit = &seg[seg.find("<literal").unwrap()..];
-        let val_start = &lit[lit.find('>').unwrap() + 1..];
-        let val_end = val_start.find('<').unwrap();
-        val_start[..val_end].parse().unwrap()
+        assert!(format(&r, &c, &FormatterConfig::sparql_xml()).is_err());
     }
 
     #[test]

@@ -212,7 +212,7 @@ struct DatasetMember {
 /// `Eq`/`Hash` exclude history metadata, so this is only armed in current mode
 /// (see [`DatasetOperator::open`]).
 ///
-/// MEMORY CLIFF (documented like `scan_graph_flakes`'s): unlike a
+/// MEMORY CLIFF (documented like `whole_graph_facts`'s): unlike a
 /// single-graph scan, a `>= 2`-member default union is no longer
 /// bounded-memory streaming — the seen-set grows O(distinct emitted rows)
 /// with full normalized `Binding` signatures as keys, exactly like a

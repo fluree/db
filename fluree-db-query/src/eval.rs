@@ -242,10 +242,14 @@ impl Expression {
                     }
                 }
                 Some(Binding::Unbound | Binding::Poisoned) | None => Ok(None),
-                Some(Binding::Grouped(_)) => {
-                    debug_assert!(false, "Grouped binding in filter evaluation");
-                    Ok(None)
-                }
+                // A per-group list is not a value. The plan-time check
+                // (`Grouping::first_ungrouped_read`) keeps it out of every
+                // expression; reaching here is a planning bug, so fail the query
+                // (in every build) rather than read it as unbound. `Internal` is
+                // outside the FILTER/BIND demotion sets, so it propagates.
+                Some(Binding::Grouped(_)) => Err(QueryError::Internal(
+                    "grouped (list-valued) binding reached scalar evaluation".to_string(),
+                )),
                 // A path or list is not a scalar — no comparable value. The
                 // relevant functions (`length`, `size`/`head`/…) read the
                 // binding directly via dispatch / the binding-producing path.
@@ -837,6 +841,30 @@ mod tests {
         ];
 
         Batch::new(schema, vec![age_col, name_col]).unwrap()
+    }
+
+    /// A per-group list reaching scalar evaluation is a planning bug: it fails
+    /// the query in every build (it used to debug-panic and read as unbound in
+    /// release), and FILTER / BIND do not demote it.
+    #[test]
+    fn grouped_binding_fails_scalar_evaluation() {
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let list = Binding::Grouped(vec![Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"))]);
+        let batch = Batch::new(schema, vec![vec![list]]).unwrap();
+        let row = batch.row_view(0).unwrap();
+        let expr = Expression::gt(
+            Expression::Var(VarId(0)),
+            Expression::Const(FlakeValue::Long(0)),
+        );
+        for err in [
+            expr.eval_to_bool::<_>(&row, None).unwrap_err(),
+            expr.eval_to_bool_non_strict::<_>(&row, None).unwrap_err(),
+            Expression::Var(VarId(0))
+                .eval_to_comparable::<_>(&row, None)
+                .unwrap_err(),
+        ] {
+            assert!(matches!(err, QueryError::Internal(_)), "{err}");
+        }
     }
 
     #[test]

@@ -590,6 +590,18 @@ impl super::Parser<'_> {
         Some(GraphPattern::Bind { expr, var, span })
     }
 
+    /// Parse the optional `ValuesClause` that follows a query's
+    /// `SolutionModifier`. The grammar allows one after every query form
+    /// (`Query ::= Prologue ( SelectQuery | ConstructQuery | DescribeQuery |
+    /// AskQuery ) ValuesClause`) and after a sub-SELECT.
+    pub(super) fn parse_trailing_values(&mut self) -> Option<Box<GraphPattern>> {
+        if self.stream.check_keyword(TokenKind::KwValues) {
+            self.parse_values_pattern().map(Box::new)
+        } else {
+            None
+        }
+    }
+
     /// Parse a VALUES clause.
     ///
     /// Syntax:
@@ -852,11 +864,7 @@ impl super::Parser<'_> {
         // `SubSelect ::= SelectClause WhereClause SolutionModifier ValuesClause`
         // (same position as a top-level query's post-query VALUES;
         // W3C bindings#inline2).
-        let values = if self.stream.check_keyword(TokenKind::KwValues) {
-            self.parse_values_pattern().map(Box::new)
-        } else {
-            None
-        };
+        let values = self.parse_trailing_values();
 
         // Expect closing brace for the subquery
         if !self.stream.match_token(&TokenKind::RBrace) {

@@ -159,6 +159,8 @@ This error fires from the JSON-LD strict compact-IRI guard. A value that *looks*
 2. Misspelled or missing prefix in `@context`
 3. Intentionally using a bare `prefix:suffix` string as an opaque identifier
 
+Turtle and TriG writes are not read as JSON-LD, so their IRIs, whatever the scheme (`tag:`, `urn:`, `kb:`), never raise this error.
+
 ### Solutions
 
 **Add the missing prefix to @context** (most common fix):
