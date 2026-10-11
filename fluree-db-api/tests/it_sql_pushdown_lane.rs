@@ -2391,6 +2391,32 @@ fn aggregate_cases() -> Vec<Case> {
             routing: Routing::MustFire,
             declined: None,
         },
+        // A canary pair: the key-only grouping is one grouped statement, and the
+        // same grouping with a SELECT expression stays in the engine, which
+        // evaluates the expression once per group (#1978); the lane pushes no
+        // per-group BIND.
+        Case {
+            name: "GROUP BY a foreign-key object with COUNT",
+            sparql: "SELECT ?c (COUNT(?o) AS ?n) FROM <shop-sql:main> WHERE { ?o ex:customer ?c } GROUP BY ?c",
+            sql: &[r#"SELECT "t1"."id" AS "c0", COUNT("t0"."id") AS "c1" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#],
+            rows: &[
+                "c=http://example.org/customer/1 n=2",
+                "c=http://example.org/customer/2 n=1",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a grouped SELECT expression stays in the engine",
+            sparql: "SELECT ?c (COUNT(?o) AS ?n) (?n * 10 AS ?m) FROM <shop-sql:main> WHERE { ?o ex:customer ?c } GROUP BY ?c",
+            sql: &[],
+            rows: &[
+                "c=http://example.org/customer/1 m=20 n=2",
+                "c=http://example.org/customer/2 m=10 n=1",
+            ],
+            routing: Routing::MustNotFire,
+            declined: None,
+        },
         Case {
             name: "AVG pushes SUM and COUNT and divides in the engine",
             sparql: "SELECT ?c (AVG(?t) AS ?a) FROM <shop-sql:main> WHERE { ?o ex:customer ?c . ?o ex:total ?t } GROUP BY ?c",

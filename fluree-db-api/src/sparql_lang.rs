@@ -104,9 +104,10 @@ fn lower_policy_query(
     }
 
     let mut patterns = query.patterns;
-    // A trailing VALUES clause is an inner-join constraint; keep it.
+    // A trailing VALUES clause is an inner-join constraint; keep it, and the
+    // binds that run after it.
     if let Some(values) = query.post_values {
-        patterns.push(values);
+        patterns.extend(values.to_patterns());
     }
     Ok(patterns)
 }
