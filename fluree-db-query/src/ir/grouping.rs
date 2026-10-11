@@ -569,6 +569,7 @@ impl Grouping {
     /// aggregate input/output vars, post-aggregation binds, and HAVING. Used by
     /// the equijoin-filter fold to unify two provably-equal variables.
     pub fn substitute_var(&mut self, old: VarId, new: VarId) {
+        let over_group_row = self.group_row_renamer(old);
         let rename = |v: &mut VarId| {
             if *v == old {
                 *v = new;
@@ -600,11 +601,31 @@ impl Grouping {
         }
         for (var, expr) in binds {
             rename(var);
-            expr.substitute_var(old, new);
+            over_group_row(expr, old, new);
         }
         if let Some(expr) = having {
-            expr.substitute_var(old, new);
+            over_group_row(expr, old, new);
         }
+    }
+
+    /// How [`Self::substitute_var`] renames `old` in an expression evaluated
+    /// over the group row (HAVING, a bind, an ORDER BY bind). An EXISTS body
+    /// there is correlated with `old` only if the group row binds it (a key,
+    /// an aggregate output or a bind); otherwise `old` is free in the body and
+    /// keeps its name. Take it before renaming the grouping itself.
+    pub fn group_row_renamer(&self, old: VarId) -> fn(&mut Expression, VarId, VarId) {
+        if self.group_row_binds(old) {
+            Expression::substitute_var
+        } else {
+            Expression::substitute_row_read
+        }
+    }
+
+    /// Whether a group row binds `v`: a key, an aggregate output or a bind.
+    pub fn group_row_binds(&self, v: VarId) -> bool {
+        self.group_by_vars().any(|k| k == v)
+            || self.aggregates().any(|spec| spec.output_var == v)
+            || self.binds().any(|(out, _)| *out == v)
     }
 }
 

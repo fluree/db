@@ -1211,6 +1211,73 @@ async fn exists_body_variables_are_free_over_the_group_row() {
     }
 }
 
+/// The equijoin fold (`FILTER(?e = ?f)` → one variable) keeps `?f` free in an
+/// EXISTS body over the group row: `?f` is not a key, so renaming it to the key
+/// `?e` there would correlate the body with each group. Each folded query is
+/// checked against the same query with `STR(?e) = STR(?f)`, which never folds.
+#[tokio::test]
+async fn equijoin_fold_keeps_exists_body_variables_free_over_the_group_row() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "grouped-projection/fold-exists:main").await;
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:e1",
+                "ex:flag": true
+            }),
+        )
+        .await
+        .expect("flag")
+        .ledger;
+    let where_ = |eq: &str| format!("WHERE {{ ?e ex:area ?a . ?f ex:area ?b FILTER({eq}) }}");
+    let exists = "EXISTS { ?f ex:flag true }";
+    let every_entity: Vec<String> = (1..=6)
+        .map(|i| format!("http://example.org/e{i}"))
+        .collect();
+    for eq in ["?e = ?f", "STR(?e) = STR(?f)"] {
+        let w = where_(eq);
+        for body in [
+            format!("SELECT ?e (COUNT(*) AS ?n) {w} GROUP BY ?e HAVING ({exists})"),
+            format!(
+                "SELECT ?e ?n WHERE {{ {{ SELECT ?e (COUNT(*) AS ?n) {w} \
+                 GROUP BY ?e HAVING ({exists}) }} }}"
+            ),
+        ] {
+            let result = run(&fluree, &ledger, &body).await;
+            let mut entities: Vec<String> = sparql_rows(&result, &ledger)
+                .into_iter()
+                .map(|r| r["e"].clone())
+                .collect();
+            entities.sort();
+            assert_eq!(entities, every_entity, "{body}");
+        }
+        let body = format!("SELECT ?e ({exists} AS ?x) {w} GROUP BY ?e");
+        let result = run(&fluree, &ledger, &body).await;
+        let flags: Vec<String> = sparql_rows(&result, &ledger)
+            .into_iter()
+            .map(|r| r["x"].clone())
+            .collect();
+        assert_eq!(flags, vec!["true"; 6], "{body}");
+        // Every group's key is true, so the order falls to DESC(?e).
+        let top_one = format!(
+            "SELECT ?e (COUNT(*) AS ?n) {w} GROUP BY ?e ORDER BY DESC({exists}) DESC(?e) LIMIT 1"
+        );
+        for body in [
+            top_one.clone(),
+            format!("SELECT ?e ?n WHERE {{ {{ {top_one} }} }}"),
+        ] {
+            let result = run(&fluree, &ledger, &body).await;
+            assert_eq!(
+                sparql_rows(&result, &ledger),
+                rows(&json!([{"e": "http://example.org/e6", "n": "1"}])),
+                "{body}"
+            );
+        }
+    }
+}
+
 /// The area fixture with `ex:E` types, for Cypher's label match.
 async fn seed_typed_areas(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
     let ledger0 = genesis_ledger(fluree, ledger_id);

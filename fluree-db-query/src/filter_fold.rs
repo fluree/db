@@ -93,6 +93,10 @@ pub fn fold_equijoin_filters(query: &mut Query, stats: Option<&StatsView>) {
             for p in &mut query.patterns {
                 p.substitute_var(drop, keep);
             }
+            let rename_order_bind: fn(&mut Expression, VarId, VarId) = query
+                .grouping
+                .as_ref()
+                .map_or(Expression::substitute_var, |g| g.group_row_renamer(drop));
             if let Some(g) = &mut query.grouping {
                 g.substitute_var(drop, keep);
             }
@@ -105,7 +109,7 @@ pub fn fold_equijoin_filters(query: &mut Query, stats: Option<&StatsView>) {
                 if *v == drop {
                     *v = keep;
                 }
-                expr.substitute_var(drop, keep);
+                rename_order_bind(expr, drop, keep);
             }
             // The post-query VALUES clause lives outside `patterns`; it must be
             // unified too, or a `VALUES ?y { … }` on the dropped side would be

@@ -153,6 +153,10 @@ impl SubqueryPattern {
         for p in &mut self.patterns {
             p.substitute_var(old, new);
         }
+        let rename_order_bind: fn(&mut Expression, VarId, VarId) = self
+            .grouping
+            .as_ref()
+            .map_or(Expression::substitute_var, |g| g.group_row_renamer(old));
         if let Some(g) = &mut self.grouping {
             g.substitute_var(old, new);
         }
@@ -165,7 +169,7 @@ impl SubqueryPattern {
             if *v == old {
                 *v = new;
             }
-            expr.substitute_var(old, new);
+            rename_order_bind(expr, old, new);
         }
     }
 
