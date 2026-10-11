@@ -265,13 +265,20 @@ struct WhereCursorOperator<'a> {
 impl WhereCursor<'_> {
     /// Pull the next result batch. Returns `Ok(None)` when the operator is
     /// exhausted; further calls continue to return `Ok(None)`.
+    ///
+    /// A nested subquery is planned when it is first pulled, so its plan
+    /// errors surface here; like the open errors, they name their variables.
     pub async fn next_batch(&mut self) -> Result<Option<Batch>> {
         match &mut self.inner {
             CursorInner::Operator(state) => {
                 if state.closed {
                     return Ok(None);
                 }
-                let result = state.operator.next_batch(&state.ctx).await?;
+                let result = state
+                    .operator
+                    .next_batch(&state.ctx)
+                    .await
+                    .map_err(|e| e.name_variables(state.ctx.vars))?;
                 if result.is_none() {
                     state.operator.close();
                     state.closed = true;
@@ -381,8 +388,12 @@ pub async fn execute_where_streaming<'a>(
     let planning = temporal_mode::PlanningContext::current()
         .with_multi_default_graph(dataset.is_some_and(|ds| ds.default_graphs().len() >= 2))
         .with_unmatched_optional(unmatched_optional);
-    let mut operator = build_where_operators_seeded(None, patterns, stats, None, &planning)?;
-    operator.open(&ctx).await?;
+    let mut operator = build_where_operators_seeded(None, patterns, stats, None, &planning)
+        .map_err(|e| e.name_variables(vars))?;
+    operator
+        .open(&ctx)
+        .await
+        .map_err(|e| e.name_variables(vars))?;
     Ok(WhereCursor {
         inner: CursorInner::Operator(Box::new(WhereCursorOperator {
             operator,

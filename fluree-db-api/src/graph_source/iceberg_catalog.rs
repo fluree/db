@@ -12,13 +12,17 @@
 //! can browse/preview **before** a graph source is saved.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::graph_source::config::{CatalogMode, IcebergConnectionConfig};
 use crate::Result;
 
-use fluree_db_iceberg::catalog::{RestCatalogClient, RestCatalogConfig, SendCatalogClient};
+use fluree_db_iceberg::catalog::{
+    GlueSdkCatalogClient, LoadTableResponse, RestCatalogClient, RestCatalogConfig,
+    S3TablesSdkCatalogClient, SendCatalogClient,
+};
 use fluree_db_iceberg::io::batch::IcebergFieldTypeExt;
 use fluree_db_iceberg::io::{
     FileIcebergStorage, IcebergStorageBackend, S3IcebergStorage, SendIcebergStorage,
@@ -135,62 +139,129 @@ pub struct CatalogBrowse {
     pub tables: Vec<TableRef>,
 }
 
-/// Build a REST catalog client from a connection, or a clear typed error for
-/// Direct mode (which has no catalog to browse/list).
-pub(crate) fn rest_catalog_client(
+/// Build a catalog client from a connection — REST, AWS Glue, or AWS S3 Tables —
+/// or a clear typed error for Direct mode (which has no catalog to browse/list).
+///
+/// The one constructor behind every onboarding operation (browse, preview,
+/// sample, storage verification, provisional query), so each of them supports
+/// every catalog mode. Returns the client, a display label (the REST catalog URI,
+/// the Glue catalog id, or the S3 Tables bucket ARN), and the warehouse (REST
+/// only). Async because the AWS SDK clients load the ambient AWS config.
+///
+/// REST auth must already be resolver-free (see [`crate::Fluree::hydrate_conn`]).
+pub(crate) async fn catalog_client(
     conn: &IcebergConnectionConfig,
     op: &str,
-) -> Result<(RestCatalogClient, String, Option<String>)> {
-    let rest = match &conn.catalog_mode {
-        CatalogMode::Rest(rest) => rest,
-        CatalogMode::Direct { .. } => {
-            return Err(crate::ApiError::config(format!(
-                "Direct catalog mode cannot be used for {op}: there is no REST catalog to query. \
-                 Provide a REST connection (catalog_uri + auth)."
-            )));
+) -> Result<(Arc<dyn SendCatalogClient>, String, Option<String>)> {
+    match &conn.catalog_mode {
+        CatalogMode::Rest(rest) => {
+            let auth = rest.auth.create_provider_arc().map_err(|e| {
+                crate::ApiError::config(format!("Failed to create auth provider: {e}"))
+            })?;
+            let catalog_config = RestCatalogConfig {
+                uri: rest.catalog_uri.clone(),
+                warehouse: rest.warehouse.clone(),
+                ..Default::default()
+            };
+            let catalog = RestCatalogClient::new(catalog_config, auth).map_err(|e| {
+                crate::ApiError::config(format!("Failed to create catalog client: {e}"))
+            })?;
+            Ok((
+                Arc::new(catalog),
+                rest.catalog_uri.clone(),
+                rest.warehouse.clone(),
+            ))
         }
-    };
-
-    let auth = rest
-        .auth
-        .create_provider_arc()
-        .map_err(|e| crate::ApiError::config(format!("Failed to create auth provider: {e}")))?;
-
-    let catalog_config = RestCatalogConfig {
-        uri: rest.catalog_uri.clone(),
-        warehouse: rest.warehouse.clone(),
-        ..Default::default()
-    };
-
-    let catalog = RestCatalogClient::new(catalog_config, auth)
-        .map_err(|e| crate::ApiError::config(format!("Failed to create catalog client: {e}")))?;
-
-    Ok((catalog, rest.catalog_uri.clone(), rest.warehouse.clone()))
+        CatalogMode::Glue { catalog_id, .. } => {
+            let region = conn.aws_catalog_region()?;
+            let catalog = GlueSdkCatalogClient::new(region.as_deref(), catalog_id.clone())
+                .await
+                .map_err(|e| {
+                    crate::ApiError::config(format!("Failed to create Glue catalog client: {e}"))
+                })?;
+            Ok((
+                Arc::new(catalog),
+                conn.catalog_uri_or_location().to_string(),
+                None,
+            ))
+        }
+        CatalogMode::S3Tables {
+            table_bucket_arn, ..
+        } => {
+            let region = conn.aws_catalog_region()?;
+            let catalog =
+                S3TablesSdkCatalogClient::new(region.as_deref(), table_bucket_arn.clone())
+                    .await
+                    .map_err(|e| {
+                        crate::ApiError::config(format!(
+                            "Failed to create S3 Tables catalog client: {e}"
+                        ))
+                    })?;
+            Ok((Arc::new(catalog), table_bucket_arn.clone(), None))
+        }
+        CatalogMode::Direct { .. } => Err(crate::ApiError::config(format!(
+            "Direct catalog mode cannot be used for {op}: there is no catalog to query. \
+             Provide a REST connection (catalog_uri + auth) or an AWS Glue / S3 Tables catalog."
+        ))),
+    }
 }
 
-/// Browse an Iceberg REST catalog: list namespaces and, at `depth = Tables`,
-/// the tables in each namespace.
+/// The table metadata a catalog `loadTable` resolved: the inline copy a REST
+/// catalog returns (Snowflake Horizon / Polaris include it), else the metadata
+/// JSON at `metadata_location`, read through [`build_preview_storage`] — the same
+/// credential decision every other preview read makes. Glue and S3 Tables return
+/// only a location, as does a REST catalog that omits the inline object.
+pub(crate) async fn load_response_metadata(
+    conn: &IcebergConnectionConfig,
+    load: &mut LoadTableResponse,
+) -> Result<TableMetadata> {
+    if let Some(metadata) = load.metadata.take() {
+        return Ok(metadata);
+    }
+    let storage = build_preview_storage(conn, load.credentials.as_ref()).await?;
+    read_load_response_metadata(&storage, load).await
+}
+
+/// [`load_response_metadata`] for a caller that has already built the table's
+/// storage: the inline copy, else one read of `metadata_location` through it.
+pub(crate) async fn read_load_response_metadata(
+    storage: &IcebergStorageBackend,
+    load: &mut LoadTableResponse,
+) -> Result<TableMetadata> {
+    if let Some(metadata) = load.metadata.take() {
+        return Ok(metadata);
+    }
+    let bytes = storage
+        .read(&load.metadata_location)
+        .await
+        .map_err(|e| storage_api_error("Failed to read table metadata", e))?;
+    TableMetadata::from_json(&bytes)
+        .map_err(|e| crate::ApiError::config(format!("Failed to parse table metadata: {e}")))
+}
+
+/// Browse an Iceberg catalog (REST, AWS Glue, or S3 Tables): list namespaces
+/// and, at `depth = Tables`, the tables in each namespace.
 ///
-/// **Metadata-only** and stateless — it needs no `Fluree` instance and touches
-/// no S3. Direct catalog mode returns a clear [`crate::ApiError::Config`] (there
-/// is nothing to browse).
+/// **Metadata-only** and stateless — it needs no `Fluree` instance and reads no
+/// S3 objects (Glue / S3 Tables list via their native SDK APIs). Direct catalog
+/// mode returns a clear [`crate::ApiError::Config`] (there is nothing to browse).
 pub async fn browse_iceberg_catalog(
     conn: IcebergConnectionConfig,
     depth: BrowseDepth,
 ) -> Result<CatalogBrowse> {
-    let (catalog, catalog_uri, warehouse) = rest_catalog_client(&conn, "catalog browse")?;
+    let (catalog, catalog_uri, warehouse) = catalog_client(&conn, "catalog browse").await?;
 
-    let namespaces = SendCatalogClient::list_namespaces(&catalog)
+    let namespaces = SendCatalogClient::list_namespaces(&*catalog)
         .await
-        .map_err(|e| crate::ApiError::config(format!("Failed to list namespaces: {e}")))?;
+        .map_err(|e| storage_api_error("Failed to list namespaces", e))?;
 
     let mut tables = Vec::new();
     if depth == BrowseDepth::Tables {
         for ns in &namespaces {
-            let ns_tables = SendCatalogClient::list_tables(&catalog, ns)
+            let ns_tables = SendCatalogClient::list_tables(&*catalog, ns)
                 .await
                 .map_err(|e| {
-                    crate::ApiError::config(format!("Failed to list tables in namespace {ns}: {e}"))
+                    storage_api_error(&format!("Failed to list tables in namespace {ns}"), e)
                 })?;
             for qualified in ns_tables {
                 tables.push(split_qualified_table(ns, &qualified));
@@ -224,13 +295,14 @@ impl crate::Fluree {
     /// Resolve any `ConfigValue::SecretRef` auth references in a REST connection
     /// via this instance's injected secret resolver, returning a connection whose
     /// auth is resolver-free (literal / env-var / none) and therefore safe to
-    /// hand to the SYNCHRONOUS [`rest_catalog_client`].
+    /// hand to [`catalog_client`], which builds its auth provider synchronously.
     ///
-    /// Pass-through for Direct mode (no catalog auth) and for connections with no
-    /// secret reference. Fails closed with an actionable error when a `SecretRef`
+    /// Pass-through for Direct, Glue and S3 Tables modes (no catalog auth — the
+    /// AWS SDK resolves its own credentials) and for connections with no secret
+    /// reference. Fails closed with an actionable error when a `SecretRef`
     /// is present but no resolver was injected (the OSS/CLI path). This is the
     /// single hydration hop the impl-`Fluree` catalog wrappers call at their top,
-    /// keeping `rest_catalog_client` and the free functions unchanged for
+    /// keeping `catalog_client` and the free functions unchanged for
     /// external literal/env-var users.
     pub(crate) async fn hydrate_conn(
         &self,
@@ -668,31 +740,28 @@ fn preview_counts_are_upper_bounds(
 /// Preview an Iceberg table's schema (Tier-A) and, at `tier = Stats`, its
 /// per-column statistics (Tier-B).
 ///
-/// **Metadata-only**: Tier-A reads the inline REST `loadTable` metadata (no S3);
-/// Tier-B additionally reads the snapshot's manifest-list + manifest Avro files
-/// (never a Parquet/data file). Direct catalog mode and a catalog that omits the
-/// inline metadata both return a clear typed error.
+/// **Metadata-only**: Tier-A reads the table metadata JSON — inline from the
+/// REST `loadTable` response, or (for the AWS SDK catalogs, which return only a
+/// `metadata_location`) fetched + parsed from S3 — never a Parquet/data file.
+/// Tier-B additionally reads the snapshot's manifest-list + manifest Avro files.
+/// Direct catalog mode returns a clear typed error (there is no catalog to load).
 pub async fn preview_iceberg_table(
     conn: IcebergConnectionConfig,
     table: TableIdentifier,
     tier: StatsTier,
 ) -> Result<TablePreview> {
-    let (catalog, _uri, _wh) = rest_catalog_client(&conn, "table preview")?;
+    let (catalog, _uri, _wh) = catalog_client(&conn, "table preview").await?;
     let table_id = table.to_catalog();
 
-    let load = SendCatalogClient::load_table(&catalog, &table_id, conn.io.vended_credentials)
+    let mut load = SendCatalogClient::load_table(&*catalog, &table_id, conn.io.vended_credentials)
         .await
         .map_err(|e| {
-            crate::ApiError::config(format!("Failed to load table {}: {e}", table.qualified()))
+            storage_api_error(&format!("Failed to load table {}", table.qualified()), e)
         })?;
 
-    let metadata = load.metadata.as_ref().ok_or_else(|| {
-        crate::ApiError::config(format!(
-            "Catalog did not return inline table metadata for {} — metadata preview requires a \
-             REST catalog whose loadTable response includes the `metadata` object.",
-            table.qualified()
-        ))
-    })?;
+    // Inline from a REST `loadTable`, else read from `metadata_location` (Glue /
+    // S3 Tables return only the location).
+    let metadata = &load_response_metadata(&conn, &mut load).await?;
 
     // W2: name BOTH the catalog-qualified table and its storage location, so an
     // operator grepping logs finds the same identifier the scan planners emit
@@ -833,11 +902,13 @@ pub async fn preview_iceberg_table(
 /// preserving the typed access-denied case.
 ///
 /// [`StorageAccessDenied`](fluree_db_iceberg::IcebergError::StorageAccessDenied)
-/// becomes `QueryError::StorageAccessDenied` (→ HTTP 403); every other variant
-/// becomes `QueryError::Internal("{context}: {err}")`, byte-for-byte the
-/// pre-existing wrapping. Use ONLY at storage-read sites (metadata / manifest /
-/// Parquet / resolve-from-table-location) — client-construction failures stay
-/// `Internal`.
+/// becomes `QueryError::StorageAccessDenied` (→ HTTP 403), and a catalog's
+/// refusal ([`CatalogAccessDenied`](fluree_db_iceberg::IcebergError::CatalogAccessDenied),
+/// AWS Glue / S3 Tables) becomes `QueryError::CatalogAccessDenied` (→ HTTP 403);
+/// every other variant becomes `QueryError::Internal("{context}: {err}")`,
+/// byte-for-byte the pre-existing wrapping. Use ONLY at storage-read and
+/// catalog-load sites (metadata / manifest / Parquet / resolve-from-table-location
+/// / `loadTable`) — client-construction failures stay `Internal`.
 pub(crate) fn storage_query_error(
     context: &str,
     err: fluree_db_iceberg::IcebergError,
@@ -852,7 +923,7 @@ pub(crate) fn storage_query_error(
             bucket,
             key,
             region,
-            message,
+            message: query_safe_denial(context, message),
         },
         // §2's fail-closed error, raised inside a deferred `LazyS3Storage` build and
         // ferried out through the builder's `IcebergError` channel. Lift it back so
@@ -861,14 +932,61 @@ pub(crate) fn storage_query_error(
         fluree_db_iceberg::IcebergError::CatalogCredentialsNotVended { catalog_uri } => {
             fluree_db_query::QueryError::CatalogCredentialsNotVended { catalog_uri }
         }
+        fluree_db_iceberg::IcebergError::CatalogAccessDenied { table, message } => {
+            fluree_db_query::QueryError::CatalogAccessDenied {
+                table,
+                message: query_safe_denial(context, message),
+            }
+        }
         other => fluree_db_query::QueryError::Internal(format!("{context}: {other}")),
     }
 }
 
+/// The reason a storage or catalog denial gives a QUERY client. AWS phrases a
+/// denial as `User: arn:aws:sts::<account>:assumed-role/<role>/… is not authorized
+/// to perform: s3:GetObject on resource: … because …`, which would hand any
+/// querying client the server's role and account. The ARNs are redacted and the
+/// reason kept; the full text goes to the server log. The onboarding and verify
+/// paths (`storage_api_error`, admin-facing, and what hosts classify runbooks by)
+/// keep the full text.
+pub(crate) fn query_safe_denial(context: &str, message: String) -> String {
+    match redact_aws_arns(&message) {
+        std::borrow::Cow::Borrowed(_) => message,
+        std::borrow::Cow::Owned(redacted) => {
+            tracing::warn!(context, denial = %message, "access denied (AWS identities redacted from the query error)");
+            redacted
+        }
+    }
+}
+
+/// `text` with every AWS ARN (`arn:aws…`, any partition) replaced by
+/// `arn:<redacted>`; borrowed when there is none.
+pub(crate) fn redact_aws_arns(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("arn:aws") {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("arn:aws") {
+        out.push_str(&rest[..at]);
+        out.push_str("arn:<redacted>");
+        let arn = &rest[at..];
+        let end = arn
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ')' | ']' | '}' | ';')
+            })
+            .unwrap_or(arn.len());
+        rest = &arn[end..];
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
+}
+
 /// Preview/browse-path analogue of [`storage_query_error`]: lift a
-/// storage-read [`IcebergError`](fluree_db_iceberg::IcebergError) into an
-/// [`ApiError`](crate::ApiError). The access-denied case becomes
-/// `ApiError::StorageAccessDenied` (→ HTTP 403); everything else becomes
+/// storage-read or catalog [`IcebergError`](fluree_db_iceberg::IcebergError) into
+/// an [`ApiError`](crate::ApiError). Storage access-denied becomes
+/// `ApiError::StorageAccessDenied` and a catalog's refusal the query path's
+/// `CatalogAccessDenied` (both → HTTP 403); everything else becomes
 /// `ApiError::config("{context}: {err}")`, matching the pre-existing preview
 /// wrapping.
 pub(crate) fn storage_api_error(
@@ -887,6 +1005,14 @@ pub(crate) fn storage_api_error(
             region,
             message,
         },
+        // A catalog's refusal (REST 401/403, AWS Glue / S3 Tables access denied)
+        // is the same 403 the query path reports.
+        fluree_db_iceberg::IcebergError::CatalogAccessDenied { table, message } => {
+            crate::ApiError::Query(fluree_db_query::QueryError::CatalogAccessDenied {
+                table,
+                message,
+            })
+        }
         other => crate::ApiError::config(format!("{context}: {other}")),
     }
 }
@@ -954,7 +1080,9 @@ pub(crate) async fn build_preview_storage(
             return Ok(IcebergStorageBackend::File(FileIcebergStorage::new()));
         }
     }
-    let io = &conn.io;
+    // Glue / S3 Tables read S3 in the catalog's region unless `s3_region` says
+    // otherwise (see `IoConfig::with_catalog_region`).
+    let io = &conn.storage_io();
     let is_rest = matches!(conn.catalog_mode, CatalogMode::Rest(_));
     let storage =
         match decide_credential_source(io.vended_credentials, credentials.is_some(), is_rest) {
@@ -981,7 +1109,9 @@ pub(crate) async fn build_preview_storage(
                 // so this destructure always matches.
                 let catalog_uri = match &conn.catalog_mode {
                     CatalogMode::Rest(rest) => rest.catalog_uri.clone(),
-                    CatalogMode::Direct { .. } => {
+                    CatalogMode::Direct { .. }
+                    | CatalogMode::Glue { .. }
+                    | CatalogMode::S3Tables { .. } => {
                         unreachable!("FailClosed is only produced for REST catalogs")
                     }
                 };
@@ -1230,18 +1360,19 @@ fn parse_qualified_table(table: &str) -> TableIdentifier {
 /// query will not fail on storage permissions, on the same credential path
 /// queries use.
 ///
-/// REST catalogs only: Direct mode returns the same clear typed error as
-/// [`preview_iceberg_table`] (there is no catalog to authorize the read).
+/// Catalog modes only (REST, Glue, S3 Tables): Direct mode returns the same clear
+/// typed error as [`preview_iceberg_table`] (there is no catalog to authorize the
+/// read).
 pub async fn verify_storage_access(
     conn: IcebergConnectionConfig,
     table: &str,
 ) -> Result<StorageAccessReport> {
-    let (catalog, _uri, _wh) = rest_catalog_client(&conn, "storage access verification")?;
+    let (catalog, _uri, _wh) = catalog_client(&conn, "storage access verification").await?;
     let table_id = parse_qualified_table(table);
     let catalog_table = table_id.to_catalog();
 
-    let load =
-        match SendCatalogClient::load_table(&catalog, &catalog_table, conn.io.vended_credentials)
+    let mut load =
+        match SendCatalogClient::load_table(&*catalog, &catalog_table, conn.io.vended_credentials)
             .await
         {
             Ok(load) => load,
@@ -1269,13 +1400,13 @@ pub async fn verify_storage_access(
         "ambient"
     };
 
-    let metadata = load.metadata.as_ref().ok_or_else(|| {
-        crate::ApiError::config(format!(
-            "Catalog did not return inline table metadata for {} — storage verification \
-             resolves the current snapshot from the loadTable `metadata` object.",
-            table_id.qualified()
-        ))
-    })?;
+    // The current snapshot comes from the inline `loadTable` metadata, or (Glue /
+    // S3 Tables) from the metadata file — read through the storage under test, so
+    // a denied read is reported like any other.
+    let metadata = &match read_load_response_metadata(&storage, &mut load).await {
+        Ok(metadata) => metadata,
+        Err(e) => return storage_failure(e, load.metadata_location),
+    };
 
     // Mirror the Tier-B preview: resolve the CURRENT snapshot from the inline
     // metadata. A snapshotless table has no manifests or data files to read, so
@@ -1335,6 +1466,100 @@ impl crate::Fluree {
 
 #[cfg(test)]
 mod tests {
+    /// A catalog's refusal (REST 401/403, AWS Glue / S3 Tables access denied) is
+    /// the same typed 403 on the query path and the onboarding path, never an
+    /// internal or config error.
+    /// A denial on the QUERY path does not hand the client the server's AWS
+    /// identity; the reason AWS gives stays. Onboarding keeps the full text.
+    #[test]
+    fn query_denials_redact_aws_identities_but_keep_the_reason() {
+        let aws = "User: arn:aws:sts::123456789012:assumed-role/FlureeServer/i-0abc is not \
+                   authorized to perform: glue:GetTable on resource: \
+                   arn:aws:glue:us-east-1:123456789012:table/sales/orders because no \
+                   identity-based policy allows the glue:GetTable action";
+        let redacted = super::redact_aws_arns(aws);
+        assert!(!redacted.contains("123456789012"), "{redacted}");
+        assert!(!redacted.contains("FlureeServer"), "{redacted}");
+        assert!(
+            redacted.contains("arn:<redacted> is not authorized"),
+            "{redacted}"
+        );
+        assert!(
+            redacted.contains("because no identity-based policy allows"),
+            "{redacted}"
+        );
+        // Other partitions, and quoted ARNs, are redacted too; text without an ARN
+        // is returned as is (no allocation).
+        assert_eq!(
+            super::redact_aws_arns("on \"arn:aws-cn:s3:::bucket/key\", denied"),
+            "on \"arn:<redacted>\", denied"
+        );
+        assert!(matches!(
+            super::redact_aws_arns("Catalog request failed (403 Forbidden): not yours"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+
+        let storage = fluree_db_iceberg::IcebergError::StorageAccessDenied {
+            bucket: "lake".to_string(),
+            key: "t/data/0.parquet".to_string(),
+            region: None,
+            message: aws.to_string(),
+        };
+        match super::storage_query_error("Failed to read data file", storage) {
+            fluree_db_query::QueryError::StorageAccessDenied { message, .. } => {
+                assert!(!message.contains("123456789012"), "{message}");
+                assert!(
+                    message.contains("because no identity-based policy"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected StorageAccessDenied, got {other:?}"),
+        }
+        let catalog = || fluree_db_iceberg::IcebergError::CatalogAccessDenied {
+            table: "sales.orders".to_string(),
+            message: aws.to_string(),
+        };
+        match super::storage_query_error("Failed to load table from catalog", catalog()) {
+            fluree_db_query::QueryError::CatalogAccessDenied { message, .. } => {
+                assert!(!message.contains("123456789012"), "{message}");
+            }
+            other => panic!("expected CatalogAccessDenied, got {other:?}"),
+        }
+        // Onboarding / verify (admin-facing) keep the full text.
+        let api = super::storage_api_error("Failed to load table sales.orders", catalog());
+        assert!(api.to_string().contains("123456789012"), "{api}");
+    }
+
+    #[test]
+    fn a_catalog_denial_lifts_to_a_typed_403_on_both_paths() {
+        let denied = || fluree_db_iceberg::IcebergError::CatalogAccessDenied {
+            table: "sales.orders".to_string(),
+            message: "Catalog request failed (403 Forbidden): not yours".to_string(),
+        };
+        let query = super::storage_query_error("Failed to load table from catalog", denied());
+        match &query {
+            fluree_db_query::QueryError::CatalogAccessDenied { table, message } => {
+                assert_eq!(table, "sales.orders");
+                // Hosts classify verify failures by this wording.
+                assert!(message.contains("Catalog request failed (403"), "{message}");
+            }
+            other => panic!("expected CatalogAccessDenied, got {other:?}"),
+        }
+        assert_eq!(crate::ApiError::Query(query).status_code(), 403);
+        let api = super::storage_api_error("Failed to load table sales.orders", denied());
+        assert_eq!(api.status_code(), 403, "{api:?}");
+        // Anything else keeps its pre-existing wrapping.
+        let other = super::storage_api_error(
+            "Failed to load table sales.orders",
+            fluree_db_iceberg::IcebergError::Catalog("boom".into()),
+        );
+        assert_eq!(
+            other.to_string(),
+            crate::ApiError::config("Failed to load table sales.orders: Catalog error: boom")
+                .to_string()
+        );
+    }
+
     use super::*;
 
     // ── §2 credential-source decision (pure; the full matrix) ──

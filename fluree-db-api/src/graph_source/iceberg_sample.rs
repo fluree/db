@@ -38,7 +38,8 @@ use fluree_db_iceberg::{
 
 use crate::graph_source::config::IcebergConnectionConfig;
 use crate::graph_source::iceberg_catalog::{
-    build_preview_storage, rest_catalog_client, TableIdentifier,
+    build_preview_storage, catalog_client, load_response_metadata, storage_api_error,
+    TableIdentifier,
 };
 use crate::{ApiError, Result};
 
@@ -110,22 +111,18 @@ async fn sample_table_batches<F>(
 where
     F: FnOnce(&Schema) -> Result<Vec<i32>>,
 {
-    let (catalog, _uri, _wh) = rest_catalog_client(conn, "table sample")?;
+    let (catalog, _uri, _wh) = catalog_client(conn, "table sample").await?;
     let table_id = table.to_catalog();
 
-    let load = SendCatalogClient::load_table(&catalog, &table_id, conn.io.vended_credentials)
+    let mut load = SendCatalogClient::load_table(&*catalog, &table_id, conn.io.vended_credentials)
         .await
         .map_err(|e| {
-            ApiError::config(format!("Failed to load table {}: {e}", table.qualified()))
+            storage_api_error(&format!("Failed to load table {}", table.qualified()), e)
         })?;
 
-    let metadata = load.metadata.as_ref().ok_or_else(|| {
-        ApiError::config(format!(
-            "Catalog did not return inline table metadata for {} — sampling requires a REST \
-             catalog whose loadTable response includes the `metadata` object.",
-            table.qualified()
-        ))
-    })?;
+    // Inline from a REST `loadTable`, else read from `metadata_location` (Glue /
+    // S3 Tables return only the location).
+    let metadata = &load_response_metadata(conn, &mut load).await?;
 
     let schema = metadata
         .current_schema()

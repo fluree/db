@@ -3224,6 +3224,8 @@ pub enum IcebergAction {
     ///   fluree iceberg map my-gs --catalog-uri https://polaris.example.com --table openflights.airlines
     ///   fluree iceberg map my-gs --catalog-uri https://... --r2rml mappings/airlines.ttl
     ///   fluree iceberg map my-gs --mode direct --table-location s3://bucket/warehouse/ns/table
+    ///   fluree iceberg map my-gs --mode glue --region us-east-1 --r2rml mappings/sales.ttl
+    ///   fluree iceberg map my-gs --mode s3tables --table-bucket-arn arn:aws:s3tables:us-east-1:123456789012:bucket/demo --table sales.orders
     #[command(verbatim_doc_comment)]
     Map(Box<IcebergMapArgs>),
 
@@ -3758,7 +3760,7 @@ pub struct IcebergMapArgs {
     #[arg(long)]
     pub remote: Option<String>,
 
-    /// Catalog mode: "rest" (default) or "direct"
+    /// Catalog mode: "rest" (default), "direct", "glue", or "s3tables"
     #[arg(long, default_value = "rest")]
     pub mode: String,
 
@@ -3767,8 +3769,9 @@ pub struct IcebergMapArgs {
     pub catalog_uri: Option<String>,
 
     /// Table identifier in namespace.table format (e.g., "openflights.airlines").
-    /// Required for rest mode without --r2rml. When using --r2rml, tables are
-    /// defined in the mapping file.
+    /// Required for rest, glue and s3tables modes without --r2rml. When using
+    /// --r2rml, tables are defined in the mapping file (for glue, each
+    /// rr:tableName is a Glue `<database>.<table>`).
     #[arg(long)]
     pub table: Option<String>,
 
@@ -3787,6 +3790,23 @@ pub struct IcebergMapArgs {
     /// needed — direct mode reads with ambient IAM credentials.
     #[arg(long)]
     pub table_location: Option<String>,
+
+    /// AWS region of the Glue / S3 Tables catalog (glue / s3tables mode). Falls
+    /// back to --s3-region, then the AWS SDK's region chain; for s3tables, the
+    /// table bucket ARN's region. S3 data reads use --s3-region when given, else
+    /// this region.
+    #[arg(long)]
+    pub region: Option<String>,
+
+    /// AWS Glue catalog id for cross-account access (glue mode; defaults to the
+    /// caller's account)
+    #[arg(long)]
+    pub catalog_id: Option<String>,
+
+    /// AWS S3 Tables table-bucket ARN (required for s3tables mode),
+    /// e.g. "arn:aws:s3tables:us-east-1:123456789012:bucket/my-bucket"
+    #[arg(long)]
+    pub table_bucket_arn: Option<String>,
 
     /// R2RML mapping file (Turtle format). Defines how Iceberg table rows
     /// are mapped to RDF triples. When provided, table references come from

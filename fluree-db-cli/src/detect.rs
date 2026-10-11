@@ -115,14 +115,13 @@ pub fn trig_refused(command: &str) -> CliError {
     ))
 }
 
-/// Whether a body that sniffed or was named as Turtle is TriG: it has graph
-/// blocks or txn-meta. This parses rather than looking for braces, since a
-/// `{` inside a Turtle string literal is not a graph block. A body that is
-/// not well-formed TriG either is left to the Turtle parser to report.
+/// Whether a body that sniffed or was named as Turtle is TriG: it has a
+/// graph block (`<#txn-meta>` included). Read from tokens, so a `{` inside a
+/// Turtle string literal is not a graph block and a block's contents are
+/// not parsed at all. A body the locator cannot read is left to the parser
+/// that stages it to report.
 pub fn is_trig_body(content: &str) -> bool {
-    fluree_db_transact::might_contain_graph_block(content)
-        && fluree_db_transact::parse_trig_phase1(content)
-            .is_ok_and(|p| !p.named_graphs.is_empty() || p.raw_meta.is_some())
+    fluree_db_transact::has_graph_blocks(content).unwrap_or(false)
 }
 
 /// [`trig_refused`] for a TriG body that reached a one-graph command as
@@ -320,6 +319,10 @@ mod tests {
             "<http://example.org/g> { <http://example.org/s> <http://example.org/p> 1 . }",
             "@prefix fluree: <https://ns.flur.ee/db#> .\n\
              GRAPH <#txn-meta> { fluree:commit:this <http://example.org/machine> \"m\" . }",
+            // Block contents the TriG reader used to refuse (`[ ]`, a
+            // collection) made the body read as "not TriG".
+            "GRAPH <http://example.org/g> { <http://example.org/s> <http://example.org/p> \
+             [ <http://example.org/q> ( 1 2 ) ] . }",
         ] {
             assert_eq!(
                 super::detect_data_format(None, trig, None).unwrap(),

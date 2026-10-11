@@ -1023,26 +1023,13 @@ pub async fn run(
                             return Ok(());
                         }
 
-                        if let Some(output) = output::format_sparql_table_from_result(
+                        let output = output::format_sparql_table_from_result(
                             &result,
                             &view.snapshot,
                             Some(BENCH_ROWS),
-                        )? {
-                            println!("{}", output.text);
-                            print_footer(output.total_rows, Some(BENCH_ROWS), elapsed);
-                        } else {
-                            // Rare fallback: GROUP BY produces grouped bindings requiring
-                            // disaggregation, so fall back to the existing JSON-based formatter.
-                            let formatted_json = cli_sparql_json(&result, &view.snapshot)?;
-                            let output = output::format_result(
-                                &formatted_json,
-                                OutputFormatKind::Table,
-                                query_format,
-                                Some(BENCH_ROWS),
-                            )?;
-                            println!("{}", output.text);
-                            print_footer(output.total_rows, Some(BENCH_ROWS), elapsed);
-                        }
+                        )?;
+                        println!("{}", output.text);
+                        print_footer(output.total_rows, Some(BENCH_ROWS), elapsed);
                     }
                     detect::QueryFormat::JsonLd => {
                         // JSON-LD can be nested; keep bench output in the lightweight TSV form.
@@ -1105,31 +1092,30 @@ pub async fn run(
                     && display_format == OutputFormatKind::Table
                 {
                     let render_timer = Instant::now();
-                    if let Some(output) = output::format_sparql_table_from_result(
+                    let output = output::format_sparql_table_from_result(
                         &result,
                         &view.snapshot,
                         effective_limit,
-                    )? {
-                        let render_elapsed = render_timer.elapsed();
-                        println!("{}", output.text);
-                        if let Some(n) = effective_limit {
-                            eprintln!(
-                                "(first {} of {} rows, query: {}, render: {})",
-                                format_count(n),
-                                format_count(output.total_rows),
-                                format_duration(elapsed),
-                                format_duration(render_elapsed),
-                            );
-                        } else {
-                            eprintln!(
-                                "({} rows, query: {}, render: {})",
-                                format_count(output.total_rows),
-                                format_duration(elapsed),
-                                format_duration(render_elapsed),
-                            );
-                        }
-                        return Ok(());
+                    )?;
+                    let render_elapsed = render_timer.elapsed();
+                    println!("{}", output.text);
+                    if let Some(n) = effective_limit {
+                        eprintln!(
+                            "(first {} of {} rows, query: {}, render: {})",
+                            format_count(n),
+                            format_count(output.total_rows),
+                            format_duration(elapsed),
+                            format_duration(render_elapsed),
+                        );
+                    } else {
+                        eprintln!(
+                            "({} rows, query: {}, render: {})",
+                            format_count(output.total_rows),
+                            format_duration(elapsed),
+                            format_duration(render_elapsed),
+                        );
                     }
+                    return Ok(());
                 }
 
                 // Full formatting path

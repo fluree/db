@@ -65,7 +65,9 @@ pub fn detect_sql_block_aggregate(query: &Query) -> Option<SqlAggregatePlan> {
     }
     let grouping = query.grouping.as_ref()?;
     let group_by: Vec<VarId> = grouping.group_by_vars().collect();
-    if grouping.aggregation().is_some_and(|a| !a.binds.is_empty()) {
+    // Per-group binds run after grouping, with or without an aggregation
+    // stage (a dedup-only GROUP BY can carry them); none are pushed down.
+    if grouping.binds().next().is_some() {
         return None;
     }
     let aggregates: Vec<(VarId, AggregateFn)> = grouping

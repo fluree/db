@@ -142,6 +142,63 @@ def test_registration_mistakes_are_refused(conn):
         conn.map_iceberg("x", PEOPLE_MAPPING, table_location="file:///tmp/t", auth="token")
 
 
+ORDERS_MAPPING = f"""
+@prefix rr: <http://www.w3.org/ns/r2rml#> . @prefix ex: <{EX}> .
+<{EX}mapping#Orders> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "sales.orders" ] ;
+  rr:subjectMap [ rr:template "{EX}order/{{order_id}}" ; rr:class ex:Order ] .
+"""
+
+
+def test_glue_and_s3_tables_sources_register(conn):
+    # Registering reads no catalog (only a REST catalog is connection-tested),
+    # so these register offline; the mapping's rr:tableName names each table.
+    # Reading them end to end is covered by fluree-db-api's it_iceberg_glue_moto.
+    glue = conn.map_iceberg(
+        "glue-orders", ORDERS_MAPPING, glue=fluree.Glue(region="us-east-1", catalog_id="123456789012")
+    )
+    assert (glue.id, glue.kind) == ("glue-orders:main", "iceberg")
+    arn = "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics"
+    tables = conn.map_iceberg("s3t-orders", ORDERS_MAPPING, s3_tables=fluree.S3Tables(arn))
+    assert (tables.id, tables.kind) == ("s3t-orders:main", "iceberg")
+
+
+def test_glue_and_s3_tables_mistakes_are_refused(conn):
+    with pytest.raises(InvalidRequestError, match="table_location"):
+        conn.map_iceberg("x", ORDERS_MAPPING, glue=fluree.Glue(), catalog_uri="http://c")
+    with pytest.raises(TypeError):
+        conn.map_iceberg("x", ORDERS_MAPPING, glue="us-east-1")
+    with pytest.raises(fluree.FlureeError, match="ARN"):
+        conn.map_iceberg("x", ORDERS_MAPPING, s3_tables=fluree.S3Tables("not-an-arn"))
+    with pytest.raises(fluree.FlureeError, match="not an AWS region"):
+        conn.map_iceberg("x", ORDERS_MAPPING, glue=fluree.Glue(region="evil.com"))
+    # REST-only settings would be ignored by Glue / S3 Tables: refused instead.
+    with pytest.raises(InvalidRequestError, match="auth applies to rest mode only"):
+        conn.map_iceberg("x", ORDERS_MAPPING, glue=fluree.Glue(), auth=Bearer("t"))
+    with pytest.raises(InvalidRequestError, match="vended_credentials applies to rest mode only"):
+        conn.map_iceberg("x", ORDERS_MAPPING, glue=fluree.Glue(), vended_credentials=True)
+    with pytest.raises(InvalidRequestError, match="warehouse applies to rest mode only"):
+        conn.map_iceberg("x", ORDERS_MAPPING, glue=fluree.Glue(), warehouse="w")
+    with pytest.raises(InvalidRequestError, match="auth applies to rest mode only"):
+        conn.map_iceberg(
+            "x",
+            ORDERS_MAPPING,
+            s3_tables=fluree.S3Tables("arn:aws:s3tables:us-east-1:123456789012:bucket/b"),
+            auth=Bearer("t"),
+        )
+    # Turning vending off agrees with every mode.
+    conn.map_iceberg("glue-no-vend", ORDERS_MAPPING, glue=fluree.Glue(), vended_credentials=False)
+
+
+def test_a_rest_catalog_source_can_take_its_tables_from_the_mapping(conn):
+    # No `table`: the mapping's rr:tableName names it, as on the CLI and server.
+    # The catalog is unreachable (a refused loopback address), so registration
+    # warns rather than fails.
+    with pytest.warns(UserWarning, match="could not reach the catalog"):
+        rest = conn.map_iceberg("rest-orders", ORDERS_MAPPING, catalog_uri="http://127.0.0.1:9/catalog")
+    assert rest.kind == "iceberg"
+
+
 @local_tables
 def test_a_mapping_can_be_a_file(conn, tmp_path):
     mapping = tmp_path / "people.ttl"

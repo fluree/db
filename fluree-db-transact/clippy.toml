@@ -1,0 +1,7 @@
+# RDF text is staged from one parse (`crate::parse::rdf_text`). Converting it
+# to JSON-LD first loses collection order, refuses IRIs whose scheme reads as
+# an undefined prefix (`tag:`, `kb:`), and reads literals differently from
+# insert, so no transaction lane may do it quietly.
+disallowed-methods = [
+    { path = "fluree_graph_turtle::parse_to_json", reason = "lossy JSON-LD round trip: stage RDF text with crate::parse::rdf_text" },
+]

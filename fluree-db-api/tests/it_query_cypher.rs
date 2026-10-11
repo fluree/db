@@ -1339,20 +1339,62 @@ async fn cypher_collect_through_with() {
         .collect();
     assert_eq!(rows, vec![json!("Bob"), json!("Carol")], "{unwound}");
 
-    // ORDER BY directly on a collect() list in the same WITH is still rejected
-    // (sorting a list value is unsound in v1).
-    assert!(
-        fluree
-            .query_cypher(
-                &db,
-                r#"MATCH (p:Person)-[:KNOWS]->(f:Person)
-                   WITH p, collect(f.name) AS friends ORDER BY friends
-                   RETURN p.name, friends"#,
-            )
+    // ORDER BY on a collect() list in the same WITH, or on a list built from
+    // one, is still rejected (sorting a list value is unsound in v1).
+    for order_by in ["friends", "tail(friends)", "friends + ['x']"] {
+        let query = format!(
+            "MATCH (p:Person)-[:KNOWS]->(f:Person) \
+             WITH p, collect(f.name) AS friends ORDER BY {order_by} RETURN p.name, friends"
+        );
+        assert!(
+            fluree.query_cypher(&db, &query).await.is_err(),
+            "ORDER BY on a collect() list in WITH is rejected: {query}"
+        );
+    }
+
+    // An ORDER BY key that reads the list and yields a scalar sorts after the
+    // aggregation, in a WITH and in a RETURN.
+    for (query, expected) in [
+        (
+            "MATCH (p:Person)-[:KNOWS]->(f:Person) \
+             WITH p, collect(f.name) AS friends ORDER BY size(friends) \
+             RETURN p.name AS name, size(friends) AS n",
+            json!([["Bob", 1], ["Alice", 2]]),
+        ),
+        (
+            "MATCH (p:Person)-[:KNOWS]->(f:Person) \
+             RETURN p.name AS name, collect(f.name) AS friends ORDER BY size(friends) DESC",
+            json!(["Alice", "Bob"]),
+        ),
+        (
+            "MATCH (p:Person)-[:KNOWS]->(f:Person) \
+             WITH p, collect(f.name) AS friends ORDER BY any(x IN friends WHERE x = 'Bob') \
+             RETURN p.name AS name",
+            json!([["Bob"], ["Alice"]]),
+        ),
+    ] {
+        let cj = fluree
+            .query_cypher(&db, query)
             .await
-            .is_err(),
-        "ORDER BY on a collect() list in WITH is rejected"
-    );
+            .unwrap_or_else(|e| panic!("{e}\n{query}"))
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .expect("cypher json");
+        let rows: Vec<JsonValue> = cj["results"][0]["data"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|r| r["row"].clone())
+            .collect();
+        let rows = match expected.as_array().and_then(|e| e.first()) {
+            // Names only: the friends list's order is unspecified.
+            Some(JsonValue::String(_)) => {
+                JsonValue::Array(rows.iter().map(|r| r[0].clone()).collect())
+            }
+            _ => JsonValue::Array(rows),
+        };
+        assert_eq!(rows, expected, "{query}");
+    }
 }
 
 #[tokio::test]
@@ -7061,6 +7103,61 @@ async fn cypher_unwind_runtime_list() {
         vec!["Alice", "Bob", "Carol", "Dave"],
         "one name per path node: {names}"
     );
+}
+
+#[tokio::test]
+async fn cypher_unwind_runtime_list_binds_the_alias_a_later_match_reads() {
+    // A runtime list (one that does not lower to VALUES) unwound into an alias
+    // a later MATCH reads: one row per element. Run after that MATCH, the
+    // UNWIND overwrote the node or value it bound, so every match came back
+    // once per element.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_ic1_chain(&fluree, "it/cypher:unwind-alias-later-match").await;
+    let items: Vec<JsonValue> = (1..=5)
+        .map(|i| json!({"@id": format!("item{i}"), "@type": "Item", "idx": i}))
+        .collect();
+    let l = fluree
+        .insert(l, &json!({"@context": ctx(), "@graph": items}))
+        .await
+        .expect("seed items")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let mut wrong = Vec::new();
+    for (query, expected) in [
+        (
+            "UNWIND range(1, 3) AS i MATCH (n:Item {idx: i}) RETURN n.idx",
+            json!([[1], [2], [3]]),
+        ),
+        (
+            r#"UNWIND [x IN ["Alice", "Carol"] | x] AS nm
+               MATCH (p:Person {name: nm}) RETURN p.name"#,
+            json!([["Alice"], ["Carol"]]),
+        ),
+        (
+            r#"MATCH (a:Person {name:"Alice"}),(c:Person {name:"Carol"})
+               MATCH p = shortestPath((a)-[:KNOWS*]->(c))
+               UNWIND nodes(p) AS pn
+               MATCH (pn:Person)
+               RETURN pn.name"#,
+            json!([["Alice"], ["Bob"], ["Carol"]]),
+        ),
+    ] {
+        let out = fluree
+            .query_cypher(&db, query)
+            .await
+            .expect(query)
+            .to_jsonld_async(db.as_graph_db_ref())
+            .await
+            .expect("jsonld");
+        let mut rows = out.as_array().expect("rows").clone();
+        rows.sort_by_key(ToString::to_string);
+        let rows = JsonValue::Array(rows);
+        if rows != expected {
+            wrong.push(format!("{query}\n  got {rows}\n  expected {expected}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 #[tokio::test]
