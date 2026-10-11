@@ -407,10 +407,13 @@ fn served(store: &span_capture::SpanStore, before: usize, site: &str) -> bool {
 }
 
 /// A query no fast path may answer runs the generic pipeline, whose only
-/// stamp is the fused chain it passed through (a sibling fast path, such as
-/// the count planner, would add its own).
+/// stamps are the fused chain it passed through and the scan's count-only
+/// drain under an ungrouped `COUNT(*)` (a sibling fast path, such as the
+/// count planner, would add its own).
 fn generic_only(sites: &[String]) -> bool {
-    sites.iter().all(|s| s == "fused_chain")
+    sites
+        .iter()
+        .all(|s| s == "fused_chain" || s == "scan-count-drain")
 }
 
 #[tokio::test]
