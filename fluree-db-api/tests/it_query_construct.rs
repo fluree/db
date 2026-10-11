@@ -1872,3 +1872,67 @@ async fn construct_and_describe_read_a_trailing_values() {
     }));
     assert_eq!(actual, expected);
 }
+
+/// A DESCRIBE target that a solution leaves unbound describes nothing; it was
+/// read as a free subject, so the result was every node in the graph. bbob's
+/// friend is jbob (type, handle, friend, full name, seven favorite numbers) and
+/// jbob's is fbueller (type, handle, full name); the others have none.
+#[tokio::test]
+async fn describe_skips_an_unbound_target() {
+    let (fluree, ledger) = seed_people().await;
+    let db = support::graphdb_from_ledger(&ledger);
+    const P: &str = "PREFIX person: <http://example.org/Person#> PREFIX ex: <http://example.org/> ";
+    let jdoe = "http://example.org/jdoe".to_string();
+    let jbob = "http://example.org/jbob".to_string();
+    let fbueller = "http://example.org/fbueller".to_string();
+    for (body, expected) in [
+        ("DESCRIBE ?s VALUES ?s { UNDEF }", vec![]),
+        (
+            "DESCRIBE ?s ?t VALUES (?s ?t) { (ex:jdoe UNDEF) }",
+            vec![(jdoe.clone(), 7)],
+        ),
+        (
+            "DESCRIBE ?f WHERE { ?s person:handle ?h OPTIONAL { ?s person:friend ?f } }",
+            vec![(fbueller.clone(), 3), (jbob.clone(), 11)],
+        ),
+    ] {
+        let query = format!("{P}{body}");
+        let out = db
+            .query(&fluree)
+            .sparql(&query)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{query}"));
+        let subjects: Vec<(String, usize)> = graph_subjects(&out)
+            .into_iter()
+            .map(|(id, n)| (id.replace("ex:", "http://example.org/"), n))
+            .collect();
+        assert_eq!(subjects, expected, "{query}\n{out:#}");
+    }
+}
+
+/// DESCRIBE refuses GROUP BY and HAVING whatever its targets; with only IRI
+/// targets they were ignored.
+#[tokio::test]
+async fn describe_refuses_grouping_for_every_target() {
+    let (fluree, ledger) = seed_people().await;
+    let db = support::graphdb_from_ledger(&ledger);
+    const P: &str = "PREFIX person: <http://example.org/Person#> PREFIX ex: <http://example.org/> ";
+    for body in [
+        "DESCRIBE ex:jdoe WHERE { ?s person:handle ?h } GROUP BY ?s",
+        "DESCRIBE ex:jdoe WHERE { ?s person:handle ?h } HAVING (COUNT(?h) > 0)",
+        "DESCRIBE ?s WHERE { ?s person:handle ?h } GROUP BY ?s",
+    ] {
+        let query = format!("{P}{body}");
+        let err = db
+            .query(&fluree)
+            .sparql(&query)
+            .execute_formatted()
+            .await
+            .expect_err(&query);
+        assert!(
+            err.to_string().contains("DESCRIBE with GROUP BY/HAVING"),
+            "{query}: {err}"
+        );
+    }
+}
