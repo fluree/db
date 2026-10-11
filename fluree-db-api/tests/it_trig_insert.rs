@@ -573,7 +573,7 @@ async fn parse_errors_name_the_real_problem() {
         .expect_err("malformed TriG")
         .to_string();
     assert!(
-        err.contains("expected '}' to close GRAPH block"),
+        err.contains("unclosed graph block"),
         "a malformed block must be reported as one, not as Turtle choking on GRAPH, got: {err}"
     );
 }
@@ -755,9 +755,10 @@ async fn quads(fluree: &MemoryFluree, db: &GraphDb) -> Vec<Vec<String>> {
 /// TriG phase 1 rebuilt a document's default graph with every directive
 /// first and expanded every graph block with the document's final prefix
 /// map, so a later `@prefix`/`@base` silently rewrote the IRIs before it.
-/// Upsert takes phase 1 whenever the text holds `{` or the bytes "graph",
-/// even inside a literal; insert takes it for TriG. The last case is a
-/// control with no redefinition.
+/// Upsert took phase 1 whenever the text held `{` or the bytes "graph",
+/// even inside a literal, and insert took it for TriG. Both now read RDF
+/// text once, in document order. The last case is a control with no
+/// redefinition.
 #[tokio::test]
 async fn a_redefined_prefix_or_base_applies_only_after_it() {
     let fluree = memory();

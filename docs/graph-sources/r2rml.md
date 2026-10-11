@@ -18,7 +18,7 @@ In Fluree, this enables querying Iceberg tables as if they were RDF graphs.
 
 Use `R2rmlCreateConfig` to register a graph source that combines:
 
-- an Iceberg table (REST catalog or Direct S3), and
+- an Iceberg table (REST catalog, Direct S3, AWS Glue Data Catalog, or AWS S3 Tables — see [Catalog Modes](iceberg.md#catalog-modes)), and
 - an R2RML mapping (Turtle) that materializes table rows into RDF triples.
 
 If you use **Direct S3** mode, Fluree resolves the current Iceberg metadata by reading `metadata/version-hint.text` under the configured `table_location`, then loading the metadata file referenced by the hint. The Iceberg table layout must already exist at that location.
@@ -399,31 +399,22 @@ An R2RML graph source is *virtual* — every query re-reads the underlying table
 
 ### Connection Errors
 
-```json
-{
-  "error": "IcebergConnectionError",
-  "message": "Cannot load table metadata"
-}
-```
+An R2RML graph source reads its tables through its Iceberg catalog, so its connection errors are those of the catalog mode it uses (`rest`, `direct`, `glue` or `s3tables`). [Iceberg → Connection Issues](iceberg.md#connection-issues) lists them with their causes, and [`POST /iceberg/catalog/verify`](../api/endpoints.md#post-api_base_urlicebergcatalogverify) checks a connection's credentials before you query. The ones seen most often:
 
-**Solutions:**
-- Check catalog configuration (REST vs Direct)
-- Verify AWS credentials and S3 access
-- Verify `version-hint.text` is present for Direct mode
+- `Catalog denied access to table '…': …` (HTTP `403`, `err:catalog/AccessDenied`): the catalog refused the token or AWS identity the source uses for that table.
+- `Catalog … authorized the table but vended no storage credentials; …` (HTTP `403`, `err:catalog/CredentialsNotVended`): a REST catalog answered without the storage credentials the source requires. Fix the catalog's credential vending, or turn vended credentials off to read with the server's own AWS identity.
+- `Storage access denied for s3://…` (HTTP `403`, `err:storage/AccessDenied`): the catalog answered, but the credentials cannot read the table's files.
+- `Failed to read version-hint.text at …` (`direct` mode): `table_location` is not the root of an Iceberg table, or the identity cannot read its `metadata/` directory.
 
 ### Mapping Errors
 
-```json
-{
-  "error": "R2RMLMappingError",
-  "message": "Invalid R2RML mapping: table 'customers' not found"
-}
-```
+A mapping that does not parse or compile is refused when the source is mapped, with HTTP `400` (`fluree iceberg map` reports the same message):
 
-**Solutions:**
-- Verify table name / location
-- Check referenced column names in the mapping
-- Validate R2RML syntax (Turtle)
+- `Failed to parse R2RML Turtle: …`: the Turtle itself is malformed.
+- `Failed to compile R2RML mapping: …`: the Turtle parsed, but is not a mapping Fluree can load. The reason names the problem, for example `Missing required property: rr:tableName in logical table`, `Invalid value for …: …`, or `Unsupported feature: …` (see [Limitations](#limitations)).
+- `R2RML mapping must be in Turtle format. JSON-LD is not yet supported.`
+
+Table and column names are not checked when the source is mapped. A table or column the mapping names but the catalog does not have shows up at query time, as described in [Iceberg → Schema Mismatch](iceberg.md#schema-mismatch), which also covers `POST /iceberg/r2rml/validate`, the read-only check of a mapping's tables, columns, join key types and subject keys against the live catalog.
 
 ### Slow Queries
 

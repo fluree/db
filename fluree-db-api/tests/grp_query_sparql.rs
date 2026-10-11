@@ -41,6 +41,8 @@ mod it_query_sparql_annotations;
 mod it_query_sparql_count_distinct_star;
 #[path = "it_query_sparql_group_concat_iri.rs"]
 mod it_query_sparql_group_concat_iri;
+#[path = "it_query_sparql_grouped_projection.rs"]
+mod it_query_sparql_grouped_projection;
 #[path = "it_query_sparql_parse_errors.rs"]
 mod it_query_sparql_parse_errors;
 #[path = "it_query_sparql_path_literal_object.rs"]

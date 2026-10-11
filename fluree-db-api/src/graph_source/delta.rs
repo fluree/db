@@ -647,7 +647,14 @@ fn delta_query_error(graph_source_id: &str, table_name: &str, error: DeltaError)
             table,
             message,
             denied: true,
-        } => QueryError::CatalogAccessDenied { table, message },
+        } => QueryError::CatalogAccessDenied {
+            table,
+            // As for Iceberg: no AWS identity in a query client's error.
+            message: crate::graph_source::iceberg_catalog::query_safe_denial(
+                "Delta catalog denied access",
+                message,
+            ),
+        },
         other => QueryError::Internal(format!(
             "Delta graph source '{graph_source_id}', table '{table_name}': {other}"
         )),

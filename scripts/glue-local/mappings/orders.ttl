@@ -1,0 +1,9 @@
+@base <http://example.org/mapping/> .
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<#Orders> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "demo.orders" ] ;
+  rr:subjectMap [ rr:template "http://example.org/order/{order_id}" ; rr:class ex:Order ] ;
+  rr:predicateObjectMap [ rr:predicate ex:amount ; rr:objectMap [ rr:column "amount" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:customer ; rr:objectMap [ rr:template "http://example.org/customer/{customer_id}" ; rr:termType rr:IRI ] ] .

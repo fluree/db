@@ -105,6 +105,7 @@ WHERE {
 - R2RML mapping for tabular data (Iceberg-backed)
 - Time-travel via Iceberg snapshots
 - **Direct S3 mode**: bypass REST catalog servers for `iceberg-rust` / self-managed tables — reads `version-hint.text` for automatic version discovery
+- **AWS Glue Data Catalog and AWS S3 Tables modes**: resolve tables through the native AWS SDK, reading with the ambient AWS credentials
 
 See the [Iceberg documentation](../graph-sources/iceberg.md) for details.
 

@@ -18,8 +18,30 @@ crate-type = ["cdylib"]
 test = false
 doctest = false
 
+[features]
+# The extension module itself. maturin turns it on (pyproject.toml); without
+# it the crate is empty, so a workspace build (the CLI release's, under fat
+# LTO) does not link a second copy of the engine it never ships.
+extension = [
+    "dep:bytes",
+    "dep:fluree-db-api",
+    "dep:fluree-db-core",
+    "dep:fluree-db-nameservice",
+    "dep:fluree-db-query",
+    "dep:fluree-db-sparql",
+    "dep:fluree-vocab",
+    "dep:pyo3",
+    "dep:pythonize",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:stacker",
+    "dep:tokio",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+]
+
 [dependencies]
-bytes = "1"
+bytes = { version = "1", optional = true }
 # The engine features the CLI ships with (fluree-db-cli's default set, less
 # its server): S3/DynamoDB storage, SHACL, Iceberg / SQL / Delta graph
 # sources, and GraphQL.
@@ -31,20 +53,20 @@ fluree-db-api = { path = "../fluree-db-api", features = [
     "sql",
     "delta",
     "graphql",
-] }
-fluree-db-core = { path = "../fluree-db-core" }
-fluree-db-nameservice = { path = "../fluree-db-nameservice" }
-fluree-db-query = { path = "../fluree-db-query" }
-fluree-db-sparql = { path = "../fluree-db-sparql" }
-fluree-vocab = { path = "../fluree-vocab" }
-pyo3 = "0.29"
-pythonize = "0.29"
-serde = { workspace = true }
-serde_json = { workspace = true }
-stacker = "0.1"
-tokio = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+], optional = true }
+fluree-db-core = { path = "../fluree-db-core", optional = true }
+fluree-db-nameservice = { path = "../fluree-db-nameservice", optional = true }
+fluree-db-query = { path = "../fluree-db-query", optional = true }
+fluree-db-sparql = { path = "../fluree-db-sparql", optional = true }
+fluree-vocab = { path = "../fluree-vocab", optional = true }
+pyo3 = { version = "0.29", optional = true }
+pythonize = { version = "0.29", optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+stacker = { version = "0.1", optional = true }
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
 
 [lints]
 workspace = true
