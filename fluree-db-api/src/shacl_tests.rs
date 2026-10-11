@@ -3718,6 +3718,65 @@ async fn shacl_unique_lang() {
     assert_shacl_violation(err, "more than one value");
 }
 
+/// An upsert that replaces every language's label satisfies `sh:uniqueLang`:
+/// the replaced values are retracted with their language tags, so the
+/// staged state holds one label per language. A second label in a language
+/// is still refused.
+#[tokio::test]
+async fn a_refresh_upsert_satisfies_unique_lang() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:UniqueLabelShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Translated"},
+        "sh:property": [{
+            "@id": "ex:pshape_unique_label",
+            "sh:path": {"@id": "ex:label"},
+            "sh:uniqueLang": true
+        }]
+    });
+    let ledger = fluree
+        .create_ledger("shacl/uniq-refresh:main")
+        .await
+        .unwrap();
+    let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
+    let doc = |en: &str, fr: &str| {
+        json!({
+            "@context": context.clone(),
+            "@id": "ex:doc1",
+            "@type": "ex:Translated",
+            "ex:label": [
+                {"@value": en, "@language": "en"},
+                {"@value": fr, "@language": "fr"}
+            ]
+        })
+    };
+    let ledger = fluree
+        .upsert(ledger, &doc("colour", "couleur"))
+        .await
+        .expect("first labels")
+        .ledger;
+    let ledger = fluree
+        .upsert(ledger, &doc("color", "coloris"))
+        .await
+        .expect("a refresh replaces each language's label")
+        .ledger;
+    let err = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:doc1",
+                "ex:label": {"@value": "hue", "@language": "en"}
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "more than one value");
+}
+
 /// `sh:pattern` on IRI values matches the full decoded IRI (SPARQL `STR()`),
 /// not the SID name fragment — and non-matching IRIs violate.
 #[tokio::test]
