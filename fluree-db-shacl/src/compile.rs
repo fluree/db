@@ -44,7 +44,7 @@ pub struct LiteralTarget {
 }
 
 /// Severity level for constraint violations
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Severity {
     #[default]
     Violation,

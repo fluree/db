@@ -51,6 +51,7 @@ use fluree_db_sparql::ast::query::{
 };
 use fluree_db_sparql::{parse_sparql, QueryBody, SparqlAst};
 use fluree_vocab::shacl as sh_vocab;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// A `sh:sparql` constraint that could not run: its query does not parse,
@@ -65,7 +66,7 @@ use std::sync::Arc;
 /// The transaction path then decides by severity and the graph's validation
 /// mode: a Violation in a reject-mode graph fails the transaction with the
 /// same error; anything else is logged.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConstraintFailure {
     /// The constraint's IRI.
     pub constraint: String,
@@ -90,18 +91,28 @@ impl ConstraintFailure {
 }
 
 /// Collects the [`ConstraintFailure`]s of one validation pass (see
-/// `ShaclEngine::with_constraint_failures`).
+/// `ShaclEngine::with_constraint_failures`). A constraint fails the same way
+/// for every focus node it runs on, so each distinct failure is kept once,
+/// with the order it first occurred in and the number of focus nodes.
 #[derive(Debug, Default)]
-pub struct ConstraintFailures(parking_lot::Mutex<Vec<ConstraintFailure>>);
+pub struct ConstraintFailures(parking_lot::Mutex<HashMap<ConstraintFailure, (usize, usize)>>);
 
 impl ConstraintFailures {
     fn record(&self, failure: ConstraintFailure) {
-        self.0.lock().push(failure);
+        let mut seen = self.0.lock();
+        let next = seen.len();
+        seen.entry(failure).or_insert((next, 0)).1 += 1;
     }
 
-    /// The failures recorded so far, in the order they occurred.
-    pub fn take(&self) -> Vec<ConstraintFailure> {
-        std::mem::take(&mut *self.0.lock())
+    /// Each distinct failure recorded so far, with the number of focus nodes
+    /// it occurred for, in the order each first occurred.
+    pub fn take(&self) -> Vec<(ConstraintFailure, usize)> {
+        let mut failures: Vec<_> = std::mem::take(&mut *self.0.lock()).into_iter().collect();
+        failures.sort_unstable_by_key(|(_, (first, _))| *first);
+        failures
+            .into_iter()
+            .map(|(failure, (_, focus_nodes))| (failure, focus_nodes))
+            .collect()
     }
 }
 
@@ -966,5 +977,39 @@ mod tests {
             })
             .collect();
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// Each distinct failure is kept once, with its focus-node count, in the
+    /// order it first occurred. One that differs only in severity is distinct:
+    /// a Violation must not be counted into a Warning.
+    #[test]
+    fn constraint_failures_count_each_distinct_failure_once() {
+        use super::{ConstraintFailure, ConstraintFailures};
+        use crate::compile::Severity;
+        let failure = |constraint: &str, severity| ConstraintFailure {
+            constraint: constraint.to_string(),
+            message: format!("{constraint} cannot run"),
+            severity,
+            graph_id: 0,
+        };
+        let failures = ConstraintFailures::default();
+        for f in [
+            failure("ex:a", Severity::Warning),
+            failure("ex:b", Severity::Warning),
+            failure("ex:a", Severity::Warning),
+            failure("ex:a", Severity::Violation),
+            failure("ex:a", Severity::Warning),
+        ] {
+            failures.record(f);
+        }
+        assert_eq!(
+            failures.take(),
+            vec![
+                (failure("ex:a", Severity::Warning), 3),
+                (failure("ex:b", Severity::Warning), 1),
+                (failure("ex:a", Severity::Violation), 1),
+            ]
+        );
+        assert!(failures.take().is_empty());
     }
 }
