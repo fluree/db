@@ -257,8 +257,13 @@ pub fn try_read_cached_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
 /// authoritative CAS fetch, not errors: a coalesced fetch's leader checks the
 /// entry through this before fetching, and anything mapped to `Err` here
 /// would fail the read outright.
+///
+/// An empty file is a miss too. No object is empty, and an entry renamed into
+/// place without an fsync can come back empty after a host crash; serving it
+/// would fail every read of the object until the entry is evicted.
 fn read_result_as_cache_outcome(res: io::Result<Vec<u8>>) -> io::Result<Option<Vec<u8>>> {
     match res {
+        Ok(bytes) if bytes.is_empty() => Ok(None),
         Ok(bytes) => Ok(Some(bytes)),
         Err(err)
             if matches!(
@@ -643,7 +648,9 @@ impl DiskArtifactCache {
     }
 
     fn write_atomic(target: &Path, bytes: &[u8]) -> io::Result<bool> {
-        if target.exists() {
+        // An empty entry is crash debris that readers treat as a miss; the
+        // rename below replaces it.
+        if fs::metadata(target).is_ok_and(|meta| meta.len() > 0) {
             return Ok(false);
         }
 
@@ -669,7 +676,7 @@ impl DiskArtifactCache {
     }
 
     pub fn best_effort_write(&self, target: &Path, bytes: &[u8]) {
-        if self.budget_bytes == 0 {
+        if self.budget_bytes == 0 || bytes.is_empty() {
             return;
         }
 
@@ -860,13 +867,15 @@ impl CachedContentStore {
 }
 
 /// A cache entry's bytes. Read failures are misses: the entry is a copy, and
-/// the inner store is the authority.
+/// the inner store is the authority. So is an empty entry; see
+/// [`read_result_as_cache_outcome`].
 #[cfg(not(target_arch = "wasm32"))]
 fn read_entry(path: &Path) -> Option<ContentBytes> {
     // SAFETY: entries land by renaming a staged file into place
-    // (`write_atomic`) and are only ever unlinked after that.
+    // (`write_atomic`) and are only ever unlinked after that. The one entry
+    // replaced in place is an empty one, which is read, never mapped.
     match unsafe { ContentBytes::open(path) } {
-        Ok(bytes) => bytes,
+        Ok(bytes) => bytes.filter(|bytes| !bytes.is_empty()),
         Err(err) => {
             tracing::debug!(path = %path.display(), error = %err, "unreadable cache entry; fetching");
             None
@@ -879,26 +888,31 @@ fn read_entry(_path: &Path) -> Option<ContentBytes> {
     None
 }
 
-/// `range` of a cache entry, read positionally; `None` when the entry is
-/// absent or unreadable.
+/// `range` of a cache entry, read positionally and clamped to the entry, as
+/// [`ContentStore::get_range`] requires (`mid..u64::MAX` reads to the end);
+/// `None` when the entry is absent, empty or unreadable.
 #[cfg(not(target_arch = "wasm32"))]
 fn read_entry_range(path: &Path, range: std::ops::Range<u64>) -> Option<Vec<u8>> {
     let file = fs::File::open(path).ok()?;
-    let len = range.end.saturating_sub(range.start) as usize;
+    let entry_len = file.metadata().ok()?.len();
+    if entry_len == 0 {
+        return None;
+    }
+    let start = range.start.min(entry_len);
+    let len = (range.end.min(entry_len).saturating_sub(start)) as usize;
     let mut buf = vec![0u8; len];
     #[cfg(unix)]
-    let n = {
+    {
         use std::os::unix::fs::FileExt;
-        file.read_at(&mut buf, range.start).ok()?
-    };
+        file.read_exact_at(&mut buf, start).ok()?;
+    }
     #[cfg(not(unix))]
-    let n = {
+    {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = file;
-        file.seek(SeekFrom::Start(range.start)).ok()?;
-        file.read(&mut buf).ok()?
-    };
-    buf.truncate(n);
+        file.seek(SeekFrom::Start(start)).ok()?;
+        file.read_exact(&mut buf).ok()?;
+    }
     Some(buf)
 }
 
@@ -979,7 +993,9 @@ impl ContentStore for CachedContentStore {
         let Some(path) = self.entry(id) else {
             return Ok(());
         };
-        if path.exists() || self.inner.get_local(id)?.is_some() {
+        if fs::metadata(&path).is_ok_and(|meta| meta.len() > 0)
+            || self.inner.get_local(id)?.is_some()
+        {
             return Ok(());
         }
         self.fetch(id, Some(&path)).await.map(drop)
@@ -1605,6 +1621,47 @@ mod tests {
         store.prefetch(&prefetched).await.unwrap();
         assert_eq!(inner.gets(), 1);
         assert!(store.get_local(&prefetched).unwrap().is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A range read from an entry is sized from the entry, not the range:
+    /// `mid..u64::MAX` reads to the end, and a range past the end is empty.
+    #[tokio::test]
+    async fn a_range_read_from_an_entry_is_clamped_to_it() {
+        let dir = temp_cache_dir("wrapper-range");
+        let data: Vec<u8> = (0..128).collect();
+        let id = ContentId::new(crate::ContentKind::IndexLeaf, &data);
+        let inner = Arc::new(CountingStore::remote(&data));
+        let store = cached(Arc::clone(&inner), &dir);
+
+        store.get(&id).await.unwrap();
+        assert_eq!(
+            store.get_range(&id, 100..u64::MAX).await.unwrap(),
+            &data[100..]
+        );
+        assert!(store.get_range(&id, 200..300).await.unwrap().is_empty());
+        assert_eq!(inner.gets(), 1, "both ranges came from the entry");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An empty entry — what a crash can leave of one renamed into place
+    /// without an fsync — is a miss, and the fetch it causes replaces it.
+    #[tokio::test]
+    async fn an_empty_entry_is_a_miss_the_next_fetch_replaces() {
+        let dir = temp_cache_dir("wrapper-empty");
+        let data = vec![3u8; 96];
+        let id = ContentId::new(crate::ContentKind::IndexLeaf, &data);
+        let inner = Arc::new(CountingStore::remote(&data));
+        let store = cached(Arc::clone(&inner), &dir);
+        let entry = dir.join(id.to_string());
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&entry, b"").unwrap();
+
+        assert!(store.get_local(&id).unwrap().is_none());
+        assert_eq!(store.get_range(&id, 0..8).await.unwrap(), &data[..8]);
+        assert_eq!(store.get(&id).await.unwrap(), data);
+        assert_eq!(fs::read(&entry).unwrap(), data, "the fetch rewrote it");
+        assert_eq!(store.get_local(&id).unwrap().unwrap(), data);
         let _ = fs::remove_dir_all(&dir);
     }
 
