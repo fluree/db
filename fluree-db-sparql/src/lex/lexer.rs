@@ -18,6 +18,13 @@ use crate::span::SourceSpan;
 /// Input type for the lexer - tracks position for spans.
 pub type Input<'a> = LocatingSlice<&'a str>;
 
+/// A `#` comment: its text without the leading `#`, and where it sits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Comment {
+    pub text: String,
+    pub span: SourceSpan,
+}
+
 /// Lexer for SPARQL queries.
 pub struct Lexer<'a> {
     input: &'a str,
@@ -34,8 +41,7 @@ impl<'a> Lexer<'a> {
         self.tokenize_collecting(&mut Vec::new())
     }
 
-    /// Tokenize the entire input, collecting comment text (without the
-    /// leading `#`, one entry per comment) into `comments`.
+    /// Tokenize the entire input, collecting each comment into `comments`.
     ///
     /// Comments are identified by the lexer itself, so `#` characters inside
     /// string literals or IRIs are never treated as comments.
@@ -44,7 +50,7 @@ impl<'a> Lexer<'a> {
     /// `\uXXXX`/`\UXXXXXXXX` are unescaped over the whole query string
     /// before tokenizing), so token spans index into the unescaped string
     /// when escapes are present.
-    pub fn tokenize_collecting(self, comments: &mut Vec<String>) -> Vec<Token> {
+    pub fn tokenize_collecting(self, comments: &mut Vec<Comment>) -> Vec<Token> {
         let unescaped = unescape_codepoints(self.input);
         let mut tokens = Vec::new();
         let mut input = LocatingSlice::new(unescaped.as_ref());
@@ -185,9 +191,8 @@ fn decode_codepoint_escape(bytes: &[u8], at: usize) -> Option<(char, usize)> {
     char::from_u32(code).map(|c| (c, total))
 }
 
-/// Skip whitespace and comments, collecting comment text (without the
-/// leading `#`) into `comments`.
-fn skip_ws_and_comments(input: &mut Input<'_>, comments: &mut Vec<String>) {
+/// Skip whitespace and comments, collecting each comment into `comments`.
+fn skip_ws_and_comments(input: &mut Input<'_>, comments: &mut Vec<Comment>) {
     loop {
         // Skip whitespace
         let _: ModalResult<&str, ContextError> = take_while(0.., is_ws).parse_next(input);
@@ -195,10 +200,14 @@ fn skip_ws_and_comments(input: &mut Input<'_>, comments: &mut Vec<String>) {
         // Check for comment
         if input.starts_with('#') {
             // Skip until end of line
+            let start = input.current_token_start();
             let comment: ModalResult<&str, ContextError> =
                 take_till(0.., |c| c == '\n' || c == '\r').parse_next(input);
             if let Ok(text) = comment {
-                comments.push(text.trim_start_matches('#').to_string());
+                comments.push(Comment {
+                    text: text.trim_start_matches('#').to_string(),
+                    span: SourceSpan::new(start, input.current_token_start()),
+                });
             }
             // Skip the newline if present
             let _: ModalResult<Option<char>, ContextError> =
@@ -1060,9 +1069,8 @@ pub fn tokenize(input: &str) -> Vec<Token> {
     Lexer::new(input).tokenize()
 }
 
-/// Tokenize a SPARQL query string, also returning comment text (without
-/// the leading `#`, one entry per comment, in source order).
-pub fn tokenize_with_comments(input: &str) -> (Vec<Token>, Vec<String>) {
+/// Tokenize a SPARQL query string, also returning its comments in source order.
+pub fn tokenize_with_comments(input: &str) -> (Vec<Token>, Vec<Comment>) {
     let mut comments = Vec::new();
     let tokens = Lexer::new(input).tokenize_collecting(&mut comments);
     (tokens, comments)

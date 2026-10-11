@@ -147,41 +147,50 @@ impl LeafHandle for FullBlobLeafHandle {
 }
 
 // ============================================================================
-// SharedBlobLeafHandle (wasm32 residency tier)
+// SharedBlobLeafHandle (resident bytes)
 // ============================================================================
 
-/// Leaf handle over shared, already-resident bytes (wasm32 only).
+/// Leaf handle over shared, already-resident bytes.
 ///
-/// The wasm read path serves whole leaf blobs from the content store's
-/// residency tier (`resolve_cached_bytes`) as `Arc<[u8]>`; this handle is
+/// Whole leaf blobs the content store already holds in memory
+/// (`resolve_cached_bytes`) arrive as `Arc<[u8]>`: in-memory storage on
+/// native, the residency tier on wasm32. This handle is
 /// [`FullBlobLeafHandle`] with shared instead of owned backing, so opening a
-/// resident leaf clones two `Arc`s and decodes the directory — no byte copy.
-#[cfg(any(target_arch = "wasm32", feature = "residency"))]
+/// resident leaf clones two `Arc`s — no byte copy.
 pub struct SharedBlobLeafHandle {
     bytes: Arc<[u8]>,
-    dir: DecodedLeafDirV3,
+    dir: Arc<DecodedLeafDirV3>,
     sidecar: Option<Arc<[u8]>>,
     leaf_id: u128,
 }
 
-#[cfg(any(target_arch = "wasm32", feature = "residency"))]
 impl SharedBlobLeafHandle {
     /// Create from resident leaf bytes and optional resident sidecar bytes.
     ///
     /// Parses the header and directory from the leaf bytes.
     pub fn new(bytes: Arc<[u8]>, sidecar: Option<Arc<[u8]>>, leaf_id: u128) -> io::Result<Self> {
         let header = decode_leaf_header_v3(&bytes)?;
-        let dir = decode_leaf_dir_v3_with_base(&bytes, &header)?;
-        Ok(Self {
+        let dir = Arc::new(decode_leaf_dir_v3_with_base(&bytes, &header)?);
+        Ok(Self::with_dir(bytes, dir, sidecar, leaf_id))
+    }
+
+    /// Create with a directory already decoded, shared from the
+    /// [`LeafletCache`](super::leaflet_cache::LeafletCache).
+    pub fn with_dir(
+        bytes: Arc<[u8]>,
+        dir: Arc<DecodedLeafDirV3>,
+        sidecar: Option<Arc<[u8]>>,
+        leaf_id: u128,
+    ) -> Self {
+        Self {
             bytes,
             dir,
             sidecar,
             leaf_id,
-        })
+        }
     }
 }
 
-#[cfg(any(target_arch = "wasm32", feature = "residency"))]
 impl LeafHandle for SharedBlobLeafHandle {
     fn dir(&self) -> &DecodedLeafDirV3 {
         &self.dir

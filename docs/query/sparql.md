@@ -99,6 +99,8 @@ ASK {
 }
 ```
 
+ASK is `true` when a solution remains after its solution modifiers and a trailing `VALUES` clause: `GROUP BY` / `HAVING` count the groups that pass, `OFFSET 1` needs a second solution, and `LIMIT 0` is always `false`. `ORDER BY` cannot change the answer.
+
 ### DESCRIBE Queries
 
 Return RDF description of resources:
@@ -376,6 +378,26 @@ WHERE {
 }
 ```
 
+### Parameters
+
+When Fluree is embedded (the Rust API and the Python package), a query or
+update can take parameters: values bound to variables by name. A parameter
+replaces its variable — written `?name` or `$name`, which SPARQL treats as the
+same variable — everywhere in the request before it is planned, so
+`SELECT ?person WHERE { ?person ex:name $name }` with `name = "Alice"` runs
+exactly as `SELECT ?person WHERE { ?person ex:name "Alice" }`. Unlike a
+`VALUES` block, the value is visible inside every `FILTER`, `OPTIONAL` and
+subquery.
+
+- A projected parameter (`SELECT $name ?age`) is still a column, holding the
+  value; `SELECT *` does not list it.
+- A parameter that the request never mentions is an error, since a misspelt
+  variable would otherwise be unbound and match everything. So is a parameter
+  the request assigns itself (`BIND`, `VALUES`, `AS`), and one used inside a
+  remote `SERVICE`, whose body is sent to the endpoint as written.
+- `INSERT DATA` and `DELETE DATA` take no variables, so no parameters; use
+  `INSERT { ... } WHERE { ... }`.
+
 ## Aggregation
 
 ### GROUP BY
@@ -404,6 +426,16 @@ GROUP BY (SUBSTR(?name, 1, 1) AS ?initial)
 
 The expression is evaluated per row and bound to the alias variable before grouping. Any SPARQL expression is supported, including function calls, arithmetic, and type casts.
 
+**SELECT expressions in a grouped query** are evaluated once per group, after aggregation, in SELECT order (SPARQL 1.1 §18.2.4.4); the ones `HAVING` reads run before it, the rest after it. They may read GROUP BY keys, aggregate results and earlier SELECT aliases:
+
+```sparql
+SELECT (IF(?area = "Net", "network", "other") AS ?segment) (COUNT(?e) AS ?n)
+WHERE { ?e ex:area ?area }
+GROUP BY ?area
+```
+
+returns one row per `?area`. A query groups when it has a `GROUP BY` or an aggregate anywhere in SELECT, HAVING or ORDER BY; `SELECT *` of such a query projects its GROUP BY keys (none, without a `GROUP BY`). An aggregate cannot read an alias of the same SELECT clause (it is bound after aggregation): aggregate the expression itself, e.g. `COUNT(IF(…))`.
+
 ### HAVING
 
 Filter grouped results:
@@ -416,6 +448,8 @@ WHERE {
 GROUP BY ?category
 HAVING (COUNT(?product) > 10)
 ```
+
+`HAVING` can read the SELECT clause's aliases: an aggregate's alias, such as `?count` above, and an expression's alias (`(COUNT(?product) + 1 AS ?n) … HAVING (?n > 10)`), whose expression is evaluated once, before `HAVING`. SPARQL 1.1 evaluates SELECT expressions after `HAVING`, which leaves such an alias unbound there; reading it is a Fluree extension that many engines share (see [compatibility](../reference/compatibility.md)). In `HAVING` and `ORDER BY`, a variable that is neither a GROUP BY key nor inside an aggregate means `SAMPLE(?v)`, an arbitrary value from the group (§18.2.4.1). On a query that does not group, `HAVING` filters the solutions (§18.2.4.2).
 
 ### Aggregation Functions
 
@@ -754,6 +788,33 @@ Per W3C SPARQL 1.1 §17.5, XSD constructor functions cast values between datatyp
 - `ISBLANK(?x)` - Is blank node
 - `ISLITERAL(?x)` - Is literal
 - `ISNUMERIC(?x)` - Is numeric
+
+### Search and Similarity Functions
+
+Fluree extensions that score values for ranking, used in `BIND`:
+
+- `fulltext(?text, "query")` - BM25 relevance of a full-text value to a query string; `0` when no query term occurs. Also written `f:fulltext(...)`. See [Inline Fulltext Search](../indexing-and-search/fulltext.md).
+- `dotProduct(?v1, ?v2)` - Dot product of two vectors
+- `cosineSimilarity(?v1, ?v2)` - Cosine similarity of two vectors
+- `euclideanDistance(?v1, ?v2)` - Euclidean (L2) distance between two vectors
+
+Vectors are `f:embeddingVector` literals (`"[0.1, 0.2]"^^f:embeddingVector`); see [Vector Search](../indexing-and-search/vector-search.md). Names are case-insensitive and accept underscores (`cosine_similarity`).
+
+```sparql
+PREFIX ex: <http://example.org/>
+PREFIX f:  <https://ns.flur.ee/db#>
+
+SELECT ?doc ?text ?similar WHERE {
+  VALUES ?q { "[0.88, 0.12, 0.08]"^^f:embeddingVector }
+  ?doc ex:body ?body ;
+       ex:embedding ?vec .
+  BIND(fulltext(?body, "graph databases") AS ?text)
+  BIND(cosineSimilarity(?vec, ?q) AS ?similar)
+  FILTER(?text > 0 || ?similar > 0.8)
+}
+ORDER BY DESC(0.6 * ?text + 0.4 * ?similar)
+LIMIT 10
+```
 
 ## Subqueries
 
@@ -1204,6 +1265,8 @@ SPARQL UPDATE `MODIFY` supports dataset scoping for named graphs:
 
 The ledger’s own address (`mydb`, `mydb:main` or `urn:fluree:mydb:main`, with no `#fragment` and no time pin) names the ledger’s default graph in `USING` and `WITH`. `WITH <mydb:main>` therefore reads and writes the default graph and never creates a named graph called `mydb:main`. Only these two clauses treat the address this way: a `GRAPH <iri>` block in a template or in the `WHERE`, `USING NAMED`, and an `INSERT DATA`/`DELETE DATA` quad resolve it like any other graph IRI. The reserved graphs keep their own IRIs, such as `urn:fluree:mydb:main#config`.
 
+`urn:default`, the name [`/info`](../api/endpoints.md#get-infoledger-id) lists the default graph under, names the default graph in every clause that reads a graph: `USING`, `USING NAMED`, `WITH`, and `GRAPH <urn:default>` in the `WHERE`. `WITH <urn:default>` also writes the default graph. The default graph is not a named graph, so a write that names one by it (a `GRAPH <urn:default>` template or `INSERT DATA` quad, `CREATE GRAPH`, or a `CLEAR`/`DROP`/`ADD`/`COPY`/`MOVE` operand) is refused with a `400`; leave out `GRAPH`, or write `DEFAULT` in graph management.
+
 ### Graph variables in templates
 
 A `GRAPH ?g { ... }` block in an INSERT or DELETE template writes to whichever graph `?g` names in each `WHERE` solution. This rewrites every match in the graph it was found in:
@@ -1321,6 +1384,49 @@ curl -X POST http://localhost:8090/v1/fluree/update \
   -d 'PREFIX ex: <http://example.org/ns/>
       INSERT DATA { ex:alice ex:name "Alice" }'
 ```
+
+## Request options (`# PRAGMA`)
+
+A SPARQL request carries Fluree options in comments of the form `# PRAGMA name: value`. They are the SPARQL counterpart of a JSON-LD request's `opts` block and of the `fluree-*` [request headers](../api/headers.md#fluree-request-headers), and because they are comments, the text stays valid SPARQL for any other tool.
+
+```sparql
+# PRAGMA max-fuel: 5000
+# PRAGMA meta: fuel, time
+# PRAGMA policy-class: ex:EmployeeClass
+PREFIX ex: <http://example.org/ns/>
+
+SELECT ?name WHERE { ?person ex:name ?name }
+```
+
+| Pragma | Value | Applies to | JSON-LD `opts` | Header |
+|--------|-------|------------|----------------|--------|
+| `reasoning` | `rdfs`, `owl2ql`, `owl2rl`, `datalog`, `owl-datalog`, `none`, or a list | queries | `reasoning` | — |
+| `reasoning-max-facts`, `reasoning-max-seconds`, `reasoning-max-memory-mb` | integer | queries | `reasoningBudget` | — |
+| `include-system-facts` | `true` / `false` | queries | `includeSystemFacts` | — |
+| `union-default-graph` | `true` / `false` | queries | `unionDefaultGraph` | — |
+| `min-t` | transaction `t` | queries | `min-t` | `fluree-min-t` |
+| `meta` | `true`, `false`, or a list of `time`, `fuel`, `policy` | queries and updates | `meta` | `fluree-track-*` |
+| `max-fuel` | number | queries and updates | `max-fuel` | `fluree-max-fuel` |
+| `identity` | IRI | queries and updates | `identity` | `fluree-identity` |
+| `policy-class` | IRI list | queries and updates | `policy-class` | `fluree-policy-class` |
+| `policy-values` | one-line JSON object | queries and updates | `policy-values` | `fluree-policy-values` |
+| `default-allow` | `true` / `false` | queries and updates | `default-allow` | `fluree-default-allow` |
+| `event-time` | RFC 3339 timestamp | updates | `eventTime` | — |
+| `validation-mode` | `warn` / `reject` | updates | `validationMode` | — |
+| `unique-properties` | IRI list | updates | `uniqueProperties` | — |
+
+Rules:
+
+- **A comment whose first word is `PRAGMA` is a directive.** The name is case-insensitive, the `:` is optional, and list values are separated by commas or spaces. A pragma may sit anywhere a comment can, including after the query. When one repeats, the last wins.
+- **Errors are never silent.** An unknown name, a malformed value, or a pragma that does not apply to the request (`min-t` on an update, `event-time` on a query) fails the request with a `400` (diagnostic `F012`), rather than running it without the option it asked for.
+- **IRIs** may be written `<…>` or as a prefixed name the request declares with `PREFIX`; anything else (a DID, a URN) is taken as written.
+- **A pragma wins over the header** that names the same option, as a JSON-LD body's `opts` do, with three exceptions:
+  - **`meta` adds tracking.** The request reports what the pragma asks for and what the `fluree-track-*` headers ask for; a pragma cannot switch off tracking a header requested.
+  - **`max-fuel` is a cap.** The request runs under the smaller of the pragma and the `fluree-max-fuel` header, so a pragma can lower a limit but never raise it.
+  - **On an authenticated request, policy pragmas cannot change the headers' policy selection.** When a request carries a bearer token or a signature and its headers select policy (`fluree-identity`, `fluree-policy-class`, `fluree-policy`, `fluree-policy-values` or `fluree-default-allow`), a policy pragma may repeat that selection or narrow `default-allow` to `false`. Any other policy pragma is refused with a `403`, including one that names an option the headers left unset. This lets an application that forwards its users' SPARQL pin policy with headers. When the headers select nothing, the pragmas select.
+- **Policy pragmas are held to the caller's credential exactly as headers are.** A selection the credential does not permit is refused with a `403`. The inline policy document has no pragma; send it with the `fluree-policy` header. See [Policy in queries](../security/policy-in-queries.md#sparql-queries).
+- **In a multi-query envelope**, a SPARQL alias's pragmas act as its body `opts`, so they win over the alias's and the envelope's `opts`. The same exceptions apply: a pragma's `meta` adds to the alias's `opts.meta`, its `max-fuel` cannot raise the alias's `opts.max-fuel`, and on an authenticated request a policy pragma may only repeat the selection that the envelope and alias `opts` make.
+- **The MCP `sparql_query` tool** refuses policy and `min-t` pragmas: the connection's identity selects policy, and the tool's `t` argument pins the snapshot.
 
 ## Best Practices
 

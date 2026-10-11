@@ -4,7 +4,7 @@ use crate::error::{CliError, CliResult};
 use fluree_db_api::server_defaults::FlureeDir;
 
 pub async fn run(ledger: &str, dirs: &FlureeDir) -> CliResult<()> {
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let ledger_id = context::to_ledger_id(ledger)?;
 
     // Check if it's a local ledger

@@ -40,6 +40,9 @@ Configuration is organized into independent **setting groups**, each governing a
 | [`f:reasoningDefaults`](setting-groups.md#reasoning-defaults) | OWL/RDFS reasoning | `f:reasoningModes`, `f:schemaSource` |
 | [`f:datalogDefaults`](setting-groups.md#datalog-defaults) | Datalog rules | `f:datalogEnabled`, `f:rulesSource` |
 | [`f:transactDefaults`](setting-groups.md#transact-defaults) | Transaction constraints | `f:uniqueEnabled`, `f:constraintsSource` |
+| [`f:fullTextDefaults`](setting-groups.md#full-text-defaults) | Full-text indexing | `f:property`, `f:defaultLanguage` |
+| [`f:queryDefaults`](setting-groups.md#fquerydefaults--query-defaults) | Query defaults (ledger-scoped) | `f:unionDefaultGraph` |
+| [`f:servingDefaults`](setting-groups.md#fservingdefaults--serving-posture) | Serving posture (ledger-scoped) | `f:serveQuery`, `f:serveBlocks`, `f:publicVisibility` |
 
 Each group is resolved independently — locking down policy does not affect whether reasoning can be overridden.
 

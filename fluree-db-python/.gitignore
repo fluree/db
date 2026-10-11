@@ -1,0 +1,6 @@
+# Built by `maturin develop`
+*.so
+*.pyd
+__pycache__/
+.venv/
+.pytest_cache/

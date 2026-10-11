@@ -838,3 +838,82 @@ async fn history_range_nonexistent_id_returns_empty_novelty_only() {
         "non-matching @id must return zero rows (novelty-only); got {missing_rows:#?}"
     );
 }
+
+/// The `to` end of a history range bounds it: events after `to` are not
+/// returned, on novelty and on an indexed ledger, through JSON-LD and SPARQL.
+#[tokio::test]
+async fn history_range_respects_to_bound() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let fluree = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .build()
+        .expect("build");
+    let ledger_id = "test/history-to:main";
+
+    let ledger0 = fluree.create_ledger(ledger_id).await.expect("create");
+    let tx = |name: &str| json!({"@context": ctx(), "@id": "ex:alice", "ex:name": name});
+    let r1 = fluree.insert(ledger0, &tx("A")).await.expect("t=1");
+    let r2 = fluree.upsert(r1.ledger, &tx("B")).await.expect("t=2");
+    fluree.upsert(r2.ledger, &tx("C")).await.expect("t=3");
+
+    let jsonld = |to: &str| {
+        json!({
+            "@context": ctx(),
+            "from": format!("{ledger_id}@t:1"),
+            "to":   format!("{ledger_id}@t:{to}"),
+            "select": ["?v", "?t", "?op"],
+            "where": [{"@id": "ex:alice", "ex:name": {"@value": "?v", "@t": "?t", "@op": "?op"}}],
+            "orderBy": ["?t", "?op", "?v"],
+        })
+    };
+    let sparql = |to: &str| {
+        format!(
+            "PREFIX ex: <http://example.org/> PREFIX f: <https://ns.flur.ee/db#>
+             SELECT ?v ?t ?op FROM <{ledger_id}@t:1> TO <{ledger_id}@t:{to}>
+             WHERE {{ << ex:alice ex:name ?v >> f:t ?t . << ex:alice ex:name ?v >> f:op ?op . }}
+             ORDER BY ?t ?op ?v"
+        )
+    };
+    let events = |rows: serde_json::Value| -> Vec<(String, i64, bool)> {
+        rows.as_array()
+            .expect("rows")
+            .iter()
+            .map(flatten_v_t_op)
+            .collect()
+    };
+    let ev = |v: &str, t: i64, op: bool| (v.to_string(), t, op);
+    let through_t2 = vec![ev("A", 1, true), ev("A", 2, false), ev("B", 2, true)];
+    let through_t1 = vec![ev("A", 1, true)];
+
+    for lane in ["novelty", "indexed"] {
+        if lane == "indexed" {
+            reindex_to_current(&fluree, ledger_id).await;
+        }
+        for (to, expected) in [("2", &through_t2), ("1", &through_t1)] {
+            let by_jsonld = fluree
+                .query_from()
+                .jsonld(&jsonld(to))
+                .format(FormatterConfig::typed_json().with_normalize_arrays())
+                .execute_tracked()
+                .await
+                .expect("jsonld history");
+            assert_eq!(
+                &events(serde_json::to_value(&by_jsonld.result).unwrap()),
+                expected,
+                "{lane}: JSON-LD to t:{to}"
+            );
+            let query = sparql(to);
+            let by_sparql = fluree
+                .query_from()
+                .sparql(&query)
+                .format(FormatterConfig::typed_json().with_normalize_arrays())
+                .execute_tracked()
+                .await
+                .expect("sparql history");
+            assert_eq!(
+                &events(serde_json::to_value(&by_sparql.result).unwrap()),
+                expected,
+                "{lane}: SPARQL TO t:{to}"
+            );
+        }
+    }
+}

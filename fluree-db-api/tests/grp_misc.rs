@@ -21,6 +21,8 @@ mod it_edge_annotations_parse;
 mod it_fast_group_count;
 #[path = "it_file_backed.rs"]
 mod it_file_backed;
+#[path = "it_file_startup_recovery.rs"]
+mod it_file_startup_recovery;
 #[path = "it_file_storage_jsonld.rs"]
 mod it_file_storage_jsonld;
 #[path = "it_fuel_floor.rs"]

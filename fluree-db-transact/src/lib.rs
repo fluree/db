@@ -62,7 +62,7 @@ pub use commit::{
     build_commit, commit, CommitOpts, CommitOptsRequest, CommitReceipt, StagedCommit,
 };
 pub use commit_flakes::generate_commit_flakes;
-pub use error::{Result, TransactError};
+pub use error::{ReportResult, Result, ShaclViolations, TransactError};
 pub use flake_sink::FlakeSink;
 pub use generate::{apply_cancellation, FlakeGenerator};
 pub use ir::{

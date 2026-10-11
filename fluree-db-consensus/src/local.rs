@@ -406,7 +406,8 @@ impl SubmissionLookup for LocalCommitter {
 /// fit. The split mirrors the commit check (`current + delta >= max`): a
 /// delta at or above the ceiling fails even against drained novelty. The
 /// datatype limit keeps its identity for the same reason: 422 +
-/// `err:db/DatatypeLimitExceeded`.
+/// `err:db/DatatypeLimitExceeded`, and so does a commit reference that names
+/// no commit: 404 + `err:db/CommitNotFound`.
 pub(crate) fn execution_failure(err: ApiError) -> SubmissionError {
     match &err {
         ApiError::Transact(fluree_db_api::TransactError::NoveltyWouldExceed {
@@ -427,6 +428,9 @@ pub(crate) fn execution_failure(err: ApiError) -> SubmissionError {
                 message: err.to_string(),
             }
         }
+        ApiError::CommitNotFound(message) => SubmissionError::CommitNotFound {
+            message: message.clone(),
+        },
         _ => SubmissionError::Execution {
             status: err.status_code(),
             message: err.to_string(),

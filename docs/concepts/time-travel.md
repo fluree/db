@@ -122,6 +122,9 @@ with the current time at commit, but a transaction may supply its own:
 }
 ```
 
+A SPARQL UPDATE supplies it with `# PRAGMA event-time: 2021-03-15T00:00:00Z`
+(see [Request options](../query/sparql.md#request-options--pragma)).
+
 This is how historical data gets *real* time travel: replay a year of history
 as ordinary transactions, each stamped with the date the change actually
 happened, and `@time:` queries work over that custom timeline with no further

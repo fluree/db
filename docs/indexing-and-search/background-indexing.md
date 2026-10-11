@@ -268,9 +268,9 @@ The nameservice stores the current index root CID (`index_head_id`) and its wate
 Old index snapshots are retained for time-travel safety and concurrent query safety. Cleanup is performed by the binary index garbage collector, governed by:
 
 - `IndexerConfig.gc_max_old_indexes` (`--gc-max-old-indexes` / `FLUREE_GC_MAX_OLD_INDEXES`, default 5): old versions to retain.
-- `IndexerConfig.gc_min_time_mins` (`--gc-min-time-mins` / `FLUREE_GC_MIN_TIME_MINS`, default 30): minimum age before a version can be collected.
+- `IndexerConfig.gc_min_time_mins` (`--gc-min-time-mins` / `FLUREE_GC_MIN_TIME_MINS`, default 15): minimum age before a version can be collected.
 
-Both must be satisfied, so the slower of the two wins. Under a sustained publish rate that is the age guard: a ledger publishing every few seconds holds far more than `gc_max_old_indexes` versions inside the 30-minute window, and the count bounds nothing. Retention becomes "however many versions fit in the window", which grows with publish rate and per-version size. Every one of those versions is still reachable and still on disk.
+Both must be satisfied, so the slower of the two wins. Under a sustained publish rate that is the age guard: a ledger publishing every few seconds holds far more than `gc_max_old_indexes` versions inside the 15-minute window, and the count bounds nothing. Retention becomes "however many versions fit in the window", which grows with publish rate and per-version size. Every one of those versions is still reachable and still on disk.
 
 - `IndexerConfig.gc_hard_max_old_indexes` (`--gc-hard-max-old-indexes` / `FLUREE_GC_HARD_MAX_OLD_INDEXES`, unset by default): a ceiling past which versions are collected regardless of age.
 

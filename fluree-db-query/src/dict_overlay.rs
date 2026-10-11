@@ -644,16 +644,6 @@ impl DictOverlay {
             .decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id)
     }
 
-    /// Decode a datatype ID back to a Sid.
-    pub fn decode_dt_sid(&self, dt_id: u16) -> Sid {
-        self.graph_view
-            .store()
-            .dt_sids()
-            .get(dt_id as usize)
-            .cloned()
-            .unwrap_or_else(|| Sid::new(0, ""))
-    }
-
     /// Decode lang_id and i_val into FlakeMeta.
     ///
     /// Handles both persisted lang_ids (delegated to store) and ephemeral

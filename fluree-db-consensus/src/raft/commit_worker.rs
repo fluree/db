@@ -76,8 +76,8 @@ const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const RAFT_BACKOFF: Duration = Duration::from_millis(250);
 
 /// Max staging attempts before [`process_entry`] gives up and
-/// proposes a poison. Only [`PoisonReason::StagingFailed`] is
-/// retried; the other variants are deterministic.
+/// proposes a poison. Transient failures and policy denials are retried
+/// after refresh; other staging failures are poisoned immediately.
 const MAX_STAGE_ATTEMPTS: u32 = 3;
 
 /// First-attempt backoff between staging retries; doubles per
@@ -218,11 +218,10 @@ impl Worker {
     /// Reads the [`QueuedRequest`] envelope from CAS, stages the
     /// commit, writes the commit blob, and publishes the head
     /// advance through the [`CommitPublisher`]. Transient staging
-    /// failures (`PoisonReason::StagingFailed`) retry with
-    /// exponential backoff up to [`MAX_STAGE_ATTEMPTS`] times before
-    /// poisoning — the other `PoisonReason` variants are
-    /// deterministic (`BodyMalformed`, `PolicyViolation`, etc.) so
-    /// retrying them just burns a worker round. Between retries
+    /// failures and policy denials retry with exponential backoff up
+    /// to [`MAX_STAGE_ATTEMPTS`] times before poisoning. Other stage
+    /// failures are deterministic, so retrying them just burns a worker
+    /// round. Between retries
     /// the local Fluree cache is `refresh()`ed against the durable
     /// nameservice head so a conflict rooted in stale state (e.g.
     /// a namespace allocation this node missed because it took
@@ -239,7 +238,12 @@ impl Worker {
             attempt += 1;
             match self.try_advance_head(&entry).await {
                 Ok(()) => return Ok(()),
-                Err(WorkerError::Transient(error)) => {
+                Err(error @ (WorkerError::Transient(_) | WorkerError::PolicyDenied(_))) => {
+                    let (error, policy_denied) = match error {
+                        WorkerError::Transient(message) => (message, false),
+                        WorkerError::PolicyDenied(message) => (message, true),
+                        _ => unreachable!(),
+                    };
                     if attempt < MAX_STAGE_ATTEMPTS {
                         let backoff = STAGE_RETRY_BASE_BACKOFF * (1u32 << (attempt - 1));
                         debug!(
@@ -279,15 +283,15 @@ impl Worker {
                         %error,
                         "exhausted staging retries, poisoning entry"
                     );
-                    return self
-                        .propose_poison(
-                            entry.queue_id,
-                            PoisonReason::StagingFailed {
-                                error,
-                                attempts: attempt,
-                            },
-                        )
-                        .await;
+                    let reason = if policy_denied {
+                        PoisonReason::PolicyViolation { error }
+                    } else {
+                        PoisonReason::StagingFailed {
+                            error,
+                            attempts: attempt,
+                        }
+                    };
+                    return self.propose_poison(entry.queue_id, reason).await;
                 }
                 Err(WorkerError::Lagged(msg)) => {
                     // The entry is still at the queue front: either
@@ -1245,8 +1249,12 @@ impl Worker {
                 Ok(Ok(())) => {
                     last_committed = Some(queue_id);
                 }
-                Ok(Err(WorkerError::Transient(_) | WorkerError::Stage(_))) => {
-                    unreachable!("process_entry maps Transient/Stage failures to PoisonQueueEntry")
+                Ok(Err(
+                    WorkerError::Transient(_)
+                    | WorkerError::PolicyDenied(_)
+                    | WorkerError::Stage(_),
+                )) => {
+                    unreachable!("process_entry maps staging failures to PoisonQueueEntry")
                 }
                 Ok(Err(WorkerError::Stale(_))) => {
                     unreachable!("try_advance_head consumes Stale internally and returns Ok")
@@ -1603,6 +1611,17 @@ fn stage_failure(message: &str) -> WorkerError {
 /// Anything else can be rooted in this node's view (a commit or namespace
 /// conflict, policy or SHACL over lagging state) and stays transient.
 fn build_commit_failure(err: ApiError) -> WorkerError {
+    if matches!(
+        &err,
+        ApiError::Policy(fluree_db_api::PolicyError::ModifyDenied { .. })
+            | ApiError::Transact(fluree_db_api::TransactError::PolicyViolation(
+                fluree_db_api::PolicyError::ModifyDenied { .. },
+            ))
+    ) {
+        // A stale local view can affect policy evaluation. Retry after the
+        // normal refresh, then preserve the denial if it still fails.
+        return WorkerError::PolicyDenied(err.to_string());
+    }
     match err.status_code() {
         400 | 413 => stage(PoisonReason::BodyMalformed {
             error: err.to_string(),
@@ -1652,6 +1671,10 @@ pub enum WorkerError {
     /// the actual count rather than a placeholder.
     #[error("transient staging error: {0}")]
     Transient(String),
+    /// A typed policy denial that follows the same refresh-and-retry path as
+    /// `Transient`, then becomes `PoisonReason::PolicyViolation` if it persists.
+    #[error("policy denied during staging: {0}")]
+    PolicyDenied(String),
     /// `PoisonReason` is boxed so this enum stays small even though
     /// `PushCasFailed` carries two `Option<ContentId>`s — without
     /// the indirection every `Result<(), WorkerError>` in the worker
@@ -1756,6 +1779,17 @@ mod tests {
                 "{status}"
             );
         }
+    }
+
+    #[test]
+    fn policy_denial_keeps_its_identity_across_staging_retries() {
+        let denied = ApiError::Transact(fluree_db_api::TransactError::PolicyViolation(
+            fluree_db_api::PolicyError::modify_denied("write refused"),
+        ));
+        assert!(matches!(
+            build_commit_failure(denied),
+            WorkerError::PolicyDenied(message) if message.contains("write refused")
+        ));
     }
 
     fn sample_transact_envelope() -> QueuedRequest {

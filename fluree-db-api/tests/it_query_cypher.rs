@@ -1339,20 +1339,62 @@ async fn cypher_collect_through_with() {
         .collect();
     assert_eq!(rows, vec![json!("Bob"), json!("Carol")], "{unwound}");
 
-    // ORDER BY directly on a collect() list in the same WITH is still rejected
-    // (sorting a list value is unsound in v1).
-    assert!(
-        fluree
-            .query_cypher(
-                &db,
-                r#"MATCH (p:Person)-[:KNOWS]->(f:Person)
-                   WITH p, collect(f.name) AS friends ORDER BY friends
-                   RETURN p.name, friends"#,
-            )
+    // ORDER BY on a collect() list in the same WITH, or on a list built from
+    // one, is still rejected (sorting a list value is unsound in v1).
+    for order_by in ["friends", "tail(friends)", "friends + ['x']"] {
+        let query = format!(
+            "MATCH (p:Person)-[:KNOWS]->(f:Person) \
+             WITH p, collect(f.name) AS friends ORDER BY {order_by} RETURN p.name, friends"
+        );
+        assert!(
+            fluree.query_cypher(&db, &query).await.is_err(),
+            "ORDER BY on a collect() list in WITH is rejected: {query}"
+        );
+    }
+
+    // An ORDER BY key that reads the list and yields a scalar sorts after the
+    // aggregation, in a WITH and in a RETURN.
+    for (query, expected) in [
+        (
+            "MATCH (p:Person)-[:KNOWS]->(f:Person) \
+             WITH p, collect(f.name) AS friends ORDER BY size(friends) \
+             RETURN p.name AS name, size(friends) AS n",
+            json!([["Bob", 1], ["Alice", 2]]),
+        ),
+        (
+            "MATCH (p:Person)-[:KNOWS]->(f:Person) \
+             RETURN p.name AS name, collect(f.name) AS friends ORDER BY size(friends) DESC",
+            json!(["Alice", "Bob"]),
+        ),
+        (
+            "MATCH (p:Person)-[:KNOWS]->(f:Person) \
+             WITH p, collect(f.name) AS friends ORDER BY any(x IN friends WHERE x = 'Bob') \
+             RETURN p.name AS name",
+            json!([["Bob"], ["Alice"]]),
+        ),
+    ] {
+        let cj = fluree
+            .query_cypher(&db, query)
             .await
-            .is_err(),
-        "ORDER BY on a collect() list in WITH is rejected"
-    );
+            .unwrap_or_else(|e| panic!("{e}\n{query}"))
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .expect("cypher json");
+        let rows: Vec<JsonValue> = cj["results"][0]["data"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|r| r["row"].clone())
+            .collect();
+        let rows = match expected.as_array().and_then(|e| e.first()) {
+            // Names only: the friends list's order is unspecified.
+            Some(JsonValue::String(_)) => {
+                JsonValue::Array(rows.iter().map(|r| r[0].clone()).collect())
+            }
+            _ => JsonValue::Array(rows),
+        };
+        assert_eq!(rows, expected, "{query}");
+    }
 }
 
 #[tokio::test]
@@ -11110,4 +11152,116 @@ async fn cypher_null_from_optional_match_matches_nothing_inside_exists() {
             json!(["Carol", true])
         ]
     );
+}
+
+/// A Cypher read honors the caller's execution options and tracker: a fuel
+/// limit stops it, the tracker reports what it cost, and a cancelled handle
+/// stops it — as for SPARQL and JSON-LD.
+#[tokio::test]
+async fn cypher_reads_honor_fuel_limits_and_cancellation() {
+    use fluree_db_api::{QueryCancellation, QueryExecutionOptions, Tracker, TrackingOptions};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:limits");
+    let people: Vec<JsonValue> = (0..60)
+        .map(|i| json!({"@id": format!("p{i}"), "@type": "Person", "n": i}))
+        .collect();
+    let committed = fluree
+        .insert(ledger0, &json!({"@context": ctx(), "@graph": people}))
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+    let cross = "MATCH (a:Person), (b:Person), (c:Person) RETURN count(*) AS n";
+    let options = QueryExecutionOptions::default();
+
+    let tracked = |max_fuel: Option<u64>| {
+        Tracker::new(TrackingOptions {
+            track_time: true,
+            track_fuel: true,
+            track_policy: false,
+            max_fuel,
+        })
+    };
+    let tracker = tracked(None);
+    let result = fluree
+        .query_cypher_with_tracker(&db, cross, None, &options, &tracker)
+        .await
+        .expect("unlimited");
+    assert_eq!(result.row_count(), 1);
+    let fuel = tracker.tally().and_then(|t| t.fuel).expect("fuel tallied");
+    assert!(fuel > 0.0, "{fuel}");
+
+    let err = fluree
+        .query_cypher_with_tracker(&db, cross, None, &options, &tracked(Some(1)))
+        .await
+        .expect_err("fuel limit");
+    assert!(err.to_string().to_lowercase().contains("fuel"), "{err}");
+
+    let cancellation = QueryCancellation::new();
+    cancellation.cancel();
+    let err = fluree
+        .query_cypher_with_options(
+            &db,
+            cross,
+            None,
+            &QueryExecutionOptions::new().with_cancellation(cancellation),
+        )
+        .await
+        .expect_err("cancelled");
+    assert!(err.to_string().to_lowercase().contains("cancel"), "{err}");
+}
+
+/// The reads a Cypher write makes count against its fuel limit, as its
+/// staging does: a write whose read is the costly part stops at a limit its
+/// writes alone fit under.
+#[tokio::test]
+async fn cypher_write_reads_count_against_its_fuel_limit() {
+    use fluree_db_api::cypher_seq::{detect_sequential, CypherSeqInput};
+    use fluree_db_api::TrackingOptions;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:write-fuel";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let people: Vec<JsonValue> = (0..60)
+        .map(|i| json!({"@id": format!("p{i}"), "@type": "Person", "n": i}))
+        .collect();
+    fluree
+        .insert(ledger0, &json!({"@context": ctx(), "@graph": people}))
+        .await
+        .expect("seed");
+    let write = |cypher: &'static str, max_fuel: Option<u64>| {
+        let fluree = &fluree;
+        async move {
+            let ast = fluree_db_cypher::parse_cypher(cypher).ast.expect("parse");
+            let plan = detect_sequential(&ast).expect("a sequential write");
+            let handle = fluree.ledger_cached(ledger_id).await.expect("handle");
+            fluree
+                .stage(&handle)
+                .cypher_sequential(CypherSeqInput {
+                    plan,
+                    governance: Default::default(),
+                    skolem_txn_id: None,
+                })
+                .tracking(TrackingOptions {
+                    track_time: false,
+                    track_fuel: true,
+                    track_policy: false,
+                    max_fuel,
+                })
+                .execute()
+                .await
+        }
+    };
+    // A one-row MERGE, read through a 60^3 cross product: its writes cost
+    // ~10 fuel, its read ~220.
+    let cypher = "MATCH (a:Person), (b:Person), (c:Person) WHERE a.n + b.n + c.n = 177 \
+                  MERGE (t:Tag {name: 'probe'})";
+    let fifty_fuel = 50 * fluree_db_core::tracking::MICRO_FUEL_PER_FUEL;
+    let err = write(cypher, Some(fifty_fuel))
+        .await
+        .expect_err("fuel limit");
+    assert!(err.to_string().to_lowercase().contains("fuel"), "{err}");
+    let committed = write(cypher, None).await.expect("unlimited");
+    let fuel = committed.tally.and_then(|t| t.fuel).expect("fuel tallied");
+    assert!(fuel > 50.0, "{fuel}");
 }

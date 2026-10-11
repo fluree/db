@@ -290,8 +290,9 @@ pub enum RemoteLedgerError {
     Network(String),
     /// 401 Unauthorized
     Unauthorized,
-    /// 403 Forbidden
-    Forbidden,
+    /// 403 Forbidden (includes server message if any, such as the reason a
+    /// policy gives for denying a write)
+    Forbidden(String),
     /// 404 Not Found (includes server message if any)
     NotFound(String),
     /// 400 Bad Request (includes server error message)
@@ -318,7 +319,8 @@ impl fmt::Display for RemoteLedgerError {
                  Run `fluree auth login` to store a new token, or \
                  `fluree auth status` to check expiry."
             ),
-            RemoteLedgerError::Forbidden => write!(f, "access denied (403)"),
+            RemoteLedgerError::Forbidden(msg) if msg.is_empty() => write!(f, "access denied (403)"),
+            RemoteLedgerError::Forbidden(msg) => write!(f, "access denied (403): {msg}"),
             RemoteLedgerError::NotFound(msg) => write!(f, "not found: {msg}"),
             RemoteLedgerError::BadRequest(msg) => write!(f, "bad request: {msg}"),
             RemoteLedgerError::Conflict(msg) => write!(f, "conflict (409): {msg}"),
@@ -423,7 +425,7 @@ impl RemoteLedgerClient {
 
         match status {
             StatusCode::UNAUTHORIZED => RemoteLedgerError::Unauthorized,
-            StatusCode::FORBIDDEN => RemoteLedgerError::Forbidden,
+            StatusCode::FORBIDDEN => RemoteLedgerError::Forbidden(message),
             StatusCode::NOT_FOUND => RemoteLedgerError::NotFound(if message.is_empty() {
                 "resource not found".to_string()
             } else {
@@ -3572,6 +3574,30 @@ mod tests {
 
         let err = RemoteLedgerError::BadRequest("invalid query syntax".to_string());
         assert_eq!(format!("{err}"), "bad request: invalid query syntax");
+    }
+
+    /// A write a modify policy denies is a 403 whose body carries the
+    /// policy's reason; the error shows it.
+    #[tokio::test]
+    async fn test_forbidden_keeps_the_server_message() {
+        let response = |body: &'static str| {
+            reqwest::Response::from(
+                http::Response::builder()
+                    .status(403)
+                    .body(body)
+                    .expect("response"),
+            )
+        };
+        let err = RemoteLedgerClient::map_error(response(
+            r#"{"error":"Employees may not modify document content.","status":403}"#,
+        ))
+        .await;
+        assert_eq!(
+            err.to_string(),
+            "access denied (403): Employees may not modify document content."
+        );
+        let err = RemoteLedgerClient::map_error(response("")).await;
+        assert_eq!(err.to_string(), "access denied (403)");
     }
 
     #[test]

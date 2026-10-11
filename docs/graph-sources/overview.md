@@ -140,10 +140,12 @@ Non-ledger graph sources are registered in nameservice:
 
 **Purpose:** Analytics on data lake
 
-Iceberg graph sources require an [R2RML mapping](r2rml.md) that defines how table rows become RDF triples. Two catalog modes select how Iceberg metadata is discovered:
+Iceberg graph sources require an [R2RML mapping](r2rml.md) that defines how table rows become RDF triples. Four catalog modes select how Iceberg metadata is discovered:
 
 - **REST catalog**: connects to an Iceberg REST catalog API (e.g., Polaris)
 - **Direct S3**: reads `metadata/version-hint.text` from the table’s S3 location (no catalog server required)
+- **AWS Glue Data Catalog**: looks the table up in Glue and reads the metadata file its `metadata_location` names, with the ambient AWS credentials
+- **AWS S3 Tables**: resolves the table's metadata file in an S3 Tables table bucket, with the ambient AWS credentials
 
 See [Iceberg / Parquet](iceberg.md) for full configuration details and examples.
 
@@ -190,7 +192,7 @@ Graph sources are created and registered via the `fluree-db-api` Rust API, which
 ```rust
 use fluree_db_api::{FlureeBuilder, R2rmlCreateConfig};
 
-let fluree = FlureeBuilder::default().build().await?;
+let fluree = FlureeBuilder::file("/path/to/data").build_async().await?;
 
 let config = R2rmlCreateConfig::new_direct(
     "execution-log",

@@ -35,7 +35,9 @@ impl Fluree {
         let parsed = parse_query(query_json, primary.snapshot.as_ref(), &mut vars, None)?;
 
         // Build the runtime dataset
-        let runtime_dataset = dataset.as_runtime_dataset();
+        let runtime_dataset = self
+            .runtime_dataset(dataset, parsed.union_default_graph)
+            .await?;
 
         // Build executable query
         let executable = ExecutableQuery::simple(parsed.clone());

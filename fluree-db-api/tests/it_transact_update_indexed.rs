@@ -250,3 +250,88 @@ async fn multi_op_graph_delta_mapping_survives_reload() {
         .expect("json");
     assert_routing(cold_zzz, cold_aaa, "cold reload");
 }
+
+/// A reversal is netted against what the base holds, and in a named graph
+/// the base's values may live only in the index, whose rows carry no graph.
+/// Read cold, so nothing is in novelty: deleting and re-inserting a held
+/// value commits nothing, and inserting and deleting one still deletes it.
+#[tokio::test]
+async fn multi_op_reversal_nets_against_an_indexed_named_graph() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let ledger_id = "it/multiop-named:main";
+    {
+        let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+        fluree
+            .create_ledger(ledger_id)
+            .await
+            .expect("create ledger");
+        fluree
+            .graph(ledger_id)
+            .transact()
+            .sparql_update(
+                r#"PREFIX ex: <http://example.org/ns/>
+                   INSERT DATA { GRAPH ex:g { ex:s ex:p "x" , "y" } }"#,
+            )
+            .commit()
+            .await
+            .expect("seed");
+        crate::support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    }
+    let fluree = FlureeBuilder::file(path).build().expect("cold reload");
+    let update = |sparql: &'static str| {
+        let fluree = fluree.clone();
+        async move {
+            fluree
+                .graph(ledger_id)
+                .transact()
+                .sparql_update(sparql)
+                .commit()
+                .await
+                .expect("commit")
+                .receipt
+        }
+    };
+
+    let receipt = update(
+        r#"PREFIX ex: <http://example.org/ns/>
+           DELETE DATA { GRAPH ex:g { ex:s ex:p "y" } } ;
+           INSERT DATA { GRAPH ex:g { ex:s ex:p "y" } }"#,
+    )
+    .await;
+    assert_eq!(
+        (receipt.t, receipt.flake_count),
+        (1, 0),
+        "deleting and re-inserting a held value commits nothing"
+    );
+
+    let receipt = update(
+        r#"PREFIX ex: <http://example.org/ns/>
+           INSERT DATA { GRAPH ex:g { ex:s ex:p "x" } } ;
+           DELETE DATA { GRAPH ex:g { ex:s ex:p "x" } }"#,
+    )
+    .await;
+    assert_eq!(
+        (receipt.t, receipt.retract_count),
+        (2, 1),
+        "inserting and deleting a held value deletes it"
+    );
+
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let json = query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/ns/> SELECT ?o WHERE { GRAPH ex:g { ex:s ex:p ?o } }",
+    )
+    .await
+    .expect("query")
+    .to_sparql_json(&ledger.snapshot)
+    .expect("sparql json");
+    let values: Vec<&str> = json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|b| b["o"]["value"].as_str().expect("value"))
+        .collect();
+    assert_eq!(values, vec!["y"], "{json}");
+}

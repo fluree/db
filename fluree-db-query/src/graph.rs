@@ -55,6 +55,7 @@ use crate::sort::SortSpec;
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
+use fluree_db_binary_index::BinaryGraphView;
 use fluree_db_core::FlakeValue;
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use std::sync::Arc;
@@ -71,12 +72,52 @@ async fn r2rml_mapping_for_rewrite(
     graph_iri: &str,
 ) -> Option<Arc<CompiledR2rmlMapping>> {
     let provider = ctx.r2rml_provider?;
-    let as_of_t = if ctx.dataset.is_some() {
+    let as_of_t = if ctx.explicit_dataset().is_some() {
         None
     } else {
         Some(ctx.to_t)
     };
     provider.compiled_mapping(graph_iri, as_of_t).await.ok()
+}
+
+/// The encoded bindings a `GRAPH` scope must decode as they leave it, and the
+/// scope's own view to decode them against.
+struct ScopeExit {
+    view: Option<BinaryGraphView>,
+    /// Decode every encoded binding, not only NUM_BIG handles.
+    all: bool,
+}
+
+impl ScopeExit {
+    fn new(ctx: &ExecutionContext<'_>, graph_ctx: &ExecutionContext<'_>) -> Self {
+        // NumBig arena handles are scoped per (graph, predicate), so one that
+        // leaves for a scope on another g_id would be decoded against the
+        // OUTER graph's arena, silently producing wrong values. The other
+        // encoded kinds decode against store-global dictionaries and are safe
+        // to carry out, unless the surrounding scope spans several graphs (a
+        // union default graph, or `FROM` naming several): it has no graph view
+        // to decode anything against.
+        let all = !ctx.has_binary_store();
+        let view = if all || graph_ctx.binary_g_id != ctx.binary_g_id {
+            graph_ctx.graph_view()
+        } else {
+            None
+        };
+        Self { view, all }
+    }
+
+    fn decode(&self, binding: Binding) -> Binding {
+        let leaves_encoded = if self.all {
+            binding.is_encoded()
+        } else {
+            crate::object_binding::is_numbig_encoded(&binding)
+        };
+        if leaves_encoded && self.view.is_some() {
+            crate::group_aggregate::materialize_encoded(&binding, self.view.as_ref())
+        } else {
+            binding
+        }
+    }
 }
 
 /// GRAPH pattern operator - scopes inner patterns to a specific graph
@@ -399,18 +440,7 @@ impl GraphOperator {
         let mem_before_inner = graph_ctx.mem_used();
         inner.open(&graph_ctx).await?;
 
-        // NumBig arena handles are scoped per (graph, predicate). When this
-        // GRAPH scope runs against a different g_id than the surrounding
-        // query, encoded NUM_BIG bindings escaping the scope would later be
-        // decoded against the OUTER graph's arena — silently producing wrong
-        // values. Materialize them here, against this graph's view, before
-        // they leave the scope. (Subject/string/predicate dictionaries are
-        // store-global, so all other encoded kinds escape safely.)
-        let numbig_exit_gv = if graph_ctx.binary_g_id != ctx.binary_g_id {
-            graph_ctx.graph_view()
-        } else {
-            None
-        };
+        let scope_exit = ScopeExit::new(ctx, &graph_ctx);
 
         while let Some(batch) = inner.next_batch(&graph_ctx).await? {
             graph_ctx.check_cancelled()?;
@@ -482,17 +512,7 @@ impl GraphOperator {
                             .get(inner_row_idx, *var)
                             .cloned()
                             .unwrap_or(Binding::Unbound);
-                        let binding = if numbig_exit_gv.is_some()
-                            && crate::object_binding::is_numbig_encoded(&binding)
-                        {
-                            crate::group_aggregate::materialize_encoded(
-                                &binding,
-                                numbig_exit_gv.as_ref(),
-                            )
-                        } else {
-                            binding
-                        };
-                        merged_row.push(binding);
+                        merged_row.push(scope_exit.decode(binding));
                     }
                 }
 
@@ -592,11 +612,7 @@ impl GraphOperator {
         let mem_before_inner = graph_ctx.mem_used();
         inner.open(&graph_ctx).await?;
 
-        let numbig_exit_gv = if graph_ctx.binary_g_id != ctx.binary_g_id {
-            graph_ctx.graph_view()
-        } else {
-            None
-        };
+        let scope_exit = ScopeExit::new(ctx, &graph_ctx);
 
         while let Some(batch) = inner.next_batch(&graph_ctx).await? {
             graph_ctx.check_cancelled()?;
@@ -617,17 +633,7 @@ impl GraphOperator {
                         .get(inner_row_idx, *var)
                         .cloned()
                         .unwrap_or(Binding::Unbound);
-                    let binding = if numbig_exit_gv.is_some()
-                        && crate::object_binding::is_numbig_encoded(&binding)
-                    {
-                        crate::group_aggregate::materialize_encoded(
-                            &binding,
-                            numbig_exit_gv.as_ref(),
-                        )
-                    } else {
-                        binding
-                    };
-                    merged_row.push(binding);
+                    merged_row.push(scope_exit.decode(binding));
                 }
                 self.result_buffer.push(merged_row);
             }
@@ -747,10 +753,10 @@ impl Operator for GraphOperator {
             // Run the whole parent batch through ONE uncorrelated scan so the
             // inner R2RML hash join joins all parent rows at once, instead of
             // re-scanning the table per parent row.
-            if ctx.dataset.is_none() {
+            if ctx.explicit_dataset().is_none() {
                 if let GraphName::Iri(iri) = &graph_name {
                     let is_user_graph = ctx.single_db_user_graph_id(iri).is_some();
-                    let is_alias = iri.as_ref() == ctx.active_snapshot.ledger_id;
+                    let is_alias = ctx.names_default_graph(iri);
                     let is_r2rml_gs = !is_user_graph
                         && !is_alias
                         && if ctx.r2rml_graph_ids.contains(iri.as_ref()) {
@@ -777,7 +783,7 @@ impl Operator for GraphOperator {
                     GraphName::Iri(iri) => {
                         // Concrete graph: run inner patterns in that graph
                         // If graph doesn't exist in dataset → empty result
-                        if let Some(ds) = &ctx.dataset {
+                        if let Some(ds) = ctx.explicit_dataset() {
                             if ds.has_named_graph(iri) {
                                 self.execute_in_graph(
                                     ctx,
@@ -790,10 +796,11 @@ impl Operator for GraphOperator {
                             }
                             // else: graph not found → no output for this row
                         } else {
-                            // Single-db: a registered user graph, the ledger
-                            // alias (default graph), or an R2RML graph source.
+                            // Single-db: a registered user graph, a name of
+                            // the default graph (`names_default_graph`), or an
+                            // R2RML graph source.
                             let is_user_graph = ctx.single_db_user_graph_id(iri).is_some();
-                            let is_alias = iri.as_ref() == ctx.active_snapshot.ledger_id;
+                            let is_alias = ctx.names_default_graph(iri);
                             let is_r2rml_gs = !is_user_graph
                                 && !is_alias
                                 && if ctx.r2rml_graph_ids.contains(iri.as_ref()) {
@@ -823,7 +830,7 @@ impl Operator for GraphOperator {
                                 Self::extract_graph_iri_from_binding(ctx, binding)
                             {
                                 // ?g already bound: use only that graph
-                                if let Some(ds) = &ctx.dataset {
+                                if let Some(ds) = ctx.explicit_dataset() {
                                     if ds.has_named_graph(&bound_iri) {
                                         self.execute_in_graph(
                                             ctx,
@@ -839,8 +846,7 @@ impl Operator for GraphOperator {
                                     // Single-db: same resolution as the concrete arm.
                                     let is_user_graph =
                                         ctx.single_db_user_graph_id(&bound_iri).is_some();
-                                    let is_alias =
-                                        bound_iri.as_ref() == ctx.active_snapshot.ledger_id;
+                                    let is_alias = ctx.names_default_graph(&bound_iri);
                                     let is_r2rml_gs = !is_user_graph
                                         && !is_alias
                                         && if ctx.r2rml_graph_ids.contains(bound_iri.as_ref()) {
@@ -866,7 +872,7 @@ impl Operator for GraphOperator {
                             // else: binding exists but isn't a string IRI → no output
                         } else {
                             // ?g unbound: iterate ALL named graphs, bind ?g
-                            if let Some(ds) = &ctx.dataset {
+                            if let Some(ds) = ctx.explicit_dataset() {
                                 for iri in ds.named_graph_iris() {
                                     self.execute_in_graph(
                                         ctx,

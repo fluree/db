@@ -964,8 +964,15 @@ pub(crate) async fn current_asserted_for_key(
     )
     .await?;
 
+    // The range is scoped to the key's graph, but index rows decode with no
+    // graph of their own, so each takes the key's rather than being compared
+    // against it.
     Ok(flakes
         .into_iter()
-        .filter(|flake| flake.op && flake.g == key.g)
+        .filter(|flake| flake.op)
+        .map(|flake| Flake {
+            g: key.g.clone(),
+            ..flake
+        })
         .collect())
 }

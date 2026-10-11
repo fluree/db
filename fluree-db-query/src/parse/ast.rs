@@ -711,6 +711,9 @@ pub struct UnresolvedOptions {
     /// `opts.includeSystemFacts: true`. See
     /// [`crate::ir::Query::include_system_facts`].
     pub include_system_facts: bool,
+    /// Parsed from `opts.unionDefaultGraph`. See
+    /// [`crate::ir::Query::union_default_graph`].
+    pub union_default_graph: Option<bool>,
 }
 
 impl UnresolvedOptions {
@@ -733,6 +736,7 @@ impl Default for UnresolvedOptions {
             reasoning: None,
             object_var_parsing: true,
             include_system_facts: false,
+            union_default_graph: None,
         }
     }
 }

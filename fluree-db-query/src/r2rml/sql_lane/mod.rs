@@ -270,7 +270,7 @@ pub(super) async fn resolve_block(
     projection: Option<&[VarId]>,
 ) -> Result<Option<Resolved>> {
     let iri = graph_iri;
-    match ctx.dataset {
+    match ctx.explicit_dataset() {
         // Dataset mode reaches the lane: a `FROM <sql-source>` query builds a
         // dataset in which the source is a named graph, and the lane serves it.
         // The membership test is also what keeps a non-member name from
@@ -299,7 +299,7 @@ pub(super) async fn resolve_block(
     let Some(caps) = table_provider.pushdown_capabilities(iri).await? else {
         return Ok(None);
     };
-    let as_of_t = if ctx.dataset.is_some() {
+    let as_of_t = if ctx.explicit_dataset().is_some() {
         None
     } else {
         Some(ctx.to_t)

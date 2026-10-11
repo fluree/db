@@ -179,6 +179,10 @@ pub struct DataSet<'a> {
     /// Further names for graphs, addressable by `GRAPH <name>` but not
     /// enumerated by `GRAPH ?g`, so one graph never binds `?g` twice.
     named_graph_aliases: HashMap<Arc<str>, GraphRef<'a>>,
+    /// Whether the query named this dataset (`FROM` / `FROM NAMED`). A
+    /// ledger's union default graph is not named by the query; see
+    /// [`Self::implicit`].
+    explicit: bool,
 }
 
 impl<'a> DataSet<'a> {
@@ -188,7 +192,24 @@ impl<'a> DataSet<'a> {
             default_graphs: Vec::new(),
             named_graphs: HashMap::new(),
             named_graph_aliases: HashMap::new(),
+            explicit: true,
         }
+    }
+
+    /// Mark this dataset as one the query did not name: a ledger's union
+    /// default graph, whose members are that ledger's graphs. Only
+    /// default-graph patterns read it as a dataset. `GRAPH` resolution, graph
+    /// sources, and as-of time behave as they do with no dataset at all, so
+    /// switching the union on changes nothing but what the default graph
+    /// holds.
+    pub fn implicit(mut self) -> Self {
+        self.explicit = false;
+        self
+    }
+
+    /// Whether the query named this dataset; see [`Self::implicit`].
+    pub fn is_explicit(&self) -> bool {
+        self.explicit
     }
 
     /// Add a default graph
@@ -280,6 +301,7 @@ impl<'a> DataSet<'a> {
                 .iter()
                 .map(|(iri, g)| (Arc::clone(iri), patch(g)))
                 .collect(),
+            explicit: self.explicit,
         }
     }
 

@@ -15,12 +15,14 @@
 //! - Variable names without `?` prefix
 //! - Each binding: `{"type": "literal|uri|bnode", "value": "...", "datatype"?: "...", "xml:lang"?: "..."}`
 //! - Omit datatype for inferable types (xsd:string, xsd:integer, xsd:double, xsd:boolean)
-//! - Disaggregation: `Binding::Grouped` explodes into multiple rows (cartesian product)
+//! - One binding object per solution. A per-group list (`Binding::Grouped`,
+//!   which only a JSON-LD query projects) has no SPARQL-results form, so it is
+//!   a [`FormatError`], like a Cypher path or list.
 
 use super::config::FormatterConfig;
 use super::datatype::may_omit_datatype;
 use super::iri::IriCompactor;
-use super::json_write::{push_json_string, push_value};
+use super::json_write::push_json_string;
 use super::{materialize, FormatError, Result};
 use crate::QueryResult;
 use fluree_db_core::FlakeValue;
@@ -40,7 +42,7 @@ pub fn format(
     let select_one = result.output.is_select_one();
     let mut bindings = Vec::new();
 
-    for batch in &result.batches {
+    'batches: for batch in &result.batches {
         for row_idx in 0..batch.len() {
             // Collect bindings for this row
             let row_bindings: Vec<_> = head_vars
@@ -51,19 +53,12 @@ pub fn format(
                 })
                 .collect();
 
-            // Disaggregate grouped bindings (cartesian product)
-            let disaggregated = disaggregate_row(result, &row_bindings, &result.vars, compactor)?;
+            let row = format_sparql_row(result, &row_bindings, &result.vars, compactor)?;
+            bindings.push(JsonValue::Object(row));
             if select_one {
-                // SelectOne: only return a single formatted row (after disaggregation)
-                if let Some(first) = disaggregated.into_iter().next() {
-                    bindings.push(first);
-                }
-                break;
+                // SelectOne: only return a single formatted row.
+                break 'batches;
             }
-            bindings.extend(disaggregated);
-        }
-        if select_one && !bindings.is_empty() {
-            break;
         }
     }
 
@@ -121,11 +116,9 @@ pub(crate) fn compute_head(result: &QueryResult) -> (Vec<String>, Vec<fluree_db_
 /// Stream SPARQL 1.1 JSON results directly into a `String`, byte-identical to
 /// `serde_json::to_string(&format(...))` for the non-`select_one` SELECT case.
 ///
-/// The common (non-grouped) row streams cell-by-cell with no per-cell
-/// `serde_json::Value` allocation. Grouped rows (GROUP BY without aggregation)
-/// are rare and reuse the proven [`disaggregate_row`] cartesian expansion,
-/// serialized leaf-wise via [`push_value`]. `select_one`, ASK, CONSTRUCT, and
-/// `pretty` are handled by the caller on the DOM path and never reach here.
+/// Every row streams cell-by-cell with no per-cell `serde_json::Value`
+/// allocation. `select_one`, ASK, CONSTRUCT, and `pretty` are handled by the
+/// caller on the DOM path and never reach here.
 pub fn format_string(
     result: &QueryResult,
     compactor: &IriCompactor,
@@ -164,55 +157,26 @@ pub fn format_string(
             .collect();
 
         for row_idx in 0..batch.len() {
-            let has_grouped = cols.iter().any(|&c| {
-                matches!(
-                    c.map(|c| batch.get_by_col(row_idx, c)),
-                    Some(Binding::Grouped(_))
-                )
-            });
-
-            if has_grouped {
-                // Rare: cartesian-expand via the DOM disaggregator, then splice
-                // each fully-built binding object in verbatim.
-                let row_bindings: Vec<(fluree_db_query::VarId, &Binding)> = head_vars
-                    .iter()
-                    .map(|&var_id| {
-                        (
-                            var_id,
-                            batch.get(row_idx, var_id).unwrap_or(&Binding::Unbound),
-                        )
-                    })
-                    .collect();
-                let objs = disaggregate_row(result, &row_bindings, &result.vars, compactor)?;
-                for obj in &objs {
-                    if !first_binding {
-                        out.push(',');
-                    }
-                    first_binding = false;
-                    push_value(&mut out, obj)?;
-                }
-            } else {
-                if !first_binding {
-                    out.push(',');
-                }
-                first_binding = false;
-                out.push('{');
-                let mut first_cell = true;
-                for (k, &col) in cols.iter().enumerate() {
-                    if let Some(col) = col {
-                        let binding = batch.get_by_col(row_idx, col);
-                        write_cell(
-                            &mut out,
-                            result,
-                            binding,
-                            &vars[k],
-                            compactor,
-                            &mut first_cell,
-                        )?;
-                    }
-                }
-                out.push('}');
+            if !first_binding {
+                out.push(',');
             }
+            first_binding = false;
+            out.push('{');
+            let mut first_cell = true;
+            for (k, &col) in cols.iter().enumerate() {
+                if let Some(col) = col {
+                    let binding = batch.get_by_col(row_idx, col);
+                    write_cell(
+                        &mut out,
+                        result,
+                        binding,
+                        &vars[k],
+                        compactor,
+                        &mut first_cell,
+                    )?;
+                }
+            }
+            out.push('}');
         }
     }
 
@@ -220,16 +184,16 @@ pub fn format_string(
     Ok(out)
 }
 
-/// Append NDJSON `{"type":"row","row":{...}}` records — one per logical result
-/// row, each newline-terminated — for every row in `batch`. Returns the count
-/// of row records written (grouped rows expand to several).
+/// Append NDJSON `{"type":"row","row":{...}}` records — one per result row,
+/// each newline-terminated — for every row in `batch`. Returns the count of row
+/// records written.
 ///
-/// The row body (`{...}`) is produced by the same [`write_cell`] /
-/// [`disaggregate_row`] path as the buffered [`format`]/[`format_string`]
-/// binding objects, so a streamed row is byte-identical to the corresponding
-/// SPARQL-JSON binding object — only the surrounding framing differs (an NDJSON
-/// record wrapper instead of an array element). `head_vars`/`vars` come from
-/// [`compute_head`] and are computed once by the driver, then reused per batch.
+/// The row body (`{...}`) is produced by the same [`write_cell`] path as the
+/// buffered [`format_string`] binding objects, so a streamed row is
+/// byte-identical to the corresponding SPARQL-JSON binding object — only the
+/// surrounding framing differs (an NDJSON record wrapper instead of an array
+/// element). `head_vars`/`vars` come from [`compute_head`] and are computed
+/// once by the driver, then reused per batch.
 pub(crate) fn stream_ndjson_rows(
     out: &mut String,
     result: &QueryResult,
@@ -245,48 +209,18 @@ pub(crate) fn stream_ndjson_rows(
         .map(|&v| schema.iter().position(|&sv| sv == v))
         .collect();
 
-    let mut emitted = 0usize;
     for row_idx in 0..batch.len() {
-        let has_grouped = cols.iter().any(|&c| {
-            matches!(
-                c.map(|c| batch.get_by_col(row_idx, c)),
-                Some(Binding::Grouped(_))
-            )
-        });
-
-        if has_grouped {
-            // Rare: cartesian-expand via the DOM disaggregator, then emit one
-            // row record per fully-built binding object.
-            let row_bindings: Vec<(fluree_db_query::VarId, &Binding)> = head_vars
-                .iter()
-                .map(|&var_id| {
-                    (
-                        var_id,
-                        batch.get(row_idx, var_id).unwrap_or(&Binding::Unbound),
-                    )
-                })
-                .collect();
-            let objs = disaggregate_row(result, &row_bindings, &result.vars, compactor)?;
-            for obj in &objs {
-                out.push_str("{\"type\":\"row\",\"row\":");
-                push_value(out, obj)?;
-                out.push_str("}\n");
-                emitted += 1;
+        out.push_str("{\"type\":\"row\",\"row\":{");
+        let mut first_cell = true;
+        for (k, &col) in cols.iter().enumerate() {
+            if let Some(col) = col {
+                let binding = batch.get_by_col(row_idx, col);
+                write_cell(out, result, binding, &vars[k], compactor, &mut first_cell)?;
             }
-        } else {
-            out.push_str("{\"type\":\"row\",\"row\":{");
-            let mut first_cell = true;
-            for (k, &col) in cols.iter().enumerate() {
-                if let Some(col) = col {
-                    let binding = batch.get_by_col(row_idx, col);
-                    write_cell(out, result, binding, &vars[k], compactor, &mut first_cell)?;
-                }
-            }
-            out.push_str("}}\n");
-            emitted += 1;
         }
+        out.push_str("}}\n");
     }
-    Ok(emitted)
+    Ok(batch.len())
 }
 
 /// Write one `"name":{term}` cell, or nothing for Unbound/Poisoned/null literals
@@ -350,11 +284,7 @@ fn write_term(out: &mut String, binding: &Binding, compactor: &IriCompactor) -> 
                 compactor.emits_absolute_iris(),
             )?;
         }
-        Binding::Grouped(_) => {
-            return Err(FormatError::InvalidBinding(
-                "Binding::Grouped should be disaggregated before formatting".to_string(),
-            ));
-        }
+        Binding::Grouped(_) => return Err(grouped_cell_error()),
         Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {
             return Err(FormatError::InvalidBinding(
                 "SPARQL results have no path/list type (Cypher-only)".to_string(),
@@ -677,10 +607,7 @@ fn format_binding(
             }
         }
 
-        // Grouped values should be disaggregated before reaching here
-        Binding::Grouped(_) => Err(FormatError::InvalidBinding(
-            "Binding::Grouped should be disaggregated before formatting".to_string(),
-        )),
+        Binding::Grouped(_) => Err(grouped_cell_error()),
 
         Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {
             Err(FormatError::InvalidBinding(
@@ -698,64 +625,18 @@ fn format_binding(
 
 // NOTE: encoded binding materialization is centralized in `format::materialize`.
 
-/// Disaggregate grouped bindings into multiple rows (cartesian product)
-///
-/// Input row with Grouped columns: {a: [1,2], b: [x,y]}
-/// Output: [{a:1, b:x}, {a:1, b:y}, {a:2, b:x}, {a:2, b:y}]
-fn disaggregate_row(
-    result: &QueryResult,
-    bindings: &[(fluree_db_query::VarId, &Binding)],
-    vars: &VarRegistry,
-    compactor: &IriCompactor,
-) -> Result<Vec<JsonValue>> {
-    // Separate grouped from scalar columns
-    let mut grouped_cols: Vec<(fluree_db_query::VarId, &[Binding])> = Vec::new();
-    let mut scalar_cols: Vec<(fluree_db_query::VarId, &Binding)> = Vec::new();
-
-    for &(var_id, binding) in bindings {
-        match binding {
-            Binding::Grouped(values) => grouped_cols.push((var_id, values)),
-            _ => scalar_cols.push((var_id, binding)),
-        }
-    }
-
-    if grouped_cols.is_empty() {
-        // No grouped columns - single row output
-        let row = format_sparql_row(result, &scalar_cols, vars, compactor)?;
-        return Ok(vec![JsonValue::Object(row)]);
-    }
-
-    // Start with a single empty row
-    let mut results: Vec<Map<String, JsonValue>> = vec![Map::new()];
-
-    // Add scalar columns to all result rows
-    for (var_id, binding) in &scalar_cols {
-        if let Some(formatted) = format_binding(result, binding, compactor)? {
-            let var_name = strip_question_mark(vars.name(*var_id));
-            for row in &mut results {
-                row.insert(var_name.clone(), formatted.clone());
-            }
-        }
-    }
-
-    // Expand grouped columns via cartesian product
-    for (var_id, values) in grouped_cols {
-        let var_name = strip_question_mark(vars.name(var_id));
-        let mut new_results = Vec::new();
-
-        for row in results {
-            for val in values {
-                let mut new_row = row.clone();
-                if let Some(formatted) = format_binding(result, val, compactor)? {
-                    new_row.insert(var_name.clone(), formatted);
-                }
-                new_results.push(new_row);
-            }
-        }
-        results = new_results;
-    }
-
-    Ok(results.into_iter().map(JsonValue::Object).collect())
+/// A per-group list in a SPARQL-results cell. Only a JSON-LD query projects one
+/// (a SPARQL query cannot: `Grouping::first_ungrouped_read` rejects it at plan
+/// time), and SPARQL results have no list type. Expanding it into one row per
+/// element — what this formatter used to do — invents solutions and drops the
+/// row of an empty list.
+pub(crate) fn grouped_cell_error() -> FormatError {
+    FormatError::InvalidBinding(
+        "SPARQL results have no list type: a JSON-LD query projected a per-group list \
+         (a variable its grouping neither keys nor aggregates); aggregate it (e.g. with \
+         group-concat) or use a JSON-LD output format"
+            .to_string(),
+    )
 }
 
 /// Format a single row of scalar bindings to a SPARQL JSON binding object
@@ -1130,23 +1011,35 @@ mod tests {
         assert_parity(&r, &c);
     }
 
+    /// A per-group list has no SPARQL-results form: every writer refuses it
+    /// rather than expanding it into one row per element (a cartesian product
+    /// across list columns, and a dropped row for an empty list).
     #[test]
-    fn parity_grouped_disaggregation() {
+    fn grouped_cell_is_a_format_error() {
         let c = make_test_compactor();
-        let r = make_result(
-            &["?a", "?b"],
-            vec![vec![
-                Binding::Grouped(vec![
-                    Binding::lit(FlakeValue::Long(10), Sid::new(2, "long")),
-                    Binding::lit(FlakeValue::Long(20), Sid::new(2, "long")),
-                ]),
-                Binding::Grouped(vec![
+        for list in [
+            Binding::Grouped(vec![
+                Binding::lit(FlakeValue::Long(10), Sid::new(2, "long")),
+                Binding::lit(FlakeValue::Long(20), Sid::new(2, "long")),
+            ]),
+            Binding::Grouped(Vec::new()),
+        ] {
+            let r = make_result(
+                &["?a", "?b"],
+                vec![vec![
+                    list,
                     Binding::lit(FlakeValue::Long(1), Sid::new(2, "long")),
-                    Binding::lit(FlakeValue::Long(2), Sid::new(2, "long")),
-                ]),
-            ]],
-        );
-        assert_parity(&r, &c);
+                ]],
+            );
+            let config = FormatterConfig::sparql_json();
+            assert!(format(&r, &c, &config).is_err());
+            assert!(format_string(&r, &c, &config).is_err());
+            let (vars, head_vars) = compute_head(&r);
+            let mut out = String::new();
+            assert!(
+                stream_ndjson_rows(&mut out, &r, &r.batches[0], &head_vars, &vars, &c).is_err()
+            );
+        }
     }
 
     #[test]

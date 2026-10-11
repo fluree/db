@@ -124,6 +124,10 @@ impl<'a> QueryCore<'a> {
         self.execution = options;
     }
 
+    pub(crate) fn set_params(&mut self, params: fluree_db_sparql::ParamMap) {
+        self.execution = std::mem::take(&mut self.execution).with_params(params);
+    }
+
     #[cfg(feature = "iceberg")]
     pub(crate) fn set_r2rml(&mut self) {
         self.graph_sources = GraphSourceMode::R2rml;
@@ -231,6 +235,12 @@ impl<'a> ViewQueryBuilder<'a> {
     /// Attach a cooperative cancellation handle.
     pub fn cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
         self.core.set_cancellation(cancellation);
+        self
+    }
+
+    /// Bind SPARQL variables to values; see [`QueryExecutionOptions::with_params`].
+    pub fn params(mut self, params: fluree_db_sparql::ParamMap) -> Self {
+        self.core.set_params(params);
         self
     }
 
@@ -506,6 +516,12 @@ impl<'a> DatasetQueryBuilder<'a> {
     /// Attach a cooperative cancellation handle.
     pub fn cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
         self.core.set_cancellation(cancellation);
+        self
+    }
+
+    /// Bind SPARQL variables to values; see [`QueryExecutionOptions::with_params`].
+    pub fn params(mut self, params: fluree_db_sparql::ParamMap) -> Self {
+        self.core.set_params(params);
         self
     }
 
@@ -871,6 +887,12 @@ impl<'a> FromQueryBuilder<'a> {
         self
     }
 
+    /// Bind SPARQL variables to values; see [`QueryExecutionOptions::with_params`].
+    pub fn params(mut self, params: fluree_db_sparql::ParamMap) -> Self {
+        self.core.set_params(params);
+        self
+    }
+
     /// Set query execution controls.
     pub fn execution_options(mut self, options: QueryExecutionOptions) -> Self {
         self.core.set_execution_options(options);
@@ -909,12 +931,13 @@ impl<'a> FromQueryBuilder<'a> {
     /// / inline policy) that should be resolved into a `PolicyContext`
     /// *internally*, against the query's own resolved dataset.
     ///
-    /// This is the policy channel for **SPARQL** sub-queries, which have no
-    /// body `opts` block to carry identity/policy the way JSON-LD does. When
-    /// set and the input is SPARQL, execution routes through
+    /// This is the programmatic policy channel for **SPARQL**, which carries
+    /// only the pragma subset of JSON-LD's body `opts` (no inline `policy`
+    /// document). When set and the input is SPARQL, execution routes through
     /// `query_connection_sparql_with_opts` (mirroring JSON-LD's
-    /// `query_connection` opts→policy path). For JSON-LD input it is a no-op
-    /// — JSON-LD carries its opts in the body. Takes precedence over
+    /// `query_connection` opts→policy path), and the request's own
+    /// `# PRAGMA` policy selection is not consulted. For JSON-LD input it is a
+    /// no-op — JSON-LD carries its opts in the body. Takes precedence over
     /// [`Self::policy`] when both are set.
     pub fn connection_opts(mut self, opts: GovernanceOptions) -> Self {
         self.connection_opts = Some(opts);
@@ -936,6 +959,7 @@ impl<'a> FromQueryBuilder<'a> {
     }
 
     fn prepare_authorization(&mut self) -> Result<Option<JsonValue>> {
+        self.adopt_sparql_pragma_policy();
         let Some(authorization) = self.authorization else {
             return Ok(None);
         };
@@ -952,6 +976,22 @@ impl<'a> FromQueryBuilder<'a> {
             Ok(Some(json))
         } else {
             Ok(None)
+        }
+    }
+
+    /// A SPARQL request's policy pragmas stand in for the body `opts` it has
+    /// no room for, unless the caller chose policy programmatically. Under
+    /// [`Self::authorization`] they are constrained like any request selection.
+    fn adopt_sparql_pragma_policy(&mut self) {
+        if self.connection_opts.is_some() || self.policy.is_some() {
+            return;
+        }
+        if let Some(QueryInput::Sparql(sparql)) = self.core.input {
+            let mut opts = GovernanceOptions::from_sparql(sparql);
+            if opts.has_any_policy_inputs() {
+                opts.server_identity = self.core.execution.server_identity.clone();
+                self.connection_opts = Some(opts);
+            }
         }
     }
 
@@ -1129,7 +1169,7 @@ impl<'a> FromQueryBuilder<'a> {
                     execution.clone(),
                 )
                 .await?;
-            let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
+            let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
             let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
             return if let Some(alias) = spec
                 .default_graphs
@@ -1228,7 +1268,7 @@ impl<'a> FromQueryBuilder<'a> {
                         }
                     },
                 };
-                let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
+                let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
                 let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
                 if let Some(alias) = spec
                     .default_graphs
@@ -1299,7 +1339,7 @@ impl<'a> FromQueryBuilder<'a> {
                     execution.clone(),
                 )
                 .await?;
-            let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
+            let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
             let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
             return if let Some(alias) = spec
                 .default_graphs
@@ -1404,7 +1444,7 @@ impl<'a> FromQueryBuilder<'a> {
                         }
                     },
                 };
-                let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
+                let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
                 let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
                 if let Some(alias) = spec
                     .default_graphs
