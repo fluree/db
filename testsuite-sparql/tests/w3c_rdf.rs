@@ -1,12 +1,12 @@
 //! W3C RDF test suite registration.
 //!
 //! Runs the vendored `rdf-tests` RDF 1.1 and RDF 1.2 Turtle manifests
-//! through the Turtle parser on the `GraphCollectorSink` path — the parser
-//! behind `parse_to_json`, i.e. the conversion every JSON-LD write path
-//! (upsert, graph sync, memory import) uses for Turtle input — and the RDF
-//! 1.2 N-Triples, N-Quads and TriG manifests (each including its RDF 1.1
-//! suite) through the parsers their ingest paths use. Same contract
-//! as `w3c_sparql.rs`: a suite is green when every test passes or appears in
+//! through the Turtle parser on the `GraphCollectorSink` path (the sink
+//! behind `parse_to_json`, which memory import uses; insert, upsert and
+//! graph sync read RDF text with the same parser), and the RDF 1.2
+//! N-Triples, N-Quads and TriG manifests (each including its RDF 1.1 suite)
+//! through the parsers their ingest paths use. Same contract as
+//! `w3c_sparql.rs`: a suite is green when every test passes or appears in
 //! its register, and `check_testsuite` polices the register both ways.
 
 use anyhow::Result;

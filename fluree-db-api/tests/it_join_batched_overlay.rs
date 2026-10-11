@@ -483,8 +483,8 @@ async fn batched_object_join_merges_novelty() {
         .expect("reindex base");
 
     // Novelty tail: b2's author retracted, b3 asserted, grace + b4 exist only
-    // in novelty, and b5's two-entry author @list is fully retracted (both
-    // flakes share (s, p, o) and differ only in o_i).
+    // in novelty, and one entry of b5's two-entry author @list is retracted
+    // (both flakes share (s, p, o) and differ only in o_i).
     let receipt = fluree
         .update(
             receipt.ledger,
@@ -499,14 +499,15 @@ async fn batched_object_join_merges_novelty() {
     let receipt = fluree
         .update(
             receipt.ledger,
+            // A constant delete names one entry of a value held at several
+            // list positions; a WHERE-driven delete would name every one.
             &json!({
                 "@context": ctx(),
-                "where":  {"@id": "ex:b5", "ex:authors": "?a"},
-                "delete": {"@id": "ex:b5", "ex:authors": "?a"}
+                "delete": {"@id": "ex:b5", "ex:authors": {"@id": "ex:bob"}}
             }),
         )
         .await
-        .expect("retract b5 author list");
+        .expect("retract one b5 author entry");
     let _receipt = fluree
         .insert(
             receipt.ledger,
@@ -542,10 +543,9 @@ async fn batched_object_join_merges_novelty() {
             r"PREFIX ex: <http://example.org/ns/>
               SELECT ?x WHERE { VALUES ?b { ex:bob ex:dave } ?x ex:authors ?b }
               ORDER BY ?x",
-            1, // the delete's WHERE dedupes the repeated @list value to one
-            // binding, so exactly ONE of the two o_i entries is retracted:
-            // the fate check must discriminate the entries by o_i (a
-            // default-read o_i would either resurrect both or drop both)
+            1, // exactly ONE of the two o_i entries is retracted: the fate
+            // check must discriminate the entries by o_i (a default-read o_i
+            // would either resurrect both or drop both)
             true,
         ),
         (

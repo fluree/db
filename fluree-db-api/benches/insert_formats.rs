@@ -14,7 +14,14 @@
 //
 //   formats:   jsonld, turtle, trig (the same Turtle body inside one
 //              `GRAPH <g> { … }` block — exercises the named-graph
-//              structured path, which Turtle and JSON-LD never touch)
+//              structured path, which Turtle and JSON-LD never touch),
+//              upsert_turtle (the Turtle bodies upserted into a fresh
+//              ledger: new subjects), upsert_turtle_replace (the same
+//              upserts over a ledger that already holds them: every
+//              subject's values are read and restated), and trig_mixed
+//              (TriG insert of each body with its first half in the
+//              default graph and its second half in a trailing block —
+//              the documents the streaming Turtle parse stops on)
 //   txn counts: 10, 100
 //   nodes/txn:  10, 100, 1000
 //
@@ -82,6 +89,11 @@ struct PregenData {
     turtle_txns: Vec<String>,
     /// `turtle_txns` with the body wrapped in a single named-graph block.
     trig_txns: Vec<String>,
+    /// `turtle_txns` with the second half of the body in a trailing block.
+    trig_mixed_txns: Vec<String>,
+    /// `turtle_txns` with every statement in its own block, under extra
+    /// prefix declarations.
+    trig_blocks_txns: Vec<String>,
     /// Total flakes produced by inserting all transactions (calibrated once).
     total_flakes: u64,
 }
@@ -99,12 +111,16 @@ fn pregen(
     let mut jsonld_txns = Vec::with_capacity(txn_count);
     let mut turtle_txns = Vec::with_capacity(txn_count);
     let mut trig_txns = Vec::with_capacity(txn_count);
+    let mut trig_mixed_txns = Vec::with_capacity(txn_count);
+    let mut trig_blocks_txns = Vec::with_capacity(txn_count);
 
     for txn_idx in 0..txn_count {
         let data = generate_txn_data(txn_idx, nodes_per_txn);
         jsonld_txns.push(txn_data_to_jsonld(&data));
         let turtle = txn_data_to_turtle(&data);
         trig_txns.push(turtle_to_trig(&turtle));
+        trig_mixed_txns.push(turtle_to_trig_mixed(&turtle));
+        trig_blocks_txns.push(turtle_to_trig_blocks(&turtle));
         turtle_txns.push(turtle);
     }
 
@@ -135,6 +151,8 @@ fn pregen(
         jsonld_txns,
         turtle_txns,
         trig_txns,
+        trig_mixed_txns,
+        trig_blocks_txns,
         total_flakes,
     }
 }
@@ -156,6 +174,70 @@ fn turtle_to_trig(turtle: &str) -> String {
     out.push_str("GRAPH <http://example.org/ns/bench-graph> {\n");
     out.push_str(&body);
     out.push_str("}\n");
+    out
+}
+
+/// Keep the first half of a Turtle document's statements in the default
+/// graph and move the second half into one trailing `GRAPH <g> { … }` block.
+/// Statements are the blank-line-separated paragraphs `txn_data_to_turtle`
+/// writes, after its `@prefix` lines.
+fn turtle_to_trig_mixed(turtle: &str) -> String {
+    let (prefixes, body): (Vec<&str>, Vec<&str>) =
+        turtle.lines().partition(|l| l.starts_with("@prefix"));
+    let body = body.join("\n");
+    let statements: Vec<&str> = body
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let split = statements.len() / 2;
+    let mut out = String::with_capacity(turtle.len() + 64);
+    for p in prefixes {
+        out.push_str(p);
+        out.push('\n');
+    }
+    for st in &statements[..split] {
+        out.push_str(st);
+        out.push_str("\n\n");
+    }
+    out.push_str("GRAPH <http://example.org/ns/bench-graph> {\n");
+    for st in &statements[split..] {
+        out.push_str(st);
+        out.push_str("\n\n");
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// Every statement of a Turtle document in its own `GRAPH <g> { … }` block,
+/// over ten graphs, with sixteen more prefix declarations than the document
+/// uses: the many-small-blocks shape, where per-block parser setup would
+/// dominate.
+fn turtle_to_trig_blocks(turtle: &str) -> String {
+    let (prefixes, body): (Vec<&str>, Vec<&str>) =
+        turtle.lines().partition(|l| l.starts_with("@prefix"));
+    let body = body.join("\n");
+    let mut out = String::with_capacity(turtle.len() * 2);
+    for p in prefixes {
+        out.push_str(p);
+        out.push('\n');
+    }
+    for i in 0..16 {
+        out.push_str(&format!(
+            "@prefix x{i}: <http://example.org/extra/{i}/> .\n"
+        ));
+    }
+    for (k, st) in body
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .enumerate()
+    {
+        out.push_str(&format!(
+            "GRAPH <http://example.org/ns/bench-graph-{}> {{\n{st}\n}}\n",
+            k % 10
+        ));
+    }
     out
 }
 
@@ -202,6 +284,29 @@ async fn run_turtle_inserts(
                 CommitOpts::default(),
                 index_config,
                 None,
+            )
+            .await
+            .unwrap();
+        ledger = result.ledger;
+    }
+    ledger
+}
+
+async fn run_turtle_upserts(
+    fluree: &BenchFluree,
+    ledger: BenchLedger,
+    txns: &[String],
+    index_config: &IndexConfig,
+) -> BenchLedger {
+    let mut ledger = ledger;
+    for txn in txns {
+        let result = fluree
+            .upsert_turtle_with_opts(
+                ledger,
+                txn,
+                TxnOpts::default(),
+                CommitOpts::default(),
+                index_config,
             )
             .await
             .unwrap();
@@ -418,6 +523,112 @@ fn bench_insert_formats(c: &mut Criterion) {
                     });
                 });
             });
+
+            // --- Turtle upsert, new subjects ---
+            group.bench_with_input(
+                BenchmarkId::new("upsert_turtle", &param_label),
+                &data,
+                |b, data| {
+                    b.iter(|| {
+                        let alias = next_ledger_alias("ttl-up");
+                        rt.block_on(async {
+                            let ledger = fluree.create_ledger(&alias).await.unwrap();
+                            black_box(
+                                run_turtle_upserts(
+                                    &fluree,
+                                    ledger,
+                                    &data.turtle_txns,
+                                    &index_config,
+                                )
+                                .await,
+                            )
+                        })
+                    });
+                },
+            );
+
+            // --- Turtle upsert over the same data (read + restate) ---
+            group.bench_with_input(
+                BenchmarkId::new("upsert_turtle_replace", &param_label),
+                &data,
+                |b, data| {
+                    b.iter_batched(
+                        || {
+                            rt.block_on(async {
+                                let alias = next_ledger_alias("ttl-up-rep");
+                                let ledger = fluree.create_ledger(&alias).await.unwrap();
+                                run_turtle_inserts(
+                                    &fluree,
+                                    ledger,
+                                    &data.turtle_txns,
+                                    &index_config,
+                                )
+                                .await
+                            })
+                        },
+                        |ledger| {
+                            rt.block_on(async {
+                                black_box(
+                                    run_turtle_upserts(
+                                        &fluree,
+                                        ledger,
+                                        &data.turtle_txns,
+                                        &index_config,
+                                    )
+                                    .await,
+                                )
+                            })
+                        },
+                        criterion::BatchSize::PerIteration,
+                    );
+                },
+            );
+
+            // --- TriG insert: default graph + trailing block ---
+            group.bench_with_input(
+                BenchmarkId::new("trig_mixed", &param_label),
+                &data,
+                |b, data| {
+                    b.iter(|| {
+                        let alias = next_ledger_alias("trig-mixed");
+                        rt.block_on(async {
+                            let ledger = fluree.create_ledger(&alias).await.unwrap();
+                            black_box(
+                                run_turtle_inserts(
+                                    &fluree,
+                                    ledger,
+                                    &data.trig_mixed_txns,
+                                    &index_config,
+                                )
+                                .await,
+                            )
+                        })
+                    });
+                },
+            );
+
+            // --- TriG insert: every statement in its own block ---
+            group.bench_with_input(
+                BenchmarkId::new("trig_blocks", &param_label),
+                &data,
+                |b, data| {
+                    b.iter(|| {
+                        let alias = next_ledger_alias("trig-blocks");
+                        rt.block_on(async {
+                            let ledger = fluree.create_ledger(&alias).await.unwrap();
+                            black_box(
+                                run_turtle_inserts(
+                                    &fluree,
+                                    ledger,
+                                    &data.trig_blocks_txns,
+                                    &index_config,
+                                )
+                                .await,
+                            )
+                        })
+                    });
+                },
+            );
 
             // Collect a single timed run for the summary table.
             let jsonld_ms = time_jsonld_run(&rt, &fluree, &data.jsonld_txns, &index_config);

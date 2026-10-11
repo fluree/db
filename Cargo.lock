@@ -4006,6 +4006,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ulid",
+ "xxhash-rust",
  "zstd",
 ]
 

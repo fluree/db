@@ -3,6 +3,7 @@
 //! This module provides `FlakeGenerator` for materializing triple templates
 //! with variable bindings into concrete flakes.
 
+use crate::current_facts::RetractIntent;
 use crate::error::{Result, TransactError};
 use crate::ir::{TemplateGraph, TemplateTerm, TemplateTripleTerm, TripleTemplate};
 use crate::namespace::NamespaceRegistry;
@@ -137,13 +138,29 @@ impl<'a> FlakeGenerator<'a> {
         self.generate_flakes(templates, bindings, true)
     }
 
-    /// Generate retraction flakes from delete templates
-    pub fn generate_retractions(
+    /// Instantiate DELETE templates into retraction intents, one per template
+    /// per solution row. `witnessed[i]` says whether a WHERE triple witnesses
+    /// `templates[i]` (see `delete_witness`). An intent is what the
+    /// transaction asks to retract, not yet a retraction: the resolver turns
+    /// it into one only if it names a stored fact.
+    pub(crate) fn generate_retract_intents(
         &mut self,
         templates: &[TripleTemplate],
+        witnessed: &[bool],
         bindings: &Batch,
-    ) -> Result<Vec<Flake>> {
-        self.generate_flakes(templates, bindings, false)
+    ) -> Result<Vec<RetractIntent>> {
+        debug_assert_eq!(templates.len(), witnessed.len());
+        let mut intents = Vec::new();
+        for row_idx in 0..Self::solution_rows(bindings) {
+            for (template, &witnessed) in templates.iter().zip(witnessed) {
+                if let Some(flake) =
+                    self.materialize_template(template, bindings, row_idx, false)?
+                {
+                    intents.push(RetractIntent::new(flake, witnessed));
+                }
+            }
+        }
+        Ok(intents)
     }
 
     /// Generate flakes from templates with given operation flag
@@ -154,26 +171,27 @@ impl<'a> FlakeGenerator<'a> {
         op: bool,
     ) -> Result<Vec<Flake>> {
         let mut flakes = Vec::new();
-
-        // Row count semantics:
-        // - INSERT without WHERE produces an "empty bindings" batch (0 vars, 0 rows). We still need
-        //   to materialize templates once, so treat it as a single empty row.
-        // - UPDATE/UPSERT where WHERE matches nothing produces an empty batch with a non-empty
-        //   schema (vars present but 0 rows). In that case, there are **zero solution rows** and
-        //   templates must produce **zero flakes** (no-op).
-        let row_count = if bindings.is_empty() {
-            usize::from(bindings.schema().is_empty())
-        } else {
-            bindings.len()
-        };
-
-        for row_idx in 0..row_count {
+        for row_idx in 0..Self::solution_rows(bindings) {
             for template in templates {
                 flakes.extend(self.materialize_template(template, bindings, row_idx, op)?);
             }
         }
-
         Ok(flakes)
+    }
+
+    /// Solution rows in a WHERE batch.
+    ///
+    /// - INSERT without WHERE produces an "empty bindings" batch (0 vars, 0
+    ///   rows). Templates still materialize once, so it is one empty row.
+    /// - UPDATE/UPSERT where WHERE matches nothing produces an empty batch
+    ///   with a non-empty schema (vars present but 0 rows): **zero solution
+    ///   rows**, so templates produce **zero flakes** (no-op).
+    fn solution_rows(bindings: &Batch) -> usize {
+        if bindings.is_empty() {
+            usize::from(bindings.schema().is_empty())
+        } else {
+            bindings.len()
+        }
     }
 
     /// Materialize a single template with bindings into a flake
@@ -563,6 +581,16 @@ impl<'a> FlakeGenerator<'a> {
         Ok(Some(fluree_db_core::TripleTermValue { s, p, o, dt, lang }))
     }
 
+    /// The Sid an upsert's blank node `label` skolemizes to.
+    ///
+    /// Upsert has no WHERE, so its templates are instantiated for exactly one
+    /// solution — index 0 — and this is the Sid that solution's assertions
+    /// carry. The upsert wave uses it to find the stored values of a blank
+    /// subject whose skolem scope is deterministic.
+    pub(crate) fn upsert_blank_subject(&mut self, label: &str) -> Sid {
+        self.skolemize_blank_node(label, 0)
+    }
+
     /// Skolemize a blank node to a Sid.
     ///
     /// Creates a unique Sid for a blank node label within this transaction and
@@ -733,10 +761,12 @@ mod tests {
         )];
 
         let batch = make_empty_batch();
-        let flakes = generator.generate_retractions(&templates, &batch).unwrap();
+        let intents = generator
+            .generate_retract_intents(&templates, &[false], &batch)
+            .unwrap();
 
-        assert_eq!(flakes.len(), 1);
-        assert!(!flakes[0].op);
+        assert_eq!(intents.len(), 1);
+        assert!(!intents[0].flake().op);
     }
 
     #[test]
