@@ -86,6 +86,11 @@ async fn plan_ops(fluree: &fluree_db_api::Fluree, body: &str) -> Vec<String> {
         .explain_sparql(&view, &sparql(body))
         .await
         .expect("explain");
+    physical_ops(&plan)
+}
+
+/// The physical operators of an explain plan, root first.
+fn physical_ops(plan: &JsonValue) -> Vec<String> {
     fn walk(node: &JsonValue, out: &mut Vec<String>) {
         if let Some(op) = node["op"].as_str() {
             let right = node["details"]["right"].as_str().unwrap_or_default();
@@ -465,6 +470,46 @@ async fn bind_anchors_the_property_path_that_starts_from_its_target() {
 }
 
 #[tokio::test]
+async fn jsonld_bind_anchors_the_property_path_that_starts_from_its_target() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let chain: Vec<JsonValue> = (0..5)
+        .map(|i| json!({"@id": format!("ex:n{i}"), "ex:next": {"@id": format!("ex:n{}", i + 1)}}))
+        .collect();
+    seed_computed_keys(&fluree, 0, 0, chain, false).await;
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/", "nextPlus": {"@path": "ex:next+"}},
+        "from": LEDGER_ID,
+        "select": ["?x"],
+        "where": [
+            ["bind", "?start", "(iri \"http://example.org/ns/n0\")"],
+            {"@id": "?start", "nextPlus": "?x"}
+        ]
+    });
+    let view = fluree.db(LEDGER_ID).await.expect("view");
+    let ops = physical_ops(&fluree.explain(&view, &query).await.expect("explain"));
+    let at = |op: &str| {
+        ops.iter()
+            .position(|o| o.starts_with(op))
+            .unwrap_or_else(|| panic!("no {op}: {ops:?}"))
+    };
+    assert!(
+        at("PropertyPathOperator") < at("BindOperator"),
+        "the BIND should feed the path: {ops:?}"
+    );
+    let result = fluree
+        .query_from()
+        .jsonld(&query)
+        .execute_tracked()
+        .await
+        .expect("query should succeed");
+    let mut found: Vec<JsonValue> = result.result.as_array().expect("rows").clone();
+    found.sort_by_key(ToString::to_string);
+    let expected: Vec<JsonValue> = (1..6).map(|i| json!([format!("ex:n{i}")])).collect();
+    assert_eq!(found, expected);
+}
+
+#[tokio::test]
 async fn jsonld_unwind_reads_the_value_its_triple_binds_after_an_undef_cell() {
     let fluree = FlureeBuilder::memory().build_memory();
     seed(&fluree, false).await;
@@ -500,4 +545,35 @@ async fn jsonld_unwind_reads_the_value_its_triple_binds_after_an_undef_cell() {
         .collect();
     expected.sort_by_key(ToString::to_string);
     assert_eq!(found, expected);
+}
+
+/// A BIND feeds a UNION whose branches read its target, so each branch runs
+/// with the key bound. Held behind the UNION, the branches ran with `?start`
+/// unbound and the BIND kept the rows that matched it.
+#[tokio::test]
+async fn bind_feeds_the_union_whose_branches_read_its_target() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let chain: Vec<JsonValue> = (0..5)
+        .map(|i| json!({"@id": format!("ex:n{i}"), "ex:next": {"@id": format!("ex:n{}", i + 1)}}))
+        .collect();
+    seed_computed_keys(&fluree, 0, 0, chain, false).await;
+
+    let body = "SELECT ?x WHERE {
+      BIND(ex:n1 AS ?start)
+      { ?start ex:next ?x } UNION { ?x ex:next ?start }
+    }";
+    let ops = plan_ops(&fluree, body).await;
+    let at = |op: &str| {
+        ops.iter()
+            .position(|o| o.starts_with(op))
+            .unwrap_or_else(|| panic!("no {op}: {ops:?}"))
+    };
+    assert!(
+        at("UnionOperator") < at("BindOperator"),
+        "the BIND should feed the UNION: {ops:?}"
+    );
+    assert_eq!(
+        rows(&fluree, body, &["x"]).await,
+        vec![vec![s("n0")], vec![s("n2")]]
+    );
 }

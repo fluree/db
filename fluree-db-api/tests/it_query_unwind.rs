@@ -227,6 +227,31 @@ async fn unwind_binds_the_variable_a_later_triple_matches() {
     );
 }
 
+/// The same on an indexed ledger, where the triple matches the unwound values
+/// against encoded index terms.
+#[tokio::test]
+async fn unwind_binds_the_variable_a_later_triple_matches_indexed() {
+    let fluree = fluree_db_api::FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/unwind:later-triple-indexed";
+    seed_orders(&fluree, ledger_id).await;
+    crate::support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let ledger = fluree.ledger(ledger_id).await.expect("indexed ledger");
+    assert_eq!(ledger.index_t(), ledger.t(), "reads come from the index");
+
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?o", "?year"],
+        "where": [
+            ["unwind", "?year", "(range 2020 2021)"],
+            {"@id": "?o", "ex:orderYear": "?year"}
+        ]
+    });
+    assert_eq!(
+        sorted_rows(&fluree, &ledger, &q).await,
+        vec![json!(["ex:o2", 2020]), json!(["ex:o3", 2020])]
+    );
+}
+
 /// An update's WHERE is planned the same way, so it decides which orders the
 /// update writes to.
 #[tokio::test]
