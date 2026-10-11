@@ -46,10 +46,12 @@ Turtle input is sent as written and parsed where it is staged, the way
 every write reads RDF text (see
 [How RDF text is read](../transactions/turtle.md#how-rdf-text-is-read)).
 A `.nt` file is read as Turtle, of which N-Triples is a subset. With
-`--remote`, a server from before `/sync` accepted Turtle bodies answers
-415; for that server the CLI converts the Turtle to JSON-LD and sends it
-again. The conversion loses collection order and refuses some IRI schemes
-(`tag:`, `kb:`), so upgrading the server is the better fix.
+`--remote`, a server from before `/sync` accepted Turtle bodies refuses
+one: v4.2.0 and v4.2.1 answer 400 (`convert Turtle payloads client-side`),
+others 415. For that server the CLI converts the Turtle to JSON-LD, sends
+it again, and prints a warning. The conversion loses collection order and
+refuses some IRI schemes (`tag:`, `kb:`), so upgrading the server is the
+better fix.
 
 TriG is sent as TriG. It is recognized by a `.trig` name or
 `--format trig`, and also when a body read as Turtle turns out to hold

@@ -22,7 +22,8 @@
 use crate::support;
 use fluree_db_api::policy_builder::build_policy_context_from_opts;
 use fluree_db_api::{
-    Fluree, FlureeBuilder, GovernanceOptions, LedgerState, PolicyContext, TransactResult,
+    CommitRef, ConflictStrategy, Fluree, FlureeBuilder, GovernanceOptions, LedgerState,
+    PolicyContext, TransactResult,
 };
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::{range_with_overlay, FlakeValue, RangeMatch, RangeOptions, RangeTest};
@@ -183,6 +184,105 @@ async fn deleting_an_absent_fact_commits_nothing() {
             t,
             &format!("Cypher REMOVE of an absent label (indexed={indexed})"),
         );
+    }
+}
+
+/// A delete that names a graph the ledger does not have commits nothing and
+/// registers no graph, as in the default graph; it used to land an empty
+/// commit that registered the graph. A graph an INSERT template names is still
+/// registered when the WHERE matches nothing, delete beside it or not
+/// (`no_match_update_naming_a_new_graph_commits_its_registration`).
+#[tokio::test]
+async fn a_delete_in_a_new_graph_commits_nothing() {
+    const NEW: &str = "http://example.org/new";
+    let registered = |r: &TransactResult| r.ledger.snapshot.graph_registry.graph_id_for_iri(NEW);
+    for indexed in [false, true] {
+        let seed = json!({"@id": "ex:s", "ex:p": "present"});
+
+        let (_d, fluree, ledger) = seeded("new-graph-sparql", seed.clone(), indexed).await;
+        let t = ledger.t();
+        let r = sparql_update(
+            &fluree,
+            ledger,
+            &format!("DELETE DATA {{ GRAPH <{NEW}> {{ ex:s ex:p \"present\" }} }}"),
+        )
+        .await;
+        let what = format!("SPARQL DELETE DATA (indexed={indexed})");
+        no_commit(&r, t, &what);
+        assert!(registered(&r).is_none(), "{what}: registered {NEW}");
+
+        let (_d, fluree, ledger) = seeded("new-graph-jsonld", seed.clone(), indexed).await;
+        let t = ledger.t();
+        let r = jsonld_update(
+            &fluree,
+            ledger,
+            json!({"graph": NEW, "delete": {"@id": "ex:s", "ex:p": "present"}}),
+        )
+        .await;
+        let what = format!("JSON-LD delete (indexed={indexed})");
+        no_commit(&r, t, &what);
+        assert!(registered(&r).is_none(), "{what}: registered {NEW}");
+
+        let (_d, fluree, ledger) = seeded("new-graph-insert", seed.clone(), indexed).await;
+        let t = ledger.t();
+        let r = sparql_update(
+            &fluree,
+            ledger,
+            &format!(
+                "DELETE {{ GRAPH <{NEW}> {{ ?s ex:q \"x\" }} }} \
+                 INSERT {{ GRAPH <{NEW}> {{ ?s ex:q \"y\" }} }} WHERE {{ ?s ex:p \"nothing\" }}"
+            ),
+        )
+        .await;
+        let what = format!("DELETE and INSERT, no match (indexed={indexed})");
+        assert_eq!(
+            (r.receipt.flake_count, r.ledger.t()),
+            (0, t + 1),
+            "{what}: the registration commits"
+        );
+        assert!(registered(&r).is_some(), "{what}: {NEW} not registered");
+    }
+}
+
+/// A WHERE-driven DELETE removes every stored fact its rows name, list
+/// entries holding the same value included: each identical row used to take
+/// the first stored entry, so `DELETE WHERE` over `["v", "v", "w"]` left one
+/// `"v"` behind, and over a plain `"v"` beside a list `["v"]` left the plain
+/// one. A WHERE that repeats each row (a second pattern matching twice)
+/// retracts each stored fact once.
+#[tokio::test]
+async fn a_where_driven_delete_removes_every_identical_list_entry() {
+    for indexed in [false, true] {
+        for (what, seed, delete, retracted) in [
+            (
+                "repeated list value",
+                json!({"@id": "ex:s", "ex:list": {"@list": ["v", "v", "w"]}}),
+                "DELETE WHERE { ex:s ex:list ?o }",
+                3,
+            ),
+            (
+                "plain value beside a list entry",
+                json!({"@id": "ex:s", "ex:list": ["v", {"@list": ["v"]}]}),
+                "DELETE WHERE { ex:s ex:list ?o }",
+                2,
+            ),
+            (
+                "rows repeated by another pattern",
+                json!({"@graph": [
+                    {"@id": "ex:s", "ex:list": {"@list": ["v", "v"]}},
+                    {"@id": "ex:x1", "ex:q": 1},
+                    {"@id": "ex:x2", "ex:q": 2}
+                ]}),
+                "DELETE { ex:s ex:list ?o } WHERE { ex:s ex:list ?o . ?x ex:q ?y }",
+                2,
+            ),
+        ] {
+            let (_d, fluree, ledger) = seeded("identical-entries", seed, indexed).await;
+            let r = sparql_update(&fluree, ledger, delete).await;
+            let what = format!("{what} (indexed={indexed})");
+            assert_eq!(r.receipt.retract_count, retracted, "{what}");
+            assert!(facts(&fluree, &r.ledger).await.is_empty(), "{what}");
+        }
     }
 }
 
@@ -485,10 +585,70 @@ async fn constant_deletes_name_big_integers_under_their_subtype() {
     }
 }
 
+/// A novelty retraction of an indexed fact under another identity with the
+/// same index key leaves no ghost: a revert retracts a big integer under its
+/// declared subtype, which the index row does not keep, and queries stop
+/// seeing the value. The stored-fact read used to keep reporting it, so a
+/// later upsert of the same value cancelled against it and committed
+/// nothing, and the value stayed gone until the next reindex.
+#[tokio::test]
+async fn a_reverted_indexed_big_integer_can_be_written_again() {
+    for dt in ["integer", "nonNegativeInteger"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .build()
+            .expect("file fluree");
+        let name = format!("it/delete-stored-revert-{dt}");
+        let id = format!("{name}:main");
+        let ledger = fluree.create_ledger(&id).await.expect("create");
+        let ledger = fluree
+            .insert(
+                ledger,
+                &json!({"@context": ctx(), "@id": "ex:s", "ex:other": 1}),
+            )
+            .await
+            .expect("seed")
+            .ledger;
+        let value = json!({"@context": ctx(), "@id": "ex:s",
+                           "ex:n": {"@value": BIG, "@type": format!("xsd:{dt}")}});
+        let inserted = fluree.insert(ledger, &value).await.expect("insert");
+        let commit = inserted.receipt.commit_id.clone();
+        drop(inserted);
+        support::rebuild_and_publish_index(&fluree, &id).await;
+        fluree
+            .revert_commit(
+                &name,
+                "main",
+                CommitRef::Exact(commit),
+                ConflictStrategy::TakeSource,
+            )
+            .await
+            .expect("revert");
+        let ledger = fluree.ledger(&id).await.expect("reload");
+        assert_eq!(
+            facts(&fluree, &ledger).await,
+            ["other=1"],
+            "xsd:{dt}: reverted"
+        );
+
+        let r = fluree.upsert(ledger, &value).await.expect("upsert");
+        assert_eq!(
+            (r.receipt.assert_count, r.receipt.retract_count),
+            (1, 0),
+            "xsd:{dt}: the upsert writes the value"
+        );
+        assert_eq!(
+            facts(&fluree, &r.ledger).await,
+            [format!("n={BIG}"), "other=1".to_string()],
+            "xsd:{dt}: written again"
+        );
+    }
+}
+
 /// A value bound by OPTIONAL, UNION or BIND is not a witness, so its DELETE
 /// row is matched against the stored facts of its slot. The row carries the
-/// query's decode of the value; on an indexed ledger that decode and the
-/// stored fact's differ in datatype, and the row still names the fact.
+/// query's decode of the value, which on an indexed ledger has lost a
+/// declared subtype, and the row still names the fact.
 ///
 /// Not covered: BIND on a novelty-only ledger with a subtype. BIND gives a
 /// big integer `xsd:integer` whatever its declared subtype, so there the row
@@ -1061,6 +1221,61 @@ async fn delete_insert_of_one_value_refused_by_policy_regardless_of_stored_value
 /// Restating a value the identity can view commits nothing, without modify
 /// permission, as it did before; a changed value is still refused. As root,
 /// a restatement commits nothing either.
+/// A transfer judges a fact the destination already holds as a restatement:
+/// `ADD` or `COPY` of a value the identity can neither view nor modify is
+/// refused with one answer whether or not the destination holds it. A held
+/// fact used to stage nothing and commit, so the outcome told the identity
+/// what the destination held.
+#[tokio::test]
+async fn transfer_refused_by_policy_regardless_of_destination_contents() {
+    const G2: &str = "http://example.org/g2";
+    for indexed in [false, true] {
+        for dest_holds in [true, false] {
+            for verb in ["ADD", "COPY"] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+                    .build()
+                    .expect("file fluree");
+                let id = format!("it/delete-stored-transfer-{verb}-{dest_holds}-{indexed}:main");
+                let ledger = fluree.create_ledger(&id).await.expect("create");
+                let dest = if dest_holds {
+                    "ex:alice ex:salary 100"
+                } else {
+                    "ex:alice ex:name \"Alice\""
+                };
+                let ledger = sparql_update(
+                    &fluree,
+                    ledger,
+                    &format!(
+                        "INSERT DATA {{ GRAPH <{G1}> {{ ex:alice ex:salary 100 }} \
+                         GRAPH <{G2}> {{ {dest} }} }}"
+                    ),
+                )
+                .await
+                .ledger;
+                let ledger = if indexed {
+                    drop(ledger);
+                    support::rebuild_and_publish_index(&fluree, &id).await;
+                    fluree.ledger(&id).await.expect("reload")
+                } else {
+                    ledger
+                };
+                let policy = name_only(&ledger).await;
+                let body = format!("{verb} GRAPH <{G1}> TO GRAPH <{G2}>");
+                let err = sparql_update_as(&fluree, ledger, &body, policy)
+                    .await
+                    .map(|r| r.receipt.flake_count)
+                    .expect_err(&body);
+                assert!(
+                    err.to_string()
+                        .contains("Policy enforcement prevents modification"),
+                    "{body}, destination holds it={dest_holds}, indexed={indexed}: {err}"
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn restating_a_viewable_value_commits_nothing_without_modify() {
     for indexed in [false, true] {

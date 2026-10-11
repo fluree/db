@@ -230,13 +230,18 @@ fn skip_statement(tokens: &[Token], mut i: usize) -> usize {
 /// Scan a block's contents from `i` (just past its `{`). Returns the index
 /// of its `}` and whether its last statement omits the terminating dot.
 fn scan_block(tokens: &[Token], mut i: usize) -> Result<(usize, bool)> {
-    let mut depth = 0i32;
+    // Openers not yet closed, innermost last: a `}` or the end of the text
+    // reached with one open is reported at that opener, not further on.
+    let mut open: Vec<&Token> = Vec::new();
     let mut last: Option<&TokenKind> = None;
     while i < tokens.len() {
         let tok = &tokens[i];
         match &tok.kind {
             TokenKind::Eof => break,
-            TokenKind::RBrace if depth == 0 => {
+            TokenKind::RBrace => {
+                if let Some(opener) = open.last() {
+                    return Err(unclosed(opener, "before the graph block's '}'"));
+                }
                 let needs_dot = last.is_some_and(|k| !matches!(k, TokenKind::Dot));
                 return Ok((i, needs_dot));
             }
@@ -252,13 +257,37 @@ fn scan_block(tokens: &[Token], mut i: usize) -> Result<(usize, bool)> {
                     "a prefix, base or version directive cannot appear inside a graph block",
                 ));
             }
-            kind => depth = (depth + nesting(kind)).max(0),
+            kind => match nesting(kind) {
+                1 => open.push(tok),
+                -1 => {
+                    open.pop();
+                }
+                _ => {}
+            },
         }
         last = Some(&tok.kind);
         i += 1;
     }
+    if let Some(opener) = open.last() {
+        return Err(unclosed(opener, "before the end of the document"));
+    }
     let at = tokens.last().map_or(0, |t| t.end as usize);
     Err(locate_error(at, "unclosed graph block: expected '}'"))
+}
+
+/// An opener inside a graph block that is still open at `context`.
+fn unclosed(opener: &Token, context: &str) -> TransactError {
+    let (open, close) = match opener.kind {
+        TokenKind::LBracket => ("[", "]"),
+        TokenKind::LParen => ("(", ")"),
+        TokenKind::ReifiedTripleStart => ("<<", ">>"),
+        TokenKind::TripleTermStart => ("<<(", ")>>"),
+        _ => ("{|", "|}"),
+    };
+    locate_error(
+        opener.start as usize,
+        format!("unclosed '{open}' in a graph block: expected '{close}' {context}"),
+    )
 }
 
 /// Whether `text` holds at least one graph block, read by the locator: a
@@ -353,6 +382,34 @@ mod tests {
         for (doc, needle) in refused {
             let e = locate(doc).expect_err("should be refused").to_string();
             assert!(e.contains(needle), "{doc}: {e}");
+        }
+    }
+
+    /// A bracket left open inside a block is reported where it opens, not at
+    /// the next block (as a nested block) or at the end (as an unclosed block).
+    #[test]
+    fn an_unclosed_bracket_in_a_block_is_reported_where_it_opens() {
+        for (doc, opener, needle) in [
+            (
+                "GRAPH <http://g> { <http://a> <http://p> [ <http://q> 1 } GRAPH <http://h> { }",
+                "[",
+                "unclosed '[' in a graph block: expected ']' before the graph block's '}'",
+            ),
+            (
+                "GRAPH <http://g> { <http://a> <http://p> ( 1 2 }",
+                "(",
+                "unclosed '(' in a graph block: expected ')' before the graph block's '}'",
+            ),
+            (
+                "GRAPH <http://g> { <http://a> <http://p> [ <http://q> 1",
+                "[",
+                "unclosed '[' in a graph block: expected ']' before the end of the document",
+            ),
+        ] {
+            let e = locate(doc).expect_err("should be refused").to_string();
+            let at = doc.find(opener).expect("opener");
+            assert!(e.contains(needle), "{doc}: {e}");
+            assert!(e.contains(&format!("position {at}")), "{doc}: {e}");
         }
     }
 }

@@ -15,6 +15,7 @@ use crate::detect;
 use crate::error::{CliError, CliResult};
 use crate::input;
 use crate::remote_client::{RemoteLedgerClient, RemoteLedgerError};
+use colored::Colorize;
 use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_api::{GraphPayload, GraphSel, SyncGraphOpts, SyncGraphReport, TxnOpts};
 use std::path::Path;
@@ -91,9 +92,10 @@ impl SyncSource {
 }
 
 /// Send `payload` to a remote `/sync`. RDF text goes as written; only a
-/// server from before `/sync` read RDF bodies answers 415, and for that one
-/// Turtle is converted to JSON-LD here and sent again (TriG has no JSON-LD
-/// form for its blocks, so it gets the 415).
+/// server from before `/sync` read RDF bodies refuses it (see
+/// [`predates_rdf_sync`]), and for that one Turtle is converted to JSON-LD
+/// here and sent again (TriG has no JSON-LD form for its blocks, so it gets
+/// the refusal).
 async fn sync_remote(
     client: &RemoteLedgerClient,
     ledger: &str,
@@ -116,7 +118,13 @@ async fn sync_remote(
                 .sync_rdf(ledger, graph, text, content_type, dry_run, allow_empty)
                 .await
             {
-                Err(RemoteLedgerError::UnsupportedMediaType(_)) if !*trig => {
+                Err(e) if !*trig && predates_rdf_sync(&e) => {
+                    eprintln!(
+                        "  {} the server predates RDF bodies on /sync, so the Turtle was converted \
+                         to JSON-LD client-side,\n  which can lose collection order and mishandle \
+                         IRIs with schemes like `tag:` or `kb:`. Upgrade the server to avoid this.",
+                        "warning:".yellow().bold()
+                    );
                     let json = turtle_as_json_ld(text)?;
                     Ok(client
                         .sync_jsonld(ledger, graph, &json, dry_run, allow_empty)
@@ -125,6 +133,20 @@ async fn sync_remote(
                 other => Ok(other?),
             }
         }
+    }
+}
+
+/// Whether `/sync` refused an RDF body because the server cannot read one:
+/// v4.2.0 and v4.2.1 answer with this 400, other such servers with a 415.
+/// Both come before staging, so resending as JSON-LD is safe. Any other 400
+/// (bad Turtle, policy, ...) is a verdict on the payload and must stand.
+fn predates_rdf_sync(err: &RemoteLedgerError) -> bool {
+    const PRE_RDF_SYNC_400: &str =
+        "sync accepts application/json (JSON-LD); convert Turtle payloads client-side";
+    match err {
+        RemoteLedgerError::UnsupportedMediaType(_) => true,
+        RemoteLedgerError::BadRequest(msg) => msg.contains(PRE_RDF_SYNC_400),
+        _ => false,
     }
 }
 
@@ -383,12 +405,32 @@ mod tests {
     /// A stub `/sync` answering its requests with `statuses` in turn,
     /// recording each request's content type.
     async fn stub(statuses: Vec<u16>) -> (RemoteLedgerClient, Arc<Mutex<Vec<String>>>) {
+        stub_replying(
+            statuses
+                .into_iter()
+                .map(|status| {
+                    let body = if status == 200 {
+                        r#"{"ledger":"db:main","t":2}"#
+                    } else {
+                        r#"{"error":"unsupported media type"}"#
+                    };
+                    (status, body)
+                })
+                .collect(),
+        )
+        .await
+    }
+
+    /// [`stub`] with each reply's body given.
+    async fn stub_replying(
+        replies: Vec<(u16, &'static str)>,
+    ) -> (RemoteLedgerClient, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let seen: Arc<Mutex<Vec<String>>> = Arc::default();
         let recorded = Arc::clone(&seen);
         tokio::spawn(async move {
-            for status in statuses {
+            for (status, body) in replies {
                 let (mut sock, _) = listener.accept().await.unwrap();
                 let mut buf = Vec::new();
                 let mut tmp = [0u8; 4096];
@@ -423,11 +465,6 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(header("content-type:").unwrap_or_default());
-                let body = if status == 200 {
-                    r#"{"ledger":"db:main","t":2}"#
-                } else {
-                    r#"{"error":"unsupported media type"}"#
-                };
                 let reply = format!(
                     "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -460,12 +497,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turtle_falls_back_to_json_ld_only_on_a_415() {
+    async fn turtle_falls_back_to_json_ld_on_a_415() {
         let (client, seen) = stub(vec![415, 200]).await;
         sync_remote(&client, "db:main", None, &turtle(), false, false)
             .await
             .expect("sync after the fallback");
         assert_eq!(*seen.lock().unwrap(), ["text/turtle", "application/json"]);
+    }
+
+    /// v4.2.0 and v4.2.1 refuse a Turtle body with a 400, not a 415.
+    #[tokio::test]
+    async fn turtle_falls_back_on_the_v4_2_0_refusal() {
+        let (client, seen) = stub_replying(vec![
+            (
+                400,
+                r#"{"error":"Bad request: sync accepts application/json (JSON-LD); convert Turtle payloads client-side","status":400,"@type":"err:api/BadRequest"}"#,
+            ),
+            (200, r#"{"ledger":"db:main","t":2}"#),
+        ])
+        .await;
+        sync_remote(&client, "db:main", None, &turtle(), false, false)
+            .await
+            .expect("sync after the fallback");
+        assert_eq!(*seen.lock().unwrap(), ["text/turtle", "application/json"]);
+    }
+
+    #[tokio::test]
+    async fn any_other_400_is_reported_not_converted() {
+        let (client, seen) = stub_replying(vec![(
+            400,
+            r#"{"error":"Turtle parse error: Parse error at position 52: expected '.'","status":400,"@type":"err:api/BadRequest"}"#,
+        )])
+        .await;
+        let err = sync_remote(&client, "db:main", None, &turtle(), false, false)
+            .await
+            .expect_err("the server's verdict stands");
+        assert!(err.to_string().contains("Turtle parse error"), "{err}");
+        assert_eq!(*seen.lock().unwrap(), ["text/turtle"]);
     }
 
     #[tokio::test]

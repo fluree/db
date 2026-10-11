@@ -271,9 +271,10 @@ impl SequentialStager {
     /// the fact, or retracted then re-asserted when it has it. Last-wins
     /// alone would commit the final op — a retraction of a fact the ledger
     /// never held, for `INSERT x ; DELETE x`. Only facts whose first and last
-    /// ops differ are looked up; the base decides because staging does not
-    /// filter an assert of a fact already present (or a retract of one
-    /// absent), so the first op does not say what the base held.
+    /// ops differ are looked up; the base decides because staging still
+    /// stages an assert of a fact already present, so a first-op assert does
+    /// not say what the base held. (A first-op retraction does: staging only
+    /// retracts a stored fact.)
     async fn drop_reversed_facts(&mut self) -> Result<()> {
         let mut keep = vec![true; self.folded.len()];
         for (i, flake) in self.folded.iter().enumerate() {

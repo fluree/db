@@ -1118,7 +1118,34 @@ pub async fn stage_with_graph_delta(
             "transaction staging completed"
         );
 
-        let graph_delta = ledger_graph_delta(&ledger, &txn.write_graphs);
+        let mut graph_delta = ledger_graph_delta(&ledger, &txn.write_graphs);
+        // A new graph that only a DELETE names is not registered when no
+        // staged fact lands in it, so a delete of facts the graph cannot hold
+        // commits nothing, as it does in the default graph. A graph an INSERT
+        // template names stays registered even when the WHERE matched
+        // nothing; CREATE GRAPH and a sync target register one on purpose.
+        if !txn.delete_templates.is_empty() && txn.sync_graph.is_none() {
+            let landed: HashSet<&Sid> = flakes.iter().filter_map(|f| f.g.as_ref()).collect();
+            let inserted: HashSet<&str> = txn
+                .insert_templates
+                .iter()
+                .filter_map(|t| match &t.graph {
+                    TemplateGraph::Iri(iri) => Some(iri.as_ref()),
+                    TemplateGraph::Default | TemplateGraph::Var(_) => None,
+                })
+                .collect();
+            graph_delta.retain(|_, iri| {
+                ledger
+                    .snapshot
+                    .graph_registry
+                    .graph_id_for_iri(iri)
+                    .is_some()
+                    || inserted.contains(iri.as_str())
+                    || graph_sids
+                        .get(iri.as_str())
+                        .is_some_and(|sid| landed.contains(sid))
+            });
+        }
         Ok((
             StagedLedger::new(ledger, flakes, &reverse_graph)?,
             ns_registry,
@@ -1420,6 +1447,11 @@ async fn stage_graph_mgmt(
         // Ledger g_id -> graph Sid, for every named graph our flakes touch;
         // becomes the reverse routing map for novelty application / policy.
         let mut graph_sids: HashMap<GraphId, Sid> = HashMap::new();
+        // Under a non-root policy, a re-homed fact the destination already
+        // holds stages nothing but is judged as a restatement, as in `stage`
+        // (`hidden_restatements`): (the stored fact's retraction, the assertion).
+        let policed = options.policy_ctx.is_some_and(|p| !p.wrapper().is_root());
+        let mut restated: Vec<(Flake, Flake)> = Vec::new();
 
         match op {
             GraphMgmtOp::Clear(target) => {
@@ -1602,6 +1634,14 @@ async fn stage_graph_mgmt(
                         .iter()
                         .map(|f| flake_content(f.flake()))
                         .collect();
+                    let dest_held: HashMap<FlakeContent, Flake> = if policed {
+                        dest_facts
+                            .iter()
+                            .map(|f| (flake_content(f.flake()), f.clone().retract(new_t).into_flake()))
+                            .collect()
+                    } else {
+                        HashMap::new()
+                    };
 
                     // O5: re-homing rewrites the `f:reifiesGraph` anchor per src/
                     // dest graph (see the assert loop below), so an
@@ -1756,10 +1796,13 @@ async fn stage_graph_mgmt(
                     }
 
                     // Assert re-homed source facts not already present in the
-                    // destination.
+                    // destination; a present one is a restatement.
                     for a in rehomed {
-                        if !dest_contents.contains(&flake_content(&a)) {
+                        let content = flake_content(&a);
+                        if !dest_contents.contains(&content) {
                             flakes.push(a);
+                        } else if let Some(held) = dest_held.get(&content) {
+                            restated.push((held.clone(), a));
                         }
                     }
 
@@ -1787,10 +1830,22 @@ async fn stage_graph_mgmt(
 
         let reverse_graph = build_reverse_graph_lookup(&graph_sids);
 
-        // Policy enforcement (skipped for root), identical to `stage`.
+        // Policy enforcement (skipped for root), identical to `stage`: so
+        // whether a transfer into a graph the identity cannot view succeeds
+        // does not depend on what that graph already holds.
         if let Some(policy) = options.policy_ctx {
             if !policy.wrapper().is_root() {
-                enforce_modify_policies(&flakes, policy, &ledger, options.tracker, &reverse_graph)
+                let hidden =
+                    hidden_restatements(&ledger, policy, restated, &reverse_graph, options.tracker)
+                        .await?;
+                let judged: std::borrow::Cow<'_, [Flake]> = if hidden.is_empty() {
+                    std::borrow::Cow::Borrowed(&flakes)
+                } else {
+                    let mut all = flakes.clone();
+                    all.extend(hidden);
+                    std::borrow::Cow::Owned(all)
+                };
+                enforce_modify_policies(&judged, policy, &ledger, options.tracker, &reverse_graph)
                     .await?;
             }
         }
@@ -1917,8 +1972,9 @@ fn subjects_with_prior_rows(
 /// from, not a field on the flake — while a named-graph transaction's own
 /// flakes carry `g: Some(sid)`. Any comparison or decode that reads `g` has to
 /// put it back first, or an indexed named-graph bundle silently fails to line
-/// up with the transaction that is editing it. `scan_graph_flakes` has always
-/// done this; every other scan of a reifier's own facts needs it too.
+/// up with the transaction that is editing it. [`CurrentFacts`] stamps every
+/// fact it reads ([`whole_graph_facts`] included); a scan of a reifier's own
+/// facts outside it needs the same.
 fn stamp_graph(flakes: &mut [Flake], g_sid: Option<&Sid>) {
     for f in flakes {
         f.g = g_sid.cloned();
@@ -2057,8 +2113,7 @@ async fn enforce_single_target_reifiers(
             // without this stamp an indexed named-graph bundle never matches
             // the txn's keys: a re-assert would not collapse, and the net
             // bundle would mix `None` and `Some` and decode as
-            // `MixedFlakeGraphs`. `scan_graph_flakes` stamps for the same
-            // reason.
+            // `MixedFlakeGraphs`. `CurrentFacts` stamps for the same reason.
             stamp_graph(&mut current, g_sid.as_ref());
             let mut net: HashMap<ReifiesKey, Flake> = HashMap::new();
             for f in current {

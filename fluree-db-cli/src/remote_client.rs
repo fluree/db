@@ -1312,8 +1312,10 @@ impl RemoteLedgerClient {
     /// [`sync_jsonld`](Self::sync_jsonld) with an RDF text body sent as
     /// `content_type` (`text/turtle`, `application/n-triples`,
     /// `application/trig`). A server that does not read RDF bodies on
-    /// `/sync` answers 415 ([`RemoteLedgerError::UnsupportedMediaType`])
-    /// before staging anything, so the caller may retry in another format.
+    /// `/sync` refuses before staging anything, so the caller may retry in
+    /// another format: 415 ([`RemoteLedgerError::UnsupportedMediaType`]), or
+    /// on v4.2.0 and v4.2.1 a 400 ([`RemoteLedgerError::BadRequest`]) asking
+    /// for JSON-LD.
     pub async fn sync_rdf(
         &self,
         ledger: &str,

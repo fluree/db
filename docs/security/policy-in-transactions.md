@@ -81,7 +81,7 @@ Every modification path runs the same `f:modify` policy check on its staged flak
 
 Crucially, the policy is checked against the **flakes**, not the operation type. A transaction that retracts a flake the identity can't modify is rejected just like an insert that asserts one.
 
-A write that restates a stored value as it is stages nothing: an upsert of an unchanged value, or a DELETE and INSERT of the same value. When the identity cannot view that value, the restatement is still checked against `f:modify`, so it is refused unless the identity may modify the value, whether or not the value is stored. Restating a value the identity can view commits nothing, with no modify check.
+A write that restates a stored value as it is stages nothing: an upsert of an unchanged value, a DELETE and INSERT of the same value, or an `ADD`, `COPY` or `MOVE` of a fact the destination graph already holds. When the identity cannot view that value, the restatement is still checked against `f:modify`, so it is refused unless the identity may modify the value, whether or not the value is stored. Restating a value the identity can view commits nothing, with no modify check.
 
 **Modify without view.** Granting `f:modify` on a value without `f:view` does not keep that value confidential from the identity: an identity that may modify a property can tell whether a given value is stored by writing it. Configure such policies with care.
 

@@ -11,7 +11,7 @@ use crate::support::{genesis_ledger, rebuild_and_publish_index, MemoryFluree};
 use fluree_db_api::policy_builder::build_policy_context_from_opts;
 use fluree_db_api::{
     CommitOpts, Fluree, FlureeBuilder, GovernanceOptions, GraphDb, GraphPayload, LedgerState,
-    PolicyContext, TrackingOptions,
+    PolicyContext, TrackingOptions, TransactionOptions, TxnOperation,
 };
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::{
@@ -250,11 +250,13 @@ async fn every_rdf_text_lane_stores_iris_the_json_ld_round_trip_refused() {
         "cached handle",
         "cached handle + policy",
         "graph builder",
+        "multi-write transaction",
         "insert: Fluree::insert_turtle",
         "insert: owned builder",
         "insert: cached handle",
         "insert: cached handle + policy",
         "insert: graph builder",
+        "insert: multi-write transaction",
     ] {
         let id = format!(
             "it/rdf-iri-{}:main",
@@ -348,6 +350,21 @@ async fn every_rdf_text_lane_stores_iris_the_json_ld_round_trip_refused() {
                 .commit()
                 .await
                 .map(|_| ()),
+            "multi-write transaction" | "insert: multi-write transaction" => {
+                let operation = if lane.starts_with("insert") {
+                    TxnOperation::InsertTurtle(doc.clone())
+                } else {
+                    TxnOperation::UpsertTurtle(doc.clone())
+                };
+                let mut txn = fluree
+                    .begin_transaction(&id, TransactionOptions::default())
+                    .await
+                    .expect("begin");
+                match txn.stage(operation).await {
+                    Ok(()) => txn.commit(CommitOpts::default()).await.map(|_| ()),
+                    Err(e) => Err(e),
+                }
+            }
             other => unreachable!("{other}"),
         };
         if let Err(e) = outcome {
@@ -1021,6 +1038,45 @@ async fn a_malformed_document_fails_as_a_turtle_parse_error() {
         .map(|_| ())
         .expect_err("nested");
     assert!(err.to_string().contains("nested graph block"), "{err}");
+}
+
+/// `urn:default` names the default graph, never a graph an RDF text write can
+/// create: a TriG insert, an RDF graph insert and an RDF graph sync that name
+/// it are refused, as the upsert and JSON-LD sync lanes are
+/// (`it_default_graph_name`).
+#[tokio::test]
+async fn rdf_text_writes_naming_urn_default_as_a_graph_are_refused() {
+    const REFUSAL: &str = "names the default graph, not a named graph";
+    let fluree = memory();
+    let statements = "<http://example.org/z> <http://example.org/v> \"zed\" .\n";
+    let block = format!("GRAPH <urn:default> {{ {statements} }}\n");
+    let urn_default = || GraphSel::Graph("urn:default".to_string());
+    let mut failures = Vec::new();
+    for (lane, body) in [
+        ("TriG insert", &block),
+        ("graph insert, TriG block", &block),
+        ("sync, Turtle body", &statements.to_string()),
+        ("sync, TriG block", &block),
+    ] {
+        let id = format!(
+            "it/rdf-urn-default-{}:main",
+            lane.replace(|c: char| !c.is_ascii_alphanumeric(), "-")
+        );
+        let builder = fluree.stage_owned(genesis_ledger(&fluree, &id));
+        let builder = match lane {
+            "TriG insert" => builder.insert_turtle(body),
+            "graph insert, TriG block" => {
+                builder.insert_graph_payload(urn_default(), GraphPayload::Rdf(body))
+            }
+            _ => builder.sync_graph_payload(urn_default(), GraphPayload::Rdf(body), false),
+        };
+        match builder.execute().await {
+            Ok(_) => failures.push(format!("{lane}: committed")),
+            Err(e) if !e.to_string().contains(REFUSAL) => failures.push(format!("{lane}: {e}")),
+            Err(_) => {}
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
 /// What a block's contents are refused for is the user's mistake, reported

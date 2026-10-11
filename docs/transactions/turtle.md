@@ -635,7 +635,7 @@ Every transaction endpoint reads Turtle and TriG with the same parser, once, and
 - **Blank-node labels are document-scoped:** `_:b` in the default graph and in two blocks is one node. Each `[ ]` is a new node.
 - **Errors point into the document as sent:** a parse error in a block reports its position in the whole document, and a malformed block (nested, unclosed, a directive inside it, a blank-node label) is named as such.
 
-An upsert scopes a document's blank nodes to its content, so upserting the same document again addresses the same nodes and commits nothing. The scope ignores statement order (anonymous `[ ]` nodes are numbered in document order, so moving statements that contain them relative to each other gives a new scope); any change to the statements gives a new scope and new nodes, and the previous nodes stay. To find blank-node subjects that nothing references any more:
+An upsert scopes a document's blank nodes to its content, so upserting the same document again addresses the same nodes and commits nothing. The scope ignores statement order (anonymous `[ ]` nodes are numbered in document order, so moving statements that contain them relative to each other gives a new scope); any change to the statements, or to how they are written beyond IRI and quote style (`1` vs `"1"^^xsd:integer`, a language tag's case, a repeated statement, a renamed blank-node label), gives a new scope and new nodes, and the previous nodes stay. To find blank-node subjects that nothing references any more:
 
 ```sparql
 SELECT DISTINCT ?b WHERE {
