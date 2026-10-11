@@ -73,27 +73,8 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             deferred_order_exprs: _,
         } = level.base;
 
-        // A group solution binds the grouping's keys only (CONSTRUCT has no
-        // SELECT expressions, so no aggregate outputs or binds reach the
-        // template): any other template variable is unbound in it, and the
-        // template triples that read it are skipped (§16.2). Rename those to
-        // variables nothing binds; template blank nodes are minted per row.
         if let Some(grouping) = &level.grouping {
-            let produced: std::collections::HashSet<_> = grouping
-                .group_by_vars()
-                .chain(grouping.aggregates().map(|spec| spec.output_var))
-                .chain(grouping.binds().map(|(var, _)| *var))
-                .collect();
-            let unbound: std::collections::HashSet<_> = construct_template
-                .var_iter()
-                .filter(|v| !produced.contains(v) && !construct_template.bnode_vars.contains(v))
-                .collect();
-            for var in unbound {
-                let fresh = self
-                    .vars
-                    .get_or_insert(&format!("?__construct_unbound_{}", self.vars.len()));
-                construct_template.substitute_var(var, fresh);
-            }
+            construct_template.unbind_outside_group_row(grouping, self.vars);
         }
 
         let ctx = self.build_jsonld_context()?;

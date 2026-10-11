@@ -1055,30 +1055,36 @@ async fn ask_and_construct_group() {
         assert_eq!(ask(body.clone()).await, json!(expected), "{body}");
     }
 
-    let construct = format!(
-        "CONSTRUCT {{ ex:summary ex:bigArea ?a . ?e ex:inBigArea ?a }} {W} \
-         GROUP BY ?a HAVING (COUNT(?e) > 1)"
-    );
-    let graph = run(&fluree, &ledger, &construct)
-        .await
-        .to_construct(&ledger.snapshot)
-        .expect("to_construct")["@graph"]
-        .clone();
-    let nodes = graph.as_array().expect("@graph");
-    assert_eq!(
-        nodes.len(),
-        1,
-        "only the summary node, no ?e triples: {graph}"
-    );
-    assert_eq!(nodes[0]["@id"], "ex:summary", "{graph}");
-    let mut areas: Vec<String> = nodes[0]["ex:bigArea"]
-        .as_array()
-        .expect("values")
-        .iter()
-        .map(|v| v.as_str().expect("string").to_string())
-        .collect();
-    areas.sort();
-    assert_eq!(areas, ["Local", "Net"], "{graph}");
+    // The aggregate streams; a dedup-only GROUP BY runs on the lane that
+    // carries the other WHERE variables as per-group lists.
+    for (modifiers, expected) in [
+        ("GROUP BY ?a HAVING (COUNT(?e) > 1)", vec!["Local", "Net"]),
+        ("GROUP BY ?a", vec!["Local", "Net", "Remote"]),
+    ] {
+        let construct = format!(
+            "CONSTRUCT {{ ex:summary ex:bigArea ?a . ?e ex:inBigArea ?a }} {W} {modifiers}"
+        );
+        let graph = run(&fluree, &ledger, &construct)
+            .await
+            .to_construct(&ledger.snapshot)
+            .expect("to_construct")["@graph"]
+            .clone();
+        let nodes = graph.as_array().expect("@graph");
+        assert_eq!(
+            nodes.len(),
+            1,
+            "only the summary node, no ?e triples: {graph}"
+        );
+        assert_eq!(nodes[0]["@id"], "ex:summary", "{graph}");
+        let mut areas: Vec<String> = nodes[0]["ex:bigArea"]
+            .as_array()
+            .expect("values")
+            .iter()
+            .map(|v| v.as_str().expect("string").to_string())
+            .collect();
+        areas.sort();
+        assert_eq!(areas, expected, "{graph}");
+    }
 
     let body = format!("DESCRIBE ?a {W} GROUP BY ?a");
     let err = support::query_sparql(&fluree, &ledger, &format!("{PREFIX}{body}"))

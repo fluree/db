@@ -20,7 +20,7 @@ use super::projection::{Column, Projection};
 use super::reasoning::ReasoningConfig;
 use super::triple::{Ref, TriplePattern};
 use crate::sort::SortSpec;
-use crate::var_registry::VarId;
+use crate::var_registry::{VarId, VarRegistry};
 
 /// Resolved CONSTRUCT template patterns
 ///
@@ -166,6 +166,21 @@ impl ConstructTemplate {
         }
         if self.bnode_vars.remove(&old) {
             self.bnode_vars.insert(new);
+        }
+    }
+
+    /// Under `grouping`, the template is instantiated once per group row, and
+    /// a template variable that row does not bind is unbound (§16.2: the
+    /// triples that read it are skipped). Rename each such variable to one
+    /// nothing binds; template blank nodes are minted per row and stay.
+    pub fn unbind_outside_group_row(&mut self, grouping: &Grouping, vars: &mut VarRegistry) {
+        let unbound: HashSet<VarId> = self
+            .var_iter()
+            .filter(|v| !grouping.group_row_binds(*v) && !self.bnode_vars.contains(v))
+            .collect();
+        for var in unbound {
+            let fresh = vars.get_or_insert(&format!("?__construct_unbound_{}", vars.len()));
+            self.substitute_var(var, fresh);
         }
     }
 }

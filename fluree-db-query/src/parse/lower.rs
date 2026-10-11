@@ -138,10 +138,13 @@ pub(crate) fn lower_query<E: IriEncoder>(
             ungrouped: crate::ir::UngroupedProjection::Reject,
         },
         SelectMode::Construct => {
-            let template = match ast.construct_template {
+            let mut template = match ast.construct_template {
                 Some(ref t) => lower_construct_template(t, encoder, vars)?,
                 None => ConstructTemplate::new(Vec::new()),
             };
+            if let Some(grouping) = &grouping {
+                template.unbind_outside_group_row(grouping, vars);
+            }
             QueryOutput::Construct(template)
         }
         SelectMode::Ask => QueryOutput::Ask,

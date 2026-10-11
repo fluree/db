@@ -708,6 +708,57 @@ async fn jsonld_ask_groups() {
     }
 }
 
+/// `groupBy` / `having` group a `construct`: the template is instantiated once
+/// per group, and a template variable that is not a key is unbound in the group
+/// solution, so its triples are skipped (the SPARQL CONSTRUCT twin is
+/// `ask_and_construct_group`). It used to fail at format time on the per-group
+/// list.
+#[tokio::test]
+async fn jsonld_construct_groups() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "jsonld-grouped/construct:main").await;
+    // The aggregate streams; a dedup-only `groupBy` runs on the lane that
+    // carries the other WHERE variables as per-group lists.
+    for (having, expected) in [
+        (Some("(> (count ?e) 1)"), vec!["Local", "Net"]),
+        (None, vec!["Local", "Net", "Remote"]),
+    ] {
+        let mut query = json!({
+            "@context": {"ex": "http://example.org/"},
+            "construct": [
+                {"@id": "ex:summary", "ex:bigArea": "?a"},
+                {"@id": "?e", "ex:inBigArea": "?a"}
+            ],
+            "where": {"@id": "?e", "ex:area": "?a"},
+            "groupBy": ["?a"]
+        });
+        if let Some(having) = having {
+            query["having"] = json!(having);
+        }
+        let graph = support::query_jsonld(&fluree, &ledger, &query)
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{query}"))
+            .to_construct(&ledger.snapshot)
+            .unwrap_or_else(|e| panic!("{e}\n{query}"))["@graph"]
+            .clone();
+        let nodes = graph.as_array().expect("@graph");
+        assert_eq!(
+            nodes.len(),
+            1,
+            "only the summary node, no ?e triples: {graph}"
+        );
+        assert_eq!(nodes[0]["@id"], "ex:summary", "{graph}");
+        let mut areas: Vec<String> = nodes[0]["ex:bigArea"]
+            .as_array()
+            .expect("values")
+            .iter()
+            .map(|v| v.as_str().expect("string").to_string())
+            .collect();
+        areas.sort();
+        assert_eq!(areas, expected, "{graph}");
+    }
+}
+
 /// JSON-LD `having` has no EXISTS form (unlike a `filter`): one is refused at
 /// parse time, never evaluated as false. The SPARQL twin
 /// (`having_exists_is_evaluated_per_group`) evaluates it per group.
