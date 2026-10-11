@@ -6183,9 +6183,9 @@ mod tests {
         let fluree = FlureeBuilder::memory()
             .build_ipfs("http://127.0.0.1:5001")
             .expect("build_ipfs");
-        // Backend should be Permanent (IPFS), not Managed.
+        // Under the disk cache, the backend should be Permanent (IPFS), not Managed.
         assert!(matches!(
-            fluree.backend(),
+            fluree.backend().without_disk_cache(),
             fluree_db_core::StorageBackend::Permanent(_)
         ));
         // Admin storage should be None for IPFS (no raw Storage interface).
