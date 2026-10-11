@@ -885,19 +885,24 @@ impl BinaryIndexStore {
     /// opened and mapped once rather than per read. The lookup runs outside
     /// the cache's single-flight loader: nothing here fetches over the
     /// sync→async bridge, and the loader's `block_in_place` would otherwise
-    /// be paid on every open of a leaf the cache never holds.
+    /// be paid on every open of a leaf the cache never holds. The exception
+    /// is a store whose local reads decrypt: there the loader runs the read
+    /// once per leaf, off the async worker, however many cursors open it.
     fn local_leaf_bytes(
         &self,
         cs: &Arc<dyn ContentStore>,
         leaf_cid: &ContentId,
         leaf_id: u128,
     ) -> io::Result<Option<ContentBytes>> {
-        if let Some(bytes) = self
-            .leaflet_cache
-            .as_ref()
-            .and_then(|cache| cache.get_leaf_bytes(leaf_id))
-        {
-            return Ok(Some(bytes));
+        if let Some(cache) = &self.leaflet_cache {
+            if cs.costly_local_reads() {
+                return cache.try_get_or_load_leaf_bytes(leaf_id, || {
+                    cs.get_local(leaf_cid).map_err(storage_io_error)
+                });
+            }
+            if let Some(bytes) = cache.get_leaf_bytes(leaf_id) {
+                return Ok(Some(bytes));
+            }
         }
         let Some(bytes) = cs.get_local(leaf_cid).map_err(storage_io_error)? else {
             return Ok(None);
@@ -4585,6 +4590,92 @@ pub(crate) mod tests {
             unsafe { fluree_db_core::ContentBytes::open(&path) }
                 .map_err(|e| fluree_db_core::Error::io(e.to_string()))
         }
+    }
+
+    /// A store whose local reads cost work per call, as storage that
+    /// encrypts at rest does: each `get_local` takes a while and hands out
+    /// fresh heap bytes.
+    #[derive(Debug, Clone)]
+    struct DecryptingContentStore {
+        inner: MemoryContentStore,
+        local_reads: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ContentStore for DecryptingContentStore {
+        async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
+            self.inner.has(id).await
+        }
+
+        async fn get(
+            &self,
+            id: &ContentId,
+        ) -> fluree_db_core::Result<fluree_db_core::ContentBytes> {
+            self.inner.get(id).await
+        }
+
+        async fn put(&self, kind: ContentKind, bytes: &[u8]) -> fluree_db_core::Result<ContentId> {
+            self.inner.put(kind, bytes).await
+        }
+
+        async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> fluree_db_core::Result<()> {
+            self.inner.put_with_id(id, bytes).await
+        }
+
+        async fn release(&self, id: &ContentId) -> fluree_db_core::Result<()> {
+            self.inner.release(id).await
+        }
+
+        fn get_local(
+            &self,
+            id: &ContentId,
+        ) -> fluree_db_core::Result<Option<fluree_db_core::ContentBytes>> {
+            self.local_reads.fetch_add(1, AtomicOrdering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            Ok(self.inner.get_local(id)?.map(|bytes| bytes.to_vec().into()))
+        }
+
+        fn costly_local_reads(&self) -> bool {
+            true
+        }
+    }
+
+    /// Cursors that open one leaf at once on a store whose local reads
+    /// decrypt share one read, rather than each decrypting the whole leaf.
+    #[test]
+    fn concurrent_opens_of_a_leaf_that_decrypts_locally_read_it_once() {
+        let store = DecryptingContentStore {
+            inner: MemoryContentStore::new(),
+            local_reads: Arc::new(AtomicUsize::new(0)),
+        };
+        let leaf_bytes = build_test_leaf_bytes();
+        let leaf_cid = run_sync_on_runtime({
+            let store = store.clone();
+            async move {
+                store
+                    .put(ContentKind::IndexLeaf, &leaf_bytes)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))
+            }
+        })
+        .expect("store leaf bytes");
+        let mut binary_store = empty_store(Arc::new(store.clone()));
+        binary_store.leaflet_cache = Some(Arc::new(LeafletCache::with_max_mb(4)));
+
+        let openers = 8;
+        let start = std::sync::Barrier::new(openers);
+        std::thread::scope(|s| {
+            for _ in 0..openers {
+                s.spawn(|| {
+                    start.wait();
+                    let handle = binary_store
+                        .open_leaf_handle(&leaf_cid, None, false)
+                        .expect("open");
+                    assert_eq!(handle.dir().entries.len(), 1);
+                });
+            }
+        });
+        assert_eq!(store.local_reads.load(AtomicOrdering::SeqCst), 1);
     }
 
     /// A store that holds its blobs in memory and hands them out shared, as

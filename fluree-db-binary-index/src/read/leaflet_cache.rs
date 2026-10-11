@@ -669,6 +669,44 @@ impl LeafletCache {
         }
     }
 
+    /// A local leaf's bytes, read by `load` at most once however many
+    /// openers race on the leaf, inside a blocking region — for a store whose
+    /// local reads are costly (decryption). `Ok(None)` when the store does
+    /// not hold the leaf; neither that nor an error is cached.
+    pub fn try_get_or_load_leaf_bytes<F>(
+        &self,
+        key: u128,
+        load: F,
+    ) -> io::Result<Option<ContentBytes>>
+    where
+        F: FnOnce() -> io::Result<Option<ContentBytes>>,
+    {
+        enum Miss {
+            Absent,
+            Failed(io::Error),
+        }
+        // Fast path: a plain hit must not pay the block_in_place cost.
+        if let Some(bytes) = self.get_leaf_bytes(key) {
+            return Ok(Some(bytes));
+        }
+        let result = in_blocking_region(|| {
+            self.inner
+                .try_get_with(CacheKey::LeafBytes(key), || match load() {
+                    Ok(Some(bytes)) => Ok(CachedEntry::LeafBytes(bytes)),
+                    Ok(None) => Err(Miss::Absent),
+                    Err(err) => Err(Miss::Failed(err)),
+                })
+        });
+        match result {
+            Ok(CachedEntry::LeafBytes(bytes)) => Ok(Some(bytes)),
+            Ok(_) => unreachable!("LeafBytes key always maps to LeafBytes entry"),
+            Err(miss) => match miss.as_ref() {
+                Miss::Absent => Ok(None),
+                Miss::Failed(err) => Err(io::Error::new(err.kind(), err.to_string())),
+            },
+        }
+    }
+
     /// Get or load a decoded leaf directory with single-flight and error
     /// propagation.
     ///

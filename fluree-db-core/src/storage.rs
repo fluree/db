@@ -769,6 +769,15 @@ pub trait ContentStore: Debug + Send + Sync {
         false
     }
 
+    /// Whether [`Self::get_local`] does work in proportion to the object —
+    /// decrypting it — rather than hand back bytes this machine already
+    /// holds. A reader that may be asked for one object from several threads
+    /// at once then loads it once, off the async workers. The default is
+    /// `false`.
+    fn costly_local_reads(&self) -> bool {
+        false
+    }
+
     /// Make every write this store reported complete short of the device
     /// durable now; see [`StorageWrite::sync`]. Call it before publishing a
     /// pointer to content written through this store.
@@ -828,6 +837,10 @@ impl ContentStore for Arc<dyn ContentStore> {
 
     fn supports_ranged_reads(&self) -> bool {
         self.as_ref().supports_ranged_reads()
+    }
+
+    fn costly_local_reads(&self) -> bool {
+        self.as_ref().costly_local_reads()
     }
 
     fn keep_local(&self, id: &ContentId, bytes: &[u8]) {
@@ -1149,6 +1162,11 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
 
     fn supports_ranged_reads(&self) -> bool {
         self.storage.supports_ranged_reads()
+    }
+
+    /// A storage that encrypts at rest decrypts every local read.
+    fn costly_local_reads(&self) -> bool {
+        self.storage.encryption_admin().is_some()
     }
 
     fn miss_register(&self) -> Option<&residency::MissRegister> {
@@ -1614,6 +1632,12 @@ impl ContentStore for BranchedContentStore {
             && self.parents.iter().all(ContentStore::supports_ranged_reads)
     }
 
+    /// A local read may be served by any ancestor.
+    fn costly_local_reads(&self) -> bool {
+        self.branch_store.costly_local_reads()
+            || self.parents.iter().any(ContentStore::costly_local_reads)
+    }
+
     fn miss_register(&self) -> Option<&residency::MissRegister> {
         self.branch_store
             .miss_register()
@@ -2029,6 +2053,7 @@ mod tests {
     struct HintRecorder {
         held: Vec<ContentId>,
         ranged: bool,
+        costly: bool,
         kept: Mutex<Vec<ContentId>>,
         prefetched: Mutex<Vec<ContentId>>,
     }
@@ -2038,6 +2063,7 @@ mod tests {
             Arc::new(Self {
                 held: vec![id.clone()],
                 ranged: true,
+                costly: true,
                 ..Self::default()
             })
         }
@@ -2075,6 +2101,9 @@ mod tests {
         fn supports_ranged_reads(&self) -> bool {
             self.ranged
         }
+        fn costly_local_reads(&self) -> bool {
+            self.costly
+        }
         fn keep_local(&self, id: &ContentId, _bytes: &[u8]) {
             self.kept.lock().unwrap().push(id.clone());
         }
@@ -2093,6 +2122,7 @@ mod tests {
     async fn an_arc_dyn_store_forwards_every_hint() {
         async fn hints<S: ContentStore>(store: &S, id: &ContentId) {
             assert!(store.supports_ranged_reads());
+            assert!(store.costly_local_reads());
             assert!(store.get_local(id).unwrap().is_some());
             store.keep_local(id, b"bytes");
             store.prefetch(id).await.unwrap();
@@ -2121,6 +2151,7 @@ mod tests {
         );
 
         assert!(store.supports_ranged_reads());
+        assert!(store.costly_local_reads());
         assert!(store.get_local(&inherited).unwrap().is_some());
         store.keep_local(&inherited, b"bytes");
         assert_eq!(branch.kept(), vec![inherited.clone()]);
@@ -2142,6 +2173,13 @@ mod tests {
             )],
         );
         assert!(!unranged.supports_ranged_reads());
+        let cheap = BranchedContentStore::with_parents(
+            Arc::new(HintRecorder::default()),
+            vec![BranchedContentStore::leaf(
+                Arc::new(HintRecorder::default()),
+            )],
+        );
+        assert!(!cheap.costly_local_reads());
     }
 
     /// Memory storage is keyed by address while readers ask by CID: the

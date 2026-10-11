@@ -153,6 +153,10 @@ impl ContentStore for MeteredContentStore {
         self.inner.supports_ranged_reads()
     }
 
+    fn costly_local_reads(&self) -> bool {
+        self.inner.costly_local_reads()
+    }
+
     fn keep_local(&self, id: &ContentId, bytes: &[u8]) {
         self.inner.keep_local(id, bytes);
     }
@@ -253,6 +257,9 @@ mod tests {
         fn supports_ranged_reads(&self) -> bool {
             true
         }
+        fn costly_local_reads(&self) -> bool {
+            true
+        }
         fn keep_local(&self, id: &ContentId, _bytes: &[u8]) {
             self.kept.lock().unwrap().push(id.clone());
         }
@@ -271,6 +278,7 @@ mod tests {
         let id = ContentId::new(ContentKind::IndexLeaf, b"leaf");
 
         assert!(metered.supports_ranged_reads());
+        assert!(metered.costly_local_reads());
         assert!(metered.get_local(&id).unwrap().is_some());
         metered.keep_local(&id, b"bytes");
         metered.prefetch(&id).await.unwrap();

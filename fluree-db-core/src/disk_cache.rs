@@ -1012,6 +1012,10 @@ impl ContentStore for CachedContentStore {
         self.inner.supports_ranged_reads()
     }
 
+    fn costly_local_reads(&self) -> bool {
+        self.inner.costly_local_reads()
+    }
+
     async fn put(&self, kind: crate::ContentKind, bytes: &[u8]) -> crate::error::Result<ContentId> {
         self.inner.put(kind, bytes).await
     }
