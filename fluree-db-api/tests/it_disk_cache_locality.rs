@@ -377,7 +377,8 @@ async fn a_child_branch_miss_does_not_fail_a_concurrent_parent_read() {
 }
 
 /// Verification reads the storage itself: a commit the storage lost is
-/// reported missing even while this process's disk cache holds a copy.
+/// reported missing even while the disk cache directory holds a copy, as one
+/// written by a release that cached commits would.
 #[tokio::test(flavor = "multi_thread")]
 async fn verify_reports_a_commit_the_storage_lost_despite_a_cached_copy() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -401,12 +402,13 @@ async fn verify_reports_a_commit_the_storage_lost_despite_a_cached_copy() {
         .receipt
         .commit_id;
 
-    fluree
+    let head_bytes = fluree
         .content_store(ledger_id)
         .get(&head)
         .await
         .expect("read the head");
-    assert!(cache_dir.join(head.to_string()).exists(), "head not cached");
+    std::fs::create_dir_all(&cache_dir).expect("cache dir");
+    std::fs::write(cache_dir.join(head.to_string()), &head_bytes[..]).expect("plant a copy");
     let address = fluree_db_core::storage::content_address(
         storage.storage_method(),
         ContentKind::Commit,

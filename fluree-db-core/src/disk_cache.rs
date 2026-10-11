@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
-use crate::{ContentBytes, ContentId, ContentStore};
+use crate::{ContentBytes, ContentId, ContentKind, ContentStore};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
@@ -777,7 +777,8 @@ impl DiskArtifactCache {
 /// stores whose reads leave the machine, and every read through the wrapper
 /// is served from the inner store's local tier, then this cache, then a
 /// fetch that writes the cache. A local store is never wrapped, so it is
-/// never copied into the cache.
+/// never copied into the cache. Only index artifacts are cached; other
+/// objects are fetched straight through (see [`is_cached_kind`]).
 ///
 /// Built [`uncached`](Self::uncached) (for a store whose bytes may not sit
 /// on disk in plaintext) it still coalesces concurrent fetches of one object,
@@ -796,6 +797,33 @@ pub struct CachedContentStore {
     flights: Arc<StoreFlights>,
     /// The namespace `inner` reads, which scopes its flights in `flights`.
     scope: Arc<str>,
+}
+
+/// Whether objects of `kind` get a disk-cache entry: the index artifacts that
+/// queries and the indexer read again and again. Commits, transactions and
+/// the other objects a load or fold reads once are fetched (and coalesced)
+/// but not written: caching them would push hot leaves out of a cache that
+/// evicts in write order, and would put transaction data on local disk.
+fn is_cached_kind(kind: &ContentKind) -> bool {
+    match kind {
+        ContentKind::IndexRoot
+        | ContentKind::IndexBranch
+        | ContentKind::IndexLeaf
+        | ContentKind::DictBlob { .. }
+        | ContentKind::HistorySidecar
+        | ContentKind::GarbageRecord
+        | ContentKind::StatsSketch
+        | ContentKind::SpatialIndex
+        | ContentKind::AnnotationForwardBranch
+        | ContentKind::AnnotationForwardLeaf
+        | ContentKind::AnnotationReverseBranch
+        | ContentKind::AnnotationReverseLeaf => true,
+        ContentKind::Commit
+        | ContentKind::Txn
+        | ContentKind::LedgerConfig
+        | ContentKind::GraphSourceSnapshot
+        | ContentKind::GraphSourceMapping => false,
+    }
 }
 
 /// In-flight fetches of the stores one backend hands out, keyed by namespace
@@ -829,10 +857,13 @@ impl CachedContentStore {
         }
     }
 
+    /// Where `id`'s cache entry lives, when this store caches it at all.
     fn entry(&self, id: &ContentId) -> Option<PathBuf> {
-        self.disk
+        let cache = self.disk.as_ref()?;
+        id.content_kind()
             .as_ref()
-            .map(|cache| cache.root.join(id.to_string()))
+            .is_some_and(is_cached_kind)
+            .then(|| cache.root.join(id.to_string()))
     }
 
     /// `id` from the inner store, one fetch per object in flight in this
@@ -1662,6 +1693,31 @@ mod tests {
         assert_eq!(store.get(&id).await.unwrap(), data);
         assert_eq!(fs::read(&entry).unwrap(), data, "the fetch rewrote it");
         assert_eq!(store.get_local(&id).unwrap().unwrap(), data);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Only index artifacts get an entry. A commit is fetched through every
+    /// time and never written, so a fold over a long history leaves the
+    /// cache's leaves alone and keeps transaction data off local disk.
+    #[tokio::test]
+    async fn only_index_artifacts_are_written_to_the_cache() {
+        let dir = temp_cache_dir("wrapper-kinds");
+        let data = vec![4u8; 64];
+        let commit = ContentId::new(crate::ContentKind::Commit, &data);
+        let inner = Arc::new(CountingStore::remote(&data));
+        let store = cached(Arc::clone(&inner), &dir);
+
+        store.get(&commit).await.unwrap();
+        store.keep_local(&commit, &data);
+        store.prefetch(&commit).await.unwrap();
+        assert!(store.get_local(&commit).unwrap().is_none());
+        assert!(regular_files_under(&dir).is_empty(), "no commit entry");
+        store.get(&commit).await.unwrap();
+        assert_eq!(inner.gets(), 2, "each read fetches");
+
+        let leaf = ContentId::new(crate::ContentKind::IndexLeaf, &data);
+        store.get(&leaf).await.unwrap();
+        assert_eq!(regular_files_under(&dir), vec![dir.join(leaf.to_string())]);
         let _ = fs::remove_dir_all(&dir);
     }
 
