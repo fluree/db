@@ -201,7 +201,9 @@ pub fn compare_bindings(a: &Binding, b: &Binding) -> Ordering {
         (Binding::Poisoned, _) => Ordering::Less,
         (_, Binding::Poisoned) => Ordering::Greater,
 
-        // Grouped sorts last (should not appear in normal sort contexts)
+        // Grouped sorts last. Unreachable: a sort key never reads a per-group
+        // list (the plan-time `Grouping::first_ungrouped_read` check); this
+        // comparator cannot fail, so it keeps a total order.
         (Binding::Grouped(_), Binding::Grouped(_)) => {
             debug_assert!(
                 false,
