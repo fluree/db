@@ -112,11 +112,19 @@ impl PredicateGroupCountFirstsOperator {
 
     async fn open_fallback(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         use crate::dataset_operator::DatasetOperator;
+        use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
         use crate::group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
         use crate::ir::triple::{Ref, TriplePattern};
         use crate::ir::AggregateFn;
         use crate::limit::LimitOperator;
         use crate::sort::{SortDirection, SortOperator, SortSpec};
+
+        // The plan stamped `Proceed` when the detector matched; a decline at
+        // open is stamped here, so planned and executed can be told apart.
+        stamp_fast_path(
+            "group_by_object_count_topk",
+            FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
+        );
 
         let tp = TriplePattern::new(
             Ref::Var(self.subject_var),
@@ -365,9 +373,17 @@ impl PredicateObjectCountFirstsOperator {
 
     async fn open_fallback(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         use crate::dataset_operator::DatasetOperator;
+        use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
         use crate::group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
         use crate::ir::triple::{Ref, TriplePattern};
         use crate::ir::AggregateFn;
+
+        // As for the count top-k: the plan stamped `Proceed`; a decline at
+        // open is stamped here.
+        stamp_fast_path(
+            "predicate_object_count",
+            FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
+        );
 
         let tp = TriplePattern::new(
             Ref::Var(self.subject_var),

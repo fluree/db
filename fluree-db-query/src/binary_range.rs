@@ -320,6 +320,34 @@ impl BinaryRangeProvider {
     pub fn runtime_small_dicts(&self) -> &Arc<RuntimeSmallDicts> {
         &self.runtime_small_dicts
     }
+
+    /// The key a persisted row holding `flake`'s object carries in graph
+    /// `g_id` under the flake's predicate: `(o_type, o_key)`, the index's
+    /// identity for the object, as overlay retractions are matched against
+    /// it.
+    ///
+    /// The index keeps less than some values carry — a big integer keeps no
+    /// XSD subtype, a `dateTime` or `time` keeps microseconds — so distinct
+    /// terms can share a key. Terms that share one are one stored fact.
+    ///
+    /// `None` when no persisted row can hold the object: its predicate,
+    /// string, subject, language tag, datatype or big number is not in the
+    /// persisted dictionaries, or it is a vector (keyed by fact, not by
+    /// value).
+    pub fn persisted_object_key(&self, g_id: GraphId, flake: &Flake) -> Option<(u16, u64)> {
+        let p_id = self.store.sid_to_p_id(&flake.p)?;
+        let lang = flake.m.as_ref().and_then(|m| m.lang.as_deref());
+        crate::binary_scan::value_to_otype_okey(
+            &flake.o,
+            &flake.dt,
+            lang,
+            &self.store,
+            None,
+            Some((g_id, p_id)),
+        )
+        .ok()
+        .map(|(o_type, o_key)| (o_type.as_u16(), o_key))
+    }
 }
 
 impl RangeProvider for BinaryRangeProvider {
@@ -414,6 +442,111 @@ fn raw_fact_may_match(f: &Flake, match_val: &RangeMatch) -> bool {
     match_val.s.as_ref().is_none_or(|s| f.s == *s)
         && match_val.p.as_ref().is_none_or(|p| f.p == *p)
         && match_val.o.as_ref().is_none_or(|o| f.o == *o)
+}
+
+/// The overlay side of one V3 range probe: the translated ops the cursor
+/// merges, the untranslatable flakes that may match the probe, and the
+/// ephemeral predicate ids the ops use.
+struct ProbeOverlay {
+    ops: Arc<[fluree_db_binary_index::OverlayOp]>,
+    untranslated: Vec<Flake>,
+    ephemeral_p_id_to_sid: Arc<HashMap<u32, Sid>>,
+}
+
+/// Translate `overlay` for one probe.
+///
+/// An effectively empty overlay (`NoOverlay`, or a novelty holding no
+/// flakes) contributes nothing, so it returns before touching the
+/// translation LRU. Staging reads the persisted index through `NoOverlay`
+/// once per retraction group, and `NoOverlay` vouches for a content version,
+/// so without this check every new `to_t` put an empty entry into the
+/// process-wide LRU — eight slots, keyed on `to_t` — and evicted a live
+/// query's novelty translation once per commit.
+///
+/// Otherwise unfiltered translations are served from the cross-call LRU when
+/// the overlay reports a content version (raw `Novelty` does) — see
+/// `range_translation_cache` for why fresh per-call translation makes
+/// point-lookup loops quadratic in novelty size. When the caller supplied a
+/// projection-predicate allow-list, the translation is fresh and filtered on
+/// `flake.p`: the allow-list changes both the translated set and the
+/// raw-fallback set (it must not smuggle non-selected predicates back in),
+/// so that product is not cacheable under the unfiltered key. Sid match (vs
+/// persisted p_id) so novel predicates still pass.
+#[allow(clippy::too_many_arguments)]
+fn probe_overlay(
+    overlay: &dyn OverlayProvider,
+    g_id: GraphId,
+    index: IndexType,
+    effective_to_t: i64,
+    store: &Arc<BinaryIndexStore>,
+    dict_novelty: &Arc<DictNovelty>,
+    runtime_small_dicts: &Arc<RuntimeSmallDicts>,
+    match_val: &RangeMatch,
+    predicate_filter: Option<&[Sid]>,
+) -> ProbeOverlay {
+    if overlay.is_effectively_empty() {
+        return ProbeOverlay {
+            ops: Arc::from(Vec::new()),
+            untranslated: Vec::new(),
+            ephemeral_p_id_to_sid: Arc::new(HashMap::new()),
+        };
+    }
+    let cached = if predicate_filter.is_none() {
+        cached_overlay_translation(
+            overlay,
+            g_id,
+            index,
+            effective_to_t,
+            store,
+            dict_novelty,
+            runtime_small_dicts,
+            "V3 range",
+        )
+    } else {
+        None
+    };
+    if let Some(entry) = cached {
+        return ProbeOverlay {
+            ops: Arc::clone(&entry.ops),
+            untranslated: raw_window(&entry.raw, index, match_val)
+                .iter()
+                .filter(|f| raw_fact_may_match(f, match_val))
+                .cloned()
+                .collect(),
+            ephemeral_p_id_to_sid: Arc::clone(&entry.ephemeral_p_id_to_sid),
+        };
+    }
+    let predicate_filter_sids = predicate_filter.map(<[Sid]>::to_vec);
+    let OverlayTranslateV3Result {
+        mut ops,
+        raw,
+        ephemeral_p_id_to_sid,
+        failed: _overlay_failed_translation,
+    } = translate_overlay_ops_v3_with_raw(
+        overlay,
+        g_id,
+        index,
+        effective_to_t,
+        store,
+        dict_novelty,
+        runtime_small_dicts,
+        move |flake| match &predicate_filter_sids {
+            Some(allow) => allow.iter().any(|p| p == &flake.p),
+            None => true,
+        },
+        "V3 range",
+    );
+    let order = index_type_to_sort_order(index);
+    fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, order);
+    fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
+    ProbeOverlay {
+        ops: Arc::from(ops),
+        untranslated: raw
+            .into_iter()
+            .filter(|f| raw_fact_may_match(f, match_val))
+            .collect(),
+        ephemeral_p_id_to_sid: Arc::new(ephemeral_p_id_to_sid),
+    }
 }
 
 /// V3 equality range query: scan the appropriate index order with filters,
@@ -642,73 +775,21 @@ fn binary_range_eq_v3(
             })
             .collect();
 
-    // Overlay translation. Unfiltered translations are served from the
-    // cross-call LRU when the overlay reports a content version (raw
-    // `Novelty` does) — see `range_translation_cache` for why fresh per-call
-    // translation makes point-lookup loops quadratic in novelty size.
-    //
-    // When the caller supplied a projection-predicate allow-list, translate
-    // fresh with the `flake.p` filter as before — the allow-list changes
-    // both the translated set and the raw-fallback set (it must not smuggle
-    // non-selected predicates back in), so that product is not cacheable
-    // under the unfiltered key. Sid match (vs persisted p_id) so novel
-    // predicates still pass.
-    let cached = if opts.predicate_filter.is_none() {
-        cached_overlay_translation(
-            overlay,
-            g_id,
-            index,
-            effective_to_t,
-            store,
-            dict_novelty,
-            runtime_small_dicts,
-            "V3 range",
-        )
-    } else {
-        None
-    };
-    let (overlay_ops, untranslated, ephemeral_p_id_to_sid) = match cached {
-        Some(entry) => (
-            Arc::clone(&entry.ops),
-            raw_window(&entry.raw, index, match_val)
-                .iter()
-                .filter(|f| raw_fact_may_match(f, match_val))
-                .cloned()
-                .collect::<Vec<Flake>>(),
-            Arc::clone(&entry.ephemeral_p_id_to_sid),
-        ),
-        None => {
-            let predicate_filter_sids = opts.predicate_filter.clone();
-            let OverlayTranslateV3Result {
-                mut ops,
-                raw,
-                ephemeral_p_id_to_sid,
-                failed: _overlay_failed_translation,
-            } = translate_overlay_ops_v3_with_raw(
-                overlay,
-                g_id,
-                index,
-                effective_to_t,
-                store,
-                dict_novelty,
-                runtime_small_dicts,
-                move |flake| match &predicate_filter_sids {
-                    Some(allow) => allow.iter().any(|p| p == &flake.p),
-                    None => true,
-                },
-                "V3 range",
-            );
-            fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, order);
-            fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
-            (
-                Arc::<[fluree_db_binary_index::OverlayOp]>::from(ops),
-                raw.into_iter()
-                    .filter(|f| raw_fact_may_match(f, match_val))
-                    .collect(),
-                Arc::new(ephemeral_p_id_to_sid),
-            )
-        }
-    };
+    let ProbeOverlay {
+        ops: overlay_ops,
+        untranslated,
+        ephemeral_p_id_to_sid,
+    } = probe_overlay(
+        overlay,
+        g_id,
+        index,
+        effective_to_t,
+        store,
+        dict_novelty,
+        runtime_small_dicts,
+        match_val,
+        opts.predicate_filter.as_deref(),
+    );
     if !untranslated.is_empty() {
         tracing::trace!(
             raw_merged = untranslated.len(),
@@ -2071,6 +2152,43 @@ mod tests {
         assert_eq!(
             overlay.yielded.load(std::sync::atomic::Ordering::Relaxed),
             2
+        );
+    }
+
+    /// A probe through an overlay with nothing in it — `NoOverlay`, which
+    /// staging uses for every base-only read — translates nothing and must
+    /// leave the process-wide translation LRU alone. `NoOverlay` reports a
+    /// content version, so each new `to_t` used to add an empty entry, and
+    /// with eight slots a few commits evicted a live query's translation.
+    #[test]
+    fn an_empty_overlay_probe_leaves_the_translation_lru_alone() {
+        let store = Arc::new(BinaryIndexStore::empty(std::env::temp_dir()));
+        let dict_novelty = Arc::new(DictNovelty::new_uninitialized());
+        let small_dicts = Arc::new(RuntimeSmallDicts::new());
+        let probe = RangeMatch::subject_predicate(s("a"), s("weight"));
+        for to_t in 1..=3 {
+            let out = probe_overlay(
+                &fluree_db_core::NoOverlay,
+                0,
+                IndexType::Spot,
+                to_t,
+                &store,
+                &dict_novelty,
+                &small_dicts,
+                &probe,
+                None,
+            );
+            assert!(out.ops.is_empty() && out.untranslated.is_empty());
+        }
+        let entries_for_store = range_translation_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(key, _)| key.store_id == store.store_id())
+            .count();
+        assert_eq!(
+            entries_for_store, 0,
+            "an empty overlay must not occupy translation LRU slots"
         );
     }
 }

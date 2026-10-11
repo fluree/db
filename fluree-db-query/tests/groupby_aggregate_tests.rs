@@ -23,18 +23,16 @@ use std::sync::Arc;
 fn aggregation(aggregates: Vec<AggregateSpec>) -> Aggregation {
     Aggregation {
         aggregates: NonEmpty::try_from_vec(aggregates).expect("non-empty aggregates"),
-        binds: Vec::new(),
     }
 }
 
 fn explicit_grouping(by: Vec<VarId>, aggregates: Vec<AggregateSpec>) -> Grouping {
     Grouping::Explicit {
         group_by: NonEmpty::try_from_vec(by).expect("non-empty group_by"),
-        aggregation: NonEmpty::try_from_vec(aggregates).map(|aggregates| Aggregation {
-            aggregates,
-            binds: Vec::new(),
-        }),
+        aggregation: NonEmpty::try_from_vec(aggregates)
+            .map(|aggregates| Aggregation { aggregates }),
         having: None,
+        binds: Vec::new(),
     }
 }
 
@@ -45,11 +43,10 @@ fn explicit_grouping_having(
 ) -> Grouping {
     Grouping::Explicit {
         group_by: NonEmpty::try_from_vec(by).expect("non-empty group_by"),
-        aggregation: NonEmpty::try_from_vec(aggregates).map(|aggregates| Aggregation {
-            aggregates,
-            binds: Vec::new(),
-        }),
+        aggregation: NonEmpty::try_from_vec(aggregates)
+            .map(|aggregates| Aggregation { aggregates }),
         having: Some(having),
+        binds: Vec::new(),
     }
 }
 
@@ -57,6 +54,7 @@ fn implicit_grouping(aggregates: Vec<AggregateSpec>) -> Grouping {
     Grouping::Implicit {
         aggregation: aggregation(aggregates),
         having: None,
+        binds: Vec::new(),
     }
 }
 
@@ -605,7 +603,8 @@ async fn test_order_by_on_grouped_var_errors() {
     );
 
     // GROUP BY ?city, no aggregates: ?person becomes Grouped(...)
-    // ORDER BY ?person is undefined -> should error.
+    // ORDER BY ?person is undefined -> should error. (The SPARQL and JSON-LD
+    // lowerers never build this: they read it as SAMPLE(?person).)
     query.grouping = Some(explicit_grouping(vec![VarId(0)], vec![]));
     query.ordering = vec![fluree_db_query::sort::SortSpec::asc(VarId(1))];
 
@@ -615,7 +614,8 @@ async fn test_order_by_on_grouped_var_errors() {
         .await
         .unwrap_err();
     assert!(
-        err.to_string().contains("Cannot ORDER BY"),
+        err.to_string()
+            .contains("ORDER BY variable VarId(1) is neither a GROUP BY key nor an aggregate"),
         "unexpected error: {err}"
     );
 }
@@ -678,8 +678,10 @@ async fn test_aggregate_output_onto_group_by_key_errors() {
     let snapshot = make_test_snapshot();
     let vars = VarRegistry::new();
 
+    // Projects only the key: projecting the ungrouped ?person would fail the
+    // plan before the aggregate check this test is about.
     let mut query = make_query(
-        vec![VarId(0), VarId(1)],
+        vec![VarId(0)],
         vec![Pattern::Values {
             vars: vec![VarId(0), VarId(1)],
             rows: vec![vec![
@@ -705,7 +707,8 @@ async fn test_aggregate_output_onto_group_by_key_errors() {
         .await
         .unwrap_err();
     assert!(
-        err.to_string().contains("already exists in schema"),
+        err.to_string()
+            .contains("is already bound in the WHERE pattern"),
         "unexpected error: {err}"
     );
 }

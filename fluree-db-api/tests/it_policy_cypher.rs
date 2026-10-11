@@ -232,6 +232,61 @@ async fn cypher_where_metadata_filter_under_policy_sees_filtered_flakes() {
     );
 }
 
+#[tokio::test]
+async fn cypher_with_where_metadata_after_aggregation_under_policy_sees_filtered_flakes() {
+    // After an aggregating WITH, the WHERE lowers to HAVING, which evaluates
+    // with FILTER's predicate: a metadata read resolves through the policy
+    // filter. With the synchronous readers (fail-closed under policy) keys(n)
+    // read as empty, so `size(keys(n)) = 1` matched no node.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/policy-cypher:with-where";
+    let l = seed(&fluree, ledger_id).await;
+
+    let qc_opts = GovernanceOptions {
+        policy: Some(deny_secret_policy()),
+        default_allow: Some(true),
+        ..Default::default()
+    };
+    let db_policy = fluree
+        .db_with_policy(ledger_id, &qc_opts)
+        .await
+        .expect("db_with_policy");
+    let q = |keys: usize| {
+        format!(
+            "MATCH (n:Person) WITH n, count(*) AS c WHERE size(keys(n)) = {keys} \
+             RETURN n.name AS name ORDER BY name"
+        )
+    };
+
+    let policed = fluree
+        .query_cypher(&db_policy, &q(1))
+        .await
+        .expect("cypher with-where metadata under policy")
+        .to_jsonld_async(db_policy.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        all_strings(&policed),
+        ["Alice", "Bob"],
+        "with secret hidden, each node has one visible key: {policed}"
+    );
+
+    // Control: without policy each node has both keys.
+    let db_root = graphdb_from_ledger(&l);
+    let rooted = fluree
+        .query_cypher(&db_root, &q(2))
+        .await
+        .expect("cypher with-where metadata root")
+        .to_jsonld_async(db_root.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        all_strings(&rooted),
+        ["Alice", "Bob"],
+        "without policy each node has two keys: {rooted}"
+    );
+}
+
 /// Every string inside a typed cell tree (node labels, property keys and
 /// values, nested lists/maps), for leak assertions on the Bolt-facing
 /// typed-table formatter.
