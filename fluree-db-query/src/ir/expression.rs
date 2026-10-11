@@ -111,25 +111,45 @@ pub enum Expression {
     Resolved(Box<crate::binding::Binding>),
 }
 
+/// Which variables an [`Expression`] walk covers: every one it mentions, or
+/// only the ones it reads from its row (see [`Expression::row_reads`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VarScope {
+    All,
+    RowReads,
+}
+
 impl Expression {
     /// Rename every occurrence of variable `old` to `new` (recursively through
     /// call arguments and EXISTS sub-patterns). Used by the equijoin-filter fold.
     pub fn substitute_var(&mut self, old: VarId, new: VarId) {
+        self.substitute(old, new, VarScope::All);
+    }
+
+    /// Rename `old` to `new` where this expression reads it from its row
+    /// ([`Self::row_reads`]), leaving its correlated sub-patterns alone: inside
+    /// them `old` stays the variable the row binds, or a free one. The grouped
+    /// SAMPLE rewrite renames this way.
+    pub fn substitute_row_read(&mut self, old: VarId, new: VarId) {
+        self.substitute(old, new, VarScope::RowReads);
+    }
+
+    fn substitute(&mut self, old: VarId, new: VarId, scope: VarScope) {
         match self {
             Expression::Var(v) => {
                 if *v == old {
                     *v = new;
                 }
             }
-            Expression::Const(_) => {}
+            Expression::Const(_) | Expression::Resolved(_) => {}
             Expression::Call { args, .. } => {
                 for arg in args {
-                    arg.substitute_var(old, new);
+                    arg.substitute(old, new, scope);
                 }
             }
             Expression::Map(entries) => {
                 for (_, v) in entries {
-                    v.substitute_var(old, new);
+                    v.substitute(old, new, scope);
                 }
             }
             // Scoped iteration: always rename in the list/init (outer scope), but
@@ -140,13 +160,13 @@ impl Expression {
                 filter,
                 map,
             } => {
-                list.substitute_var(old, new);
+                list.substitute(old, new, scope);
                 if *var != old {
                     if let Some(f) = filter {
-                        f.substitute_var(old, new);
+                        f.substitute(old, new, scope);
                     }
                     if let Some(m) = map {
-                        m.substitute_var(old, new);
+                        m.substitute(old, new, scope);
                     }
                 }
             }
@@ -157,10 +177,10 @@ impl Expression {
                 list,
                 body,
             } => {
-                init.substitute_var(old, new);
-                list.substitute_var(old, new);
+                init.substitute(old, new, scope);
+                list.substitute(old, new, scope);
                 if *acc != old && *var != old {
-                    body.substitute_var(old, new);
+                    body.substitute(old, new, scope);
                 }
             }
             Expression::ListPredicate {
@@ -169,27 +189,41 @@ impl Expression {
                 predicate,
                 ..
             } => {
-                list.substitute_var(old, new);
+                list.substitute(old, new, scope);
                 if *var != old {
-                    predicate.substitute_var(old, new);
+                    predicate.substitute(old, new, scope);
                 }
             }
-            Expression::Member { target, .. } => target.substitute_var(old, new),
+            Expression::Member { target, .. } => target.substitute(old, new, scope),
             Expression::Exists { patterns, .. } => {
-                for p in patterns {
-                    p.substitute_var(old, new);
+                if scope == VarScope::All {
+                    for p in patterns {
+                        p.substitute_var(old, new);
+                    }
                 }
             }
             Expression::PatternComprehension {
                 patterns,
                 projection,
-            } => {
-                for p in patterns {
-                    p.substitute_var(old, new);
+            } => match scope {
+                VarScope::All => {
+                    for p in patterns.iter_mut() {
+                        p.substitute_var(old, new);
+                    }
+                    projection.substitute(old, new, scope);
                 }
-                projection.substitute_var(old, new);
-            }
-            Expression::Resolved(_) => {}
+                // A projection variable the pattern also mentions is the
+                // pattern's; only an outer one is a read of the row.
+                VarScope::RowReads => {
+                    if !patterns
+                        .iter()
+                        .flat_map(Pattern::referenced_vars)
+                        .any(|v| v == old)
+                    {
+                        projection.substitute(old, new, scope);
+                    }
+                }
+            },
         }
     }
 
@@ -547,20 +581,47 @@ impl Expression {
         }
     }
 
-    /// Variables this expression references when evaluated. Expressions
-    /// produce values, never bindings, so there is no `produced_vars`
-    /// counterpart.
+    /// Variables this expression references when evaluated, including every
+    /// variable its correlated sub-patterns mention (see [`Self::row_reads`]).
+    /// Expressions produce values, never bindings, so there is no
+    /// `produced_vars` counterpart.
     pub fn referenced_vars(&self) -> Vec<VarId> {
+        let mut vars = Vec::new();
+        self.collect_vars(VarScope::All, &mut vars);
+        vars
+    }
+
+    /// Variables this expression reads from the row it is evaluated on:
+    /// [`Self::referenced_vars`] without the variables of its correlated
+    /// sub-patterns, an `EXISTS` / `NOT EXISTS` body and a pattern
+    /// comprehension's pattern (with what its projection reads from that
+    /// pattern).
+    ///
+    /// A sub-pattern correlates with the row only where the row binds its
+    /// variables; any other variable is free inside it (SPARQL's
+    /// `substitute(P, μ)`). Over a group row, then, these are what the grouping
+    /// has to supply: a sub-pattern variable it does not supply is not read,
+    /// it is free.
+    pub fn row_reads(&self) -> Vec<VarId> {
+        let mut vars = Vec::new();
+        self.collect_vars(VarScope::RowReads, &mut vars);
+        vars
+    }
+
+    fn collect_vars(&self, scope: VarScope, out: &mut Vec<VarId>) {
         match self {
-            Expression::Var(v) => vec![*v],
-            Expression::Const(_) => Vec::new(),
+            Expression::Var(v) => out.push(*v),
+            Expression::Const(_) | Expression::Resolved(_) => {}
             Expression::Call { args, .. } => {
-                args.iter().flat_map(Expression::referenced_vars).collect()
+                for arg in args {
+                    arg.collect_vars(scope, out);
+                }
             }
-            Expression::Map(entries) => entries
-                .iter()
-                .flat_map(|(_, v)| v.referenced_vars())
-                .collect(),
+            Expression::Map(entries) => {
+                for (_, v) in entries {
+                    v.collect_vars(scope, out);
+                }
+            }
             // The loop/acc variables are bound internally — exclude them, but
             // keep the free vars referenced by the list and the scoped bodies.
             Expression::ListComprehension {
@@ -569,17 +630,15 @@ impl Expression {
                 filter,
                 map,
             } => {
-                let mut vars = list.referenced_vars();
+                list.collect_vars(scope, out);
                 let mut inner = Vec::new();
                 if let Some(f) = filter {
-                    inner.extend(f.referenced_vars());
+                    f.collect_vars(scope, &mut inner);
                 }
                 if let Some(m) = map {
-                    inner.extend(m.referenced_vars());
+                    m.collect_vars(scope, &mut inner);
                 }
-                inner.retain(|x| x != var);
-                vars.extend(inner);
-                vars
+                out.extend(inner.into_iter().filter(|x| x != var));
             }
             Expression::Reduce {
                 acc,
@@ -588,12 +647,11 @@ impl Expression {
                 list,
                 body,
             } => {
-                let mut vars = init.referenced_vars();
-                vars.extend(list.referenced_vars());
-                let mut inner = body.referenced_vars();
-                inner.retain(|x| x != acc && x != var);
-                vars.extend(inner);
-                vars
+                init.collect_vars(scope, out);
+                list.collect_vars(scope, out);
+                let mut inner = Vec::new();
+                body.collect_vars(scope, &mut inner);
+                out.extend(inner.into_iter().filter(|x| x != acc && x != var));
             }
             Expression::ListPredicate {
                 var,
@@ -601,35 +659,46 @@ impl Expression {
                 predicate,
                 ..
             } => {
-                let mut vars = list.referenced_vars();
-                let mut inner = predicate.referenced_vars();
-                inner.retain(|x| x != var);
-                vars.extend(inner);
-                vars
+                list.collect_vars(scope, out);
+                let mut inner = Vec::new();
+                predicate.collect_vars(scope, &mut inner);
+                out.extend(inner.into_iter().filter(|x| x != var));
             }
-            Expression::Member { target, .. } => target.referenced_vars(),
+            Expression::Member { target, .. } => target.collect_vars(scope, out),
             // EXISTS has no projection — only the pattern's correlation vars.
             Expression::Exists { patterns, .. } => {
-                patterns.iter().flat_map(Pattern::referenced_vars).collect()
+                if scope == VarScope::All {
+                    out.extend(patterns.iter().flat_map(Pattern::referenced_vars));
+                }
             }
             // A pattern comprehension's projection can capture OUTER variables
             // that never appear in the inner pattern (e.g. `[(a)-->(b) | c]`).
-            // Those are real dependencies — include them so dependency trimming
-            // can't drop them. Pattern-internal vars (`b`) are already covered.
+            // Those are real dependencies, and reads of the row — include them
+            // so dependency trimming can't drop them. Pattern-internal vars
+            // (`b`) are correlation variables.
             Expression::PatternComprehension {
                 patterns,
                 projection,
             } => {
-                let mut vars: Vec<VarId> =
+                let inner: Vec<VarId> =
                     patterns.iter().flat_map(Pattern::referenced_vars).collect();
-                for v in projection.referenced_vars() {
-                    if !vars.contains(&v) {
-                        vars.push(v);
+                let mut projected = Vec::new();
+                projection.collect_vars(scope, &mut projected);
+                match scope {
+                    VarScope::All => {
+                        let mut vars = inner;
+                        for v in projected {
+                            if !vars.contains(&v) {
+                                vars.push(v);
+                            }
+                        }
+                        out.extend(vars);
+                    }
+                    VarScope::RowReads => {
+                        out.extend(projected.into_iter().filter(|v| !inner.contains(v)));
                     }
                 }
-                vars
             }
-            Expression::Resolved(_) => Vec::new(),
         }
     }
 

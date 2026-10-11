@@ -153,6 +153,14 @@ error, not a `200` stream), and should use [`/query`](endpoints.md#post-query):
   formatting.
 - **History (`to` / `FROM … TO …`)** — top-level JSON-LD `to` and the SPARQL
   history range use a distinct history execution path.
+- **A JSON-LD per-group list** — a `groupBy` query that projects a variable
+  that is neither a `groupBy` key nor an aggregate (`/query` returns it as a
+  per-group array). Stream rows are SPARQL-results bindings, which have no list
+  type. Aggregate the variable instead (for example
+  `(as (groupconcat ?x ", ") ?xs)`), or use `/query`. A JSON-LD `select "*"`
+  under `groupBy` is refused the same way when the `where` binds a variable
+  that is not a key (project the keys and aggregates instead), and a projected
+  variable that nothing binds is refused as unbound.
 
 ## Auth, policy, and dataset behavior
 
@@ -171,13 +179,13 @@ connection). Inputs: `opts.identity` / `opts.policy-class`, the server
 `default_policy_class`, or `Fluree-Policy*` / `Fluree-Identity` headers.
 
 **SPARQL policy** is enforced **only on the ledger-scoped route**
-(`/stream/query/<ledger>`). SPARQL has no body `opts`, so policy arrives via the
-resolved identity (bearer / `Fluree-Identity`) and the `Fluree-Policy*` /
-`Fluree-Default-Allow` headers; `FROM`/`FROM NAMED` select named graphs *within*
-the path ledger. The **connection-scoped** SPARQL form has no single ledger to
-resolve an identity against, so it **rejects** explicit policy signals (the
-`Fluree-Identity` / `Fluree-Policy*` / `Fluree-Default-Allow` headers) rather
-than run them unenforced — use the ledger-scoped route or `/query`. This matches
+(`/stream/query/<ledger>`). Policy arrives via the resolved identity (bearer),
+the query's policy [`# PRAGMA` comments](../query/sparql.md#request-options--pragma),
+and the `Fluree-Identity` / `Fluree-Policy*` / `Fluree-Default-Allow` headers;
+`FROM`/`FROM NAMED` select named graphs *within* the path ledger. The
+**connection-scoped** SPARQL form has no single ledger to resolve an identity
+against, so it **rejects** explicit policy signals (those pragmas and headers)
+rather than run them unenforced — use the ledger-scoped route or `/query`. This matches
 `/query`, where connection SPARQL is likewise not identity-policy-scoped.
 
 > **`default_policy_class`** is a JSON-LD-path setting: it is applied to JSON-LD
@@ -197,7 +205,7 @@ The only SPARQL dataset feature still rejected outright is the **history range**
 ## Fuel and tracking
 
 The endpoint tracks fuel and time by default. `max-fuel` is honored from JSON-LD
-`opts.max-fuel` and, for SPARQL (which has no body `opts`), from the
+`opts.max-fuel` and, for SPARQL, from `# PRAGMA max-fuel` or the
 `Fluree-Max-Fuel` header. The running fuel total rides on `heartbeat` records
 and the final total on the `end` record; a `max-fuel` overrun surfaces as a
 `{"type":"error","error":{"code":"fuel_exhausted"}}` terminal.

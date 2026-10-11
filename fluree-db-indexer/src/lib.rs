@@ -35,7 +35,7 @@ pub mod fuel;
 pub mod fulltext_hook;
 pub mod gc;
 /// The per-(graph, property) cardinality sketch: the stats kernel's
-/// 256-register HyperLogLog, persisted as exactly 256 bytes.
+/// 256-register HyperLogLog. Persisted by [`stats::sketch_cas`].
 pub mod hll {
     pub use fluree_db_stats::Hll256 as HllSketch256;
 }

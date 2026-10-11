@@ -66,7 +66,7 @@ pub use commit::{
 };
 pub use commit_flakes::generate_commit_flakes;
 pub use current_facts::{CurrentFacts, Origin, Retraction, Slot, StoredFact};
-pub use error::{Result, TransactError};
+pub use error::{ReportResult, Result, ShaclViolations, TransactError};
 pub use flake_sink::FlakeSink;
 pub use generate::FlakeGenerator;
 pub use ir::{

@@ -269,7 +269,7 @@ impl Fluree {
         r2rml_table_provider: &dyn R2rmlTableProvider,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let ast = parse_and_validate_sparql(sparql)?;
+        let ast = parse_and_validate_sparql(sparql, None)?;
         let spec = extract_sparql_dataset_spec(&ast)?;
 
         if spec.is_empty() {
@@ -306,7 +306,7 @@ impl Fluree {
         // for connection-level parse/spec errors; the per-view delegate charges
         // its own floor downstream, so the reported fuel is never double-counted.
         let input = QueryInput::JsonLd(query_json);
-        let floor = tracked_query_tracker(&input, &tracking_override);
+        let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
         let (spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_ref())
@@ -455,7 +455,7 @@ impl Fluree {
     {
         // See `query_connection_jsonld_tracked` for the up-front floor enforcement.
         let input = QueryInput::JsonLd(query_json);
-        let floor = tracked_query_tracker(&input, &tracking_override);
+        let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
         let (spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_ref())
@@ -520,7 +520,7 @@ impl Fluree {
     {
         // See `query_connection_jsonld_tracked` for the up-front floor enforcement.
         let input = QueryInput::JsonLd(query_json);
-        let floor = tracked_query_tracker(&input, &tracking_override);
+        let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
         let (spec, _qc_opts) = parse_dataset_spec(query_json).map_err(|e| {
@@ -584,7 +584,7 @@ impl Fluree {
     {
         // See `query_connection_jsonld_tracked` for the up-front floor enforcement.
         let input = QueryInput::JsonLd(query_json);
-        let floor = tracked_query_tracker(&input, &tracking_override);
+        let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
         let (spec, _qc_opts) = parse_dataset_spec(query_json).map_err(|e| {
@@ -703,7 +703,7 @@ impl Fluree {
         sparql: &str,
         opts: &GovernanceOptions,
     ) -> Result<JsonValue> {
-        let ast = parse_and_validate_sparql(sparql)?;
+        let ast = parse_and_validate_sparql(sparql, None)?;
         let spec = extract_sparql_dataset_spec(&ast)?;
 
         if spec.is_empty() {
@@ -736,7 +736,7 @@ impl Fluree {
         sparql: &str,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let ast = parse_and_validate_sparql(sparql)?;
+        let ast = parse_and_validate_sparql(sparql, None)?;
         let spec = extract_sparql_dataset_spec(&ast)?;
 
         if spec.is_empty() {
@@ -756,7 +756,7 @@ impl Fluree {
         policy: &PolicyContext,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let ast = parse_and_validate_sparql(sparql)?;
+        let ast = parse_and_validate_sparql(sparql, None)?;
         let spec = extract_sparql_dataset_spec(&ast)?;
 
         if spec.is_empty() {
@@ -789,7 +789,7 @@ impl Fluree {
         r2rml: Option<crate::R2rmlProviders<'_>>,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let ast = parse_and_validate_sparql(sparql)?;
+        let ast = parse_and_validate_sparql(sparql, None)?;
         let spec = extract_sparql_dataset_spec(&ast)?;
 
         if spec.is_empty() {
@@ -825,7 +825,7 @@ impl Fluree {
         r2rml_table_provider: &dyn R2rmlTableProvider,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let ast = parse_and_validate_sparql(sparql)?;
+        let ast = parse_and_validate_sparql(sparql, None)?;
         let spec = extract_sparql_dataset_spec(&ast)?;
 
         if spec.is_empty() {
@@ -877,10 +877,10 @@ impl Fluree {
     {
         // See `query_connection_jsonld_tracked` for the up-front floor enforcement.
         let input = QueryInput::Sparql(sparql);
-        let floor = tracked_query_tracker(&input, &tracking_override);
+        let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let ast = parse_and_validate_sparql(sparql).map_err(|e| {
+        let ast = parse_and_validate_sparql(sparql, None).map_err(|e| {
             crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
         })?;
         let spec = extract_sparql_dataset_spec(&ast).map_err(|e| {
@@ -942,10 +942,10 @@ impl Fluree {
     {
         // See `query_connection_jsonld_tracked` for the up-front floor enforcement.
         let input = QueryInput::Sparql(sparql);
-        let floor = tracked_query_tracker(&input, &tracking_override);
+        let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let ast = parse_and_validate_sparql(sparql).map_err(|e| {
+        let ast = parse_and_validate_sparql(sparql, None).map_err(|e| {
             crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
         })?;
         let spec = extract_sparql_dataset_spec(&ast).map_err(|e| {
@@ -990,10 +990,10 @@ impl Fluree {
     {
         // See `query_connection_jsonld_tracked` for the up-front floor enforcement.
         let input = QueryInput::Sparql(sparql);
-        let floor = tracked_query_tracker(&input, &tracking_override);
+        let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let ast = parse_and_validate_sparql(sparql).map_err(|e| {
+        let ast = parse_and_validate_sparql(sparql, None).map_err(|e| {
             crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
         })?;
         let spec = extract_sparql_dataset_spec(&ast).map_err(|e| {
@@ -1040,10 +1040,10 @@ impl Fluree {
     {
         // See `query_connection_jsonld_tracked` for the up-front floor enforcement.
         let input = QueryInput::Sparql(sparql);
-        let floor = tracked_query_tracker(&input, &tracking_override);
+        let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let ast = parse_and_validate_sparql(sparql).map_err(|e| {
+        let ast = parse_and_validate_sparql(sparql, None).map_err(|e| {
             crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
         })?;
         let spec = extract_sparql_dataset_spec(&ast).map_err(|e| {
@@ -1099,10 +1099,10 @@ impl Fluree {
     {
         // See `query_connection_jsonld_tracked` for the up-front floor enforcement.
         let input = QueryInput::Sparql(sparql);
-        let floor = tracked_query_tracker(&input, &tracking_override);
+        let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let ast = parse_and_validate_sparql(sparql).map_err(|e| {
+        let ast = parse_and_validate_sparql(sparql, None).map_err(|e| {
             crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
         })?;
         let spec = extract_sparql_dataset_spec(&ast).map_err(|e| {

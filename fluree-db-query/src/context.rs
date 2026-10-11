@@ -456,6 +456,16 @@ pub struct ExecutionContext<'a> {
     pub translated_overlay_cache: TranslatedOverlayCache,
 }
 
+/// One graph a path traversal reads; see [`ExecutionContext::path_graphs`].
+pub struct PathGraph<'a> {
+    pub snapshot: &'a LedgerSnapshot,
+    pub overlay: &'a dyn OverlayProvider,
+    pub to_t: i64,
+    pub g_id: GraphId,
+    /// The view policy that filters this graph's edges.
+    pub policy_enforcer: Option<Arc<QueryPolicyEnforcer>>,
+}
+
 /// Re-encode a `Sid` from the primary/lowering snapshot into `target`'s
 /// namespace table.
 ///
@@ -1138,6 +1148,16 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
+    /// The dataset the query named with `FROM` / `FROM NAMED`, if any.
+    ///
+    /// `None` for a union default graph (see [`DataSet::implicit`]), which is
+    /// scanned as a dataset but otherwise stands where no dataset would:
+    /// consult this, not `dataset`, for anything that depends on how the query
+    /// addressed its graphs rather than on which graphs a pattern scans.
+    pub fn explicit_dataset(&self) -> Option<&'a DataSet<'a>> {
+        self.dataset.filter(|ds| ds.is_explicit())
+    }
+
     /// Attach a dataset to this execution context for multi-graph queries
     pub fn with_dataset(mut self, dataset: &'a DataSet<'a>) -> Self {
         self.multi_ledger = Self::compute_multi_ledger(Some(dataset), &self.active_graph);
@@ -1163,26 +1183,55 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
-    /// Require that the query targets exactly one graph.
+    /// The graphs a property path or shortest path traverses as one graph.
     ///
-    /// Returns `(db, overlay, to_t)` for the single active graph — either from
-    /// single-db mode or a dataset with exactly one active graph. Returns
-    /// `QueryError::InvalidQuery` if multiple graphs are active.
-    pub fn require_single_graph(
-        &self,
-    ) -> Result<(&'a LedgerSnapshot, &'a dyn OverlayProvider, i64), QueryError> {
+    /// That is the single active graph, or every member of a multi-graph
+    /// default graph drawn from one ledger: a union default graph, or `FROM`
+    /// naming several graphs of a ledger. Graphs of one ledger share its
+    /// namespace table, so a node reached in one member is the same node in
+    /// the next and a path continues across them. A default graph spanning
+    /// ledgers is refused, since their SIDs are not comparable.
+    pub fn path_graphs(&self) -> Result<Vec<PathGraph<'a>>, QueryError> {
         match self.active_graphs() {
-            ActiveGraphs::Single => Ok((self.active_snapshot, self.overlay(), self.to_t)),
-            ActiveGraphs::Many(graphs) if graphs.len() == 1 => {
-                let g = graphs[0];
-                Ok((g.snapshot, g.overlay, g.to_t))
-            }
-            ActiveGraphs::Many(_) => Err(QueryError::InvalidQuery(
-                "Property paths over multi-graph datasets are not supported; \
+            ActiveGraphs::Single => Ok(vec![PathGraph {
+                snapshot: self.active_snapshot,
+                overlay: self.overlay(),
+                to_t: self.to_t,
+                g_id: self.binary_g_id,
+                policy_enforcer: self.policy_enforcer.clone(),
+            }]),
+            ActiveGraphs::Many(_) if self.is_multi_ledger() => Err(QueryError::InvalidQuery(
+                "Property paths over a default graph spanning ledgers are not supported; \
                  use GRAPH to select a single graph"
                     .to_string(),
             )),
+            ActiveGraphs::Many(graphs) => Ok(graphs
+                .into_iter()
+                .map(|g| PathGraph {
+                    snapshot: g.snapshot,
+                    overlay: g.overlay,
+                    to_t: g.to_t,
+                    g_id: g.g_id,
+                    policy_enforcer: g
+                        .policy_enforcer
+                        .clone()
+                        .or_else(|| self.policy_enforcer.clone()),
+                })
+                .collect()),
         }
+    }
+
+    /// The snapshot a path traversal encodes its endpoints against. The graphs
+    /// of [`Self::path_graphs`] share one ledger's namespace table, so any of
+    /// them serves.
+    pub fn path_snapshot(&self) -> Result<&'a LedgerSnapshot, QueryError> {
+        if self.dataset.is_none() {
+            return Ok(self.active_snapshot);
+        }
+        Ok(self
+            .path_graphs()?
+            .first()
+            .map_or(self.active_snapshot, |g| g.snapshot))
     }
 
     /// True when the active scope resolves to exactly one graph and that
@@ -1361,7 +1410,7 @@ impl<'a> ExecutionContext<'a> {
     /// reserved for the default graph and never resolves here, even if a
     /// registered graph shares the ledger's IRI.
     pub fn single_db_user_graph_id(&self, iri: &str) -> Option<GraphId> {
-        if self.dataset.is_some() || iri == self.active_snapshot.ledger_id.as_str() {
+        if self.explicit_dataset().is_some() || self.names_default_graph(iri) {
             return None;
         }
         self.active_snapshot
@@ -1372,19 +1421,25 @@ impl<'a> ExecutionContext<'a> {
 
     /// User-registered named graph IRIs of the active snapshot, for `GRAPH ?g`
     /// discovery. Excludes the default, reserved system graphs, and any graph
-    /// colliding with the ledger alias (which addresses the default graph);
-    /// empty in dataset mode.
+    /// registered under a name that addresses the default graph (see
+    /// [`Self::names_default_graph`]); empty when the query names a dataset.
     pub fn single_db_user_graph_iris(&self) -> Vec<Arc<str>> {
-        if self.dataset.is_some() {
+        if self.explicit_dataset().is_some() {
             return Vec::new();
         }
-        let alias = self.active_snapshot.ledger_id.as_str();
         self.active_snapshot
             .graph_registry
             .iter_entries()
-            .filter(|(g, iri)| *g >= FIRST_USER_GRAPH_ID && *iri != alias)
+            .filter(|(g, iri)| *g >= FIRST_USER_GRAPH_ID && !self.names_default_graph(iri))
             .map(|(_, iri)| Arc::from(iri))
             .collect()
+    }
+
+    /// Whether `GRAPH <iri>` addresses the active ledger's default graph: the
+    /// ledger alias, or `urn:default`
+    /// ([`DEFAULT_GRAPH_IRI`](fluree_db_core::DEFAULT_GRAPH_IRI)).
+    pub fn names_default_graph(&self, iri: &str) -> bool {
+        iri == self.active_snapshot.ledger_id.as_str() || iri == fluree_db_core::DEFAULT_GRAPH_IRI
     }
 
     /// Create a new context with a specific named graph active
@@ -1987,5 +2042,70 @@ mod budget_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod dataset_scope_tests {
+    use super::*;
+    use crate::dataset::GraphRef;
+    use fluree_db_core::NoOverlay;
+
+    const G1: &str = "http://example.org/g1";
+
+    /// A union default graph is scanned as a dataset but names graphs as a
+    /// single ledger does: a named graph resolves through the ledger's
+    /// registry, as with no dataset at all. A dataset the query named scopes
+    /// the names to its own `FROM NAMED` instead.
+    #[test]
+    fn an_implicit_dataset_names_graphs_as_a_single_ledger_does() {
+        let mut snapshot = LedgerSnapshot::genesis("test:main");
+        let g1 = snapshot.graph_registry.apply_delta([G1])[0].0;
+        let vars = VarRegistry::new();
+        let graph = |g_id| GraphRef::new(&snapshot, g_id, &NoOverlay, 0, Arc::from("test:main"));
+        let implicit = DataSet::new()
+            .implicit()
+            .with_default_graph(graph(0))
+            .with_default_graph(graph(g1));
+        let named = DataSet::new()
+            .with_default_graph(graph(0))
+            .with_default_graph(graph(g1));
+
+        let union = ExecutionContext::new(&snapshot, &vars).with_dataset(&implicit);
+        assert!(union.dataset.is_some() && union.explicit_dataset().is_none());
+        assert_eq!(union.single_db_user_graph_id(G1), Some(g1));
+        assert_eq!(
+            union.single_db_user_graph_iris(),
+            vec![Arc::<str>::from(G1)]
+        );
+
+        let from = ExecutionContext::new(&snapshot, &vars).with_dataset(&named);
+        assert!(from.explicit_dataset().is_some());
+        assert_eq!(from.single_db_user_graph_id(G1), None);
+        assert!(from.single_db_user_graph_iris().is_empty());
+    }
+
+    /// A path traverses every graph of a one-ledger default graph, and refuses
+    /// one spanning ledgers, whose SIDs are not comparable.
+    #[test]
+    fn path_graphs_span_one_ledger_only() {
+        let mut snapshot = LedgerSnapshot::genesis("test:main");
+        let g1 = snapshot.graph_registry.apply_delta([G1])[0].0;
+        let vars = VarRegistry::new();
+        let graph =
+            |g_id, ledger: &str| GraphRef::new(&snapshot, g_id, &NoOverlay, 0, Arc::from(ledger));
+
+        let one_ledger = DataSet::new()
+            .with_default_graph(graph(0, "test:main"))
+            .with_default_graph(graph(g1, "test:main"));
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_dataset(&one_ledger);
+        let g_ids: Vec<GraphId> = ctx.path_graphs().unwrap().iter().map(|g| g.g_id).collect();
+        assert_eq!(g_ids, vec![0, g1]);
+
+        let two_ledgers = DataSet::new()
+            .with_default_graph(graph(0, "test:main"))
+            .with_default_graph(graph(0, "other:main"));
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_dataset(&two_ledgers);
+        assert!(ctx.path_graphs().is_err());
     }
 }

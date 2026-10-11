@@ -20,7 +20,7 @@ use moka::sync::Cache as SyncCache;
 #[cfg(feature = "iceberg")]
 use super::catalog_session::CachedLoadTable;
 #[cfg(feature = "iceberg")]
-use fluree_db_iceberg::catalog::RestCatalogClient;
+use fluree_db_iceberg::catalog::SendCatalogClient;
 #[cfg(feature = "iceberg")]
 use fluree_db_iceberg::{io::parquet::ParquetFooterCache, metadata::TableMetadata, DataFile};
 #[cfg(feature = "sql")]
@@ -124,16 +124,18 @@ pub struct R2rmlCache {
     #[cfg(feature = "iceberg")]
     direct_metadata_locations: SyncCache<String, String>,
 
-    /// Process-wide REST catalog clients keyed by source config fingerprint.
-    /// Reused across queries so the OAuth `CachedToken` and the HTTPS connection
-    /// pool survive — one token exchange per ~hour instead of one per query.
+    /// Process-wide catalog clients (REST, AWS Glue, AWS S3 Tables) keyed by
+    /// source config fingerprint. Reused across queries so a REST client's OAuth
+    /// `CachedToken` and every client's HTTPS connection pool (and an AWS SDK
+    /// client's resolved credential chain) survive — one token exchange per ~hour
+    /// instead of one per query.
     /// The fingerprint is over the raw config JSON, so a secret changed *inline*
     /// in the config invalidates the client, but a secret referenced by env var
     /// / secret store does not (the JSON is unchanged). A TTL
     /// (`DEFAULT_REST_CLIENT_TTL_SECS`) bounds how long such a rotation stays
     /// stale before the client is rebuilt and re-authenticated.
     #[cfg(feature = "iceberg")]
-    rest_clients: SyncCache<String, Arc<RestCatalogClient>>,
+    catalog_clients: SyncCache<String, Arc<dyn SendCatalogClient>>,
 
     /// Process-wide `loadTable` responses keyed by `(graph_source_id, ns.table)`,
     /// with a short TTL (see [`DEFAULT_REST_LOADTABLE_TTL_SECS`]) and a
@@ -142,7 +144,7 @@ pub struct R2rmlCache {
     #[cfg(feature = "iceberg")]
     rest_load_tables: SyncCache<String, Arc<CachedLoadTable>>,
 
-    /// Process-wide SQL endpoint clients keyed like `rest_clients` (id + raw
+    /// Process-wide SQL endpoint clients keyed like `catalog_clients` (id + raw
     /// config fingerprint), sharing its TTL rationale. Each client also holds
     /// the per-table schema probes, so reuse across queries skips the
     /// `LIMIT 0` round trip.
@@ -197,7 +199,7 @@ impl R2rmlCache {
                 // an env-var/secret-store secret rotation self-heal (see
                 // `DEFAULT_REST_CLIENT_TTL_SECS`) since the config fingerprint
                 // does not change when the referenced secret does.
-                rest_clients: SyncCache::builder()
+                catalog_clients: SyncCache::builder()
                     .max_capacity(64)
                     .time_to_live(Duration::from_secs(rest_client_ttl_secs()))
                     .build(),
@@ -302,23 +304,27 @@ impl R2rmlCache {
             .insert(table_location, metadata_location);
     }
 
-    /// Get a process-wide REST catalog client for a source config `fingerprint`,
-    /// or `None` on miss (or when catalog caching is disabled).
+    /// Get a process-wide catalog client for a source config `fingerprint`, or
+    /// `None` on miss (or when catalog caching is disabled).
     #[cfg(feature = "iceberg")]
-    pub(crate) fn rest_client(&self, fingerprint: &str) -> Option<Arc<RestCatalogClient>> {
+    pub(crate) fn catalog_client(&self, fingerprint: &str) -> Option<Arc<dyn SendCatalogClient>> {
         if !super::catalog_session::cache_enabled() {
             return None;
         }
-        self.rest_clients.get(fingerprint)
+        self.catalog_clients.get(fingerprint)
     }
 
-    /// Store a REST catalog client for cross-query reuse (no-op when disabled).
+    /// Store a catalog client for cross-query reuse (no-op when disabled).
     #[cfg(feature = "iceberg")]
-    pub(crate) fn put_rest_client(&self, fingerprint: String, client: Arc<RestCatalogClient>) {
+    pub(crate) fn put_catalog_client(
+        &self,
+        fingerprint: String,
+        client: Arc<dyn SendCatalogClient>,
+    ) {
         if !super::catalog_session::cache_enabled() {
             return;
         }
-        self.rest_clients.insert(fingerprint, client);
+        self.catalog_clients.insert(fingerprint, client);
     }
 
     #[cfg(feature = "sql")]
@@ -404,7 +410,7 @@ impl R2rmlCache {
             self.scan_files.invalidate_all();
             self.parquet_footers.clear().await;
             self.direct_metadata_locations.invalidate_all();
-            self.rest_clients.invalidate_all();
+            self.catalog_clients.invalidate_all();
             self.rest_load_tables.invalidate_all();
         }
         #[cfg(feature = "sql")]

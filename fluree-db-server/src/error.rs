@@ -109,6 +109,8 @@ impl ServerError {
             },
 
             // Not Found
+            ServerError::Api(ApiError::GraphNotFound(_)) => errors::GRAPH_NOT_FOUND,
+            ServerError::Api(ApiError::CommitNotFound(_)) => errors::COMMIT_NOT_FOUND,
             ServerError::Api(ApiError::NotFound(msg)) => {
                 // Distinguish graph source not found from ledger not found
                 if msg.contains("Graph source") || msg.contains("graph source") {
@@ -186,6 +188,12 @@ impl ServerError {
 
             ServerError::Api(ApiError::Query(_)) => errors::INVALID_QUERY,
             ServerError::Api(ApiError::Batch(_)) => errors::INVALID_QUERY,
+            ServerError::Api(
+                ApiError::Policy(fluree_db_api::PolicyError::ModifyDenied { .. })
+                | ApiError::Transact(fluree_db_api::TransactError::PolicyViolation(
+                    fluree_db_api::PolicyError::ModifyDenied { .. },
+                )),
+            ) => errors::ACCESS_DENIED,
             // Optimistic-concurrency conflicts: a distinct, retryable class so
             // clients can branch on `@type` (and the 409 status below).
             ServerError::Api(ApiError::Transact(
@@ -295,6 +303,8 @@ impl ServerError {
             // Every form `ApiError` gives a missing ledger, not only `NotFound`:
             // the ledger loader's own error is one, and read as a 500 here.
             ServerError::Api(e) if e.is_not_found() => StatusCode::NOT_FOUND,
+            ServerError::Api(ApiError::GraphNotFound(_)) => StatusCode::NOT_FOUND,
+            ServerError::Api(ApiError::CommitNotFound(_)) => StatusCode::NOT_FOUND,
 
             // 409 - Conflict
             ServerError::Api(ApiError::LedgerExists(_)) => StatusCode::CONFLICT,
@@ -352,6 +362,12 @@ impl ServerError {
                     | fluree_db_query::QueryError::CatalogCredentialsNotVended { .. }
                     | fluree_db_query::QueryError::CatalogAccessDenied { .. },
                 ),
+            ) => StatusCode::FORBIDDEN,
+            ServerError::Api(
+                ApiError::Policy(fluree_db_api::PolicyError::ModifyDenied { .. })
+                | ApiError::Transact(fluree_db_api::TransactError::PolicyViolation(
+                    fluree_db_api::PolicyError::ModifyDenied { .. },
+                )),
             ) => StatusCode::FORBIDDEN,
 
             // 400 - Bad Request (client errors)
@@ -659,6 +675,26 @@ pub type Result<T> = std::result::Result<T, ServerError>;
 mod tests {
     use super::*;
     use fluree_vocab::errors;
+
+    #[test]
+    fn policy_denied_write_is_forbidden_with_access_denied_type() {
+        let denied = || fluree_db_api::PolicyError::modify_denied("write refused");
+        for err in [
+            ApiError::Policy(denied()),
+            ApiError::Transact(fluree_db_api::TransactError::PolicyViolation(denied())),
+        ] {
+            let response = ServerError::Api(err).into_response();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(
+                response.headers().get(axum::http::header::RETRY_AFTER),
+                None
+            );
+        }
+        let err = ServerError::Api(ApiError::Transact(
+            fluree_db_api::TransactError::PolicyViolation(denied()),
+        ));
+        assert_eq!(err.error_type(), errors::ACCESS_DENIED);
+    }
 
     /// An id refused below the edge is still the caller's input.
     #[test]

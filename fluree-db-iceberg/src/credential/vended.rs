@@ -42,6 +42,17 @@ impl std::fmt::Debug for VendedCredentials {
     }
 }
 
+/// The `loadTable` config keys that ARE the vended credential (as opposed to how
+/// to reach storage). A matched `storage-credentials` entry is their only source;
+/// the table's top-level `config` supplies the rest.
+const CREDENTIAL_KEYS: [&str; 5] = [
+    "s3.access-key-id",
+    "s3.secret-access-key",
+    "s3.session-token",
+    "s3.session-token-expires-at-ms",
+    "expiration-time",
+];
+
 impl VendedCredentials {
     /// Parse credentials from REST catalog response config map.
     ///
@@ -117,6 +128,74 @@ impl VendedCredentials {
             region,
             path_style,
         }))
+    }
+
+    /// Parse vended credentials from a full REST `loadTable` response.
+    ///
+    /// Honors the standardized top-level `storage-credentials` array
+    /// (apache/iceberg #10722): per spec a client MUST check `storage-credentials`
+    /// **before** the legacy top-level `config` map. Among the entries whose
+    /// `prefix` matches `metadata_location` (an empty prefix matches everything),
+    /// the **longest** prefix is the catalog's decision for this table, and it is
+    /// final:
+    ///
+    /// - its static `s3.*` keys are the credentials, read with the table's
+    ///   top-level connection settings (region, endpoint, path-style) beneath the
+    ///   entry's own;
+    /// - if it has none — e.g. a remote-signing entry, which this reader does not
+    ///   implement — the result is `None`, and the source's `vended_credentials`
+    ///   policy refuses the read (§2 fail-closed) rather than falling back to a
+    ///   shorter entry or the legacy `config`, credentials the catalog did not
+    ///   scope to this table.
+    ///
+    /// Only when no entry matches do the credentials come from the flat top-level
+    /// `config` map (the shape AWS Lake Formation and older catalogs still emit). Ties between equal
+    /// prefixes go to the later entry. Entries without a `config` object are
+    /// malformed and ignored.
+    ///
+    /// The prefix is matched against `metadata_location` because one credential
+    /// set serves the whole table; a table whose data files sit outside its
+    /// metadata prefix is matched on the metadata.
+    pub fn from_load_table_response(
+        response: &serde_json::Value,
+        metadata_location: &str,
+    ) -> Result<Option<Self>> {
+        let best_entry = response
+            .get("storage-credentials")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                let prefix = entry.get("prefix").and_then(|p| p.as_str()).unwrap_or("");
+                let config = entry.get("config").and_then(|c| c.as_object())?;
+                (prefix.is_empty() || metadata_location.starts_with(prefix))
+                    .then_some((prefix.len(), config))
+            })
+            .max_by_key(|(prefix_len, _)| *prefix_len);
+
+        let top_level = response.get("config").and_then(|v| v.as_object());
+        let config: HashMap<String, serde_json::Value> = match best_entry {
+            // The table's own settings (region, endpoint, path-style) with the
+            // matched entry laid over them, as Java's S3FileIO layers a storage
+            // credential's properties over the table's. A catalog may put only the
+            // credential keys in the entry (Polaris / Snowflake Open Catalog do) and
+            // the connection settings only at the top level. The credentials
+            // themselves come ONLY from the entry: a top-level key never stands in
+            // for one the entry lacks, so an entry with no static keys (e.g. remote
+            // signing) still yields no credentials (see above).
+            Some((_, entry_config)) => top_level
+                .into_iter()
+                .flatten()
+                .filter(|(key, _)| !CREDENTIAL_KEYS.contains(&key.as_str()))
+                .chain(entry_config)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            None => match top_level {
+                Some(legacy) => legacy.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                None => return Ok(None),
+            },
+        };
+        Self::from_config_map(&config)
     }
 
     /// Check if credentials are expired or will expire within buffer.
@@ -508,5 +587,186 @@ mod tests {
         );
         // The access key ID (an identifier, unusable without the secret) is shown.
         assert!(dbg.contains("AKIAEXAMPLE"));
+    }
+
+    // ── from_load_table_response: standardized `storage-credentials` array
+    //    (apache/iceberg #10722), precedence + longest-usable-prefix + fallback ──
+
+    const ML: &str = "s3://bucket/db/tbl/metadata/v1.json";
+
+    fn creds_config(ak: &str) -> serde_json::Value {
+        serde_json::json!({
+            "s3.access-key-id": ak,
+            "s3.secret-access-key": "secret",
+            "s3.session-token": "token",
+            "client.region": "us-east-1",
+        })
+    }
+
+    fn load_creds(resp: &serde_json::Value) -> Option<VendedCredentials> {
+        VendedCredentials::from_load_table_response(resp, ML).unwrap()
+    }
+
+    #[test]
+    fn storage_credentials_array_is_parsed() {
+        let resp = serde_json::json!({
+            "metadata-location": ML,
+            "storage-credentials": [
+                { "prefix": "s3://bucket/db/tbl", "config": creds_config("AKIA_SC") }
+            ],
+        });
+        let c = load_creds(&resp).expect("creds");
+        assert_eq!(c.access_key_id, "AKIA_SC");
+        assert_eq!(c.region.as_deref(), Some("us-east-1"));
+    }
+
+    #[test]
+    fn storage_credentials_take_precedence_over_config() {
+        let resp = serde_json::json!({
+            "metadata-location": ML,
+            "config": creds_config("AKIA_CONFIG"),
+            "storage-credentials": [
+                { "prefix": "s3://bucket/db/tbl", "config": creds_config("AKIA_SC") }
+            ],
+        });
+        assert_eq!(load_creds(&resp).unwrap().access_key_id, "AKIA_SC");
+    }
+
+    #[test]
+    fn longest_matching_prefix_wins() {
+        let resp = serde_json::json!({
+            "metadata-location": ML,
+            "storage-credentials": [
+                { "prefix": "s3://bucket", "config": creds_config("AKIA_SHORT") },
+                { "prefix": "s3://bucket/db/tbl", "config": creds_config("AKIA_LONG") }
+            ],
+        });
+        assert_eq!(load_creds(&resp).unwrap().access_key_id, "AKIA_LONG");
+    }
+
+    #[test]
+    fn longest_prefix_without_static_keys_yields_no_credentials() {
+        // The longest matching prefix is remote-signing-only (no static s3.* keys).
+        // It decides this table: no credentials, NOT the shorter entry's keys.
+        let resp = serde_json::json!({
+            "metadata-location": ML,
+            "storage-credentials": [
+                { "prefix": "s3://bucket/db", "config": creds_config("AKIA_SHORTER") },
+                { "prefix": "s3://bucket/db/tbl", "config": { "s3.remote-signing-enabled": "true" } }
+            ],
+        });
+        assert!(load_creds(&resp).is_none());
+    }
+
+    #[test]
+    fn matching_remote_signing_entry_does_not_fall_back_to_legacy_config() {
+        // fluree/db#1451 review: a prefix-matching remote-signing entry plus static
+        // keys in the legacy `config` must not read with the legacy keys — the
+        // catalog asked for remote signing on this prefix.
+        let resp = serde_json::json!({
+            "metadata-location": ML,
+            "config": creds_config("AKIA_LEGACY"),
+            "storage-credentials": [
+                { "prefix": "s3://bucket/db/tbl", "config": { "s3.remote-signing-enabled": "true" } }
+            ],
+        });
+        assert!(load_creds(&resp).is_none());
+    }
+
+    #[test]
+    fn a_matched_entry_keeps_the_tables_top_level_connection_settings() {
+        // fluree/db#1451 review: Polaris / Snowflake Open Catalog put only the
+        // credential keys in the entry; region, endpoint and path-style live only
+        // in the top-level `config`. They must survive, or reads of a MinIO / other
+        // S3-compatible store go to AWS S3, and an out-of-region bucket fails.
+        let resp = serde_json::json!({
+            "metadata-location": ML,
+            "config": {
+                "client.region": "eu-west-1",
+                "s3.endpoint": "http://minio:9000",
+                "s3.path-style-access": "true",
+                "s3.access-key-id": "AKIA_TOP_LEVEL",
+                "s3.secret-access-key": "top-secret",
+            },
+            "storage-credentials": [
+                { "prefix": "s3://bucket/db/tbl", "config": {
+                    "s3.access-key-id": "AKIA_ENTRY",
+                    "s3.secret-access-key": "entry-secret",
+                    "s3.session-token": "entry-token",
+                } }
+            ],
+        });
+        let c = load_creds(&resp).expect("creds");
+        assert_eq!(
+            c.access_key_id, "AKIA_ENTRY",
+            "credentials come from the entry"
+        );
+        assert_eq!(c.session_token.as_deref(), Some("entry-token"));
+        assert_eq!(c.region.as_deref(), Some("eu-west-1"));
+        assert_eq!(c.endpoint.as_deref(), Some("http://minio:9000"));
+        assert!(c.path_style);
+
+        // The entry's own settings win over the top level's.
+        let mut overridden = resp.clone();
+        overridden["storage-credentials"][0]["config"]["client.region"] = "us-west-2".into();
+        assert_eq!(
+            load_creds(&overridden).unwrap().region.as_deref(),
+            Some("us-west-2")
+        );
+
+        // And the top level never supplies a credential the entry lacks: an entry
+        // without static keys still yields none, even with top-level credentials.
+        let unsigned = serde_json::json!({
+            "metadata-location": ML,
+            "config": { "client.region": "eu-west-1", "s3.access-key-id": "AKIA_TOP_LEVEL",
+                        "s3.secret-access-key": "top-secret" },
+            "storage-credentials": [
+                { "prefix": "s3://bucket/db/tbl", "config": { "s3.remote-signing-enabled": "true" } }
+            ],
+        });
+        assert!(load_creds(&unsigned).is_none());
+    }
+
+    #[test]
+    fn non_matching_prefix_falls_back_to_config() {
+        let resp = serde_json::json!({
+            "metadata-location": ML,
+            "storage-credentials": [
+                { "prefix": "s3://other-bucket/x", "config": creds_config("AKIA_OTHER") }
+            ],
+            "config": creds_config("AKIA_CONFIG"),
+        });
+        assert_eq!(load_creds(&resp).unwrap().access_key_id, "AKIA_CONFIG");
+    }
+
+    #[test]
+    fn falls_back_to_legacy_config_map() {
+        let resp = serde_json::json!({
+            "metadata-location": ML,
+            "config": creds_config("AKIA_CONFIG"),
+        });
+        assert_eq!(load_creds(&resp).unwrap().access_key_id, "AKIA_CONFIG");
+    }
+
+    #[test]
+    fn malformed_entries_are_skipped_gracefully() {
+        let resp = serde_json::json!({
+            "metadata-location": ML,
+            "storage-credentials": [
+                "not-an-object",
+                { "prefix": "s3://bucket/db/tbl" },            // no config
+                { "config": creds_config("AKIA_NOPREFIX") }    // no prefix -> applies to all
+            ],
+        });
+        assert_eq!(load_creds(&resp).unwrap().access_key_id, "AKIA_NOPREFIX");
+    }
+
+    #[test]
+    fn no_credentials_yields_none() {
+        let resp = serde_json::json!({
+            "metadata-location": ML,
+            "config": { "table_type": "ICEBERG" },
+        });
+        assert!(load_creds(&resp).is_none());
     }
 }

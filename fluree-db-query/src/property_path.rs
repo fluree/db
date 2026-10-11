@@ -33,7 +33,7 @@
 
 use crate::binary_scan::BinaryScanOperator;
 use crate::binding::{Batch, Binding};
-use crate::context::ExecutionContext;
+use crate::context::{ExecutionContext, PathGraph};
 use crate::error::{QueryError, Result};
 use crate::frontier::{overlay_dirty_ids, reserved_edge_pids, FrontierView, PathNode};
 use crate::ir::triple::Ref;
@@ -44,8 +44,8 @@ use crate::operator::{
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::{
-    range_with_overlay, DatatypeConstraint, Flake, FlakeValue, IndexType, RangeMatch, RangeOptions,
-    RangeTest, Sid,
+    range_with_overlay, DatatypeConstraint, Flake, FlakeValue, IndexType, LedgerSnapshot,
+    RangeMatch, RangeOptions, RangeTest, Sid,
 };
 use rustc_hash::FxHashSet;
 use std::collections::{HashSet, VecDeque};
@@ -213,20 +213,13 @@ impl PropertyPathOperator {
     /// objects and skipping the reserved predicates (`rdf:type`, `f:reifies*`).
     async fn forward_step(&self, ctx: &ExecutionContext<'_>, node: &Sid) -> Result<Vec<Sid>> {
         if self.pattern.wildcard {
-            let (db, overlay, to_t) = ctx.require_single_graph()?;
+            let graphs = ctx.path_graphs()?;
             let mut out = Vec::new();
-            let range_match = RangeMatch::new().with_subject(node.clone());
-            let flakes = range_with_overlay(
-                db,
-                ctx.binary_g_id,
-                overlay,
-                IndexType::Spot,
-                RangeTest::Eq,
-                range_match,
-                RangeOptions::new().with_to_t(to_t),
-            )
-            .await?;
-            let flakes = self.filter_edges(ctx, flakes).await?;
+            let flakes = self
+                .read_edges(ctx, &graphs, IndexType::Spot, |_| {
+                    RangeMatch::new().with_subject(node.clone())
+                })
+                .await?;
             for flake in flakes {
                 if is_reserved_edge_predicate(&flake.p) {
                     continue;
@@ -266,20 +259,13 @@ impl PropertyPathOperator {
     /// reserved predicates.
     async fn backward_step(&self, ctx: &ExecutionContext<'_>, node: &Sid) -> Result<Vec<Sid>> {
         if self.pattern.wildcard {
-            let (db, overlay, to_t) = ctx.require_single_graph()?;
+            let graphs = ctx.path_graphs()?;
             let mut out = Vec::new();
-            let range_match = RangeMatch::new().with_object(FlakeValue::Ref(node.clone()));
-            let flakes = range_with_overlay(
-                db,
-                ctx.binary_g_id,
-                overlay,
-                IndexType::Opst,
-                RangeTest::Eq,
-                range_match,
-                RangeOptions::new().with_to_t(to_t),
-            )
-            .await?;
-            let flakes = self.filter_edges(ctx, flakes).await?;
+            let flakes = self
+                .read_edges(ctx, &graphs, IndexType::Opst, |_| {
+                    RangeMatch::new().with_object(FlakeValue::Ref(node.clone()))
+                })
+                .await?;
             for flake in flakes {
                 if is_reserved_edge_predicate(&flake.p) {
                     continue;
@@ -319,52 +305,46 @@ impl PropertyPathOperator {
         preds: &[Sid],
         use_post: bool,
     ) -> Result<Vec<Sid>> {
-        let (db, overlay, to_t) = ctx.require_single_graph()?;
-        // Re-encode traversal predicates into the active graph's dict (see
-        // `reencode_pred`).
-        let preds: Vec<Sid> = preds.iter().map(|p| reencode_pred(ctx, db, p)).collect();
         let mut out = Vec::new();
         let mut seen: HashSet<Sid> = HashSet::new();
-        for node in nodes {
-            for pred in &preds {
-                let (index, range_match) = if use_post {
-                    (
-                        IndexType::Post,
-                        RangeMatch::new()
-                            .with_predicate(pred.clone())
-                            .with_object(FlakeValue::Ref(node.clone())),
-                    )
-                } else {
-                    (
-                        IndexType::Spot,
-                        RangeMatch::new()
-                            .with_subject(node.clone())
-                            .with_predicate(pred.clone()),
-                    )
-                };
-                let flakes = range_with_overlay(
-                    db,
-                    ctx.binary_g_id,
-                    overlay,
-                    index,
-                    RangeTest::Eq,
-                    range_match,
-                    RangeOptions::new().with_to_t(to_t),
-                )
-                .await?;
-                let flakes = self.filter_edges(ctx, flakes).await?;
-                for flake in flakes {
-                    // POST yields the subject side; SPOT yields the ref object.
-                    let next = if use_post {
-                        Some(flake.s)
-                    } else if let FlakeValue::Ref(o) = flake.o {
-                        Some(o)
+        for graph in &ctx.path_graphs()? {
+            // Re-encode traversal predicates into this graph's dict (see
+            // `reencode_pred`).
+            let preds: Vec<Sid> = preds
+                .iter()
+                .map(|p| reencode_pred(ctx, graph.snapshot, p))
+                .collect();
+            for node in nodes {
+                for pred in &preds {
+                    let (index, range_match) = if use_post {
+                        (
+                            IndexType::Post,
+                            RangeMatch::new()
+                                .with_predicate(pred.clone())
+                                .with_object(FlakeValue::Ref(node.clone())),
+                        )
                     } else {
-                        None
+                        (
+                            IndexType::Spot,
+                            RangeMatch::new()
+                                .with_subject(node.clone())
+                                .with_predicate(pred.clone()),
+                        )
                     };
-                    if let Some(n) = next {
-                        if seen.insert(n.clone()) {
-                            out.push(n);
+                    let flakes = Self::read_graph_edges(ctx, graph, index, range_match).await?;
+                    for flake in flakes {
+                        // POST yields the subject side; SPOT yields the ref object.
+                        let next = if use_post {
+                            Some(flake.s)
+                        } else if let FlakeValue::Ref(o) = flake.o {
+                            Some(o)
+                        } else {
+                            None
+                        };
+                        if let Some(n) = next {
+                            if seen.insert(n.clone()) {
+                                out.push(n);
+                            }
                         }
                     }
                 }
@@ -373,8 +353,33 @@ impl PropertyPathOperator {
         Ok(out)
     }
 
-    /// Apply view-policy filtering to a batch of edge flakes read during path
-    /// traversal.
+    /// Edges matching `range_match` in every graph of `graphs` (see
+    /// [`ExecutionContext::path_graphs`]), each filtered by its own graph's
+    /// view policy. `range_match` builds the match per graph snapshot, so a
+    /// pattern constant can re-encode into that graph's dictionary.
+    async fn read_edges(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        graphs: &[PathGraph<'_>],
+        index: IndexType,
+        range_match: impl Fn(&LedgerSnapshot) -> RangeMatch,
+    ) -> Result<Vec<Flake>> {
+        let Some((first, rest)) = graphs.split_first() else {
+            return Ok(Vec::new());
+        };
+        // Grow the first graph's edges rather than copying them, so the usual
+        // single-graph read hands back its scan as is.
+        let mut out =
+            Self::read_graph_edges(ctx, first, index, range_match(first.snapshot)).await?;
+        for graph in rest {
+            let flakes =
+                Self::read_graph_edges(ctx, graph, index, range_match(graph.snapshot)).await?;
+            out.extend(flakes);
+        }
+        Ok(out)
+    }
+
+    /// Edges matching `range_match` in one graph, with view-policy filtering.
     ///
     /// Property paths read edges directly via `range_with_overlay`, which (like
     /// every raw-leaflet reader) bypasses the per-flake `filter_flakes` policy
@@ -383,14 +388,32 @@ impl PropertyPathOperator {
     /// edges are removed here so the path neither traverses them nor reaches the
     /// nodes behind them, matching the per-flake semantics of the scan path.
     /// No-op for root / no policy (the filter short-circuits).
-    async fn filter_edges(
-        &self,
+    async fn read_graph_edges(
         ctx: &ExecutionContext<'_>,
-        flakes: Vec<Flake>,
+        graph: &PathGraph<'_>,
+        index: IndexType,
+        range_match: RangeMatch,
     ) -> Result<Vec<Flake>> {
-        let (db, overlay, to_t) = ctx.require_single_graph()?;
-        BinaryScanOperator::filter_flakes_by_policy(ctx, db, overlay, to_t, ctx.binary_g_id, flakes)
-            .await
+        let flakes = range_with_overlay(
+            graph.snapshot,
+            graph.g_id,
+            graph.overlay,
+            index,
+            RangeTest::Eq,
+            range_match,
+            RangeOptions::new().with_to_t(graph.to_t),
+        )
+        .await?;
+        BinaryScanOperator::filter_flakes_by_enforcer(
+            ctx,
+            graph.policy_enforcer.as_ref(),
+            graph.snapshot,
+            graph.overlay,
+            graph.to_t,
+            graph.g_id,
+            flakes,
+        )
+        .await
     }
 
     /// Layered BFS for a **bounded** path (`max_hops` set). Tracks visited per
@@ -660,18 +683,10 @@ impl PropertyPathOperator {
     /// `range_with_overlay` read still materializes the scan, as the wildcard
     /// closure does; bounding the *input* is a separate, broader change.)
     async fn zero_length_universe(&self, ctx: &ExecutionContext<'_>) -> Result<Vec<Binding>> {
-        let (db, overlay, to_t) = ctx.require_single_graph()?;
-        let flakes = range_with_overlay(
-            db,
-            ctx.binary_g_id,
-            overlay,
-            IndexType::Spot,
-            RangeTest::Eq,
-            RangeMatch::new(),
-            RangeOptions::new().with_to_t(to_t),
-        )
-        .await?;
-        let flakes = self.filter_edges(ctx, flakes).await?;
+        let graphs = ctx.path_graphs()?;
+        let flakes = self
+            .read_edges(ctx, &graphs, IndexType::Spot, |_| RangeMatch::new())
+            .await?;
 
         let mut seen_nodes: HashSet<Sid> = HashSet::new();
         // Literal term identity is (value, datatype-or-lang) — `Binding` has
@@ -772,7 +787,7 @@ impl PropertyPathOperator {
         // Pull all edges for every traversed predicate using PSOT
         // (predicate-indexed) and merge them into one adjacency map — for an
         // alternation path `(a|b)*` the closure spans both predicates' edges.
-        let (db, overlay, to_t) = ctx.require_single_graph()?;
+        let graphs = ctx.path_graphs()?;
         let mut adj: std::collections::HashMap<Sid, Vec<Sid>> = std::collections::HashMap::new();
         let mut nodes: HashSet<Sid> = HashSet::new();
         let mut ingest = |flake: fluree_db_core::Flake| {
@@ -785,17 +800,9 @@ impl PropertyPathOperator {
         if self.pattern.wildcard {
             // Wildcard closure: every node→node edge except the reserved ones.
             // A full PSOT scan (no predicate bound) over the active graph.
-            let flakes = range_with_overlay(
-                db,
-                ctx.binary_g_id,
-                overlay,
-                IndexType::Psot,
-                RangeTest::Eq,
-                RangeMatch::new(),
-                RangeOptions::new().with_to_t(to_t),
-            )
-            .await?;
-            let flakes = self.filter_edges(ctx, flakes).await?;
+            let flakes = self
+                .read_edges(ctx, &graphs, IndexType::Psot, |_| RangeMatch::new())
+                .await?;
             for flake in flakes {
                 if !is_reserved_edge_predicate(&flake.p) {
                     ingest(flake);
@@ -803,19 +810,12 @@ impl PropertyPathOperator {
             }
         } else {
             for pred in &self.pattern.predicates {
-                // Re-encode into the active graph's dict — see `reencode_pred`.
-                let range_match = RangeMatch::predicate(reencode_pred(ctx, db, pred));
-                let flakes = range_with_overlay(
-                    db,
-                    ctx.binary_g_id,
-                    overlay,
-                    IndexType::Psot,
-                    RangeTest::Eq,
-                    range_match,
-                    RangeOptions::new().with_to_t(to_t),
-                )
-                .await?;
-                let flakes = self.filter_edges(ctx, flakes).await?;
+                // Re-encode into each graph's dict — see `reencode_pred`.
+                let flakes = self
+                    .read_edges(ctx, &graphs, IndexType::Psot, |db| {
+                        RangeMatch::predicate(reencode_pred(ctx, db, pred))
+                    })
+                    .await?;
                 for flake in flakes {
                     ingest(flake);
                 }
@@ -969,23 +969,16 @@ impl PropertyPathOperator {
     /// ref objects when the leading step is inverse. Used to seed the
     /// both-unbound closure.
     async fn composite_start_candidates(&self, ctx: &ExecutionContext<'_>) -> Result<Vec<Sid>> {
-        let (db, overlay, to_t) = ctx.require_single_graph()?;
+        let graphs = ctx.path_graphs()?;
         let mut seen: HashSet<Sid> = HashSet::new();
         let mut out = Vec::new();
         for pred in &self.pattern.predicates {
-            // Re-encode into the active graph's dict — see `reencode_pred`.
-            let range_match = RangeMatch::predicate(reencode_pred(ctx, db, pred));
-            let flakes = range_with_overlay(
-                db,
-                ctx.binary_g_id,
-                overlay,
-                IndexType::Psot,
-                RangeTest::Eq,
-                range_match,
-                RangeOptions::new().with_to_t(to_t),
-            )
-            .await?;
-            let flakes = self.filter_edges(ctx, flakes).await?;
+            // Re-encode into each graph's dict — see `reencode_pred`.
+            let flakes = self
+                .read_edges(ctx, &graphs, IndexType::Psot, |db| {
+                    RangeMatch::predicate(reencode_pred(ctx, db, pred))
+                })
+                .await?;
             for flake in flakes {
                 let candidate = if self.pattern.first_inverse {
                     match flake.o {
@@ -1010,7 +1003,7 @@ impl PropertyPathOperator {
     /// zero-length match pairs each node with itself (mirrors how the simple-path
     /// closure tracks both subjects and objects).
     async fn composite_domain_nodes(&self, ctx: &ExecutionContext<'_>) -> Result<HashSet<Sid>> {
-        let (db, overlay, to_t) = ctx.require_single_graph()?;
+        let graphs = ctx.path_graphs()?;
         let mut nodes: HashSet<Sid> = HashSet::new();
         let all_preds = self.pattern.predicates.iter().chain(
             self.pattern
@@ -1019,19 +1012,12 @@ impl PropertyPathOperator {
                 .flat_map(|s| s.predicates.iter()),
         );
         for pred in all_preds {
-            // Re-encode into the active graph's dict — see `reencode_pred`.
-            let range_match = RangeMatch::predicate(reencode_pred(ctx, db, pred));
-            let flakes = range_with_overlay(
-                db,
-                ctx.binary_g_id,
-                overlay,
-                IndexType::Psot,
-                RangeTest::Eq,
-                range_match,
-                RangeOptions::new().with_to_t(to_t),
-            )
-            .await?;
-            let flakes = self.filter_edges(ctx, flakes).await?;
+            // Re-encode into each graph's dict — see `reencode_pred`.
+            let flakes = self
+                .read_edges(ctx, &graphs, IndexType::Psot, |db| {
+                    RangeMatch::predicate(reencode_pred(ctx, db, pred))
+                })
+                .await?;
             for flake in flakes {
                 nodes.insert(flake.s);
                 if let FlakeValue::Ref(o) = flake.o {
@@ -1137,8 +1123,9 @@ impl PropertyPathOperator {
     /// materialization (reasoning overlays carry Sid-space derived facts whose
     /// namespace codes may not resolve against this store), an overlay that
     /// can't be summarized per subject, a composite path (its per-sub-step
-    /// direction flips stay on the Sid lane for now), or a typed predicate
-    /// that exists only in novelty.
+    /// direction flips stay on the Sid lane for now), a typed predicate
+    /// that exists only in novelty, or a path over more than one graph (the
+    /// lane reads a single graph's index).
     fn id_lane(&self, ctx: &ExecutionContext<'_>) -> Result<Option<PathIdLane>> {
         if self.pattern.is_composite() {
             return Ok(None);
@@ -1149,7 +1136,11 @@ impl PropertyPathOperator {
         if !ctx.allow_unfiltered() || ctx.is_multi_ledger() || ctx.eager_materialization {
             return Ok(None);
         }
-        let (_db, overlay, to_t) = ctx.require_single_graph()?;
+        let graphs = ctx.path_graphs()?;
+        let [graph] = graphs.as_slice() else {
+            return Ok(None);
+        };
+        let (overlay, to_t) = (graph.overlay, graph.to_t);
         let Some(dirty) = overlay_dirty_ids(overlay, ctx.binary_g_id, store) else {
             return Ok(None);
         };
@@ -1406,7 +1397,7 @@ impl PropertyPathOperator {
         // space; re-encode into the active graph (as `process_correlated_row`
         // does) so a divergent-namespace endpoint traverses — and is emitted —
         // as the graph's own SID. Falls back to the raw SID when undecodable.
-        let (db_for_encode, _overlay, _to_t) = ctx.require_single_graph()?;
+        let db_for_encode = ctx.path_snapshot()?;
         let reencode = |s: &Sid| -> Sid {
             crate::context::reencode_sid(ctx, db_for_encode, s).unwrap_or_else(|| s.clone())
         };
@@ -1472,8 +1463,8 @@ impl PropertyPathOperator {
         let subj_binding = subj_var.and_then(|v| child_batch.column(v).map(|col| &col[row_idx]));
         let obj_binding = obj_var.and_then(|v| child_batch.column(v).map(|col| &col[row_idx]));
 
-        // Resolve the active graph (property paths require a single active graph).
-        let (db_for_encode, _overlay, _to_t) = ctx.require_single_graph()?;
+        // The snapshot the path's graphs share a namespace table with.
+        let db_for_encode = ctx.path_snapshot()?;
 
         // Extract SIDs from constants or child bindings (if bound).
         //

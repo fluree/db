@@ -541,7 +541,7 @@ impl DictTreeReader {
             let Some(cache_dir) = disk_cache_dir else {
                 return Ok(None);
             };
-            if !cs.permits_plaintext_cache() {
+            if !crate::read::artifact_cache::uses_disk_cache(cs) {
                 return Ok(None);
             }
             let cache_path = cache_dir.join(cid.to_string());
@@ -685,6 +685,9 @@ impl DictTreeReader {
                     let address = address.to_owned();
                     let disk_cache_dir = self.disk_cache_dir.clone();
                     cache.try_get_or_load_dict_leaf(cache_key, || {
+                        if let Some(bytes) = cs.resolve_cached_bytes(&cid) {
+                            return Ok(bytes);
+                        }
                         if let Some(bytes) =
                             read_disk_cached_leaf(cs.as_ref(), disk_cache_dir.as_ref(), &cid)?
                         {
@@ -710,6 +713,9 @@ impl DictTreeReader {
                         Ok(Arc::from(bytes.into_boxed_slice()))
                     })
                 } else {
+                    if let Some(bytes) = cs.resolve_cached_bytes(cid) {
+                        return Ok(bytes);
+                    }
                     if let Some(bytes) =
                         read_disk_cached_leaf(cs.as_ref(), self.disk_cache_dir.as_ref(), cid)?
                     {
@@ -882,6 +888,10 @@ mod tests {
             true
         }
 
+        fn is_remote(&self) -> bool {
+            false
+        }
+
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             Ok(self.paths.lock().contains_key(id))
         }
@@ -1049,6 +1059,10 @@ mod tests {
         fn permits_plaintext_cache(&self) -> bool {
             self.permits_plaintext_cache
         }
+
+        fn is_remote(&self) -> bool {
+            true
+        }
     }
 
     /// A disk-cache entry left under a leaf's CID by an earlier run — here a
@@ -1123,6 +1137,133 @@ mod tests {
                 "permits={permits}"
             );
             let _ = std::fs::remove_dir_all(&cache_dir);
+        }
+    }
+
+    /// In-memory store that hands its leaves out shared, as memory storage
+    /// does through the bridge. Fetches count.
+    #[derive(Debug)]
+    struct ResidentStore {
+        inner: fluree_db_core::MemoryContentStore,
+        resident: std::sync::RwLock<HashMap<ContentId, Arc<[u8]>>>,
+        gets: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl ContentStore for ResidentStore {
+        async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
+            self.inner.has(id).await
+        }
+        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+            self.gets.fetch_add(1, Ordering::Relaxed);
+            self.inner.get(id).await
+        }
+        async fn put(
+            &self,
+            kind: fluree_db_core::ContentKind,
+            bytes: &[u8],
+        ) -> fluree_db_core::Result<ContentId> {
+            let id = self.inner.put(kind, bytes).await?;
+            self.resident
+                .write()
+                .unwrap()
+                .insert(id.clone(), Arc::from(bytes));
+            Ok(id)
+        }
+        async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> fluree_db_core::Result<()> {
+            self.inner.put_with_id(id, bytes).await?;
+            self.resident
+                .write()
+                .unwrap()
+                .insert(id.clone(), Arc::from(bytes));
+            Ok(())
+        }
+        async fn release(&self, id: &ContentId) -> fluree_db_core::Result<()> {
+            self.inner.release(id).await
+        }
+        fn permits_plaintext_cache(&self) -> bool {
+            true
+        }
+        fn is_remote(&self) -> bool {
+            false
+        }
+        fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
+            self.resident.read().unwrap().get(id).cloned()
+        }
+    }
+
+    /// A store holding its dict leaves in memory hands them out shared: a
+    /// lookup borrows the leaf, through the global cache or not, and never
+    /// fetches it.
+    #[test]
+    fn resident_dict_leaves_are_borrowed_not_fetched() {
+        let entries = ["a", "b", "c"]
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ReverseEntry {
+                key: k.as_bytes().to_vec(),
+                id: i as u64,
+            })
+            .collect();
+        let tree =
+            builder::build_reverse_tree(entries, builder::DEFAULT_TARGET_LEAF_BYTES).unwrap();
+        assert_eq!(tree.leaves.len(), 1);
+        let address = tree.branch.leaves[0].address.clone();
+
+        for with_cache in [false, true] {
+            let store = Arc::new(ResidentStore {
+                inner: fluree_db_core::MemoryContentStore::new(),
+                resident: Default::default(),
+                gets: AtomicU64::new(0),
+            });
+            let cs: Arc<dyn ContentStore> = store.clone();
+            let cid = crate::read::binary_index_store::run_sync_on_runtime({
+                let cs = Arc::clone(&cs);
+                let bytes = tree.leaves[0].bytes.clone();
+                async move {
+                    cs.put(
+                        fluree_db_core::ContentKind::DictBlob {
+                            dict: fluree_db_core::DictKind::SubjectReverse,
+                        },
+                        &bytes,
+                    )
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))
+                }
+            })
+            .unwrap();
+
+            let mut remote_cids = HashMap::new();
+            remote_cids.insert(address.clone(), cid.clone());
+            let mut reader = DictTreeReader::new(
+                tree.branch.clone(),
+                LeafSource::CasOnDemand {
+                    cs,
+                    local_files: HashMap::new(),
+                    remote_cids,
+                },
+            );
+            if with_cache {
+                reader.global_cache = Some(Arc::new(LeafletCache::with_max_mb(4)));
+            }
+
+            for _ in 0..2 {
+                assert_eq!(
+                    reader.reverse_lookup(b"c").unwrap(),
+                    Some(2),
+                    "with_cache={with_cache}"
+                );
+            }
+            let leaf = reader.load_leaf(&address).unwrap();
+            assert!(
+                Arc::ptr_eq(&leaf, &store.resolve_cached_bytes(&cid).unwrap()),
+                "with_cache={with_cache}: the leaf must be the store's own allocation"
+            );
+            assert_eq!(
+                store.gets.load(Ordering::Relaxed),
+                0,
+                "with_cache={with_cache}: a resident leaf must not be fetched"
+            );
         }
     }
 

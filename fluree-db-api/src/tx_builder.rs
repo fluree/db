@@ -94,6 +94,7 @@ impl GraphPayload<'_> {
 /// last operation's delta carries the whole request's allocations.
 pub(crate) fn parse_and_lower_sparql_update(
     sparql: &str,
+    params: Option<&fluree_db_sparql::ParamMap>,
     snapshot: &LedgerSnapshot,
     txn_opts: TxnOpts,
 ) -> Result<Vec<Txn>> {
@@ -105,7 +106,7 @@ pub(crate) fn parse_and_lower_sparql_update(
             format!("SPARQL UPDATE parse error: {}", messages.join("; ")),
         ));
     }
-    let ast = parsed
+    let mut ast = parsed
         .ast
         .ok_or_else(|| ApiError::http(400, "Failed to parse SPARQL UPDATE".to_string()))?;
 
@@ -130,6 +131,10 @@ pub(crate) fn parse_and_lower_sparql_update(
             .map(|d| d.message.clone())
             .unwrap_or_else(|| "SPARQL UPDATE validation error".to_string());
         return Err(ApiError::sparql(message, errors));
+    }
+    if let Some(params) = params {
+        fluree_db_sparql::substitute_params(&mut ast, params)
+            .map_err(|e| ApiError::http(400, e.to_string()))?;
     }
 
     let mut ns = NamespaceRegistry::from_db(snapshot);
@@ -156,7 +161,7 @@ pub(crate) fn parse_and_lower_sparql_update(
 /// `commit_with_handle` would consume the already-built `stage_result`.
 /// The consensus layer's retry, which preserves the request body across
 /// attempts, handles that case instead.
-fn is_retryable_commit_conflict(e: &ApiError) -> bool {
+pub(crate) fn is_retryable_commit_conflict(e: &ApiError) -> bool {
     matches!(
         e,
         ApiError::Transact(
@@ -459,6 +464,8 @@ pub(crate) struct TransactCore<'a> {
     /// Raw SPARQL UPDATE text, lowered to a `Txn` under the write lock during
     /// `execute()` so its namespace allocation shares the staging registry.
     pub(crate) pending_sparql: Option<&'a str>,
+    /// Parameters substituted into `pending_sparql`.
+    pub(crate) sparql_params: Option<&'a fluree_db_sparql::ParamMap>,
     /// A multi-clause Cypher write staged clause-by-clause under the write
     /// lock by the sequential driver (see [`crate::cypher_seq`]).
     pub(crate) pre_built_cypher_seq: Option<crate::cypher_seq::CypherSeqInput>,
@@ -471,12 +478,27 @@ pub(crate) struct TransactCore<'a> {
 }
 
 impl<'a> TransactCore<'a> {
+    /// The request's tracker: the caller's tracking options, else the fuel
+    /// limit a SPARQL UPDATE names with `# PRAGMA max-fuel` — the twin of a
+    /// JSON-LD body's `max-fuel`, which staging applies on its own.
+    pub(crate) fn tracker(&self) -> Tracker {
+        match (&self.tracking, self.pending_sparql) {
+            (Some(opts), _) => Tracker::new(opts.clone()),
+            (None, Some(sparql)) => crate::query::helpers::tracker_for_input_limits(
+                &crate::view::QueryInput::Sparql(sparql),
+                None,
+            ),
+            (None, None) => Tracker::disabled(),
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             operation: None,
             pre_built_txn: None,
             pre_built_txn_followup: None,
             pending_sparql: None,
+            sparql_params: None,
             pre_built_cypher_seq: None,
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
@@ -557,7 +579,11 @@ impl<'a> TransactCore<'a> {
         self.txn_opts = opts;
     }
 
-    pub(crate) fn set_sparql_update(&mut self, sparql: &'a str) {
+    pub(crate) fn set_sparql_update(
+        &mut self,
+        sparql: &'a str,
+        params: Option<&'a fluree_db_sparql::ParamMap>,
+    ) {
         if self.operation.is_some() || self.pre_built_txn.is_some() || self.pending_sparql.is_some()
         {
             self.errors.push(BuilderError::Conflict {
@@ -566,6 +592,7 @@ impl<'a> TransactCore<'a> {
             });
         } else {
             self.pending_sparql = Some(sparql);
+            self.sparql_params = params;
         }
     }
 
@@ -842,12 +869,7 @@ impl<'a> OwnedTransactBuilder<'a> {
             .clone()
             .unwrap_or_else(crate::server_defaults::default_index_config);
         let store_raw_txn = self.core.txn_opts.store_raw_txn.unwrap_or(false);
-        let tracker = self
-            .core
-            .tracking
-            .clone()
-            .map(Tracker::new)
-            .unwrap_or_default();
+        let tracker = self.core.tracker();
 
         let (staged, txn_type, commit_opts, _) = self
             .fluree
@@ -875,12 +897,7 @@ impl<'a> OwnedTransactBuilder<'a> {
             .index_config
             .clone()
             .unwrap_or_else(crate::server_defaults::default_index_config);
-        let tracker = self
-            .core
-            .tracking
-            .clone()
-            .map(Tracker::new)
-            .unwrap_or_else(Tracker::disabled);
+        let tracker = self.core.tracker();
 
         // No commit follows, so there is no raw transaction to upload.
         let (stage_result, ..) = self
@@ -1024,7 +1041,18 @@ impl<'a> RefTransactBuilder<'a> {
     /// namespace-conflict retry that pre-lowering against an unlocked
     /// snapshot would require.
     pub fn sparql_update(mut self, sparql: &'a str) -> Self {
-        self.core.set_sparql_update(sparql);
+        self.core.set_sparql_update(sparql, None);
+        self
+    }
+
+    /// [`Self::sparql_update`] with variables bound to values; see
+    /// [`fluree_db_sparql::substitute_params`].
+    pub fn sparql_update_with_params(
+        mut self,
+        sparql: &'a str,
+        params: &'a fluree_db_sparql::ParamMap,
+    ) -> Self {
+        self.core.set_sparql_update(sparql, Some(params));
         self
     }
 
@@ -1139,7 +1167,7 @@ fn remap_sid(sid: &mut Sid, remap: &HashMap<u16, u16>) {
     }
 }
 
-enum OpPlan<'a> {
+pub(crate) enum OpPlan<'a> {
     InsertTurtle(&'a str),
     /// RDF text staged as templates (an upsert), parsed against whichever
     /// state it is staged on: parsing allocates namespace codes relative to
@@ -1151,7 +1179,7 @@ enum OpPlan<'a> {
     /// A SPARQL UPDATE request, parsed and lowered against whichever state
     /// it is staged on — lowering allocates namespace codes relative to
     /// that state's table.
-    Sparql(&'a str),
+    Sparql(&'a str, Option<&'a fluree_db_sparql::ParamMap>),
     JsonLike {
         txn_type: TxnType,
         txn_json: JsonValue,
@@ -1162,7 +1190,7 @@ enum OpPlan<'a> {
 
 impl<'a> OpPlan<'a> {
     /// Pre-parse a [`TransactOperation`] into an [`OpPlan`].
-    fn from_op(op: TransactOperation<'a>) -> Result<Self> {
+    pub(crate) fn from_op(op: TransactOperation<'a>) -> Result<Self> {
         match op {
             TransactOperation::InsertTurtle(turtle) => Ok(OpPlan::InsertTurtle(turtle)),
             TransactOperation::UpsertTurtle(text) => Ok(OpPlan::Rdf {
@@ -1398,8 +1426,12 @@ impl Fluree {
         }
 
         if let Some(sparql) = core.pending_sparql {
-            let txns =
-                parse_and_lower_sparql_update(sparql, &ledger_state.snapshot, core.txn_opts)?;
+            let txns = parse_and_lower_sparql_update(
+                sparql,
+                core.sparql_params,
+                &ledger_state.snapshot,
+                core.txn_opts,
+            )?;
             // A single-op request reports its own type; a multi-op (or
             // empty no-op) request is reported as a generic update.
             let txn_type = match txns.as_slice() {
@@ -1515,7 +1547,8 @@ impl Fluree {
 
     /// Stage a pre-parsed [`OpPlan`] against a given [`LedgerState`] — one
     /// iteration of the optimistic-path retry loop.
-    async fn stage_plan(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stage_plan(
         &self,
         op_plan: &OpPlan<'_>,
         ledger_state: LedgerState,
@@ -1523,12 +1556,18 @@ impl Fluree {
         commit_opts_base: &CommitOpts,
         tracker_ref: Option<&Tracker>,
         index_config: &IndexConfig,
+        policy: Option<&PolicyContext>,
     ) -> Result<(StageResult, TxnType, CommitOpts)> {
         let ledger_id = ledger_state.ledger_id().to_string();
         let store_raw_txn = txn_opts.store_raw_txn.unwrap_or(false);
         match op_plan {
-            OpPlan::Sparql(sparql) => {
-                let txns = parse_and_lower_sparql_update(sparql, &ledger_state.snapshot, txn_opts)?;
+            OpPlan::Sparql(sparql, params) => {
+                let txns = parse_and_lower_sparql_update(
+                    sparql,
+                    *params,
+                    &ledger_state.snapshot,
+                    txn_opts,
+                )?;
                 // A single-op request reports its own type; a multi-op (or
                 // empty no-op) request is reported as a generic update.
                 let txn_type = match txns.as_slice() {
@@ -1540,7 +1579,7 @@ impl Fluree {
                         ledger_state,
                         txns,
                         Some(index_config),
-                        None,
+                        policy,
                         tracker_ref,
                     )
                     .await?;
@@ -1560,7 +1599,7 @@ impl Fluree {
                         txn_opts,
                         Some(index_config),
                         tracker_ref,
-                        None,
+                        policy,
                     )
                     .await?;
                 Ok((stage_result, TxnType::Insert, commit_opts))
@@ -1600,7 +1639,7 @@ impl Fluree {
                         txn_opts,
                         Some(index_config),
                         tracker_ref,
-                        None,
+                        policy,
                     )
                     .await?;
                 Ok((stage_result, *txn_type, commit_opts))
@@ -1619,7 +1658,7 @@ impl Fluree {
                         txn_opts,
                         Some(index_config),
                         tracker_ref,
-                        None,
+                        policy,
                     )
                     .await?;
                 Ok((stage_result, op.txn_type(), commit_opts))
@@ -1673,7 +1712,7 @@ impl Fluree {
     /// Short-circuits a no-op stage ([`StageResult::is_noop`]) without
     /// touching the cache or triggering indexing.
     #[allow(clippy::too_many_arguments)]
-    async fn commit_and_finalize(
+    pub(crate) async fn commit_and_finalize(
         &self,
         write_guard: LedgerWriteGuard,
         stage_result: StageResult,
@@ -1882,7 +1921,7 @@ impl Fluree {
     /// On a pass the flakes are restamped to the new `t` and layered over a
     /// clone of the locked state; on a fail the stage is dropped and `None`
     /// says to stage again under the lock.
-    fn rebase_stage(
+    pub(crate) fn rebase_stage(
         guard: &LedgerWriteGuard,
         stage: StageResult,
         base_t: i64,
@@ -2126,7 +2165,7 @@ impl Fluree {
     pub(crate) async fn build_commit_with_handle(
         &self,
         ledger: &LedgerHandle,
-        mut core: TransactCore<'_>,
+        core: TransactCore<'_>,
     ) -> Result<Option<(LedgerWriteGuard, fluree_db_transact::StagedCommit)>> {
         core.validate().map_err(ApiError::Builder)?;
 
@@ -2135,11 +2174,7 @@ impl Fluree {
             .clone()
             .unwrap_or_else(crate::server_defaults::default_index_config);
         let store_raw_txn = core.txn_opts.store_raw_txn.unwrap_or(false);
-        let tracker = core
-            .tracking
-            .take()
-            .map(Tracker::new)
-            .unwrap_or_else(Tracker::disabled);
+        let tracker = core.tracker();
 
         let write_guard = ledger.lock_for_write().await;
         // The dry-run/consensus path has no response channel for a trailing
@@ -2263,11 +2298,7 @@ impl Fluree {
             .clone()
             .unwrap_or_else(crate::server_defaults::default_index_config);
         let store_raw_txn = core.txn_opts.store_raw_txn.unwrap_or(false);
-        let tracker = core
-            .tracking
-            .take()
-            .map(Tracker::new)
-            .unwrap_or_else(Tracker::disabled);
+        let tracker = core.tracker();
 
         // Fast path: pre-built Txn IR, Cypher sequences, or policy-gated
         // requests need the write lock held across the entire stage +
@@ -2337,7 +2368,7 @@ impl Fluree {
         // commit itself. Later attempts take the lock first and stage under
         // it; they are for commit conflicts that `refresh` heals.
         let op_plan = match core.pending_sparql.take() {
-            Some(sparql) => OpPlan::Sparql(sparql),
+            Some(sparql) => OpPlan::Sparql(sparql, core.sparql_params),
             None => OpPlan::from_op(core.operation.take().unwrap())?, // safe: validate checks
         };
         let txn_opts = core.txn_opts;
@@ -2363,6 +2394,7 @@ impl Fluree {
                         &commit_opts_base,
                         tracker_ref,
                         &index_config,
+                        None,
                     )
                     .await?;
                 let stage_us = stage_started.elapsed().as_micros() as u64;
@@ -2402,6 +2434,7 @@ impl Fluree {
                             &commit_opts_base,
                             tracker_ref,
                             &index_config,
+                            None,
                         )
                         .await?;
                     (write_guard, stage_result, txn_type, commit_opts)
@@ -2416,6 +2449,7 @@ impl Fluree {
                         &commit_opts_base,
                         tracker_ref,
                         &index_config,
+                        None,
                     )
                     .await?;
                 (write_guard, stage_result, txn_type, commit_opts)

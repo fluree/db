@@ -230,6 +230,7 @@ pub async fn run(a: SyncArgs<'_>) -> CliResult<()> {
                     SyncGraphOpts {
                         dry_run: a.dry_run,
                         allow_empty: a.allow_empty,
+                        ..Default::default()
                     },
                     TxnOpts::default(),
                     policy_ctx,

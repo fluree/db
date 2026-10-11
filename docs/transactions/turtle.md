@@ -621,7 +621,7 @@ curl -X POST "http://localhost:8090/v1/fluree/upsert?ledger=mydb:main" \
 
 From the CLI, `fluree insert -f data.trig` and `fluree upsert -f data.trig` do the same.
 
-A `GRAPH` block's contents are Turtle like the rest of the document: anonymous blank nodes (`[ … ]`), collections (`( … )`) and RDF 1.2 annotations work inside blocks on every transaction endpoint. **Known limitation ([#1930](https://github.com/fluree/db/issues/1930)):** bulk import (`fluree create --from data.trig`) still reads block contents with a smaller parser that rejects `[ … ]` and `( … )` with `expected object, found '['`; use labeled blank nodes (`_:b1`) inside blocks there.
+A `GRAPH` block's contents are Turtle like the rest of the document: anonymous blank nodes (`[ … ]`), collections (`( … )`) and RDF 1.2 annotations work inside blocks on every transaction endpoint. **Known limitation ([#1930](https://github.com/fluree/db/issues/1930)):** bulk import (`fluree create --from data.trig`) still reads block contents with a smaller parser that rejects `[ … ]` and `( … )` with an error naming the construct; use labeled blank nodes (`_:b1`) inside blocks there.
 
 ### How RDF Text Is Read
 

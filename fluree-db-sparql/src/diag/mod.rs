@@ -175,9 +175,19 @@ pub enum DiagCode {
     #[serde(rename = "V008")]
     AnonymousAnnotationInGroundData,
 
+    /// Aggregate reads an alias assigned by the same SELECT clause, which is
+    /// bound only after aggregation (SPARQL §18.2.4.4)
+    #[serde(rename = "V009")]
+    AggregateOverSelectAlias,
+
     /// Anonymous annotation (fresh blank-node reifier) in a DELETE form
     #[serde(rename = "F011")]
     AnonymousAnnotationInDelete,
+
+    /// `# PRAGMA` directive with an unknown name, a malformed value, or one
+    /// that does not apply to the request form
+    #[serde(rename = "F012")]
+    InvalidPragma,
 
     // =========================================================================
     // Rust port status (R001-R099) - "Rust engine not finished"
@@ -236,8 +246,10 @@ impl DiagCode {
             Self::NestedAggregate => "V006",
             Self::DuplicateValuesVariable => "V007",
             Self::AnonymousAnnotationInGroundData => "V008",
+            Self::AggregateOverSelectAlias => "V009",
             Self::BlankNodeInDelete => "F010",
             Self::AnonymousAnnotationInDelete => "F011",
+            Self::InvalidPragma => "F012",
             // Rust port
             Self::LoweringNotImplemented => "R001",
             // Warnings

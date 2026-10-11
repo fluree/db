@@ -90,8 +90,8 @@ impl Phase2FetchStats {
 }
 
 /// Seed the read-through artifact cache with bytes this build just uploaded,
-/// so the first reader does not re-fetch them. Skipped when the store does
-/// not permit a plaintext copy outside it (encrypted storage).
+/// so the first reader does not re-fetch them — when the store is one the
+/// cache serves at all (see `uses_disk_cache`).
 fn cache_artifact_bytes(
     content_store: &dyn ContentStore,
     cache_dir: &std::path::Path,
@@ -99,21 +99,20 @@ fn cache_artifact_bytes(
     bytes: &[u8],
     artifact_kind: &'static str,
 ) {
-    if !content_store.permits_plaintext_cache() {
-        return;
-    }
-    fluree_db_binary_index::read::artifact_cache::best_effort_cache_bytes_to_path(
+    if fluree_db_binary_index::read::artifact_cache::seed_disk_cache(
+        content_store,
+        cid,
         cache_dir,
-        &cache_dir.join(cid.to_string()),
         bytes,
-    );
-    tracing::trace!(
-        %cid,
-        artifact_kind,
-        bytes = bytes.len(),
-        cache_dir = %cache_dir.display(),
-        "V6 incremental: seeded artifact cache"
-    );
+    ) {
+        tracing::trace!(
+            %cid,
+            artifact_kind,
+            bytes = bytes.len(),
+            cache_dir = %cache_dir.display(),
+            "V6 incremental: seeded artifact cache"
+        );
+    }
 }
 
 async fn fetch_cached_index_bytes(
@@ -2149,10 +2148,9 @@ pub async fn incremental_index(
             )
             .await
             {
-                Ok(bytes) => match stats::HllSketchBlob::from_json_bytes(&bytes)
-                    .and_then(stats::HllSketchBlob::into_properties)
-                {
-                    Ok(props) => {
+                Ok(bytes) => match stats::HllSketchBlob::from_bytes(&bytes) {
+                    Ok(blob) => {
+                        let props = blob.into_properties();
                         tracing::debug!(
                             entries = props.len(),
                             bytes = bytes.len(),
@@ -2160,19 +2158,16 @@ pub async fn incremental_index(
                         );
                         props
                     }
+                    // A newer format means a downgraded indexer. Reseeding
+                    // would silently thin NDV on every build; fail instead.
+                    Err(e @ stats::SketchDecodeError::Unsupported(_)) => return Err(e.into()),
                     Err(e) => {
-                        tracing::warn!(error = %e, "failed to decode prior sketches, starting fresh");
+                        tracing::error!(error = %e, %cid, "failed to decode prior sketches, starting fresh");
                         std::collections::HashMap::new()
                     }
                 },
-                Err(IndexerError::StorageRead(e)) if e.contains("not found") => {
-                    tracing::debug!(
-                        "sketch blob CID present but content not found, starting fresh"
-                    );
-                    std::collections::HashMap::new()
-                }
                 Err(e) => {
-                    tracing::warn!(error = %e, "failed to load sketch blob, starting fresh");
+                    tracing::error!(error = %e, %cid, "failed to load sketch blob, starting fresh");
                     std::collections::HashMap::new()
                 }
             }
@@ -2282,34 +2277,18 @@ pub async fn incremental_index(
         }
 
         // Upload HLL sketches (before finalize consumes the hook).
-        let sketch_ref = {
-            let sketch_blob =
-                stats::HllSketchBlob::from_properties(novelty.max_t, stats_hook.properties());
-            if !sketch_blob.entries.is_empty() {
-                let sketch_bytes = sketch_blob
-                    .to_json_bytes()
-                    .map_err(|e| IndexerError::StorageWrite(format!("sketch serialize: {e}")))?;
-                let cid = content_store
-                    .put(ContentKind::StatsSketch, &sketch_bytes)
-                    .await
-                    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                cache_artifact_bytes(
-                    &*content_store,
-                    &cache_dir,
-                    &cid,
-                    &sketch_bytes,
-                    "stats_sketch",
-                );
-                tracing::debug!(
-                    %cid,
-                    bytes = sketch_bytes.len(),
-                    entries = sketch_blob.entries.len(),
-                    "incremental V6: HLL sketch uploaded"
-                );
+        let sketch_ref = match super::upload::upload_stats_sketch(
+            content_store.as_ref(),
+            novelty.max_t,
+            stats_hook.properties(),
+        )
+        .await?
+        {
+            Some((cid, bytes)) => {
+                cache_artifact_bytes(&*content_store, &cache_dir, &cid, &bytes, "stats_sketch");
                 Some(cid)
-            } else {
-                None
             }
+            None => None,
         };
 
         // Move per-subject maps out of the hook (avoids cloning).

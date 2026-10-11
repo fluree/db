@@ -251,7 +251,8 @@ fn weigh_submission_error(err: &SubmissionError) -> usize {
         SubmissionError::Execution { message, .. }
         | SubmissionError::NoveltyBackpressure { message }
         | SubmissionError::NoveltyDeltaTooLarge { message }
-        | SubmissionError::DatatypeLimitExceeded { message } => message.capacity(),
+        | SubmissionError::DatatypeLimitExceeded { message }
+        | SubmissionError::CommitNotFound { message } => message.capacity(),
         SubmissionError::KeyCollision
         | SubmissionError::AlreadyInFlight
         | SubmissionError::Overloaded => 0,

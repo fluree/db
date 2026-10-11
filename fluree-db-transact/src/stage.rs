@@ -14,8 +14,8 @@ use crate::error::{Result, TransactError};
 use crate::generate::{infer_datatype, FlakeAccumulator, FlakeGenerator};
 use crate::ir::InlineValues;
 use crate::ir::{
-    names_ledger, GraphMgmtOp, GraphSel, GraphTarget, TemplateGraph, TemplateTerm, TripleTemplate,
-    Txn, TxnType,
+    names_default_graph, GraphMgmtOp, GraphSel, GraphTarget, TemplateGraph, TemplateTerm,
+    TripleTemplate, Txn, TxnType,
 };
 use crate::namespace::NamespaceRegistry;
 use fluree_db_core::graph_registry::{FIRST_USER_GRAPH_ID, TXN_META_GRAPH_ID};
@@ -737,6 +737,7 @@ pub async fn stage_with_graph_delta(
         // `GRAPH ?g` targets are checked as the WHERE resolves them
         // (`route_var_graphs`).
         for iri in &txn.write_graphs {
+            refuse_default_graph_name(iri)?;
             refuse_txn_meta_write(&ledger, iri)?;
         }
 
@@ -766,6 +767,7 @@ pub async fn stage_with_graph_delta(
                 // even on a ledger whose registry never seeded them.
                 fluree_db_core::graph_registry::validate_absolute_graph_iri(iri)
                     .map_err(|msg| TransactError::Parse(format!("sync target: {msg}")))?;
+                refuse_default_graph_name(iri)?;
                 let ledger_id = ledger.snapshot.ledger_id.as_ref();
                 if *iri == fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id)
                     || *iri == fluree_db_core::graph_registry::config_graph_iri(ledger_id)
@@ -1166,11 +1168,20 @@ fn refuse_txn_meta_write(ledger: &LedgerState, iri: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refuse `urn:default` as a named graph a write targets: it names the default
+/// graph (see [`TransactError::DefaultGraphNameAsGraph`]).
+pub(crate) fn refuse_default_graph_name(iri: &str) -> Result<()> {
+    if iri == fluree_db_core::DEFAULT_GRAPH_IRI {
+        return Err(TransactError::DefaultGraphNameAsGraph);
+    }
+    Ok(())
+}
+
 /// SPARQL `WITH <iri>` and a JSON-LD update's top-level `graph` name the
 /// update's template default graph ([`Txn::template_default_graph`]). With no
 /// `USING`/`from`, the WHERE reads the same IRI as its default graph
-/// (`resolve_where_default_graph`), and when the IRI is this ledger's own
-/// address ([`names_ledger`]) that is the ledger's default graph. Make the
+/// (`resolve_where_default_graph`), and when the IRI names this ledger's
+/// default graph ([`names_default_graph`]) that is the default graph. Make the
 /// write half agree: the templates that took the default write the default
 /// graph, and the IRI is not registered as a named graph unless a template
 /// names it itself. Templates that name their graph are left alone.
@@ -1178,7 +1189,7 @@ fn template_default_address_to_default_graph(txn: &mut Txn, ledger_id: &fluree_d
     let Some(iri) = txn.template_default_graph.clone() else {
         return;
     };
-    if !names_ledger(ledger_id, &iri) {
+    if !names_default_graph(ledger_id, &iri) {
         return;
     }
     let mut named_by_a_template = false;
@@ -1255,6 +1266,7 @@ fn route_var_graphs(
         if reverse_graph.contains_key(sid) {
             continue;
         }
+        refuse_default_graph_name(iri)?;
         refuse_txn_meta_write(ledger, iri)?;
         let g_id = provisional.get(iri.as_str()).copied().ok_or_else(|| {
             TransactError::FlakeGeneration(format!("no provisional graph id for <{iri}>"))
@@ -1387,6 +1399,20 @@ async fn stage_graph_mgmt(
         }
         if let Some(tracker) = options.tracker {
             tracker.consume_fuel(TXN_BASELINE_MICRO_FUEL)?;
+        }
+
+        // These verbs reach the default graph as DEFAULT; `urn:default` as a
+        // named-graph operand is refused rather than read or created.
+        match op {
+            GraphMgmtOp::Clear(GraphTarget::Graph(iri)) => refuse_default_graph_name(iri)?,
+            GraphMgmtOp::Clear(_) => {}
+            GraphMgmtOp::Transfer { from, to, .. } => {
+                for sel in [from, to] {
+                    if let GraphSel::Graph(iri) = sel {
+                        refuse_default_graph_name(iri)?;
+                    }
+                }
+            }
         }
 
         let new_t = ledger.t() + 1;
@@ -2654,11 +2680,11 @@ async fn stream_where_into_accumulator(
     };
 
     // A WHERE default graph named by `USING`, `WITH` or JSON-LD `from`/`graph`:
-    // this ledger's own address names its default graph (see `names_ledger`),
-    // a registered IRI names that graph, and anything else names a graph that
-    // does not exist here, so `None`.
+    // `urn:default` and this ledger's own address name its default graph (see
+    // `names_default_graph`), a registered IRI names that graph, and anything
+    // else names a graph that does not exist here, so `None`.
     let resolve_where_default_graph = |iri: &str| -> Option<GraphId> {
-        if names_ledger(&ledger.snapshot.ledger_id, iri) {
+        if names_default_graph(&ledger.snapshot.ledger_id, iri) {
             return Some(0);
         }
         resolve_graph_id(iri)
@@ -2796,7 +2822,12 @@ async fn stream_where_into_accumulator(
     let mut named: Vec<(Arc<str>, GraphId, bool, Arc<str>)> = Vec::new();
     if let Some(allowlist) = allowed_named_graphs {
         for (iri, alias) in allowlist {
-            let Some(g_id) = resolve_graph_id(&iri) else {
+            let g_id = if iri == fluree_db_core::DEFAULT_GRAPH_IRI {
+                Some(0)
+            } else {
+                resolve_graph_id(&iri)
+            };
+            let Some(g_id) = g_id else {
                 continue;
             };
             // Explicitly listed, so enumerable even when reserved.
@@ -2812,7 +2843,10 @@ async fn stream_where_into_accumulator(
         // The ambient graph store. Reserved system graphs (txn-meta, config)
         // stay addressable by their full IRI — config maintenance reads
         // `GRAPH <…#config>` in an update's WHERE — but, as on the query
-        // side, are never enumerated.
+        // side, are never enumerated. `GRAPH <urn:default>` reads the default
+        // graph, ahead of any graph an earlier version registered by that name.
+        let default_name: Arc<str> = fluree_db_core::DEFAULT_GRAPH_IRI.into();
+        named.push((default_name.clone(), 0, false, default_name));
         let binary_entries = binary_store
             .as_ref()
             .map(|store| store.graph_entries())
@@ -2924,7 +2958,7 @@ async fn stream_where_into_accumulator(
         // Per-batch shape: project → materialize in place → generate →
         // hydrate (retractions only) → push. Batch drops at end of iter.
         let batch = batch.project_owned(template_vars);
-        let batch = materialize_encoded_bindings_for_txn(ledger, batch)?;
+        let batch = materialize_encoded_bindings_for_txn(ledger, base_db.g_id, batch)?;
 
         // Per-batch `delete_gen` span. Nested under `where_exec`. Fields:
         // `template_count` (stable per txn), `retraction_count` (per-batch
@@ -3047,7 +3081,14 @@ fn lower_sparql_where_patterns(
 ///   `Encoded*` variant. Already-concrete columns are left untouched (no
 ///   per-binding clone, no Vec reallocation). Only columns that need it pay
 ///   for in-place rewriting.
-fn materialize_encoded_bindings_for_txn(ledger: &LedgerState, batch: Batch) -> Result<Batch> {
+///
+/// `g_id` is the WHERE's default graph. NUM_BIG arena handles are numbered per
+/// graph, so decoding a `USING <g>` row through graph 0 reads another value.
+fn materialize_encoded_bindings_for_txn(
+    ledger: &LedgerState,
+    g_id: GraphId,
+    batch: Batch,
+) -> Result<Batch> {
     if batch.is_empty() {
         return Ok(batch);
     }
@@ -3060,7 +3101,7 @@ fn materialize_encoded_bindings_for_txn(ledger: &LedgerState, batch: Batch) -> R
         return Ok(batch);
     };
 
-    let gv = fluree_db_binary_index::BinaryGraphView::new(Arc::clone(&store), 0);
+    let gv = fluree_db_binary_index::BinaryGraphView::new(Arc::clone(&store), g_id);
 
     let (schema, mut columns, len) = batch.into_parts();
 
@@ -3150,9 +3191,7 @@ fn materialize_one_binding(
                 }
                 other => {
                     let dt_sid = store_ref
-                        .dt_sids()
-                        .get(dt_id as usize)
-                        .cloned()
+                        .resolve_dt_id_sid_for_value(dt_id, &other)
                         .unwrap_or_else(|| Sid::new(0, ""));
                     let dt_iri = store_ref.sid_to_iri(&dt_sid).ok_or_else(|| {
                         TransactError::Query(fluree_db_query::QueryError::Internal(format!(
@@ -3565,8 +3604,14 @@ pub async fn validate_view_with_shacl(
     // `cross_ledger_db` is a live handle into a model ledger holding the
     // controlled vocabulary (cross-ledger `f:shapesSource`), consulted on
     // demand for `sh:class` membership.
+    // An `sh:sparql` constraint that cannot run is recorded with its shape's
+    // severity (the outermost reporting shape's, when its shape is checked as
+    // a nested shape) rather than raised, so severity and the graph's mode
+    // apply to it as they do to a result (below).
+    let constraint_failures = std::sync::Arc::new(fluree_db_shacl::ConstraintFailures::default());
     let engine = ShaclEngine::from_shared_cache(shacl_cache, hierarchy)
-        .with_membership_graphs(membership_g_ids.to_vec());
+        .with_membership_graphs(membership_g_ids.to_vec())
+        .with_constraint_failures(std::sync::Arc::clone(&constraint_failures));
     let enabled_graphs: Option<HashSet<GraphId>> =
         per_graph_policy.map(|m| m.keys().copied().collect());
     let report = validate_staged_nodes(
@@ -3579,21 +3624,49 @@ pub async fn validate_view_with_shacl(
     )
     .await?;
 
+    // A graph's validation mode. When per_graph_policy is None, every graph
+    // is in Reject mode.
+    let mode_of = |g_id: Option<GraphId>| match (per_graph_policy, g_id) {
+        (Some(m), Some(g_id)) => m
+            .get(&g_id)
+            .map(|p| p.mode)
+            .unwrap_or(fluree_db_core::ledger_config::ValidationMode::Reject),
+        _ => fluree_db_core::ledger_config::ValidationMode::Reject,
+    };
+
+    // A constraint that cannot run, on a Violation shape in a Reject-mode
+    // graph, fails the transaction with the constraint's error (fail closed);
+    // on a Warning or Info shape, or in a Warn-mode graph, it is logged and
+    // the transaction goes on, as a result there would.
+    let failures = constraint_failures.take();
+    if let Some((failure, _)) = failures.iter().find(|(failure, _)| {
+        failure.severity == fluree_db_shacl::Severity::Violation
+            && matches!(
+                mode_of(Some(failure.graph_id)),
+                fluree_db_core::ledger_config::ValidationMode::Reject
+            )
+    }) {
+        return Err(failure.clone().into_error().into());
+    }
+    for (failure, focus_nodes) in failures {
+        tracing::warn!(
+            constraint = %failure.constraint,
+            severity = ?failure.severity,
+            graph = failure.graph_id,
+            focus_nodes,
+            message = %failure.message,
+            "sh:sparql constraint could not run (non-violation severity or warn-mode graph, continuing)"
+        );
+    }
+
     // Split violations by the graph's configured mode. `graph_id` on each
     // result was tagged during the per-graph loop in validate_staged_nodes.
-    // When per_graph_policy is None, every violation defaults to Reject.
     let mut outcome = ShaclValidationOutcome::default();
     for r in report.results {
         if r.severity != fluree_db_shacl::Severity::Violation {
             continue;
         }
-        let mode = match (per_graph_policy, r.graph_id) {
-            (Some(m), Some(g_id)) => m
-                .get(&g_id)
-                .map(|p| p.mode)
-                .unwrap_or(fluree_db_core::ledger_config::ValidationMode::Reject),
-            _ => fluree_db_core::ledger_config::ValidationMode::Reject,
-        };
+        let mode = mode_of(r.graph_id);
         match mode {
             fluree_db_core::ledger_config::ValidationMode::Reject => {
                 outcome.reject_violations.push(r);

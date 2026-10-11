@@ -32,10 +32,16 @@ const RESULT_FORMATS: [&str; 8] = [
 /// It claims the SPARQL query language at versions 1.0 through 1.2 (SPARQL
 /// 1.2's unversioned `sd:SPARQLQuery` with `sd:supportedVersion`, plus 1.1's
 /// `sd:SPARQL11Query` for older clients), the result formats above, and simple
-/// entailment, since reasoning is opt-in per query. It claims no `sd:feature`:
-/// the default graph is not the union of the named graphs, and Fluree has no
-/// empty named graph.
-pub fn sparql_service_description(endpoint: &str, config: &FormatterConfig) -> Result<String> {
+/// entailment, since reasoning is opt-in per query. Its one `sd:feature` is
+/// `sd:UnionDefaultGraph`, claimed when `union_default_graph` says a query
+/// that names no dataset reads the union of the named graphs (a ledger's
+/// `f:unionDefaultGraph`); Fluree has no empty named graph to claim
+/// `sd:EmptyGraphs` for.
+pub fn sparql_service_description(
+    endpoint: &str,
+    union_default_graph: bool,
+    config: &FormatterConfig,
+) -> Result<String> {
     let service = Term::blank("service");
     let sd = |local: &str| Term::iri(format!("{SD}{local}"));
     let mut graph = Graph::new();
@@ -65,6 +71,9 @@ pub fn sparql_service_description(endpoint: &str, config: &FormatterConfig) -> R
             sd("resultFormat"),
             Term::iri(format!("{FORMATS}{format}")),
         );
+    }
+    if union_default_graph {
+        graph.add_triple(service.clone(), sd("feature"), sd("UnionDefaultGraph"));
     }
     graph.add_triple(
         service,
@@ -104,7 +113,8 @@ mod tests {
     #[test]
     fn describes_the_endpoint_in_every_graph_format() {
         let endpoint = "http://example.test/v1/fluree/query/db:main";
-        let nt = sparql_service_description(endpoint, &FormatterConfig::ntriples()).unwrap();
+        let nt = sparql_service_description(endpoint, false, &FormatterConfig::ntriples()).unwrap();
+        assert!(!nt.contains(&format!("<{SD}feature>")), "{nt}");
         for line in [
             format!("<{SD}endpoint> <{endpoint}> ."),
             format!("<{SD}supportedLanguage> <{SD}SPARQLQuery> ."),
@@ -118,8 +128,16 @@ mod tests {
             FormatterConfig::turtle(),
             FormatterConfig::rdf_xml(),
         ] {
-            let doc = sparql_service_description(endpoint, &config).unwrap();
+            let doc = sparql_service_description(endpoint, false, &config).unwrap();
             assert!(doc.contains(endpoint), "{:?}\n{doc}", config.format);
         }
+    }
+
+    #[test]
+    fn claims_the_union_default_graph_feature_when_asked() {
+        let endpoint = "http://example.test/v1/fluree/query/db:main";
+        let nt = sparql_service_description(endpoint, true, &FormatterConfig::ntriples()).unwrap();
+        let line = format!("<{SD}feature> <{SD}UnionDefaultGraph> .");
+        assert!(nt.lines().any(|l| l.ends_with(&line)), "{nt}");
     }
 }

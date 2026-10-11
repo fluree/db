@@ -756,6 +756,17 @@ fn writeback(file: &File, fsyncs: &AtomicU64) -> io::Result<()> {
     Ok(())
 }
 
+/// Open a written file to hand it to the drive. Windows flushes a file only
+/// through a handle with write access (`FlushFileBuffers`); a Unix
+/// descriptor flushes either way.
+fn open_to_flush(path: &Path) -> io::Result<File> {
+    if cfg!(windows) {
+        std::fs::OpenOptions::new().write(true).open(path)
+    } else {
+        File::open(path)
+    }
+}
+
 /// The Linux batch commit: flush the filesystem holding `base` and wait.
 #[cfg(target_os = "linux")]
 fn syncfs(base: &Path, fsyncs: &AtomicU64) -> io::Result<()> {
@@ -787,7 +798,7 @@ pub(super) fn flush_keys(base: &Path, keys: &[String], fsyncs: &AtomicU64) -> io
     let mut any_file = false;
     for key in unique {
         let path = base.join(key);
-        match File::open(&path) {
+        match open_to_flush(&path) {
             Ok(file) => {
                 writeback(&file, fsyncs)?;
                 barrier = Some(file);
@@ -850,7 +861,8 @@ fn write_page_cache(path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
-fn read_opt(path: &Path) -> io::Result<Option<Vec<u8>>> {
+/// Reads `path`. A missing or empty file reads as `None`.
+pub(super) fn read_opt(path: &Path) -> io::Result<Option<Vec<u8>>> {
     match std::fs::read(path) {
         Ok(bytes) if bytes.is_empty() => Ok(None),
         Ok(bytes) => Ok(Some(bytes)),
@@ -863,10 +875,18 @@ fn read_opt(path: &Path) -> io::Result<Option<Vec<u8>>> {
 /// write. Replay takes it too: a writer in per-write mode on the same root
 /// may be publishing the same head, and a replayed transition must not land
 /// on top of a newer one.
+///
+/// The lock is a separate `.lock` file because writes replace the data file by rename.
+/// A rename gives the data file a new inode, and a lock on the old inode would not cover it.
 pub(super) fn key_lock(path: &Path) -> io::Result<File> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    open_key_lock(path)
+}
+
+/// Takes the [`key_lock`] for `path` without creating its parent directory.
+pub(super) fn open_key_lock(path: &Path) -> io::Result<File> {
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -2321,8 +2341,9 @@ mod tests {
         }
         let before = log.fsyncs_issued();
         let oversized = vec![b'x'; MAX_RECORD_BYTES + 1];
+        let published = oversized.clone();
         storage
-            .compare_and_swap(head, |_| Ok(CasAction::Write::<()>(oversized.clone())))
+            .compare_and_swap(head, move |_| Ok(CasAction::Write::<()>(published.clone())))
             .await
             .unwrap();
         assert!(

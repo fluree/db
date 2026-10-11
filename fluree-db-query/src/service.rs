@@ -157,7 +157,7 @@ impl ServiceOperator {
         endpoint_iri: &str,
     ) -> Result<()> {
         // Look up the ledger in the dataset
-        let graph_ref = if let Some(ds) = &ctx.dataset {
+        let graph_ref = if let Some(ds) = ctx.explicit_dataset() {
             ds.find_by_ledger_id(full_ledger_ref)
         } else {
             // No dataset - check if alias matches the current db
@@ -620,7 +620,7 @@ impl Operator for ServiceOperator {
                             // Binding exists but not a string - skip silently
                         } else {
                             // Variable unbound - iterate all ledgers in dataset
-                            if let Some(ds) = &ctx.dataset {
+                            if let Some(ds) = ctx.explicit_dataset() {
                                 // Iterate all ledgers in dataset
                                 let ledger_ides: Vec<Arc<str>> = ds
                                     .named_graphs_iter()

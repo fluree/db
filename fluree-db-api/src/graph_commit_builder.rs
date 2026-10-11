@@ -270,7 +270,7 @@ impl<'a, 'g> CommitBuilder<'a, 'g> {
         let content_store = self.graph.fluree.content_store(&self.graph.ledger_id);
         let blob = content_store.get(&commit_id).await.map_err(|e| {
             if matches!(e, fluree_db_core::error::Error::NotFound(_)) {
-                ApiError::NotFound(format!("Commit {commit_id} not found"))
+                ApiError::CommitNotFound(format!("Commit {commit_id} not found"))
             } else {
                 ApiError::internal(format!(
                     "Failed to read commit {commit_id} from storage: {e}"

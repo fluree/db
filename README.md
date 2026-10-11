@@ -340,3 +340,9 @@ The published docs are available as LLM-readable text following the [`llms.txt`]
 
 Licensed under the [Business Source License 1.1](LICENSE), with a Change Date
 to Apache License 2.0 as specified in that file.
+
+In short: you may use Fluree in production for anything except offering
+Fluree itself to others as a hosted or managed database. Building your own
+applications and data products on Fluree is permitted, including publishing a
+dataset you curate with a public, read-only query endpoint. See the
+[License FAQ](docs/reference/license-faq.md) for details.
