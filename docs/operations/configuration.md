@@ -503,7 +503,7 @@ Index garbage-collection retention (see [Index Retention](../indexing-and-search
 | Flag                         | Env Var                           | Default | Description                                     |
 | ---------------------------- | --------------------------------- | ------- | ----------------------------------------------- |
 | `--gc-max-old-indexes`       | `FLUREE_GC_MAX_OLD_INDEXES`       | `5`     | Old index versions to retain before GC |
-| `--gc-min-time-mins`         | `FLUREE_GC_MIN_TIME_MINS`         | `30`    | Minimum age (minutes) before an index version can be collected. Protects queries that started against an older version. ANDed with the count, so the slower of the two wins |
+| `--gc-min-time-mins`         | `FLUREE_GC_MIN_TIME_MINS`         | `15`    | Minimum age (minutes) before an index version can be collected. Protects queries that started against an older version, so keep it above your longest query: `query_timeout_ms` defaults to 15 minutes, and with it set to `0` nothing bounds a query. ANDed with the count, so the slower of the two wins |
 | `--gc-hard-max-old-indexes`  | `FLUREE_GC_HARD_MAX_OLD_INDEXES`  | unset   | Version ceiling past which the age guard is overridden and versions are collected regardless of age. Bounds retained versions, not bytes; past it GC can release artifacts a still-running query needs, so set it well above the versions published during your longest query |
 
 Config file equivalent:
@@ -514,7 +514,7 @@ enabled = true
 reindex_min_bytes = 100            # ≈ every commit — soft trigger
 # reindex_max_bytes = 536870912    # 512 MB — defaults to 20% of system RAM if omitted
 # gc_max_old_indexes = 5
-# gc_min_time_mins = 30
+# gc_min_time_mins = 15
 # gc_hard_max_old_indexes = 40     # unset by default: the age guard is never overridden
 ```
 
@@ -1010,7 +1010,7 @@ fluree server run \
 | `FLUREE_REINDEX_MIN_BYTES`              | Soft reindex threshold (bytes)                  | `100`                                                                   |
 | `FLUREE_REINDEX_MAX_BYTES`              | Hard reindex threshold (bytes)                  | 20% of system RAM (256 MB fallback)                                      |
 | `FLUREE_GC_MAX_OLD_INDEXES`             | Old index versions to retain before GC          | `5`                                                                     |
-| `FLUREE_GC_MIN_TIME_MINS`               | Minimum age (minutes) before an index version can be collected; protects queries that started against an older version | `30`                              |
+| `FLUREE_GC_MIN_TIME_MINS`               | Minimum age (minutes) before an index version can be collected; protects queries that started against an older version | `15`                              |
 | `FLUREE_GC_HARD_MAX_OLD_INDEXES`        | Version ceiling past which the age guard is overridden. Bounds versions, not bytes; past it GC can release artifacts a still-running query needs — see [Index Retention](../indexing-and-search/background-indexing.md#index-retention) | Unset (no ceiling) |
 | `FLUREE_DICT_COMPACTION`                | Merge forward dictionary packs during incremental index builds. Off (`0`/`false`/`off`/`no`) appends packs without ever merging them, so a dictionary's object and mapping count grows once per build forever — see [Forward pack compaction](../design/index-format.md#forward-pack-compaction). Read once per process. | `true` |
 | `FLUREE_CACHE_MAX_MB`                   | Global in-memory cache budget (MB)              | Tiered by RAM: `<4GB: 30%, 4-8GB: 40%, >=8GB: 35%`                                                     |
@@ -1129,7 +1129,8 @@ Register remote connections on the `FlureeBuilder`:
 let fluree = FlureeBuilder::file("./data")
     .remote_connection("acme", "https://acme-fluree.example.com", Some(token))
     .remote_connection("partner", "https://partner.example.com", None)
-    .build()?;
+    .build_async()
+    .await?;
 ```
 
 Each call registers a named connection. The name is used in SPARQL queries:
@@ -1203,6 +1204,7 @@ environment-only.
 | `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS` | unset (none) | Comma-separated names of environment variables that an `iceberg/map`, browse or preview request may name as its catalog secret (`auth_bearer_env`, `oauth2_client_secret_env`). A request naming any other variable is refused. The request also chooses where the secret is sent, so list only variables that hold catalog credentials. Does not apply to a local CLI, which reads its own environment. See [Iceberg graph sources](../graph-sources/iceberg.md#stored-configuration-format-nameservice). |
 | `FLUREE_ICEBERG_LOADTABLE_CACHE` | on | Master switch for all REST catalog caching. Set to `0`/`false`/`off` to build a fresh catalog client and reload the table on **every** scan (restores a per-scan OAuth exchange + `loadTable` round-trip). Disables the client/OAuth reuse, the cross-query `loadTable` cache, and the per-query snapshot pin. **Materialize refusal:** because disabling the cache also disables the per-query snapshot pin, `fluree materialize` **refuses to build** a twin while this is off (the twin's stamped watermark could not be guaranteed to describe its contents) — re-enable the cache to materialize. |
 | `FLUREE_ICEBERG_LOADTABLE_TTL_SECS` | `60` | TTL (seconds) for the **cross-query** `loadTable`-response cache. A REST `loadTable` GET against a catalog such as Snowflake Horizon costs ~1.3–3 s, so caching it lets a burst of queries against the same table skip the round-trip. The TTL bounds how stale a snapshot a *new* query may observe; `0` disables the cross-query layer (leaving only the per-query pin). Every cache read is additionally gated on vended-credential expiry (30 s buffer), so a long TTL never hands out about-to-expire credentials. |
+| `FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS` | `300` | TTL (seconds) for the **persisted** `loadTable` pointer: a table's current `metadata_location`, kept in the on-disk catalog cache so a restarted process can resolve the table without a catalog round-trip. Within the TTL a query reads that location without asking the catalog (see the freshness note below). `0` disables pointer persistence. |
 | `FLUREE_ICEBERG_REST_CLIENT_TTL_SECS` | `900` | TTL (seconds) for the process-wide REST **catalog-client** cache (the reused OAuth token + HTTPS pool). The cache is keyed by a fingerprint of the raw config JSON, which does **not** change when a secret referenced by env var / secret store is rotated; this TTL bounds how long a rotated secret stays stale before the client is rebuilt and re-authenticated. `0` rebuilds the client every query (restoring a per-query OAuth exchange). The same TTL bounds the shared handle of a [Delta table](../graph-sources/delta.md#performance): its remembered log state, and, for a table named in Unity Catalog, where the name points. |
 | `FLUREE_R2RML_SCAN_CACHE` | on | Toggles the correlated-join inner-scan cache, which reuses a materialized inner (dimension) table across a join's child batches instead of re-scanning it per batch. Set to `0`/`false`/`off` to restore per-child-batch re-scans. |
 | `FLUREE_R2RML_LIMIT_PUSHDOWN` | on | Toggles pushing a query's `LIMIT` into the R2RML scan as a row budget, so a scan stops after enough output rows instead of draining the table. Set to `0`/`false`/`off` to always scan fully. |
@@ -1226,9 +1228,14 @@ environment-only.
 **Caching model.** Catalog access is cached at two scopes. Within a single query,
 the first scan of a table pins its `metadata_location`, so every scan in that
 query reads one consistent Iceberg snapshot even if the table commits mid-query.
-Across queries, a process-wide cache reuses the REST client (so its OAuth token —
-valid ~1 h — and HTTPS connection pool survive) and the `loadTable` response
-(bounded by `FLUREE_ICEBERG_LOADTABLE_TTL_SECS`). On a warm server this means the
+Across queries, a process-wide cache reuses the catalog client (REST, AWS Glue or
+S3 Tables, so a REST OAuth token — valid ~1 h — and every HTTPS connection pool
+survive) and the `loadTable` response (bounded by
+`FLUREE_ICEBERG_LOADTABLE_TTL_SECS`); the on-disk catalog cache keeps the table's
+metadata location across restarts (bounded by
+`FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS`). Both are keyed by the source's config,
+so a source re-created under the same name with another catalog never reuses the
+old one's entries. On a warm server this means the
 second and later queries against a table typically skip both the OAuth exchange
 and the `loadTable` GET entirely. The cross-query cache always records the
 catalog's current state, never a query's pinned snapshot, so pin preservation
@@ -1240,11 +1247,18 @@ picked up only when the client cache entry expires
 (`FLUREE_ICEBERG_REST_CLIENT_TTL_SECS`, default 15 min) — until then the reused
 client keeps presenting the old credential.
 
-**Freshness vs. latency.** The only knob with a data-freshness tradeoff is
-`FLUREE_ICEBERG_LOADTABLE_TTL_SECS`: a new query may read a snapshot up to that
-many seconds old. This is well within typical warehouse ETL latency; lower it (or
-set `0`) if you need each query to always resolve the newest snapshot, at the cost
-of paying the `loadTable` GET per query.
+**Freshness vs. latency.** Two knobs trade freshness for latency:
+`FLUREE_ICEBERG_LOADTABLE_TTL_SECS` (in memory, default 60 s) and
+`FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS` (on disk, default 300 s). A new query may
+read a snapshot as old as the longer of the two, and within them it does not ask
+the catalog at all: a table dropped, or catalog access revoked, is noticed only
+when the window passes. A REST catalog that vends credentials is asked again
+sooner: past the in-memory window, a query that must read data files asks it for
+fresh credentials. AWS Glue and S3 Tables vend none, so they are not asked for the
+whole disk window. Object-store access is still authorized on every read. These windows are
+well within typical warehouse ETL latency; lower them (or set `0`) if each query
+must resolve the newest snapshot and the catalog's current permissions, at the
+cost of a catalog call per query.
 
 ## Related Documentation
 

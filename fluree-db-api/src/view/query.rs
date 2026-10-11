@@ -4,9 +4,10 @@
 //! a GraphDb, respecting policy and reasoning wrappers.
 
 use crate::query::helpers::{
-    build_query_result, charge_query_floor, lower_sparql_ast, parse_and_validate_sparql,
-    parse_cypher_to_ir, parse_jsonld_query, prepare_for_execution, sparql_ast_has_dataset,
-    status_for_query_error, tracked_query_tracker, tracker_for_limits,
+    build_query_result, charge_query_floor, input_fuel_limit, limits_tracker, lower_sparql_ast,
+    parse_and_validate_sparql, parse_cypher_to_ir, parse_jsonld_query, prepare_for_execution,
+    sparql_ast_has_dataset, status_for_query_error, tracked_query_tracker,
+    tracker_for_input_limits,
 };
 use crate::view::{DataSetDb, GraphDb, QueryInput};
 use crate::{
@@ -340,8 +341,9 @@ impl Fluree {
         // #1473: parse SPARQL once. The AST is reused for FROM-clause resolution
         // and IR lowering below, instead of re-lexing the string 2–3×.
         let parse_start = fluree_db_core::clock::Instant::now();
+        let params = options.sparql_params(&input)?;
         let mut sparql_ast = match input {
-            QueryInput::Sparql(sparql) => Some(parse_and_validate_sparql(sparql)?),
+            QueryInput::Sparql(sparql) => Some(parse_and_validate_sparql(sparql, params)?),
             QueryInput::JsonLd(_) => None,
         };
 
@@ -370,10 +372,8 @@ impl Fluree {
         // 0. Tracker for fuel limits only (no tracking overhead for non-tracked
         // calls). Charge the floor up front so a sub-floor `max-fuel` is
         // rejected before we spend parse/plan work; no-op when fuel isn't tracked.
-        let tracker = match &input {
-            QueryInput::JsonLd(json) => tracker_for_limits(json),
-            QueryInput::Sparql(_) => Tracker::disabled(),
-        };
+        let fuel_limit = input_fuel_limit(&input, sparql_ast.as_ref());
+        let tracker = limits_tracker(fuel_limit);
         charge_query_floor(&tracker).map_err(fluree_db_query::QueryError::from)?;
 
         // 1. Lower to common IR (SPARQL reuses the AST parsed above).
@@ -417,10 +417,7 @@ impl Fluree {
             let _guard = residency_cs.as_ref().and_then(|cs| cs.query_guard());
             let mut budget = fluree_db_binary_index::read::need_fetch::RetryBudget::default();
             loop {
-                let round_tracker = match &input {
-                    QueryInput::JsonLd(json) => tracker_for_limits(json),
-                    QueryInput::Sparql(_) => Tracker::disabled(),
-                };
+                let round_tracker = limits_tracker(fuel_limit);
                 charge_query_floor(&round_tracker).map_err(fluree_db_query::QueryError::from)?;
                 let round = self
                     .plan_and_execute_round(db, &vars, &parsed, &round_tracker, &options)
@@ -515,6 +512,21 @@ impl Fluree {
         params: Option<&fluree_db_cypher::ParamMap>,
         options: &QueryExecutionOptions,
     ) -> Result<QueryResult> {
+        self.query_cypher_with_tracker(db, cypher, params, options, &Tracker::disabled())
+            .await
+    }
+
+    /// [`Self::query_cypher_with_options`], charging `tracker` — the fuel
+    /// limit it carries stops the query, and its tally reports what the query
+    /// cost.
+    pub async fn query_cypher_with_tracker(
+        &self,
+        db: &GraphDb,
+        cypher: &str,
+        params: Option<&fluree_db_cypher::ParamMap>,
+        options: &QueryExecutionOptions,
+        tracker: &Tracker,
+    ) -> Result<QueryResult> {
         let parse_start = fluree_db_core::clock::Instant::now();
         let (vars, mut parsed) = parse_cypher_to_ir(
             cypher,
@@ -529,7 +541,7 @@ impl Fluree {
         maybe_wrap_for_graph_source(db, &mut parsed);
         guard_graph_source_patterns(db, &parsed, QuerySyntax::Cypher)?;
 
-        self.execute_cypher_ir(db, vars, parsed, parse_ms, options.server_identity.as_ref())
+        self.execute_cypher_ir(db, vars, parsed, parse_ms, options, tracker)
             .await
     }
 
@@ -540,6 +552,17 @@ impl Fluree {
         &self,
         db: &GraphDb,
         ast: &fluree_db_cypher::CypherAst,
+    ) -> Result<QueryResult> {
+        self.query_cypher_ast_tracked(db, ast, None).await
+    }
+
+    /// [`Self::query_cypher_ast`], charging `tracker`: a Cypher write's reads
+    /// count against its fuel limit.
+    pub(crate) async fn query_cypher_ast_tracked(
+        &self,
+        db: &GraphDb,
+        ast: &fluree_db_cypher::CypherAst,
+        tracker: Option<&Tracker>,
     ) -> Result<QueryResult> {
         let (vars, mut parsed) = crate::query::helpers::lower_cypher_ast_to_ir(
             ast,
@@ -552,7 +575,16 @@ impl Fluree {
         guard_graph_source_patterns(db, &parsed, QuerySyntax::Cypher)?;
         // Code-built probe ASTs carry no query-time reasoning or datalog
         // overrides, so override control has nothing to gate: anonymous.
-        self.execute_cypher_ir(db, vars, parsed, 0.0, None).await
+        let disabled = Tracker::disabled();
+        self.execute_cypher_ir(
+            db,
+            vars,
+            parsed,
+            0.0,
+            &QueryExecutionOptions::default(),
+            tracker.unwrap_or(&disabled),
+        )
+        .await
     }
 
     /// Execute a constructed Cypher read AST whose leading `InlineRows`
@@ -569,6 +601,7 @@ impl Fluree {
         ast: &fluree_db_cypher::CypherAst,
         seed_cols: &[String],
         rows: Vec<Vec<fluree_db_query::Binding>>,
+        tracker: Option<&Tracker>,
     ) -> Result<QueryResult> {
         let (vars, mut parsed) = crate::query::helpers::lower_cypher_ast_to_ir(
             ast,
@@ -618,7 +651,16 @@ impl Fluree {
         guard_graph_source_patterns(db, &parsed, QuerySyntax::Cypher)?;
         // Code-built probe ASTs carry no query-time reasoning or datalog
         // overrides, so override control has nothing to gate: anonymous.
-        self.execute_cypher_ir(db, vars, parsed, 0.0, None).await
+        let disabled = Tracker::disabled();
+        self.execute_cypher_ir(
+            db,
+            vars,
+            parsed,
+            0.0,
+            &QueryExecutionOptions::default(),
+            tracker.unwrap_or(&disabled),
+        )
+        .await
     }
 
     async fn execute_cypher_ir(
@@ -627,19 +669,18 @@ impl Fluree {
         vars: crate::VarRegistry,
         parsed: fluree_db_query::ir::Query,
         parse_ms: f64,
-        server_identity: Option<&VerifiedIdentity>,
+        options: &QueryExecutionOptions,
+        tracker: &Tracker,
     ) -> Result<QueryResult> {
         let plan_start = fluree_db_core::clock::Instant::now();
         let executable = self
-            .build_executable_for_view(db, &parsed, server_identity)
+            .build_executable_for_view(db, &parsed, options.server_identity.as_ref())
             .await?;
         let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 
-        let tracker = Tracker::disabled();
-        let options = QueryExecutionOptions::default();
         let exec_start = fluree_db_core::clock::Instant::now();
         let batches = self
-            .execute_view_internal(db, &vars, &executable, &tracker, &options)
+            .execute_view_internal(db, &vars, &executable, tracker, options)
             .await?;
         let exec_ms = exec_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -681,9 +722,10 @@ impl Fluree {
         // connection/spawn contexts), so a dataset clause is rejected here rather
         // than silently ignored; plain within-ledger datasets are handled by
         // `query_with_options`. Otherwise the AST is reused for lowering.
+        let params = options.sparql_params(&input)?;
         let mut sparql_ast = match input {
             QueryInput::Sparql(sparql) => {
-                let ast = parse_and_validate_sparql(sparql)?;
+                let ast = parse_and_validate_sparql(sparql, params)?;
                 if sparql_ast_has_dataset(&ast) {
                     return Err(single_ledger_dataset_clause_error());
                 }
@@ -694,10 +736,7 @@ impl Fluree {
 
         // 0. Tracker (fuel limits only). Charge the floor up front so a
         // sub-floor `max-fuel` is rejected before parse/plan; no-op untracked.
-        let tracker = match &input {
-            QueryInput::JsonLd(json) => tracker_for_limits(json),
-            QueryInput::Sparql(_) => Tracker::disabled(),
-        };
+        let tracker = tracker_for_input_limits(&input, sparql_ast.as_ref());
         charge_query_floor(&tracker).map_err(fluree_db_query::QueryError::from)?;
 
         // 1. Lower to common IR (SPARQL reuses the AST parsed above).
@@ -780,11 +819,23 @@ impl Fluree {
 
     /// Explain a SPARQL query plan against a GraphDb.
     pub async fn explain_sparql(&self, db: &GraphDb, sparql: &str) -> Result<JsonValue> {
+        self.explain_sparql_with_params(db, sparql, None).await
+    }
+
+    /// [`Self::explain_sparql`] with parameters substituted, as
+    /// [`QueryExecutionOptions::with_params`] would run the query.
+    pub async fn explain_sparql_with_params(
+        &self,
+        db: &GraphDb,
+        sparql: &str,
+        params: Option<&fluree_db_sparql::ParamMap>,
+    ) -> Result<JsonValue> {
         let db = self.prepare_explain_view(db).await?;
         crate::explain::explain_sparql_for_view(
             &db.snapshot,
             sparql,
             db.default_context.as_ref(),
+            params,
             db.is_root(),
         )
         .map(|result| explain_policy_notice(result, &db))
@@ -833,12 +884,24 @@ impl Fluree {
         // already-parsed AST) before charging the floor (the dataset method
         // charges it) so fuel is accounted exactly once. `Err` = cross-ledger
         // clause IRI.
+        let params = match options.sparql_params(&input) {
+            Ok(params) => params,
+            Err(e) => {
+                let tracker = tracked_query_tracker(&input, &tracking_override, None);
+                let _ = charge_query_floor(&tracker);
+                return Err(crate::query::TrackedErrorResponse::new(
+                    400,
+                    e.to_string(),
+                    tracker.tally(),
+                ));
+            }
+        };
         let mut sparql_ast = None;
         if let QueryInput::Sparql(sparql) = input {
-            let ast = match parse_and_validate_sparql(sparql) {
+            let ast = match parse_and_validate_sparql(sparql, params) {
                 Ok(ast) => ast,
                 Err(e) => {
-                    let tracker = tracked_query_tracker(&input, &tracking_override);
+                    let tracker = tracked_query_tracker(&input, &tracking_override, None);
                     let _ = charge_query_floor(&tracker);
                     return Err(crate::query::TrackedErrorResponse::new(
                         400,
@@ -866,7 +929,7 @@ impl Fluree {
                 }
                 Ok(None) => sparql_ast = Some(ast),
                 Err(e) => {
-                    let tracker = tracked_query_tracker(&input, &tracking_override);
+                    let tracker = tracked_query_tracker(&input, &tracking_override, Some(&ast));
                     let _ = charge_query_floor(&tracker);
                     return Err(crate::query::TrackedErrorResponse::new(
                         400,
@@ -878,7 +941,7 @@ impl Fluree {
         }
 
         // Tracker: caller-provided options if given, else per-input defaults.
-        let tracker = tracked_query_tracker(&input, &tracking_override);
+        let tracker = tracked_query_tracker(&input, &tracking_override, sparql_ast.as_ref());
 
         // Charge the one-time query floor before parsing so a parse/plan error
         // still reports it and a sub-floor max-fuel is rejected up front.
@@ -999,10 +1062,23 @@ impl Fluree {
         // FROM/FROM NAMED is unsupported (the R2RML dataset path is non-`Send`;
         // this runs from `Send` contexts), so a resolved clause is rejected
         // rather than silently ignored. Otherwise the AST is reused for lowering.
+        let params = match options.sparql_params(&input) {
+            Ok(params) => params,
+            Err(e) => {
+                let tracker = tracked_query_tracker(&input, &tracking_override, None);
+                let _ = charge_query_floor(&tracker);
+                return Err(crate::query::TrackedErrorResponse::new(
+                    400,
+                    e.to_string(),
+                    tracker.tally(),
+                ));
+            }
+        };
         let mut sparql_ast = None;
         if let QueryInput::Sparql(sparql) = input {
-            let tracker = tracked_query_tracker(&input, &tracking_override);
-            let ast = match parse_and_validate_sparql(sparql) {
+            let parsed = parse_and_validate_sparql(sparql, params);
+            let tracker = tracked_query_tracker(&input, &tracking_override, parsed.as_ref().ok());
+            let ast = match parsed {
                 Ok(ast) => ast,
                 Err(e) => {
                     let _ = charge_query_floor(&tracker);
@@ -1034,7 +1110,7 @@ impl Fluree {
             }
         }
 
-        let tracker = tracked_query_tracker(&input, &tracking_override);
+        let tracker = tracked_query_tracker(&input, &tracking_override, sparql_ast.as_ref());
 
         // Charge the one-time query floor before parsing (see `query_tracked`).
         charge_query_floor(&tracker)
@@ -1117,6 +1193,23 @@ impl Fluree {
         ))
     }
 
+    /// The dataset a SPARQL query's `FROM` / `FROM NAMED` clauses name within
+    /// `db`'s ledger, resolved as [`Self::query`] resolves them, for an entry
+    /// that takes a [`DataSetDb`] such as
+    /// [`Self::plan_stream_query_dataset_with_options`]. Each graph keeps
+    /// `db`'s policy.
+    ///
+    /// `None` when the query names no dataset; an error when a clause names a
+    /// graph outside this ledger.
+    pub fn sparql_dataset_within_ledger(
+        &self,
+        db: &GraphDb,
+        sparql: &str,
+    ) -> Result<Option<DataSetDb>> {
+        let ast = parse_and_validate_sparql(sparql, None)?;
+        self.build_within_ledger_dataset_from_ast(db, &ast)
+    }
+
     // ========================================================================
     // Internal Helpers
     // ========================================================================
@@ -1151,7 +1244,7 @@ impl Fluree {
         // Prefix-expanded, BASE-resolved FROM / FROM NAMED IRIs (shared
         // resolution with constant IRIs; shipped by pr-base).
         let Some(clause) = fluree_db_sparql::resolve_dataset_clause(ast)
-            .map_err(|e| ApiError::query(e.to_string()))?
+            .map_err(|e| ApiError::invalid_query(e.to_string()))?
         else {
             return Ok(None);
         };
@@ -1196,7 +1289,8 @@ impl Fluree {
     ///
     /// - the ledger alias → the default graph (g_id 0), mirroring
     ///   `ExecutionContext::single_db_user_graph_id`, which reserves the alias
-    ///   for the default graph;
+    ///   for the default graph; `urn:default`, the name ledger info lists it
+    ///   under, likewise;
     /// - a registered named-graph IRI → that graph's g_id;
     /// - this ledger's own reserved-graph IRI, written out in full → that
     ///   reserved graph.
@@ -1261,7 +1355,10 @@ impl Fluree {
         use crate::dataset::GraphSelector;
         use fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID;
 
-        if iri == db.snapshot.ledger_id.as_str() || iri == db.ledger_id.as_ref() {
+        if iri == db.snapshot.ledger_id.as_str()
+            || iri == db.ledger_id.as_ref()
+            || iri == fluree_db_core::DEFAULT_GRAPH_IRI
+        {
             return Ok(Some(Self::apply_graph_selector(
                 db.clone(),
                 &GraphSelector::Default,
@@ -1325,7 +1422,7 @@ impl Fluree {
     /// [`build_within_ledger_dataset_from_ast`](Self::build_within_ledger_dataset_from_ast)
     /// and only reject cross-ledger clause IRIs.
     pub(crate) fn validate_sparql_for_view(&self, sparql: &str) -> Result<()> {
-        let ast = parse_and_validate_sparql(sparql)?;
+        let ast = parse_and_validate_sparql(sparql, None)?;
         if sparql_ast_has_dataset(&ast) {
             return Err(single_ledger_dataset_clause_error());
         }
@@ -1392,8 +1489,16 @@ impl Fluree {
         // Start with the standard executable
         let mut executable = prepare_for_execution(parsed);
 
-        self.apply_reasoning_to_executable(db, &mut executable, !db.is_root(), server_identity)
+        let db = self
+            .apply_reasoning_to_executable(db, &mut executable, !db.is_root(), server_identity)
             .await?;
+
+        // Settle the union default graph here, beside the other config
+        // defaults: execution reads only the settled switch.
+        executable.query.union_default_graph = Some(
+            self.reads_union_default_graph(&db, parsed.union_default_graph)
+                .await?,
+        );
 
         Ok(executable)
     }
@@ -1412,7 +1517,9 @@ impl Fluree {
     ///
     /// Config defaults are completed here rather than taken from the view as
     /// received: a view arrives fully prepared, config-attached but
-    /// wrapper-less, or bare, depending on which entry point built it.
+    /// wrapper-less, or bare, depending on which entry point built it. The
+    /// completed view is returned, so the caller reads any further config
+    /// setting off it without resolving the config again.
     ///
     /// `strip_query_rules` is true when a non-root view policy applies —
     /// `!db.is_root()` for a single view, `dataset.any_non_root_policy()`
@@ -1424,8 +1531,9 @@ impl Fluree {
         executable: &mut ExecutableQuery,
         strip_query_rules: bool,
         server_identity: Option<&VerifiedIdentity>,
-    ) -> Result<()> {
-        let db = &self.complete_config_defaults(db, server_identity).await?;
+    ) -> Result<GraphDb> {
+        let completed = self.complete_config_defaults(db, server_identity).await?;
+        let db = &completed;
 
         // Apply wrapper reasoning if applicable
         if db.reasoning().is_some() {
@@ -1523,7 +1631,7 @@ impl Fluree {
         // Resolve `f:schemaSource` + `owl:imports` closure, if configured.
         self.attach_schema_bundle(db, executable, &mut ctx).await?;
 
-        Ok(())
+        Ok(completed)
     }
 
     /// If the resolved datalog config carries a cross-ledger
@@ -1774,18 +1882,24 @@ impl Fluree {
         options: &QueryExecutionOptions,
     ) -> Result<Vec<crate::Batch>> {
         let db_ref = db.as_graph_db_ref();
+        let union = super::union_default_dataset(db, executable);
         // Single-graph view: no dataset-level history detection — current state.
         // Single ledger + root policy ⇒ semantic stats rewrites (redundant
         // `rdf:type` elision) are sound; a non-root enforcer hides rows and must
-        // not allow it.
-        let allow_semantic_elision = db.policy_enforcer().is_none_or(|p| p.is_root());
-        let prepare_config = PrepareConfig::current_with_semantic_elision(
+        // not allow it, and a union default graph reads past the default
+        // graph's stats.
+        let allow_semantic_elision =
+            union.is_none() && db.policy_enforcer().is_none_or(|p| p.is_root());
+        let mut prepare_config = PrepareConfig::current_with_semantic_elision(
             db.binary_store.as_ref(),
             allow_semantic_elision,
         );
+        prepare_config.planning = prepare_config
+            .planning
+            .with_multi_default_graph(union.is_some());
         let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config)
             .await
-            .map_err(query_error_to_api_error)?;
+            .map_err(|e| query_error_to_api_error(e.name_variables(vars)))?;
 
         // A time-pinned graph-source view reads that table state, never current.
         crate::graph_source::pin_graph_source_times([db], r2rml.table_provider)
@@ -1800,6 +1914,7 @@ impl Fluree {
             options,
             Some((r2rml.provider, r2rml.table_provider)),
         );
+        config.dataset = union.as_ref();
 
         execute_prepared(db_ref, vars, prepared, config)
             .await
@@ -1847,14 +1962,22 @@ impl Fluree {
         tracker.record_policy_enforcement(db.policy_enforcement());
 
         let db_ref = db.as_graph_db_ref();
+        let union = super::union_default_dataset(db, executable);
         // Single-graph view: no dataset-level history detection — current state.
-        // Single ledger + root policy ⇒ semantic stats rewrites are sound.
-        let allow_semantic_elision = db.policy_enforcer().is_none_or(|p| p.is_root());
-        let prepare_config = PrepareConfig::current_with_semantic_elision(
+        // Single ledger + root policy ⇒ semantic stats rewrites are sound,
+        // unless a union default graph reads past the default graph's stats.
+        let allow_semantic_elision =
+            union.is_none() && db.policy_enforcer().is_none_or(|p| p.is_root());
+        let mut prepare_config = PrepareConfig::current_with_semantic_elision(
             db.binary_store.as_ref(),
             allow_semantic_elision,
         );
-        let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config).await?;
+        prepare_config.planning = prepare_config
+            .planning
+            .with_multi_default_graph(union.is_some());
+        let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config)
+            .await
+            .map_err(|e| e.name_variables(vars))?;
 
         crate::graph_source::pin_graph_source_times([db], r2rml.table_provider)?;
 
@@ -1867,6 +1990,7 @@ impl Fluree {
             options,
             Some((r2rml.provider, r2rml.table_provider)),
         );
+        config.dataset = union.as_ref();
 
         execute_prepared(db_ref, vars, prepared, config).await
     }
@@ -1906,7 +2030,7 @@ fn query_error_to_status(err: &fluree_db_query::QueryError) -> u16 {
 /// (streaming views, R2RML-provider queries). One definition so the message
 /// cannot drift between its call sites.
 fn single_ledger_dataset_clause_error() -> ApiError {
-    ApiError::query(
+    ApiError::invalid_query(
         "SPARQL FROM/FROM NAMED clauses are not supported on a single-ledger GraphDb. \
          Use query_connection_sparql for multi-ledger queries.",
     )
@@ -1916,7 +2040,7 @@ fn single_ledger_dataset_clause_error() -> ApiError {
 /// this ledger (or the `FROM..TO` history extension). The message mentions
 /// `FROM` so callers and tests can recognize the dataset-clause rejection.
 fn cross_ledger_dataset_error() -> ApiError {
-    ApiError::query(
+    ApiError::invalid_query(
         "SPARQL FROM/FROM NAMED references a graph that is not in this ledger. \
          A within-ledger dataset names this ledger's graphs (its default graph \
          via the ledger alias, or a registered named graph) — check the IRI \
@@ -1930,7 +2054,7 @@ fn cross_ledger_dataset_error() -> ApiError {
 /// a time range, not a cross-ledger graph — reusing the graph-membership
 /// message there would misdescribe the rejection.
 fn history_range_dataset_error() -> ApiError {
-    ApiError::query(
+    ApiError::invalid_query(
         "SPARQL `FROM <from> TO <to>` is the Fluree history-range extension, not \
          a within-ledger dataset clause; issue it through the connection/history \
          query path.",

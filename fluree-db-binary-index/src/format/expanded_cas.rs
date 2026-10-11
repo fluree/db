@@ -355,6 +355,10 @@ mod tests {
             self.inner.permits_plaintext_cache()
         }
 
+        fn is_remote(&self) -> bool {
+            self.inner.is_remote()
+        }
+
         async fn has(&self, id: &ContentId) -> Result<bool> {
             self.inner.has(id).await
         }

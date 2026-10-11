@@ -340,6 +340,10 @@ pub struct GeoSearchPattern {
 
     /// Variable to bind the distance in meters (optional)
     pub distance_var: Option<VarId>,
+
+    /// Variable to bind the matching point, as the `geo:wktLiteral` the
+    /// triple it replaces would bind (optional)
+    pub location_var: Option<VarId>,
 }
 
 /// Center point for geo search - can be constant or variable.
@@ -366,6 +370,7 @@ impl GeoSearchPattern {
             limit: None,
             subject_var,
             distance_var: None,
+            location_var: None,
         }
     }
 
@@ -381,13 +386,18 @@ impl GeoSearchPattern {
         self
     }
 
+    /// Set the variable bound to the matching point
+    pub fn with_location_var(mut self, var: VarId) -> Self {
+        self.location_var = Some(var);
+        self
+    }
+
     /// Variables this pattern adds to the row's binding set: the matching
-    /// subject IRI, plus the optional distance binding.
+    /// subject IRI, plus the optional distance and point bindings.
     pub fn produced_vars(&self) -> Vec<VarId> {
         let mut vars = vec![self.subject_var];
-        if let Some(v) = self.distance_var {
-            vars.push(v);
-        }
+        vars.extend(self.distance_var);
+        vars.extend(self.location_var);
         vars
     }
 

@@ -750,6 +750,9 @@ fn check_builtin_function_keyword(tokens: &TokenStream) -> Option<FunctionName> 
     if tokens.check_keyword(TokenKind::KwEuclideanDistance) {
         return Some(FunctionName::EuclideanDistance);
     }
+    if tokens.check_keyword(TokenKind::KwFulltext) {
+        return Some(FunctionName::Fulltext);
+    }
 
     None
 }
@@ -1287,5 +1290,25 @@ mod tests {
             }
             _ => panic!("Expected function call"),
         }
+    }
+
+    #[test]
+    fn fulltext_is_a_function_but_not_a_reserved_word() {
+        for input in ["fulltext(?text, \"rust\")", "FULL_TEXT(?text, \"rust\")"] {
+            match parse_expr_str(input).unwrap() {
+                Expression::FunctionCall { name, args, .. } => {
+                    assert_eq!(name, FunctionName::Fulltext);
+                    assert_eq!(args.len(), 2);
+                }
+                other => panic!("expected a function call, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            parse_expr_str("?fulltext").unwrap(),
+            Expression::Var(v) if v.name.as_ref() == "fulltext"
+        ));
+        let query = "PREFIX fulltext: <http://example.org/> \
+                     SELECT ?s WHERE { ?s fulltext:title ?fulltext }";
+        assert!(!crate::parse_sparql(query).has_errors());
     }
 }

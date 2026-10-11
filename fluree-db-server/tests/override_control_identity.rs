@@ -616,3 +616,85 @@ async fn unverified_identity_does_not_soften_shacl_posture() {
         "a fluree-identity header naming the allow-listed DID must not soften the posture",
     );
 }
+
+/// A violating SPARQL UPDATE that asks to soften the posture with
+/// `# PRAGMA validation-mode: warn` — the twin of `warn_mode_violating_insert`.
+async fn warn_mode_violating_sparql_update(
+    app: &axum::Router,
+    subject: &str,
+    pragmas: &str,
+    headers: &[(&str, String)],
+) -> (StatusCode, JsonValue) {
+    let update = format!(
+        "# PRAGMA validation-mode: warn\n{pragmas}\n\
+         PREFIX ex: <http://example.org/>\n\
+         INSERT DATA {{ {subject} a ex:Person }}"
+    );
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/fluree/update/{LEDGER}"))
+        .header("content-type", "application/sparql-update");
+    for (k, v) in headers {
+        req = req.header(*k, v.as_str());
+    }
+    let resp = app
+        .clone()
+        .oneshot(req.body(Body::from(update)).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: JsonValue = serde_json::from_slice(&bytes).unwrap_or(JsonValue::Null);
+    (status, json)
+}
+
+/// SPARQL twin of `allow_listed_bearer_may_soften_shacl_posture`.
+#[tokio::test]
+async fn allow_listed_bearer_may_soften_shacl_posture_via_sparql_pragma() {
+    let (_tmp, app) = seeded_app_with(DataAuthMode::Required, SHACL_CONFIG_TRIG).await;
+
+    let auth = (
+        "authorization",
+        format!("Bearer {}", bearer(Some(ADMIN), true)),
+    );
+    let (status, json) = warn_mode_violating_sparql_update(&app, "ex:nameless1", "", &[auth]).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the allow-listed verified identity may soften the posture: {json}"
+    );
+
+    let auth = (
+        "authorization",
+        format!("Bearer {}", bearer(Some(OTHER), true)),
+    );
+    let (status, json) = warn_mode_violating_sparql_update(&app, "ex:nameless2", "", &[auth]).await;
+    assert_shacl_rejected(
+        status,
+        &json,
+        "a verified identity outside the allow-list is denied",
+    );
+}
+
+/// SPARQL twin of `unverified_identity_does_not_soften_shacl_posture`: a
+/// `# PRAGMA identity` naming the allow-listed DID is a policy identity, not a
+/// verified one. Paired with the test above, which shows the `validation-mode`
+/// pragma is honored for a verified identity; on its own it would also pass if
+/// the pragma were ignored.
+#[tokio::test]
+async fn unverified_pragma_identity_does_not_soften_shacl_posture() {
+    let (_tmp, app) = seeded_app_with(DataAuthMode::None, SHACL_CONFIG_TRIG).await;
+
+    let (status, json) = warn_mode_violating_sparql_update(
+        &app,
+        "ex:nameless1",
+        &format!("# PRAGMA identity: <{ADMIN}>"),
+        &[],
+    )
+    .await;
+    assert_shacl_rejected(
+        status,
+        &json,
+        "a pragma identity naming the allow-listed DID must not soften the posture",
+    );
+}

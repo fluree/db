@@ -756,6 +756,87 @@ pub fn merged_opts(envelope: Option<&JsonValue>, inner: Option<&JsonValue>) -> O
     }
 }
 
+/// A SPARQL sub-query's `# PRAGMA` options as the `opts` object a JSON-LD body
+/// would carry: the body layer of the alias's opts merge, so they win over the
+/// alias's and the envelope's `opts` as a JSON-LD body's do. `Err` names a
+/// pragma that does not parse.
+pub fn sparql_pragma_opts(sparql: &str) -> std::result::Result<Option<JsonValue>, String> {
+    let pragmas = fluree_db_sparql::request_pragmas(sparql)?;
+    let mut opts = serde_json::Map::new();
+    if let Some(meta) = pragmas.meta {
+        opts.insert(
+            "meta".into(),
+            serde_json::json!({"time": meta.time, "fuel": meta.fuel, "policy": meta.policy}),
+        );
+    }
+    if let Some(max_fuel) = pragmas.max_fuel {
+        opts.insert("max-fuel".into(), serde_json::json!(max_fuel));
+    }
+    if let Some(min_t) = pragmas.min_t {
+        opts.insert("min-t".into(), serde_json::json!(min_t));
+    }
+    if let Some(identity) = pragmas.identity {
+        opts.insert("identity".into(), JsonValue::String(identity));
+    }
+    if let Some(classes) = pragmas.policy_class {
+        opts.insert("policy-class".into(), serde_json::json!(classes));
+    }
+    if let Some(values) = pragmas.policy_values {
+        opts.insert("policy-values".into(), JsonValue::Object(values));
+    }
+    if let Some(default_allow) = pragmas.default_allow {
+        opts.insert("default-allow".into(), JsonValue::Bool(default_allow));
+    }
+    Ok((!opts.is_empty()).then_some(JsonValue::Object(opts)))
+}
+
+/// Hold the tracking options a SPARQL alias's pragmas put into `merged` to
+/// those its `outer` (envelope ⊕ alias) opts already set. Unlike the alias's
+/// other pragmas, which win as body `opts` do, a pragma's `max-fuel` can
+/// tighten the outer cap but never lift it, and its `meta` adds to the outer
+/// tracking but never removes it — as they combine with `fluree-max-fuel` and
+/// `fluree-track-*` on a single query.
+pub fn hold_pragma_tracking(merged: &mut Option<JsonValue>, outer: Option<&JsonValue>) {
+    let (Some(outer), Some(JsonValue::Object(opts))) = (outer, merged.as_mut()) else {
+        return;
+    };
+    let cap = ["max-fuel", "max_fuel", "maxFuel"]
+        .iter()
+        .find_map(|key| outer.get(*key))
+        .and_then(JsonValue::as_f64);
+    if let Some(cap) = cap {
+        if opts
+            .get("max-fuel")
+            .and_then(JsonValue::as_f64)
+            .is_some_and(|max_fuel| max_fuel > cap)
+        {
+            opts.insert("max-fuel".into(), serde_json::json!(cap));
+        }
+    }
+    let flags = |meta: Option<&JsonValue>| {
+        let flag = |key: &str| {
+            matches!(meta, Some(JsonValue::Bool(true)))
+                || meta
+                    .and_then(|m| m.get(key))
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false)
+        };
+        [flag("time"), flag("fuel"), flag("policy")]
+    };
+    let outer_flags = flags(outer.get("meta"));
+    if opts.contains_key("meta") && outer_flags.contains(&true) {
+        let [time, fuel, policy] = flags(opts.get("meta"));
+        opts.insert(
+            "meta".into(),
+            serde_json::json!({
+                "time": time || outer_flags[0],
+                "fuel": fuel || outer_flags[1],
+                "policy": policy || outer_flags[2],
+            }),
+        );
+    }
+}
+
 /// Shallow merge two JSON values, returning a new value. If both are objects,
 /// `inner`'s keys override `outer`'s on conflict. If either is not an object,
 /// `inner` wins entirely (matches "sub-query overrides envelope" semantics).

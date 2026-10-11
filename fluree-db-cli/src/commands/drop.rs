@@ -94,7 +94,7 @@ async fn run_remote(name: &str, client: &RemoteLedgerClient) -> CliResult<()> {
 }
 
 async fn run_local(name: &str, dirs: &FlureeDir) -> CliResult<()> {
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
 
     // Try dropping as a ledger first
     let report = fluree

@@ -167,7 +167,7 @@ async fn run_local(
         ));
     }
 
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let ledger_id = context::to_ledger_id(&alias)?;
 
     // The same call the server's `GET /v1/fluree/log` makes, so `--direct` and

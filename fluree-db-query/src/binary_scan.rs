@@ -39,6 +39,7 @@ use crate::object_binding::{
 };
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
 use crate::operator::{Operator, OperatorState};
+use crate::policy::QueryPolicyEnforcer;
 use crate::sid_iri;
 use crate::stats_cache::cached_stats_view_for_db;
 use crate::var_registry::VarId;
@@ -1025,7 +1026,31 @@ impl BinaryScanOperator {
         g_id: GraphId,
         flakes: Vec<Flake>,
     ) -> Result<Vec<Flake>> {
-        let Some(enforcer) = ctx.policy_enforcer.as_ref() else {
+        Self::filter_flakes_by_enforcer(
+            ctx,
+            ctx.policy_enforcer.as_ref(),
+            snapshot,
+            overlay,
+            to_t,
+            g_id,
+            flakes,
+        )
+        .await
+    }
+
+    /// [`Self::filter_flakes_by_policy`] under `enforcer` rather than the
+    /// context's own, for a reader that visits several graphs each carrying
+    /// its own policy.
+    pub(crate) async fn filter_flakes_by_enforcer(
+        ctx: &ExecutionContext<'_>,
+        enforcer: Option<&Arc<QueryPolicyEnforcer>>,
+        snapshot: &LedgerSnapshot,
+        overlay: &dyn OverlayProvider,
+        to_t: i64,
+        g_id: GraphId,
+        flakes: Vec<Flake>,
+    ) -> Result<Vec<Flake>> {
+        let Some(enforcer) = enforcer else {
             return Ok(flakes);
         };
         if enforcer.is_root() || flakes.is_empty() {
@@ -3752,7 +3777,7 @@ fn string_not_found_error(value: &str) -> std::io::Error {
 /// - langString: OType must embed the lang_id, not use XSD_STRING
 /// - numeric subtypes: xsd:int vs xsd:integer can share the same FlakeValue::Long
 /// - string subtypes: xsd:anyURI vs xsd:string share FlakeValue::String
-fn value_to_otype_okey(
+pub(crate) fn value_to_otype_okey(
     val: &FlakeValue,
     dt_sid: &Sid,
     lang: Option<&str>,

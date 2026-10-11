@@ -33,6 +33,12 @@ This:
 2. Deletes that age value
 3. Inserts the new age value
 
+A DELETE retracts only facts that are stored. A template instantiated with a
+value the ledger does not hold (a constant that is absent, or a value bound by
+a different pattern) retracts nothing, and cannot cancel an INSERT of the same
+triple: `DELETE { x } INSERT { x } WHERE {}` inserts `x` when it is absent.
+See [Retraction Semantics](retractions.md#retraction-semantics).
+
 ## WHERE clause capabilities
 
 The update transaction `where` clause uses the **same pattern grammar as JSON-LD queries**, so you can use rich patterns like OPTIONAL, UNION, FILTER, VALUES, and subqueries.
@@ -109,6 +115,7 @@ There are two ways to target graphs in `insert` / `delete` templates:
 Notes:
 - `graph` is a **graph IRI** (a string like `"http://example.org/graphs/audit"`)
 - The ledger's own address (`urn:fluree:mydb:main`, `mydb:main` or `mydb`, with no `#fragment` and no time pin) names the ledger's **default graph** in a top-level `graph` and in `from`: the update reads and writes the default graph and never creates a named graph called by the address. A per-node `@graph` or a `["graph", …]` template resolves the address like any other graph IRI. `urn:fluree:mydb:main#config` is the config graph, not the address.
+- `urn:default` names the default graph in a top-level `graph`, in `from` and `fromNamed`, and in a `["graph", "urn:default", …]` pattern in the `where`. A per-node `@graph` or a `["graph", …]` template naming `urn:default` is refused with a `400`, since the default graph is not a named graph.
 - Named-graph reads are available after indexing completes (see `docs/query/datasets.md`)
 
 ## Dataset scoping for WHERE (`from` / `fromNamed`)
@@ -688,11 +695,11 @@ Updates ALL entities with status="pending".
 
 | Feature | WHERE/DELETE/INSERT | Replace Mode |
 |---------|---------------------|--------------|
-| **Granularity** | Property-level | Entity-level |
-| **Other properties** | Preserved | Removed |
+| **Granularity** | Value-level | Predicate-level (every value, every language) |
+| **Other properties** | Preserved | Preserved |
 | **Conditional** | Yes (with filters) | No |
 | **Pattern matching** | Yes | No |
-| **Idempotent** | Depends on logic | Yes |
+| **Idempotent** | Depends on logic | Yes, with one exception (see [Upsert](upsert.md#idempotency)) |
 | **Use case** | Partial updates | Complete replacement |
 
 ## Best Practices

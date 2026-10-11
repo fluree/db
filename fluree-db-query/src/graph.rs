@@ -71,7 +71,7 @@ async fn r2rml_mapping_for_rewrite(
     graph_iri: &str,
 ) -> Option<Arc<CompiledR2rmlMapping>> {
     let provider = ctx.r2rml_provider?;
-    let as_of_t = if ctx.dataset.is_some() {
+    let as_of_t = if ctx.explicit_dataset().is_some() {
         None
     } else {
         Some(ctx.to_t)
@@ -549,9 +549,11 @@ impl GraphOperator {
         }
 
         // The whole parent batch seeds the source undecoded: sound only
-        // because nothing crosses graphs here. This path runs without a
-        // dataset, where the source scope inherits the outer graph id, so the
-        // arena crossing is a no-op both ways.
+        // because nothing crosses graphs here. This path runs without an
+        // explicit dataset: with none, the source scope inherits the outer
+        // graph id; under an implicit union default graph, the outer context
+        // has no graph view and the source is no member graph, so neither side
+        // has one. Either way the arena crossing is a no-op both ways.
         let crossing = crate::object_binding::ArenaCrossing::between(ctx, &graph_ctx);
         debug_assert!(
             crossing.is_noop(),
@@ -736,10 +738,10 @@ impl Operator for GraphOperator {
             // Run the whole parent batch through ONE uncorrelated scan so the
             // inner R2RML hash join joins all parent rows at once, instead of
             // re-scanning the table per parent row.
-            if ctx.dataset.is_none() {
+            if ctx.explicit_dataset().is_none() {
                 if let GraphName::Iri(iri) = &graph_name {
                     let is_user_graph = ctx.single_db_user_graph_id(iri).is_some();
-                    let is_alias = iri.as_ref() == ctx.active_snapshot.ledger_id;
+                    let is_alias = ctx.names_default_graph(iri);
                     let is_r2rml_gs = !is_user_graph
                         && !is_alias
                         && if ctx.r2rml_graph_ids.contains(iri.as_ref()) {
@@ -766,7 +768,7 @@ impl Operator for GraphOperator {
                     GraphName::Iri(iri) => {
                         // Concrete graph: run inner patterns in that graph
                         // If graph doesn't exist in dataset → empty result
-                        if let Some(ds) = &ctx.dataset {
+                        if let Some(ds) = ctx.explicit_dataset() {
                             if ds.has_named_graph(iri) {
                                 self.execute_in_graph(
                                     ctx,
@@ -779,10 +781,11 @@ impl Operator for GraphOperator {
                             }
                             // else: graph not found → no output for this row
                         } else {
-                            // Single-db: a registered user graph, the ledger
-                            // alias (default graph), or an R2RML graph source.
+                            // Single-db: a registered user graph, a name of
+                            // the default graph (`names_default_graph`), or an
+                            // R2RML graph source.
                             let is_user_graph = ctx.single_db_user_graph_id(iri).is_some();
-                            let is_alias = iri.as_ref() == ctx.active_snapshot.ledger_id;
+                            let is_alias = ctx.names_default_graph(iri);
                             let is_r2rml_gs = !is_user_graph
                                 && !is_alias
                                 && if ctx.r2rml_graph_ids.contains(iri.as_ref()) {
@@ -812,7 +815,7 @@ impl Operator for GraphOperator {
                                 Self::extract_graph_iri_from_binding(ctx, binding)
                             {
                                 // ?g already bound: use only that graph
-                                if let Some(ds) = &ctx.dataset {
+                                if let Some(ds) = ctx.explicit_dataset() {
                                     if ds.has_named_graph(&bound_iri) {
                                         self.execute_in_graph(
                                             ctx,
@@ -828,8 +831,7 @@ impl Operator for GraphOperator {
                                     // Single-db: same resolution as the concrete arm.
                                     let is_user_graph =
                                         ctx.single_db_user_graph_id(&bound_iri).is_some();
-                                    let is_alias =
-                                        bound_iri.as_ref() == ctx.active_snapshot.ledger_id;
+                                    let is_alias = ctx.names_default_graph(&bound_iri);
                                     let is_r2rml_gs = !is_user_graph
                                         && !is_alias
                                         && if ctx.r2rml_graph_ids.contains(bound_iri.as_ref()) {
@@ -855,7 +857,7 @@ impl Operator for GraphOperator {
                             // else: binding exists but isn't a string IRI → no output
                         } else {
                             // ?g unbound: iterate ALL named graphs, bind ?g
-                            if let Some(ds) = &ctx.dataset {
+                            if let Some(ds) = ctx.explicit_dataset() {
                                 for iri in ds.named_graph_iris() {
                                     self.execute_in_graph(
                                         ctx,

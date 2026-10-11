@@ -1,6 +1,8 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_annotation_delete_named_graph.rs"]
+mod it_annotation_delete_named_graph;
 #[path = "it_annotation_filter_pushdown.rs"]
 mod it_annotation_filter_pushdown;
 #[path = "it_compile_breakdown.rs"]
@@ -21,6 +23,8 @@ mod it_edge_annotations_parse;
 mod it_fast_group_count;
 #[path = "it_file_backed.rs"]
 mod it_file_backed;
+#[path = "it_file_startup_recovery.rs"]
+mod it_file_startup_recovery;
 #[path = "it_file_storage_jsonld.rs"]
 mod it_file_storage_jsonld;
 #[path = "it_fuel_floor.rs"]

@@ -1561,13 +1561,15 @@ async fn test_unknown_named_graph_error() {
                 "where": {"@id": "?s", "ex:name": "?name"}
             });
 
-            let result = fluree.query_connection(&query).await;
-            assert!(result.is_err(), "should error on unknown named graph");
-            let err_msg = format!("{}", result.unwrap_err());
+            let err = fluree
+                .query_connection(&query)
+                .await
+                .expect_err("should error on unknown named graph");
             assert!(
-                err_msg.contains("Unknown named graph"),
-                "error should mention unknown graph: {err_msg}"
+                matches!(err, fluree_db_api::ApiError::GraphNotFound(_)),
+                "error should be GraphNotFound: {err}"
             );
+            assert_eq!(err.status_code(), 404, "{err}");
         })
         .await;
 }

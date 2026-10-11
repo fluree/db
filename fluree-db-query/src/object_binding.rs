@@ -154,6 +154,9 @@ pub(crate) fn late_materialized_object_binding(
             i_val: encoded_i_val(o_i),
             t,
         }),
+        // The arena holds overflow integers and decimals alike, so `dt_id` is
+        // a placeholder: decode, then resolve via
+        // `BinaryIndexStore::resolve_dt_id_sid_for_value`.
         DecodeKind::NumBigArena => Some(Binding::EncodedLit {
             o_kind: ObjKind::NUM_BIG.as_u8(),
             o_key,
@@ -882,12 +885,16 @@ pub(crate) struct ArenaCrossing {
     enter: Option<fluree_db_binary_index::BinaryGraphView>,
     /// The scope's graph: decodes the handles its rows carry out.
     leave: Option<fluree_db_binary_index::BinaryGraphView>,
+    /// Decode every encoded binding leaving, not only arena handles: the
+    /// outer context spans several graphs, whose members decode as they scan.
+    leave_all: bool,
 }
 
 impl ArenaCrossing {
     /// The crossing between `outer` and a `scope` derived from it. An outer
     /// context that spans several graphs (a union) has no graph to decode a
-    /// handle through, so everything leaving the scope for it is decoded.
+    /// binding through, so everything encoded leaving the scope for it is
+    /// decoded.
     pub(crate) fn between(
         outer: &crate::context::ExecutionContext<'_>,
         scope: &crate::context::ExecutionContext<'_>,
@@ -899,11 +906,13 @@ impl ArenaCrossing {
             return Self {
                 enter: None,
                 leave: None,
+                leave_all: false,
             };
         }
         Self {
             enter: outer.graph_view(),
             leave: scope.graph_view(),
+            leave_all: !outer.has_binary_store(),
         }
     }
 
@@ -925,12 +934,15 @@ impl ArenaCrossing {
     }
 
     /// `binding`, bound inside the scope, decoded through the scope's graph
-    /// when it is an arena handle.
+    /// when it is an arena handle, or any encoded binding for a union.
     pub(crate) fn leave(&self, binding: Binding) -> Binding {
+        let decode = if self.leave_all {
+            binding.is_encoded()
+        } else {
+            is_arena_encoded(&binding)
+        };
         match &self.leave {
-            Some(gv) if is_arena_encoded(&binding) => {
-                crate::group_aggregate::materialize_encoded(&binding, Some(gv))
-            }
+            Some(gv) if decode => crate::group_aggregate::materialize_encoded(&binding, Some(gv)),
             _ => binding,
         }
     }

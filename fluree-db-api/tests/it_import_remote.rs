@@ -8,6 +8,7 @@
 #![cfg(feature = "native")]
 
 use crate::support;
+use crate::support::hooked_storage::{HookedStorage, StorageHooks};
 
 use async_trait::async_trait;
 use fluree_db_api::{FlureeBuilder, RemoteObject, RemoteSource};
@@ -465,39 +466,18 @@ async fn import_from_storage_rejects_mixed_formats() {
 // re-parks between chunks (in-flight backpressure == 1).
 // ============================================================================
 
-/// A `StorageRead` that yields to the runtime before serving each read,
-/// mimicking a real async backend (File/S3) that hands control to the IO
-/// driver mid-read. `MemoryStorage` resolves reads synchronously, so it cannot
-/// reproduce the producer re-park that the commit consumer depends on the
-/// runtime worker to drive.
+/// Storage hooks that yield to the runtime before each read.
+///
+/// A real async backend (File/S3) hands control to the IO driver mid-read.
+/// `MemoryStorage` resolves reads synchronously. Yielding makes the producer
+/// task depend on the runtime worker being free, as it does with a real backend.
 #[derive(Debug)]
-struct YieldingStorage {
-    inner: Arc<MemoryStorage>,
-}
+struct YieldBeforeRead;
 
 #[async_trait]
-impl StorageRead for YieldingStorage {
-    fn permits_plaintext_cache(&self) -> bool {
-        self.inner.permits_plaintext_cache()
-    }
-
-    fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
-        self.inner.encryption_admin()
-    }
-
-    async fn read_bytes(&self, address: &str) -> fluree_db_core::error::Result<Vec<u8>> {
-        // Hand control back to the runtime so the producer task genuinely
-        // depends on the worker being free to make progress.
+impl StorageHooks for YieldBeforeRead {
+    async fn before_read(&self, _address: &str) {
         tokio::task::yield_now().await;
-        self.inner.read_bytes(address).await
-    }
-
-    async fn exists(&self, address: &str) -> fluree_db_core::error::Result<bool> {
-        self.inner.exists(address).await
-    }
-
-    async fn list_prefix(&self, prefix: &str) -> fluree_db_core::error::Result<Vec<String>> {
-        self.inner.list_prefix(prefix).await
     }
 }
 
@@ -517,7 +497,7 @@ impl StorageRead for YieldingStorage {
 async fn remote_import_single_inflight_yielding_storage_does_not_deadlock() {
     const N: usize = 6;
 
-    let inner = Arc::new(MemoryStorage::new());
+    let inner = MemoryStorage::new();
     let mut objects = Vec::with_capacity(N);
     for i in 0..N {
         let addr = format!("imports/chunk_{i:04}.ttl");
@@ -540,7 +520,7 @@ async fn remote_import_single_inflight_yielding_storage_does_not_deadlock() {
         .build()
         .expect("build file-backed Fluree");
 
-    let storage_dyn: Arc<dyn StorageRead> = Arc::new(YieldingStorage { inner });
+    let storage_dyn: Arc<dyn StorageRead> = Arc::new(HookedStorage::over(inner, YieldBeforeRead));
     let result = fluree
         .create("test/remote-single-inflight:main")
         .import_from_storage(storage_dyn, RemoteSource::OrderedObjects(objects))

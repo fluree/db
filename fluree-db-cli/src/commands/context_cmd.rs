@@ -31,7 +31,7 @@ pub async fn get(
         }
     }
 
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     match fluree.get_default_context(&ledger_id).await? {
         Some(ctx) => {
             println!(
@@ -138,7 +138,7 @@ pub async fn set(
         }
     }
 
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     match fluree.set_default_context(&ledger_id, &ctx_value).await? {
         fluree_db_api::SetContextResult::Updated => {
             eprintln!("Default context updated for '{alias}'.");

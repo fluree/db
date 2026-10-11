@@ -468,7 +468,7 @@ async fn staging_rejects_malformed_and_system_graph_targets() {
 /// An identical resync must still be a no-op after the graph has been
 /// indexed — the case the memory-backed tests cannot reach.
 ///
-/// `scan_graph_flakes` reads through the range provider, and
+/// `whole_graph_facts` reads through the range provider, and
 /// `BinaryRangeProvider` materializes flakes with `g: None`
 /// (`binary_range.rs:753`, `:1393`). The accumulator buckets on `flake.g`,
 /// so without the explicit stamp in the sync wave the retractions land in a
@@ -638,4 +638,33 @@ async fn graph_management_verbs_work_on_indexed_data() {
             );
         })
         .await;
+}
+
+#[tokio::test]
+async fn a_sync_commit_carries_its_message_and_reports_its_id() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/sync-graph/message:main";
+    seed(&fluree, ledger_id).await;
+    let report = fluree
+        .sync_named_graph(
+            ledger_id,
+            ONT_IRI,
+            &payload_v1(),
+            SyncGraphOpts {
+                message: Some("nightly ontology".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("sync");
+    let (log, _) = fluree.commit_log(ledger_id, Some(1)).await.expect("log");
+    assert_eq!(report.commit_id.as_ref(), Some(&log[0].commit_id));
+    assert_eq!(log[0].message.as_deref(), Some("nightly ontology"));
+
+    let unchanged = fluree
+        .sync_named_graph(ledger_id, ONT_IRI, &payload_v1(), SyncGraphOpts::default())
+        .await
+        .expect("identical sync");
+    assert!(!unchanged.committed);
+    assert_eq!(unchanged.commit_id, None);
 }

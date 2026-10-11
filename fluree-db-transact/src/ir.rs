@@ -182,8 +182,8 @@ pub struct Txn {
     /// of a JSON-LD update's top-level `graph`. Lowering writes every template
     /// that names no graph itself to it (marking the template
     /// [`TripleTemplate::graph_from_template_default`]) and lists it in
-    /// [`Txn::write_graphs`]. When it is this ledger's own address (see
-    /// `names_ledger`), staging writes those templates to the ledger's
+    /// [`Txn::write_graphs`]. When it names this ledger's default graph (see
+    /// `names_default_graph`), staging writes those templates to the ledger's
     /// default graph instead, the graph the WHERE reads for that IRI.
     pub template_default_graph: Option<String>,
 
@@ -592,10 +592,12 @@ pub enum TemplateGraph {
     Var(VarId),
 }
 
-/// Whether the graph IRI `iri` is the address of the ledger `ledger_id`: any
-/// spelling [`LedgerRef::parse`](fluree_db_core::LedgerRef::parse) accepts
-/// (`name`, `name:branch`, `urn:fluree:…`), with no time pin and no graph
-/// fragment.
+/// Whether the graph IRI `iri` names the default graph of the ledger
+/// `ledger_id` in an update's default-graph positions: `urn:default`
+/// ([`DEFAULT_GRAPH_IRI`](fluree_db_core::DEFAULT_GRAPH_IRI)), or the ledger's
+/// own address in any spelling [`LedgerRef::parse`](fluree_db_core::LedgerRef::parse)
+/// accepts (`name`, `name:branch`, `urn:fluree:…`) with no time pin and no
+/// graph fragment.
 ///
 /// Only an update's default-graph positions consult it, and they read such an
 /// IRI as the ledger's default graph (the within-ledger convention, D-3): the
@@ -605,7 +607,10 @@ pub enum TemplateGraph {
 /// registry like any other IRI: `GRAPH <iri>` in a template or in the WHERE,
 /// `GRAPH ?g`, `USING NAMED`, JSON-LD `fromNamed`, `@graph` and
 /// `["graph", …]`, data quads and TriG blocks.
-pub(crate) fn names_ledger(ledger_id: &fluree_db_core::LedgerId, iri: &str) -> bool {
+pub(crate) fn names_default_graph(ledger_id: &fluree_db_core::LedgerId, iri: &str) -> bool {
+    if iri == fluree_db_core::DEFAULT_GRAPH_IRI {
+        return true;
+    }
     // Every spelling starts with the ledger name, so most IRIs are rejected
     // without parsing (a parse allocates the canonical id).
     let body = iri

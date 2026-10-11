@@ -786,6 +786,8 @@ pub async fn query(
 
         // Log query text according to configuration
         log_query_text(&sparql, &state.telemetry_config, &span);
+        // Merge the `# PRAGMA` options into the headers (see `with_sparql_pragmas`).
+        let headers = headers.clone().with_sparql_request_pragmas(&sparql)?;
 
         // Connection-scoped SPARQL requires a FROM/FROM NAMED clause to specify the ledger.
         //
@@ -1156,6 +1158,8 @@ pub async fn query_ledger(
 
         // Log query text according to configuration
         log_query_text(&sparql, &state.telemetry_config, &span);
+        // Merge the `# PRAGMA` options into the headers (see `with_sparql_pragmas`).
+        let headers = headers.clone().with_sparql_request_pragmas(&sparql)?;
 
         // Enforce bearer ledger scope for unsigned requests
         if let Some(p) = bearer.0.as_ref() {
@@ -1302,8 +1306,9 @@ pub async fn query_get(
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
 ) -> Result<Response> {
-    if let Some(description) = service_description(&uri, &params, &credential)? {
-        return Ok(description);
+    if wants_service_description(&params, &credential) {
+        // The connection endpoint's default graph is whatever `FROM` names.
+        return service_description(&uri, &credential, false);
     }
     query(State(state), params, headers, bearer, credential).await
 }
@@ -1318,8 +1323,9 @@ pub async fn query_ledger_get(
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
 ) -> Result<Response> {
-    if let Some(description) = service_description(&uri, &params, &credential)? {
-        return Ok(description);
+    if wants_service_description(&params, &credential) {
+        let union = ledger_union_default_graph(&state, &ledger, &bearer, &credential).await;
+        return service_description(&uri, &credential, union);
     }
     query_ledger(
         State(state),
@@ -1334,18 +1340,49 @@ pub async fn query_ledger_get(
 }
 
 /// SPARQL Service Description §2: a `GET` on a SPARQL endpoint with no query
-/// returns an RDF description of the service, in the graph format `Accept`
-/// asks for. `None` when the request carries a query. It describes the
-/// endpoint's capabilities, not data; it sits behind the same authentication
-/// as the endpoint, which the extractors apply before this runs.
+/// returns an RDF description of the service, which a `GET` carrying a query
+/// or a body does not ask for.
+fn wants_service_description(params: &SparqlParams, credential: &MaybeCredential) -> bool {
+    params.query.is_none() && credential.body.iter().all(u8::is_ascii_whitespace)
+}
+
+/// Whether `ledger`'s endpoint claims `sd:UnionDefaultGraph`: its
+/// `f:unionDefaultGraph` setting. Off when the caller's token may not read the
+/// ledger or the ledger cannot be loaded, so a description never becomes an
+/// error, nor a probe of a ledger the caller cannot see.
+async fn ledger_union_default_graph(
+    state: &AppState,
+    ledger: &str,
+    bearer: &MaybeDataBearer,
+    credential: &MaybeCredential,
+) -> bool {
+    let Ok(path) = PathLedger::parse(ledger) else {
+        return false;
+    };
+    if let Some(p) = bearer.0.as_ref() {
+        let readable = crate::error::scope_id(&path.ledger).is_ok_and(|id| p.can_read(&id));
+        if !credential.is_signed() && !readable {
+            return false;
+        }
+    }
+    let Ok(view) = state.fluree.db(&path.ledger).await else {
+        return false;
+    };
+    view.ledger_config()
+        .and_then(|c| c.query.as_ref())
+        .and_then(|q| q.union_default_graph)
+        .unwrap_or(false)
+}
+
+/// The endpoint's SPARQL service description, in the graph format `Accept`
+/// asks for. It describes the endpoint's capabilities, not data; it sits
+/// behind the same authentication as the endpoint, which the extractors apply
+/// before this runs.
 fn service_description(
     uri: &axum::http::Uri,
-    params: &SparqlParams,
     credential: &MaybeCredential,
-) -> Result<Option<Response>> {
-    if params.query.is_some() || !credential.body.iter().all(u8::is_ascii_whitespace) {
-        return Ok(None);
-    }
+    union_default_graph: bool,
+) -> Result<Response> {
     let header = |name: &str| {
         credential
             .headers
@@ -1367,15 +1404,17 @@ fn service_description(
         .or_else(|| header("host"))
         .unwrap_or("localhost");
     let endpoint = format!("{scheme}://{host}{}", uri.path());
-    let body = fluree_db_api::sparql_service_description(&endpoint, &format.formatter())
-        .map_err(|e| ServerError::internal(e.to_string()))?;
-    Ok(Some(
-        (
-            [(axum::http::header::CONTENT_TYPE, format.content_type())],
-            body,
-        )
-            .into_response(),
-    ))
+    let body = fluree_db_api::sparql_service_description(
+        &endpoint,
+        union_default_graph,
+        &format.formatter(),
+    )
+    .map_err(|e| ServerError::internal(e.to_string()))?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, format.content_type())],
+        body,
+    )
+        .into_response())
 }
 
 pub async fn query_ledger_tail(
@@ -1478,6 +1517,8 @@ pub async fn explain_ledger(
         if is_sparql_request(&headers, &credential, &params) {
             let sparql = resolve_sparql_text(&params, &credential)?;
             log_query_text(&sparql, &state.telemetry_config, &span);
+            // Merge the `# PRAGMA` options into the headers (see `with_sparql_pragmas`).
+            let headers = headers.clone().with_sparql_request_pragmas(&sparql)?;
 
             // Enforce bearer ledger scope for unsigned requests
             if let Some(p) = bearer.0.as_ref() {
@@ -4145,6 +4186,8 @@ pub async fn explain(
         if is_sparql_request(&headers, &credential, &params) {
             let sparql = resolve_sparql_text(&params, &credential)?;
             log_query_text(&sparql, &state.telemetry_config, &span);
+            // Merge the `# PRAGMA` options into the headers (see `with_sparql_pragmas`).
+            let headers = headers.clone().with_sparql_request_pragmas(&sparql)?;
 
             // Determine target ledger: header wins, otherwise require a single FROM ledger id.
             // FROM may carry a time-travel suffix (`@t:N` / `@iso:` / `@commit:`);
@@ -4683,6 +4726,12 @@ fn collect_multi_query_min_t_requirements(
             }
             SubqueryLanguage::Sparql => {
                 if let Some(sparql) = sub.query.as_str() {
+                    // `# PRAGMA min-t` is the alias's body option, so it wins
+                    // over the alias's `opts`.
+                    let sub_min_t = fluree_db_sparql::request_pragmas(sparql)
+                        .map_err(ServerError::bad_request)?
+                        .min_t
+                        .or(sub_min_t);
                     // The envelope already applied any `Fluree-Min-T` header to
                     // every distinct ledger; the sub-collector only needs to pick
                     // up per-query `@t:` pins, so pass no header here.
@@ -5082,11 +5131,70 @@ fn apply_envelope_sparql_auth(
     envelope_opts: Option<&JsonValue>,
     headers: &FlureeHeaders,
 ) -> Result<()> {
-    let merged = fluree_db_api::query::multi::merged_opts(envelope_opts, sub.opts.as_ref());
+    use fluree_db_api::query::multi::merged_opts;
+
+    let selection = |opts: Option<JsonValue>| {
+        fluree_db_api::GovernanceOptions::from_json(&serde_json::json!({ "opts": opts }))
+            .map_err(|e| ServerError::bad_request(e.to_string()))
+    };
+
+    // The alias's `# PRAGMA` options are its body opts, which the dispatcher
+    // lays over `sub.opts`: authorize the selection it will actually run with.
+    // Under a bound credential the envelope's selection is the holder's, and
+    // the pragmas may only repeat it, as they may only repeat its headers.
+    let pragma_opts = sparql_alias_pragma_opts(sub)?;
+    let outer = merged_opts(envelope_opts, sub.opts.as_ref());
+    if let (Some(pragma_opts), Some(_)) = (&pragma_opts, &headers.policy_authorization) {
+        crate::extract::validate_pragma_selection(
+            &selection(Some(pragma_opts.clone()))?,
+            &selection(outer.clone())?,
+        )?;
+    }
+    let mut merged = merged_opts(outer.as_ref(), pragma_opts.as_ref());
+    fluree_db_api::query::multi::hold_pragma_tracking(&mut merged, outer.as_ref());
     let mut synthetic = serde_json::json!({"opts": merged});
     crate::routes::policy_auth::apply_authorization_to_opts(&mut synthetic, headers)?;
     sub.opts = synthetic.get("opts").cloned();
+
+    // Authorization accepts a pragma selection only where it matches the
+    // bound one, so laying the pragmas back over the result changes nothing.
+    // Hold that here rather than lean on it: a difference would be a pragma
+    // replacing the authorized selection.
+    if let Some(pragma_opts) = &pragma_opts {
+        let authorized = selection(sub.opts.clone())?;
+        let dispatched = selection(merged_opts(sub.opts.as_ref(), Some(pragma_opts)))?;
+        if !same_policy_selection(&authorized, &dispatched) {
+            return Err(fluree_db_api::ApiError::http(
+                403,
+                "Credential does not permit policy selection: a SPARQL alias's pragmas \
+                 conflict with the authorized selection",
+            )
+            .into());
+        }
+    }
     Ok(())
+}
+
+/// A SPARQL alias's pragmas as `opts`, with a malformed pragma as a 400.
+fn sparql_alias_pragma_opts(sub: &MultiQuerySubquery) -> Result<Option<JsonValue>> {
+    fluree_db_api::query::multi::sparql_pragma_opts(sub.query.as_str().unwrap_or_default())
+        .map_err(ServerError::bad_request)
+}
+
+/// Whether two policy selections pick the same policies; class order and
+/// repeats do not change the set.
+fn same_policy_selection(
+    a: &fluree_db_api::GovernanceOptions,
+    b: &fluree_db_api::GovernanceOptions,
+) -> bool {
+    fn classes(o: &fluree_db_api::GovernanceOptions) -> Option<BTreeSet<&String>> {
+        o.policy_class.as_ref().map(|c| c.iter().collect())
+    }
+    a.identity == b.identity
+        && classes(a) == classes(b)
+        && a.policy == b.policy
+        && a.policy_values == b.policy_values
+        && a.default_allow == b.default_allow
 }
 
 /// Merge envelope, alias, and body options before authorization, using the

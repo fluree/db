@@ -79,7 +79,7 @@ pub async fn run(
         ));
     }
 
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let ledger_view = fluree.ledger(&alias).await?;
     let result = fluree.query_connection(&query).await?;
     let json = result.to_jsonld(&ledger_view.snapshot)?;

@@ -631,9 +631,27 @@ pub fn parse_time_travel_spec(
         Ok(LedgerIdTimeSpec::AtSnapshot(id))
     } else {
         Err(LedgerIdParseError::new(format!(
-            "Invalid time travel format: '{spec}'. Expected {sigil}t:, {sigil}time:, {sigil}recorded:, {sigil}commit:, or {sigil}snapshot: prefix"
+            "Invalid time travel format: '{spec}'. Expected {sigil}t:, {sigil}time:, {sigil}recorded:, {sigil}commit:, or {sigil}snapshot: prefix{}",
+            untagged_spec_hint(spec, sigil)
         )))
     }
+}
+
+/// The tagged spelling a spec written without its tag most likely meant: a
+/// transaction number, a timestamp, or a commit id. The tag stays required,
+/// since a bare `123456` is both a `t` and a commit prefix.
+fn untagged_spec_hint(spec: &str, sigil: &str) -> String {
+    let tag = if spec.parse::<i64>().is_ok() {
+        "t:"
+    } else if spec.starts_with(|c: char| c.is_ascii_digit()) && spec.contains('-') {
+        "time:"
+    } else if spec.len() >= COMMIT_PREFIX_MIN_LEN && spec.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        "commit:"
+    } else {
+        return String::new();
+    };
+    format!("; did you mean '{sigil}{tag}{spec}'?")
 }
 
 /// Split a ledger ID string into its base and optional time-travel suffix.
@@ -804,6 +822,32 @@ mod tests {
             assert_eq!(err, format!("Missing value after '@{tag}'"));
         }
         assert!(TIME_TRAVEL_TAGS.contains(&"time:") && TIME_TRAVEL_TAGS.contains(&"iso:"));
+    }
+
+    /// A ledger address needs its tag, as `--at` does not; the refusal of an
+    /// untagged spec names the tagged spelling it most likely meant.
+    #[test]
+    fn untagged_spec_is_refused_with_its_tagged_spelling() {
+        let cid = "bagaybqabciqlaerm7xhrb6eo4viqu7ym4asun2mlovojslqlmlri3qrjia66fji";
+        for (spec, meant) in [
+            (cid, format!("@commit:{cid}")),
+            ("3dd028ab", "@commit:3dd028ab".to_string()),
+            ("5", "@t:5".to_string()),
+            (
+                "2025-01-01T00:00:00Z",
+                "@time:2025-01-01T00:00:00Z".to_string(),
+            ),
+        ] {
+            let err = parse_ledger_id_with_time(&format!("ledger@{spec}"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.ends_with(&format!("did you mean '{meant}'?")),
+                "{spec}: {err}"
+            );
+        }
+        let err = parse_time_travel_spec("abc", "@").unwrap_err().to_string();
+        assert!(!err.contains("did you mean"), "{err}");
     }
 
     #[test]

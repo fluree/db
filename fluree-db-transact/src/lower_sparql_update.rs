@@ -734,6 +734,12 @@ struct LiteralResult {
 /// committed as ONE atomic commit (roadmap decision D-10). An empty vector
 /// (empty or prologue-only request) is a valid no-op.
 ///
+/// The request's `validation-mode` and `unique-properties` pragmas fill the
+/// matching `opts` fields the caller left unset. The other update pragmas
+/// (`event-time`, `max-fuel`, `meta`, policy) govern the commit, tracking and
+/// authorization around the lowered `Txn`s, so they ride `ast.pragmas` for
+/// the caller to apply.
+///
 /// # Errors
 ///
 /// Returns `LowerError` if:
@@ -751,6 +757,7 @@ pub fn lower_sparql_update_request(
             return Err(LowerError::NotAnUpdate { span: ast.span });
         }
     };
+    let opts = with_pragma_txn_opts(ast, opts);
     let mut txns = Vec::with_capacity(request.operations.len());
     for op in &request.operations {
         txns.push(lower_sparql_update(
@@ -769,7 +776,8 @@ pub fn lower_sparql_update_request(
 /// the common one-operation request. It fails loudly on a request with
 /// zero or multiple operations — callers that accept the full request
 /// grammar (the API transaction seam) must use
-/// [`lower_sparql_update_request`] and stage the sequence.
+/// [`lower_sparql_update_request`] and stage the sequence. Pragmas apply as
+/// they do there.
 ///
 /// # Errors
 ///
@@ -790,7 +798,12 @@ pub fn lower_sparql_update_ast(
         }
     };
     match request.operations.as_slice() {
-        [op] => lower_sparql_update(&op.operation, &op.prologue, ns, opts),
+        [op] => lower_sparql_update(
+            &op.operation,
+            &op.prologue,
+            ns,
+            with_pragma_txn_opts(ast, opts),
+        ),
         [] => Err(LowerError::UnsupportedFeature {
             feature: "empty update request (no operation) in single-operation lowering; \
                       use lower_sparql_update_request",
@@ -804,7 +817,27 @@ pub fn lower_sparql_update_ast(
     }
 }
 
+/// `opts` with the transaction options a `# PRAGMA` names, under the same
+/// precedence as their JSON-LD `opts` twins: a value the caller set wins.
+fn with_pragma_txn_opts(ast: &SparqlAst, mut opts: TxnOpts) -> TxnOpts {
+    if opts.validation_mode.is_none() {
+        opts.validation_mode = ast
+            .pragmas
+            .validation_mode
+            .as_deref()
+            .and_then(fluree_db_core::ledger_config::ValidationMode::parse_opt);
+    }
+    if opts.unique_properties.is_none() {
+        opts.unique_properties = ast.pragmas.unique_properties.clone();
+    }
+    opts
+}
+
 /// Lower a SPARQL UPDATE operation to the Transaction IR.
+///
+/// A single operation carries no pragmas; lower the whole request with
+/// [`lower_sparql_update_request`] or [`lower_sparql_update_ast`] to have them
+/// applied.
 ///
 /// # Arguments
 ///
@@ -1028,6 +1061,7 @@ fn lower_insert_data(
         bnodes,
         &mut write_graphs,
         None,
+        IllTyped::Refuse,
     )?;
 
     Ok(Txn {
@@ -1083,6 +1117,7 @@ fn lower_delete_data(
         bnodes,
         &mut write_graphs,
         None,
+        IllTyped::AsStored,
     )?;
 
     Ok(Txn {
@@ -1252,6 +1287,7 @@ fn lower_delete_where_with_graphs(
         &mut bnodes,
         &mut write_graphs,
         None,
+        IllTyped::AsStored,
     )?;
 
     Ok(Txn {
@@ -1472,6 +1508,7 @@ fn lower_modify(
             bnodes,
             &mut write_graphs,
             default_template_graph.clone(),
+            IllTyped::AsStored,
         )?
     } else {
         Vec::new()
@@ -1496,6 +1533,7 @@ fn lower_modify(
             bnodes,
             &mut write_graphs,
             default_template_graph.clone(),
+            IllTyped::Refuse,
         )?
     } else {
         Vec::new()
@@ -1522,6 +1560,7 @@ fn lower_modify(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_quad_pattern_to_templates(
     elements: &[QuadPatternElement],
     prologue: &Prologue,
@@ -1530,12 +1569,13 @@ fn lower_quad_pattern_to_templates(
     bnodes: &mut BlankNodeCounter,
     write_graphs: &mut BTreeSet<String>,
     default_graph: Option<Arc<str>>,
+    ill_typed: IllTyped,
 ) -> Result<Vec<TripleTemplate>, LowerError> {
     let mut out: Vec<TripleTemplate> = Vec::new();
     for el in elements {
         match el {
             QuadPatternElement::Triple(tp) => {
-                let mut t = lower_triple_to_template(tp, prologue, ns, vars, bnodes)?;
+                let mut t = lower_triple_to_template(tp, prologue, ns, vars, bnodes, ill_typed)?;
                 if let Some(iri) = &default_graph {
                     t = t.in_template_default_graph(Arc::clone(iri));
                 }
@@ -1548,7 +1588,7 @@ fn lower_quad_pattern_to_templates(
                     let iri: Arc<str> = Arc::from(iri);
                     for tp in triples {
                         out.push(
-                            lower_triple_to_template(tp, prologue, ns, vars, bnodes)?
+                            lower_triple_to_template(tp, prologue, ns, vars, bnodes, ill_typed)?
                                 .in_graph(Arc::clone(&iri)),
                         );
                     }
@@ -1559,7 +1599,7 @@ fn lower_quad_pattern_to_templates(
                     let graph_var = vars.get_or_insert(&format!("?{}", v.name));
                     for tp in triples {
                         out.push(
-                            lower_triple_to_template(tp, prologue, ns, vars, bnodes)?
+                            lower_triple_to_template(tp, prologue, ns, vars, bnodes, ill_typed)?
                                 .with_graph_var(graph_var),
                         );
                     }
@@ -1577,6 +1617,7 @@ fn lower_triple_to_template(
     ns: &mut NamespaceRegistry,
     vars: &mut VarRegistry,
     bnodes: &mut BlankNodeCounter,
+    ill_typed: IllTyped,
 ) -> Result<TripleTemplate, LowerError> {
     let subject = subject_to_template(&triple.subject, prologue, ns, vars, bnodes)?;
     let predicate = predicate_to_template(&triple.predicate, prologue, ns, vars)?;
@@ -1584,7 +1625,7 @@ fn lower_triple_to_template(
     // Object needs special handling for literal metadata
     let (object, dtc) = match &triple.object {
         Term::Literal(lit) => {
-            let result = literal_to_template(lit, prologue, ns)?;
+            let result = literal_to_template(lit, prologue, ns, ill_typed)?;
             (result.term, result.dtc)
         }
         other => (object_to_template(other, prologue, ns, vars, bnodes)?, None),
@@ -1750,7 +1791,7 @@ fn lower_triple_to_delete_template_delete_where(
             (TemplateTerm::Sid(ns.sid_for_iri(&expanded)), None)
         }
         Term::Literal(lit) => {
-            let r = literal_to_template(lit, prologue, ns)?;
+            let r = literal_to_template(lit, prologue, ns, IllTyped::AsStored)?;
             (r.term, r.dtc)
         }
         Term::BlankNode(bn) => {
@@ -1949,7 +1990,7 @@ fn object_to_template(
             Ok(TemplateTerm::Sid(ns.sid_for_iri(&expanded)))
         }
         // Literals should go through literal_to_template for metadata; this is a fallback
-        Term::Literal(lit) => Ok(literal_to_template(lit, prologue, ns)?.term),
+        Term::Literal(lit) => Ok(literal_to_template(lit, prologue, ns, IllTyped::Refuse)?.term),
         Term::BlankNode(bn) => {
             let label = match &bn.value {
                 BlankNodeValue::Labeled(l) => {
@@ -1975,11 +2016,24 @@ fn object_to_template(
     }
 }
 
+/// How a template lowers a typed literal whose lexical form its datatype
+/// does not accept (`"abc"^^xsd:integer`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IllTyped {
+    /// Refuse it: an insert template writes what it names.
+    Refuse,
+    /// Keep the lexical form as a string with the declared datatype, the
+    /// form a Turtle write stores an ill-typed literal in. A DELETE names
+    /// what is stored, and a term that is not stored retracts nothing.
+    AsStored,
+}
+
 /// Convert SPARQL Literal to TemplateTerm with datatype/language metadata.
 fn literal_to_template(
     lit: &Literal,
     prologue: &Prologue,
     ns: &mut NamespaceRegistry,
+    ill_typed: IllTyped,
 ) -> Result<LiteralResult, LowerError> {
     match &lit.value {
         SparqlLiteralValue::Simple(s) => Ok(LiteralResult {
@@ -1993,7 +2047,11 @@ fn literal_to_template(
         SparqlLiteralValue::Typed { value, datatype } => {
             let dt_iri = expand_iri(datatype, prologue)?;
             let dt_sid = ns.sid_for_iri(&dt_iri);
-            let coerced = coerce_typed_flake_value(value, &dt_iri, lit.span)?;
+            let coerced = match coerce_typed_flake_value(value, &dt_iri, lit.span) {
+                Ok(coerced) => coerced,
+                Err(_) if ill_typed == IllTyped::AsStored => FlakeValue::String(value.to_string()),
+                Err(e) => return Err(e),
+            };
             Ok(LiteralResult {
                 term: TemplateTerm::Value(coerced),
                 dtc: Some(DatatypeConstraint::Explicit(dt_sid)),
@@ -2786,5 +2844,42 @@ mod tests {
             ),
             "expected a clean quoted-triple-subject UnsupportedFeature, got {result:?}"
         );
+    }
+
+    /// Every request-level entry applies the transaction pragmas, so an
+    /// embedder that lowers the AST itself enforces what the request asked for.
+    #[test]
+    fn request_entries_apply_txn_pragmas_unless_caller_set_them() {
+        use fluree_db_core::ledger_config::ValidationMode;
+
+        let parsed = fluree_db_sparql::parse_sparql(
+            "# PRAGMA unique-properties: ex:email\n\
+             # PRAGMA validation-mode: warn\n\
+             PREFIX ex: <http://example.org/ns/>\n\
+             INSERT DATA { ex:bob ex:email \"bob@example.org\" }",
+        );
+        let ast = parsed.ast.expect("AST");
+        let email = Some(vec!["http://example.org/ns/email".to_string()]);
+
+        let mut ns = NamespaceRegistry::new();
+        let single = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
+        let request =
+            lower_sparql_update_request(&ast, &mut ns, TxnOpts::default()).expect("lower");
+        for opts in [&single.opts, &request[0].opts] {
+            assert_eq!(opts.unique_properties, email);
+            assert_eq!(opts.validation_mode, Some(ValidationMode::Warn));
+        }
+
+        let caller = TxnOpts {
+            unique_properties: Some(vec!["http://example.org/ns/handle".to_string()]),
+            validation_mode: Some(ValidationMode::Reject),
+            ..TxnOpts::default()
+        };
+        let txn = lower_sparql_update_ast(&ast, &mut ns, caller).expect("lower");
+        assert_eq!(
+            txn.opts.unique_properties,
+            Some(vec!["http://example.org/ns/handle".to_string()])
+        );
+        assert_eq!(txn.opts.validation_mode, Some(ValidationMode::Reject));
     }
 }

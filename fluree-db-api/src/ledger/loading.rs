@@ -202,8 +202,9 @@ impl Fluree {
     ///   `at` is a malformed timestamp, a time before the source's first
     ///   commit, a transaction number below 1, or an `AtSnapshot` (a
     ///   graph-source table snapshot, never a commit on a ledger)
-    /// - [`ApiError::NotFound`] if the source branch does not exist, or if
-    ///   `at` resolves to a commit not reachable from source HEAD
+    /// - [`ApiError::NotFound`] if the source branch does not exist
+    /// - [`ApiError::CommitNotFound`] if `at` names no commit, or one not
+    ///   reachable from source HEAD
     pub async fn create_branch(
         &self,
         ledger_name: &str,
@@ -491,7 +492,7 @@ async fn verify_ancestor<C: ContentStore + ?Sized>(
     let target_envelope = load_commit_envelope_by_id(store, target)
         .await
         .map_err(|_| {
-            ApiError::NotFound(format!("commit {target} not found in source namespace"))
+            ApiError::CommitNotFound(format!("commit {target} not found in source namespace"))
         })?;
 
     if source_head == target {
@@ -504,7 +505,7 @@ async fn verify_ancestor<C: ContentStore + ?Sized>(
     if line.iter().any(|(_, cid)| cid == target) {
         Ok(target_envelope.t)
     } else {
-        Err(ApiError::NotFound(format!(
+        Err(ApiError::CommitNotFound(format!(
             "commit {target} is not on the line of commits behind {source_head}. \
              A commit that arrived through a merge cannot be branched at: branch \
              at the merge commit instead, or at a commit on the branch that made it"

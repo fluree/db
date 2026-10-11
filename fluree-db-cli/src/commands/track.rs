@@ -105,7 +105,7 @@ async fn run_add(
     let effective_remote_alias = crate::context::to_ledger_id(remote_alias.unwrap_or(ledger))?;
 
     // Check mutual exclusion: refuse if local ledger exists
-    let fluree = crate::context::build_fluree(dirs)?;
+    let fluree = crate::context::build_fluree(dirs).await?;
     let local_ledger_id = &local_alias;
     if fluree.ledger_exists(local_ledger_id).await.unwrap_or(false) {
         return Err(CliError::Config(format!(

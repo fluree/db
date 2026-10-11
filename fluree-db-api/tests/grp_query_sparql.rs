@@ -41,6 +41,8 @@ mod it_query_sparql_annotations;
 mod it_query_sparql_count_distinct_star;
 #[path = "it_query_sparql_group_concat_iri.rs"]
 mod it_query_sparql_group_concat_iri;
+#[path = "it_query_sparql_grouped_projection.rs"]
+mod it_query_sparql_grouped_projection;
 #[path = "it_query_sparql_parse_errors.rs"]
 mod it_query_sparql_parse_errors;
 #[path = "it_query_sparql_path_literal_object.rs"]
@@ -66,3 +68,12 @@ mod it_w3c_result_formats;
 
 #[path = "it_query_subquery_streaming.rs"]
 mod it_query_subquery_streaming;
+
+#[path = "it_union_default_graph.rs"]
+mod it_union_default_graph;
+
+#[path = "it_sparql_params.rs"]
+mod it_sparql_params;
+
+#[path = "it_query_sparql_vector_constant.rs"]
+mod it_query_sparql_vector_constant;

@@ -1,0 +1,5 @@
+# Pinned for scripts/glue-local (moto + pyiceberg's GlueCatalog). See README.md.
+moto[server]==5.2.3
+pyiceberg[glue,pyarrow]==0.12.0
+boto3==1.43.109
+pyarrow==25.0.1

@@ -24,11 +24,7 @@ impl super::Parser<'_> {
         let modifiers = self.parse_solution_modifiers();
 
         // Parse optional post-query VALUES clause (SPARQL grammar: ValuesClause after SolutionModifier)
-        let values = if self.stream.check_keyword(TokenKind::KwValues) {
-            self.parse_values_pattern().map(Box::new)
-        } else {
-            None
-        };
+        let values = self.parse_trailing_values();
 
         let span = start.union(self.stream.previous_span());
 

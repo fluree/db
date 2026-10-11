@@ -70,8 +70,9 @@ pub(crate) fn parse_sparql_to_ir(
     sparql: &str,
     snapshot: &LedgerSnapshot,
     default_context: Option<&JsonValue>,
+    params: Option<&fluree_db_sparql::ParamMap>,
 ) -> Result<(VarRegistry, Query)> {
-    let ast = parse_and_validate_sparql(sparql)?;
+    let ast = parse_and_validate_sparql(sparql, params)?;
     lower_sparql_ast(ast, snapshot, default_context, sparql)
 }
 
@@ -504,7 +505,21 @@ pub(crate) fn sparql_parse_count() -> usize {
     SPARQL_PARSE_COUNT.with(std::cell::Cell::get)
 }
 
-pub(crate) fn parse_and_validate_sparql(sparql: &str) -> Result<fluree_db_sparql::SparqlAst> {
+/// Parse and validate `sparql`, then substitute `params` into it. Without
+/// parameters this is the parse alone.
+pub(crate) fn parse_and_validate_sparql(
+    sparql: &str,
+    params: Option<&fluree_db_sparql::ParamMap>,
+) -> Result<fluree_db_sparql::SparqlAst> {
+    let mut ast = parse_and_validate_unparameterized(sparql)?;
+    if let Some(params) = params {
+        fluree_db_sparql::substitute_params(&mut ast, params)
+            .map_err(|e| ApiError::invalid_query(e.to_string()))?;
+    }
+    Ok(ast)
+}
+
+fn parse_and_validate_unparameterized(sparql: &str) -> Result<fluree_db_sparql::SparqlAst> {
     #[cfg(test)]
     SPARQL_PARSE_COUNT.with(|c| c.set(c.get() + 1));
 
@@ -592,26 +607,63 @@ pub(crate) fn charge_query_floor(
 }
 
 /// Tracker for a "tracked" query path: an explicit `tracking_override` if given,
-/// otherwise the per-input default — opts-derived for JSON-LD, all-enabled for
-/// SPARQL (which has no `opts` carrier). This is the single derivation shared by
-/// the view/dataset tracked entry points and [`floor_only_tally`].
+/// otherwise what the request names — JSON-LD `opts.meta` / `max-fuel`, or a
+/// SPARQL request's `# PRAGMA meta` / `max-fuel` — falling back to all tracking.
+/// This is the single derivation shared by the view/dataset tracked entry
+/// points and [`floor_only_tally`]. `sparql_ast` is the request's AST when the
+/// caller has already parsed it, so its pragmas are not parsed again.
 pub(crate) fn tracked_query_tracker(
     input: &QueryInput<'_>,
     tracking_override: &Option<TrackingOptions>,
+    sparql_ast: Option<&fluree_db_sparql::SparqlAst>,
 ) -> Tracker {
     match tracking_override {
         Some(opts) => Tracker::new(opts.clone()),
         None => match input {
             QueryInput::JsonLd(json) => tracker_for_tracked_endpoint(json),
-            QueryInput::Sparql(_) => Tracker::new(TrackingOptions::all_enabled()),
+            QueryInput::Sparql(sparql) => {
+                let tracking = sparql_tracking_options(sparql, sparql_ast);
+                if tracking.any_enabled() {
+                    Tracker::new(tracking)
+                } else {
+                    Tracker::new(TrackingOptions::all_enabled())
+                }
+            }
         },
+    }
+}
+
+/// Fuel-limit tracker for an untracked query: see [`input_fuel_limit`].
+pub(crate) fn tracker_for_input_limits(
+    input: &QueryInput<'_>,
+    sparql_ast: Option<&fluree_db_sparql::SparqlAst>,
+) -> Tracker {
+    limits_tracker(input_fuel_limit(input, sparql_ast))
+}
+
+/// The fuel limit an untracked query names: the JSON-LD body's `max-fuel`, or
+/// a SPARQL request's `# PRAGMA max-fuel`, read from `sparql_ast` when the
+/// caller has already parsed the request.
+pub(crate) fn input_fuel_limit(
+    input: &QueryInput<'_>,
+    sparql_ast: Option<&fluree_db_sparql::SparqlAst>,
+) -> Option<u64> {
+    match input {
+        QueryInput::JsonLd(json) => {
+            let opts = json.as_object().and_then(|o| o.get("opts"));
+            TrackingOptions::from_opts_value(opts).max_fuel
+        }
+        QueryInput::Sparql(sparql) => sparql_tracking_options(sparql, sparql_ast).max_fuel,
     }
 }
 
 pub(crate) fn tracker_for_limits(query_json: &JsonValue) -> Tracker {
     let opts = query_json.as_object().and_then(|o| o.get("opts"));
-    let tracking = TrackingOptions::from_opts_value(opts);
-    match tracking.max_fuel.filter(|limit| *limit > 0) {
+    limits_tracker(TrackingOptions::from_opts_value(opts).max_fuel)
+}
+
+pub(crate) fn limits_tracker(max_fuel: Option<u64>) -> Tracker {
+    match max_fuel.filter(|limit| *limit > 0) {
         Some(limit) => Tracker::new(TrackingOptions {
             track_time: false,
             track_fuel: true,
@@ -619,6 +671,37 @@ pub(crate) fn tracker_for_limits(query_json: &JsonValue) -> Tracker {
             max_fuel: Some(limit),
         }),
         None => Tracker::disabled(),
+    }
+}
+
+/// The tracking a SPARQL request's `# PRAGMA meta` / `max-fuel` names — the
+/// twin of [`TrackingOptions::from_opts_value`]. Read from `ast` when the
+/// caller has already parsed the request; otherwise from the text, where a
+/// request whose pragmas do not parse gets none (the parse that runs it
+/// reports the error).
+pub(crate) fn sparql_tracking_options(
+    sparql: &str,
+    ast: Option<&fluree_db_sparql::SparqlAst>,
+) -> TrackingOptions {
+    match ast {
+        Some(ast) => sparql_pragma_tracking(&ast.pragmas),
+        None => {
+            sparql_pragma_tracking(&fluree_db_sparql::request_pragmas(sparql).unwrap_or_default())
+        }
+    }
+}
+
+/// The tracking a SPARQL request's `# PRAGMA meta` / `max-fuel` name.
+pub fn sparql_pragma_tracking(pragmas: &fluree_db_sparql::Pragmas) -> TrackingOptions {
+    let meta = pragmas.meta.unwrap_or_default();
+    let max_fuel = pragmas
+        .max_fuel
+        .map(fluree_db_core::tracking::fuel_to_micro);
+    TrackingOptions {
+        track_time: meta.time,
+        track_fuel: meta.fuel || max_fuel.is_some(),
+        track_policy: meta.policy,
+        max_fuel,
     }
 }
 
@@ -631,6 +714,7 @@ pub(crate) fn status_for_query_error(err: &fluree_db_query::QueryError) -> u16 {
         // specifically (a query too memory-heavy, not a slow one).
         fluree_db_query::QueryError::MemoryBudgetExceeded { .. } => 507,
         fluree_db_query::QueryError::InvalidQuery(_) => 400,
+        fluree_db_query::QueryError::UngroupedRead(_) => 400,
         fluree_db_query::QueryError::InvalidFilter(_) => 400,
         fluree_db_query::QueryError::InvalidExpression(_) => 400,
         _ => 500,
@@ -741,7 +825,7 @@ mod tests {
         reset_sparql_parse_count();
 
         let sparql = "SELECT * WHERE { ?s ?p ?o }";
-        let ast = parse_and_validate_sparql(sparql).expect("parse");
+        let ast = parse_and_validate_sparql(sparql, None).expect("parse");
         assert_eq!(sparql_parse_count(), 1, "exactly one parse so far");
 
         let snapshot = LedgerSnapshot::genesis("test:main");
@@ -760,7 +844,8 @@ mod tests {
     fn parse_sparql_to_ir_parses_once() {
         reset_sparql_parse_count();
         let snapshot = LedgerSnapshot::genesis("test:main");
-        let _ = parse_sparql_to_ir("SELECT * WHERE { ?s ?p ?o }", &snapshot, None).expect("lower");
+        let _ = parse_sparql_to_ir("SELECT * WHERE { ?s ?p ?o }", &snapshot, None, None)
+            .expect("lower");
         assert_eq!(sparql_parse_count(), 1);
     }
 

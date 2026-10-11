@@ -144,11 +144,11 @@ pub fn evaluate_update_evaluation_test(test: &Test) -> Result<()> {
 /// named graphs. Returns the resulting ledger state.
 ///
 /// Named graphs are loaded as TriG `GRAPH <name> { ... }` blocks through the
-/// alias-based transact builder (`upsert_turtle`), which routes through
-/// `parse_trig_phase1`. Each file's `@prefix`/`@base` directives are hoisted
-/// above the GRAPH block (TriG directives are document-scoped), and each
-/// graph loads in its own transaction so prefix declarations can't collide
-/// across files.
+/// alias-based transact builder (`upsert_turtle`), which parses the document
+/// once with the Turtle parser. Each file's `@prefix`/`@base` directives are
+/// hoisted above the GRAPH block (a directive cannot sit inside a block),
+/// and each graph loads in its own transaction so prefix declarations can't
+/// collide across files.
 async fn setup_graph_store(
     fluree: &Fluree,
     data_url: Option<&str>,
@@ -191,8 +191,8 @@ async fn setup_graph_store(
             continue;
         }
         let trig = format!("{directives}GRAPH <{graph_name}> {{\n{body}}}\n");
-        // upsert_turtle (not insert_turtle): the builder's insert_turtle
-        // fast path bypasses TriG GRAPH-block extraction.
+        // Either verb reads a TriG body; upsert keeps a repeated load of the
+        // same graph from accumulating copies.
         match fluree
             .graph(TEST_LEDGER)
             .transact()

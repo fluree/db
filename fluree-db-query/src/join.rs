@@ -428,8 +428,8 @@ pub(crate) enum Substitution {
     /// must then correlate the slot by term equality on the scan's output.
     Free,
     /// No triple holds this value in this slot: a literal as a subject or
-    /// predicate, or a value that is not an RDF term (a list, map, path,
-    /// relationship or grouped value). The slot stays a variable.
+    /// predicate, or a value that is not an RDF term (a list, map, path or
+    /// relationship). The slot stays a variable.
     Unmatchable,
 }
 
@@ -538,9 +538,9 @@ pub(crate) fn substitute_binding(
                     }
                 }
                 Binding::Unbound | Binding::Poisoned => return Ok(Substitution::Free),
+                Binding::Grouped(_) => return Err(grouped_in_substitution()),
                 Binding::Lit { .. }
                 | Binding::EncodedLit { .. }
-                | Binding::Grouped(_)
                 | Binding::Path { .. }
                 | Binding::Rel(_)
                 | Binding::List(_)
@@ -651,11 +651,7 @@ pub(crate) fn substitute_binding(
                 None => return Ok(Substitution::Free),
             },
             Binding::Unbound | Binding::Poisoned => return Ok(Substitution::Free),
-            Binding::Grouped(_) => {
-                // Grouped bindings shouldn't appear in join codepaths
-                debug_assert!(false, "Grouped binding in correlated substitution");
-                return Ok(Substitution::Unmatchable);
-            }
+            Binding::Grouped(_) => return Err(grouped_in_substitution()),
             Binding::Path { .. } => {
                 // A path value is never a join key.
                 debug_assert!(false, "Path binding in correlated substitution");
@@ -670,6 +666,15 @@ pub(crate) fn substitute_binding(
         },
     }
     Ok(Substitution::Bound)
+}
+
+/// A per-group list never leaves a grouping stage (the plan-time
+/// `Grouping::first_ungrouped_read` check); leaving the slot a variable would
+/// match anything.
+fn grouped_in_substitution() -> QueryError {
+    QueryError::Internal(
+        "grouped (list-valued) binding reached a correlated substitution".to_string(),
+    )
 }
 
 /// Identifies the source of a left row in `pending_output`.
