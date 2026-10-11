@@ -48,14 +48,13 @@ fn checked_dt_id(dt_id: u32) -> Result<u16, String> {
         })
 }
 
-/// System-injected txn-meta predicates that legitimately live in a reserved
-/// namespace: `build_commit` strips any user-supplied claim for these and
-/// injects the system-controlled value (`f:identity` for provenance,
-/// `db:receivedAt` for the dual-stamp audit axis). They must flow through
-/// the resolver like ordinary entries so they stay queryable post-index.
-fn is_system_txn_meta_entry(entry: &fluree_db_novelty::TxnMetaEntry) -> bool {
-    entry.predicate_ns == FLUREE_DB
-        && (entry.predicate_name == db::IDENTITY || entry.predicate_name == db::RECEIVED_AT)
+/// Txn-meta predicates that legitimately live in a reserved namespace
+/// ([`db::TXN_META`]): the user claims `extract_txn_meta` admits (`f:message`,
+/// `f:author`) and the entries the system writes (`f:identity`,
+/// `db:receivedAt`, `f:reverts`). They flow through the resolver like
+/// ordinary entries so they stay queryable post-index.
+fn is_fluree_db_txn_meta_entry(entry: &fluree_db_novelty::TxnMetaEntry) -> bool {
+    entry.predicate_ns == FLUREE_DB && db::TXN_META.contains(&entry.predicate_name.as_str())
 }
 use num_bigint::BigInt;
 use rustc_hash::FxHashMap;
@@ -504,7 +503,7 @@ impl CommitResolver {
     ) -> Result<u32, ResolverError> {
         debug_assert!(
             !RESERVED_PREDICATE_NAMESPACES.contains(&entry.predicate_ns)
-                || is_system_txn_meta_entry(entry),
+                || is_fluree_db_txn_meta_entry(entry),
             "TxnMetaEntry in reserved namespace {} reached resolver — extract_txn_meta guard bypassed?",
             entry.predicate_ns
         );
@@ -2001,7 +2000,7 @@ impl SharedResolverState {
     ) -> Result<u32, ResolverError> {
         debug_assert!(
             !RESERVED_PREDICATE_NAMESPACES.contains(&entry.predicate_ns)
-                || is_system_txn_meta_entry(entry),
+                || is_fluree_db_txn_meta_entry(entry),
             "TxnMetaEntry in reserved namespace {} reached resolver — extract_txn_meta guard bypassed?",
             entry.predicate_ns
         );

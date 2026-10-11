@@ -66,7 +66,7 @@ const RESERVED_PREDICATE_NAMESPACES: &[u16] = &[FLUREE_COMMIT, FLUREE_URN];
 /// `f:message` — commit message (free-form user claim).
 /// `f:author` — commit author (user claim; distinct from `f:identity` which is
 /// the authenticated subject and is system-controlled).
-const FLUREE_DB_USER_ALLOWED: &[&str] = &[fluree_vocab::db::MESSAGE, fluree_vocab::db::AUTHOR];
+const FLUREE_DB_USER_ALLOWED: &[&str] = fluree_vocab::db::TXN_META_USER;
 
 /// The top-level body key for the txn-meta sidecar.
 ///

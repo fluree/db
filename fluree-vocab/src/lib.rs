@@ -1834,6 +1834,15 @@ pub mod db {
     /// reconstruct revert provenance from the txn-meta graph.
     pub const REVERTS: &str = "reverts";
 
+    /// The local names in this namespace that a user may set in a commit's
+    /// txn-meta: `f:message` and `f:author`.
+    pub const TXN_META_USER: &[&str] = &[MESSAGE, AUTHOR];
+
+    /// Every local name in this namespace a commit's txn-meta holds: the user
+    /// claims ([`TXN_META_USER`]) and the entries the system writes
+    /// (`f:identity`, `db:receivedAt`, and `f:reverts` on a revert).
+    pub const TXN_META: &[&str] = &[MESSAGE, AUTHOR, IDENTITY, RECEIVED_AT, REVERTS];
+
     /// db:txn - transaction address (optional)
     pub const TXN: &str = "txn";
 
